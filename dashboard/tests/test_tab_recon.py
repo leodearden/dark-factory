@@ -14,7 +14,9 @@ executably by dashboard/tests/js/recon_status.test.mjs. What THAT suite
 structurally cannot see is whether app.jsx and tabs.jsx actually CALL it, or
 whether they quietly go on restating status literals of their own. That is
 what this module asserts — the same division test_tab_tasks_status_counts.py
-documents for task_status_counts.js.
+documents for task_status_counts.js. The stylesheet half of the contract
+(TestBadgeTonesAreStyled) lives here for the same reason: styles.css is
+reachable from the test client and not from a node process.
 
 Deliberately a NEW module. test_app.py is scoped to app-shell concerns and
 test_tab_orchestrators.py to the Orchestrators tab; neither covers the Recon
@@ -95,9 +97,9 @@ def _extract_object_literal(code: str, name: str) -> str:
 
 
 class TestReconRailBadgeWiring:
-    """DEFECT 1 — the rail badge must count the store's real terminal-failure
-    states ('failed' + 'interrupted') via recon_status.js, not 'failed' plus a
-    spelling that is never written."""
+    """DEFECT 1 — the rail badge must count the rows an operator should act on,
+    via recon_status.js, instead of 'failed' plus a spelling the store has
+    never written."""
 
     def test_app_jsx_served(self, _client):
         resp = _client.get('/static/redux/app.jsx')
@@ -120,16 +122,24 @@ class TestReconRailBadgeWiring:
             'badge is still counting a status vocabulary of its own.'
         )
         names = {n.strip() for n in match.group(1).split(',') if n.strip()}
-        assert 'reconRunCounts' in names
+        assert {'reconRunCounts', 'reconAttentionCount'} <= names, (
+            f'app.jsx destructures {sorted(names)} from window.DF_RECON_STATUS '
+            '— the rail badge needs both: the counts bucket the window, and '
+            'reconAttentionCount says which of those buckets is an alarm.'
+        )
 
     def test_rail_recon_count_comes_from_the_pure_module(self, app_jsx_code):
-        """The railCounts `recon:` entry must call reconRunCounts and read
-        `.unsuccessful`.
+        """The railCounts `recon:` entry must be reconAttentionCount's answer.
 
         Scoped to the railCounts literal so a call elsewhere in app.jsx cannot
-        satisfy it. `.unsuccessful` specifically, not any bucket: the badge
-        carries an ATTENTION signal, so folding in-flight runs into it would
-        make a busy healthy system and a failing one render the same digit.
+        satisfy it. The badge asks "how many rows should an operator go and
+        look at?", which is NOT the same question as the rate tile's "how many
+        did not succeed?": journal.py writes 'interrupted' whenever a run's
+        process died, and this fleet is restarted routinely, so an interrupted
+        row is a healthy-fleet artefact. Counting it here would sit the badge
+        permanently nonzero — the old under-count traded for a standing false
+        alarm. recon_status.js answers both questions separately; the badge
+        must consume the one it means rather than arithmetic of its own.
         """
         rail = _extract_object_literal(app_jsx_code, 'railCounts')
 
@@ -141,40 +151,52 @@ class TestReconRailBadgeWiring:
             f'railCounts.recon does not call reconRunCounts(...): {entry!r} — '
             'the badge must derive from the module the node suite covers.'
         )
-        assert '.unsuccessful' in entry, (
-            f'railCounts.recon does not read `.unsuccessful`: {entry!r} — the '
-            'badge counts terminal FAILURES (failed + interrupted); any other '
-            'bucket changes what the number means to an operator.'
+        assert 'reconAttentionCount(' in entry, (
+            f'railCounts.recon does not call reconAttentionCount(...): '
+            f'{entry!r} — the badge is an attention signal, and what deserves '
+            'attention is the module\'s call, not a bucket picked here.'
+        )
+        assert '.unsuccessful' not in entry, (
+            f'railCounts.recon reads `.unsuccessful`: {entry!r} — that bucket '
+            "includes 'interrupted', which this fleet produces routinely, so "
+            'the badge would never return to zero on a healthy system.'
         )
 
     def test_dead_partial_disjunct_is_gone(self, app_jsx_code):
-        """`'partial'` must not appear anywhere in app.jsx.
+        """`'partial'` must not appear in railCounts.
 
         Absence, not bypass: a status the journal has never written is a
         literal no reader can evaluate, and leaving it in place is what made
         the badge look like it already handled more than 'failed'.
         """
-        assert "'partial'" not in app_jsx_code, (
-            "app.jsx still contains the literal 'partial' — the "
+        rail = _extract_object_literal(app_jsx_code, 'railCounts')
+        assert "'partial'" not in rail, (
+            "railCounts still contains the literal 'partial' — the "
             'reconciliation journal has never written that status.'
         )
 
-    def test_no_recon_status_literal_is_restated_in_app_jsx(self, app_jsx_code):
-        """app.jsx must not compare a status against any recon run-status
+    def test_no_recon_status_literal_is_restated_in_rail_counts(self, app_jsx_code):
+        """railCounts must not compare a status against a recon run-status
         literal.
 
-        The vocabulary is consumed from recon_status.js, never restated. Note
-        this deliberately does NOT forbid `status === 'in-progress'` and the
-        other TASK statuses on the neighbouring railCounts line: those belong
-        to a different vocabulary with a different writer, and collapsing the
-        two would be a change this task was not asked to make.
+        The vocabulary is consumed from recon_status.js, never restated.
+        Scoped to the railCounts literal, NOT to app.jsx as a whole: these
+        words are not exclusive to reconciliation — tabs.jsx already spells an
+        ORCHESTRATOR run 'running' / 'completed' — and app.jsx is the shell
+        that holds a count for every tab, so a future merge or escalation
+        count legitimately writing `d.status === 'completed'` would otherwise
+        fail a RECON test with a message blaming the recon vocabulary. Even
+        within this scope the TASK statuses on the neighbouring line
+        (`'in-progress'`, `'blocked'`, `'pending'`) are deliberately spared:
+        different vocabulary, different writer.
         """
+        rail = _extract_object_literal(app_jsx_code, 'railCounts')
         restated = [
             lit for lit in RECON_STATUS_LITERALS
-            if re.search(r'status\s*===\s*' + re.escape(f"'{lit}'"), app_jsx_code)
+            if re.search(r'status\s*===\s*' + re.escape(f"'{lit}'"), rail)
         ]
         assert restated == [], (
-            f'app.jsx compares a status against {restated} — the recon run '
+            f'railCounts compares a status against {restated} — the recon run '
             'vocabulary must come from recon_status.js so the rail badge and '
             'the Recon tab cannot drift apart from each other.'
         )
@@ -254,6 +276,35 @@ class TestReconSuccessRateWiring:
             'ReconTab does not bind reconRunCounts(...) to `const counts`.'
         )
 
+    def test_each_run_derived_tile_declares_the_window_it_counts(
+        self, recon_tab_code
+    ):
+        """The tiles count the store; the table below counts a filter. Say so.
+
+        `runs` is r.runs narrowed by projectFilter and search, and the Recent
+        runs table headlines it as "N matching" — so with a filter active a
+        tile and the table describe different populations, and "3 in
+        progress" sitting above "4 matching" reads as a contradiction.
+
+        The tiles stay store-wide: that is what the acceptance wording asks
+        for ("with N runs in status 'running' IN THE STORE, the tab displays
+        N"), and the three tiles beside them — Buffered events, Active
+        agents, Last full run — are all store-wide already, the last of them
+        over the very watermarks the filtered table below it narrows. What
+        must hold instead is that a run-derived tile never lets its number be
+        mistaken for the table's: each one names its scope in the hint.
+        """
+        for label in ('In progress', 'Run success rate'):
+            tile = _extract_stat_tile(recon_tab_code, label)
+            hint = re.search(r'hint=\{(.*?)\}\s*\n', tile, re.DOTALL)
+            assert hint is not None, f'the {label} tile has no hint: {tile!r}'
+            assert 'all projects' in hint.group(1), (
+                f'the {label} tile counts the whole store but its hint does '
+                f'not say so: {hint.group(1)!r} — an operator who filtered to '
+                f'one project reads it as disagreeing with the "N matching" '
+                f'table below.'
+            )
+
     def test_success_rate_tile_value_comes_from_recon_success_pct(self, recon_tab_code):
         """The rate the tile renders must be the module's, traced in two hops.
 
@@ -278,20 +329,16 @@ class TestReconSuccessRateWiring:
             f'local bound to reconSuccessPct(counts): {tile!r}'
         )
 
-    def test_tile_no_longer_filters_for_the_success_status(self, recon_tab_code):
-        """The filter that pinned the tile at 0% must be gone.
+    def test_the_success_tally_is_not_recomputed_by_hand(self, recon_tab_code):
+        """`successCount` — the local that filtered for 'success' — must be gone.
 
-        Absence rather than bypass: the journal has never written 'success',
-        so a surviving comparison against it is dead code that reads as though
-        the status were handled. The BROADER rule — that no run-status literal
-        at all survives anywhere in ReconTab — is asserted by
-        TestReconStatusLiteralsAreGone once the Recent Runs badge (the third
-        and last call site) is converted too.
+        Only the LOCAL is checked here. That no comparison against 'success'
+        (or any other status literal) survives is the strictly stronger rule
+        asserted once, by
+        TestReconStatusLiteralsAreGone::test_no_run_status_literal_survives_anywhere_in_recon_tab;
+        restating it here would be a second copy that can never fail while
+        that one passes.
         """
-        assert "x.status === 'success'" not in recon_tab_code, (
-            "ReconTab still filters r.runs for x.status === 'success', which "
-            'is always zero: the reconciliation journal writes "completed".'
-        )
         assert 'successCount' not in recon_tab_code, (
             'ReconTab still computes `successCount` by hand — the success '
             'tally belongs to reconRunCounts.'
@@ -311,9 +358,9 @@ class TestReconSuccessRateWiring:
             'ReconTab still computes `totalRuns` — the success rate denominator '
             'must be the TERMINAL count (counts.terminal), not the window size.'
         )
-        assert not re.search(r'/\s*r\.runs\.length', recon_tab_code), (
-            'ReconTab still divides by r.runs.length — an in-flight run would '
-            'depress the success rate.'
+        assert not re.search(r'/\s*(r\.)?runs\.length', recon_tab_code), (
+            'ReconTab still divides by the window size — an in-flight run '
+            'would depress the success rate.'
         )
 
     def test_success_rate_hint_surfaces_the_denominator_and_the_residue(
@@ -424,6 +471,74 @@ class TestReconInProgressTile:
         )
 
 
+@pytest.fixture(scope='module')
+def recon_status_js_code(_client):
+    """recon_status.js as the page serves it, comments blanked."""
+    resp = _client.get('/static/redux/recon_status.js')
+    assert resp.status_code == 200, (
+        'recon_status.js is not served — index.html loads it, so a non-200 '
+        'here means the tones read below come from a file no browser ever '
+        'receives.'
+    )
+    return strip_js_comments(resp.text)
+
+
+@pytest.fixture(scope='module')
+def recon_badge_tones(recon_status_js_code):
+    """Every tone reconStatusTone can return, read out of the module itself.
+
+    Deliberately NOT a hand-written list. A second copy of the tones would
+    reduce the test below to "these two lists agree", which is precisely the
+    failure it exists to catch: a tone added to the module AND to the copy
+    but not to the stylesheet renders an unstyled badge and stays green.
+    Both halves of the return set are parsed — the mapped tones and the
+    unrecognised-status fallback — and each is asserted non-empty, so a
+    restructuring that defeats the parse fails loudly instead of shrinking
+    the check to nothing.
+    """
+    mapped = set(re.findall(
+        r":\s*'([\w-]+)'",
+        _extract_object_literal(recon_status_js_code, 'RECON_STATUS_TONES'),
+    ))
+    fallback = set(re.findall(
+        r"'([\w-]+)'",
+        extract_function_body(recon_status_js_code, 'reconStatusTone'),
+    ))
+    assert mapped, (
+        'no tones parsed out of RECON_STATUS_TONES — the map was restructured '
+        'and this fixture no longer sees what a badge can be given.'
+    )
+    assert fallback, (
+        'no fallback tone parsed out of reconStatusTone — the '
+        'unrecognised-status branch was restructured and is no longer checked.'
+    )
+    return mapped | fallback
+
+
+class TestBadgeTonesAreStyled:
+    """Every tone recon_status.js can hand a badge must be styled.
+
+    dashboard/tests/js/recon_status.test.mjs pins reconStatusTone's RETURN
+    SET; what a node process structurally cannot see is whether styles.css
+    defines those classes. Without this, a tone added to the module renders
+    as an unstyled badge — every run row looking alike — and nothing fails.
+    """
+
+    def test_every_tone_the_module_returns_has_a_badge_rule(
+        self, recon_badge_tones, styles_css_body
+    ):
+        unstyled = sorted(
+            tone for tone in recon_badge_tones
+            if not _extract_css_rule_block(styles_css_body, f'.badge.{tone}')
+        )
+        assert unstyled == [], (
+            f'reconStatusTone can return {unstyled}, for which styles.css has '
+            'no `.badge.<tone>` rule — those badges render with the base '
+            '.badge styling alone, so a failed run reads exactly like a '
+            'completed one.'
+        )
+
+
 class TestReconStatusLiteralsAreGone:
     """The invariant that closes the task: after the Recent Runs badge is
     converted, ReconTab CONSUMES the run vocabulary and RESTATES none of it.
@@ -453,13 +568,6 @@ class TestReconStatusLiteralsAreGone:
         assert re.search(r'badge \$\{reconStatusTone\(', recon_tab_code), (
             'the Recent Runs status badge does not derive its class from '
             'reconStatusTone(...).'
-        )
-
-    def test_badge_status_ternary_is_gone(self, recon_tab_code):
-        """The chained ternary that hard-coded three literals must be gone."""
-        assert 'rn.status ===' not in recon_tab_code, (
-            'the Recent Runs badge still branches on rn.status literals '
-            'instead of delegating to reconStatusTone.'
         )
 
     def test_no_run_status_literal_survives_anywhere_in_recon_tab(

@@ -28,12 +28,14 @@ const {
   RECON_RUN_UNSUCCESSFUL,
   reconRunCounts,
   reconSuccessPct,
+  reconAttentionCount,
   reconStatusTone,
 } = reconStatus;
 
 const EXPECTED_FUNCTION_NAMES = [
   'reconRunCounts',
   'reconSuccessPct',
+  'reconAttentionCount',
   'reconStatusTone',
 ];
 
@@ -43,12 +45,6 @@ const EXPECTED_ARRAY_NAMES = [
   'RECON_RUN_SUCCESS',
   'RECON_RUN_UNSUCCESSFUL',
 ];
-
-// The statuses the store's sole writer actually writes:
-// fused-memory/src/fused_memory/reconciliation/journal.py — the `status`
-// column defaults to 'running', and `complete_run` is called with exactly
-// 'completed' | 'failed' | 'interrupted' across the whole package.
-const STORE_VOCABULARY = ['running', 'completed', 'failed', 'interrupted'];
 
 // The two spellings the dashboard used to test for and that the store has
 // never once written — the defect this module exists to close.
@@ -83,26 +79,6 @@ test('default-imported module exposes the vocabulary arrays', () => {
 // The vocabulary — one closed set, partitioned three ways.
 // ---------------------------------------------------------------------------
 
-test('RECON_RUN_STATES is exactly the four statuses the journal writes', () => {
-  assert.deepEqual(
-    [...RECON_RUN_STATES].sort(),
-    [...STORE_VOCABULARY].sort(),
-  );
-});
-
-test("RECON_RUN_STATES contains neither retired spelling ('success', 'partial')", () => {
-  // These are the literals the two defects tested for. 'success' pinned the
-  // rate tile at 0% forever; 'partial' was a dead disjunct in the rail
-  // badge. Neither has ever been written by journal.py::complete_run.
-  for (const ghost of NEVER_WRITTEN) {
-    assert.ok(
-      !RECON_RUN_STATES.includes(ghost),
-      `'${ghost}' is not a status the reconciliation journal writes; it must ` +
-        'not re-enter the vocabulary',
-    );
-  }
-});
-
 test('the three partitions are a disjoint cover of RECON_RUN_STATES', () => {
   // Disjoint: no status may be counted into two buckets (which would let
   // the success rate exceed 100%). Covering: no status may be orphaned
@@ -118,11 +94,19 @@ test('the three partitions are a disjoint cover of RECON_RUN_STATES', () => {
 });
 
 test('the partitions place each status where the journal semantics put it', () => {
+  // Exact contents, so this test plus the disjoint-cover one above together
+  // pin RECON_RUN_STATES to precisely the four statuses
+  // fused-memory/src/fused_memory/reconciliation/journal.py writes — the
+  // `status` column defaults to 'running' and `complete_run` is called with
+  // exactly 'completed' | 'failed' | 'interrupted' across the whole package.
+  // Neither retired spelling can re-enter the vocabulary without failing one
+  // of the two.
   assert.deepEqual(RECON_RUN_IN_FLIGHT, ['running']);
   assert.deepEqual(RECON_RUN_SUCCESS, ['completed']);
   // 'interrupted' is a run the process died in the middle of — it did not
   // succeed, so it belongs in the rate's denominator-only side (K in
-  // M/(M+K)) alongside 'failed'.
+  // M/(M+K)) alongside 'failed'. It is nonetheless NOT an alarm; see the
+  // reconAttentionCount tests below.
   assert.deepEqual([...RECON_RUN_UNSUCCESSFUL].sort(), ['failed', 'interrupted']);
 });
 
@@ -143,6 +127,8 @@ test('reconRunCounts: buckets a mixed window, counting interrupted as unsuccessf
   assert.equal(counts.total, 25);
   assert.equal(counts.inFlight, 3);
   assert.equal(counts.success, 12);
+  assert.equal(counts.failed, 4);
+  assert.equal(counts.interrupted, 6);
   assert.equal(counts.unsuccessful, 10, 'failed + interrupted');
   assert.equal(counts.terminal, 22);
   assert.equal(counts.unknown, 0);
@@ -167,6 +153,7 @@ test('reconRunCounts: the buckets partition the window exactly', () => {
     counts.total,
     'a run was lost or double-counted',
   );
+  assert.equal(counts.unsuccessful, counts.failed + counts.interrupted);
   assert.equal(counts.terminal, counts.success + counts.unsuccessful);
 });
 
@@ -181,6 +168,7 @@ test('reconRunCounts: an out-of-vocabulary status lands in `unknown` and nowhere
     assert.equal(counts.total, 4);
     assert.equal(counts.inFlight, 0, `'${status}' must not be counted as in-flight`);
     assert.equal(counts.success, 0, `'${status}' must not be counted as a success`);
+    assert.equal(counts.failed, 0, `'${status}' must not be counted as a failure`);
     assert.equal(counts.unsuccessful, 0, `'${status}' must not be counted as unsuccessful`);
     assert.equal(counts.terminal, 0, `'${status}' must not enter the rate denominator`);
   }
@@ -198,7 +186,8 @@ test('reconRunCounts: empty / undefined / null input yields an all-zero shape', 
   // The tiles render before recon data has necessarily arrived; throwing
   // here would blank the whole Recon tab.
   const allZero = {
-    total: 0, inFlight: 0, success: 0, unsuccessful: 0, terminal: 0, unknown: 0,
+    total: 0, inFlight: 0, success: 0, failed: 0, interrupted: 0,
+    unsuccessful: 0, terminal: 0, unknown: 0,
   };
   for (const input of [[], undefined, null]) {
     assert.deepEqual(
@@ -276,6 +265,52 @@ test('reconSuccessPct: null / undefined counts do not throw', () => {
 });
 
 // ---------------------------------------------------------------------------
+// reconAttentionCount — the rail badge's number. Failures + unrecognised.
+// ---------------------------------------------------------------------------
+
+test('reconAttentionCount: counts failures and unrecognised statuses only', () => {
+  const counts = reconRunCounts([
+    ...runsWithStatus('failed', 5),
+    ...runsWithStatus('some-future-status', 2),
+    ...runsWithStatus('completed', 30),
+    ...runsWithStatus('running', 4),
+  ]);
+
+  assert.equal(reconAttentionCount(counts), 7, '5 failed + 2 unrecognised');
+});
+
+test('reconAttentionCount: an interrupted run is not an alarm', () => {
+  // journal.py records 'interrupted' when a run's process died, and this
+  // fleet is restarted routinely — so interrupted rows are a standing
+  // background population on a HEALTHY fleet. Counting them here would sit
+  // the rail badge permanently nonzero, trading the old under-count for a
+  // permanent false alarm. They are still unsuccessful for the RATE, which
+  // is a different question; the reconSuccessPct tests above pin that.
+  const counts = reconRunCounts(runsWithStatus('interrupted', 12));
+
+  assert.equal(counts.unsuccessful, 12, 'still not a success');
+  assert.equal(reconAttentionCount(counts), 0, 'but nothing to investigate');
+});
+
+test('reconAttentionCount: a status the store grows later is visible from the rail', () => {
+  // The defect this module fixes was a consumer reading a status vocabulary
+  // that had moved on without it. `unknown` is the only runtime signal that
+  // it has moved again, and the rail badge is the one surface an operator
+  // sees without opening the Recon tab — so it must not be dropped here.
+  const counts = reconRunCounts(runsWithStatus('aborted', 3));
+
+  assert.equal(counts.unknown, 3);
+  assert.equal(reconAttentionCount(counts), 3);
+});
+
+test('reconAttentionCount: a quiet healthy window is zero, and null does not throw', () => {
+  assert.equal(reconAttentionCount(reconRunCounts(runsWithStatus('completed', 50))), 0);
+  assert.equal(reconAttentionCount(reconRunCounts([])), 0);
+  assert.equal(reconAttentionCount(null), 0);
+  assert.equal(reconAttentionCount(undefined), 0);
+});
+
+// ---------------------------------------------------------------------------
 // reconStatusTone — the per-row badge class. Classifies; never relabels.
 // ---------------------------------------------------------------------------
 
@@ -310,9 +345,12 @@ test('reconStatusTone: an unrecognised status is muted, not silently ok', () => 
   }
 });
 
-test('reconStatusTone returns only tones the stylesheet defines', () => {
-  // The badge classes styles.css already ships; inventing a new token here
-  // would render an unstyled badge.
+test('reconStatusTone returns a tone from its closed set, never anything else', () => {
+  // This pins the RETURN SET only. That every one of these tokens has a
+  // `.badge.<tone>` rule — the property that keeps a badge from rendering
+  // unstyled — is asserted against the real stylesheet by
+  // dashboard/tests/test_tab_recon.py::TestBadgeTonesAreStyled, which reads
+  // the tones out of recon_status.js rather than out of a second list.
   const KNOWN_TONES = ['ok', 'bad', 'warn', 'info', 'muted'];
   for (const status of [...RECON_RUN_STATES, 'anything-else']) {
     assert.ok(

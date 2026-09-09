@@ -724,11 +724,18 @@ function ReconTab({ projectFilter, search }) {
             lastFullIso = ts; lastFullProject = pid;
           }
         }
-        // ONE derivation for every tile below — recon_status.js owns the
-        // vocabulary, so no two tiles can disagree about the same window.
+        // ONE derivation for every run-derived tile below — recon_status.js
+        // owns the vocabulary, so no two tiles can disagree about the same
+        // window. That window is the UNFILTERED r.runs, like the three tiles
+        // beside them (Buffered events, Active agents, Last full run): the
+        // strip reports the store, the tables below report the operator's
+        // project/search filter. The Recent runs table headlines its own,
+        // narrower window as "N matching", so each run-derived tile names
+        // its scope in the hint — otherwise the two numbers read as a
+        // disagreement rather than as two different questions.
         const counts = reconRunCounts(r.runs);
         const successPct = reconSuccessPct(counts);
-        // Sparkline of recent run durations (oldest first).
+        // Sparkline of recent run durations (oldest first), same window.
         const durSpark = r.runs
           .filter(x => x.duration_seconds != null)
           .slice(0, 40)
@@ -745,7 +752,7 @@ function ReconTab({ projectFilter, search }) {
                 hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`}
                 spark={(r.agents_spark?.values || []).slice(-30)} sparkColor={CP.accent} />
             <ST label="In progress" value={counts.inFlight}
-                hint={`of ${counts.total} recent runs`}
+                hint={`of ${counts.total} recent runs (all projects)`}
                 spark={[]} />
             <ST label="Last full run"
                 value={lastFullIso ? window.DF_SHELL.timeago(lastFullIso) : '—'}
@@ -755,7 +762,8 @@ function ReconTab({ projectFilter, search }) {
                 value={successPct != null ? successPct : '—'}
                 unit={successPct != null ? '%' : ''}
                 hint={`${counts.terminal} finished · ${counts.inFlight} in flight`
-                  + (counts.unknown ? ` · ${counts.unknown} unknown status` : '')}
+                  + (counts.unknown ? ` · ${counts.unknown} unknown status` : '')
+                  + ' (all projects)'}
                 spark={durSpark} sparkColor={CP.ok} />
           </div>
         );
