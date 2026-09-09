@@ -42,6 +42,7 @@ import asyncio
 import importlib
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -240,6 +241,54 @@ def _parent_key(module: Any) -> str:
     return key if isinstance(key, str) and key else 'parent_id'
 
 
+class _VerdictObject:
+    """A designating verdict spelled as a small object."""
+
+    __slots__ = ('candidate_id', 'outcome')
+
+    def __init__(self, outcome: str, candidate_id: str) -> None:
+        self.outcome = outcome
+        self.candidate_id = candidate_id
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f'<verdict {self.outcome} -> {self.candidate_id}>'
+
+
+class _Spelling(NamedTuple):
+    """One plausible wire shape for "the verdict names its own candidate"."""
+
+    label: str
+    payload: Callable[[str, str], Any]
+
+
+#: THE DESIGNATION-SHAPE SEARCH. Option (a) has not landed, so no single
+#: spelling may be pinned: requiring one would fail a correct fix that chose
+#: another, which is the false-FAIL class this gate family exists to remove.
+#: Every shape is tried and the FIRST whose consumption test holds wins. A
+#: spelling the implementation cannot consume simply is not the winner and
+#: costs nothing; only a module where NO spelling holds fails.
+#:
+#: The bare outcome str is included DELIBERATELY as a control that must never
+#: satisfy on its own — it designates no candidate, so a module that widened
+#: nothing must not open the gate on it. A control nobody exercises proves
+#: nothing, so it is tried and reported like any other.
+_SPELLINGS: tuple[_Spelling, ...] = (
+    _Spelling('bare outcome str', lambda outcome, _ident: outcome),
+    _Spelling(
+        '(outcome, candidate_id) tuple',
+        lambda outcome, ident: (outcome, ident),
+    ),
+    _Spelling(
+        '{outcome, candidate_id} mapping',
+        lambda outcome, ident: {'outcome': outcome, 'candidate_id': ident},
+    ),
+    _Spelling(
+        'object with .outcome/.candidate_id',
+        lambda outcome, ident: _VerdictObject(outcome, ident),
+    ),
+)
+
+
 class _FakeJudge:
     """An async judge that records its call and returns a designating verdict.
 
@@ -358,6 +407,42 @@ def _measure(module: Any) -> tuple[_Run, list[str], Any]:
     return run, [i for i in slate_ids if isinstance(i, str)], band_canonical
 
 
+def _first_few(reasons: list[str], limit: int = 4) -> str:
+    """Bounded join. The report shares a 2000-character escalation window."""
+    shown = '; '.join(reasons[:limit])
+    if len(reasons) > limit:
+        shown += f'; …{len(reasons) - limit} more'
+    return shown
+
+
+def _search_spellings(
+    module: Any,
+    designated: str,
+) -> tuple[_Spelling | None, list[str]]:
+    """Try every designation spelling; return the first that is CONSUMED.
+
+    Mirrors the discipline of item 1's ``_search_option_b``: a spelling the
+    implementation ignores simply is not the winner, and the whole search is
+    reported on failure so an operator sees what was tried rather than one
+    arbitrary verdict.
+    """
+    attempts: list[str] = []
+    for spelling in _SPELLINGS:
+        judge = _FakeJudge(spelling.payload(_ATTACH_OUTCOME, designated))
+        run = _drive(module, judge)
+        if run.error is not None:
+            attempts.append(f'{spelling.label} — {run.error}')
+            continue
+        observed = getattr(run.decision, 'canonical_id', None)
+        if observed == designated:
+            return spelling, attempts
+        attempts.append(
+            f'{spelling.label} — the attach landed on {observed!r}, not the '
+            f'designated {designated!r}',
+        )
+    return None, attempts
+
+
 def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     out.append(
         f'write_triage attach-consumption probe — src-root={src_root}',
@@ -378,26 +463,23 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
         )
 
     designated = usable[0]
-    judge = _FakeJudge((_ATTACH_OUTCOME, designated))
-    run = _drive(module, judge)
-    if run.error is not None:
-        raise _Unverifiable(run.error)
-    observed = getattr(run.decision, 'canonical_id', None)
-    out.append(
-        f'designation: an (outcome, candidate_id) pair naming {designated!r} — '
-        f'the attach landed on {observed!r}',
-    )
-    if observed == designated:
+    winner, attempts = _search_spellings(module, designated)
+    if winner is not None:
+        out.append(
+            f'designation channel: {winner.label} — the attach tracked the '
+            f'candidate the judge designated ({designated!r})',
+        )
         out.append(_PASS_MARKER)
         return EXIT_OK
+
+    out.append(f'spellings tried: {_first_few(attempts)}')
     out.append(_FAIL_MARKER)
     out.append(
         f'      band canonical {band_canonical!r}; the judge designated '
-        f'{designated!r}; the attach landed on {observed!r}.',
+        f'{designated!r}; no designation spelling reached the attach.',
     )
     out.append(
-        '      A verdict earned by one candidate is filed against another, so '
-        'the',
+        '      A verdict earned by one candidate is filed against another, so the',
     )
     out.append(
         '      judge-side binding item 1 asserts is not carried into the write.',
