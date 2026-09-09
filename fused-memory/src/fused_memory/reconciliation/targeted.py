@@ -1382,12 +1382,38 @@ class TargetedReconciler:
         )
         try:
             assert self.task_interceptor is not None  # narrowed by caller
-            await self.task_interceptor.set_task_status(
+            resp_status = await self.task_interceptor.set_task_status(
                 task_id=task_id,
                 status='blocked',
                 project_root=project_root,
                 reopen_reason=reason,
             )
+            # Returning before the metadata block is what keeps the invariant
+            # "parent_cancelled / needs_recheck_against_main appear only on
+            # tasks this sweep actually blocked" true by construction --
+            # _unblock_veto_reason vetoes on exactly those keys, so stamping a
+            # still-pending task would silently park it.
+            if not interceptor_write_succeeded(resp_status):
+                error_code = (
+                    (resp_status.get('error_type') or resp_status.get('error'))
+                    if isinstance(resp_status, dict) else 'unknown'
+                ) or 'unknown'
+                logger.warning(
+                    'sweep: block (status) rejected for descendant %s '
+                    '(parent %s): error=%r',
+                    task_id, parent_id, error_code,
+                )
+                await self.journal.add_run_action(
+                    run_id, 'skip', 'taskmaster', 'set_task_status',
+                    {
+                        'task_id': task_id,
+                        'parent_id': parent_id,
+                        'type': 'descendant_block',
+                        'error': error_code,
+                    },
+                    causation_id=run_id,
+                )
+                return None
         except Exception as e:
             logger.warning(
                 'sweep: block (status) failed for descendant %s (parent %s): %s',
