@@ -1922,6 +1922,13 @@ def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree
     ``try`` BODY -- would pass every other case here while still leaving a
     holder unprotected against an earlier statement in that same body
     raising before the call is reached.
+
+    Cases (g) and (h) pin two properties this helper's own docstring already
+    claims but that no case previously exercised: (g) that an indirect
+    argument (not a direct ``ast.Name``) is reported as a finding rather
+    than silently excused, and (h) that the whole-function scope credits a
+    teardown living in a completely different ``try`` from where the holder
+    was bound.
     """
 
     def parse_func(source: str) -> ast.FunctionDef:
@@ -1989,7 +1996,7 @@ def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree
         'would wrongly return [] here'
     )
 
-    # keyword spelling: kill_holder_tree's first parameter is named `proc`.
+    # (e) keyword spelling: kill_holder_tree's first parameter is named `proc`.
     func_e = parse_func("""
         def f():
             holder = spawn_verify_merge()
@@ -2024,6 +2031,46 @@ def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree
         'last statement of a try BODY, not its finally/except) must still '
         'be flagged -- an earlier statement in the same try body raising '
         'would skip it entirely'
+    )
+
+    # (g) indirection defeats the matcher: kill_holder_tree(procs[0]) does
+    # not count as tearing down `holder`, even though `procs` holds it at
+    # runtime -- only a DIRECT ast.Name argument counts, so an indirection
+    # is reported as a finding rather than silently excused.
+    func_g = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            procs = [holder]
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(procs[0], timeout=5)
+    """)
+    assert _untorn_down_holders(func_g, {'holder'}) == ['f:holder'], (
+        'kill_holder_tree(procs[0]) is an indirection, not a direct '
+        'ast.Name argument -- it must not excuse holder, even though procs '
+        'holds it at runtime'
+    )
+
+    # (h) whole-function scope: holder is bound before one try and torn down
+    # in a COMPLETELY DIFFERENT, later try's finally -- unlike
+    # _bare_kill_offenders (which is per-try), this check must not flag it.
+    func_h = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            except RuntimeError:
+                pass
+            try:
+                do_more_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_h, {'holder'}) == [], (
+        'a holder torn down in a completely different try from where it '
+        'was bound is still torn down -- this check is scoped to the '
+        'whole function, not per-try'
     )
 
 
