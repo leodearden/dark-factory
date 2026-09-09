@@ -493,3 +493,365 @@ class TestB5ZeroMatchIsInert:
         full collection walk.
         """
         assert await resolved_prefixes(NONE_CALL) == ['20260904', 'deadbeef']
+
+
+# ---------------------------------------------------------------------------
+# Resolution builders and a hand-advanced clock.
+# ---------------------------------------------------------------------------
+
+
+def unique(
+    full_id: str, namespace: guard.Namespace = 'mem0', preview: str = ''
+) -> guard.Resolution:
+    """A `unique` resolution — exactly one candidate, as C2 requires."""
+    return guard.Resolution('unique', (guard.Candidate(namespace, full_id, preview),))
+
+
+class _Clock:
+    """A hand-advanced clock, so a storm window is a decision and not a race."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+#: Full ids, each with its own prefix as a literal prefix — the monotonicity
+#: `substitute` enforces, so a wrong expansion stays visible and reversible.
+BFF = 'bff81530'
+BFF_FULL = 'bff81530-1a2b-4c3d-8e9f-0123456789ab'
+F1C = 'f1c4a651'
+F1C_FULL = 'f1c4a651-2b3c-4d5e-8f90-1234567890ab'
+B7B = 'b7b0f63b'
+B7B_FULL = 'b7b0f63b-3c4d-4e5f-8a01-234567890abc'
+BEC = '8bec9cd6'
+BEC_FULL = '8bec9cd6-4d5e-4f60-8b12-34567890abcd'
+
+#: A dead full uuid, which corpus convention treats as provenance. It sits
+#: beside an expandable prefix in the B8 list so "the guard touched exactly one
+#: entry" is asserted rather than assumed.
+SIBLING_FULL = '48433882-ee71-480d-aff7-c91aa4640ff5'
+
+AGENT = 'claude-interactive'
+
+
+def expanded_fact(**overrides: Any) -> dict[str, Any]:
+    """One complete ``uuid_prefix_detected`` record for an expansion.
+
+    Spelled as a COMPLETE record with overrides rather than as a subset check,
+    so a key the guard silently stopped emitting fails a test instead of
+    passing one.
+    """
+    fact = {
+        'fact': 'uuid_prefix_detected',
+        'tool': 'add_memory',
+        'field': 'content',
+        'token': BFF,
+        'outcome': 'expanded',
+        'candidate_ids': [BFF_FULL],
+        'namespace': 'mem0',
+        'agent_id': AGENT,
+        'project': PROJECT,
+    }
+    fact.update(overrides)
+    return fact
+
+
+# ---------------------------------------------------------------------------
+# B1 — unique expansion on a memory write.
+# ---------------------------------------------------------------------------
+
+
+class TestB1UniqueExpansion:
+    CALL = {
+        'content': f'the {BFF} record already answers this',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL, preview='the reconciler ran twice')})
+
+    async def test_the_tool_received_the_expanded_value(self) -> None:
+        """Read off the RECORDER, not off meta.
+
+        ``meta`` reports what the guard says it did; the recorder reports what
+        the tool was actually handed. A guard that reported a substitution it
+        never applied would pass every meta assertion in this file.
+        """
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+
+    async def test_the_other_arguments_are_untouched(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['project_id'] == PROJECT
+        assert h.recorder.args['agent_id'] == AGENT
+        assert h.recorder.args['metadata'] is None
+
+    async def test_the_substitution_is_reported_on_meta(self) -> None:
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {
+            'substitutions': [
+                {
+                    'field': 'content',
+                    'path': ['content'],
+                    'from': BFF,
+                    'to': BFF_FULL,
+                    'namespace': 'mem0',
+                }
+            ]
+        }
+
+    async def test_exactly_one_fact_with_outcome_expanded(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.facts == [expanded_fact()]
+
+    async def test_fastmcps_own_meta_is_preserved_not_replaced(self) -> None:
+        """``call_next``'s result already carries FastMCP's signalling.
+
+        Discarding it to deliver our own would be a poor trade, so the report
+        is FOLDED into whatever meta came back.
+        """
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert (result.meta or {}).get('fastmcp') == {'wrap_result': True}
+
+
+# ---------------------------------------------------------------------------
+# B7 — a slash-separated pair: the glue rule keeps both, and both expand.
+# ---------------------------------------------------------------------------
+
+
+class TestB7SlashSeparatedPair:
+    CALL = {
+        'content': f'both {F1C}/{B7B} are cited',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={F1C: unique(F1C_FULL), B7B: unique(B7B_FULL)})
+
+    async def test_both_tokens_reach_the_tool_expanded(self) -> None:
+        """The reverse-document-order fold, observed rather than argued.
+
+        Applying the earlier span first would shift every later offset by the
+        length of the expansion, so the second replacement would land inside
+        the first one's new text. Both landing span-exact is the direct
+        evidence that did not happen.
+        """
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'both {F1C_FULL}/{B7B_FULL} are cited'
+
+    async def test_two_substitutions_are_reported_in_document_order(self) -> None:
+        """Applied in reverse, REPORTED in reading order — the consumer's order."""
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result)
+        assert repair is not None
+        assert [(s['from'], s['to']) for s in repair['substitutions']] == [
+            (F1C, F1C_FULL),
+            (B7B, B7B_FULL),
+        ]
+
+    async def test_one_fact_per_token(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert [(f['token'], f['candidate_ids']) for f in h.facts] == [
+            (F1C, [F1C_FULL]),
+            (B7B, [B7B_FULL]),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# B8 — the nested path, which is the shape the 4643 incident actually took.
+# ---------------------------------------------------------------------------
+
+
+class TestB8NestedPath:
+    CALL = {
+        'title': 'follow up on the cluster',
+        'description': 'nothing citable here',
+        'project_root': '/home/leo/src/reify',
+        'metadata': {'cluster_memory_ids': [BEC, SIBLING_FULL]},
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BEC: unique(BEC_FULL)})
+
+    async def test_the_tool_received_the_expanded_list_entry(self) -> None:
+        h = self.harness()
+        await h.call('submit_task', dict(self.CALL))
+        assert h.recorder.args['metadata']['cluster_memory_ids'][0] == BEC_FULL
+
+    async def test_the_sibling_full_uuid_is_untouched(self) -> None:
+        """A full uuid is never a token, so nothing may happen to one."""
+        h = self.harness()
+        await h.call('submit_task', dict(self.CALL))
+        assert h.recorder.args['metadata']['cluster_memory_ids'][1] == SIBLING_FULL
+
+    async def test_the_substitution_carries_the_structured_path(self) -> None:
+        """A list, not ``'metadata.cluster_memory_ids[0]'`` (heuristic 12).
+
+        An encoded path would need an ad-hoc parser at every consumer and
+        would be ambiguous the moment a key contains a dot or a bracket.
+        """
+        h = self.harness()
+        result = await h.call('submit_task', dict(self.CALL))
+        repair = repair_of(result)
+        assert repair is not None
+        assert repair['substitutions'] == [
+            {
+                'field': 'metadata',
+                'path': ['metadata', 'cluster_memory_ids', 0],
+                'from': BEC,
+                'to': BEC_FULL,
+                'namespace': 'mem0',
+            }
+        ]
+
+    async def test_the_fact_names_the_top_level_argument(self) -> None:
+        """``field`` stays the FLAT vocabulary the markup fact stream uses.
+
+        Both streams stay queryable the same way; ``path`` is what carries the
+        depth.
+        """
+        h = self.harness()
+        await h.call('submit_task', dict(self.CALL))
+        assert h.facts == [
+            expanded_fact(
+                tool='submit_task',
+                field='metadata',
+                token=BEC,
+                candidate_ids=[BEC_FULL],
+                agent_id=None,
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The `unique` row is the SAME cell for both tool classes.
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueIsIdenticalOnTheForwardOnAmbiguityClass:
+    """A tool's class changes what happens on AMBIGUITY, and nothing else.
+
+    Driven rather than inferred from the matrix, because the matrix says the
+    two cells are equal and this says the body honours that.
+    """
+
+    CALL = {
+        'task_id': '4643',
+        'project_root': '/home/leo/src/reify',
+        'description': f'supersedes {BFF}',
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(
+            answers={BFF: unique(BFF_FULL)},
+            forward_on_ambiguity_tools=frozenset({'update_task'}),
+        )
+
+    async def test_the_tool_received_the_expanded_value(self) -> None:
+        h = self.harness()
+        await h.call('update_task', dict(self.CALL))
+        assert h.recorder.args['description'] == f'supersedes {BFF_FULL}'
+
+    async def test_the_fact_is_an_expansion(self) -> None:
+        h = self.harness()
+        await h.call('update_task', dict(self.CALL))
+        assert [(f['tool'], f['outcome']) for f in h.facts] == [('update_task', 'expanded')]
+
+
+# ---------------------------------------------------------------------------
+# One id cited twice: resolved once, edited twice, reported twice.
+# ---------------------------------------------------------------------------
+
+
+class TestARepeatedCitationIsOneResolutionAndTwoEdits:
+    """The two vocabularies are per-DIFFERENT-things, and that is deliberate.
+
+    A resolution is per distinct token — the expensive part, a store walk. A
+    substitution and its fact are per OCCURRENCE, because they describe an
+    edit at a site, which is what an operator querying by ``field`` needs.
+    """
+
+    CALL = {
+        'content': f'{BFF} is the record; see {BFF} again',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL)})
+
+    async def test_the_store_is_walked_once(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.resolver.prefixes == [BFF]
+
+    async def test_both_occurrences_are_expanded(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'{BFF_FULL} is the record; see {BFF_FULL} again'
+
+    async def test_two_substitutions_and_two_facts(self) -> None:
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result)
+        assert repair is not None
+        assert len(repair['substitutions']) == 2
+        assert h.facts == [expanded_fact(), expanded_fact()]
+
+
+# ---------------------------------------------------------------------------
+# INV-4 — `expanded` is the designed success path and is NOT storm-counted.
+# ---------------------------------------------------------------------------
+
+
+class TestExpandedIsNeverStormCounted:
+    """Ten expansions inside one window, through ONE middleware instance.
+
+    At ~10% of 124 writes/day a counted success path would fire the 3/3600
+    thresholds continuously and be ignored, which is how a storm escape stops
+    being an escape. The clock is injected and never advanced, so all ten
+    events sit inside one window by construction rather than by being fast.
+    """
+
+    async def _ten_calls(self) -> Harness:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, time_provider=_Clock())
+        for index in range(10):
+            await h.call(
+                'add_memory',
+                {'content': f'{BFF} cited in call {index}', 'project_id': PROJECT},
+            )
+        return h
+
+    async def test_all_ten_calls_landed(self) -> None:
+        h = await self._ten_calls()
+        assert len(h.recorder.calls) == 10
+
+    async def test_no_storm_summary_ever_appears(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, time_provider=_Clock())
+        for index in range(10):
+            result = await h.call(
+                'add_memory',
+                {'content': f'{BFF} cited in call {index}', 'project_id': PROJECT},
+            )
+            repair = repair_of(result)
+            assert repair is not None
+            assert 'storm' not in repair
+
+    async def test_the_escalation_sink_received_nothing(self) -> None:
+        h = await self._ten_calls()
+        assert h.escalations == []
