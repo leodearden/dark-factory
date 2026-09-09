@@ -794,17 +794,9 @@ class TaskCurator:
         # a match here is re-verified against the live source tree on every
         # call (see recon_code_fix_premise_guard.verify_premise_refuted) —
         # only the YAML load itself is cached for the instance lifetime.
-        self._premise_registry: list | None = None
-        self._premise_registry_load_attempted: bool = False
-        # Guards the one-shot lazy load above. Needed because the load is
-        # offloaded via asyncio.to_thread: the await point means a concurrent
-        # caller could otherwise observe load_attempted=True with
-        # _premise_registry still None and silently fail the guard open. One
-        # TaskCurator instance is shared across projects while the
-        # interceptor's curator lock is per-project, so concurrent entry is
-        # reachable. asyncio.Lock() is loop-agnostic at construction on
-        # Python 3.13, so building it here in __init__ is safe.
-        self._premise_registry_load_lock = asyncio.Lock()
+        self._premise_registry = _LazyRegistry(
+            config_key='recon_code_fix_premise_registry_path', label='recon-premise',
+        )
         # Operational-ask registry (filing-policy gate) — lazy-loaded on first
         # curate() call, same shape as _blocklist above. A match routes the
         # candidate straight to a deterministic PURE-GATE instead of the LLM;
@@ -1166,32 +1158,27 @@ class TaskCurator:
         signature symmetry with ``_maybe_blocklist_drop`` and is unused here.
 
         Both blocking halves of this method run off the event-loop thread
-        (task 4201, 2026-08-29): the one-shot registry load and the
-        per-match live-source re-verification are each dispatched via
-        ``asyncio.to_thread``. The textual match (``match_candidate``) is
-        deliberately kept ON the loop — it is pure string work with no I/O,
-        so the common case of a non-matching candidate pays no thread-pool
-        dispatch. Measured on the shipped registry: registry load ~9.9ms
-        (8.15ms of it ``yaml.safe_load``, only 21us the ``read_text``);
-        worst per-match verification 1.2ms warm / 6.2ms cold on a 664 KB
-        cited file; thread-dispatch overhead ~67us. This resolves an
-        instance of INV-8 ``loop-thread-occupancy-bounded``
-        (docs/legibility/design-invariants.md), mirroring the offload
-        pattern already used by :meth:`_maybe_flag_unverified_claims` and
-        the claim-verification block in :meth:`curate_batch_prepared`.
+        (task 4201, 2026-08-29): the one-shot registry load (via the shared
+        :class:`_LazyRegistry`) and the per-match live-source re-verification
+        are each dispatched via ``asyncio.to_thread``. The textual match
+        (``match_candidate``) is deliberately kept ON the loop — it is pure
+        string work with no I/O, so the common case of a non-matching
+        candidate pays no thread-pool dispatch. Measured on the shipped
+        registry: registry load ~9.9ms (8.15ms of it ``yaml.safe_load``,
+        only 21us the ``read_text``); worst per-match verification 1.2ms
+        warm / 6.2ms cold on a 664 KB cited file; thread-dispatch overhead
+        ~67us. This resolves an instance of INV-8
+        ``loop-thread-occupancy-bounded`` (docs/legibility/design-invariants.md),
+        mirroring the offload pattern already used by
+        :meth:`_maybe_flag_unverified_claims` and the claim-verification
+        block in :meth:`curate_batch_prepared`.
 
-        This bounds the loop stall for THIS guard only. The two sibling
-        one-shot lazy loads invoked earlier in the same :meth:`curate` /
-        :meth:`curate_batch_prepared` sequence — :meth:`_maybe_blocklist_drop`
-        loading ``cancelled_premise_blocklist_path`` (2.2 KB) and
-        :meth:`_maybe_route_deterministic` loading
-        ``operational_ask_registry_path`` (6.7 KB, ~60% the size of this
-        guard's own 11 KB registry) — still run synchronously on the loop, so
-        the first-submission loop stall under the per-project curator write
-        lock is reduced by this change, not bounded by it. Left as-is here
-        (task 4201 scope); tracked as a follow-up to either extend the
-        offload to those two sites or fold all three into one shared
-        lazy-load helper so the idiom exists once.
+        All three curator guards — this one, :meth:`_maybe_blocklist_drop`,
+        and :meth:`_maybe_route_deterministic` — now share
+        :class:`_LazyRegistry` for their one-shot lazy loads (task 5007), so
+        the event-loop stall those loads can cause is bounded for the whole
+        :meth:`curate` / :meth:`curate_batch_prepared` first-submission
+        sequence, not just this guard.
 
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
@@ -1201,12 +1188,13 @@ class TaskCurator:
           this TaskCurator instance rather than retrying per call). This is
           deliberate even for a cause that is transient in principle (a
           partially-written file observed mid-deploy, a momentary worker
-          thread I/O error): the load's ``except Exception`` below does not
-          distinguish exception type, so any raise latches the same as a
-          permanently-malformed file, and a process restart is the recovery
-          path. Only ``asyncio.CancelledError`` is excluded from the latch
-          (see the comment on that except block) — every other exception is
-          treated as permanent by design, not oversight.
+          thread I/O error): :class:`_LazyRegistry.entries`'s
+          ``except Exception`` does not distinguish exception type, so any
+          raise latches the same as a permanently-malformed file, and a
+          process restart is the recovery path. Only
+          ``asyncio.CancelledError`` is excluded from the latch (see the
+          comment on that except block) — every other exception is treated
+          as permanent by design, not oversight.
         - The registry is empty.
         - No entry textually matches the candidate.
         - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
@@ -1236,58 +1224,9 @@ class TaskCurator:
             )
             return None
 
-        # Lazy load — run at most once per TaskCurator instance. Offloaded:
-        # measured 9.9ms for the shipped 11 KB registry, of which 8.15ms is
-        # pure-Python yaml.safe_load (not the 21us read_text) — the largest
-        # single event-loop stall in this method, paid on the first task
-        # submission per process while the per-project curator write lock is
-        # held.
-        #
-        # Double-checked lock: the await point inside the offloaded load
-        # means a concurrent second caller could otherwise observe
-        # load_attempted=True while self._premise_registry is still None and
-        # silently fail the guard open. The outer unlocked check keeps the
-        # steady-state path (every call after the first) lock-free; the
-        # inner re-check under the lock is what makes concurrent first calls
-        # correct. The flag is set only AFTER the assignment so nobody can
-        # observe the attempted-but-unassigned window.
-        if not self._premise_registry_load_attempted:
-            async with self._premise_registry_load_lock:
-                if not self._premise_registry_load_attempted:
-                    raw_path = Path(cfg_path)
-                    if not raw_path.is_absolute():
-                        raw_path = self._cwd / raw_path
-                    try:
-                        self._premise_registry = await asyncio.to_thread(
-                            load_premise_registry, raw_path,
-                        )
-                    except Exception as exc:
-                        # load_premise_registry documents "never raises" and,
-                        # since task 4483, actually honours it for the whole
-                        # read/parse path (FileNotFoundError, OSError,
-                        # UnicodeDecodeError, yaml.YAMLError all degrade to []).
-                        # This wrapper is still required: asyncio.to_thread is a
-                        # raise path of its own (thread-pool failure/shutdown)
-                        # that the guard module's internal excepts cannot cover.
-                        # Fail OPEN (guard disabled) rather than escaping into
-                        # curate()/curate_batch_prepared, which call this
-                        # unguarded — an escape fails the whole task submission.
-                        logger.warning(
-                            'task_curator: recon-premise registry load errored for %s, '
-                            'failing open (guard disabled): %s',
-                            raw_path, exc,
-                        )
-                        self._premise_registry = None
-                    # Settled outcome (loaded, or failed open) — latch the
-                    # one-shot contract. Deliberately NOT a `finally`:
-                    # asyncio.CancelledError is a BaseException, so it bypasses
-                    # the except above, and latching in a `finally` would
-                    # permanently disable the guard because an unrelated caller
-                    # was cancelled mid-load. Leaving the flag clear on
-                    # cancellation lets the next call retry.
-                    self._premise_registry_load_attempted = True
-
-        entries = self._premise_registry
+        entries = await self._premise_registry.entries(
+            load_premise_registry, cfg_path, self._cwd,
+        )
         if not entries:
             return None
 
