@@ -1681,3 +1681,187 @@ class TestTheOverrideIsFailClosed:
             {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': {'keep': 'this'}},
         )
         assert h.recorder.args['content'] == f'see {BFF_FULL}'
+
+
+# ---------------------------------------------------------------------------
+# project_for — the erratum-7 case, and the no_project arm.
+# ---------------------------------------------------------------------------
+#
+# C3's letter says every guarded tool declares `project_id`. It does not:
+# `update_task` and `submit_task` declare `project_root`, and D3 puts
+# `update_task` in the forward-on-ambiguity class — so a project_for written to
+# the PRD's letter goes silently inert on the ONE tool that ruling most depends
+# on. The shipped factory therefore reads `project_id` first and TRANSLATES a
+# `project_root` through the registry, which is the opposite precedence to
+# MarkupGuardMiddleware._identity: that one prefers the root because an
+# escalation queue is addressed by filesystem root, while the value here feeds
+# a resolver whose universe is keyed by project_id.
+
+REIFY_ROOT = '/home/leo/src/reify'
+DF_ROOT = '/home/leo/src/dark-factory'
+REGISTRY = {PROJECT: REIFY_ROOT, 'dark_factory': DF_ROOT}
+
+
+class TestProjectFromArgumentsResolvesAProjectId:
+    def test_a_project_id_argument_resolves_directly(self) -> None:
+        project_for = guard.project_from_arguments(REGISTRY)
+        assert project_for({'project_id': PROJECT, 'content': 'x'}) == PROJECT
+
+    def test_a_project_root_argument_is_inverted_through_the_registry(self) -> None:
+        """The erratum-7 translation: the root is not the resolver's vocabulary."""
+        project_for = guard.project_from_arguments(REGISTRY)
+        assert project_for({'project_root': REIFY_ROOT, 'task_id': '4643'}) == PROJECT
+
+    def test_project_id_is_read_first(self) -> None:
+        project_for = guard.project_from_arguments(REGISTRY)
+        arguments = {'project_id': PROJECT, 'project_root': DF_ROOT}
+        assert project_for(arguments) == PROJECT
+
+    def test_a_project_id_needs_no_registry_entry(self) -> None:
+        """It IS the resolver's vocabulary already — nothing to translate."""
+        assert guard.project_from_arguments({})({'project_id': PROJECT}) == PROJECT
+
+
+class TestProjectFromArgumentsNeverGuesses:
+    """An unresolvable identity yields None, never a default.
+
+    Mirrors ``fused_memory/server/markup_guard.py::_resolve_project_root``'s
+    refusal to accept a path the registry does not vouch for. A guessed project
+    would resolve a citation against ANOTHER project's ids — the one failure
+    mode worse than leaving the prefix alone.
+    """
+
+    @pytest.mark.parametrize(
+        'arguments',
+        [
+            pytest.param({'project_root': '/tmp/not-a-known-project'}, id='unknown-root'),
+            pytest.param({'project_root': ''}, id='empty-root'),
+            pytest.param({'project_id': ''}, id='empty-id'),
+            pytest.param({'project_id': 7}, id='non-string-id'),
+            pytest.param({'project_root': [REIFY_ROOT]}, id='non-string-root'),
+            pytest.param({'project_id': None, 'project_root': None}, id='both-null'),
+            pytest.param({'content': 'no identity argument at all'}, id='absent'),
+        ],
+    )
+    def test_none(self, arguments: dict[str, Any]) -> None:
+        assert guard.project_from_arguments(REGISTRY)(arguments) is None
+
+    def test_an_empty_registry_cannot_translate_a_root(self) -> None:
+        assert guard.project_from_arguments({})({'project_root': REIFY_ROOT}) is None
+
+    def test_a_root_is_matched_exactly(self) -> None:
+        """No prefix, suffix or normalisation games — exact membership only."""
+        project_for = guard.project_from_arguments(REGISTRY)
+        assert project_for({'project_root': REIFY_ROOT + '/'}) is None
+        assert project_for({'project_root': REIFY_ROOT + '/.worktrees/5322'}) is None
+
+
+class TestAMalformedRegistryRaisesAtBuildTime:
+    """Two ids on one root is a WIRING bug, caught on the first construction.
+
+    Deterministic and at startup, the ``StormCounter`` fire_mode precedent:
+    silently picking one of them would make the guard resolve a whole project's
+    citations against another project's ids, and nothing downstream could tell.
+    """
+
+    def test_a_duplicate_root_raises(self) -> None:
+        with pytest.raises(ValueError):
+            guard.project_from_arguments({'reify': REIFY_ROOT, 'reify_mirror': REIFY_ROOT})
+
+    def test_the_message_names_both_ids_and_the_root(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            guard.project_from_arguments({'reify': REIFY_ROOT, 'reify_mirror': REIFY_ROOT})
+        message = str(excinfo.value)
+        assert 'reify' in message
+        assert 'reify_mirror' in message
+        assert REIFY_ROOT in message
+
+
+class TestErratum7EndToEnd:
+    """The consequence at the boundary, not just in the factory.
+
+    ``update_task`` carries only ``project_root``. With the shipped factory it
+    resolves, reaches D3's forward-on-ambiguity arm and reports the ambiguity;
+    with a project_for written to C3's letter it would have found no project
+    and gone silently inert — which is exactly Leo's ruling failing closed
+    without anyone seeing it.
+    """
+
+    def harness(self) -> Harness:
+        return build_harness(
+            answers={AMB: AMBIGUOUS},
+            forward_on_ambiguity_tools=frozenset({'update_task'}),
+            project_for=guard.project_from_arguments(REGISTRY),
+        )
+
+    async def test_the_resolver_is_asked_about_the_project_ID(self) -> None:
+        h = self.harness()
+        await h.call('update_task', update_call(project_root=REIFY_ROOT))
+        assert h.resolver.calls == [(PROJECT, AMB)], (
+            'the resolver universe is one Mem0 collection and one graph '
+            'group_id, both keyed by project_id — a root would resolve nothing'
+        )
+
+    async def test_it_reaches_the_forward_on_ambiguity_arm(self) -> None:
+        h = self.harness()
+        result = await h.call('update_task', update_call(project_root=REIFY_ROOT))
+        repair = repair_of(result)
+        assert repair is not None
+        assert [a['token'] for a in repair['ambiguous']] == [AMB]
+        assert repair.get('resolver') is None
+
+    async def test_the_fact_is_attributed_to_the_project_id(self) -> None:
+        h = self.harness()
+        await h.call('update_task', update_call(project_root=REIFY_ROOT))
+        assert [(f['outcome'], f['project']) for f in h.facts] == [
+            ('forwarded_ambiguous', PROJECT)
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The no_project arm — visible, never inferred.
+# ---------------------------------------------------------------------------
+
+
+def no_project_harness() -> Harness:
+    """A registry that vouches for nothing the toy calls name."""
+    return build_harness(
+        answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS},
+        project_for=guard.project_from_arguments(REGISTRY),
+    )
+
+
+UNSCOPED_CALL = {'content': f'see {BFF}', 'agent_id': AGENT}
+
+
+class TestTheNoProjectArm:
+    async def test_the_tool_receives_its_arguments_unchanged(self) -> None:
+        h = no_project_harness()
+        await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert h.recorder.args['content'] == f'see {BFF}'
+
+    async def test_meta_says_so_rather_than_leaving_it_to_be_inferred(self) -> None:
+        """An absent meta block and an unscoped call are different answers."""
+        h = no_project_harness()
+        result = await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert repair_of(result) == {'resolver': 'no_project'}
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        h = no_project_harness()
+        await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert h.resolver.calls == [], (
+            'a prefix is only meaningful inside a project scope: with none '
+            'there is no universe to resolve against'
+        )
+
+    async def test_no_fact_and_no_escalation(self) -> None:
+        h = no_project_harness()
+        await h.call('add_memory', dict(UNSCOPED_CALL))
+        assert h.facts == []
+        assert h.escalations == []
+
+    async def test_an_unscoped_call_is_never_rejected(self) -> None:
+        """Nothing was resolved, so there is no ambiguity to refuse over."""
+        h = no_project_harness()
+        await h.call('add_memory', {'content': f'see {AMB}', 'agent_id': AGENT})
+        assert h.recorder.args['content'] == f'see {AMB}'
