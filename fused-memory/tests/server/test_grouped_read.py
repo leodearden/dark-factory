@@ -1705,3 +1705,238 @@ class TestPointIdParentIsVerified:
             'A canonical has no parent pointer to verify, so the point-id surface '
             f'must issue no extra read, got {service.get_memory_by_id.await_args_list!r}'
         )
+
+
+class TestDigestCarriesOriginProjectTag:
+    """task 4008: an amendment digest carries its child's ORIGIN-project tag.
+
+    A nested digest is agent-visible content: ``group_search_results`` hangs it
+    inside a KEPT parent entry at ``entry['grouped']['amendments']``, and the
+    orchestrator briefing renders that sub-object verbatim into a dispatched
+    agent's ``# Context`` block.  The briefing's cross-project safeguard
+    (``orchestrator/src/orchestrator/agents/briefing.py``:
+    ``filter_foreign_project_results``) reads a project tag off each entry's
+    ``metadata`` — so a digest that carries no ``metadata`` at all cannot be
+    classified, and the deliberate keep-untagged policy keeps every one of
+    them.  Emitting the tag here is what gives that safeguard a key to read.
+
+    The leak shape this addresses is the task-2273 CGL-eta rehome: a record
+    PHYSICALLY IN this project's collection whose ``src_project`` names a
+    different origin project.  A child living in another project's collection
+    cannot appear at all — ``_read_grouped_document`` scopes every child read
+    by ``project_id``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_tagged_child_digest_carries_its_origin_tag(self):
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
+                '2026-08-01T00:00:00+00:00', src_project='reify',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert entry.get('metadata') == {'src_project': 'reify'}, (
+            'A digest built from a child carrying src_project must carry that '
+            'origin tag, or the briefing filter has no key to read on it — '
+            f'got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_native_tagged_child_digest_carries_its_tag_too(self):
+        """The native case is tagged POSITIVELY, not left to keep-untagged."""
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a local correction',
+                '2026-08-01T00:00:00+00:00', project_id=_PROJECT_ID,
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert entry.get('metadata') == {'project_id': 'dark_factory'}, (
+            'A natively-tagged child must be classifiable as NATIVE rather than '
+            f'falling through to the keep-untagged default, got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_untagged_child_digest_emits_no_metadata_key_at_all(self):
+        """Omit-when-absent, as ``contested`` and ``truncated`` already do.
+
+        The overwhelmingly common corpus carries no origin tag, and an empty
+        ``metadata: {}`` on every digest would be pure wire cost for a key
+        that says nothing.
+        """
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'an untagged correction',
+                '2026-08-01T00:00:00+00:00',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert 'metadata' not in entry, (
+            'An untagged child must emit NO metadata key — never an empty dict '
+            f'— per the module\'s omit-when-absent convention, got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_projection_is_narrow_and_never_leaks_managed_keys(self):
+        """Only origin-tag keys ride along — not the body, not mem0's own keys.
+
+        No member of ``MEM0_MANAGED_METADATA_KEYS`` may appear in the emitted
+        projection: mem0's ``user_id`` scoping key in particular must never be
+        readable as an origin-project tag, or a native record could be
+        false-positive dropped by a filter that mistook it for one.
+        """
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a noisy rehomed correction',
+                '2026-08-01T00:00:00+00:00',
+                src_project='reify', hash='abc', user_id='dark_factory',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        emitted = block['amendments'][0].get('metadata')
+        assert emitted == {'src_project': 'reify'}, (
+            f'The projection must carry ONLY origin-project tags, got {emitted!r}'
+        )
+        for noise in ('data', 'hash', 'user_id', 'kind', 'parent_id'):
+            assert noise not in emitted, (
+                f'{noise!r} must not ride along in the origin-tag projection — '
+                f'got {emitted!r}'
+            )
+        assert not (MEM0_MANAGED_METADATA_KEYS & set(emitted)), (
+            "No mem0-managed key may be emitted as an origin tag (mem0's own "
+            f'user_id scoping key most of all), got {emitted!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_pre_existing_digest_fields_are_untouched(self):
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
+                '2026-08-01T00:00:00+00:00', src_project='reify',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert entry['id'] == _AMEND_1
+        assert entry['digest'] == 'a rehomed correction'
+        assert entry['created_at'] == '2026-08-01T00:00:00+00:00'
+        assert entry['kind'] == AMENDMENT_KIND
+
+
+class TestPinnedChildCarriesOriginProjectTag:
+    """task 4008: a PINNED matched child carries its origin-project tag too.
+
+    ``matched_children`` is where a swallowed child's FULL body lands — the
+    highest-value leak shape, since the briefing renders that body verbatim
+    into a dispatched agent's ``# Context`` block, attached to a canonical
+    that may itself be correctly tagged native.  Both branches of
+    :func:`_pin_matched_child` are covered: the ``pinned.append`` branch (a
+    matched sighting, or an amendment beyond the digest cap) and the in-place
+    digest-marking branch (the common in-cap amendment).
+    """
+
+    @staticmethod
+    def _canonical_hit(score: float = 0.9) -> MemoryResult:
+        return _result(_CANONICAL_ID, 'the canonical claim', score, metadata={'kind': 'canonical'})
+
+    @pytest.mark.asyncio
+    async def test_pinned_sighting_carries_its_origin_tag(self):
+        """(a) The append branch: a sighting is structurally unlistable as a digest."""
+        service = _stub_service([
+            _child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a routine addendum', '2026-08-01T00:00:00+00:00'),
+            _child(_SIGHT_1, _CANONICAL_ID, SIGHTING_KIND, 'a rehomed sighting', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [
+            self._canonical_hit(),
+            _child_result(_SIGHT_1, 0.8, kind=SIGHTING_KIND, src_project='reify'),
+        ]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        pinned = {e['id']: e for e in block.get('matched_children', [])}
+        assert _SIGHT_1 in pinned, (
+            f'PRECONDITION: the matched sighting must be pinned, got {block!r}'
+        )
+        entry = pinned[_SIGHT_1]
+        assert entry.get('metadata') == {'src_project': 'reify'}, (
+            'A pinned body is agent-visible content, so it must carry the origin '
+            f'tag a cross-project filter needs to classify it — got {entry!r}'
+        )
+        # ...and the pre-existing pinned-entry fields are unchanged.
+        assert entry['id'] == _SIGHT_1
+        assert entry['content'] == 'a correction'
+        assert entry['created_at'] is None
+        assert entry['kind'] == SIGHTING_KIND
+        assert entry['matched'] is True
+
+    @pytest.mark.asyncio
+    async def test_in_place_marking_does_not_clobber_the_digests_origin_tag(self):
+        """(b) The in-place branch: a full foreign body lands on a marked digest.
+
+        Regression guard, not new behaviour — ``_digest_entry`` already tagged
+        this entry from the raw Qdrant payload.  Marking it ``matched`` and
+        attaching the FULL body must not drop that tag, or the leakiest shape
+        of all (a complete foreign body hanging off a native canonical) would
+        go back to being unclassifiable.
+        """
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
+                '2026-08-01T00:00:00+00:00', src_project='reify',
+            ),
+            _child(_AMEND_2, _CANONICAL_ID, AMENDMENT_KIND, 'a local correction', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [self._canonical_hit(), _child_result(_AMEND_1, 0.8, src_project='reify')]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        by_id = {d['id']: d for d in block['amendments']}
+        assert 'matched_children' not in block, (
+            f'PRECONDITION: an in-cap amendment is marked in place, got {block!r}'
+        )
+        entry = by_id[_AMEND_1]
+        assert entry['matched'] is True
+        assert entry['content'] == 'a correction', (
+            f'PRECONDITION: the marked digest gains the FULL body, got {entry!r}'
+        )
+        assert entry.get('metadata') == {'src_project': 'reify'}, (
+            'In-place marking must not clobber the origin tag _digest_entry set '
+            f'— got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_untagged_pinned_child_emits_no_metadata_key(self):
+        """(c) Omit-when-absent holds on the pinned path too."""
+        service = _stub_service([
+            _child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a routine addendum', '2026-08-01T00:00:00+00:00'),
+            _child(_SIGHT_1, _CANONICAL_ID, SIGHTING_KIND, 'an untagged sighting', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [self._canonical_hit(), _child_result(_SIGHT_1, 0.8, kind=SIGHTING_KIND)]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        pinned = {e['id']: e for e in block.get('matched_children', [])}
+        assert _SIGHT_1 in pinned, f'PRECONDITION: the sighting must be pinned, got {block!r}'
+        assert 'metadata' not in pinned[_SIGHT_1], (
+            'An untagged pinned child must emit NO metadata key — never an empty '
+            f'dict, got {pinned[_SIGHT_1]!r}'
+        )
