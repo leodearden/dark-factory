@@ -446,17 +446,18 @@ def read_escalation_for_scan(
       caller, where the record would have been filtered out anyway -- an
       archived record is by definition no longer pending -- so warning would
       only train operators to ignore the channel.  For an ARCHIVE-INCLUDING
-      scan it is a deliberate residual, stated plainly rather than implied:
-      ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
-      record relocated root -> ``archive/<date>/`` inside that window is in
-      NEITHER listing and drops out of the result entirely, reported only at
-      DEBUG.  Such a caller (``server.py``'s ``get_task_escalations`` when its
-      caller passes no status, and ``orchestrator.workflow``'s unfiltered
-      ``get_by_task(self.task_id)`` sweeps) can therefore receive a listing
-      that is silently short by one.  Still strictly better than the
-      pre-change crash, and bounded by the race window -- but recovering the
-      record would take a second archive glob after the root pass, which is
-      tracked as a follow-up rather than smuggled in here.
+      scan, ``get_by_task`` globs the archive tier BEFORE the root read loop,
+      so a record relocated root -> ``archive/<date>/`` inside that window is
+      in NEITHER the snapshot taken for the archive tier NOR the still-live
+      root copy at read time.  Task 5118 closes that residual: such a caller
+      (``get_by_task`` with ``status != 'pending'`` -- e.g. ``server.py``'s
+      ``get_task_escalations`` when its caller passes no status, and
+      ``orchestrator.workflow``'s unfiltered ``get_by_task(self.task_id)``
+      sweeps) re-locates the id via a fresh ``_locate_path`` call and retries
+      the read once before giving up on it, so the listing recovers the
+      record instead of silently coming back short by one.  A
+      ``status='pending'`` caller does not get this recovery -- see above,
+      the record would be filtered out on status anyway.
     - ``'unreadable'`` -- any OTHER ``OSError``: EACCES, EIO, fd exhaustion.
       The file IS present and something is genuinely wrong.  Logged at
       WARNING, in wording deliberately disjoint from the parse channel's so
@@ -534,12 +535,17 @@ def read_escalation_for_scan(
     ``orchestrator.digest`` and ``fused_memory.reconciliation.harness``
     (``Exception``).
 
-    EXPLICITLY OUT OF SCOPE: ``EscalationQueue.get`` is ``_locate_path``-then-
-    read rather than glob-then-read.  Its blast radius is the single record
-    the caller asked about rather than a whole listing, and the semantically
-    correct repair is re-locate-and-retry -- the record MOVED, it did not
-    vanish -- which is a different shape from "skip and continue".  Tracked as
-    a follow-up.
+    NOT ROUTED THROUGH THIS HELPER: ``EscalationQueue.get`` is
+    ``_locate_path``-then-read rather than glob-then-read.  Its blast radius
+    is the single record the caller asked about rather than a whole listing,
+    and the semantically correct repair is re-locate-and-retry -- the record
+    MOVED, it did not vanish -- which is a different shape from "skip and
+    continue".  Task 5118 implements exactly that repair directly in
+    ``get()`` (a bare ``FileNotFoundError`` catch around its own
+    locate-then-read sequence, retried once via a fresh ``_locate_path``)
+    rather than by routing through this tri-state helper, which exists for
+    glob-then-read listings and would need a different return shape to fit
+    a single-record caller.
 
     DECODE FAULTS follow the caller's ``parse_errors``, by design and not by
     accident.  ``UnicodeDecodeError`` from ``read_text`` on a truncated or
@@ -870,15 +876,46 @@ class EscalationQueue:
         that same nonexistent id do not re-scan the archive, at the cost of
         a bounded staleness window that clears on this instance's next
         self-archival.
+
+        TOCTOU retry (task 5118): ``_locate_path`` and ``read_text`` are two
+        separate filesystem operations with no lock held across them, so the
+        archive sweep (or a concurrent ``resolve()``) can relocate the record
+        in between -- ``_locate_path`` can return a path that is gone by the
+        time it is read.  That is a MOVE, not a vanish, so a single retry
+        re-locates (a fresh ``_locate_path`` call, which finds the record at
+        its new location via the archive fallback/re-probe logic above) and
+        re-reads before concluding the id is genuinely absent, rather than
+        raising ``FileNotFoundError`` or silently returning ``None`` on the
+        first miss.  This is the per-record case ``read_escalation_for_scan``'s
+        docstring named "EXPLICITLY OUT OF SCOPE" for that helper (this
+        method's blast radius is one record, not a whole listing); it is
+        handled here instead, with the same re-locate-and-retry shape.
         """
-        path = self._locate_path(escalation_id)
-        if path is None:
-            return None
-        try:
-            return Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-            return None
+        for attempt in range(2):
+            path = self._locate_path(escalation_id)
+            if path is None:
+                return None
+            try:
+                text = path.read_text()
+            except FileNotFoundError:
+                if attempt == 0:
+                    logger.debug(
+                        f'get: {escalation_id} vanished between locate and read '
+                        '(likely concurrent archive-sweep relocation); '
+                        're-locating and retrying'
+                    )
+                    continue
+                logger.debug(
+                    f'get: {escalation_id} still missing after re-locate retry; '
+                    'treating as genuinely absent'
+                )
+                return None
+            try:
+                return Escalation.from_json(text)
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+        return None  # pragma: no cover - loop always returns within 2 attempts
 
     def get_by_task(
         self, task_id: str, status: str | None = None, level: int | None = None,
@@ -910,6 +947,32 @@ class EscalationQueue:
         filter.  Note: the pre-scan covers only the paths that are actually
         scanned — when ``status == 'pending'`` the archive is skipped entirely,
         so a cross-tier duplicate is invisible to the pre-scan in that mode.
+
+        Mid-scan relocation recovery (task 5118): the path list above is a
+        snapshot; nothing holds a lock while the read loop below runs it, so
+        the archive sweep can relocate a record between the snapshot and its
+        read.  ``read_escalation_for_scan`` reports that as ``'vanished'``
+        rather than raising.  For an archive-including scan (``status !=
+        'pending'``) that is recoverable — the record MOVED, it did not
+        vanish — so the read loop re-locates it via a fresh ``_locate_path``
+        call and retries the read once before dropping it, instead of
+        silently returning a listing that is short by one.  For
+        ``status == 'pending'`` no recovery is attempted: the archive is
+        skipped by design there, and a record relocated out of the root is by
+        definition no longer pending, so recovering it would only add
+        archive I/O to the fast path for a record the filter would discard
+        anyway.
+
+        Recovery is further gated to a ``'vanished'`` path whose parent is
+        the queue ROOT (the same root/archive tier test the pre-scan above
+        already makes).  An archive-tier path going ``'vanished'`` is
+        overwhelmingly ``archive.prune_archive`` rmtree-ing its whole dated
+        subdir wholesale — a genuine deletion recovery cannot help with, not
+        the root -> archive move this recovery targets — and re-locating it
+        anyway would cost a full targeted archive rglob (the archive is
+        shared across every project) plus a negative-cache write for an id
+        that is genuinely gone.  This deliberately leaves a second,
+        archive-to-archive relocation (e.g. a re-date) unrecovered.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
@@ -952,6 +1015,35 @@ class EscalationQueue:
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
             # distinguishable from a genuinely faulty file (WARNING).
             esc, reason = read_escalation_for_scan(path, context='queue.get_by_task')
+            if reason == 'vanished' and status != 'pending' and path.parent == self.queue_dir:
+                # Task 5118 (follow-up to task 5111's amendment 8): for an
+                # archive-including scan, a record relocated root -> archive
+                # inside this window landed in NEITHER the pre-scan archive
+                # glob above nor this still-a-hit read, so it would otherwise
+                # drop out of the listing silently.  It MOVED, it did not
+                # vanish -- re-locate it fresh and retry the read once before
+                # giving up on it.
+                #
+                # Gated to the ROOT tier (path.parent == self.queue_dir), the
+                # same root/archive test the pre-scan above already uses.
+                # An ARCHIVE-tier path going 'vanished' is overwhelmingly
+                # archive.prune_archive rmtree-ing its whole dated subdir --
+                # a genuine deletion this recovery cannot help with, not the
+                # root -> archive move it targets. Recovering it anyway would
+                # cost a full targeted rglob (archive.py's archive is shared
+                # across every project) plus a negative-cache write for an id
+                # that is genuinely gone. This deliberately leaves a second,
+                # archive-to-archive relocation (e.g. a re-date) unrecovered.
+                relocated = self._locate_path(path.stem)
+                if relocated is not None:
+                    esc, reason = read_escalation_for_scan(
+                        relocated, context='queue.get_by_task (re-glob after vanish)',
+                    )
+                    if reason == 'ok' and esc is not None:
+                        logger.debug(
+                            f'get_by_task: recovered {path.stem!r} via re-glob after '
+                            f'mid-scan relocation from {path} to {relocated}'
+                        )
             # esc is None iff reason != 'ok'; the second clause narrows the
             # type without relying on an assert (stripped under -O).
             if reason != 'ok' or esc is None:
