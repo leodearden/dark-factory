@@ -13,8 +13,18 @@ parse contract therefore opens item 1 while the attach still lands on the
 band's top-1 — the very harm item 1 describes, still live.
 
 This probe closes that gap by EXECUTING ``triage_write`` with an injected fake
-judge and asking whether the id the judge designated is the id the returned
-``BandDecision`` attaches to.
+judge and asking whether the attach id is determined by the candidate the judge
+reasoned about.
+
+TWO BRANCHES, BECAUSE TWO REMEDIES ARE OPEN. Under option (a) the JUDGE names
+its candidate back and the write honours it; under option (b) the CALLER picks
+the attach target and tells the judge which candidate it is reasoning about, so
+the judge names nothing back and no judge-side designation exists to track.
+Both satisfy the invariant, and the probe PASSes on either — what is asserted
+is the invariant, not which remedy landed. Requiring the judge-side branch
+alone would fail a correct option (b) and re-block task 3169, which is the
+false-FAIL class this gate family was rewritten to remove. Item 1 is structured
+the same way and for the same reason.
 
 WHY THE JUDGE SEAM. ``triage_write(..., judge=...)`` is a real injection point
 the module's own contract tests already use, and ``memory_service`` is
@@ -88,6 +98,22 @@ _ATTACH_OUTCOME = 'restated'
 
 _PASS_MARKER = 'PASS  the judge-bound candidate is CONSUMED by the attach'
 _FAIL_MARKER = 'FAIL  the judge-bound candidate is NOT CONSUMED by the attach'
+
+_ANNOUNCED_BRANCH = 'announced-target branch'
+_ANNOUNCEMENT_IGNORED = 'the attach did not land on the announced target'
+
+#: The kwargs main ALREADY hands the judge. An announcement read out of any of
+#: these is one main already makes -- `decision.canonical_id` is precisely the
+#: id main already attaches to -- so admitting them would let the branch hold
+#: on a codebase where nothing changed at all. Excluding them is what makes the
+#: branch evidence rather than decoration.
+_JUDGE_KWARGS = frozenset({
+    'memory_service',
+    'content',
+    'project_id',
+    'decision',
+    'candidates',
+})
 
 
 class _Unverifiable(Exception):
@@ -483,6 +509,64 @@ def _swap_verdict(
     return None
 
 
+def _announced_ids(
+    call: dict[str, Any],
+    eligible: list[str],
+) -> list[tuple[str, str]]:
+    """Slate candidates the module NAMED to the judge, as ``(kwarg, id)`` pairs.
+
+    An announcement counts only when it is BOTH beyond :data:`_JUDGE_KWARGS`
+    and drawn from *eligible* — the ids that are distinguishable from the
+    band's own canonical, the same set the swap draws its designations from and
+    for the same reason. Announcing the id main already attaches to says
+    nothing about whether the announcement was honoured.
+
+    A candidate may be named as its id or as the object itself; both are read,
+    because which one a remedy would pass is a mechanism this probe may not pin.
+    """
+    found = []
+    for name, value in call.items():
+        if name in _JUDGE_KWARGS:
+            continue
+        ident = value if isinstance(value, str) else getattr(value, 'id', None)
+        if isinstance(ident, str) and ident in eligible:
+            found.append((name, ident))
+    return found
+
+
+def _announced_target_branch(
+    run: _Run,
+    eligible: list[str],
+) -> tuple[bool, str]:
+    """Did the attach land on a candidate the module itself announced?
+
+    Returns ``(satisfied, report line)``. The line is emitted whether or not
+    the branch holds, so a reader can see the branch was EVALUATED rather than
+    skipped — the non-vacuity of "main does not satisfy it" is only legible if
+    main's run says so out loud.
+    """
+    announced = _announced_ids(run.calls[0], eligible)
+    observed = getattr(run.decision, 'canonical_id', None)
+    if not announced:
+        return False, (
+            f'{_ANNOUNCED_BRANCH}: the judge was told no slate candidate beyond '
+            f'{sorted(_JUDGE_KWARGS)}, so nothing was announced for the attach '
+            'to honour'
+        )
+    honoured = [name for name, ident in announced if ident == observed]
+    if honoured:
+        return True, (
+            f'{_ANNOUNCED_BRANCH}: satisfied — triage_write announced '
+            f'{observed!r} to the judge via {honoured[0]!r}, and the attach '
+            'landed there'
+        )
+    return False, (
+        f'{_ANNOUNCED_BRANCH}: triage_write announced '
+        f'{_first_few([f"{name}={ident!r}" for name, ident in announced])}, but '
+        f'the attach landed on {observed!r} — {_ANNOUNCEMENT_IGNORED}'
+    )
+
+
 def _search_spellings(
     module: Any,
     designations: tuple[str, str],
@@ -510,11 +594,22 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     module = _import_triage(src_root, extra_paths)
     out.append(f'triage module: {getattr(module, "__file__", "<unknown>")}')
 
-    _, slate_ids, band_canonical = _measure(module)
+    measured, slate_ids, band_canonical = _measure(module)
     out.append(
         f'slate: {slate_ids!r} — band canonical {band_canonical!r}',
     )
     usable = _designated_ids(slate_ids, band_canonical)
+
+    # The option-(b) branch first: it is decided by the run already measured,
+    # and a module that satisfies it has no judge-side designation for the swap
+    # to find, so searching for one would only spend the report on four
+    # spellings none of which could ever have held.
+    announced, announced_line = _announced_target_branch(measured, usable)
+    out.append(announced_line)
+    if announced:
+        out.append(_PASS_MARKER)
+        return EXIT_OK
+
     if len(usable) < 2:
         # UNVERIFIABLE, never PASS. With fewer than two candidates that are
         # distinguishable from the band's own canonical there is nothing here
