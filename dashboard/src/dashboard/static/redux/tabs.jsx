@@ -21,6 +21,7 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 // asserted served-200 and asserted to load before this file.
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
+const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
@@ -723,9 +724,10 @@ function ReconTab({ projectFilter, search }) {
             lastFullIso = ts; lastFullProject = pid;
           }
         }
-        const totalRuns = r.runs.length;
-        const successCount = r.runs.filter(x => x.status === 'success').length;
-        const successPct = totalRuns ? Math.round(successCount / totalRuns * 100) : null;
+        // ONE derivation for every tile below — recon_status.js owns the
+        // vocabulary, so no two tiles can disagree about the same window.
+        const counts = reconRunCounts(r.runs);
+        const successPct = reconSuccessPct(counts);
         // Sparkline of recent run durations (oldest first).
         const durSpark = r.runs
           .filter(x => x.duration_seconds != null)
@@ -749,7 +751,8 @@ function ReconTab({ projectFilter, search }) {
             <ST label="Run success rate"
                 value={successPct != null ? successPct : '—'}
                 unit={successPct != null ? '%' : ''}
-                hint={`${totalRuns} runs · last ${durSpark.length} durations`}
+                hint={`${counts.terminal} finished · ${counts.inFlight} in flight`
+                  + (counts.unknown ? ` · ${counts.unknown} unknown status` : '')}
                 spark={durSpark} sparkColor={CP.ok} />
           </div>
         );

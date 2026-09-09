@@ -248,24 +248,46 @@ class TestReconSuccessRateWiring:
         )
 
     def test_success_rate_tile_value_comes_from_recon_success_pct(self, recon_tab_code):
-        """The rate is computed by the module the node suite covers."""
+        """The rate the tile renders must be the module's, traced in two hops.
+
+        The tile reads a local, and that local is bound to reconSuccessPct —
+        deliberately not inlined into the tile, because `value` and `unit`
+        both branch on it and inlining would call it twice. Asserting the two
+        hops separately pins the provenance without dictating which of the
+        two spellings the component uses.
+        """
         tile = _extract_stat_tile(recon_tab_code, 'Run success rate')
-        assert 'reconSuccessPct(' in tile, (
-            f'the Run success rate tile does not call reconSuccessPct(...): '
-            f'{tile!r}'
+
+        bound = re.search(
+            r'const\s+(\w+)\s*=\s*reconSuccessPct\s*\(\s*counts\s*\)', recon_tab_code
+        )
+        assert bound is not None, (
+            'ReconTab does not bind reconSuccessPct(counts) — the rate must '
+            'come from the module the node suite covers, computed over the '
+            'same counts object every other tile reads.'
+        )
+        assert re.search(r'value=\{[^}]*\b' + bound.group(1) + r'\b', tile), (
+            f'the Run success rate tile does not render {bound.group(1)!r}, the '
+            f'local bound to reconSuccessPct(counts): {tile!r}'
         )
 
-    def test_success_literal_is_gone_from_recon_tab(self, recon_tab_code):
-        """The literal that pinned the tile at 0% must be absent.
+    def test_tile_no_longer_filters_for_the_success_status(self, recon_tab_code):
+        """The filter that pinned the tile at 0% must be gone.
 
         Absence rather than bypass: the journal has never written 'success',
-        so any surviving comparison against it is dead code that reads as
-        though the status were handled.
+        so a surviving comparison against it is dead code that reads as though
+        the status were handled. The BROADER rule — that no run-status literal
+        at all survives anywhere in ReconTab — is asserted by
+        TestReconStatusLiteralsAreGone once the Recent Runs badge (the third
+        and last call site) is converted too.
         """
-        assert "x.status === 'success'" not in recon_tab_code
-        assert "'success'" not in recon_tab_code, (
-            "ReconTab still contains the literal 'success' — the "
-            'reconciliation journal writes "completed", never "success".'
+        assert "x.status === 'success'" not in recon_tab_code, (
+            "ReconTab still filters r.runs for x.status === 'success', which "
+            'is always zero: the reconciliation journal writes "completed".'
+        )
+        assert 'successCount' not in recon_tab_code, (
+            'ReconTab still computes `successCount` by hand — the success '
+            'tally belongs to reconRunCounts.'
         )
 
     def test_rate_denominator_is_terminal_runs_not_the_whole_window(
