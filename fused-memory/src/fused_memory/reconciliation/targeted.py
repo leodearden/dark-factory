@@ -1451,6 +1451,17 @@ class TargetedReconciler:
                 'sweep: block (metadata) failed for descendant %s (parent %s): %s',
                 task_id, parent_id, e,
             )
+            action['metadata_stamp'] = 'failed'
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'update_task',
+                {
+                    'task_id': task_id,
+                    'parent_id': parent_id,
+                    'type': 'block_metadata_stamp',
+                    'error': str(e)[:200],
+                },
+                causation_id=run_id,
+            )
         return action
 
     def _sweep_escalate_l1(
