@@ -567,6 +567,83 @@ triage_write = _make_announcing_triage_write(_attach_band_canonical)
 """
 
 
+#: THE UNUSABLE REFS. Each is a way the probe can be pointed at a tree it
+#: cannot decide the invariant on, and every one of them must land on
+#: UNVERIFIABLE rather than on a verdict — an unverifiable invariant is not a
+#: satisfied one, and this gate authorises a production flag flip.
+_RAISES_ON_CALL = r"""
+
+async def triage_write(memory_service, *, content, project_id, counter,
+                       judge=None, allow_near_duplicate=False,
+                       caller_owns_attach_keys=False):
+    raise RuntimeError('triage_write is not usable in this ref')
+"""
+
+
+#: SystemExit is NOT an Exception, so an `except Exception` around the import
+#: does not catch it: it propagates through the probe and out of the
+#: interpreter, which exits 0 having printed nothing — and a gate that greps
+#: for a FAIL marker reads silence as a PASS. This is a measured escape, not a
+#: hypothetical one; the item-1 probe once exited 0 this way.
+_EXITS_DURING_IMPORT = r"""
+
+raise SystemExit(0)
+
+
+async def triage_write(memory_service, *, content, project_id, counter,
+                       judge=None, allow_near_duplicate=False,
+                       caller_owns_attach_keys=False):
+    return BandDecision(OUTCOME_STORED, None, None, None, None)
+"""
+
+
+#: A plain `def`: calling it returns a BandDecision rather than something to
+#: await, so nothing the probe measures came from executing the write path.
+_NOT_AWAITABLE = r"""
+
+def triage_write(memory_service, *, content, project_id, counter,
+                 judge=None, allow_near_duplicate=False,
+                 caller_owns_attach_keys=False):
+    return BandDecision(OUTCOME_RESTATED, 'm0', 0.6, None, None)
+"""
+
+
+#: Reaches the judge — so the probe's "was the judge slot reached?" check
+#: passes — and then returns something with no `canonical_id` at all. Every
+#: attach id the probe would read is then None, which is neither the band's
+#: top-1 nor a designation: a probe that only compared ids would report NOT
+#: CONSUMED and send an operator to fix a consumption defect that this run
+#: never measured.
+_RETURNS_NON_DECISION = r"""
+
+async def triage_write(memory_service, *, content, project_id, counter,
+                       judge=None, allow_near_duplicate=False,
+                       caller_owns_attach_keys=False):
+    decision, candidates = await _band_and_candidates(
+        memory_service, content, project_id, counter,
+    )
+    if decision.outcome == OUTCOME_JUDGE:
+        await (judge or _stub_judge)(
+            memory_service=memory_service,
+            content=content,
+            project_id=project_id,
+            decision=decision,
+            candidates=candidates,
+        )
+    return OUTCOME_RESTATED
+"""
+
+
+#: A ref that CONSUMES the designation but whose fail-open counter class is
+#: gone. The invariant is still decidable — the probe falls back to a counting
+#: stand-in — so this must PASS, and must say out loud that it measured
+#: fail-opens with a stand-in rather than with the ref's own accounting.
+_COUNTER_CLASS_MISSING = _CONSUMES_TUPLE + r"""
+
+del TriageFailOpenCounter
+"""
+
+
 #: variant name -> the ``triage_write`` that defines it. Appended to
 #: :data:`TRIAGE_PREAMBLE` by :func:`write_fake_triage`.
 VARIANT_TAILS: dict[str, str] = {
@@ -578,6 +655,11 @@ VARIANT_TAILS: dict[str, str] = {
     'fail_opens_on_designation': _FAIL_OPENS_ON_DESIGNATION,
     'announces_attach_target': _ANNOUNCES_TARGET,
     'announces_but_attaches_elsewhere': _ANNOUNCES_BUT_ATTACHES_ELSEWHERE,
+    'raises_on_triage_write': _RAISES_ON_CALL,
+    'exits_during_import': _EXITS_DURING_IMPORT,
+    'not_awaitable': _NOT_AWAITABLE,
+    'returns_non_decision': _RETURNS_NON_DECISION,
+    'counter_class_missing': _COUNTER_CLASS_MISSING,
 }
 
 

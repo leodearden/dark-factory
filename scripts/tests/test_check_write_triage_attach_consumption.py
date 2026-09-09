@@ -86,6 +86,33 @@ _DESIGNATING_VARIANTS = (
     'consumes_designated_object',
 )
 
+#: Emitted on the PASS path only — the run that authorises a production flag
+#: flip — and saying what the PASS does NOT cover: the probe stops at
+#: BandDecision.canonical_id and never executes tools.py::add_memory's stamp.
+_SCOPE_NOTE = 'NOTE this gate asserts at BandDecision.canonical_id'
+#: The probe's own degraded-measurement records. They go on STDOUT (the gate
+#: drops stderr) and LAST (a tail-truncated report keeps its end).
+_WARN = 'WARN'
+
+#: Every way the probe can be pointed at a tree it cannot decide the invariant
+#: on. Each must land on UNVERIFIABLE, never on a verdict and never on silence.
+_UNVERIFIABLE_VARIANTS = (
+    # No importable module at all.
+    'missing',
+    # Importable, but the write path cannot be executed.
+    'raises_on_triage_write',
+    # SystemExit is not an Exception; unguarded it exits the interpreter 0
+    # having printed nothing, and a gate grepping for a marker reads that as a
+    # PASS. Measured, not hypothetical.
+    'exits_during_import',
+    # Calling it returns a BandDecision rather than something to await, so
+    # nothing measured came from executing the write path.
+    'not_awaitable',
+    # Reaches the judge and then returns a shape with no canonical_id, so every
+    # attach id read is None — which is not the band top-1 either.
+    'returns_non_decision',
+)
+
 #: The hoisted parent the probe's own fixture slate makes the band pick. It
 #: belongs to NO candidate in the slate — that is what separates "the attach
 #: followed the designation" from "the attach used the band's winner" — so the
@@ -273,3 +300,77 @@ class TestConsumptionProbe:
         assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
         assert _PASS not in proc.stdout, proc.stdout
         assert _ANNOUNCEMENT_IGNORED in proc.stdout, proc.stdout
+
+
+class TestFailsClosed:
+    """An unverifiable invariant is not a satisfied one.
+
+    Item 5's PASS authorises flipping `write_triage.enabled` in production, so
+    every way of not knowing has to be reported as not knowing. The failure
+    mode that matters most is not a wrong verdict but SILENCE: the gate greps
+    stdout for a marker, so a probe that dies without printing is read as
+    whatever the shell's exit code says.
+    """
+
+    @pytest.mark.parametrize('variant', _UNVERIFIABLE_VARIANTS)
+    def test_an_undecidable_ref_is_unverifiable_never_a_pass(self, tmp_path, variant):
+        src_root = write_fake_triage(tmp_path / 'src', variant=variant)
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+        assert _PASS not in proc.stdout, proc.stdout
+
+    def test_a_sibling_root_that_merely_extends_the_name_is_not_inside_it(
+        self, tmp_path,
+    ):
+        """Containment is decided on PATH COMPONENTS, not on characters.
+
+        `str(origin).startswith(str(src_root))` also accepts `<root>-installed`,
+        so the probe would report on a module the ref never shipped — and the
+        gate would attribute the verdict to the ref it named. The extra path is
+        the realistic route in: the gate passes one for the ref's `shared/src`.
+        """
+        src_root = write_fake_triage(tmp_path / 'src', variant='missing')
+        sibling = write_fake_triage(
+            tmp_path / 'src-installed', variant='consumes_designated_id',
+        )
+        proc = _run_probe(src_root, extra_paths=(sibling,))
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+        assert _PASS not in proc.stdout, proc.stdout
+
+    def test_a_pass_carries_the_scope_note(self, tmp_path):
+        """What the PASS does not cover, said on the run that acts on it.
+
+        The probe stops at `BandDecision.canonical_id` — the value
+        tools.py::add_memory consumes verbatim as `attached_to` — and does not
+        execute the stamp, so a future edit to that function's target selection
+        would pass this gate. An operator about to flip the flag is entitled to
+        read that from the report rather than from the plan.
+
+        On the PASS path only: a FAIL's report window belongs to the remedy.
+        """
+        src_root = write_fake_triage(
+            tmp_path / 'src', variant='consumes_designated_id',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _SCOPE_NOTE in proc.stdout, proc.stdout
+
+    def test_a_degraded_measurement_warns_on_stdout_and_last(self, tmp_path):
+        """A ref whose fail-open counter is gone is still decidable — loudly.
+
+        The probe falls back to a counting stand-in, so the invariant is still
+        measured and this ref PASSes. But what it measured is no longer the
+        ref's own accounting, and that has to reach the operator: on STDOUT
+        because the gate drops stderr, and LAST because a report read through a
+        tail keeps its end.
+        """
+        src_root = write_fake_triage(
+            tmp_path / 'src', variant='counter_class_missing',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS in proc.stdout, proc.stdout
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        assert _WARN in lines[-1], proc.stdout
