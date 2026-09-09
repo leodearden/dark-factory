@@ -1198,7 +1198,14 @@ def run_healthcheck(
                 detail=result.detail,
                 latency_ms=result.latency_ms,
                 measured_at=measured_at,
-                arm_footprint_mib=budget.arm_footprint_mib,
+                # `ArmRow.arm_footprint_mib` is the ONLY place an arm's own
+                # footprint survives the merge, which keeps one vram block for
+                # the whole slate.  An arm that never loaded took 0 -- a
+                # theorem gated on `is_placeholder`, not a fallback default --
+                # and the block's measured value belongs to a different arm
+                # entirely, so charging it here would put "this TBD arm took
+                # 4050 MiB" in the artifact with nothing to discount it by.
+                arm_footprint_mib=0 if arm.is_placeholder else budget.arm_footprint_mib,
                 reasoning=arm.reasoning,
                 top_level_entities_named=result.top_level_entities_named,
             )
