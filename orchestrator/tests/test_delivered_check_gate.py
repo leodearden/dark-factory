@@ -428,6 +428,209 @@ class TestRunnerPathKind:
 
 
 # ---------------------------------------------------------------------------
+# TestRunnerPathKindFailSafe (task 4743 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerPathKindFailSafe:
+    """The kind='path' ERRORED boundary — where an unresolvable check lands.
+
+    Separated from TestRunnerPathKind because the boundary is the part most
+    easily got wrong: `ls-tree` prints nothing on a MISSING path AND
+    nothing on a git error, so an implementation that only inspected stdout
+    would silently collapse "genuinely absent" (FAILED, a definitive answer
+    a caller can act on) into the same bucket as "could not be evaluated"
+    (ERRORED, a fail-safe wait). Only rc separates them.
+    """
+
+    def _scripted_runner(self, responses: list[tuple[int, str]]):
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            rc, out = responses[len(calls) - 1]
+            return (rc, out, '')
+
+        return _runner, calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'expect', [pytest.param('present', id='present'), pytest.param('absent', id='absent')]
+    )
+    async def test_bad_ref_is_errored_not_failed(self, expect):
+        """A bad ref exits 128 with empty stdout — measured. Empty stdout
+        alone would read as "does not exist"; only rc distinguishes it."""
+        runner, _calls = self._scripted_runner([(128, '')])
+        check = {'name': 'cap', 'kind': 'path', 'expect': expect, 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_pathspec_outside_repository_is_errored(self):
+        """`git ls-tree ... -- /etc/passwd` exits 128 ("outside repository")
+        — measured. The schema validator refuses such a descriptor at
+        authoring time; this is the runner's defense in depth."""
+        runner, _calls = self._scripted_runner([(128, '')])
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_git_error_short_circuits_remaining_paths(self):
+        runner, calls = self._scripted_runner([(0, 'a/one.py\n'), (128, ''), (0, 'c/three.py\n')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.ERRORED
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py']
+
+    @pytest.mark.asyncio
+    async def test_runner_raising_oserror_is_errored(self):
+        called = False
+
+        async def _runner(argv, **kwargs):
+            nonlocal called
+            called = True
+            raise OSError('git not on PATH')
+
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=_runner)
+
+        assert called, 'the injected runner must actually be invoked'
+        assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_runner_raising_timeout_is_errored(self):
+        called = False
+
+        async def _runner(argv, **kwargs):
+            nonlocal called
+            called = True
+            raise TimeoutError('simulated timeout')
+
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=_runner)
+
+        assert called, 'the injected runner must actually be invoked'
+        assert result is DeliveredCheckResult.ERRORED
+
+
+class TestVerifyOnMainWithPathKind:
+    """A path check participates in verify_delivered_checks_on_main's collapse.
+
+    The aggregate precedence (all_delivered > failed > errored) is
+    kind-agnostic, so these tests are what confirm no path-specific wiring
+    was needed there — and that verdict.failed_check carries the PATH
+    descriptor rather than some other check's.
+    """
+
+    def _runner_for(self, by_path: dict[str, tuple[int, str]]):
+        """Answer per requested pathspec (argv's last element), so several
+        checks can be evaluated concurrently and still be distinguished."""
+
+        async def _runner(argv, **kwargs):
+            if 'ls-tree' in argv:
+                rc, out = by_path[argv[-1]]
+                return (rc, out, '')
+            # grep kind: rc 0 == match
+            return (0, '', '')
+
+        return _runner
+
+    @pytest.mark.asyncio
+    async def test_path_check_delivered_collapses_to_all_delivered(self):
+        checks = [
+            {'name': 'cap-path', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+        ]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/one.py': (0, 'a/one.py\n')}),
+        )
+
+        assert verdict.outcome == 'all_delivered'
+        assert verdict.main_sha == 'abc123'
+
+    @pytest.mark.asyncio
+    async def test_failed_path_check_is_carried_as_failed_check(self):
+        path_check = {
+            'name': 'cap-path',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/missing.py'],
+        }
+        checks = [{'name': 'cap-grep', 'kind': 'grep', 'pattern': 'x', 'expect': 'present'}, path_check]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/missing.py': (0, '')}),
+        )
+
+        assert verdict.outcome == 'failed'
+        assert verdict.failed_check == path_check
+
+    @pytest.mark.asyncio
+    async def test_errored_path_check_alone_collapses_to_errored(self):
+        checks = [
+            {'name': 'cap-path', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+        ]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/one.py': (128, '')}),
+        )
+
+        assert verdict.outcome == 'errored'
+
+    @pytest.mark.asyncio
+    async def test_failed_path_check_outranks_an_errored_sibling(self):
+        """FAILED > ERRORED: a definitive absence drives the clean recovery
+        and must not be masked into a fail-safe no-op."""
+        failing = {
+            'name': 'cap-missing',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/missing.py'],
+        }
+        checks = [
+            {'name': 'cap-broken', 'kind': 'path', 'expect': 'present', 'paths': ['a/broken.py']},
+            failing,
+        ]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/broken.py': (128, ''), 'a/missing.py': (0, '')}),
+        )
+
+        assert verdict.outcome == 'failed'
+        assert verdict.failed_check == failing
+
+
+# ---------------------------------------------------------------------------
 # TestDepsSatisfiedDeliveredGate (task 2580 — step-5 RED / step-6 GREEN)
 # ---------------------------------------------------------------------------
 
