@@ -1593,6 +1593,38 @@ class TestBuildDeliveredCheckEscalation:
         assert 'pattern' not in detail, 'script-kind detail must not mention pattern'
         assert 'set task 11 back to pending' in detail
 
+    def test_path_kind_detail_names_paths_and_expect_not_pattern(self):
+        """A path descriptor has no ``pattern``; the binary that used to
+        render this body emitted a bare ``pattern: None`` line into a
+        born-at-L2 escalation that routes straight to a human. A gate that
+        fails and then misdescribes itself to the human it paged is the
+        costliest form of mis-handling a new kind."""
+        check = {
+            'name': 'cap-three',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['orchestrator/tests/test_workflow_merge_gating_strand.py'],
+        }
+
+        summary, detail = _build_delivered_check_escalation(
+            task_id='11',
+            dep_id='21',
+            dep_status='done',
+            check=check,
+            main_sha='0123456789abcdef',
+        )
+
+        assert summary == (
+            "DEP_CAPABILITY_NOT_DELIVERED: task 11 — dep 21 done but check "
+            "'cap-three' fails on main@0123456789ab"
+        ), f'unexpected summary: {summary!r}'
+        assert 'kind=path' in detail
+        assert 'orchestrator/tests/test_workflow_merge_gating_strand.py' in detail
+        assert 'expect: present' in detail
+        assert 'FAILED' in detail
+        assert 'pattern' not in detail, 'path-kind detail must not mention pattern'
+        assert 'script' not in detail, 'path-kind detail must not mention script'
+
 
 # ---------------------------------------------------------------------------
 # TestNoteDeliveredHold (task 2580 — step-11 RED / step-12 GREEN)
@@ -3497,6 +3529,11 @@ class TestGateMarkDoneOnDeliveredChecks:
     ) -> dict:
         return {'name': name, 'kind': 'script', 'script': script, 'timeout_secs': 5.0}
 
+    def _path_check(
+        self, name: str = 'cap-p', path: str = 'orchestrator/tests/test_x.py'
+    ) -> dict:
+        return {'name': name, 'kind': 'path', 'expect': 'present', 'paths': [path]}
+
     def _meta(self, checks: list[dict] | None = None) -> dict:
         return {'delivered_checks': checks if checks is not None else [self._grep_check()]}
 
@@ -3587,6 +3624,35 @@ class TestGateMarkDoneOnDeliveredChecks:
         text = self._warnings(caplog)[0].getMessage()
         assert 'scripts/verify_cap.sh' in text
         assert 'cap-s' in text
+
+    @pytest.mark.asyncio
+    async def test_failed_path_check_warning_names_the_paths(self, caplog):
+        """Row 2b — the same defect one kind over. ``is_grep`` is False for
+        a path descriptor, so the old binary logged ``script=None``: it
+        named a field the descriptor does not have, carrying a value that
+        is not the problem. The WARNING must name ``paths`` and the actual
+        path instead."""
+        failed_check = self._path_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta([failed_check]),
+                verify_mock=verify,
+                git_ops=self._git_ops(),
+            )
+
+        assert block is not None and block.reason == 'failed'
+        text = self._warnings(caplog)[0].getMessage()
+        assert 'cap-p' in text
+        assert 'orchestrator/tests/test_x.py' in text
+        assert 'paths' in text
+        assert 'script' not in text, (
+            'a path descriptor has no script; naming one (with a None value) '
+            f'misdescribes the failure: {text!r}'
+        )
 
     # -- Row 3: all_delivered ----------------------------------------------
 
