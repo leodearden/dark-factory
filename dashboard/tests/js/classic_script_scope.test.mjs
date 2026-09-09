@@ -69,6 +69,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'task_row_cells.js': 'DF_TASK_ROW_CELLS',
   'burndown_bands.js': 'DF_BURNDOWN_BANDS',
   'pins_recovery.js': 'DF_PINS_RECOVERY',
+  'recon_status.js': 'DF_RECON_STATUS',
 };
 
 function readIndexHtml() {

@@ -620,6 +620,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 _TASK_ROW_CELLS_PREFIX = '/static/redux/task_row_cells.js'
 _BURNDOWN_BANDS_PREFIX = '/static/redux/burndown_bands.js'
 _PINS_RECOVERY_PREFIX = '/static/redux/pins_recovery.js'
+_RECON_STATUS_PREFIX = '/static/redux/recon_status.js'
 _TAB_ESCALATIONS_PREFIX = '/static/redux/tab_escalations.jsx'
 _TAB_ESC_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
@@ -776,6 +777,73 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
             'tab_escalation_analytics.jsx (the per-row PINNING chip) '
             'destructures window.DF_PINS_RECOVERY at top level; '
             'pins_recovery.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: recon_status.js must load BEFORE tabs.jsx and app.jsx
+# (task 5320)
+# ---------------------------------------------------------------------------
+
+
+def test_recon_status_js_is_served(client) -> None:
+    """GET /static/redux/recon_status.js returns 200.
+
+    The load-order guards below only inspect <script> tag positions in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. Both consumers destructure window.DF_RECON_STATUS at top
+    level with no fallback, so a 404 here throws while tabs.jsx / app.jsx are
+    evaluating — taking the whole dashboard, not just the Recon tab.
+    """
+    resp = client.get(_RECON_STATUS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_RECON_STATUS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_recon_status_js_loads_before_tabs(index_html_body: str) -> None:
+    """recon_status.js must load BEFORE tabs.jsx.
+
+    tabs.jsx destructures {reconRunCounts, reconSuccessPct, reconStatusTone}
+    from window.DF_RECON_STATUS at top-level execution time with no fallback,
+    for ReconTab's tiles and its Recent Runs badges. A later (or missing) tag
+    throws while tabs.jsx is evaluating, so every tab that file defines goes
+    with it.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _TABS_PREFIX,
+        before_label='recon_status.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (ReconTab) destructures window.DF_RECON_STATUS at top '
+            'level; recon_status.js must define it first.'
+        ),
+    )
+
+
+def test_recon_status_js_loads_before_app(index_html_body: str) -> None:
+    """recon_status.js must also load BEFORE app.jsx.
+
+    A SECOND consumer in a different file, so it needs its own assertion:
+    app.jsx destructures {reconRunCounts} at top level to compute the Recon
+    rail badge. Ordering this one wrong is the quieter failure of the two —
+    the rail count is a single digit an operator has no independent way to
+    check, which is how the vocabulary mismatch this task fixes survived.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='recon_status.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'app.jsx destructures window.DF_RECON_STATUS at top level for the '
+            'Recon rail badge; recon_status.js must define it first.'
         ),
     )
 
