@@ -556,7 +556,16 @@ class TestGateNeverRaisesOnGenericHit:
             f'row nulled it out'
         )
 
-    @pytest.mark.parametrize('wedge_shape', [_LONG_RUN, 'not-a-wedge-shape', 7])
+    @pytest.mark.parametrize(
+        'wedge_shape',
+        # The last two are UNHASHABLE, and they are the ones with teeth: a
+        # frozenset closed set would raise `TypeError: unhashable type` on them
+        # from inside `_poisoned_observation` — i.e. from the never-raise path
+        # itself, losing the whole capture the degraded row exists to save.  The
+        # hashable non-members alone cannot catch that, which is why they are not
+        # the whole list.
+        [_LONG_RUN, 'not-a-wedge-shape', 7, {'a': 1}, ['x']],
+    )
     def test_a_non_member_wedge_shape_degrades_to_none(self, monkeypatch, wedge_shape):
         # Same reasoning as `mode`: an arbitrary string in a closed-set field is
         # the route by which credential material would ride back into a row whose

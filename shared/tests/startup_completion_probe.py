@@ -137,9 +137,18 @@ MODE_WEDGE_SHAPE: dict[str, str | None] = {
 #: The closed set :func:`_poisoned_observation` filters ``wedge_shape`` against,
 #: derived from the dict above rather than retyped so the two cannot drift.
 #: Hoisted to module level because the filter runs per degraded row and rebuilding
-#: the set per call would be pure waste.  ``None`` IS a member (healthy/replay),
-#: which is why the filter must be a membership test and never a truthiness one.
-_WEDGE_SHAPES: frozenset[str | None] = frozenset(MODE_WEDGE_SHAPE.values())
+#: it per call would be pure waste.  ``None`` IS a member (healthy/replay), which
+#: is why the filter must be a membership test and never a truthiness one.
+#:
+#: A TUPLE, matching :data:`MODES` and :data:`SAMPLE_KINDS`, and NOT a frozenset:
+#: ``in`` on a set HASHES the candidate, so an unhashable ``wedge_shape`` (a dict
+#: or a list) would raise ``TypeError`` from inside ``_poisoned_observation`` —
+#: the last-resort never-raise path whose entire reason to exist is that a raise
+#: there loses an already-paid-for live capture.  Tuple membership compares with
+#: ``==`` and is total.  ``dict.fromkeys`` collapses the duplicate ``None`` while
+#: keeping declaration order; at <=5 elements the linear scan costs nothing on a
+#: path that fires at most once per degraded row.
+_WEDGE_SHAPES: tuple[str | None, ...] = tuple(dict.fromkeys(MODE_WEDGE_SHAPE.values()))
 
 #: Full-sample offsets (seconds since spawn).  Recorded as PROVENANCE only — no
 #: test asserts a wall-clock threshold, because none is achievable (host load,
