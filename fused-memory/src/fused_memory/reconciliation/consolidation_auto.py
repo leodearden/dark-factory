@@ -38,8 +38,13 @@ Two properties a reader must not get wrong
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - a runtime import here would cost the leaf
+    from fused_memory.config.schema import ConsolidationAutoConfig
 
 __all__ = [
     'CORRECTION_BANNER_RE',
@@ -51,6 +56,7 @@ __all__ = [
     'AutoReasonCode',
     'AutoVerdict',
     'build_auto_canonical',
+    'evaluate_auto_predicate',
 ]
 
 
@@ -247,4 +253,85 @@ def build_auto_canonical(claim: str, topic: str, n: int, run_id: str) -> str:
         f'Index canonical for topic `{topic}` over {n} short peers; the live '
         f'metadata.topic scroll is the member list (auto-consolidated, run '
         f'{run_id}).'
+    )
+
+
+def evaluate_auto_predicate(
+    proposal: AutoProposal,
+    *,
+    members: Mapping[str, Mapping[str, Any] | None | _Unreadable],
+    canonical_count: int | None,
+    open_gate_id: str | None,
+    existing_canonical_slugs: Sequence[str],
+    config: ConsolidationAutoConfig,
+) -> AutoVerdict:
+    """Rule on whether *proposal* may be consolidated with no human in the loop.
+
+    PRD contract C2. The caller supplies EVERY fact and this function performs
+    no I/O: *members* is the caller's per-id read (``None`` for a genuine miss,
+    :data:`UNREADABLE` when the read did not answer), *canonical_count* is how
+    many canonicals the topic already has (``None`` when the caller could not
+    find out), *open_gate_id* is a human gate already open on the topic, and
+    *existing_canonical_slugs* is the topic vocabulary to check for a near
+    collision. There is no service parameter, because a verdict that could
+    depend on a live read would be a verdict that depends on WHEN it ran.
+
+    Evaluation order (BINDING — the rungs are tried in this sequence and the
+    first that fires decides):
+
+    1. ``already_gated`` -> NOOP. A topic a human already owns collects no
+       second filing.
+    2. Hazards -> FAIL, collecting EVERY offender rather than stopping at the
+       first, so one human sitting names every problem.
+    3. An incumbent canonical of THIS topic named in the member list is
+       STRIPPED from the retained set and disclosed.
+    4. ``already_consolidated`` -> NOOP, judged over the RETAINED set.
+    5. A retained member not yet stamped with the topic, beside exactly one
+       canonical -> PASS_TAG_ONLY.
+    6. No canonical at all -> PASS.
+
+    The order is the contract, not an optimisation (PRD D4). Two cases fix it:
+    a NEW member carrying a correction banner must FAIL even when the topic has
+    a healthy live canonical — so hazards outrank the tag-only rung — and an
+    incumbent canonical appearing in the member list is STRIPPED rather than
+    failed, or PRD B2's re-emission-with-regrowth (the majority verdict over
+    time) could never pass.
+
+    What this function deliberately does NOT check: the benign shape codes
+    ``member_count_out_of_range``, ``invalid_slug`` and
+    ``claim_not_index_shaped``. Those are refused at the emit boundary by C1
+    (``server/consolidation.py::validate_consolidate_args``) and are not
+    re-derived here — one rule, one enforcement point (PRD D6). The predicate
+    never even sees the claim.
+    """
+    # Rung 1. Evaluated before the hazard arm on purpose: when a human already
+    # holds the topic, what the members look like is not this function's
+    # business, and reporting a hazard here would invite a second filing on a
+    # cluster someone is already sitting with (task 3524's DECIDE-FIRST seam).
+    if open_gate_id is not None:
+        return AutoVerdict(
+            outcome=AutoOutcome.NOOP,
+            reasons=(
+                AutoReason(
+                    code=AutoReasonCode.already_gated,
+                    ids=(open_gate_id,),
+                    detail=(
+                        f'topic `{proposal.topic}` is already gated by task '
+                        f'{open_gate_id}; the human sitting owns it'
+                    ),
+                ),
+            ),
+            retain_ids=(),
+            stripped_ids=(),
+            predicate_version=config.predicate_version,
+        )
+
+    # PROVISIONAL: rungs 2-6 land in the steps that follow this one. Until they
+    # do, everything past the gate reads as a fresh cluster.
+    return AutoVerdict(
+        outcome=AutoOutcome.PASS,
+        reasons=(),
+        retain_ids=tuple(proposal.member_ids),
+        stripped_ids=(),
+        predicate_version=config.predicate_version,
     )
