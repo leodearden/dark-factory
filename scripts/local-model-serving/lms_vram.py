@@ -1033,6 +1033,51 @@ def evaluate_budget(
     )
 
 
+def unstarted_budget(reading: GpuReading) -> BudgetVerdict:
+    """The budget answer for a run in which NO arm was ever started.
+
+    A CONSTRUCTOR, not an evaluation.  :func:`evaluate_budget` judges the
+    subtraction ``used - baseline`` and validates that subtraction's
+    preconditions -- it rejects ``baseline_mib <= 0`` (a zero baseline there
+    means the pre-start probe never ran, and subtracting it would credit the
+    desktop's memory to the arm) and ``baseline > used``.  Here there is no
+    subtraction to validate: nothing was loaded, so the footprint is 0 by
+    construction and the card as it stands IS the pre-start card.  Routing this
+    case through :func:`evaluate_budget` would impose those preconditions on a
+    reading nobody is subtracting from, turning a card that happens to read 0
+    used into a spurious probe error, and would emit its prose -- "the arm took
+    0.00 GiB ..., within the ... budget free before it started" -- which asserts
+    a measurement of an arm that was never started, in a field an operator reads
+    verbatim.
+
+    ONE PRECONDITION ON THE CALLER, which this function cannot check: nothing
+    under measurement was ever started.  For ``lms_healthcheck.run_healthcheck``
+    that means every arm in the run is ``is_placeholder`` -- an arm
+    ``lms_ctl.preflight`` refuses before the card is touched, so it can never
+    have acquired a baseline or allocated anything.  Called for a run that DID
+    start something, this would report that arm's footprint as 0.
+    """
+    return BudgetVerdict(
+        verdict='PASS',
+        reason=(
+            f'no arm was started, so the card holds only the {reading.used_gib:.2f} '
+            f'GiB it already held and there is no footprint to judge against the '
+            f'{reading.free_gib:.2f} GiB free'
+        ),
+        used_mib=reading.used_mib,
+        total_mib=reading.total_mib,
+        baseline_mib=reading.used_mib,
+        arm_footprint_mib=0,
+        budget_mib=reading.free_mib,
+        used_gib=reading.used_gib,
+        total_gib=reading.total_gib,
+        baseline_gib=reading.used_gib,
+        arm_footprint_gib=0.0,
+        budget_gib=reading.free_gib,
+        headroom_gib=reading.free_gib,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The per-arm baseline
 # ---------------------------------------------------------------------------
