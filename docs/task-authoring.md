@@ -470,18 +470,24 @@ very next tick with no operator action, since a new SHA prunes the stale
 cache entry.
 
 **Descriptor shape** (`shared.capability_manifest.DeliveredCheckMeta`; the
-`grep`/`script` fields are mutually exclusive and cross-validated):
+per-kind fields are mutually exclusive and cross-validated):
 
 ```
 {
   name: str,                      # required; names the capability in escalations
-  kind: "grep" | "script",
+  kind: "grep" | "script" | "path",
 
-  # kind="grep" — evaluated against the COMMITTED tree at `main` via
+  # kind="grep" — file CONTENTS, against the COMMITTED tree at `main` via
   # `git grep -E -e <pattern> <ref> [-- <paths...>]`
   pattern: str,                    # required iff kind="grep"
-  expect: "present" | "absent",    # required iff kind="grep"
-  paths: [str],                    # optional, kind="grep" only
+
+  # kind="path" — file EXISTENCE, against the COMMITTED tree at `main` via
+  # `git ls-tree -r --full-tree --name-only <ref> -- <path>`, once per entry
+  expect: "present" | "absent",    # required iff kind="grep" or kind="path"
+  paths: [str],                    # optional SCOPE for kind="grep";
+                                   # required and non-empty for kind="path",
+                                   # where each entry must be repo-relative,
+                                   # non-empty and free of ".." segments
 
   # kind="script" — evaluated against the WORKING CHECKOUT via
   # `<project_root>/<script> <args>`, bounded by timeout_secs
@@ -492,9 +498,12 @@ cache entry.
 ```
 
 `grep` is the primary kind (reads exactly what's on `main`, immune to
-working-checkout dirtiness); `script` is the escape hatch for capabilities
-that can't be expressed as a pattern, at the cost of running against the
-working checkout rather than a materialized `main` tree.
+working-checkout dirtiness). `path` reads the same committed tree but asserts
+EXISTENCE rather than contents, and is CONJUNCTIVE over its `paths`: every
+listed entry must exist for `expect: "present"`, every one must be gone for
+`expect: "absent"`. `script` is the escape hatch for capabilities that can't
+be expressed as either, at the cost of running against the working checkout
+rather than a materialized `main` tree.
 
 **Dispatch-time policy**
 
@@ -518,6 +527,18 @@ A `grep` for a SYMBOL NAME asserts that a string appears in a file, not that
 a behaviour exists. It is satisfiable by prose — a comment, a docstring, or a
 variable named after the thing — so it must never stand in for a behavioural
 capability. Prefer a pattern that can only match a real implementation.
+
+For a FILE-EXISTENCE capability — "does file X exist", "was file X added",
+"was file X removed" — use `kind: "path"`, never a `kind: "grep"` pattern
+naming the file. A grep reads file CONTENTS, so a pattern naming a file can
+only go green if some file happens to mention that name in its text. The
+canonical specimen, measured: task 3536 asserted `kind: "grep"`,
+`expect: "present"`, `pattern: "test_workflow_merge_gating_strand"` scoped to
+`orchestrator/tests/`. The FILE exists on `main`, but a test module does not
+mention its own filename, so the check could never go green — and it blocked
+four dependents (3537, 3544, 3545, 3837). `kind: "path"` with
+`paths: ["orchestrator/tests/test_workflow_merge_gating_strand.py"]` says
+what was meant.
 
 When the capability IS behavioural, prefer `kind: "script"` pointing at a
 COMMITTED predicate. If the same invariant is already gated elsewhere (a
