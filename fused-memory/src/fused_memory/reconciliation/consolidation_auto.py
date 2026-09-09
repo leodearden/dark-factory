@@ -256,6 +256,36 @@ def build_auto_canonical(claim: str, topic: str, n: int, run_id: str) -> str:
     )
 
 
+def _metadata(record: object) -> Mapping[str, Any]:
+    """The metadata of a member record, as a mapping, whatever the record is.
+
+    The ONE place a member record is destructured. A record may be
+    :data:`UNREADABLE`, ``None``, or a mapping whose ``metadata`` is missing or
+    itself ``None`` — and none of those may raise inside a function whose whole
+    job is to RETURN a verdict. A predicate that throws on a malformed record is
+    a predicate the caller cannot report on, which is exactly the case the
+    ``member_unreadable`` code exists to make reportable.
+    """
+    if not isinstance(record, Mapping):
+        return {}
+    metadata = record.get('metadata')
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _is_incumbent(record: object, topic: str) -> bool:
+    """Is *record* the canonical THIS topic already has?
+
+    One home for the definition, because three rules turn on it: the incumbent
+    is STRIPPED rather than retained, it is exempt from the member-level
+    canonical and banner hazards (one record must not produce two codes for one
+    fact), and it is the subject of the canonical-level hazards. A canonical of
+    a DIFFERENT topic is not an incumbent — that is the
+    ``member_already_canonical`` hazard.
+    """
+    metadata = _metadata(record)
+    return metadata.get('canonical') is True and metadata.get('topic') == topic
+
+
 def evaluate_auto_predicate(
     proposal: AutoProposal,
     *,
@@ -326,12 +356,94 @@ def evaluate_auto_predicate(
             predicate_version=config.predicate_version,
         )
 
-    # PROVISIONAL: rungs 2-6 land in the steps that follow this one. Until they
-    # do, everything past the gate reads as a fresh cluster.
-    return AutoVerdict(
-        outcome=AutoOutcome.PASS,
-        reasons=(),
-        retain_ids=tuple(proposal.member_ids),
-        stripped_ids=(),
-        predicate_version=config.predicate_version,
+    reasons: list[AutoReason] = []
+
+    # Rung 3. The proposal may name the canonical the topic already has — an
+    # LLM reading a topic scroll enumerates it along with the members. Strip it
+    # from the retained set (the executor would otherwise tag or fold the
+    # canonical into itself) and DISCLOSE it: a silently shortened member list
+    # drops a record the proposal named with nothing recording why.
+    retain_ids: list[str] = []
+    stripped_ids: list[str] = []
+    for member_id in proposal.member_ids:
+        if _is_incumbent(members.get(member_id), proposal.topic):
+            stripped_ids.append(member_id)
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.incumbent_canonical_stripped,
+                    ids=(member_id,),
+                    detail=(
+                        f'{member_id} is the canonical topic `{proposal.topic}` '
+                        'already has; it is excluded from the members to act on '
+                        'and its content and metadata are left untouched'
+                    ),
+                ),
+            )
+        else:
+            retain_ids.append(member_id)
+
+    # Rungs 4 and 5 split on the RETAINED set, after the strip above — the
+    # incumbent is accounted for separately rather than counted as a member
+    # that happens to be stamped.
+    every_member_stamped = all(
+        _metadata(members.get(member_id)).get('topic') == proposal.topic
+        for member_id in retain_ids
+    )
+
+    if canonical_count == 1:
+        if every_member_stamped:
+            # Rung 4. Nothing to write. NOOP rather than a tag-only pass is the
+            # difference between a cycle that does nothing and one that
+            # rewrites a settled topic every time Stage 1 notices it again.
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.already_consolidated,
+                    ids=tuple(retain_ids),
+                    detail=(
+                        f'topic `{proposal.topic}` already has its canonical and '
+                        f'every one of the {len(retain_ids)} proposed members is '
+                        'already stamped with it'
+                    ),
+                ),
+            )
+            return AutoVerdict(
+                outcome=AutoOutcome.NOOP,
+                reasons=tuple(reasons),
+                retain_ids=tuple(retain_ids),
+                stripped_ids=tuple(stripped_ids),
+                predicate_version=config.predicate_version,
+            )
+
+        # Rung 5. Stamp the unstamped members onto the existing topic and touch
+        # the incumbent canonical's content and metadata not at all (PRD D14).
+        return AutoVerdict(
+            outcome=AutoOutcome.PASS_TAG_ONLY,
+            reasons=tuple(reasons),
+            retain_ids=tuple(retain_ids),
+            stripped_ids=tuple(stripped_ids),
+            predicate_version=config.predicate_version,
+        )
+
+    if canonical_count == 0:
+        # Rung 6. Mint the canonical and fold the members. Reached with members
+        # already stamped too: task theta's migration stamps a topic before any
+        # canonical exists, and a NOOP there would leave a scroll with members
+        # and no index entry that nothing else sweeps.
+        return AutoVerdict(
+            outcome=AutoOutcome.PASS,
+            reasons=tuple(reasons),
+            retain_ids=tuple(retain_ids),
+            stripped_ids=tuple(stripped_ids),
+            predicate_version=config.predicate_version,
+        )
+
+    # Unreachable: rung 2 refuses `canonical_count is None` as
+    # `canonical_count_unavailable` and `canonical_count > 1` as
+    # `multiple_canonicals`, so only 0 and 1 arrive here. Loud rather than a
+    # silent default — if either hazard is ever removed, this says so at the
+    # exact point the verdict would otherwise be invented.
+    raise AssertionError(
+        f'unreachable: canonical_count={canonical_count!r} for topic '
+        f'`{proposal.topic}` should have been refused by the hazard arm as '
+        'canonical_count_unavailable or multiple_canonicals',
     )
