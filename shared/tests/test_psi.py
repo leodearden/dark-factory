@@ -512,18 +512,41 @@ class TestReadRunqueueRatio:
         path.write_text(text)
         return path
 
-    def test_happy_path_ratio_and_read_ok(self, tmp_path):
-        import os
+    def test_happy_path_ratio_and_read_ok(self, tmp_path, monkeypatch):
+        """The divisor is this process's CPU AFFINITY, not ``os.cpu_count()``.
 
+        Pinned as an exact literal against a fixed affinity mask, because an
+        assertion that recomputes the reader's own expression cannot tell the
+        two quantities apart — and under this PRD's df-*.slice topology a
+        systemd ``AllowedCPUs=`` makes them diverge, on the one arm D9 ships
+        switched ON.
+        """
+        import shared.psi
         from shared.psi import read_runqueue_ratio
 
+        monkeypatch.setattr(
+            shared.psi.os, 'sched_getaffinity', lambda _pid: {0, 1, 2, 3, 4, 5, 6, 7}
+        )
         reading = read_runqueue_ratio(
             proc_stat_path=self._write(tmp_path, PROC_STAT_TEXT)
         )
 
         assert reading.read_ok is True
         assert isinstance(reading.ratio, float)
-        assert reading.ratio == pytest.approx(64 / len(os.sched_getaffinity(0)))
+        assert reading.ratio == pytest.approx(8.0)  # procs_running 64 / 8 CPUs
+
+    def test_empty_affinity_mask_degrades_by_value(self, tmp_path, monkeypatch):
+        """A zero-CPU divisor is a ZeroDivisionError, not a wedged gate."""
+        import shared.psi
+        from shared.psi import read_runqueue_ratio
+
+        monkeypatch.setattr(shared.psi.os, 'sched_getaffinity', lambda _pid: set())
+        reading = read_runqueue_ratio(
+            proc_stat_path=self._write(tmp_path, PROC_STAT_TEXT)
+        )
+
+        assert reading.read_ok is False
+        assert reading.ratio == 0.0
 
     def test_missing_file_degrades_by_value(self, tmp_path):
         from shared.psi import read_runqueue_ratio
