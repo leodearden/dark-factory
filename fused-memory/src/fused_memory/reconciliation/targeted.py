@@ -1270,6 +1270,7 @@ class TargetedReconciler:
                 # this branch safely idempotent under the same race.
                 action = await self._sweep_cancel_orphan(
                     task_id=tid, parent_id=parent_id_str, project_root=project_root,
+                    run_id=run_id,
                 )
             else:
                 # Ambiguous route (escalate when orch live; block when orch dead).
@@ -1298,6 +1299,7 @@ class TargetedReconciler:
                         escalation_id=escalation_id,
                         is_dependent=is_dependent,
                         project_root=project_root,
+                        run_id=run_id,
                     )
 
             if action is not None:
@@ -1333,6 +1335,7 @@ class TargetedReconciler:
 
     async def _sweep_cancel_orphan(
         self, *, task_id: str, parent_id: str, project_root: ProjectRoot,
+        run_id: str,
     ) -> dict | None:
         """Auto-cancel a deterministic-orphan review-followup."""
         reason = f'{_PARENT_CANCELLED_REOPEN_PREFIX}{parent_id}'
@@ -1365,6 +1368,7 @@ class TargetedReconciler:
         escalation_id: str | None,
         is_dependent: bool,
         project_root: ProjectRoot,
+        run_id: str,
     ) -> dict | None:
         """Auto-block an ambiguous descendant + record parent_cancelled metadata.
 
