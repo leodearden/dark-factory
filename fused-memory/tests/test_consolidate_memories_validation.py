@@ -564,5 +564,6 @@ class TestProposalArm:
         list of what it got wrong."""
         err, _, _ = _propose(claim=_SHORT)
 
+        assert err is not None
         assert err['hint']
         assert 'claim' in err['hint']

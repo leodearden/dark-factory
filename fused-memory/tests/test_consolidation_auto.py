@@ -78,11 +78,16 @@ def _member(
     return {'id': member_id, 'content': content, 'metadata': metadata}
 
 
-def _members(*records: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _members(*records: dict[str, Any]) -> dict[str, Any]:
     """Key each record by its OWN id — the mapping the predicate is handed.
 
     Keying from the record keeps the mapping key and ``record['id']`` from ever
     disagreeing, which a hand-written literal would let drift silently.
+
+    The value type is the predicate's own: a record, ``None`` when the store
+    has no such id, or :data:`UNREADABLE` when the read did not answer. Tests
+    inject the latter two by assigning over a key, so a narrower annotation
+    here would contradict the very fixtures it exists to build.
     """
     return {record['id']: record for record in records}
 
@@ -396,7 +401,9 @@ class TestVerdictShapeAndGating:
                 assert isinstance(reason.code, AutoReasonCode)
                 assert isinstance(reason.ids, tuple)
             with pytest.raises(dataclasses.FrozenInstanceError):
-                verdict.outcome = AutoOutcome.PASS
+                # setattr, not a direct attribute assignment, so this stays pyright-clean
+                # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
+                setattr(verdict, 'outcome', AutoOutcome.PASS)  # noqa: B010
 
     def test_predicate_version_is_echoed_from_config(self):
         """The version is a LIVE READ of the green-tier leaf, not a constant.
@@ -406,7 +413,7 @@ class TestVerdictShapeAndGating:
         records which ruleset judged it. A module constant would silently keep
         stamping the old one.
         """
-        args = dict(
+        args: dict[str, Any] = dict(
             members=_members(_member('m1'), _member('m2')),
             canonical_count=0,
             open_gate_id='5183',
@@ -784,10 +791,8 @@ class TestMemberHazards:
         one shape of drift this arm cannot afford, since it is the only
         machine-readable half of correction detection.
         """
-        members = _members(
-            _member('m1'),
-            _member('m2', **{key: 'ce8590f1-cc05-48da-9428-1cf1f54f3fff'}),
-        )
+        correction_meta: dict[str, Any] = {key: 'ce8590f1-cc05-48da-9428-1cf1f54f3fff'}
+        members = _members(_member('m1'), _member('m2', **correction_meta))
 
         verdict = _judge(members)
 
@@ -1063,7 +1068,9 @@ class TestCanonicalAndSlugHazards:
         in at import.
         """
         members = _members(_member('m1'), _member('m2'))
-        args = dict(topic=COLLIDING_TOPIC, existing_canonical_slugs=(SLUG_AT_THRESHOLD,))
+        args: dict[str, Any] = dict(
+            topic=COLLIDING_TOPIC, existing_canonical_slugs=(SLUG_AT_THRESHOLD,)
+        )
 
         assert _judge(members, **args).outcome is AutoOutcome.FAIL
 
