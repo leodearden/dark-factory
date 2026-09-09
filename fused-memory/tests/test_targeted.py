@@ -1712,6 +1712,20 @@ class TestServerWiringContract:
 # via the ``reopen_reason.startswith('parent_cancelled:')`` check.
 
 
+def _backlog_rejection() -> dict:
+    """A fresh ``BacklogVerdict.to_error_dict()``-shaped gate rejection.
+
+    Carries ``error``/``error_type`` and **no** ``success`` key, and does not
+    raise -- the shape a bare ``try/except`` around an interceptor write is
+    blind to.  A factory rather than a constant so no test can mutate a
+    payload another test reads.
+    """
+    return {
+        'error': 'ReconciliationBacklogExceeded: backlog depth 512 exceeds limit',
+        'error_type': 'ReconciliationBacklogExceeded',
+    }
+
+
 class TestSweepCancelledDescendants:
     """Auto-sweep dep-tree on task cancellation."""
 
@@ -2315,6 +2329,102 @@ class TestSweepCancelledDescendants:
         ]
         assert not warns, (
             f"well-formed {{tasks:[]}} must emit no WARNINGs; got {warns!r}"
+        )
+
+    # ── Task 4977: the sweep's own interceptor writes must be classified ───
+    # The sweep helpers wrapped their writes in a bare ``try/except``, which
+    # sees none of the non-raising gate rejections enumerated in
+    # task_interceptor.py::interceptor_write_succeeded.  These mirror the
+    # task-4903 templates for the structurally identical split in
+    # targeted.py::_unblock_dependent.
+
+    @staticmethod
+    def _block_branch_tasks() -> dict:
+        """B is ambiguous (spawned_from=A, no escalation_id) → block branch."""
+        return {'tasks': [{
+            'id': 'B', 'status': 'pending', 'title': 'ambiguous',
+            'metadata': {'spawned_from': 'A'},
+            'dependencies': [],
+            'subtasks': [],
+        }]}
+
+    @staticmethod
+    async def _sweep_cancelled_parent(wired_reconciler, project_root) -> dict:
+        return await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=str(project_root),
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+    @staticmethod
+    def _descendant_actions(result: dict, action_type: str) -> list[dict]:
+        return [
+            a for a in result.get('actions', [])
+            if a.get('type') == action_type and a.get('task_id') == 'B'
+        ]
+
+    @staticmethod
+    async def _taskmaster_rows(journal, action_type: str, operation: str) -> list[dict]:
+        """Real journal rows for one (action_type, operation) pair."""
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+        rows = await journal.get_run_actions(runs[0].id)
+        return [
+            r for r in rows
+            if r['action_type'] == action_type and r['target'] == 'taskmaster'
+            and r['operation'] == operation
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('make_response,expected_error', [
+        pytest.param(_backlog_rejection, 'ReconciliationBacklogExceeded', id='backlog-verdict'),
+        pytest.param(lambda: None, 'unknown', id='non-dict-none'),
+    ])
+    async def test_block_metadata_stamp_rejection_is_classified(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog, make_response, expected_error,
+    ):
+        """A rejected parent_cancelled stamp must not be reported as landed.
+
+        The status flip itself genuinely landed, so the action must stay
+        ``descendant_blocked`` -- a stamp failure must not downgrade it -- but
+        it must additionally carry ``metadata_stamp='rejected'`` and leave a
+        durable ``skip`` row, because ``_unblock_veto_reason`` reads exactly
+        the keys this dropped write stamps.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+        mock_interceptor.update_task = AsyncMock(return_value=make_response())
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert len(blocks) == 1, (
+            f'The status flip landed, so exactly one descendant_blocked action '
+            f'must survive a stamp rejection; got: {blocks}'
+        )
+        assert blocks[0].get('metadata_stamp') == 'rejected', (
+            f'Expected metadata_stamp="rejected" so the audit does not claim '
+            f'the parent_cancelled stamp landed, got: {blocks[0]!r}'
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the rejected metadata stamp'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        assert len(skips) == 1, f'Expected exactly one skip/update_task row, got: {skips}'
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert detail.get('parent_id') == 'A', f'Expected parent_id="A", got: {detail!r}'
+        assert detail.get('error') == expected_error, (
+            f'Expected the stable error_type code (preferred over the rendered '
+            f'error message), falling back to "unknown" for a non-dict '
+            f'response, got: {detail!r}'
         )
 
 
