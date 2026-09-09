@@ -2621,6 +2621,29 @@ class TestSweepCancelledDescendants:
             f'Expected the stable error_type code, got: {detail!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_cancel_success_writes_journal_row(
+        self, wired_reconciler, mock_taskmaster, journal, tmp_path,
+    ):
+        """The cancel branch's positive counterpart to step-10's skip row."""
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._cancel_branch_tasks())
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        cancels = self._descendant_actions(result, 'descendant_cancelled')
+        assert len(cancels) == 1, f'Expected exactly one descendant_cancelled, got: {cancels}'
+
+        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert len(writes) == 1, (
+            f'Expected exactly one write/set_task_status row, got: {writes}'
+        )
+        detail = writes[0]['detail']
+        assert detail.get('type') == 'descendant_cancel', f'got: {detail!r}'
+        assert detail.get('task_id') == 'B', f'got: {detail!r}'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert not skips, f'Expected no skip/set_task_status rows, got: {skips}'
+
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
 # Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='in-progress').
