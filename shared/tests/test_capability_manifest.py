@@ -43,6 +43,7 @@ from pydantic import BaseModel, ValidationError
 import shared.capability_manifest as capability_manifest_module
 import shared.task_metadata as task_metadata_module
 from shared.capability_manifest import (
+    CHECK_SUBJECT_FIELD,
     MECHANICAL_CHECK_KINDS,
     CapabilityManifestDoc,
     DeliveredCheck,
@@ -1765,6 +1766,29 @@ class TestMechanicalCheckKinds:
 
     def test_is_exported_in_module_all(self):
         assert 'MECHANICAL_CHECK_KINDS' in capability_manifest_module.__all__
+
+
+class TestCheckSubjectField:
+    """CHECK_SUBJECT_FIELD — the per-kind field a failure is ABOUT."""
+
+    def test_maps_each_mechanical_kind_to_its_subject(self):
+        assert CHECK_SUBJECT_FIELD == {
+            'grep': 'pattern',
+            'script': 'script',
+            'path': 'paths',
+        }
+
+    def test_covers_exactly_the_mechanical_kinds(self):
+        # The coupling that keeps a future kind from being added to one and
+        # missed in the other, leaving a renderer with no subject to name.
+        assert set(CHECK_SUBJECT_FIELD) == set(MECHANICAL_CHECK_KINDS)
+
+    def test_every_subject_is_a_real_descriptor_field(self):
+        for field in CHECK_SUBJECT_FIELD.values():
+            assert field in DeliveredCheckMeta.model_fields
+
+    def test_is_exported_in_module_all(self):
+        assert 'CHECK_SUBJECT_FIELD' in capability_manifest_module.__all__
 
 
 class TestMetadataRegistration:

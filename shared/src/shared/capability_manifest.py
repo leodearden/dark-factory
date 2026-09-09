@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from shared.task_metadata import register_metadata_submodel
 
 __all__ = [
+    'CHECK_SUBJECT_FIELD',
     'MECHANICAL_CHECK_KINDS',
     'CapabilityManifestDoc',
     'DeliveredCheck',
@@ -417,6 +418,29 @@ must never be copied into metadata.
 Consumers: ``fused-memory``'s ``manifest_stamping`` copy filter and
 ``scripts/audit_combine_gate_marker_loss.py``'s sweep, both of which
 previously hand-kept their own copy of the tuple.
+"""
+
+
+CHECK_SUBJECT_FIELD: dict[str, str] = {
+    'grep': 'pattern',
+    'script': 'script',
+    'path': 'paths',
+}
+"""Per-kind name of the field a check's failure is ABOUT.
+
+The one field an operator needs to see when a check fails: which pattern
+did not match, which script exited non-zero, which path was not there.
+Read by the two diagnostic renderers that must name the failing
+descriptor — the ``gate_mark_done_on_delivered_checks`` WARNING and the
+born-at-L2 ``DEP_CAPABILITY_NOT_DELIVERED`` escalation body — both of
+which previously hard-coded a grep/script binary and so, for a third
+kind, named a field the descriptor does not have and printed its ``None``.
+
+A table rather than an if/elif chain (heuristic 12): the next kind is a
+data edit, and a renderer cannot silently fall through to the wrong
+field. Keyed by every mechanical kind — :data:`MECHANICAL_CHECK_KINDS` is
+the authority on that vocabulary, and the paired test asserts the two
+agree so a kind can never be added here and missed there (or vice versa).
 """
 
 

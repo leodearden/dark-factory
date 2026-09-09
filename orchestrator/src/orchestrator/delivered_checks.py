@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import ValidationError
-from shared.capability_manifest import DeliveredCheckMeta
+from shared.capability_manifest import CHECK_SUBJECT_FIELD, DeliveredCheckMeta
 
 from orchestrator import git_ops
 
@@ -573,14 +573,18 @@ async def gate_mark_done_on_delivered_checks(
 
     if verdict.outcome == 'failed':
         failed_check = verdict.failed_check or {}
-        is_grep = failed_check.get('kind') == 'grep'
+        # Name the field the descriptor ACTUALLY has. The former grep/script
+        # binary named 'script' for anything non-grep, so a path check logged
+        # `script=None` — a field it does not carry, holding a value that is
+        # not the problem.
+        subject_field = CHECK_SUBJECT_FIELD.get(failed_check.get('kind'), 'pattern')
         log.warning(
             'Delivered-checks guard [%s]: task %s delivered-check %r (%s=%r) is '
             'absent from main@%s — declared capability not present, NOT marking '
             'done',
             site, task_id, failed_check.get('name'),
-            'pattern' if is_grep else 'script',
-            failed_check.get('pattern') if is_grep else failed_check.get('script'),
+            subject_field,
+            failed_check.get(subject_field),
             sha,
         )
         return DeliveredChecksBlock('failed', sha, verdict.failed_check)
