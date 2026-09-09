@@ -1436,9 +1436,13 @@ def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
     )
     check = matches[0].delivered_check
     assert check is not None
+    pattern = check.pattern
+    assert pattern is not None, (
+        f"expected a grep check with a pattern, got kind={check.kind!r}"
+    )
 
     completed = subprocess.run(
-        ["git", "-C", root, "grep", "-E", "-n", "-e", check.pattern, "--",
+        ["git", "-C", root, "grep", "-E", "-n", "-e", pattern, "--",
          *check.paths],
         capture_output=True, text=True, timeout=30,
     )
