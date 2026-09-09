@@ -62,6 +62,7 @@ __all__ = [
     'MIN_PROBES_PER_CYCLE',
     'NEGATIVE_SET_VERDICT_TEMPLATE',
     'PROBE_LIMIT_LADDER',
+    'render_graphiti_degradation_probe_section',
 ]
 
 # The denominator pair. Defined once here and reaching the stage prompts only
@@ -82,3 +83,89 @@ NEGATIVE_SET_VERDICT_TEMPLATE = (
     '0 of {n} probes reproduced; the fault is intermittent and load-dependent, '
     'so a negative set does not clear it.'
 )
+
+
+def render_graphiti_degradation_probe_section(*, runs_probes: bool) -> str:
+    """Render the probe-protocol section for one stage.
+
+    Follows the :func:`prompts.render_finding_provenance_section` /
+    :func:`prompts.render_escalation_boundary_note` precedent: ONE shared body
+    plus a single clause selected by a keyword-only capability flag, so the
+    half both stages need exists exactly once (INV-5 ``no-lockstep-duplication``).
+
+    The split is a capability split, not a style choice. The verdict rule and
+    the cross-stage caveat govern any stage that says anything about Graphiti's
+    health; the ladder and the two counters belong only to the stage that
+    actually runs probes and reports ``stats``. Naming a counter to a stage is
+    a live instruction to emit it, so handing the read-only stage the probe
+    text would order it to report numbers it has no way to produce.
+
+    Every limit and both counter names are interpolated from this module's
+    constants. Nothing here may be hand-typed: the number an operator reads out
+    of a cycle report and the number the stage was told to emit have to be the
+    same object, or the protocol drifts silently.
+
+    Args:
+        runs_probes: True for the stage that runs the ladder and owns the
+            counters; False for a read-only stage, which inherits the verdict
+            rule and the caveat alone.
+
+    Returns:
+        The shared body plus the matching capability clause, interpolated into
+        a stage's system prompt at build time.
+    """
+    verdict = NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER))
+    ladder_phrase = ', '.join(str(limit) for limit in PROBE_LIMIT_LADDER)
+
+    if runs_probes:
+        capability_clause = (
+            'You run this probe. Each cycle, run at least '
+            f'{MIN_PROBES_PER_CYCLE} mixed-store probes — one at each of these '
+            f'`search` limits: {ladder_phrase} — and vary the query text across '
+            'them, so that fan-out rather than a single cached query is what '
+            'differs between probes. Result size is the confound: both recorded '
+            'reproductions came from wider queries, while the lone probe that '
+            'produced the false conclusion was the narrowest one available.\n\n'
+            'Report BOTH counters in your structured `stats`, always together '
+            'and never one without the other:\n'
+            f'- `{GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY}` — how many probes '
+            'you ran.\n'
+            f'- `{GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY}` — how many of them '
+            'reproduced the degradation.\n'
+            'Published alone, a reproduced count of zero reads as a no-op. '
+            'Published beside its denominator it reads as "0 of N", which is '
+            'what it actually means.'
+        )
+    else:
+        capability_clause = (
+            'You do not run this probe and do not report its counters — running '
+            'the ladder belongs to the stage that owns those stats. Report the '
+            'store health you actually observe in your own searches, and do not '
+            "treat another stage's negative probe set as having cleared "
+            'anything.'
+        )
+
+    return (
+        '## Graphiti Mixed-Store Degradation Probe\n'
+        'The Graphiti degradation this probe looks for is INTERMITTENT and '
+        'load-dependent: it fires on some queries and not others, within one '
+        'cycle, against the same store.\n\n'
+        'There is no positive observation of health available to you. `search` '
+        'reports `degraded` and `failed_stores` only WHEN a store has already '
+        'failed, so a clean probe returns no health key at all — its silence is '
+        'the absence of a fault report, not a report of no fault. A negative '
+        'probe set is therefore an absence of evidence by construction, and no '
+        'number of negatives converts it into evidence of absence.\n\n'
+        'A probe set in which nothing reproduced licenses exactly one '
+        'conclusion, and this is the permitted wording:\n'
+        f'    {verdict}\n'
+        'It does NOT license "the degradation did not reproduce", "no '
+        'persistent Graphiti problem", or any other claim that the fault is '
+        'absent, cleared, resolved or historical.\n\n'
+        "Neither stage's probe result binds the other. In run cd53b227 one "
+        'stage probed negative and a later stage of the SAME cycle observed '
+        "`degraded: true` with `failed_stores: ['graphiti']` — so a stage that "
+        "observes the fault must not defer to a sibling's negative, and no "
+        "stage may cite another stage's negative as corroboration.\n\n"
+        + capability_clause
+    )
