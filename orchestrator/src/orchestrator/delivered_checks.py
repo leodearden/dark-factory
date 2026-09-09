@@ -3,17 +3,26 @@ capability-delivered-checks PRD: plans/capability-delivered-checks-prd.md).
 
 Evaluates a single ``metadata.delivered_checks`` entry (PRD §Contract;
 schema defined by ``shared.capability_manifest.DeliveredCheckMeta``, task
-alpha) and returns a :class:`DeliveredCheckResult`. Two kinds:
+alpha) and returns a :class:`DeliveredCheckResult`. Three kinds:
 
-- ``grep`` — evaluated against the COMMITTED tree at *ref* (default
-  ``'main'``) via ``git -C <project_root> grep -E -e <pattern> <ref>``.
-  This is the PRIMARY kind: it reads exactly what's on ``main``, immune to
-  working-checkout dirtiness.
+- ``grep`` — file CONTENTS, evaluated against the COMMITTED tree at *ref*
+  (default ``'main'``) via ``git -C <project_root> grep -E -e <pattern>
+  <ref>``. This is the PRIMARY kind: it reads exactly what's on ``main``,
+  immune to working-checkout dirtiness.
+- ``path`` — file EXISTENCE, also against the committed tree at *ref*, via
+  ``git ls-tree``. For "does file X exist" a grep pattern naming the file
+  can never go green (a test module does not mention its own filename), so
+  that capability needs its own kind.
 - ``script`` — evaluated against the WORKING CHECKOUT (PRD Open-Q 2
   DECIDED: a documented approximation, not a temp-tree materialization of
   *ref*) via ``<project_root>/<script> <args>``, bounded by
   ``timeout_secs``. The escape hatch for capabilities that can't be
-  expressed as a grep pattern.
+  expressed as either.
+
+The two committed-tree kinds read their answer from OPPOSITE places and
+their idioms must not be copied across: ``git grep`` signals match/no-match
+through its RETURN CODE, while ``git ls-tree`` exits 0 either way and
+signals existence through whether it printed anything on STDOUT.
 
 ``Scheduler._compute_delivered_check_cache`` (scheduler.py) is the sole
 caller in production; both the git subprocess runner and the resolved
@@ -104,9 +113,9 @@ async def run_delivered_check(
     a task record) — defensively re-validated here via
     :class:`shared.capability_manifest.DeliveredCheckMeta` so a malformed
     entry degrades to :attr:`DeliveredCheckResult.ERRORED` rather than
-    raising. *ref* is only consulted by the ``grep`` kind (the ``script``
-    kind always runs against the working checkout — see the module
-    docstring). *runner* is the injected subprocess seam
+    raising. *ref* is consulted by the ``grep`` and ``path`` kinds, which
+    both read the committed tree (the ``script`` kind always runs against
+    the working checkout — see the module docstring). *runner* is the injected subprocess seam
     (``(argv, **kwargs) -> (returncode, stdout, stderr)``), defaulting to
     :func:`orchestrator.git_ops._run`.
     """
@@ -121,6 +130,8 @@ async def run_delivered_check(
     try:
         if meta.kind == 'grep':
             return await _run_grep_check(meta, project_root=project_root, ref=ref, runner=runner)
+        if meta.kind == 'path':
+            return await _run_path_check(meta, project_root=project_root, ref=ref, runner=runner)
         return await _run_script_check(meta, project_root=project_root, runner=runner)
     except Exception:
         logger.warning(
@@ -159,6 +170,62 @@ async def _run_grep_check(
     matched = rc == 0
     delivered = matched if meta.expect == 'present' else not matched
     return DeliveredCheckResult.DELIVERED if delivered else DeliveredCheckResult.FAILED
+
+
+async def _run_path_check(
+    meta: DeliveredCheckMeta,
+    *,
+    project_root: str | Path,
+    ref: str,
+    runner: _Runner,
+) -> DeliveredCheckResult:
+    """``git -C <project_root> ls-tree -r --full-tree --name-only <ref> -- <path>``,
+    once per entry in ``meta.paths``.
+
+    EXISTENCE IS READ FROM STDOUT, NOT FROM THE RETURN CODE — the opposite
+    of :func:`_run_grep_check`, and the one thing that must not be carried
+    across by analogy. ``git grep`` answers through rc (0=match, 1=no
+    match), but ``ls-tree`` exits 0 either way: a MISSING path prints
+    nothing, an existing path prints its name. Reading ``rc == 0`` here
+    would make every path check report DELIVERED — a universal false green
+    on a dispatch gate. A non-zero rc is reserved for genuine git errors
+    (a bad ref and a pathspec outside the repository both exit 128) and is
+    handled by the caller-facing fail-safe path.
+
+    ``--full-tree`` makes the pathspec repo-root-relative regardless of the
+    subprocess cwd, matching the repo-relative ``paths`` invariant the
+    schema validator enforces.
+
+    Multi-path semantics are CONJUNCTIVE and short-circuiting:
+    ``expect='present'`` requires EVERY listed path to exist and
+    ``expect='absent'`` requires every one to be gone, returning on the
+    first path that settles the verdict. A delivered_check is a dispatch
+    GATE, so it must be biased toward withholding: disjunctive semantics
+    would let it go green while part of the asserted capability was still
+    missing. One invocation per path rather than one multi-pathspec call,
+    because ``ls-tree`` returns a flat filename list that cannot be
+    attributed back to the requesting pathspec without an ad-hoc parser
+    over git output.
+    """
+    for path in meta.paths:
+        argv = [
+            'git',
+            '-C',
+            str(project_root),
+            'ls-tree',
+            '-r',
+            '--full-tree',
+            '--name-only',
+            ref,
+            '--',
+            path,
+        ]
+        _rc, out, _err = await runner(argv)
+        exists = bool(out.strip())
+        delivered = exists if meta.expect == 'present' else not exists
+        if not delivered:
+            return DeliveredCheckResult.FAILED
+    return DeliveredCheckResult.DELIVERED
 
 
 async def _run_script_check(
