@@ -5663,6 +5663,225 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# task-5007 RED: TestBlocklistLazyLoadRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestBlocklistLazyLoadRunsOffEventLoop:
+    """Tests that _maybe_blocklist_drop's one-shot lazy registry load runs OFF
+    the event-loop thread, so it cannot stall the fused-memory event loop or
+    any other coroutine sharing it — e.g. a concurrent project's curate()
+    call, since TaskInterceptor._get_curator memoises a single TaskCurator
+    while TaskInterceptor._curator_lock is keyed per-project. Mirrors
+    TestPremiseGuardRunsOffEventLoop (task 4201).
+    """
+
+    async def test_blocklist_load_runs_off_event_loop(self, tmp_path):
+        """RED: the one-shot lazy blocklist load must be offloaded.
+
+        Asserts thread IDENTITY rather than a wall-clock timing threshold —
+        same rationale as TestPremiseGuardRunsOffEventLoop.
+        test_registry_load_runs_off_event_loop.
+
+        Delegates to the REAL load_blocklist (captured before patching)
+        rather than stubbing a return value: a stub returning [] would make
+        the thread-identity assertion vacuous by short-circuiting at
+        ``if not entries: return None`` before ever reaching match_candidate,
+        and would not exercise a genuine refusal.
+        """
+        import threading
+
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            load_blocklist as real_load_blocklist,
+        )
+
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        load_threads: list[int] = []
+
+        def recording_load(path):
+            load_threads.append(threading.get_ident())
+            return real_load_blocklist(path)
+
+        with patch(
+            "fused_memory.middleware.cancelled_premise_blocklist.load_blocklist",
+            side_effect=recording_load,
+        ):
+            decision1 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert load_threads and all(tid != loop_thread_id for tid in load_threads)
+        assert len(load_threads) == 1  # lazy load, at most once per instance
+        assert decision1 is not None and decision1.action == "refuse"
+        assert decision2 is not None and decision2.action == "refuse"
+
+    async def test_concurrent_first_calls_both_see_loaded_blocklist(self, tmp_path):
+        """GUARD (expected GREEN already): concurrent first calls must not
+        observe a half-loaded blocklist.
+
+        This locks a property that already holds on the current branch (the
+        attempted flag is set BEFORE the synchronous load, with no await
+        point between the two, so two gathered first calls cannot
+        interleave) against the obvious wrong fix for the sibling RED test
+        above — an offload that keeps the flag-before-load ordering without
+        a lock. Uses a slow load_blocklist wrapper (sleeps inside the worker
+        thread, off the event loop) to force the second concurrent call to
+        enter while the first load is still in flight. Reachable, not
+        theoretical: TaskInterceptor._get_curator memoises a SINGLE
+        TaskCurator on self._curator with no project key, while
+        TaskInterceptor._curator_lock is keyed PER-PROJECT — so two projects
+        can be inside curate() concurrently on the same TaskCurator
+        instance.
+        """
+        import time
+
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            load_blocklist as real_load_blocklist,
+        )
+
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        load_call_count = 0
+
+        def slow_load(path):
+            nonlocal load_call_count
+            load_call_count += 1
+            time.sleep(0.05)  # yields the loop; runs on the to_thread worker
+            return real_load_blocklist(path)
+
+        with patch(
+            "fused_memory.middleware.cancelled_premise_blocklist.load_blocklist",
+            side_effect=slow_load,
+        ):
+            d1, d2 = await asyncio.gather(
+                curator._maybe_blocklist_drop(candidate, candidate.payload_hash()),
+                curator._maybe_blocklist_drop(candidate, candidate.payload_hash()),
+            )
+
+        assert d1 is not None and d1.action == "refuse"
+        assert d2 is not None and d2.action == "refuse"
+        assert load_call_count == 1
+
+    async def test_blocklist_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a blocklist load that RAISES must fail OPEN, not escape, and
+        must not latch into a permanent failure.
+
+        Today, _maybe_blocklist_drop's lazy-load block has no try/except at
+        all: a load_blocklist raise escapes as-is, violating this method's
+        own "Never raises" docstring — and curate()/curate_batch_prepared
+        call it unguarded, so the escape fails the whole task submission.
+
+        Injects the raise directly via side_effect (a counting wrapper that
+        raises) rather than a non-UTF-8 file — this targets
+        asyncio.to_thread's own raise path, which no loader-internal except
+        can ever cover, and stays valid regardless of what exception types
+        load_blocklist itself later learns to catch (see the task-4483
+        collision-risk note in plan.json).
+        """
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        load_calls = 0
+
+        def counting_raise(path):
+            nonlocal load_calls
+            load_calls += 1
+            raise RuntimeError("boom")
+
+        with patch(
+            "fused_memory.middleware.cancelled_premise_blocklist.load_blocklist",
+            side_effect=counting_raise,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "blocklist" + "failing open" is the exact text the shared load
+        # helper's except block emits — narrower than "failing" appearing
+        # somewhere, which would stay green even if this WARNING were
+        # deleted and some unrelated warning fired instead.
+        fail_open_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "blocklist" in r.getMessage()
+        ]
+        assert len(fail_open_records) == 1
+
+    async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
+        """Behaviour-preservation pin: a relative
+        cancelled_premise_blocklist_path with no cwd resolves against the
+        process CWD and logs a WARNING naming the config key so an operator
+        can identify which field to make absolute. Green today
+        (task_curator.py _maybe_blocklist_drop's lazy-load block); must stay
+        green once this branch moves into the shared _LazyRegistry._resolve.
+        """
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path="relative/blocklist.yaml")
+        curator = TaskCurator(config=config, taskmaster=None, cwd=None)
+
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        with caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        assert any(
+            "cancelled_premise_blocklist_path" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+
 # step-13 RED: TestCancelledPremiseBlocklistPinsFixCRegression
 # ──────────────────────────────────────────────────────────────────────────────
 
