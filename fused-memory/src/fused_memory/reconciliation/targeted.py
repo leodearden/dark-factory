@@ -154,6 +154,26 @@ _STALE_ECHO_DELETE_LIMIT = 25
 _STAGE2_SUPPRESS_KEY = 'stage2_suppress'
 
 
+def _write_error_code(resp: object) -> str:
+    """The stable aggregation code for an interceptor write this module
+    classified as rejected via ``interceptor_write_succeeded``.
+
+    ``error_type`` (a machine code, e.g. BacklogVerdict's
+    ``ReconciliationBacklogExceeded``) is preferred over ``error`` (a
+    rendered human message) so operators can aggregate journal rows and
+    ``hints_skipped`` actions by equality -- task 1215.  Rejection shapes
+    carrying neither key, and the non-dict shapes, collapse to
+    ``'unknown'`` so a queryable code is always recorded.
+
+    Sole owner of that precedence and that fallback: six call sites across
+    _on_task_blocked, _sweep_cancel_orphan, _sweep_block_orphan and
+    _unblock_dependent route through here, and hand-rolled copies had
+    already drifted apart on the fallback (task 4977 review).
+    """
+    code = (resp.get('error_type') or resp.get('error')) if isinstance(resp, dict) else None
+    return str(code) if code else 'unknown'
+
+
 class TargetedReconciler:
     """Lightweight reconciliation triggered by task state transitions."""
 
@@ -1031,9 +1051,7 @@ class TargetedReconciler:
                         causation_id=run_id,
                     )
                 else:
-                    # Prefer 'error_type' (stable machine-friendly code, e.g. BacklogVerdict)
-                    # over 'error' (rendered human message) for audit-query aggregation — task 1215.
-                    error_code = (resp.get('error_type') or resp.get('error')) if isinstance(resp, dict) else 'unknown'
+                    error_code = _write_error_code(resp)
                     reason = resp.get('reason') if isinstance(resp, dict) else None
                     result['actions'].append({
                         'type': 'hints_skipped',
@@ -1348,10 +1366,7 @@ class TargetedReconciler:
                 reopen_reason=reason,
             )
             if not interceptor_write_succeeded(resp):
-                error_code = (
-                    (resp.get('error_type') or resp.get('error'))
-                    if isinstance(resp, dict) else 'unknown'
-                ) or 'unknown'
+                error_code = _write_error_code(resp)
                 logger.warning(
                     'sweep: cancel rejected for orphan %s (parent %s): error=%r',
                     task_id, parent_id, error_code,
@@ -1361,7 +1376,7 @@ class TargetedReconciler:
                     {
                         'task_id': task_id,
                         'parent_id': parent_id,
-                        'type': 'descendant_cancel',
+                        'type': 'descendant_cancelled',
                         'error': error_code,
                     },
                     causation_id=run_id,
@@ -1372,15 +1387,30 @@ class TargetedReconciler:
                 {
                     'task_id': task_id,
                     'parent_id': parent_id,
-                    'type': 'descendant_cancel',
+                    'type': 'descendant_cancelled',
                     'new_status': 'cancelled',
                 },
                 causation_id=run_id,
             )
         except Exception as e:
+            # A raising write (db locked, interceptor timeout) is the failure
+            # class most worth investigating, so it leaves the same durable row
+            # as a gate rejection -- otherwise `WHERE action_type='skip'`
+            # silently under-counts exactly there.  add_run_action swallows its
+            # own exceptions (journal.py::add_run_action), so this cannot mask e.
             logger.warning(
                 'sweep: cancel failed for orphan %s (parent %s): %s',
                 task_id, parent_id, e,
+            )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'set_task_status',
+                {
+                    'task_id': task_id,
+                    'parent_id': parent_id,
+                    'type': 'descendant_cancelled',
+                    'error': str(e)[:200],
+                },
+                causation_id=run_id,
             )
             return None
         return {
@@ -1424,10 +1454,7 @@ class TargetedReconciler:
             # _unblock_veto_reason vetoes on exactly those keys, so stamping a
             # still-pending task would silently park it.
             if not interceptor_write_succeeded(resp_status):
-                error_code = (
-                    (resp_status.get('error_type') or resp_status.get('error'))
-                    if isinstance(resp_status, dict) else 'unknown'
-                ) or 'unknown'
+                error_code = _write_error_code(resp_status)
                 logger.warning(
                     'sweep: block (status) rejected for descendant %s '
                     '(parent %s): error=%r',
@@ -1438,7 +1465,7 @@ class TargetedReconciler:
                     {
                         'task_id': task_id,
                         'parent_id': parent_id,
-                        'type': 'descendant_block',
+                        'type': 'descendant_blocked',
                         'error': error_code,
                     },
                     causation_id=run_id,
@@ -1449,7 +1476,7 @@ class TargetedReconciler:
                 {
                     'task_id': task_id,
                     'parent_id': parent_id,
-                    'type': 'descendant_block',
+                    'type': 'descendant_blocked',
                     'new_status': 'blocked',
                 },
                 causation_id=run_id,
@@ -1458,6 +1485,16 @@ class TargetedReconciler:
             logger.warning(
                 'sweep: block (status) failed for descendant %s (parent %s): %s',
                 task_id, parent_id, e,
+            )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'set_task_status',
+                {
+                    'task_id': task_id,
+                    'parent_id': parent_id,
+                    'type': 'descendant_blocked',
+                    'error': str(e)[:200],
+                },
+                causation_id=run_id,
             )
             return None
 
@@ -1481,9 +1518,9 @@ class TargetedReconciler:
         # a rejection dict rather than raising, so a bare handler drops the
         # stamp silently under exactly the deep-backlog conditions this sweep
         # runs in, and _unblock_veto_reason reads the very keys it writes.  Full
-        # rationale for the capture/classify/mark pattern, the
-        # error_type-before-error precedence and the rejected-vs-failed split
-        # lives in targeted.py::_unblock_dependent.
+        # rationale for the capture/classify/mark pattern and the
+        # rejected-vs-failed split lives in targeted.py::_unblock_dependent;
+        # for the error code itself, in targeted.py::_write_error_code.
         try:
             resp_meta = await self.task_interceptor.update_task(
                 task_id=task_id,
@@ -1492,10 +1529,7 @@ class TargetedReconciler:
                 append=True,
             )
             if not interceptor_write_succeeded(resp_meta):
-                error_code = (
-                    (resp_meta.get('error_type') or resp_meta.get('error'))
-                    if isinstance(resp_meta, dict) else 'unknown'
-                ) or 'unknown'
+                error_code = _write_error_code(resp_meta)
                 logger.warning(
                     'sweep: block (metadata) rejected for descendant %s '
                     '(parent %s): error=%r',
@@ -1909,10 +1943,7 @@ class TargetedReconciler:
             # BacklogVerdict, which carries 'error'/'error_type' but no
             # 'success' key either) must not be reported as applied.
             if not interceptor_write_succeeded(resp):
-                error_code = (
-                    (resp.get('error_type') or resp.get('error'))
-                    if isinstance(resp, dict) else 'unknown'
-                )
+                error_code = _write_error_code(resp)
                 actual_status = resp.get('actual_status') if isinstance(resp, dict) else None
                 logger.warning(
                     'sweep: unblock rejected for dependent %s (satisfied by %s): '
@@ -2024,13 +2055,7 @@ class TargetedReconciler:
                     metadata_mode='merge',
                 )
                 if not interceptor_write_succeeded(resp_meta):
-                    # Stable machine code first, rendered message second --
-                    # the same precedence used for hints_skipped in
-                    # targeted.py::_on_task_blocked.
-                    error_code = (
-                        (resp_meta.get('error_type') or resp_meta.get('error'))
-                        if isinstance(resp_meta, dict) else 'unknown'
-                    ) or 'unknown'
+                    error_code = _write_error_code(resp_meta)
                     logger.warning(
                         'sweep: metadata stamp rejected for unblocked dependent %s '
                         '(satisfied by %s): error=%r',

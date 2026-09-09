@@ -2376,8 +2376,14 @@ class TestSweepCancelledDescendants:
 
     @staticmethod
     async def _taskmaster_rows(journal, action_type: str, operation: str) -> list[dict]:
-        """Real journal rows for one (action_type, operation) pair."""
-        runs = await journal.get_recent_runs('test-project', limit=1)
+        """Real journal rows for one (action_type, operation) pair.
+
+        ``limit`` is deliberately above 1 so the cardinality assertion below
+        can actually fail: under ``limit=1`` it could only ever catch zero
+        runs, silently narrowing every per-row count to whichever run came
+        back.  One reconcile_task call is one run.
+        """
+        runs = await journal.get_recent_runs('test-project', limit=5)
         assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
         rows = await journal.get_run_actions(runs[0].id)
         return [
@@ -2524,7 +2530,7 @@ class TestSweepCancelledDescendants:
         detail = status_skips[0]['detail']
         assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
         assert detail.get('parent_id') == 'A', f'Expected parent_id="A", got: {detail!r}'
-        assert detail.get('type') == 'descendant_block', f'got: {detail!r}'
+        assert detail.get('type') == 'descendant_blocked', f'got: {detail!r}'
         assert detail.get('error') == 'ReconciliationBacklogExceeded', (
             f'Expected the stable error_type code, got: {detail!r}'
         )
@@ -2560,7 +2566,7 @@ class TestSweepCancelledDescendants:
         assert len(status_writes) == 1, (
             f'Expected exactly one write/set_task_status row, got: {status_writes}'
         )
-        assert status_writes[0]['detail'].get('type') == 'descendant_block', (
+        assert status_writes[0]['detail'].get('type') == 'descendant_blocked', (
             f'got: {status_writes[0]["detail"]!r}'
         )
         assert status_writes[0]['detail'].get('task_id') == 'B', (
@@ -2614,7 +2620,7 @@ class TestSweepCancelledDescendants:
         )
         detail = skips[0]['detail']
         assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
-        assert detail.get('type') == 'descendant_cancel', (
+        assert detail.get('type') == 'descendant_cancelled', (
             f'Expected the cancel-branch discriminator, got: {detail!r}'
         )
         assert detail.get('error') == 'ReconciliationBacklogExceeded', (
@@ -2638,11 +2644,98 @@ class TestSweepCancelledDescendants:
             f'Expected exactly one write/set_task_status row, got: {writes}'
         )
         detail = writes[0]['detail']
-        assert detail.get('type') == 'descendant_cancel', f'got: {detail!r}'
+        assert detail.get('type') == 'descendant_cancelled', f'got: {detail!r}'
         assert detail.get('task_id') == 'B', f'got: {detail!r}'
 
         skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
         assert not skips, f'Expected no skip/set_task_status rows, got: {skips}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('tasks_key,action_type', [
+        pytest.param('_block_branch_tasks', 'descendant_blocked', id='block-branch'),
+        pytest.param('_cancel_branch_tasks', 'descendant_cancelled', id='cancel-branch'),
+    ])
+    async def test_status_write_exception_leaves_skip_row(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog, tasks_key, action_type,
+    ):
+        """A RAISING status write is journalled like a refused one.
+
+        Gate rejections and raises are two arms of the same decision, and the
+        raising arm (db locked, interceptor timeout) is the one an operator
+        most needs to see.  Journalling only the rejection arm would leave
+        `WHERE action_type='skip'` under-counting precisely there.  Both
+        branches also assert the success row is absent, pinning that the row
+        is emitted only for a landed write.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=getattr(self, tasks_key)())
+        mock_interceptor.set_task_status = AsyncMock(side_effect=RuntimeError('db locked'))
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        acted = self._descendant_actions(result, action_type)
+        assert not acted, f'A raising write must report no {action_type}; got: {acted}'
+        mock_interceptor.update_task.assert_not_called()
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the raising status write'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert len(skips) == 1, (
+            f'Expected exactly one skip/set_task_status row, got: {skips}'
+        )
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'got: {detail!r}'
+        assert detail.get('type') == action_type, (
+            f'Expected the journal type to match the action vocabulary, got: {detail!r}'
+        )
+        assert 'db locked' in str(detail.get('error')), (
+            f'Expected the raised message recorded, got: {detail!r}'
+        )
+
+        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert not writes, f'Nothing landed, so expected no write row; got: {writes}'
+
+    @pytest.mark.asyncio
+    async def test_cancel_no_op_response_counts_as_landed(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal, tmp_path,
+    ):
+        """The co-cancellation race the call site calls 'safely idempotent'.
+
+        targeted.py::_sweep_cancelled_descendants justifies having no
+        co-cancellation guard on this branch by the TaskInterceptor
+        same-status guard returning a no-op response.  That claim now depends
+        on interceptor_write_succeeded classifying that exact shape as
+        success -- were it ever read as a rejection, benign idempotent
+        re-cancels would start being dropped and only the comment would
+        disagree.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._cancel_branch_tasks())
+        mock_interceptor.set_task_status = AsyncMock(
+            return_value={'success': True, 'no_op': True, 'task_id': 'B'},
+        )
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        cancels = self._descendant_actions(result, 'descendant_cancelled')
+        assert len(cancels) == 1, (
+            f'A no-op re-cancel must still report the cancel, got: {result.get("actions")}'
+        )
+
+        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert len(writes) == 1, (
+            f'Expected exactly one write/set_task_status row, got: {writes}'
+        )
+        assert writes[0]['detail'].get('task_id') == 'B', f'got: {writes[0]!r}'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert not skips, f'A no-op is a landed write, not a skip; got: {skips}'
 
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
