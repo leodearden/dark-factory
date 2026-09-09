@@ -40,11 +40,19 @@ dependency to reach it. The module is not re-exported from
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
-__all__ = ['PrefixToken', 'find_prefix_tokens', 'substitute']
+__all__ = [
+    'UUID_PREFIX_OVERRIDE_KEY',
+    'PrefixToken',
+    'find_prefix_tokens',
+    'strip_uuid_prefix_override',
+    'substitute',
+    'uuid_prefix_override_requested',
+]
 
 
 #: The PRD §4-C1 grammar as ONE compiled expression. Both lookbehinds are
@@ -180,3 +188,83 @@ def _with_child(container: Any, key: str | int, child: Any) -> Any:
         copied[key] = child
         return copied
     return {**container, key: child}
+
+
+#: Declared opt-out for a deliberate bare prefix — a correction record quoting
+#: a bad citation verbatim, say.
+#:
+#: It lives in the DETECTOR module rather than the guard, which is the exact
+#: placement of ``MARKUP_OVERRIDE_KEY`` in ``shared/toolcall_markup.py`` and
+#: matters for the same reason: the flag has ONE lifecycle across TWO layers.
+#: The boundary guard honours it, and leaf γ's ``fused_memory/server/tools.py``
+#: must additionally strip it at its own write-time layer, exactly as
+#: ``allow_mcp_markup`` is stripped at both. Putting these three names in the
+#: guard would force a tool body to import a middleware module — and fastmcp
+#: with it — to reach a string constant and a five-line stripper.
+UUID_PREFIX_OVERRIDE_KEY = 'allow_uuid_prefix'
+
+
+def _as_metadata_dict(metadata: object) -> dict[str, Any] | None:
+    """Best-effort read of *metadata* as a dict, else ``None``.
+
+    ``submit_task``/``update_task`` accept metadata as an object OR a JSON
+    string, so both shapes are understood. Anything unparseable — malformed
+    JSON, a non-dict JSON payload, a wrong type entirely — yields ``None``
+    without raising: validating metadata is not this module's job, and a write
+    must never fail because an override helper choked on a field it does not
+    own.
+    """
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            parsed = json.loads(metadata)
+        except (ValueError, TypeError):
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def uuid_prefix_override_requested(metadata: object) -> bool:
+    """Return True iff *metadata* carries an explicit opt-in.
+
+    FAIL-CLOSED: only a literal boolean ``True`` counts, mirroring
+    ``markup_override_requested`` and add_memory's ``allow_near_duplicate``
+    check. A truthy-but-not-``True`` value (``'yes'``, ``1``) is far more
+    likely to be unrelated data than a considered decision to keep a bare
+    prefix out of the guard's reach — and failing closed costs the author one
+    resubmit, where failing open costs a silently unexpanded citation.
+
+    Never raises, for any input.
+    """
+    parsed = _as_metadata_dict(metadata)
+    if parsed is None:
+        return False
+    return parsed.get(UUID_PREFIX_OVERRIDE_KEY) is True
+
+
+def strip_uuid_prefix_override(metadata: Any) -> Any:
+    """Return *metadata* without :data:`UUID_PREFIX_OVERRIDE_KEY`, in the same shape.
+
+    The override is a call-time-only control flag: it must never be persisted
+    into stored memory metadata or the task metadata vocabulary. Returning the
+    shape it was given (dict in / dict out, JSON string in / JSON string out)
+    lets a call site substitute the result inline before forwarding downstream.
+
+    NON-mutating — the caller's own dict is left intact, since the handler may
+    still need the original and quietly mutating caller-owned metadata is
+    action-at-a-distance a guard should not introduce.
+
+    Unparseable input passes straight through unchanged, never raising.
+    """
+    if isinstance(metadata, dict):
+        if UUID_PREFIX_OVERRIDE_KEY not in metadata:
+            return metadata
+        return {k: v for k, v in metadata.items() if k != UUID_PREFIX_OVERRIDE_KEY}
+    if isinstance(metadata, str):
+        parsed = _as_metadata_dict(metadata)
+        if parsed is None or UUID_PREFIX_OVERRIDE_KEY not in parsed:
+            return metadata
+        return json.dumps({k: v for k, v in parsed.items() if k != UUID_PREFIX_OVERRIDE_KEY})
+    return metadata
