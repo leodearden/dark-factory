@@ -97,6 +97,27 @@ class TestDeliveredCheck:
         check = DeliveredCheck(kind='manual', reason='judged by test fixtures')
         assert check.reason == 'judged by test fixtures'
 
+    def test_path_check_present_constructs(self):
+        check = DeliveredCheck(
+            kind='path', expect='present', paths=['orchestrator/tests/test_x.py']
+        )
+        assert check.kind == 'path'
+        assert check.expect == 'present'
+        assert check.paths == ['orchestrator/tests/test_x.py']
+        assert check.pattern is None
+        assert check.script is None
+
+    def test_path_check_absent_constructs(self):
+        check = DeliveredCheck(kind='path', expect='absent', paths=['legacy/dead_module.py'])
+        assert check.expect == 'absent'
+        assert check.paths == ['legacy/dead_module.py']
+
+    def test_path_check_with_several_paths_constructs(self):
+        check = DeliveredCheck(
+            kind='path', expect='present', paths=['a/one.py', 'b/two.py', 'c/three.py']
+        )
+        assert check.paths == ['a/one.py', 'b/two.py', 'c/three.py']
+
     @pytest.mark.parametrize(
         'kwargs',
         [
@@ -185,6 +206,55 @@ class TestDeliveredCheck:
                 },
                 id='script_with_reason',
             ),
+            pytest.param({'kind': 'path', 'paths': ['a/one.py']}, id='path_missing_expect'),
+            pytest.param({'kind': 'path', 'expect': 'present'}, id='path_missing_paths'),
+            pytest.param(
+                {'kind': 'path', 'expect': 'present', 'paths': []}, id='path_empty_paths'
+            ),
+            pytest.param(
+                {'kind': 'path', 'expect': 'sideways', 'paths': ['a/one.py']},
+                id='path_expect_not_in_vocab',
+            ),
+            pytest.param(
+                {'kind': 'path', 'expect': 'present', 'paths': ['a/one.py'], 'pattern': 'foo'},
+                id='path_with_pattern',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'script': 'scripts/x.sh',
+                },
+                id='path_with_script',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'args': ['--flag'],
+                },
+                id='path_with_args',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'timeout_secs': 30,
+                },
+                id='path_with_timeout_secs',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'reason': 'nope',
+                },
+                id='path_with_reason',
+            ),
         ],
     )
     def test_invalid_specs_rejected(self, kwargs):
@@ -217,6 +287,23 @@ class TestDeliveredCheck:
         message = str(exc_info.value)
         assert 'grep' in message
         assert 'reason' in message
+
+    def test_error_names_kind_and_field_for_path_missing_paths(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(kind='path', expect='present')
+        message = str(exc_info.value)
+        assert 'path' in message
+        assert 'paths' in message
+
+    def test_error_names_kind_and_field_for_path_with_pattern(self):
+        # A path check asserts existence, never content: naming `pattern`
+        # alongside kind='path' is the exact grep/path confusion this kind
+        # exists to prevent, so the rejection must name both.
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(kind='path', expect='present', paths=['a/one.py'], pattern='foo')
+        message = str(exc_info.value)
+        assert 'path' in message
+        assert 'pattern' in message
 
 
 class TestManifestCapability:
@@ -799,8 +886,8 @@ tasks:
         ]
 
     def test_only_script_kind_is_extracted(self, tmp_path):
-        # grep / manual / a capability with NO delivered_check at all must
-        # neither be mistaken for a script check nor raise on the missing
+        # grep / path / manual / a capability with NO delivered_check at all
+        # must neither be mistaken for a script check nor raise on the missing
         # `delivered_check`.
         sidecar = self._write(
             tmp_path,
@@ -831,6 +918,14 @@ tasks:
         delivered_check:
           kind: manual
           reason: "covered by E8"
+      - name: "cap-path"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths:
+            - orchestrator/tests/test_x.py
       - name: "cap-unchecked"
         binding: "b"
         verdict: PASS
@@ -1465,9 +1560,56 @@ class TestDeliveredCheckMeta:
         assert check.script == 'scripts/x.sh'
         assert check.timeout_secs == 30
 
+    def test_path_entry_with_name_constructs(self):
+        check = DeliveredCheckMeta(
+            name='cap-three',
+            kind='path',
+            expect='present',
+            paths=['orchestrator/tests/test_x.py'],
+        )
+        assert check.name == 'cap-three'
+        assert check.kind == 'path'
+        assert check.expect == 'present'
+        assert check.paths == ['orchestrator/tests/test_x.py']
+
+    def test_path_entry_absent_constructs(self):
+        check = DeliveredCheckMeta(
+            name='cap-four', kind='path', expect='absent', paths=['legacy/dead.py']
+        )
+        assert check.expect == 'absent'
+
     def test_manual_kind_rejected(self):
         with pytest.raises(ValidationError):
             DeliveredCheckMeta(name='cap-one', kind='manual')  # type: ignore[arg-type]
+
+    def test_path_missing_expect_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='path', paths=['a/one.py'])
+
+    def test_path_missing_paths_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present')
+
+    def test_path_empty_paths_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present', paths=[])
+
+    def test_path_with_script_field_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(
+                name='cap-one',
+                kind='path',
+                expect='present',
+                paths=['a/one.py'],
+                script='scripts/x.sh',
+            )
+
+    def test_path_error_names_deliveredcheckmeta_and_the_field(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present')
+        message = str(exc_info.value)
+        assert 'DeliveredCheckMeta' in message
+        assert 'paths' in message
 
     def test_missing_name_rejected(self):
         with pytest.raises(ValidationError):
