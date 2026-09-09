@@ -1403,6 +1403,7 @@ class TestOrchestratorConfigSccache:
         config = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
         assert config.effective_verify_env == config.verify_env
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_effective_verify_env_merges_sccache_backend(self):
         config = OrchestratorConfig(
             verify_env={'RUSTC_WRAPPER': 'sccache'},
@@ -1413,6 +1414,7 @@ class TestOrchestratorConfigSccache:
             'SCCACHE_REDIS': 'redis://h:6379',
         }
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_verify_env_wins_on_key_conflict(self):
         """verify_env values beat backend_env values on shared keys."""
         config = OrchestratorConfig(
