@@ -375,7 +375,8 @@ def _designated_ids(slate_ids: list[str], band_canonical: Any) -> list[str]:
     """Slate ids usable as a designation: distinguishable from the band's own.
 
     A designation equal to the band canonical proves nothing — main already
-    attaches there — so those are dropped rather than measured.
+    attaches there — so those are dropped rather than measured. Two are needed
+    for the swap; see :func:`_swap_verdict`.
     """
     seen: dict[str, None] = {}
     for ident in slate_ids:
@@ -415,11 +416,44 @@ def _first_few(reasons: list[str], limit: int = 4) -> str:
     return shown
 
 
+def _swap_verdict(
+    module: Any,
+    spelling: _Spelling,
+    designations: tuple[str, str],
+) -> str | None:
+    """None when the attach TRACKED both designations; a reason otherwise.
+
+    THE SWAP, and why one run is not enough. A single run whose attach id
+    merely differs from the band's canonical is satisfied by any hard-coded
+    position — an implementation that always attaches to the last slate entry
+    is not the band's top-1 either. Requiring the attach to follow TWO
+    different designations makes the assertion about the DEPENDENCY rather than
+    about a value, so it accepts any mechanism that genuinely threads the
+    designation and rejects every fixed choice.
+
+    Both halves are necessary: matching one designation alone could be
+    coincidence, and differing between runs without matching either means the
+    attach is tracking something else entirely.
+    """
+    for designated in designations:
+        judge = _FakeJudge(spelling.payload(_ATTACH_OUTCOME, designated))
+        run = _drive(module, judge)
+        if run.error is not None:
+            return run.error
+        observed = getattr(run.decision, 'canonical_id', None)
+        if observed != designated:
+            return (
+                f'the attach landed on {observed!r}; it did not track the '
+                f'designated candidate {designated!r}'
+            )
+    return None
+
+
 def _search_spellings(
     module: Any,
-    designated: str,
+    designations: tuple[str, str],
 ) -> tuple[_Spelling | None, list[str]]:
-    """Try every designation spelling; return the first that is CONSUMED.
+    """Try every designation spelling; return the first the attach CONSUMES.
 
     Mirrors the discipline of item 1's ``_search_option_b``: a spelling the
     implementation ignores simply is not the winner, and the whole search is
@@ -428,18 +462,10 @@ def _search_spellings(
     """
     attempts: list[str] = []
     for spelling in _SPELLINGS:
-        judge = _FakeJudge(spelling.payload(_ATTACH_OUTCOME, designated))
-        run = _drive(module, judge)
-        if run.error is not None:
-            attempts.append(f'{spelling.label} — {run.error}')
-            continue
-        observed = getattr(run.decision, 'canonical_id', None)
-        if observed == designated:
+        reason = _swap_verdict(module, spelling, designations)
+        if reason is None:
             return spelling, attempts
-        attempts.append(
-            f'{spelling.label} — the attach landed on {observed!r}, not the '
-            f'designated {designated!r}',
-        )
+        attempts.append(f'{spelling.label} — {reason}')
     return None, attempts
 
 
@@ -455,19 +481,25 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
         f'slate: {slate_ids!r} — band canonical {band_canonical!r}',
     )
     usable = _designated_ids(slate_ids, band_canonical)
-    if not usable:
+    if len(usable) < 2:
+        # UNVERIFIABLE, never PASS. With fewer than two candidates that are
+        # distinguishable from the band's own canonical there is nothing here
+        # that could tell a correct fix from a hard-coded position.
         raise _Unverifiable(
-            f'the slate {slate_ids!r} carries no candidate distinguishable from '
-            f'the band canonical {band_canonical!r}; there is nothing here that '
-            'could tell a correct fix from an attach that simply used the band',
+            f'the slate {slate_ids!r} carries fewer than two candidates '
+            f'distinguishable from the band canonical {band_canonical!r}, so '
+            'no swap is possible and nothing here could tell a correct fix '
+            'from an attach that simply used a fixed slot',
         )
 
-    designated = usable[0]
-    winner, attempts = _search_spellings(module, designated)
+    # Chosen from the MEASURED slate at runtime rather than by fixed index, and
+    # taken from opposite ends so the pair is as far apart as the slate allows.
+    designations = (usable[0], usable[-1])
+    winner, attempts = _search_spellings(module, designations)
     if winner is not None:
         out.append(
-            f'designation channel: {winner.label} — the attach tracked the '
-            f'candidate the judge designated ({designated!r})',
+            f'designation channel: {winner.label} — the attach tracked both '
+            f'designated candidates {designations!r}',
         )
         out.append(_PASS_MARKER)
         return EXIT_OK
@@ -476,7 +508,7 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     out.append(_FAIL_MARKER)
     out.append(
         f'      band canonical {band_canonical!r}; the judge designated '
-        f'{designated!r}; no designation spelling reached the attach.',
+        f'{designations!r}; no designation spelling reached the attach.',
     )
     out.append(
         '      A verdict earned by one candidate is filed against another, so the',
