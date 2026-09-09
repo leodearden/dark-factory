@@ -57,6 +57,7 @@ from fastmcp.server.middleware import Middleware
 # reportMissingImports.
 from fastmcp.tools.base import ToolResult
 
+from shared.storm_counter import StormCounter
 from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute
 
 __all__ = [
@@ -74,6 +75,7 @@ __all__ = [
     'ResolutionOutcome',
     'ResolverUnavailable',
     'ToolClass',
+    'UUID_PREFIX_STORM_ERROR_TYPE',
     'UuidPrefixGuardMiddleware',
 ]
 
@@ -243,8 +245,15 @@ _FACT_OUTCOME: Mapping[PrefixAction, FactOutcome] = MappingProxyType(
     {
         PrefixAction.SUBSTITUTE_AND_FORWARD: 'expanded',
         PrefixAction.REJECT_WITH_CANDIDATES: 'rejected',
+        PrefixAction.FORWARD_WITH_CANDIDATES: 'forwarded_ambiguous',
     }
 )
+
+
+#: How a fired burst names itself to the escalation sink. The sink owns dedup
+#: against an open escalation in the target queue — knowledge this layer does
+#: not have and must not guess at — so this is a name, not a decision.
+UUID_PREFIX_STORM_ERROR_TYPE = 'uuid_prefix_boundary_storm'
 
 
 #: The escape from a rejection, and the ONLY action available to the caller.
@@ -313,6 +322,22 @@ def _substitution_record(planned: _Planned) -> dict[str, Any]:
     }
 
 
+def _ambiguity_record(planned: _Planned) -> dict[str, Any]:
+    """One entry of ``meta.uuid_prefix_repair.ambiguous``.
+
+    The same ``field``/``path`` pair a substitution carries, so a consumer
+    reads one location vocabulary across both keys — but ``from``/``to`` are
+    absent because nothing moved, and the candidates are here instead so the
+    author can still see what the citation could have meant.
+    """
+    return {
+        'field': _field(planned.token),
+        'path': list(planned.token.path),
+        'token': planned.token.token,
+        'candidates': [candidate._asdict() for candidate in planned.resolution.candidates],
+    }
+
+
 class UuidPrefixGuardMiddleware(Middleware):
     """Resolve and police truncated-uuid prefixes at the FastMCP boundary.
 
@@ -365,6 +390,15 @@ class UuidPrefixGuardMiddleware(Middleware):
         self._storm_threshold = storm_threshold
         self._storm_window_seconds = storm_window_seconds
         self._storm_time_provider = time_provider
+        # ONE COUNTER PER KEY, not one counter with a composed label. MEASURED
+        # (``mcp_markup_middleware``): StormCounter holds a single deque and a
+        # single _last_fire_ts, so its count spans EVERY event in the window
+        # regardless of label — a label buys per-key ATTRIBUTION, never a
+        # per-key THRESHOLD. Pooling here would fire an alarm naming a project
+        # or an outcome that never burst, and an operator sent chasing a burst
+        # that did not happen learns to ignore the alarm. The class itself is
+        # untouched and gains no fourth copy (INV-5).
+        self._storms: dict[str, StormCounter] = {}
 
     # -- the hook ---------------------------------------------------------
 
@@ -535,6 +569,12 @@ class UuidPrefixGuardMiddleware(Middleware):
         if expansions:
             report['substitutions'] = [_substitution_record(p) for p in expansions]
 
+        ambiguities = tuple(p for p in plan if p.action is PrefixAction.FORWARD_WITH_CANDIDATES)
+        if ambiguities:
+            report['ambiguous'] = [_ambiguity_record(p) for p in ambiguities]
+
+        await self._record_storms(plan, project, report)
+
         self._expand(arguments, expansions)
         return await self._forward(context, call_next, report)
 
@@ -704,3 +744,95 @@ class UuidPrefixGuardMiddleware(Middleware):
         if self._fact_sink is None:
             return
         await self._call_sink(self._fact_sink, fact, 'fact')
+
+    # -- the storm escape (INV-4) -----------------------------------------
+
+    async def _record_storms(
+        self, plan: tuple[_Planned, ...], project: str, report: dict[str, Any]
+    ) -> None:
+        """Count the fail-soft outcomes this call absorbed, once each.
+
+        Per CALL, not per site. A storm counts WRITES the boundary absorbed,
+        and one call citing three ambiguous ids is one authoring event —
+        counting citations would let a single verbose write trip the alarm on
+        its own and teach an operator to ignore it.
+
+        Only :data:`STORM_COUNTED_OUTCOMES` is counted, and `expanded` is never
+        handed to a counter AT ALL rather than being given a high threshold. A
+        threshold is a number some future edit can move; not passing the value
+        is a shape that edit would have to invent.
+
+        At most one storm-counted outcome can be present in one call — a
+        resolver outage aborts the whole resolve phase, so `resolver_unavailable`
+        and `forwarded_ambiguous` cannot co-occur — which is why ``report``
+        carries a single ``storm`` key rather than a list.
+        """
+        absorbed = {_FACT_OUTCOME[planned.action] for planned in plan} & STORM_COUNTED_OUTCOMES
+        for outcome in sorted(absorbed):
+            storm = await self._record_storm(outcome, project)
+            if storm is not None:
+                report['storm'] = storm
+
+    async def _record_storm(self, outcome: str, project: str) -> dict[str, Any] | None:
+        """Count this outcome; escalate and return a summary iff a burst fired.
+
+        Keyed by ``(project, outcome)`` as a single string, which is the key
+        the counter dict is indexed by and the label the summary is attributed
+        with — one spelling, so the two cannot disagree.
+
+        Threshold and window are passed PER CALL, honouring ``StormCounter``'s
+        reload-safety contract, so a registration site backed by a green-tier
+        config leaf can read them live rather than capturing them here.
+        """
+        key = f'{project}\x1f{outcome}'
+        counter = self._storms.get(key)
+        if counter is None:
+            counter = StormCounter(time_provider=self._storm_time_provider)
+            self._storms[key] = counter
+
+        summary = counter.record(
+            threshold=self._storm_threshold,
+            window_seconds=self._storm_window_seconds,
+            label=key,
+        )
+
+        # One counter per key means one object per key ever seen, and `project`
+        # is caller-supplied — so sweep the dormant ones, exactly as the
+        # MemoryService consumer StormCounter.prune() was written for.
+        for other, dormant in list(self._storms.items()):
+            if other != key and dormant.prune(self._storm_window_seconds) == 0:
+                del self._storms[other]
+
+        if summary is None:
+            return None
+
+        storm = {
+            'count': summary['count'],
+            'threshold': summary['threshold'],
+            'window_seconds': summary['window_seconds'],
+            'outcome': outcome,
+            'project': project,
+        }
+        # ERROR and greppable. The summary folded into the response reaches
+        # ONLY the caller, which is the one party that already knows something
+        # happened, so the operator-facing half cannot ride on it.
+        logger.error(
+            'uuid_prefix_guard_storm: %d %s outcome(s) in %ss for project=%r',
+            storm['count'], outcome, storm['window_seconds'], project,
+        )
+        await self._file_storm_escalation(storm)
+        return storm
+
+    async def _file_storm_escalation(self, storm: dict[str, Any]) -> None:
+        """Hand the burst to the injected sink; never change an outcome.
+
+        No dedup here. Dedup is against an OPEN escalation in the target queue,
+        which is knowledge this layer does not have and must not guess at.
+        """
+        if self._escalation_sink is None:
+            return
+        await self._call_sink(
+            self._escalation_sink,
+            {'error_type': UUID_PREFIX_STORM_ERROR_TYPE, **storm},
+            'escalation',
+        )
