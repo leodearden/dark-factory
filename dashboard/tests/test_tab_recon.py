@@ -415,3 +415,64 @@ class TestReconInProgressTile:
             'rules are all repeat(N, minmax(0, 1fr)) with N matching the class '
             'name, and a mismatch here would silently mis-size every tile.'
         )
+
+
+class TestReconStatusLiteralsAreGone:
+    """The invariant that closes the task: after the Recent Runs badge is
+    converted, ReconTab CONSUMES the run vocabulary and RESTATES none of it.
+
+    This is the property that would have prevented the original defect. Two
+    call sites in this one file disagreed about the same statuses — the rate
+    tile accepted only 'success' while the badge accepted 'success' OR
+    'completed' — and neither matched what journal.py writes. With every
+    literal sourced from recon_status.js, they cannot drift apart again.
+    """
+
+    def test_scope_is_really_recon_tab(self, recon_tab_code):
+        """Vacuity guard for the absence assertions below.
+
+        extract_function_body raises on a miss, so the body cannot be empty —
+        but it could in principle be the WRONG function's, and absence
+        assertions over an unrelated body would pass while proving nothing.
+        """
+        assert recon_tab_code.strip(), 'ReconTab body is empty'
+        assert 'reconRunCounts' in recon_tab_code, (
+            'the extracted body does not call reconRunCounts — this is not '
+            "ReconTab's body, so the absence assertions below prove nothing."
+        )
+
+    def test_recent_runs_badge_tone_comes_from_the_module(self, recon_tab_code):
+        """The per-row badge class must be computed by reconStatusTone."""
+        assert re.search(r'badge \$\{reconStatusTone\(', recon_tab_code), (
+            'the Recent Runs status badge does not derive its class from '
+            'reconStatusTone(...).'
+        )
+
+    def test_badge_status_ternary_is_gone(self, recon_tab_code):
+        """The chained ternary that hard-coded three literals must be gone."""
+        assert 'rn.status ===' not in recon_tab_code, (
+            'the Recent Runs badge still branches on rn.status literals '
+            'instead of delegating to reconStatusTone.'
+        )
+
+    def test_no_run_status_literal_survives_anywhere_in_recon_tab(
+        self, recon_tab_code
+    ):
+        """No vocabulary member, and neither retired spelling, may appear.
+
+        Deliberately stronger than "no comparison": a literal in a label, a
+        className or a filter is the same duplication with a different shape.
+        The rendered badge TEXT is `{rn.status}` — the raw store value — so an
+        unrecognised status still shows its own name under a muted tone
+        rather than being hidden or relabelled, which is why no literal is
+        needed here at all.
+        """
+        survivors = [
+            lit for lit in RECON_STATUS_LITERALS
+            if f"'{lit}'" in recon_tab_code
+        ]
+        assert survivors == [], (
+            f'ReconTab still hard-codes the run-status literal(s) {survivors} '
+            '— every one of them must come from recon_status.js, or two call '
+            'sites in this file can disagree about the same window again.'
+        )
