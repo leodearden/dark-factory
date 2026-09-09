@@ -21,7 +21,10 @@ Two properties are load-bearing here and pinned as such:
 
 import pytest
 
-from fused_memory.server.consolidation import validate_consolidate_args
+from fused_memory.server.consolidation import (
+    ProposalLimits,
+    validate_consolidate_args,
+)
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN
 
 _A = '11111111-1111-4111-8111-111111111111'
@@ -315,3 +318,251 @@ class TestDeleteArmRequiresRunId:
 
         assert '873889a1' in err['error']
         assert 'run_id' in err['error']
+
+
+_SHORT = 'Stage one keeps reproposing the identical cluster'          # 7 words
+_OK = 'Stage one keeps reproposing the identical unaddressed cluster'  # 8 words
+_LIMITS = ProposalLimits(claim_max_chars=200, member_min=2, member_max=20)
+
+
+def _ids(n: int) -> list[str]:
+    """*n* distinct well-formed UUIDs, deterministic so failures are readable."""
+    return [f'{i:08x}-0000-4000-8000-000000000000' for i in range(n)]
+
+
+def _propose(**overrides):
+    """Validate a well-formed PROPOSAL arg set with *overrides* applied.
+
+    The proposal shape carries no `canonical_content` (task gamma's tool has
+    not written one yet — it is proposing that the cluster be consolidated at
+    all) and no delete arm, so `supersedes` and `run_id` stay absent.
+    """
+    kwargs = {
+        'canonical_content': None,
+        'topic': _TOPIC,
+        'supersedes': None,
+        'retain': _ids(5),
+        'run_id': None,
+        'claim': _OK,
+        'limits': _LIMITS,
+    }
+    kwargs.update(overrides)
+    return validate_consolidate_args(**kwargs)
+
+
+class TestOpArmIsUnchanged:
+    """The five existing parameters and the op arm's behaviour are untouched.
+
+    `limits=None` selects the op shape, which is what `server/tools.py`'s
+    `consolidate_memories` passes by omission — so the tool needs no edit and
+    stays out of this task's file set.
+    """
+
+    def test_a_valid_op_call_still_passes_unchanged(self):
+        assert _call() == (None, [_A, _B], [])
+
+    def test_a_refused_op_call_is_byte_identical_to_today(self):
+        """Explicit `limits=None` must be indistinguishable from omitting it."""
+        assert _call(topic='memory_consolidation') == validate_consolidate_args(
+            canonical_content=_CONTENT,
+            topic='memory_consolidation',
+            supersedes=[_A, _B],
+            retain=None,
+            run_id=_RUN,
+            claim=None,
+            limits=None,
+        )
+
+    def test_a_claim_without_limits_is_refused_by_name(self):
+        """Fails CLOSED on a mis-wired caller rather than silently ignoring the
+        claim — a silently dropped claim is a silently skipped cap, which is
+        the whole reason the caps exist."""
+        err, _, _ = _call(claim=_OK)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'claim' in err['error']
+        assert 'limits' in err['error']
+
+
+class TestProposalArm:
+    """`limits is not None` selects the proposal shape (PRD C1).
+
+    Checked at the EMIT boundary, so the LLM that wrote a mis-shaped claim can
+    fix it in-turn rather than having a downstream executor discover it.
+    """
+
+    def test_a_well_formed_proposal_passes(self):
+        err, supersedes, retain = _propose()
+
+        assert err is None, err
+        assert supersedes == []
+        assert retain == _ids(5)
+
+    def test_canonical_content_is_not_required(self):
+        """The op arm's own requirement must not leak into this one: a
+        proposal has no canonical text yet, by construction."""
+        err, _, _ = _propose(canonical_content=None)
+
+        assert err is None, err
+
+    def test_a_missing_claim_is_refused(self):
+        err, _, _ = _propose(claim=None)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    def test_a_malformed_topic_is_still_refused(self):
+        """The topic rule is shared by both arms — one namespace, one check."""
+        err, _, _ = _propose(topic='memory_consolidation')
+
+        assert err is not None
+        assert 'topic' in err['error']
+
+    # --- claim shape: one executing test per rule ---
+
+    def test_a_multi_line_claim_is_refused(self):
+        claim = 'Stage one keeps reproposing\nthe identical unaddressed cluster'
+        err, _, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+        assert 'single line' in err['error']
+
+    def test_a_claim_over_the_cap_is_refused(self):
+        claim = _OK + ' ' + 'z' * (_LIMITS.claim_max_chars - len(_OK))
+        assert len(claim) == _LIMITS.claim_max_chars + 1
+
+        err, _, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert str(_LIMITS.claim_max_chars) in err['error']
+
+    def test_a_claim_exactly_at_the_cap_is_accepted(self):
+        """The bound is INCLUSIVE — an off-by-one here silently costs the
+        caller a character of the only text that reaches the canonical."""
+        claim = _OK + ' ' + 'z' * (_LIMITS.claim_max_chars - len(_OK) - 1)
+        assert len(claim) == _LIMITS.claim_max_chars
+
+        err, _, _ = _propose(claim=claim)
+
+        assert err is None, err
+
+    def test_a_bracketed_claim_is_refused(self):
+        """The B6 shape, and what makes a correction-banner body unusable as a
+        claim: a banner opens with `[CORRECTION ...]`, so a claim lifted from
+        one would carry the banner into the canonical's first paragraph."""
+        claim = '[CORRECTION 2026-09-08] Stage one keeps reproposing the cluster'
+        err, _, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'INDEX of the dashboard js test substrate cluster records',
+            'CANONICAL: memory consolidation ratchet grew once per pass here',
+        ],
+    )
+    def test_a_label_shaped_claim_is_refused(self, claim):
+        """A claim is an ASSERTION, not a heading. A label-shaped opening reads
+        as a title in the canonical's first paragraph, which is the position
+        PRD §2 measured the retrieval property out of."""
+        err, _, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'Indexing the cluster is cheaper than reading every duplicate record',
+            'Canonicalisation of the topic happened before the gate was ever filed',
+        ],
+    )
+    def test_an_ordinary_claim_beginning_with_those_words_is_accepted(self, claim):
+        """The `\\b` and the case-sensitivity are the point: the rule refuses the
+        LABEL `INDEX —`, not every sentence that starts with the same letters."""
+        err, _, _ = _propose(claim=claim)
+
+        assert err is None, err
+
+    def test_a_claim_that_only_echoes_the_slug_is_refused(self):
+        """A claim built entirely from the topic's own words and stopwords
+        asserts nothing the slug did not already say, so the canonical it
+        would open carries no claim at all."""
+        claim = (
+            'The memory consolidation is a consolidation of the memory for all '
+            'of these'
+        )
+        err, _, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    def test_a_claim_reusing_slug_words_with_real_content_is_accepted(self):
+        """Reusing the topic's words is normal and must not be punished — only
+        saying NOTHING ELSE is refused."""
+        claim = (
+            'The memory consolidation ratchet grew by one canonical per '
+            'reconciliation pass until gate 3200'
+        )
+        err, _, _ = _propose(claim=claim)
+
+        assert err is None, err
+
+    def test_a_seven_word_claim_is_refused_and_eight_is_accepted(self):
+        """The boundary, both sides, so an off-by-one cannot pass unnoticed."""
+        short_err, _, _ = _propose(claim=_SHORT)
+        ok_err, _, _ = _propose(claim=_OK)
+
+        assert short_err is not None
+        assert ok_err is None, ok_err
+
+    # --- member-count range ---
+
+    @pytest.mark.parametrize('count', [1, 21])
+    def test_a_member_count_outside_the_range_is_refused(self, count):
+        err, _, _ = _propose(retain=_ids(count))
+
+        assert err is not None
+        assert str(count) in err['error']
+        assert 'retain' in err['error']
+
+    @pytest.mark.parametrize('count', [2, 20])
+    def test_the_member_count_bounds_are_inclusive(self, count):
+        err, _, _ = _propose(retain=_ids(count))
+
+        assert err is None, err
+
+    def test_the_limits_are_read_from_the_argument_not_a_default(self):
+        """ProposalLimits carries NO defaults: the numbers have exactly one
+        home (ConsolidationAutoConfig) and a default here would be a second."""
+        err, _, _ = _propose(retain=_ids(5), limits=ProposalLimits(200, 6, 20))
+
+        assert err is not None
+        assert '5' in err['error']
+
+    # --- the no-short-circuit bar ---
+
+    def test_every_offender_is_named_in_one_error(self):
+        """PRD C1's reason for checking at the emit boundary: the LLM fixes its
+        shape IN-TURN, which it can only do if one refusal names every fault."""
+        claim = 'INDEX\n' + 'x' * 300
+        err, _, _ = _propose(claim=claim, retain=_ids(1))
+
+        assert err is not None
+        assert 'single line' in err['error'], err['error']
+        assert str(_LIMITS.claim_max_chars) in err['error'], err['error']
+        assert 'INDEX' in err['error'], err['error']
+        assert '8' in err['error'], err['error']
+        assert 'retain' in err['error'], err['error']
+
+    def test_the_hint_names_the_shape_rules(self):
+        """PRD D3: the emitting stage needs something actionable, not just a
+        list of what it got wrong."""
+        err, _, _ = _propose(claim=_SHORT)
+
+        assert err['hint']
+        assert 'claim' in err['hint']
