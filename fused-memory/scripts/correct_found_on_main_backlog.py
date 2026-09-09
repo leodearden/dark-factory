@@ -58,37 +58,24 @@ Usage
 
 WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
 -------------------------------------------------------------
-``--project-root`` must name a checkout that ALREADY HAS a task store;
-:func:`_run` refuses otherwise.
-``fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.get_tasks``
-auto-creates ``.taskmaster/tasks/tasks.db`` and returns ``{"tasks": []}`` for
-ANY ``project_root``, never raising -- so a task worktree, which has no
-``.taskmaster/`` at all, yields an empty task tree, zero corrections and exit
-0.  That is a false all-clear indistinguishable from a backlog with nothing to
-correct.  Task 2738 reached the same reading about the same auto-create from a
-different consumer
-(``fused_memory/reconciliation/stages/task_knowledge_sync.py``): "a false
-census, not a genuinely empty project".
+:func:`_run` refuses, before it constructs a backend, unless ``--project-root``
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists.  A task
+worktree has none, and merely reaching ``get_tasks`` would create one empty and
+report zero corrections -- indistinguishable from a backlog with nothing to
+correct.
 
-The guard RAISES rather than returning an exit code, which is the same property
-:func:`_apply_exit_code` already exists to protect: task 1175's whole lesson is
-that a "successful"-looking exit must never mask a write that did not land.
-The guard EXTENDS that to "I was pointed at the wrong checkout" -- ``0`` still
-means a clean run against a store that really existed -- rather than punching a
-hole in it.
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
 
-WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE, only this one.  The mem0-shaped
-``store_mutation_preflight.py::assert_store_mutation_allowed`` guards a
-mutation torn across TWO substrates under opposite confinement.  tasks.db has
-no such tear, and this file already carries the in-repo evidence for that:
-:func:`_apply_reopen`'s docstring records that task 2649's
+The in-repo evidence that tasks.db needs no SECOND, mem0-shaped preflight is
+this file's own, which is why it is recorded here and not only there:
+:func:`_apply_reopen`'s docstring notes that task 2649's
 ``sqlite_task_backend.py::SqliteTaskBackend.set_status_and_stamp_audit`` writes
 the status flip and both audit trails in a SINGLE call where "every one of them
-commits or rolls back together", which is why there is no partial state to
-separately reconcile.  Nor would a capability probe help: in the failing case
-the target directory is perfectly writable, so a probe would pass exactly when
-the danger is present.  ``fused_memory/utils/target_store_preflight.py`` is the
-normative home for that reasoning.
+commits or rolls back together" -- so there is no torn write here to guard.
+
 """
 
 from __future__ import annotations
@@ -102,11 +89,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from fused_memory.utils.target_store_preflight import (
-    TargetStoreMissing,
-    assert_target_store_exists,
-    task_store_path,
-)
+from fused_memory.utils.target_store_preflight import assert_task_store_exists
 
 logger = logging.getLogger('correct_found_on_main_backlog')
 
@@ -495,28 +478,7 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    try:
-        assert_target_store_exists(
-            task_store_path(args.project_root),
-            operation='correct_found_on_main_backlog',
-            what='the project task store (tasks.db)',
-            remedy=(
-                'pass the MAIN checkout as --project-root. A task worktree has no '
-                '.taskmaster/ (it is neither present in nor tracked by one), and '
-                'SqliteTaskBackend.get_tasks auto-creates an empty tasks.db and '
-                'returns {"tasks": []} for ANY --project-root rather than raising.'
-            ),
-        )
-    except TargetStoreMissing:
-        logger.error(
-            'correct_found_on_main_backlog: NOT started (fail-closed) — no task '
-            'store under --project-root %r. Proceeding would create an empty '
-            'tasks.db and report zero corrections, which is indistinguishable from '
-            'a backlog with nothing to correct. Pass the main checkout as '
-            '--project-root.',
-            args.project_root,
-        )
-        raise
+    assert_task_store_exists(args.project_root, operation='correct_found_on_main_backlog')
 
     import os  # noqa: PLC0415
 

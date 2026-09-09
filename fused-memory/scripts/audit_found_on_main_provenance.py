@@ -59,34 +59,26 @@ Usage
 
 WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
 -------------------------------------------------------------
-``--project-root`` must name a checkout that ALREADY HAS a task store;
-:func:`_run` refuses otherwise.
-``fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.get_tasks``
-auto-creates ``.taskmaster/tasks/tasks.db`` and returns ``{"tasks": []}`` for
-ANY ``project_root``, never raising -- so a task worktree, which has no
-``.taskmaster/`` at all, yields an empty task tree and a clean, empty report.
-That is a false all-clear indistinguishable from a project with nothing
-flagged.  Task 2738 reached the same reading about the same auto-create from a
-different consumer
-(``fused_memory/reconciliation/stages/task_knowledge_sync.py``): "a false
-census, not a genuinely empty project".
+:func:`_run` refuses, before it constructs a backend, unless ``--project-root``
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists.  A task
+worktree has none, and merely reaching ``get_tasks`` would create one empty and
+print a clean, empty report -- indistinguishable from a project with nothing
+flagged.
 
-A REFUSAL IS NOT AN EXIT CODE.  ``--fail-on-findings`` gives :func:`_run` a
-0/1/2 ladder (clean / apply errors / flagged findings) whose whole purpose is
-that a clean exit only ever means "nothing flagged", and
-``scripts/check_found_on_main_spurious_rate.py`` wraps this script as a CI
-predicate reading it.  The guard therefore RAISES ``TargetStoreMissing`` rather
-than returning any of those codes: a wrapper author must never be able to
-mistake "I was pointed at the wrong checkout" for "clean".
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
 
-The guard fires BEFORE the scan and before the backend is constructed --
-reaching ``get_tasks`` is precisely what creates the empty db.  It is an
-EXISTENCE assertion, not a write probe: in the failing case the target
-directory is perfectly writable, so a probe would pass exactly when the danger
-is present.  ``fused_memory/utils/target_store_preflight.py`` is the normative
-home for that reasoning, and for why the mem0-shaped
-``store_mutation_preflight.py::assert_store_mutation_allowed`` is correctly
-absent here.
+THE WRAPPER DOES NOT INHERIT THIS (measured, task 4319).
+``scripts/check_found_on_main_spurious_rate.py::_run`` does NOT invoke
+:func:`_run` and never reads its ``--fail-on-findings`` 0/1/2 ladder: it
+imports :func:`build_audit_report` and constructs its OWN ``SqliteTaskBackend``,
+calling ``get_tasks(args.project_root)`` directly.  So that predicate -- whose
+exit 0 means "check passed" -- remains exposed to the same false all-clear this
+guard closes here.  Covering it was outside task 4319's lock scope and is filed
+as follow-up; do not read the guard below as protecting it.
+
 """
 
 from __future__ import annotations
@@ -103,11 +95,7 @@ from typing import Any
 
 from shared.task_metadata import parse_metadata
 
-from fused_memory.utils.target_store_preflight import (
-    TargetStoreMissing,
-    assert_target_store_exists,
-    task_store_path,
-)
+from fused_memory.utils.target_store_preflight import assert_task_store_exists
 
 logger = logging.getLogger('audit_found_on_main_provenance')
 
@@ -962,28 +950,7 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    try:
-        assert_target_store_exists(
-            task_store_path(args.project_root),
-            operation='audit_found_on_main_provenance',
-            what='the project task store (tasks.db)',
-            remedy=(
-                'pass the MAIN checkout as --project-root. A task worktree has no '
-                '.taskmaster/ (it is neither present in nor tracked by one), and '
-                'SqliteTaskBackend.get_tasks auto-creates an empty tasks.db and '
-                'returns {"tasks": []} for ANY --project-root rather than raising.'
-            ),
-        )
-    except TargetStoreMissing:
-        logger.error(
-            'audit_found_on_main_provenance: NOT started (fail-closed) — no task '
-            'store under --project-root %r. Proceeding would create an empty '
-            'tasks.db and print a clean, empty report, which is indistinguishable '
-            'from a project with nothing flagged. Pass the main checkout as '
-            '--project-root.',
-            args.project_root,
-        )
-        raise
+    assert_task_store_exists(args.project_root, operation='audit_found_on_main_provenance')
 
     import os  # noqa: PLC0415
 

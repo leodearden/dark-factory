@@ -34,28 +34,16 @@ Usage
 
 WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
 -------------------------------------------------------------
-``--project-root`` must name a checkout that ALREADY HAS a task store;
-:func:`_run` refuses otherwise.
-``fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.get_tasks``
-auto-creates ``.taskmaster/tasks/tasks.db`` and returns ``{"tasks": []}`` for
-ANY ``project_root``, never raising -- so a task worktree, which has no
-``.taskmaster/`` at all, yields an empty task tree, an empty audit plan, zero
-mutations and exit 0.  That is a false all-clear indistinguishable from a
-project with no duplicates.  Task 2738 reached the same reading about the same
-auto-create from a different consumer
-(``fused_memory/reconciliation/stages/task_knowledge_sync.py``): "a false
-census, not a genuinely empty project".
+:func:`_run` refuses, before it constructs a backend, unless ``--project-root``
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists.  A task
+worktree has none, and merely reaching ``get_tasks`` would create one empty and
+yield an empty audit plan -- indistinguishable from a project with no
+duplicates.
 
-The guard fires BEFORE the scan and before the backend is constructed --
-reaching ``get_tasks`` is precisely what creates the empty db -- and it RAISES
-rather than returning an exit code, so a refusal can never be read as this
-script's ``0`` (clean) or ``1`` (apply errors).  It is an EXISTENCE assertion,
-not a write probe: in the failing case the target directory is perfectly
-writable, so a probe would pass exactly when the danger is present.
-``fused_memory/utils/target_store_preflight.py`` is the normative home for that
-reasoning, and for why the mem0-shaped
-``store_mutation_preflight.py::assert_store_mutation_allowed`` is correctly
-absent here.
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
 """
 
 from __future__ import annotations
@@ -69,11 +57,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-from fused_memory.utils.target_store_preflight import (
-    TargetStoreMissing,
-    assert_target_store_exists,
-    task_store_path,
-)
+from fused_memory.utils.target_store_preflight import assert_task_store_exists
 
 logger = logging.getLogger('audit_duplicate_tasks')
 
@@ -522,27 +506,7 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    try:
-        assert_target_store_exists(
-            task_store_path(args.project_root),
-            operation='audit_duplicate_tasks',
-            what='the project task store (tasks.db)',
-            remedy=(
-                'pass the MAIN checkout as --project-root. A task worktree has no '
-                '.taskmaster/ (it is neither present in nor tracked by one), and '
-                'SqliteTaskBackend.get_tasks auto-creates an empty tasks.db and '
-                'returns {"tasks": []} for ANY --project-root rather than raising.'
-            ),
-        )
-    except TargetStoreMissing:
-        logger.error(
-            'audit_duplicate_tasks: NOT started (fail-closed) — no task store under '
-            '--project-root %r. Proceeding would create an empty tasks.db and report '
-            'an empty audit plan, which is indistinguishable from a project with no '
-            'duplicates. Pass the main checkout as --project-root.',
-            args.project_root,
-        )
-        raise
+    assert_task_store_exists(args.project_root, operation='audit_duplicate_tasks')
 
     import os  # noqa: PLC0415
 
