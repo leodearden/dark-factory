@@ -243,6 +243,191 @@ class TestRunnerScriptKind:
 
 
 # ---------------------------------------------------------------------------
+# TestRunnerPathKind (task 4743 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerPathKind:
+    """``run_delivered_check``'s path-kind branch: argv shape + stdout mapping.
+
+    The contract INVERTS the grep kind's and must not be derived from it by
+    analogy. ``git grep`` signals its answer through rc (0=match, 1=no
+    match), so ``_run_grep_check`` reads ``matched = rc == 0``. ``git
+    ls-tree`` does NOT: a MISSING path still exits 0 and simply prints
+    nothing, while an existing path exits 0 WITH output. Copying grep's
+    idiom would make every path check report DELIVERED — a universal false
+    green on a dispatch gate.
+    """
+
+    def _fake_runner(self, rc: int, out: str = '', err: str = ''):
+        """Build an injected fake runner recording every argv it's called with."""
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            return (rc, out, err)
+
+        return _runner, calls
+
+    def _scripted_runner(self, responses: list[tuple[int, str]]):
+        """A runner replaying one (rc, stdout) per call, in order.
+
+        Needed for the multi-path cases, where each ``ls-tree`` invocation
+        must answer differently.
+        """
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            rc, out = responses[len(calls) - 1]
+            return (rc, out, '')
+
+        return _runner, calls
+
+    @pytest.mark.asyncio
+    async def test_argv_shape(self):
+        runner, calls = self._fake_runner(rc=0, out='orchestrator/tests/test_x.py\n')
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['orchestrator/tests/test_x.py'],
+        }
+
+        await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert calls == [
+            [
+                'git',
+                '-C',
+                '/proj',
+                'ls-tree',
+                '-r',
+                '--full-tree',
+                '--name-only',
+                'main',
+                '--',
+                'orchestrator/tests/test_x.py',
+            ]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_default_ref_is_main(self):
+        runner, calls = self._fake_runner(rc=0, out='a/one.py\n')
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        # ref= omitted entirely — default must be 'main'.
+        await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert calls[0][7] == 'main'
+
+    @pytest.mark.asyncio
+    async def test_non_default_ref_is_forwarded(self):
+        runner, calls = self._fake_runner(rc=0, out='a/one.py\n')
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        await run_delivered_check(check, project_root='/proj', ref='abc123', runner=runner)
+
+        assert calls[0][7] == 'abc123'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('expect', 'stdout', 'expected'),
+        [
+            ('present', 'a/one.py\n', DeliveredCheckResult.DELIVERED),
+            ('present', '', DeliveredCheckResult.FAILED),
+            ('present', '   \n', DeliveredCheckResult.FAILED),
+            ('absent', '', DeliveredCheckResult.DELIVERED),
+            ('absent', 'a/one.py\n', DeliveredCheckResult.FAILED),
+            ('absent', '   \n', DeliveredCheckResult.DELIVERED),
+        ],
+    )
+    async def test_existence_is_read_from_stdout_not_rc(self, expect, stdout, expected):
+        """rc is 0 in EVERY case here — only stdout distinguishes them."""
+        runner, _calls = self._fake_runner(rc=0, out=stdout)
+        check = {'name': 'cap', 'kind': 'path', 'expect': expect, 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is expected
+
+    @pytest.mark.asyncio
+    async def test_multiple_paths_issue_one_call_each(self):
+        runner, calls = self._fake_runner(rc=0, out='hit\n')
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py', 'c/three.py']
+
+    @pytest.mark.asyncio
+    async def test_present_all_exist_is_delivered(self):
+        runner, calls = self._scripted_runner([(0, 'a/one.py\n'), (0, 'b/two.py\n')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.DELIVERED
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_present_one_missing_among_several_is_failed(self):
+        """Conjunctive, not disjunctive: a gate must fail closed."""
+        runner, calls = self._scripted_runner([(0, 'a/one.py\n'), (0, ''), (0, 'c/three.py\n')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.FAILED
+        # Short-circuits: the third path is never probed.
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py']
+
+    @pytest.mark.asyncio
+    async def test_absent_all_gone_is_delivered(self):
+        runner, _calls = self._scripted_runner([(0, ''), (0, '')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'absent',
+            'paths': ['a/one.py', 'b/two.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.DELIVERED
+
+    @pytest.mark.asyncio
+    async def test_absent_one_still_present_among_several_is_failed(self):
+        runner, calls = self._scripted_runner([(0, ''), (0, 'b/two.py\n'), (0, '')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'absent',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.FAILED
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py']
+
+
+# ---------------------------------------------------------------------------
 # TestDepsSatisfiedDeliveredGate (task 2580 — step-5 RED / step-6 GREEN)
 # ---------------------------------------------------------------------------
 
