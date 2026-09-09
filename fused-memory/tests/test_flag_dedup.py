@@ -12999,3 +12999,178 @@ class TestFilterAccountedClusterGrowthFlags:
             'one positive confirmation is sufficient; an erroring sibling id '
             f'contributes no body and must not veto it; got {result!r}'
         )
+
+    # -- task 3476 amendment pass: only a DISCRIMINATING cited id confirms --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('memory_ids, description', [
+        pytest.param(
+            ['mem0', '3'],
+            'Cluster gate for the mem0 npx-pyright cluster; 3 primary entries',
+            id='degenerate-tokens-any-prose-contains',
+        ),
+        pytest.param(
+            ['03b783d5'],
+            f'  3. mem0 {_UUID_3417} (2026-08-01)',
+            id='truncated-uuid-prefix',
+        ),
+        pytest.param(
+            ['0123456789abcde'],
+            'tracked: mem0 0123456789abcde',
+            id='fifteen-chars-is-one-short-of-the-threshold',
+        ),
+    ])
+    async def test_a_non_discriminating_cited_id_keeps_the_flag(
+        self, memory_ids, description,
+    ):
+        """A cited id short enough to occur in prose by chance cannot confirm.
+
+        The all-present test is a case-insensitive SUBSTRING scan over the task
+        body, and ``cited_memories[].memory_id`` reaches this filter with no
+        shape validation: ``verify_cited_memories`` never resolves a
+        ``store != 'mem0'`` entry -- which this filter deliberately INCLUDES --
+        and KEEPS a citation whose lookup ERRORS, so during a Qdrant outage
+        unverified ids arrive here too.  A degenerate id therefore satisfies
+        "already written into the body" trivially, which is exactly the false
+        DROP the drops-only-on-positive-confirmation invariant exists to
+        exclude.  Fail-safe direction is KEEP.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(memory_ids=memory_ids)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value=self._make_task_record(description=description),
+        )
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'a cited id that is not discriminating cannot positively confirm '
+            'that the cluster is accounted for, however literally it appears '
+            f'in the body; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_long_non_uuid_cited_id_still_confirms(self):
+        """The length arm is inclusive, so a non-UUID store id still confirms.
+
+        Guards the opposite failure: hardening the confirmation must not narrow
+        it to UUID-shaped ids only and silently disable the guard for any store
+        whose ids are merely long.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        long_id = 'mem0point0123456'  # 16 chars: the threshold, inclusive
+        flag = self._make_growth_flag(memory_ids=[long_id])
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value=self._make_task_record(description=f'tracked: {long_id}'),
+        )
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'an id long enough not to collide with prose by chance is '
+            f'discriminating and must still confirm a drop; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('flag_kwargs, expected_tokens', [
+        pytest.param(
+            {'cited_memories': []},
+            ['no_cited_memory_ids', 'procedural_knowledge_cluster_growth', '3417'],
+            id='cites-no-memory-ids',
+        ),
+        pytest.param(
+            {'memory_ids': ['mem0']},
+            [
+                'non_discriminating_memory_id',
+                'procedural_knowledge_cluster_growth',
+                '3417',
+            ],
+            id='cites-only-a-degenerate-id',
+        ),
+        pytest.param(
+            {'task_id': None},
+            ['no_resolvable_task_id', 'procedural_knowledge_cluster_growth'],
+            id='resolves-no-task-id',
+        ),
+    ])
+    async def test_an_unconfirmable_candidate_is_logged(
+        self, caplog, flag_kwargs, expected_tokens,
+    ):
+        """A flag_type-matched flag the guard cannot act on must say so.
+
+        The drift log covers only ONE of the ways this guard silently becomes a
+        no-op -- an unrecognised flag_type.  If findings in this family put the
+        UUID only in prose (which this module deliberately refuses to parse),
+        omit ``cited_memories``, cite nothing discriminating, or carry no
+        resolvable task id, the guard is permanently ineffective while the
+        drift log stays quiet because the flag_type matched fine.  That is the
+        same failure mode the drift log exists to make observable.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(**flag_kwargs)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'tracked: mem0 {self._UUID_3417}',
+        ))
+
+        with caplog.at_level(logging.INFO):
+            result = await filter_accounted_cluster_growth_flags(
+                taskmaster, '/df', [flag],
+            )
+
+        assert result == [flag], (
+            f'an unconfirmable candidate must be KEPT; got {result!r}'
+        )
+        logged = [
+            r.getMessage() for r in caplog.records
+            if 'accounted_cluster_growth_filter_unconfirmable_candidates'
+            in r.getMessage()
+        ]
+        assert logged, (
+            'a flag_type-matched flag skipped for want of something to confirm '
+            'against must be logged, or the guard is a silent no-op; got '
+            f'records={[r.getMessage() for r in caplog.records]!r}'
+        )
+        for token in expected_tokens:
+            assert token in logged[0], (
+                f'the log must name {token!r} (the reason, the flag_type and '
+                f'the task_id); got {logged[0]!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_confirmable_batch_logs_no_unconfirmable_candidates(self, caplog):
+        """The skip log is scoped to real skips, so it cannot become noise."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'tracked: mem0 {self._UUID_3417}',
+        ))
+
+        with caplog.at_level(logging.INFO):
+            result = await filter_accounted_cluster_growth_flags(
+                taskmaster, '/df', [flag],
+            )
+
+        assert result == []
+        noise = [
+            r.getMessage() for r in caplog.records
+            if 'unconfirmable_candidates' in r.getMessage()
+        ]
+        assert not noise, (
+            f'no candidate was skipped, so nothing may be logged; got {noise!r}'
+        )
