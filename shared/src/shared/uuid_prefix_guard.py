@@ -246,6 +246,7 @@ _FACT_OUTCOME: Mapping[PrefixAction, FactOutcome] = MappingProxyType(
         PrefixAction.SUBSTITUTE_AND_FORWARD: 'expanded',
         PrefixAction.REJECT_WITH_CANDIDATES: 'rejected',
         PrefixAction.FORWARD_WITH_CANDIDATES: 'forwarded_ambiguous',
+        PrefixAction.FORWARD_UNCHANGED: 'resolver_unavailable',
     }
 )
 
@@ -266,6 +267,22 @@ _REJECT_HINT = (
     '`candidates`, put the FULL uuid in place of the prefix in `original_call`, and '
     'resubmit that call verbatim.'
 )
+
+
+class _Outage(Exception):
+    """Internal: a :class:`ResolverUnavailable`, tagged with the site that hit it.
+
+    A private wrapper rather than a field added to ``ResolverUnavailable``:
+    that type is the RESOLVER's vocabulary — leaf β raises it and knows
+    nothing about argument paths — while the site is the GUARD's. Keeping them
+    apart is what lets the resolver stay unaware of the boundary it is called
+    from.
+    """
+
+    def __init__(self, token: PrefixToken, cause: ResolverUnavailable) -> None:
+        super().__init__(str(cause))
+        self.token = token
+        self.store = cause.store
 
 
 class _Planned(NamedTuple):
@@ -433,7 +450,13 @@ class UuidPrefixGuardMiddleware(Middleware):
             # project's id.
             return await call_next(context)
 
-        resolutions = await self._resolve(project, tokens)
+        try:
+            resolutions = await self._resolve(project, tokens)
+        except _Outage as outage:
+            return await self._forward_outage(
+                context, call_next, name, arguments, project, outage
+            )
+
         plan = self._plan(name, tokens, resolutions)
         if not plan:
             return await call_next(context)
@@ -464,8 +487,12 @@ class UuidPrefixGuardMiddleware(Middleware):
         """
         resolutions: dict[str, Resolution] = {}
         for token in tokens:
-            if token.token not in resolutions:
+            if token.token in resolutions:
+                continue
+            try:
                 resolutions[token.token] = await self._resolver(project, token.token)
+            except ResolverUnavailable as unreachable:
+                raise _Outage(token, unreachable) from unreachable
         return resolutions
 
     # -- policy -----------------------------------------------------------
@@ -549,10 +576,6 @@ class UuidPrefixGuardMiddleware(Middleware):
         Facts are emitted BEFORE the outcome is delivered, so a tool body that
         raises cannot take the record of what the guard did down with it.
         """
-        unimplemented = {p.action for p in plan} - set(_FACT_OUTCOME)
-        if unimplemented:
-            raise NotImplementedError(f'no arm yet for {sorted(unimplemented)}')
-
         rejections = tuple(p for p in plan if p.action is PrefixAction.REJECT_WITH_CANDIDATES)
         if rejections:
             # A rejection is a WHOLE-CALL outcome: nothing is written, so no
@@ -698,14 +721,15 @@ class UuidPrefixGuardMiddleware(Middleware):
         agent_id = _agent_id(arguments)
         for planned in sites:
             await self._emit_fact(
-                tool, planned,
+                tool, planned.token, planned.resolution.candidates,
                 outcome=_FACT_OUTCOME[planned.action], agent_id=agent_id, project=project,
             )
 
     async def _emit_fact(
         self,
         tool: str,
-        planned: _Planned,
+        token: PrefixToken,
+        candidates: tuple[Candidate, ...],
         *,
         outcome: FactOutcome,
         agent_id: str | None,
@@ -724,13 +748,12 @@ class UuidPrefixGuardMiddleware(Middleware):
         — and a warning per success teaches a reader to ignore the channel.
         The two fail-soft arms log their own WARNING beside this record.
         """
-        candidates = planned.resolution.candidates
         namespaces = {candidate.namespace for candidate in candidates}
         fact = {
             'fact': FACT_UUID_PREFIX_DETECTED,
             'tool': tool,
-            'field': _field(planned.token),
-            'token': planned.token.token,
+            'field': _field(token),
+            'token': token.token,
             'outcome': outcome,
             'candidate_ids': [candidate.id for candidate in candidates],
             'namespace': next(iter(namespaces)) if len(namespaces) == 1 else None,
@@ -744,6 +767,47 @@ class UuidPrefixGuardMiddleware(Middleware):
         if self._fact_sink is None:
             return
         await self._call_sink(self._fact_sink, fact, 'fact')
+
+    # -- the one degraded path (INV-11) -----------------------------------
+
+    async def _forward_outage(self, context, call_next, name, arguments, project, outage):
+        """A store could not be reached: forward unchanged, and say so.
+
+        This is the guard's ONLY degraded path, and the ruling behind it is
+        not negotiable: a boundary guard that turns a store outage into lost
+        writes is worse than the defect it exists to fix. So an outage is never
+        a refusal — not even on a default-class tool, whose ambiguity cell IS a
+        refusal, because the guard never learned whether the citation was
+        ambiguous at all.
+
+        Nor is it silence. ``resolver`` is on ``meta`` and the store is NAMED,
+        so a caller can see that its citations went unchecked rather than
+        having to infer it from their absence — and "mem0 is down" is
+        actionable where "the resolver is down" is not.
+
+        The whole plan is abandoned, including any expansion already resolved
+        earlier in this call. That is what the resolve-then-apply split buys:
+        the arguments that reach the tool are byte-identical to the ones
+        submitted, so "forwarded unchanged" is structurally true rather than
+        very nearly true.
+        """
+        await self._emit_fact(
+            name, outage.token, (),
+            outcome=_FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED],
+            agent_id=_agent_id(arguments), project=project,
+        )
+        logger.warning(
+            'uuid prefix guard: the %s store could not be reached; %r forwarded '
+            'unchanged with its prefixes unresolved',
+            outage.store, name,
+        )
+        report: dict[str, Any] = {'resolver': 'unavailable', 'store': outage.store}
+        storm = await self._record_storm(
+            _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project
+        )
+        if storm is not None:
+            report['storm'] = storm
+        return await self._forward(context, call_next, report)
 
     # -- the storm escape (INV-4) -----------------------------------------
 
