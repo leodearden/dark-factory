@@ -2427,6 +2427,50 @@ class TestSweepCancelledDescendants:
             f'response, got: {detail!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_block_metadata_stamp_exception_marks_action_failed(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog,
+    ):
+        """An unexpected raise must stay distinguishable from a gate refusal.
+
+        A rejection succeeds on retry; a raise needs investigation.  Operators
+        remediate them differently, so the two must never collapse onto one
+        marker.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+        mock_interceptor.update_task = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert len(blocks) == 1, (
+            f'The status flip landed, so a raising stamp must not downgrade the '
+            f'descendant_blocked action; got: {blocks}'
+        )
+        assert blocks[0].get('metadata_stamp') == 'failed', (
+            f'Expected metadata_stamp="failed" for an unexpected raise, got: {blocks[0]!r}'
+        )
+        assert blocks[0].get('metadata_stamp') != 'rejected', (
+            'A raise and a gate refusal need different operator remediation and '
+            'must not share a marker'
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the raising metadata stamp'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        assert len(skips) == 1, f'Expected exactly one skip/update_task row, got: {skips}'
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert 'boom' in (detail.get('error') or ''), (
+            f'Expected the exception text in the journal row, got: {detail!r}'
+        )
+
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
 # Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='in-progress').
