@@ -45,6 +45,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
 from shared import uuid_prefix_guard as guard
+from shared.uuid_prefix import UUID_PREFIX_OVERRIDE_KEY
 
 # --- the resolution vocabulary is typed and closed ----------------------
 
@@ -1429,3 +1430,254 @@ class TestTheTwoFailSoftOutcomesDoNotPool:
             )
         assert all('storm' not in (repair_of(r) or {}) for r in results)
         assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# B9 — the declared exemption.
+# ---------------------------------------------------------------------------
+#
+# An id-addressed destructive tool is not a repair site. Expanding a prefix
+# before a delete, a merge or an edge rewrite is the one place where guessing
+# right and guessing wrong look identical from the caller's side, and only one
+# of them is recoverable. So the exemption is total: no scan, no resolution, no
+# meta, no fact — an exemption is a declaration that this is NOT a repair site,
+# and recording it would pollute the fact stream with a non-event.
+
+
+def exempt_harness(*, exempt: str = 'delete_memory', **guard_kwargs: Any) -> Harness:
+    """A harness whose ``delete_memory`` resolves — so an exemption is what stops it.
+
+    ``answers`` deliberately KNOWS the prefix. An exemption asserted against a
+    resolver that had no answer anyway would pass just as well with the
+    exemption deleted.
+    """
+    return build_harness(
+        answers={BFF: unique(BFF_FULL)},
+        exempt_tools=frozenset({exempt}),
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+DELETE_CALL = {'memory_id': BFF, 'project_id': PROJECT}
+
+
+class TestB9AnExemptToolIsSkippedEntirely:
+    async def test_the_prefix_reaches_the_tool_verbatim(self) -> None:
+        h = exempt_harness()
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.recorder.args['memory_id'] == BFF, (
+            'a prefix must never be expanded before a delete: an id the guard '
+            'chose is indistinguishable from one the author chose, and only '
+            'one of those is recoverable'
+        )
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        h = exempt_harness()
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.resolver.calls == []
+
+    async def test_no_meta_key_is_added(self) -> None:
+        h = exempt_harness()
+        result = await h.call('delete_memory', dict(DELETE_CALL))
+        assert repair_of(result) is None
+
+    async def test_no_fact_and_no_escalation(self) -> None:
+        h = exempt_harness()
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.facts == [], (
+            'an exemption is a declaration that this is not a repair site, so '
+            'recording it would make the fact stream measure declarations'
+        )
+        assert h.escalations == []
+
+    async def test_the_exemption_is_scoped_to_the_named_tool(self) -> None:
+        """One tool exempt is not the whole server exempt."""
+        h = exempt_harness()
+        await h.call('add_memory', {'content': f'see {BFF}', 'project_id': PROJECT})
+        assert h.recorder.args['content'] == f'see {BFF_FULL}'
+        assert [f['outcome'] for f in h.facts] == ['expanded']
+
+
+class TestTheExemptionIsMatchedBare:
+    """``context.message.name`` is the IN-SERVER name, never the agent-facing one.
+
+    A declaration written ``mcp__fused-memory__delete_memory`` would silently
+    never match, and a machine-checked declaration that fails open is worse
+    than none: the register would read as exempt while the guard expanded a
+    prefix straight into a delete (INV-1).
+    """
+
+    PREFIXED = 'mcp__fused-memory__delete_memory'
+
+    async def test_the_prefixed_spelling_does_not_match(self) -> None:
+        h = exempt_harness(exempt=self.PREFIXED)
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.recorder.args['memory_id'] == BFF_FULL
+        assert h.resolver.prefixes == [BFF]
+
+    async def test_nothing_is_exempt_by_default(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, project_for=project_of)
+        await h.call('delete_memory', dict(DELETE_CALL))
+        assert h.recorder.args['memory_id'] == BFF_FULL
+        assert [f['outcome'] for f in h.facts] == ['expanded']
+
+    async def test_the_declared_set_is_empty_by_default(self) -> None:
+        middleware = guard.UuidPrefixGuardMiddleware(
+            _FakeResolver({}), lambda arguments: PROJECT
+        )
+        assert middleware.exempt_tools == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# B17 / D10 — the author's override.
+# ---------------------------------------------------------------------------
+#
+# ``metadata={'allow_uuid_prefix': True}`` — an author who means the bare
+# token. The whole hatch is that the token survives, so nothing about the call
+# may change and nothing about it is a detection.
+
+OVERRIDE = {UUID_PREFIX_OVERRIDE_KEY: True}
+
+
+def override_harness(**guard_kwargs: Any) -> Harness:
+    return build_harness(
+        answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS},
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+class TestB17TheOverrideBypassesTheGuard:
+    async def test_the_prefix_survives_intact(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert h.recorder.args['content'] == f'see {BFF}'
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert h.resolver.calls == []
+
+    async def test_no_meta_key_and_no_fact(self) -> None:
+        h = override_harness()
+        result = await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert repair_of(result) is None
+        assert h.facts == [], (
+            'a declared, deliberate bare token is not a detection — recording '
+            'it as one would make the fact stream measure author intent'
+        )
+        assert h.escalations == []
+
+    async def test_an_ambiguous_token_is_not_rejected(self) -> None:
+        """The load-bearing case: the hatch has to work on the arm that refuses."""
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {AMB}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        assert h.recorder.args['content'] == f'see {AMB}'
+
+
+class TestTheOverrideFlagTravelsByTheToolsOwnSchema:
+    """ONE override, ONE lifecycle — γ's write-time layer must still see it.
+
+    Leaf γ strips ``allow_uuid_prefix`` at the tool body, exactly as
+    ``allow_mcp_markup`` is stripped at both layers. Consuming the flag here
+    would leave a caller doing precisely what the hint told it to and bounced
+    by the NEXT guard, so on a tool that declares ``metadata`` the map travels
+    UNCHANGED. On a tool that declares none there is nothing to inform, and
+    forwarding the parameter at all is ``Unexpected keyword argument``.
+    """
+
+    async def test_a_metadata_taking_tool_receives_the_flag_intact(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {
+                'content': f'see {BFF}',
+                'project_id': PROJECT,
+                'metadata': {UUID_PREFIX_OVERRIDE_KEY: True, 'keep': 'this'},
+            },
+        )
+        assert h.recorder.args['metadata'] == {
+            UUID_PREFIX_OVERRIDE_KEY: True,
+            'keep': 'this',
+        }
+
+    async def test_the_json_string_shape_travels_intact_too(self) -> None:
+        h = override_harness()
+        sent = json.dumps({UUID_PREFIX_OVERRIDE_KEY: True, 'keep': 'this'})
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': sent},
+        )
+        assert h.recorder.args['content'] == f'see {BFF}'
+        assert json.loads(h.recorder.args['metadata']) == {
+            UUID_PREFIX_OVERRIDE_KEY: True,
+            'keep': 'this',
+        }
+
+    async def test_a_tool_with_no_metadata_parameter_has_the_key_dropped(self) -> None:
+        """``delete_memory`` declares none — forwarding ``metadata`` cannot work."""
+        h = override_harness()
+        await h.call('delete_memory', {**DELETE_CALL, 'metadata': dict(OVERRIDE)})
+        assert 'metadata' not in h.recorder.args
+        assert h.recorder.args['memory_id'] == BFF
+
+    async def test_the_json_string_shape_is_dropped_when_it_empties(self) -> None:
+        h = override_harness()
+        await h.call(
+            'delete_memory', {**DELETE_CALL, 'metadata': json.dumps(OVERRIDE)}
+        )
+        assert 'metadata' not in h.recorder.args
+        assert h.recorder.args['memory_id'] == BFF
+
+    async def test_metadata_the_caller_also_sent_is_NOT_dropped(self) -> None:
+        """Only the emptied case is dropped — the rest is the caller's payload.
+
+        On a tool with no ``metadata`` parameter, residue sent alongside the
+        flag is the caller's own bug; leaving it in place surfaces that as an
+        unknown-parameter error, where dropping it would silently discard data.
+        """
+        h = override_harness()
+        with pytest.raises(ToolError):
+            await h.call(
+                'delete_memory',
+                {**DELETE_CALL, 'metadata': {**OVERRIDE, 'keep': 'this'}},
+            )
+
+
+class TestTheOverrideIsFailClosed:
+    """Only a literal boolean ``True``. A truthy value is not a declaration."""
+
+    @pytest.mark.parametrize('flag', ['yes', 1, 'True', [True]])
+    async def test_a_truthy_non_true_value_does_not_bypass(self, flag: Any) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {
+                'content': f'see {BFF}',
+                'project_id': PROJECT,
+                'metadata': {UUID_PREFIX_OVERRIDE_KEY: flag},
+            },
+        )
+        assert h.recorder.args['content'] == f'see {BFF_FULL}'
+        assert [f['outcome'] for f in h.facts] == ['expanded']
+
+    async def test_an_unrelated_metadata_map_does_not_bypass(self) -> None:
+        h = override_harness()
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': {'keep': 'this'}},
+        )
+        assert h.recorder.args['content'] == f'see {BFF_FULL}'
