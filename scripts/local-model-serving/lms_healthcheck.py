@@ -1083,19 +1083,42 @@ def run_healthcheck(
     Individual arm failures, by contrast, are recorded and the sweep continues:
     aborting on the first dead arm would drop verdicts already measured for the
     others and leave the report silently short of rows.
+
+    A TBD PLACEHOLDER ARM CAN NEVER HAVE A BASELINE, so it is excluded from the
+    lookup (task 4992).  ``lms_ctl.preflight`` refuses a placeholder as its
+    FIRST check, before the card is touched, and ``lms_ctl.start`` is the only
+    writer of a per-arm baseline; reading one for such an arm therefore raised
+    :class:`~lms_vram.StaleBaselineError` before the prober ran, which made
+    :func:`_placeholder_refusal` unreachable from every report-producing caller
+    and left the whole slate unassemblable for want of one row (esc-4301-2).
+    When NOTHING in the run is measurable, no baseline is consulted at all --
+    not even one supplied through *baseline*, because there is no footprint for
+    it to be subtracted from -- and the pre-start card is the snapshot itself.
     """
     read_gpu = gpu_probe if gpu_probe is not None else lms_vram.probe_gpu_snapshot
     probe_one = probe if probe is not None else probe_arm
 
+    # A placeholder is not MEASURABLE: nothing was ever started for it, so it
+    # has no footprint and no baseline to subtract one from.
+    measurable = [arm for arm in arms if not arm.is_placeholder]
+
     snapshot = read_gpu()
     reading = snapshot.reading
-    # The baseline is read BEFORE any probing, and its absence propagates for
-    # the same reason a dead GPU probe does: without the reading taken before
-    # these arms started, the report cannot say what the arms took, only what
-    # the card holds -- and that was the miscalibrated subject esc-3713-6 fixed.
-    base = baseline if baseline is not None else lms_vram.read_baseline_records(
-        [arm.arm_id for arm in arms]
-    )
+    if not measurable:
+        # Nothing in this run was ever started, so the card as it stands IS the
+        # pre-start card and there is no earlier reading to fetch.
+        base = lms_vram.GpuBaseline(
+            reading=reading, consumers=snapshot.consumers,
+            measured_at=datetime.now(UTC),
+        )
+    else:
+        # The baseline is read BEFORE any probing, and its absence propagates for
+        # the same reason a dead GPU probe does: without the reading taken before
+        # these arms started, the report cannot say what the arms took, only what
+        # the card holds -- and that was the miscalibrated subject esc-3713-6 fixed.
+        base = baseline if baseline is not None else lms_vram.read_baseline_records(
+            [arm.arm_id for arm in measurable]
+        )
     # The SAME rule the baseline was written under, read off the record itself
     # (`coresident_arms`) rather than re-derived here: a `--no-exclusive` start
     # legitimately records another arm in its inventory, and re-applying the
@@ -1134,11 +1157,13 @@ def run_healthcheck(
             # with the refusal carried by the exit code.  This narrow case is
             # different only because the arithmetic cannot be performed at all.
             raise lms_vram.PollutedMeasurementError(pollution_reason)
-    budget = lms_vram.evaluate_budget(
-        reading.used_mib,
-        reading.total_mib,
-        baseline_mib=base.reading.used_mib,
-        baseline_free_mib=base.reading.free_mib,
+    budget = lms_vram.unstarted_budget(reading) if not measurable else (
+        lms_vram.evaluate_budget(
+            reading.used_mib,
+            reading.total_mib,
+            baseline_mib=base.reading.used_mib,
+            baseline_free_mib=base.reading.free_mib,
+        )
     )
 
     measured_at = _now_iso()
