@@ -2386,6 +2386,121 @@ def test_cli_merge_reports_a_refusal_loudly_and_writes_nothing(cli_env, tmp_path
 
 
 # ---------------------------------------------------------------------------
+# A TBD placeholder arm, through a REPORT-PRODUCING path (task 4992)
+#
+# `_placeholder_refusal` had coverage only through `probe_llm_arm` (see
+# `test_a_placeholder_arm_is_refused_before_any_request` above), which made the
+# refusal look handled.  It was not reachable from any caller that WRITES a
+# report: `run_healthcheck` reads a baseline for every arm BEFORE it probes any
+# of them, and a placeholder can never have one -- `lms_ctl.preflight` refuses
+# it as its first check, before the card is touched, and `lms_ctl.start` is the
+# only writer of a per-arm baseline.  So the run raised `StaleBaselineError`,
+# the CLI exited 8 having written nothing, and the row that COVERS this arm for
+# `merge_reports` was never produced at all (esc-4301-2).
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER_ARM_ID = 'tbd-arm'
+
+
+def _placeholder_arm(**overrides) -> lms_manifest.ArmEntry:
+    return _moe_arm(**{
+        'arm_id': PLACEHOLDER_ARM_ID,
+        'served_model_name': PLACEHOLDER_ARM_ID,
+        'model_ref': 'TBD-Q3-pick-a-gguf',
+        'image': 'TBD-Q3',
+        'quant': 'TBD-Q3',
+        'port': 8416,
+        **overrides,
+    })
+
+
+@pytest.fixture
+def placeholder_manifest_env(monkeypatch, tmp_path):
+    """A manifest carrying one TBD placeholder beside two real arms.
+
+    The baseline store is a real directory populated for the NON-placeholder
+    arms ONLY, which is exactly the on-disk state `lms_ctl.start` leaves.  The
+    placeholder's absence from it is not a fixture shortcut: it is the state
+    the tools guarantee, and the one the defect turns on.
+    """
+    manifest = lms_manifest.ArmManifest(
+        port_block=(8410, 8417),
+        arms=[
+            _arm(),
+            _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+            _placeholder_arm(),
+        ],
+    )
+    monkeypatch.setattr(lms_healthcheck, 'load_arms', lambda *a, **k: manifest)
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
+    for arm in manifest.arms:
+        if arm.is_placeholder:
+            continue
+        record = _baseline()
+        lms_vram.record_baseline(arm.arm_id, record.reading, consumers=record.consumers)
+    monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
+    return manifest
+
+
+def test_the_cli_reports_on_a_placeholder_arm_instead_of_refusing_to_write(
+    placeholder_manifest_env, tmp_path, capsys,
+):
+    """The headline: `lms_healthcheck --arm <tbd>` produces the refusal ROW.
+
+    `probe_arm` is deliberately NOT patched, so the real dispatch runs and
+    `_placeholder_refusal` is what produces the row -- if the arm were probed
+    for real it would 404 on a literal `TBD-Q3` model id, which is the burial
+    that refusal exists to prevent.  Before this change the run never reached
+    the prober at all: it exited 8 (EXIT_STALE_BASELINE) with no file on disk.
+    """
+    part = tmp_path / 'tbd-arm.json'
+
+    code = lms_healthcheck.main(['--arm', PLACEHOLDER_ARM_ID, '--output', str(part)])
+
+    assert code == lms_healthcheck.EXIT_ARM_FAILED
+    assert part.exists()
+    report = lms_healthcheck.HealthReport.model_validate_json(part.read_text())
+    assert [row.arm_id for row in report.arms] == [PLACEHOLDER_ARM_ID]
+    assert report.arms[0].verdict == 'FAIL'
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.overall == 'FAIL'
+
+
+def test_a_placeholder_part_covers_its_arm_in_the_merged_slate(
+    placeholder_manifest_env, tmp_path,
+):
+    """The coverage claim the whole task turns on.
+
+    `merge_reports` refuses a set that does not COVER the manifest, so with no
+    part for the placeholder the slate could not be assembled AT ALL -- one
+    unresolved PRD Open Question made every other arm's measurement
+    unpublishable.  With the row present the slate assembles RED BUT COMPLETE.
+    """
+    part = tmp_path / 'tbd-arm.json'
+    assert lms_healthcheck.main(
+        ['--arm', PLACEHOLDER_ARM_ID, '--output', str(part)]
+    ) == lms_healthcheck.EXIT_ARM_FAILED
+    placeholder_part = lms_healthcheck.HealthReport.model_validate_json(
+        part.read_text()
+    )
+    real_parts = [
+        _single(arm) for arm in placeholder_manifest_env.arms
+        if not arm.is_placeholder
+    ]
+
+    merged = lms_healthcheck.merge_reports(
+        [*real_parts, placeholder_part],
+        expected_arm_ids=placeholder_manifest_env.arm_ids(),
+    )
+
+    assert set(placeholder_manifest_env.arm_ids()) == {
+        row.arm_id for row in merged.arms
+    }
+    assert merged.overall == 'FAIL'
+    assert lms_healthcheck.exit_code_for(merged) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+# ---------------------------------------------------------------------------
 # The extraction floor, and the reasoning-mode contract (esc-3713-10).
 #
 # Everything below exists because the two checks above it were each passing
