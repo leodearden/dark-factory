@@ -331,3 +331,87 @@ class TestReconSuccessRateWiring:
                 f'the Run success rate hint does not surface {field}: '
                 f'{hint_src!r}'
             )
+
+
+@pytest.fixture(scope='module')
+def styles_css_body(_client):
+    return _client.get('/static/redux/styles.css').text
+
+
+def _extract_css_rule_block(css: str, selector: str) -> str:
+    """Return the body of the first matching CSS rule block, braces included.
+
+    Copied from test_tab_scheduler.py rather than imported: a cross-test-module
+    import would couple two otherwise-independent suites. Walks forward from
+    the opening ``{`` counting depth; does not skip braces inside string
+    literals, which this stylesheet does not use. Returns '' if absent — the
+    caller below asserts on that explicitly rather than on a slice.
+    """
+    match = re.search(re.escape(selector) + r'\s*\{', css)
+    if match is None:
+        return ''
+    start = match.end() - 1
+    depth = 0
+    for i in range(start, len(css)):
+        if css[i] == '{':
+            depth += 1
+        elif css[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return css[start:i + 1]
+    return ''
+
+
+class TestReconInProgressTile:
+    """DEFECT 3 — none of the four tiles counted 'running', so a tab watching
+    a reconciliation actively in flight read as idle."""
+
+    def test_in_progress_tile_reads_the_shared_counts(self, recon_tab_code):
+        """The tile's value must come off the same `counts` object.
+
+        Re-deriving it with a local filter would put a second status
+        vocabulary back into this file — the exact condition that let the tile
+        and the badge disagree.
+        """
+        tile = _extract_stat_tile(recon_tab_code, 'In progress')
+        assert re.search(r'value=\{\s*counts\.inFlight\s*\}', tile), (
+            f'the In progress tile does not render counts.inFlight: {tile!r}'
+        )
+
+    def test_tile_row_declares_five_columns(self, recon_tab_code):
+        """Five tiles, one row.
+
+        Left at cols-4 the fifth tile wraps onto a second row at quarter
+        width, which reads as a rendering fault rather than a layout choice.
+        """
+        assert 'col-span-12 grid cols-5' in recon_tab_code, (
+            "ReconTab's tile row is not a five-column grid — it still declares "
+            'cols-4 (or was restructured), so the new tile wraps.'
+        )
+        assert 'col-span-12 grid cols-4' not in recon_tab_code, (
+            'ReconTab still declares a cols-4 tile row.'
+        )
+
+    def test_cols_5_grid_rule_exists(self, styles_css_body):
+        """`.cols-5` must actually declare its columns.
+
+        Not incidental to this tile: `cols-5` is ALREADY referenced by
+        MemoryTab with no matching rule, so `.grid`'s default applies and
+        those five tiles stack in one column. Adding the rule completes a
+        contract the markup has been asserting unbacked, and repairs that tab
+        as well as this one.
+        """
+        block = _extract_css_rule_block(styles_css_body, '.cols-5')
+        assert block, (
+            '.cols-5 has no rule in styles.css, but the markup references it '
+            '— the grid silently falls back to a single column and the tiles '
+            'stack.'
+        )
+        assert 'grid-template-columns' in block, (
+            f'.cols-5 declares no grid-template-columns: {block!r}'
+        )
+        assert re.search(r'repeat\(\s*5\s*,', block), (
+            f'.cols-5 does not lay out FIVE columns: {block!r} — the sibling '
+            'rules are all repeat(N, minmax(0, 1fr)) with N matching the class '
+            'name, and a mismatch here would silently mis-size every tile.'
+        )
