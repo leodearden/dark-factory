@@ -76,15 +76,27 @@ def _strand_events(harness: Harness) -> list[dict]:
     ]
 
 
-def _pending_secs_for(detail: str, esc_id: str) -> float:
+def _pending_secs_for(detail: str, esc_id: str, task_id: str) -> float:
     """Parse a strand's rendered ``pending {N}s`` out of the aggregate detail.
 
     ``detail`` is free-text prose (harness.py's per-strand ``lines``
     rendering), not structured data, so this can't just index a dict the way
-    a strand event payload can.
+    a strand event payload can. Requires ``esc_id`` to be immediately paired
+    with ``task_id`` (so a mismatched escalation/task pairing fails this
+    check rather than passing vacuously), but not that ``pending`` is the
+    very next field — tolerant of the other fields (severity,
+    workflow_blocked, ...) being reordered ahead of it. The authoritative
+    numeric assertion lives on the strand event payload (see
+    ``test_strand_event_payload_carries_age_and_blocked_ness``); this helper
+    covers only that the aggregate re-renders it per strand, paired with the
+    right task.
     """
-    match = re.search(rf'{re.escape(esc_id)} \(task \S+\): pending (\d+)s', detail)
-    assert match is not None, f'no pending_secs entry for {esc_id} in detail:\n{detail}'
+    match = re.search(
+        rf'{re.escape(esc_id)} \(task {re.escape(task_id)}\)[^\n]*?pending (\d+)s', detail,
+    )
+    assert match is not None, (
+        f'no pending_secs entry for {esc_id} (task {task_id}) in detail:\n{detail}'
+    )
     return float(match.group(1))
 
 
@@ -569,14 +581,14 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         detail = _aggregate_escalations(strand_harness)[0].detail
         assert 'esc-5189-7' in detail
         assert 'esc-5190-1' in detail
-        assert '5189' in detail and '5190' in detail
         # pending_secs is wall-clock-derived (age is recomputed at sweep time,
         # so elapsed time between seeding and the sweep adds to the seeded
         # value), so assert the property the docstring claims — each
-        # strand's rendered age is close to its seeded age — rather than an
-        # exact literal, mirroring the tolerance check at line 430.
-        assert abs(_pending_secs_for(detail, 'esc-5189-7') - STRAND_AGE_SECS) < 5
-        assert abs(_pending_secs_for(detail, 'esc-5190-1') - (STRAND_AGE_SECS + 600)) < 5
+        # strand's rendered age is close to its seeded age, paired with the
+        # right task — rather than an exact literal, mirroring the tolerance
+        # check in test_strand_event_payload_carries_age_and_blocked_ness.
+        assert abs(_pending_secs_for(detail, 'esc-5189-7', '5189') - STRAND_AGE_SECS) < 5
+        assert abs(_pending_secs_for(detail, 'esc-5190-1', '5190') - (STRAND_AGE_SECS + 600)) < 5
 
     async def test_second_sweep_with_open_aggregate_files_no_duplicate(
         self, strand_harness: Harness
