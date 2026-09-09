@@ -24,6 +24,9 @@ from functools import partial  # noqa: E402
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+    closure_exists_probe,
+)
 from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
@@ -723,20 +726,6 @@ async def run_server():
     # enabled but the transport cannot host the recon-report MCP server.
     _require_http_transport_for_reconciliation(config)
 
-    # Task 3112: project_id-adapting wrappers over the deterministic metadata
-    # scroll, for the consolidation-gate closure check. The service methods take
-    # project_id first positionally; the interceptor passes it by keyword because
-    # it resolves scope per task. Defined ABOVE the reconciliation branch because
-    # BOTH TaskInterceptor construction sites wire them — defining them inside the
-    # enabled arm left the disabled arm raising NameError at startup.
-    async def _closure_scroll(filters, *, limit, project_id):
-        return await memory_service.get_memories_by_metadata(
-            project_id, filters, limit=limit
-        )
-
-    async def _closure_count(filters, *, project_id):
-        return await memory_service.count_memories_by_metadata(project_id, filters)
-
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -887,12 +876,7 @@ async def run_server():
             targeted.task_interceptor = task_interceptor
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
-        # Task 3112: the consolidation-gate closure scroll. Dormant until
-        # wired, so this is the ONLY thing that arms the close-time refusal.
-        # memory_service is already in scope at both construction sites.
-        task_interceptor.set_consolidation_scroll(
-            _closure_scroll, count=_closure_count
-        )
+        _wire_closure_collaborators(task_interceptor, memory_service)
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -970,12 +954,7 @@ async def run_server():
         )
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
-        # Task 3112: the consolidation-gate closure scroll. Dormant until
-        # wired, so this is the ONLY thing that arms the close-time refusal.
-        # memory_service is already in scope at both construction sites.
-        task_interceptor.set_consolidation_scroll(
-            _closure_scroll, count=_closure_count
-        )
+        _wire_closure_collaborators(task_interceptor, memory_service)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -2157,6 +2136,67 @@ def _acquire_singleton_lock() -> None:
             'Kill it first or use systemctl --user restart fused-memory'
         )
         raise SystemExit(1) from None
+
+
+def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> None:
+    """Hand the interceptor all three consolidation-gate closure collaborators.
+
+    Task 3112 wired the deterministic metadata *scroll* (and its *count*):
+    the gate is DORMANT until wired, so this call is the ONLY thing that arms
+    the close-time refusal at all. Task 4808 added *exists* as the THIRD
+    collaborator — it is what makes the ``unstamped_cluster_member`` refusal
+    reachable in production, because without a probe an observed member that
+    is live but never stamped into the topic stays invisible (and an id
+    missing from the scroll cannot be told apart from one that was absorbed
+    and deleted).
+
+    All three are ``project_id``-adapting wrappers: the ``MemoryService``
+    methods take that scope FIRST positionally, while the interceptor passes
+    it by keyword because it resolves scope per task. *exists* is NOT built
+    here — it comes from the shared
+    ``consolidation_gate.py::closure_exists_probe``, the same factory
+    ``scripts/check_consolidation_closure.py`` binds, so the CLI and the seam
+    cannot disagree about that argument adaptation (INV-5). Its docstring
+    carries the fail-closed ``TimeoutError`` contract.
+
+    ONE wiring block, called from both ``TaskInterceptor`` construction sites
+    in ``server/main.py::run_server`` (reconciliation enabled and disabled).
+    "Both construction sites wire all three collaborators" therefore holds BY
+    CONSTRUCTION rather than by assertion — which is why the source-text test
+    that used to guard it (``'exists=' in`` an ``inspect.getsource`` fragment)
+    is gone rather than replaced in kind: it could not distinguish an armed
+    probe from ``exists=None``. What guards this now is
+    ``tests/test_consolidation_closure_seam.py::TestClosureCollaboratorWiring``,
+    which awaits each captured collaborator against a recording stub.
+
+    The extraction also RETIRES the ``NameError`` hazard the previous comment
+    recorded: the collaborator definitions used to sit in ``run_server``'s own
+    scope, above the reconciliation branch, because defining them inside the
+    enabled arm left the disabled arm raising ``NameError`` at startup. They
+    now live in this helper's scope, so neither arm can reference an
+    undefined name.
+
+    RESIDUAL RISK, stated rather than papered over: a future construction arm
+    could still forget to CALL this helper. That failure is strictly smaller
+    and louder than the one the deleted test allowed — one missing call
+    leaves the whole gate visibly dormant for that config, versus a silently
+    half-armed gate that passed a green ``'exists=' in call`` check. It is
+    not worth a second meta-test.
+    """
+
+    async def _closure_scroll(filters, *, limit, project_id):
+        return await memory_service.get_memories_by_metadata(
+            project_id, filters, limit=limit
+        )
+
+    async def _closure_count(filters, *, project_id):
+        return await memory_service.count_memories_by_metadata(project_id, filters)
+
+    task_interceptor.set_consolidation_scroll(
+        _closure_scroll,
+        count=_closure_count,
+        exists=closure_exists_probe(memory_service),
+    )
 
 
 def main():
