@@ -37,9 +37,22 @@ import subprocess
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_HERE = Path(__file__).resolve().parent
+# The repo-wide `--import-mode=importlib` addopts keeps a test file's own
+# directory off sys.path, and scripts/tests/conftest.py inserts scripts/ but not
+# scripts/tests/. Without this the sibling fixture module — shared with
+# test_check_write_triage_attach_consumption.py so the two suites cannot lay
+# down different triage modules — is unimportable.
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from write_triage_attach_fixtures import write_fake_triage  # noqa: E402
+
+_REPO_ROOT = _HERE.parents[1]
 _GATE_SCRIPT = _REPO_ROOT / 'scripts' / 'check_write_triage_flip_preconditions.sh'
 _PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
+#: Item 5's probe: does anything downstream CONSUME the binding item 1 asserts?
+_PROBE5 = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_consumption.py'
 
 # The probe's stable stdout vocabulary. Kept as named constants so the tests
 # and the probe cannot drift apart silently, and so it is obvious at a glance
@@ -62,6 +75,15 @@ _PENDING = 'PASS-NEEDS-CONFIRMATION'
 _GATE_PENDING = 'ITEM 1 NEEDS CONFIRMATION'
 _BARE_STR = 'returns a bare str'
 _OUTSIDE_SRC_ROOT = 'outside --src-root'
+
+#: Item 5's gate-side verdict lines, and the triage module that earns each.
+#: `band_top1` is main's shape — the attach lands on the band's top-1 whatever
+#: the judge said — so it is the default every fixture repo gets, and a test
+#: that wants a green gate has to say which triage module makes item 5 hold.
+_ITEM5_FAIL = 'FAIL  item 5'
+_ITEM5_PASS = 'PASS  item 5'
+_ITEM5_CLAUSE = 'Item 5 is'
+_TRIAGE_CONSUMES = 'consumes_designated_id'
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +1587,7 @@ def _make_gate_repo(
     tmp_path: Path,
     *,
     judge: str = 'flat',
+    triage: str = 'band_top1',
     eval_src: str | None = None,
     eval_text: str | None = None,
     repo_name: str = 'gate-repo',
@@ -1575,6 +1598,11 @@ def _make_gate_repo(
     so BOTH scripts are copied into ``<repo>/scripts/`` — that is what makes
     the fixture repo, rather than the real checkout, the thing item 1's
     ``git archive`` reads.
+
+    ``triage`` selects the ``write_triage`` stand-in item 5's probe executes.
+    It defaults to ``'band_top1'`` — main's shape, where the attach lands on
+    the band's top-1 whatever the judge said — so a repo is unfixed on item 5
+    unless a test says otherwise, and no test passes the gate by accident.
 
     ``eval_text`` and ``eval_src`` are mutually exclusive: pass at most one.
     When ``eval_text`` is given, it is written VERBATIM as the fixture's
@@ -1587,12 +1615,15 @@ def _make_gate_repo(
     )
     repo = tmp_path / repo_name
     (repo / 'scripts').mkdir(parents=True)
-    for script in (_GATE_SCRIPT, _PROBE):
+    for script in (_GATE_SCRIPT, _PROBE, _PROBE5):
         dest = repo / 'scripts' / script.name
         dest.write_bytes(script.read_bytes())
         dest.chmod(0o755)
 
+    # Both stand-ins go into the SAME tree: item 1 reads write_triage_judge.py
+    # and item 5 reads write_triage.py, and the gate extracts that tree once.
     _write_fake_judge(repo / 'fused-memory' / 'src', variant=judge)
+    write_fake_triage(repo / 'fused-memory' / 'src', variant=triage)
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True)
     if eval_text is not None:
         eval_source = eval_text
@@ -1636,8 +1667,12 @@ def _run_gate(
     if resolve_interpreter:
         assert probe_py is None, 'resolve_interpreter and probe_py are exclusive'
         full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY', None)
+        full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY', None)
     else:
         full_env['CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY'] = probe_py or sys.executable
+        full_env['CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY'] = (
+            probe_py or sys.executable
+        )
     return subprocess.run(
         [str(script)],
         capture_output=True,
@@ -1687,7 +1722,12 @@ class TestFlipPreconditionsScript:
         _assert_no_bare_grep_verdict(proc.stdout)
 
     def test_by_id_judge_with_fixed_eval_passes_everything(self, tmp_path):
-        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert 'PASS  item 1' in proc.stdout, proc.stdout
@@ -1735,7 +1775,12 @@ class TestFlipPreconditionsScript:
         grew a step that presumed a marked PROMPT, the probe suite would not
         notice: it never runs the shell.
         """
-        repo = _make_gate_repo(tmp_path, judge='option_a', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='option_a',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert 'PASS  item 1' in proc.stdout, proc.stdout
@@ -1803,7 +1848,12 @@ class TestFlipPreconditionsScript:
         verbatim the argument `_TARGET_NAME_RE`'s comment uses to reject the
         `canonical` false PASS. Give it a machine-detectable channel instead.
         """
-        repo = _make_gate_repo(tmp_path, judge='target_named_header', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='target_named_header',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert 'PASS  item 1' in proc.stdout, proc.stdout
@@ -1817,7 +1867,12 @@ class TestFlipPreconditionsScript:
 
     def test_a_behavioural_pass_is_not_reported_as_needing_confirmation(self, tmp_path):
         """The control: an ordinary PASS must stay an ordinary PASS."""
-        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert 'PASS  item 1' in proc.stdout, proc.stdout
@@ -1830,7 +1885,12 @@ class TestFlipPreconditionsScript:
         neither `$REPO/.venv/bin/python3` nor the `uv run` fallback ever ran —
         and those are the branches production uses under DeterministicRunner.
         """
-        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         marker = _install_venv_interpreter(repo)
         proc = _run_gate(
             repo / 'scripts' / _GATE_SCRIPT.name,
@@ -1854,7 +1914,11 @@ class TestFlipPreconditionsScript:
         on a judge that passes.
         """
         repo = _make_gate_repo(
-            tmp_path, judge='by_id', eval_src='fixed', repo_name='gate repo with spaces',
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+            repo_name='gate repo with spaces',
         )
         marker = _install_venv_interpreter(repo)
         proc = _run_gate(
@@ -1874,7 +1938,12 @@ class TestFlipPreconditionsScript:
         own tree was indented into the report — and only the TRAILING 2000
         characters of that report reach an operator's escalation detail.
         """
-        repo = _make_gate_repo(tmp_path, judge='by_id_noisy_import', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id_noisy_import',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert 'PASS  item 1' in proc.stdout, proc.stdout
@@ -1926,6 +1995,93 @@ class TestFlipPreconditionsScript:
 _ESCALATION_DETAIL_CHARS = 2000
 
 
+class TestItemFiveThroughTheGate:
+    """Item 5 end to end: does the gate act on the consumption probe's verdict?
+
+    Item 1 proves the judge path can BIND a verdict to a determinate candidate.
+    Nothing proved anything downstream CONSUMES that binding, so a change that
+    only widened the parse contract opened the gate while the attach still
+    landed on the band's top-1 — the harm item 1 describes, still live. Item 5
+    closes that, and it has to be able to block the flip ON ITS OWN, or a green
+    items 1/2/4 would carry a repo where the write still mis-attaches.
+    """
+
+    def test_main_shape_fails_item_5(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_FAIL in proc.stdout, proc.stdout
+        assert _ITEM5_PASS not in proc.stdout, proc.stdout
+
+    def test_a_consuming_triage_module_passes_item_5(self, tmp_path):
+        repo = _make_gate_repo(
+            tmp_path, judge='by_id', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_PASS in proc.stdout, proc.stdout
+
+    def test_item_5_blocks_the_flip_on_its_own(self, tmp_path):
+        """Green on 1, 2 and 4 and still exit 1.
+
+        This is the whole point of adding an item rather than widening item 1:
+        a repo can satisfy every existing precondition and still be one where
+        the verdict is filed against a candidate the judge never reasoned
+        about. If item 5 could not fail alone, it would be decoration.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert 'PASS  item 2' in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+        assert _ITEM5_FAIL in proc.stdout, proc.stdout
+
+    def test_item_5_reaches_the_operator_through_the_truncation_window(
+        self, tmp_path,
+    ):
+        """The FAILING ITEMS tail is the only part an operator reliably sees.
+
+        DeterministicRunner forwards the trailing 2000 characters, and item 5's
+        own verdict and report are emitted first — so the summary line is where
+        the item number has to survive.
+        """
+        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='failing')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        # Vacuous otherwise: a report that fits inside the window proves nothing.
+        assert len(proc.stdout) > _ESCALATION_DETAIL_CHARS, len(proc.stdout)
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1 2 4 5' in tail, tail
+
+    def test_the_result_block_blames_item_5_only_when_it_failed(self, tmp_path):
+        """The ownership clause may never contradict the FAILING ITEMS line.
+
+        Measured in both directions on the existing clauses: an ungated clause
+        names an item the report declared PASS a few lines above, because the
+        whole RESULT arm runs on ANY failure. Item 5's clause is gated on
+        `item_failed 5` for the same reason.
+        """
+        blamed = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(blamed / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_CLAUSE in _normalize_ws(_result_block(proc.stdout)), proc.stdout
+
+        spared = _make_gate_repo(
+            tmp_path,
+            judge='flat',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+            repo_name='item5-green',
+        )
+        proc = _run_gate(spared / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_PASS in proc.stdout, proc.stdout
+        assert _ITEM5_CLAUSE not in _normalize_ws(_result_block(proc.stdout)), (
+            proc.stdout
+        )
+
+
 class TestReportSurvivesTruncation:
     """What reaches the operator is the report's TAIL, not its head."""
 
@@ -1941,7 +2097,12 @@ class TestReportSurvivesTruncation:
         assert 'FAILING ITEMS: 1 2 4' in tail, tail
 
     def test_all_pass_tail_reports_no_failing_items(self, tmp_path):
-        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
@@ -2196,7 +2357,12 @@ class TestVerdictReadingIsNotRaceProne:
     """
 
     def test_a_pass_marker_ahead_of_a_large_report_is_never_lost(self, tmp_path):
-        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         stub = _write_marker_first_probe_stub(
             tmp_path / 'marker-first-probe',
             markers=[_gate_marker('PROBE_PASS_MARKER') + ' (option (b)).'],
@@ -2215,7 +2381,12 @@ class TestVerdictReadingIsNotRaceProne:
 
     def test_a_pending_marker_ahead_of_a_large_report_is_never_lost(self, tmp_path):
         """The silent half: item 1 still PASSES, so only this assertion catches it."""
-        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
         stub = _write_marker_first_probe_stub(
             tmp_path / 'pending-marker-first-probe',
             markers=[
