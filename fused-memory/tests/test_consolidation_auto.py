@@ -18,6 +18,7 @@ import inspect
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -109,6 +110,34 @@ def _reasons_for(verdict: AutoVerdict, code: AutoReasonCode) -> list[Any]:
     asserting the length rather than by silently reading the first.
     """
     return [reason for reason in verdict.reasons if reason.code is code]
+
+
+def _judge(
+    members: Mapping[str, Any],
+    *,
+    proposal_ids: Sequence[str] | None = None,
+    topic: str = TOPIC,
+    canonical_count: int | None = 0,
+    open_gate_id: str | None = None,
+    existing_canonical_slugs: Sequence[str] = (),
+    config: Any = None,
+) -> AutoVerdict:
+    """Run the predicate over *members*, every unmentioned fact at its benign value.
+
+    The defaults are the assertion technique: a test that names only its one
+    hazard is thereby claiming that hazard is what decided the verdict, because
+    nothing else it left unsaid could have. Proposing the mapping's own keys by
+    default keeps the proposal and the reads from drifting apart.
+    """
+    ids = tuple(proposal_ids) if proposal_ids is not None else tuple(members)
+    return evaluate_auto_predicate(
+        _proposal(ids, topic=topic),
+        members=members,
+        canonical_count=canonical_count,
+        open_gate_id=open_gate_id,
+        existing_canonical_slugs=existing_canonical_slugs,
+        config=config or _auto_config(),
+    )
 
 
 def _auto_config(**overrides: Any):
@@ -675,19 +704,6 @@ class TestMemberHazards:
     key set, or any source text, so the checks survive a reimplementation.
     """
 
-    @staticmethod
-    def _judge(members, *, proposal_ids=None, canonical_count=0, config=None):
-        """Run the predicate over *members* with the gate closed."""
-        ids = tuple(proposal_ids) if proposal_ids is not None else tuple(members)
-        return evaluate_auto_predicate(
-            _proposal(ids),
-            members=members,
-            canonical_count=canonical_count,
-            open_gate_id=None,
-            existing_canonical_slugs=(),
-            config=config or _auto_config(),
-        )
-
     def test_unreadable_member_fails_closed(self):
         """A read that DID NOT ANSWER must never look benign.
 
@@ -700,7 +716,7 @@ class TestMemberHazards:
         members = _members(_member('m1'), _member('m3'))
         members['m2'] = UNREADABLE
 
-        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'm3'))
+        verdict = _judge(members, proposal_ids=('m1', 'm2', 'm3'))
 
         assert verdict.outcome is AutoOutcome.FAIL
         reasons = _reasons_for(verdict, AutoReasonCode.member_unreadable)
@@ -711,7 +727,7 @@ class TestMemberHazards:
         members = _members(_member('m1'), _member('m3'))
         members['m2'] = None
 
-        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'm3'))
+        verdict = _judge(members, proposal_ids=('m1', 'm2', 'm3'))
 
         assert verdict.outcome is AutoOutcome.FAIL
         reasons = _reasons_for(verdict, AutoReasonCode.member_not_found)
@@ -733,7 +749,7 @@ class TestMemberHazards:
             _member('C', topic=TOPIC, canonical=True),
         )
 
-        verdict = self._judge(members, proposal_ids=('m1', 'x1', 'C'), canonical_count=1)
+        verdict = _judge(members, proposal_ids=('m1', 'x1', 'C'), canonical_count=1)
 
         assert verdict.outcome is AutoOutcome.FAIL
         reasons = _reasons_for(verdict, AutoReasonCode.member_already_canonical)
@@ -754,7 +770,7 @@ class TestMemberHazards:
             _member('x1', topic='some-other-topic'),
         )
 
-        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'x1'))
+        verdict = _judge(members, proposal_ids=('m1', 'm2', 'x1'))
 
         assert verdict.outcome is AutoOutcome.FAIL
         reasons = _reasons_for(verdict, AutoReasonCode.member_different_topic)
@@ -773,7 +789,7 @@ class TestMemberHazards:
             _member('m2', **{key: 'ce8590f1-cc05-48da-9428-1cf1f54f3fff'}),
         )
 
-        verdict = self._judge(members)
+        verdict = _judge(members)
 
         assert verdict.outcome is AutoOutcome.FAIL
         reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_metadata)
@@ -794,7 +810,7 @@ class TestMemberHazards:
         """
         members = _members(_member('m1'), _member('m2', content=body))
 
-        verdict = self._judge(members)
+        verdict = _judge(members)
 
         assert verdict.outcome is AutoOutcome.FAIL
         reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_banner)
@@ -815,7 +831,7 @@ class TestMemberHazards:
         """
         members = _members(_member('m1'), _member('m2', content=body))
 
-        verdict = self._judge(members)
+        verdict = _judge(members)
 
         assert AutoReasonCode.member_carries_correction_banner not in _codes(verdict)
         assert verdict.outcome is AutoOutcome.PASS
@@ -832,7 +848,7 @@ class TestMemberHazards:
             _member('m2', category='observations_and_summaries'),
         )
 
-        verdict = self._judge(members)
+        verdict = _judge(members)
 
         assert verdict.outcome is AutoOutcome.FAIL
         reasons = _reasons_for(verdict, AutoReasonCode.mixed_category)
@@ -840,7 +856,7 @@ class TestMemberHazards:
         assert set(reasons[0].ids) == {'m1', 'm2'}
 
         uncategorised = _members(_member('n1', category=None), _member('n2'))
-        assert AutoReasonCode.mixed_category not in _codes(self._judge(uncategorised))
+        assert AutoReasonCode.mixed_category not in _codes(_judge(uncategorised))
 
     def test_a_hazard_beside_a_live_canonical_still_fails(self):
         """PRD D4, the case the binding order exists for.
@@ -856,7 +872,7 @@ class TestMemberHazards:
             _member('n1', content=CORRECTION_BANNER_SPECIMENS['bracketed_5180_canonical']),
         )
 
-        verdict = self._judge(members, canonical_count=1)
+        verdict = _judge(members, canonical_count=1)
 
         assert verdict.outcome is AutoOutcome.FAIL
         assert AutoReasonCode.member_carries_correction_banner in _codes(verdict)
@@ -874,7 +890,7 @@ class TestMemberHazards:
         members['m2'] = UNREADABLE
         members['m3'] = None
 
-        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'm3', 'm4'))
+        verdict = _judge(members, proposal_ids=('m1', 'm2', 'm3', 'm4'))
 
         assert verdict.outcome is AutoOutcome.FAIL
         assert {
@@ -882,3 +898,282 @@ class TestMemberHazards:
             AutoReasonCode.member_not_found,
             AutoReasonCode.member_carries_correction_banner,
         } <= set(_codes(verdict))
+
+
+#: Slug fixtures whose token-Jaccard against COLLIDING_TOPIC is computed, not
+#: guessed: 0.6 exactly (the shipped threshold, so the boundary is testable),
+#: 0.75 (clearly over) and 0.1667 (clearly under).
+COLLIDING_TOPIC = 'memory-auto-consolidation-gate'
+SLUG_AT_THRESHOLD = 'memory-auto-consolidation-sweep'
+SLUG_OVER_THRESHOLD = 'memory-auto-consolidation'
+SLUG_UNDER_THRESHOLD = 'memory-metadata-census'
+
+
+class TestCanonicalAndSlugHazards:
+    """Rung 2, canonical and slug level: the hazards about the topic itself.
+
+    The incumbent-level codes are reportable only when the proposal NAMES the
+    incumbent. C2 gives the predicate per-member reads plus a count and nothing
+    else, so a canonical outside the member list is covered by the count alone
+    — and PRD D14 already assigns the undetectable case, a stale incumbent
+    carrying no banner, to the human sitting rather than to code.
+    """
+
+    def test_incumbent_carrying_a_correction_banner_fails(self):
+        """PRD B4, using the exact live record the PRD names.
+
+        Reported as `canonical_carries_correction`, NOT as the member code:
+        a corrected INCUMBENT is a different fact from a corrected member, and
+        it is the one that says this topic's index entry is itself unsound.
+        And it must not be silently stripped — stripping is what happens to a
+        HEALTHY incumbent, and doing it here would quietly consolidate a topic
+        around a canonical someone has retracted.
+        """
+        members = _members(
+            _member('m1'),
+            _member('m2'),
+            _member(
+                'C',
+                topic=TOPIC,
+                canonical=True,
+                content=CORRECTION_BANNER_SPECIMENS['bracketed_5180_canonical'],
+            ),
+        )
+
+        verdict = _judge(members, canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert [r.ids for r in _reasons_for(verdict, AutoReasonCode.canonical_carries_correction)] == [('C',)]
+        assert AutoReasonCode.member_carries_correction_banner not in _codes(verdict)
+        assert AutoReasonCode.incumbent_canonical_stripped not in _codes(verdict)
+
+    def test_incumbent_carrying_correction_metadata_fails(self):
+        """The machine-readable half of the same fact."""
+        members = _members(
+            _member('m1'),
+            _member('C', topic=TOPIC, canonical=True, superseded_by='cedabf87-ae25-4acb-9331-19b13599e78d'),
+        )
+
+        verdict = _judge(members, canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert [r.ids for r in _reasons_for(verdict, AutoReasonCode.canonical_carries_correction)] == [('C',)]
+        assert AutoReasonCode.member_carries_correction_metadata not in _codes(verdict)
+
+    def test_incumbent_category_mismatch_fails(self):
+        """An index entry filed under one category cannot index another's records.
+
+        The detail names BOTH categories, because the operator's next question
+        is always which of the two is wrong.
+        """
+        members = _members(
+            _member('m1', category='procedural_knowledge'),
+            _member('m2', category='procedural_knowledge'),
+            _member('C', topic=TOPIC, canonical=True, category='observations_and_summaries'),
+        )
+
+        verdict = _judge(members, canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.canonical_category_mismatch)
+        assert [r.ids for r in reasons] == [('C',)]
+        assert 'observations_and_summaries' in reasons[0].detail
+        assert 'procedural_knowledge' in reasons[0].detail
+
+    def test_multiple_canonicals_fails(self):
+        """Canonical uniqueness ships in WARN mode, so the predicate probes it.
+
+        `memory_metadata.enforce` is False (task 3626): nothing stops a second
+        canonical existing. Trusting an unenforced invariant is how a topic ends
+        up with two index entries and no way to tell which one is read.
+        """
+        verdict = _judge(_members(_member('m1'), _member('m2')), canonical_count=2)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.multiple_canonicals in _codes(verdict)
+
+    def test_unavailable_canonical_count_fails_closed(self):
+        """A count the caller could not obtain must never read as zero.
+
+        Zero is the MINT path. Reading "I could not find out" as "there is
+        none" is precisely how a second canonical gets written for a topic that
+        already has one.
+        """
+        verdict = _judge(_members(_member('m1'), _member('m2')), canonical_count=None)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.canonical_count_unavailable in _codes(verdict)
+
+    @pytest.mark.parametrize(
+        ('slug', 'fires'),
+        [
+            (SLUG_AT_THRESHOLD, True),
+            (SLUG_OVER_THRESHOLD, True),
+            (SLUG_UNDER_THRESHOLD, False),
+        ],
+    )
+    def test_slug_near_collision_fails(self, slug, fires):
+        """Two slugs that mean the same thing split a topic nothing sweeps.
+
+        SLUG_AT_THRESHOLD sits at EXACTLY the 0.6 default, pinning that the
+        comparison is inclusive. `>=` is the fail-closed reading of "above a
+        threshold": at the boundary a human gate costs one sitting, while a
+        wrong auto-mint splits a topic across two canonicals permanently.
+        """
+        members = _members(_member('m1'), _member('m2'))
+
+        verdict = _judge(members, topic=COLLIDING_TOPIC, existing_canonical_slugs=(slug,))
+
+        reasons = _reasons_for(verdict, AutoReasonCode.slug_near_collision)
+        assert bool(reasons) is fires
+        if fires:
+            assert verdict.outcome is AutoOutcome.FAIL
+            assert slug in reasons[0].detail
+            assert COLLIDING_TOPIC in reasons[0].detail
+        else:
+            assert verdict.outcome is AutoOutcome.PASS
+
+    def test_the_topics_own_slug_is_never_a_collision(self):
+        """The skip PRD B2 cannot live without.
+
+        On EVERY re-emission the topic already has a canonical, so its own slug
+        is necessarily in the existing-slug list and its self-Jaccard is 1.0.
+        Without the skip the collision hazard would fire on every tag-only
+        refresh and PASS_TAG_ONLY would be unreachable — the predicate would
+        refuse precisely the case it was built for.
+        """
+        members = _members(
+            _member('m1', topic=TOPIC), _member('m2', topic=TOPIC), _member('n1'),
+        )
+
+        verdict = _judge(
+            members,
+            canonical_count=1,
+            existing_canonical_slugs=(TOPIC, 'dashboard-js-test-substrate'),
+        )
+
+        assert AutoReasonCode.slug_near_collision not in _codes(verdict)
+        assert verdict.outcome is AutoOutcome.PASS_TAG_ONLY
+
+    def test_slug_collision_threshold_is_read_from_config(self):
+        """The threshold is a live green-tier read, calibrated during rollout.
+
+        PRD §12 Q2 leaves 0.6 to be tuned in the supervised cycle, which is only
+        possible if the predicate reads the leaf per call rather than baking it
+        in at import.
+        """
+        members = _members(_member('m1'), _member('m2'))
+        args = dict(topic=COLLIDING_TOPIC, existing_canonical_slugs=(SLUG_AT_THRESHOLD,))
+
+        assert _judge(members, **args).outcome is AutoOutcome.FAIL
+
+        relaxed = _judge(members, config=_auto_config(slug_collision_jaccard=0.7), **args)
+
+        assert AutoReasonCode.slug_near_collision not in _codes(relaxed)
+        assert relaxed.outcome is AutoOutcome.PASS
+
+
+#: Every reason code, mapped to inputs that actually PRODUCE it.
+#:
+#: The table is the deliverable "one test per reason code" made
+#: machine-checked: the test below RUNS each entry and asserts the code comes
+#: back, and separately asserts the key set is the whole enum. A code added
+#: without a producing fixture fails here rather than shipping unreachable, and
+#: a code whose producing conditions drift out from under it fails here too —
+#: neither of which a test-name convention could catch.
+REASON_CODE_FIXTURES: dict[AutoReasonCode, Callable[[], AutoVerdict]] = {
+    AutoReasonCode.already_gated: lambda: _judge(
+        _members(_member('m1'), _member('m2')), open_gate_id='5183',
+    ),
+    AutoReasonCode.member_unreadable: lambda: _judge(
+        {'m1': _member('m1'), 'm2': UNREADABLE},
+    ),
+    AutoReasonCode.member_not_found: lambda: _judge(
+        {'m1': _member('m1'), 'm2': None},
+    ),
+    AutoReasonCode.member_already_canonical: lambda: _judge(
+        _members(_member('m1'), _member('x1', topic='some-other-topic', canonical=True)),
+    ),
+    AutoReasonCode.member_different_topic: lambda: _judge(
+        _members(_member('m1'), _member('x1', topic='some-other-topic')),
+    ),
+    AutoReasonCode.member_carries_correction_metadata: lambda: _judge(
+        _members(_member('m1'), _member('m2', superseded_by='0090d639')),
+    ),
+    AutoReasonCode.member_carries_correction_banner: lambda: _judge(
+        _members(
+            _member('m1'),
+            _member('m2', content=CORRECTION_BANNER_SPECIMENS['bracketed_bare_stamp']),
+        ),
+    ),
+    AutoReasonCode.canonical_carries_correction: lambda: _judge(
+        _members(
+            _member('m1'),
+            _member(
+                'C',
+                topic=TOPIC,
+                canonical=True,
+                content=CORRECTION_BANNER_SPECIMENS['unbracketed_superseded'],
+            ),
+        ),
+        canonical_count=1,
+    ),
+    AutoReasonCode.mixed_category: lambda: _judge(
+        _members(
+            _member('m1', category='procedural_knowledge'),
+            _member('m2', category='preferences_and_norms'),
+        ),
+    ),
+    AutoReasonCode.canonical_category_mismatch: lambda: _judge(
+        _members(
+            _member('m1', category='procedural_knowledge'),
+            _member('C', topic=TOPIC, canonical=True, category='observations_and_summaries'),
+        ),
+        canonical_count=1,
+    ),
+    AutoReasonCode.multiple_canonicals: lambda: _judge(
+        _members(_member('m1'), _member('m2')), canonical_count=2,
+    ),
+    AutoReasonCode.canonical_count_unavailable: lambda: _judge(
+        _members(_member('m1'), _member('m2')), canonical_count=None,
+    ),
+    AutoReasonCode.slug_near_collision: lambda: _judge(
+        _members(_member('m1'), _member('m2')),
+        topic=COLLIDING_TOPIC,
+        existing_canonical_slugs=(SLUG_AT_THRESHOLD,),
+    ),
+    AutoReasonCode.incumbent_canonical_stripped: lambda: _judge(
+        _members(
+            _member('m1', topic=TOPIC),
+            _member('n1'),
+            _member('C', topic=TOPIC, canonical=True),
+        ),
+        canonical_count=1,
+    ),
+    AutoReasonCode.already_consolidated: lambda: _judge(
+        _members(_member('m1', topic=TOPIC), _member('m2', topic=TOPIC)),
+        canonical_count=1,
+    ),
+}
+
+
+class TestEveryReasonCodeIsExercised:
+    """The vocabulary and the fixtures cannot drift apart."""
+
+    def test_the_table_covers_the_whole_enum(self):
+        """A code with no producing fixture is a code nobody has ever seen."""
+        assert set(REASON_CODE_FIXTURES) == set(AutoReasonCode)
+
+    @pytest.mark.parametrize(
+        'code', list(REASON_CODE_FIXTURES), ids=lambda code: code.value,
+    )
+    def test_no_reason_code_ships_without_a_fixture(self, code):
+        """RUN the fixture and assert the code actually comes back.
+
+        Running rather than reading is the whole point: a table entry that no
+        longer produces its code — because a rung moved, or a hazard now
+        outranks it — is exactly the drift a source-level check would miss.
+        """
+        verdict = REASON_CODE_FIXTURES[code]()
+
+        assert code in _codes(verdict), verdict
