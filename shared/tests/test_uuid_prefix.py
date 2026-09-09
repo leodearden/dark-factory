@@ -13,11 +13,19 @@ No test in this file asserts on docstring or comment prose.
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
 import pytest
 
-from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute
+from shared.uuid_prefix import (
+    UUID_PREFIX_OVERRIDE_KEY,
+    PrefixToken,
+    find_prefix_tokens,
+    strip_uuid_prefix_override,
+    substitute,
+    uuid_prefix_override_requested,
+)
 
 # A 31-hex run: the INCLUSIVE upper bound of the grammar.
 HEX31 = 'bff81530aacc4f1e9d2b7c6a5e4d3f0'
@@ -412,3 +420,96 @@ def test_forward_order_is_what_would_corrupt_the_second_span() -> None:
     first, second = find_prefix_tokens(arguments)
     after_first = substitute(arguments, first, FULL_F1C)
     assert after_first['content'][second.start : second.end] != second.token
+
+
+# --- the override trio (mirrors toolcall_markup.py's MARKUP_OVERRIDE_KEY) ---
+
+
+def test_override_key_spelling() -> None:
+    assert UUID_PREFIX_OVERRIDE_KEY == 'allow_uuid_prefix'
+
+
+def test_override_requested_accepts_only_a_literal_true() -> None:
+    assert uuid_prefix_override_requested({UUID_PREFIX_OVERRIDE_KEY: True}) is True
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        pytest.param('yes', id='str-yes'),
+        pytest.param('true', id='str-true'),
+        pytest.param('True', id='str-True'),
+        pytest.param(1, id='int-1'),
+        pytest.param([1], id='non-empty-list'),
+        pytest.param({'a': 1}, id='non-empty-dict'),
+        pytest.param(False, id='false'),
+        pytest.param(None, id='none'),
+    ],
+)
+def test_override_requested_is_fail_closed(value: object) -> None:
+    """A truthy non-True is far likelier to be unrelated data than a decision."""
+    assert uuid_prefix_override_requested({UUID_PREFIX_OVERRIDE_KEY: value}) is False
+
+
+def test_override_requested_accepts_both_metadata_shapes() -> None:
+    """submit_task/update_task accept metadata as an object OR a JSON string."""
+    assert uuid_prefix_override_requested({UUID_PREFIX_OVERRIDE_KEY: True}) is True
+    assert uuid_prefix_override_requested(json.dumps({UUID_PREFIX_OVERRIDE_KEY: True})) is True
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [
+        pytest.param(None, id='none'),
+        pytest.param('', id='empty-string'),
+        pytest.param('{not json', id='malformed-json'),
+        pytest.param('[1, 2, 3]', id='json-non-dict'),
+        pytest.param('"a string"', id='json-string'),
+        pytest.param(42, id='int'),
+        pytest.param([UUID_PREFIX_OVERRIDE_KEY], id='list'),
+        pytest.param({}, id='empty-dict'),
+        pytest.param({'other': True}, id='unrelated-key'),
+    ],
+)
+def test_override_requested_never_raises_and_returns_false(metadata: object) -> None:
+    assert uuid_prefix_override_requested(metadata) is False
+
+
+def test_strip_returns_a_dict_for_a_dict() -> None:
+    stripped = strip_uuid_prefix_override({UUID_PREFIX_OVERRIDE_KEY: True, 'topic': 't'})
+    assert stripped == {'topic': 't'}
+
+
+def test_strip_returns_a_json_string_for_a_json_string() -> None:
+    stripped = strip_uuid_prefix_override(
+        json.dumps({UUID_PREFIX_OVERRIDE_KEY: True, 'topic': 't'})
+    )
+    assert isinstance(stripped, str)
+    assert json.loads(stripped) == {'topic': 't'}
+
+
+def test_strip_does_not_mutate_the_callers_dict() -> None:
+    metadata = {UUID_PREFIX_OVERRIDE_KEY: True, 'topic': 't'}
+    before = copy.deepcopy(metadata)
+    strip_uuid_prefix_override(metadata)
+    assert metadata == before
+
+
+def test_strip_leaves_other_keys_in_place() -> None:
+    metadata = {UUID_PREFIX_OVERRIDE_KEY: True, 'topic': 't', 'supersedes': ['x']}
+    assert strip_uuid_prefix_override(metadata) == {'topic': 't', 'supersedes': ['x']}
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [
+        pytest.param(None, id='none'),
+        pytest.param('{not json', id='malformed-json'),
+        pytest.param('[1, 2, 3]', id='json-non-dict'),
+        pytest.param(42, id='int'),
+        pytest.param({'topic': 't'}, id='dict-without-the-key'),
+        pytest.param('{"topic": "t"}', id='json-string-without-the-key'),
+    ],
+)
+def test_strip_passes_unaffected_input_straight_through(metadata: object) -> None:
+    assert strip_uuid_prefix_override(metadata) == metadata
