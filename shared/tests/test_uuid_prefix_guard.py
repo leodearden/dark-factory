@@ -1035,3 +1035,199 @@ class TestAMixedCallIsRejectedWhole:
         h = self.harness()
         payload = await self._reject(h)
         assert payload['token'] == AMB
+
+
+# ---------------------------------------------------------------------------
+# B3 / D3 — ambiguity on a declared forward-on-ambiguity tool.
+# ---------------------------------------------------------------------------
+#
+# Losing the write is worse than the defect: an `update_task` bounced for an
+# ambiguous citation costs the whole update, and the citation is a detail of
+# it. So the prefix travels UNCHANGED and the ambiguity is reported instead.
+
+
+def project_of(arguments: Mapping[str, Any]) -> str | None:
+    """A test-local ``project_for``: whichever identity argument the tool declares.
+
+    Deliberately trivial, and deliberately not the shipped one — that has its
+    own contract, its own erratum and its own step. All this has to do is make
+    two projects distinguishable so the storm counter's keying is testable.
+    """
+    for key in ('project_id', 'project_root'):
+        value = arguments.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def ambiguity_harness(**guard_kwargs: Any) -> Harness:
+    return build_harness(
+        answers={AMB: AMBIGUOUS},
+        forward_on_ambiguity_tools=frozenset({'update_task'}),
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+def update_call(index: int = 0, project_root: str = PROJECT) -> dict[str, Any]:
+    return {
+        'task_id': str(4643 + index),
+        'project_root': project_root,
+        'description': f'supersedes {AMB}',
+    }
+
+
+class TestB3AmbiguityForwardsOnTheDeclaredClass:
+    async def test_the_tool_received_the_prefix_unchanged(self) -> None:
+        h = ambiguity_harness()
+        await h.call('update_task', update_call())
+        assert h.recorder.args['description'] == f'supersedes {AMB}'
+
+    async def test_the_ambiguity_is_reported_on_meta(self) -> None:
+        h = ambiguity_harness()
+        result = await h.call('update_task', update_call())
+        assert repair_of(result) == {
+            'ambiguous': [
+                {
+                    'field': 'description',
+                    'path': ['description'],
+                    'token': AMB,
+                    'candidates': [
+                        {
+                            'namespace': 'mem0',
+                            'id': AMB_MEM0,
+                            'preview': 'the reconciler ran twice and both passes',
+                        },
+                        {
+                            'namespace': 'graphiti_node',
+                            'id': AMB_NODE,
+                            'preview': 'ReconciliationRun',
+                        },
+                    ],
+                }
+            ]
+        }
+
+    async def test_no_substitutions_key_claims_an_expansion_that_did_not_happen(self) -> None:
+        """Omitted, not empty. A key that is always present teaches a reader to
+        skip it, and this one distinguishes "changed nothing" from "changed
+        something and did not say what"."""
+        h = ambiguity_harness()
+        result = await h.call('update_task', update_call())
+        repair = repair_of(result)
+        assert repair is not None
+        assert 'substitutions' not in repair
+
+    async def test_one_fact_with_outcome_forwarded_ambiguous(self) -> None:
+        h = ambiguity_harness()
+        await h.call('update_task', update_call())
+        assert h.facts == [
+            detection_fact(
+                tool='update_task',
+                field='description',
+                token=AMB,
+                outcome='forwarded_ambiguous',
+                candidate_ids=[AMB_MEM0, AMB_NODE],
+                namespace=None,
+                agent_id=None,
+            )
+        ]
+
+    async def test_a_single_forward_carries_no_storm_key(self) -> None:
+        h = ambiguity_harness()
+        result = await h.call('update_task', update_call())
+        repair = repair_of(result)
+        assert repair is not None
+        assert 'storm' not in repair
+
+
+# ---------------------------------------------------------------------------
+# INV-4 — the storm escape on the fail-soft outcomes.
+# ---------------------------------------------------------------------------
+#
+# A forwarded ambiguity is INVISIBLE to its caller: the call succeeded. So a
+# burst of them is the one signal an operator has that the boundary is
+# absorbing a defect at scale, and it must not be poolable into an alarm that
+# names an outcome or a project that never burst.
+
+
+async def drive_forwards(h: Harness, count: int, project_root: str = PROJECT) -> list[Any]:
+    return [await h.call('update_task', update_call(i, project_root)) for i in range(count)]
+
+
+class TestTheStormEscape:
+    async def test_two_forwards_do_not_fire(self) -> None:
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 2)
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+    async def test_the_third_fires_and_the_summary_rides_on_meta(self) -> None:
+        """The forwarding tier is the one whose callers cannot learn of the
+        burst any other way — their calls all SUCCEEDED."""
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 3)
+        repair = repair_of(results[-1])
+        assert repair is not None
+        assert repair['storm'] == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'outcome': 'forwarded_ambiguous',
+            'project': PROJECT,
+        }
+
+    async def test_the_defaults_are_a_tripwire_not_a_rate_limit(self) -> None:
+        """3 in 3600s, read off the fired summary rather than off an attribute.
+
+        Three ambiguous citations inside one agent session is not a rate to be
+        limited, it is a signal that a whole batch of writes is citing ids that
+        do not identify anything.
+        """
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 3)
+        repair = repair_of(results[-1]) or {}
+        assert (repair['storm']['threshold'], repair['storm']['window_seconds']) == (3, 3600.0)
+
+    async def test_the_escalation_sink_received_exactly_one_record(self) -> None:
+        h = ambiguity_harness(time_provider=_Clock())
+        await drive_forwards(h, 3)
+        assert h.escalations == [
+            {
+                'error_type': 'uuid_prefix_boundary_storm',
+                'count': 3,
+                'threshold': 3,
+                'window_seconds': 3600.0,
+                'outcome': 'forwarded_ambiguous',
+                'project': PROJECT,
+            }
+        ]
+
+    async def test_every_call_still_landed(self) -> None:
+        """A storm changes what an operator is told, never what the caller gets."""
+        h = ambiguity_harness(time_provider=_Clock())
+        await drive_forwards(h, 3)
+        assert len(h.recorder.calls) == 3
+        assert all(call['description'] == f'supersedes {AMB}' for call in h.recorder.calls)
+
+    async def test_two_projects_do_not_pool_into_a_premature_fire(self) -> None:
+        """Keyed per (project, outcome). One counter whose window spans every
+        event regardless of label would fire on the fourth event here and name
+        a project that saw only two."""
+        h = ambiguity_harness(time_provider=_Clock())
+        results = await drive_forwards(h, 2, 'alpha') + await drive_forwards(h, 2, 'beta')
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+    async def test_a_rejection_never_advances_the_forwarded_counter(self) -> None:
+        """`rejected` is not in STORM_COUNTED_OUTCOMES, and not merely because
+        its threshold is high: it is never handed to a counter at all. A
+        rejection is not fail-soft — the caller is told — so it needs no
+        escape."""
+        h = ambiguity_harness(time_provider=_Clock())
+        for _ in range(2):
+            with pytest.raises(ToolError):
+                await h.call('add_memory', {'content': f'see {AMB}', 'project_id': PROJECT})
+        results = await drive_forwards(h, 2)
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
