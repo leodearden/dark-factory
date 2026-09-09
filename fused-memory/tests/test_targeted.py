@@ -2524,6 +2524,50 @@ class TestSweepCancelledDescendants:
             f'got: {stamp_skips}'
         )
 
+    @pytest.mark.asyncio
+    async def test_block_success_writes_symmetric_journal_rows(
+        self, wired_reconciler, mock_taskmaster, journal, tmp_path,
+    ):
+        """Both landed writes get their own 'write' row.
+
+        Without the positive rows an operator filtering ``action_type='skip'``
+        has no denominator, so a rejection rate cannot be computed. Absence of
+        ``metadata_stamp`` is the success signal, mirroring ``hints_attached``
+        in targeted.py::_on_task_blocked.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert len(blocks) == 1, f'Expected exactly one descendant_blocked, got: {blocks}'
+        assert 'metadata_stamp' not in blocks[0], (
+            f'metadata_stamp must be absent when the stamp landed, got: {blocks[0]!r}'
+        )
+
+        status_writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert len(status_writes) == 1, (
+            f'Expected exactly one write/set_task_status row, got: {status_writes}'
+        )
+        assert status_writes[0]['detail'].get('type') == 'descendant_block', (
+            f'got: {status_writes[0]["detail"]!r}'
+        )
+        assert status_writes[0]['detail'].get('task_id') == 'B', (
+            f'got: {status_writes[0]["detail"]!r}'
+        )
+
+        stamp_writes = await self._taskmaster_rows(journal, 'write', 'update_task')
+        assert len(stamp_writes) == 1, (
+            f'Expected exactly one write/update_task row, got: {stamp_writes}'
+        )
+        assert stamp_writes[0]['detail'].get('type') == 'block_metadata_stamp', (
+            f'got: {stamp_writes[0]["detail"]!r}'
+        )
+
+        for operation in ('set_task_status', 'update_task'):
+            skips = await self._taskmaster_rows(journal, 'skip', operation)
+            assert not skips, f'Expected no skip/{operation} rows, got: {skips}'
+
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
 # Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='in-progress').
