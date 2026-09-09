@@ -14,6 +14,7 @@ import signal
 
 import pytest
 
+import shared.proc_group as proc_group_module
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,
@@ -1097,22 +1098,65 @@ class TestScanProcessGroupsUnderPath:
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
     async def test_scan_respects_exclude_pgids(self, tmp_path):
-        """A pgid in *exclude_pgids* is dropped even when its cwd is under root.
+        """END TO END: a REAL pgid under root is dropped, its neighbour kept.
 
-        Also exercises the equality branch (cwd == root exactly).
+        ONE /proc walk, deliberately (task 4520). Each walk reads every live
+        pid on the host — 1100+ pids and 23.3 MB of ``maps`` when this was
+        measured — so its cost scales with the machine's process count and CPU
+        contention, and this was the only test in the class paying for that
+        twice. It is the file's slowest item against a 15s budget that (per
+        pytest-timeout's ``func_only=False``) also covers setup and teardown.
+        The bound is untouched; the WORK is halved.
+
+        TWO sleepers, ONE walk — and the second one is load-bearing, not
+        decoration. ``scan_process_groups_under_path`` wraps the entire walk in
+        a blanket ``except Exception: return set()``, so "the excluded pid is
+        absent" is equally satisfied by a scan that never saw the tree at all:
+        a stat-format change, a ``_PROC_ROOT`` mishap or a permissions change
+        would blow the walk up, get laundered into an empty set, and turn this
+        test GREEN. The unexcluded ``keeper`` is the witness that separates
+        EXCLUDED from NEVER FOUND AT ALL. It costs a fork, not a second walk;
+        the walk count is the thing this test exists to keep at one.
+
+        The coverage that a single walk cannot carry is carried elsewhere,
+        against the identical helper:
+
+        * the ``<root>XYZ`` prefix boundary and the "outside" case —
+          :meth:`test_scan_matches_cwd_under_root_and_respects_boundary`;
+        * the cwd == root EQUALITY branch, selective exclusion across several
+          groups, and same-pgrp de-duplication —
+          :class:`TestScanProcessGroupsAgainstASyntheticProc`, exhaustively and
+          deterministically, because it controls the whole pid population,
+          which a walk over 1100 uncontrolled pids cannot.
+
+        What only a REAL walk can prove, and what this test therefore keeps:
+        genuinely live process groups under root are told apart — one named in
+        *exclude_pgids* dropped, one not named returned — end-to-end through
+        the real procfs.
         """
         root = tmp_path.resolve() / '_merge-verify'
-        root.mkdir()
-        proc = await _spawn_sleeper_in(root)
+        keeper_cwd = root / 'build'
+        keeper_cwd.mkdir(parents=True)
+        excluded = await _spawn_sleeper_in(root)
+        keeper = await _spawn_sleeper_in(keeper_cwd)
         try:
-            assert proc.pid in scan_process_groups_under_path(root)
-            assert proc.pid not in scan_process_groups_under_path(
-                root, exclude_pgids=frozenset({proc.pid})
+            found = scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({excluded.pid})
+            )
+            assert excluded.pid not in found, (
+                f'pgid {excluded.pid} was named in exclude_pgids and must not '
+                f'be returned; got {found}'
+            )
+            assert keeper.pid in found, (
+                f'pgid {keeper.pid} (cwd {keeper_cwd}, NOT excluded) is missing '
+                f'from {found} — the walk never reached the tree, which would '
+                f'make the exclusion assertion above pass vacuously'
             )
         finally:
-            _kill_group(proc.pid)
-            with contextlib.suppress(Exception):
-                await proc.wait()
+            for p in (excluded, keeper):
+                _kill_group(p.pid)
+                with contextlib.suppress(Exception):
+                    await p.wait()
 
     def test_scan_never_raises_on_unreadable_pid(self, monkeypatch, tmp_path):
         """A readlink that raises (vanished / permission-denied pid) is swallowed.
@@ -1139,6 +1183,202 @@ class TestScanProcessGroupsUnderPath:
         result = scan_process_groups_under_path(tmp_path / 'never-created')
         assert isinstance(result, set)
         assert result == set()
+
+
+class TestScanProcessGroupsAgainstASyntheticProc:
+    """The scan's branches, pinned against a FABRICATED /proc — no real walk.
+
+    A real-/proc walk cannot control its pid population: it reads 1100+ live
+    pids (23.3 MB of ``maps`` alone), it cannot assert that two pids sharing a
+    pgrp are de-duplicated, and it costs 0.8-1.5s that scales with host load —
+    which is how the two-walk ``test_scan_respects_exclude_pgids`` came to sit
+    against a 15s budget with thin headroom (task 4520). A fabricated tree
+    controls every pid, covers strictly more branches, and costs microseconds.
+
+    Points the module at the fake tree via ``shared.proc_group._PROC_ROOT``,
+    the same monkeypatch-module-internals idiom
+    ``test_scan_never_raises_on_unreadable_pid`` (``os.readlink``) and
+    ``test_reap_refuses_unsafe_pgids`` (``os.killpg``) already use — rather
+    than adding a test-only parameter to the public function.
+    """
+
+    @staticmethod
+    def _stat_line(pid: int, pgrp: int, comm: str = 'weird (name) proc') -> str:
+        """A real-format ``/proc/<pid>/stat``: ``pid (comm) state ppid pgrp ...``.
+
+        *comm* deliberately contains spaces AND a ``)`` so the parser's
+        ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
+        mis-read this line, and the kernel really does allow it (a process can
+        set an arbitrary 15-char comm).
+        """
+        return (
+            f'{pid} ({comm}) S 1 {pgrp} {pgrp} 0 -1 4194304 '
+            + ' '.join(['0'] * 20)
+            + '\n'
+        )
+
+    @pytest.fixture
+    def fake_proc(self, tmp_path, monkeypatch):
+        """Build the fabricated /proc and the root the scan is aimed at.
+
+        Returns ``(proc_root, root)``. Population:
+
+        ==== ===== ============================ =========================
+        pid  pgrp  cwd                          expectation
+        ==== ===== ============================ =========================
+        100  100   <root>                       match (equality branch)
+        200  200   <root>/build/deep            match (strictly under)
+        300  300   <root>XYZ                    NO match (prefix boundary)
+        400  400   an unrelated dir             NO match
+        510  500   <root>/build                 match
+        520  500   <root>/build                 same group, de-duplicated
+        600  --    stat is a DIRECTORY          skipped (OSError on read)
+        700  --    no stat at all               skipped (OSError on read)
+        800  --    stat has no ')'              skipped (parse failure)
+        810  --    stat pgrp is not an int      skipped (parse failure)
+        ==== ===== ============================ =========================
+
+        Plus non-numeric entries (``self``, ``cpuinfo``) that must be ignored.
+        No ``fd`` dir and no ``maps`` file anywhere, so every decision here is
+        made on ``cwd`` alone — the other two signals have their own coverage.
+        """
+        proc_root = tmp_path / 'proc'
+        proc_root.mkdir()
+        base = (tmp_path / 'work').resolve()
+        root = base / '_merge-verify'
+        (root / 'build' / 'deep').mkdir(parents=True)
+        sibling = base / '_merge-verifyXYZ'
+        outside = base / 'other'
+        for d in (sibling, outside):
+            d.mkdir(parents=True)
+
+        def _pid(pid: int, pgrp: int, cwd) -> None:
+            entry = proc_root / str(pid)
+            entry.mkdir()
+            (entry / 'stat').write_text(self._stat_line(pid, pgrp))
+            (entry / 'cwd').symlink_to(cwd)
+
+        _pid(100, 100, root)
+        _pid(200, 200, root / 'build' / 'deep')
+        _pid(300, 300, sibling)
+        _pid(400, 400, outside)
+        _pid(510, 500, root / 'build')
+        _pid(520, 500, root / 'build')
+
+        # 600: stat is a directory — IsADirectoryError (an OSError) on read,
+        # and unlike chmod 0o000 it stays unreadable when the suite runs as root.
+        (proc_root / '600' / 'stat').mkdir(parents=True)
+        (proc_root / '600' / 'cwd').symlink_to(root)
+        # 700: no stat at all — FileNotFoundError.
+        (proc_root / '700').mkdir()
+        (proc_root / '700' / 'cwd').symlink_to(root)
+        # 800 / 810: stat present but unparseable.
+        (proc_root / '800').mkdir()
+        (proc_root / '800' / 'stat').write_text('no closing paren here\n')
+        (proc_root / '800' / 'cwd').symlink_to(root)
+        (proc_root / '810').mkdir()
+        (proc_root / '810' / 'stat').write_text('810 (x) S 1 not-a-number 0\n')
+        (proc_root / '810' / 'cwd').symlink_to(root)
+        # Non-numeric entries: a dir and a file, both ignored.
+        (proc_root / 'self').mkdir()
+        (proc_root / 'cpuinfo').write_text('processor : 0\n')
+
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        return proc_root, root
+
+    def test_matches_equality_and_under_but_not_the_prefix_sibling(self, fake_proc):
+        """cwd == root and cwd under root match; <root>XYZ and outside do not."""
+        _proc_root, root = fake_proc
+        found = scan_process_groups_under_path(root)
+        assert found == {100, 200, 500}, (
+            f'expected pgids 100 (cwd == root), 200 (under root) and 500 '
+            f'(two pids, one group); got {found}'
+        )
+        assert 300 not in found, 'a <root>XYZ sibling must not match root'
+        assert 400 not in found, 'an unrelated cwd must not match root'
+
+    def test_exclude_pgids_drops_only_the_named_group(self, fake_proc):
+        """The excluded pgid goes; every other matching pgid stays."""
+        _proc_root, root = fake_proc
+        assert scan_process_groups_under_path(
+            root, exclude_pgids=frozenset({500})
+        ) == {100, 200}
+        assert scan_process_groups_under_path(
+            root, exclude_pgids=frozenset({100, 200, 500})
+        ) == set()
+
+    def test_two_pids_in_one_group_are_inspected_once(self, fake_proc, monkeypatch):
+        """The ``pgrp in result`` short-circuit skips the group's second pid.
+
+        A set result would hide a missing short-circuit, so this counts the
+        expensive per-pid inspection instead — which is the thing that reads
+        ``cwd``, every open fd, and the whole ``maps`` file.
+        """
+        _proc_root, root = fake_proc
+        inspected: list[str] = []
+        real = proc_group_module._pid_references_path_at_or_under
+
+        def counting(entry, target):
+            inspected.append(entry.name)
+            return real(entry, target)
+
+        monkeypatch.setattr(
+            'shared.proc_group._pid_references_path_at_or_under', counting
+        )
+        assert scan_process_groups_under_path(root) == {100, 200, 500}
+        group_500 = [name for name in inspected if name in ('510', '520')]
+        assert len(group_500) == 1, (
+            f'both pids of pgid 500 were inspected ({group_500}); the '
+            f'`pgrp in result` short-circuit is not working'
+        )
+
+    def test_excluded_group_is_never_inspected(self, fake_proc, monkeypatch):
+        """An excluded pgid must skip the fd/maps inspection entirely."""
+        _proc_root, root = fake_proc
+        inspected: list[str] = []
+        monkeypatch.setattr(
+            'shared.proc_group._pid_references_path_at_or_under',
+            lambda entry, target: inspected.append(entry.name) or False,
+        )
+        scan_process_groups_under_path(root, exclude_pgids=frozenset({500}))
+        assert '510' not in inspected and '520' not in inspected, (
+            f'an excluded pgid must not pay for inspection; inspected {inspected}'
+        )
+
+    def test_unreadable_and_malformed_pids_are_skipped_not_raised(self, fake_proc):
+        """A pid whose stat cannot be read or parsed is skipped, never fatal.
+
+        All four are planted with a cwd EXACTLY at root, so a scan that failed
+        to skip them would show up as an extra pgid rather than as silence.
+        """
+        _proc_root, root = fake_proc
+        found = scan_process_groups_under_path(root)
+        assert found == {100, 200, 500}
+        assert 600 not in found and 700 not in found
+        assert 800 not in found and 810 not in found
+
+    def test_a_missing_proc_root_yields_an_empty_set(self, tmp_path, monkeypatch):
+        """The `not proc_dir.exists()` branch — an empty result, not a raise.
+
+        Asserted against the UNSAFE helper, because the public wrapper cannot
+        express this: it converts ANY exception into ``set()``, so an empty
+        result from it is equally consistent with the intended early return,
+        with an unexpected raise from anywhere in the walk, and with a walk
+        that simply matched nothing — the branch named in this docstring would
+        not actually be pinned. Against
+        ``_scan_process_groups_under_path_unsafe`` a raise FAILS the test
+        instead of being laundered into the expected answer. Reaching a module
+        internal is the idiom this class already relies on (``_PROC_ROOT``,
+        ``_pid_references_path_at_or_under``).
+
+        The public wrapper is then asserted too, so the branch stays pinned
+        through the layer callers actually use.
+        """
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path / 'absent')
+        assert proc_group_module._scan_process_groups_under_path_unsafe(
+            str(tmp_path), frozenset()
+        ) == set()
+        assert scan_process_groups_under_path(tmp_path) == set()
 
 
 class TestReapProcessGroups:
