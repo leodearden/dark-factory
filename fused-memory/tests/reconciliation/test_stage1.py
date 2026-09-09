@@ -5059,8 +5059,8 @@ class TestAccountedClusterGrowthWiring:
     @pytest.mark.asyncio
     async def test_accounted_growth_flag_dropped_and_benign_survives(self):
         """The 3417 false positive is dropped; a benign finding survives."""
-        stage = _make_consolidator(project_root='/tmp/reify')
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage = make_consolidator(project_root='/tmp/reify')
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_task = AsyncMock(return_value=self._make_gate_task())
 
         growth_flag = self._make_growth_flag()
@@ -5092,7 +5092,7 @@ class TestAccountedClusterGrowthWiring:
     @pytest.mark.asyncio
     async def test_stat_is_present_and_zero_when_growth_is_genuine(self):
         """The stat must never be conditionally absent (always-present convention)."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         assert stage.taskmaster is not None
         stage.taskmaster.get_task = AsyncMock(return_value=self._make_gate_task())
 
@@ -5122,7 +5122,7 @@ class TestAccountedClusterGrowthWiring:
         dedup_flags internally writes a stage1_flag_marker per surviving flag,
         so a flag dropped AFTER it would leave marker churn behind.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         assert stage.taskmaster is not None
         stage.taskmaster.get_task = AsyncMock(return_value=self._make_gate_task())
 
@@ -5138,6 +5138,7 @@ class TestAccountedClusterGrowthWiring:
         )
 
         dedup_mock.assert_awaited_once()
+        assert dedup_mock.await_args is not None
         passed_flags = dedup_mock.await_args.kwargs['flags']
         assert growth_flag not in passed_flags, (
             'the dropped flag must never reach dedup_flags — dropping it after '
