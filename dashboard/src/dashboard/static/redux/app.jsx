@@ -6,6 +6,7 @@ const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, Esca
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
+const { reconRunCounts } = window.DF_RECON_STATUS;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -107,7 +108,10 @@ function App() {
   const railCounts = {
     orch: summary.orchRunning,
     tasks: DD.ACTIVE_TASKS.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'pending').length,
-    recon: DD.RECON_STATE.runs.filter(r => r.status === 'failed' || r.status === 'partial').length,
+    // Terminal failures only — 'failed' AND 'interrupted'. The badge is an
+    // attention signal, so in-flight runs get their own tile on the tab
+    // rather than inflating this number.
+    recon: reconRunCounts(DD.RECON_STATE.runs).unsuccessful,
     merge: Object.values(DD.MERGE_QUEUE).reduce((s, d) => s + d.active.length, 0),
     esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0,
   };
