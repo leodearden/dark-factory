@@ -274,6 +274,19 @@ class TestGetPendingLevelFilter:
         queue.submit(esc)
         return esc
 
+    def test_seeded_records_carry_a_level_labelled_summary(self, tmp_path: Path) -> None:
+        """``_seed_esc``'s summary names the record's level, and that is what
+        distinguishes the three records each test below seeds into one queue
+        (level=0/1/2, all under the same ``task-A``) -- so a filter assertion that
+        fails is legible from the record alone."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc = self._seed_esc(queue, 'task-A', level=1)
+
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.summary == 'level=1 test escalation'
+
     @pytest.mark.asyncio
     async def test_filter_level2_returns_only_l2(self, tmp_path: Path):
         """get_pending_escalations(level=2) returns only the L2 escalation."""
