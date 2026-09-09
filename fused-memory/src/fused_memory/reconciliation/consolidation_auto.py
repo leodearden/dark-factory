@@ -50,6 +50,7 @@ __all__ = [
     'AutoReason',
     'AutoReasonCode',
     'AutoVerdict',
+    'build_auto_canonical',
 ]
 
 
@@ -212,3 +213,38 @@ CORRECTION_BANNER_RE: re.Pattern[str] = re.compile(
     r'\[\s*(?:CORRECTION|SUPERSEDED|RETRACTED|RETRACTION)\b'
     r'|(?m:^(?:CORRECTION|Correction|SUPERSEDED|CORPUS-HYGIENE WARNING)\b)',
 )
+
+
+def build_auto_canonical(claim: str, topic: str, n: int, run_id: str) -> str:
+    """Render the canonical body for an auto-consolidated cluster (PRD C3).
+
+    The ONE home of auto-consolidated canonical text: task delta's executor
+    calls this and writes nothing of its own, so there is exactly one shape to
+    audit and exactly one place to change it.
+
+    The LLM supplies only *claim*. Its ``rationale`` and ``seeded_from`` fields
+    are reviewer-facing and never enter canonical text (PRD D2), and *claim*
+    leads the body verbatim because PRD §2 measured that a template canonical
+    whose claim leads retrieves within 0.015 cosine of a hand-written one.
+
+    The member list deliberately does NOT appear in the text. The live
+    ``metadata.topic`` scroll IS the member list; *run_id* and the ledger row
+    are the pointers back to the decision that wrote it. Naming the members
+    here would give one fact two homes, and the copy in the text would be the
+    one that goes stale (PRD D6).
+
+    There is no runtime length cap, by decision D5: with every input at its own
+    cap — a 200-char claim, a 100-char slug, N=20 and a 36-char uuid run id —
+    the result is 464 characters, so a cap would be unreachable dead code, and
+    dead code that looks like a safety bound is worse than none. The bound is
+    asserted by ``tests/test_consolidation_auto.py`` instead.
+
+    No truncation, no conditionals, no defaults: any branch here would be a
+    second canonical shape.
+    """
+    return (
+        f'{claim}\n\n'
+        f'Index canonical for topic `{topic}` over {n} short peers; the live '
+        f'metadata.topic scroll is the member list (auto-consolidated, run '
+        f'{run_id}).'
+    )
