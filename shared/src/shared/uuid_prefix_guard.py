@@ -41,12 +41,14 @@ from __future__ import annotations
 
 import enum
 import inspect
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
-from typing import Any, Literal, NamedTuple, get_args
+from typing import Any, Literal, NamedTuple, NoReturn, get_args
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
 # From ``fastmcp.tools.base``, which is where ``Middleware.on_call_tool``'s own
@@ -228,6 +230,33 @@ ProjectFor = Callable[[Mapping[str, Any]], str | None]
 #: Either channel may be a plain function OR an ``async def``: the machinery a
 #: registration site wires them to is largely async in this repo.
 Sink = Callable[[dict[str, Any]], Any | Awaitable[Any]]
+
+
+#: Which fact outcome each action reports. A DECLARED table for the same
+#: reason :data:`POLICY_MATRIX` is one: the guard has two vocabularies — what
+#: it DID (an action) and what it tells an operator (a fact outcome) — and the
+#: map between them is policy rather than a body detail.
+#:
+#: :attr:`PrefixAction.INERT` has no entry, which is the mechanical reason a
+#: `none` token never produces a fact: there is no outcome to report.
+_FACT_OUTCOME: Mapping[PrefixAction, FactOutcome] = MappingProxyType(
+    {
+        PrefixAction.SUBSTITUTE_AND_FORWARD: 'expanded',
+        PrefixAction.REJECT_WITH_CANDIDATES: 'rejected',
+    }
+)
+
+
+#: The escape from a rejection, and the ONLY action available to the caller.
+#: It must not offer to choose: "exactly one candidate across both namespaces,
+#: or nothing is changed" is the whole design, and a hint that implied
+#: otherwise would be a promise this guard cannot keep.
+_REJECT_HINT = (
+    'More than one live id in this project starts with that prefix, so there is no '
+    'single correct expansion and the choice is yours. Pick the intended id from '
+    '`candidates`, put the FULL uuid in place of the prefix in `original_call`, and '
+    'resubmit that call verbatim.'
+)
 
 
 class _Planned(NamedTuple):
@@ -486,23 +515,83 @@ class UuidPrefixGuardMiddleware(Middleware):
         Facts are emitted BEFORE the outcome is delivered, so a tool body that
         raises cannot take the record of what the guard did down with it.
         """
-        unimplemented = {p.action for p in plan} - {PrefixAction.SUBSTITUTE_AND_FORWARD}
+        unimplemented = {p.action for p in plan} - set(_FACT_OUTCOME)
         if unimplemented:
             raise NotImplementedError(f'no arm yet for {sorted(unimplemented)}')
+
+        rejections = tuple(p for p in plan if p.action is PrefixAction.REJECT_WITH_CANDIDATES)
+        if rejections:
+            # A rejection is a WHOLE-CALL outcome: nothing is written, so no
+            # other site in this plan was acted on and none of them has
+            # anything to report. Emitting an `expanded` fact for a token this
+            # call never expanded would put a lie in the stream.
+            await self._emit_facts(name, rejections, arguments, project)
+            self._reject(name, arguments, rejections[0])
+
+        await self._emit_facts(name, plan, arguments, project)
 
         report: dict[str, Any] = {}
         expansions = tuple(p for p in plan if p.action is PrefixAction.SUBSTITUTE_AND_FORWARD)
         if expansions:
             report['substitutions'] = [_substitution_record(p) for p in expansions]
 
-        for planned in expansions:
-            await self._emit_fact(
-                name, planned, outcome='expanded',
-                agent_id=_agent_id(arguments), project=project,
-            )
-
         self._expand(arguments, expansions)
         return await self._forward(context, call_next, report)
+
+    def _reject(self, name: str, arguments: Mapping[str, Any], planned: _Planned) -> NoReturn:
+        """Write nothing; bounce the caller with the complete original call.
+
+        RAISES rather than short-circuiting with a middleware-authored
+        ``ToolResult``. Measured on the markup guard: a tool with a return
+        annotation carries an output schema, and a ToolResult that does not
+        satisfy it fails with "Output validation error: 'result' is a required
+        property". This middleware is generic over every tool on the server, so
+        it cannot know how to satisfy an arbitrary output schema. Raising is
+        verified to prevent the tool body from running at all — which is what
+        makes "nothing written" TRUE rather than merely intended — and to
+        round-trip a ``json.dumps`` payload to the caller byte-intact.
+
+        ``original_call`` is the COMPLETE argument map, and it is the caller's
+        own: the resolve phase finishes before any substitution is applied, so
+        a call carrying one unique and one ambiguous token bounces with
+        nothing expanded rather than half-repaired.
+
+        There is deliberately NO ``repaired_call``, which is where this refusal
+        diverges from the markup guard's. A mis-closed tag has one correct
+        repair; an ambiguous citation has two correct answers and no way to
+        tell them apart, so a repaired call would be the guard making the
+        author's choice and presenting it as a fix.
+
+        The first ambiguity in document order is the one named, the markup
+        guard's first-hit-wins convention: a refusal is a whole-call outcome
+        and the caller resubmits the whole call, so listing the rest would add
+        length without adding an action.
+
+        The flat key vocabulary — error / error_type / outcome / tool / field /
+        token / hint — is the markup guard's refusal shape, so an agent bounced
+        by either guard reads ONE diagnostic contract.
+        """
+        field = _field(planned.token)
+        raise ToolError(
+            json.dumps(
+                {
+                    'error': (
+                        f'Tool call rejected: {planned.token.token!r} in {field!r} is a '
+                        'truncated uuid that matches more than one live id in this project.'
+                    ),
+                    'error_type': 'ambiguous_uuid_prefix',
+                    'outcome': _FACT_OUTCOME[PrefixAction.REJECT_WITH_CANDIDATES],
+                    'tool': name,
+                    'field': field,
+                    'token': planned.token.token,
+                    'candidates': [
+                        candidate._asdict() for candidate in planned.resolution.candidates
+                    ],
+                    'original_call': dict(arguments),
+                    'hint': _REJECT_HINT,
+                }
+            )
+        )
 
     @staticmethod
     def _expand(arguments: dict[str, Any], expansions: tuple[_Planned, ...]) -> None:
@@ -553,6 +642,25 @@ class UuidPrefixGuardMiddleware(Middleware):
         )
 
     # -- facts (INV-2) ----------------------------------------------------
+
+    async def _emit_facts(
+        self,
+        tool: str,
+        sites: tuple[_Planned, ...],
+        arguments: Mapping[str, Any],
+        project: str,
+    ) -> None:
+        """Emit one fact per acted-on site, BEFORE the outcome is delivered.
+
+        Identity is read here, ahead of any substitution, so a fact reports the
+        arguments the caller actually sent.
+        """
+        agent_id = _agent_id(arguments)
+        for planned in sites:
+            await self._emit_fact(
+                tool, planned,
+                outcome=_FACT_OUTCOME[planned.action], agent_id=agent_id, project=project,
+            )
 
     async def _emit_fact(
         self,
