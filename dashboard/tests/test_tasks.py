@@ -480,12 +480,13 @@ class TestTasksReadRecord:
         assert windowed['page_size'] == 25
         assert windowed['offset'] == 50
 
-    def test_wire_arguments_window_is_independent_of_the_records_own_mode(self):
+    def test_a_walk_varies_the_window_across_pages_of_one_record(self):
         """The walk re-uses one record across pages, varying only the window.
 
         Each page of a chunked complete read is the SAME _TasksRead with a
-        different window, so the encoder must take the window as an argument
-        rather than reading it off ``self.mode``.
+        different window, which is why the encoder takes a window at all. A
+        ``_CompleteRead`` mode fixes no window of its own, so this is the one
+        mode that may supply one.
         """
         read = tasks_mod._TasksRead(
             '/r', frozenset({'done'}), tasks_mod._CompleteRead(10)
@@ -497,6 +498,34 @@ class TestTasksReadRecord:
             'project_root': '/r', 'statuses': ['done'], 'page_size': 10, 'offset': 0,
         }
         assert second['offset'] == 10
+
+    def test_a_page_read_takes_its_wire_window_from_its_own_mode(self):
+        """The bytes on the wire come from the field the KEY hashes.
+
+        A page read passes no window: `_OnePage` already fixes one, so the
+        request is derived from `mode` itself. That is what makes the offset
+        drift the old two-encoder shape produced unrepresentable rather than
+        merely absent — there is no second copy to disagree with.
+        """
+        read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
+
+        assert read.wire_arguments(None) == {
+            'project_root': '/r', 'page_size': 25, 'offset': 50,
+        }
+
+    def test_a_page_read_refuses_a_second_window(self):
+        """Offering a window to a page read RAISES rather than overriding.
+
+        Silently preferring either one would reintroduce exactly the key/wire
+        disagreement this record exists to eliminate: the key would carry
+        `mode` while the wire carried the argument. `TypeError`, not
+        `ValueError` — `first_success` treats `ValueError` as a soft per-url
+        failure and would launder a programming error into an offline marker.
+        """
+        read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
+
+        with pytest.raises(TypeError):
+            read.wire_arguments(tasks_mod._OnePage(25, 75))
 
 
 class TestFetchTasksCache:

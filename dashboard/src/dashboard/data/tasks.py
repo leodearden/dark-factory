@@ -160,7 +160,9 @@ guarantee it is not.
 #   OFFSET DRIFT.  The encoder rendered ``|o={offset}`` unconditionally while
 #   ``offset`` only reached the wire alongside ``page_size``, so two reads with
 #   a byte-identical wire request minted two entries.  Here the only read that
-#   HAS an offset is :class:`_OnePage`, which always sends one.
+#   HAS an offset is :class:`_OnePage`, and ``wire_arguments`` sends THAT
+#   field rather than a window handed to it, so the bytes on the wire are the
+#   bytes in the key by construction.
 #
 #   STATUSES ORDER.  ``['a','b']`` and ``['b','a']`` encoded differently while
 #   naming one order-insensitive SQL ``IN`` list.  ``frozenset`` collapses them.
@@ -210,7 +212,11 @@ class _TasksRead:
 
     Being both is the point.  The key and the request dict used to be built by
     two separate encoders that already disagreed about ``offset``; deriving
-    both from this one record means they cannot disagree again.
+    both from this one record means they cannot disagree again.  For a PAGE
+    read that is enforced rather than merely intended: :meth:`wire_arguments`
+    reads the window off :attr:`mode` — the very field the key hashes — and
+    REFUSES a second one, so no call site can hand the wire a window the key
+    does not carry.
 
     The RETURN CONTRACT is the *mode*'s TYPE — ``type(read.mode)`` answers
     "one page or the whole set?" without parsing anything out of a string.
@@ -223,9 +229,16 @@ class _TasksRead:
     def wire_arguments(self, window: _OnePage | None) -> dict:
         """Build the MCP ``get_tasks`` arguments for this read.
 
-        *window* is a PARAMETER rather than being read off :attr:`mode`
-        because a chunked walk re-uses ONE record across every page, varying
-        only the window.
+        *window* exists for the WALK, which re-uses ONE record across every
+        page and varies only the window — that is the whole reason this is a
+        parameter at all.  A :class:`_OnePage` read has no such freedom: its
+        window IS :attr:`mode`, so it is read from there and a caller-supplied
+        one is a ``TypeError`` rather than a silent override.  Both halves
+        matter.  Deriving it is what makes key/wire OFFSET DRIFT structurally
+        impossible instead of a discipline the one page call site happens to
+        keep; refusing the redundant argument is what stops a future edit
+        (clamping an offset, retrying a short page) from reintroducing the
+        disagreement quietly.
 
         ``statuses`` is guarded on ``is not None``, never truthiness:
         ``frozenset()`` is falsy but means "no tasks at all", the opposite of
@@ -233,12 +246,19 @@ class _TasksRead:
         It crosses the wire ``sorted()`` — a frozenset has no iteration order,
         and deterministic bytes beat nondeterministic ones for logs and mocks.
         """
+        if isinstance(self.mode, _OnePage) and window is not None:
+            raise TypeError(
+                f'{self.mode!r} already fixes this read\'s window; passing '
+                f'{window!r} as well is the key/wire disagreement this record '
+                f'exists to make unrepresentable'
+            )
+        page = self.mode if isinstance(self.mode, _OnePage) else window
         arguments: dict = {'project_root': self.project_root}
         if self.statuses is not None:
             arguments['statuses'] = sorted(self.statuses)
-        if window is not None:
-            arguments['page_size'] = window.page_size
-            arguments['offset'] = window.offset
+        if page is not None:
+            arguments['page_size'] = page.page_size
+            arguments['offset'] = page.offset
         return arguments
 
 
@@ -490,8 +510,9 @@ async def _walk_pages(
     page_budget: int | None = None
     first_total: int | None = None
     while True:
-        # Same record, different window — which is why wire_arguments takes the
-        # window as an argument rather than reading it off `read.mode`.
+        # Same record, different window — which is why wire_arguments takes a
+        # window at all.  Only a `_CompleteRead` may supply one; a page read's
+        # window is its own mode, and offering a second raises.
         # `statuses` therefore reaches EVERY page: the tool applies the status
         # filter BEFORE its in-memory slice, so `total` is the FILTERED count and
         # an unfiltered page would both over-read and desynchronise the walk's
@@ -750,19 +771,22 @@ async def fetch_task_page(
     through the single :func:`_cached_fanout` core, so there is deliberately
     no second copy of that policy — or of its description — to drift.
     """
-    window = _OnePage(page_size, offset)
     read = _TasksRead(
         str(project_root),
         None if statuses is None else frozenset(statuses),
-        window,
+        _OnePage(page_size, offset),
     )
 
     async def _call(url: str) -> list[dict]:
         """Read the whole answer from ONE url: for a page read, that is a page."""
+        # No window is passed: `read.mode` IS this read's window, so the wire
+        # request is derived from the cache key rather than from a second copy
+        # of *page_size*/*offset* that could drift from it.
+        #
         # The pagination envelope is deliberately DISCARDED. It bounds a WALK;
         # here the requested window IS the contract, and a short final page is
         # a correct answer rather than a truncation to detect.
-        return (await _fetch_page(client, url, read, window, timeout)).rows
+        return (await _fetch_page(client, url, read, None, timeout)).rows
 
     return await _cached_fanout(client, config, read, _call, timeout)
 
