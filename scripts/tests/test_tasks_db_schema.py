@@ -169,7 +169,16 @@ def _arbitrary_db(tmp_path: Path) -> Path:
                 PRIMARY KEY (left_id, right_id)
             );
             CREATE TABLE loose (anything);
+            CREATE TABLE assorted (
+                label   VARCHAR(20),
+                ratio   DOUBLE,
+                payload BLOB
+            );
             """
+        )
+        conn.execute(
+            "INSERT INTO assorted (label, ratio, payload) VALUES (?, ?, ?)",
+            ("a label", 1.5, b"\x00bytes"),
         )
         conn.commit()
     finally:
@@ -246,3 +255,87 @@ def test_introspect_returns_records_rather_than_rendered_text(make_tasks_db):
     first_column = reported[0].columns[0]
     with pytest.raises(AttributeError):
         first_column.name = "renamed"
+
+
+# ---------------------------------------------------------------------------
+# Column.python_type — the remedy for the AttributeError half of the sighting.
+#
+# Every claim here is checked against a REAL insert/select round trip, never
+# against a lookup table the test also wrote.
+# ---------------------------------------------------------------------------
+
+def _columns_of(conn: sqlite3.Connection, table: str) -> dict:
+    return {
+        column.name: column
+        for reported in introspect(conn)
+        if reported.name == table
+        for column in reported.columns
+    }
+
+
+def test_reported_python_type_is_what_a_read_actually_hands_back(make_tasks_db):
+    conn = connect_ro(make_tasks_db([{"id": 7, "status": "done"}]))
+    try:
+        columns = _columns_of(conn, "tasks")
+        row_id, row_status = conn.execute("SELECT id, status FROM tasks").fetchone()
+    finally:
+        conn.close()
+
+    assert type(row_id) is columns["id"].python_type
+    assert type(row_status) is columns["status"].python_type
+    assert (columns["id"].python_type, columns["status"].python_type) == (int, str)
+
+
+def test_a_task_id_read_from_the_store_has_no_isdigit(make_tasks_db):
+    """The sighting itself: ``'int' object has no attribute 'isdigit'``.
+
+    A task id is spelled as a string everywhere a human meets one — in a
+    branch name, a worktree path, an escalation id — so reaching for a string
+    method on one read out of the store is the natural mistake. The reported
+    python type is what makes it avoidable BEFORE the query is written.
+    """
+    conn = connect_ro(make_tasks_db([{"id": 7}]))
+    try:
+        columns = _columns_of(conn, "tasks")
+        (row_id,) = conn.execute("SELECT id FROM tasks").fetchone()
+    finally:
+        conn.close()
+
+    assert columns["id"].python_type is int
+    assert getattr(row_id, "isdigit", None) is None
+
+
+def test_python_type_follows_affinity_rules_not_an_exact_type_table(tmp_path):
+    """``VARCHAR(20)``/``DOUBLE``/``BLOB`` are none of them the canonical
+    spellings, and all three round-trip to the reported type."""
+    conn = connect_ro(_arbitrary_db(tmp_path))
+    try:
+        columns = _columns_of(conn, "assorted")
+        row = conn.execute("SELECT label, ratio, payload FROM assorted").fetchone()
+    finally:
+        conn.close()
+
+    assert [type(value) for value in row] == [
+        columns[name].python_type for name in ("label", "ratio", "payload")
+    ]
+    assert [columns[name].python_type for name in ("label", "ratio", "payload")] == [
+        str,
+        float,
+        bytes,
+    ]
+
+
+def test_a_column_with_no_declared_type_is_reported_as_unconstrained(tmp_path):
+    """sqlite constrains nothing here, so the tool must claim nothing.
+
+    A guessed ``str`` would be exactly the failure mode this tool exists to
+    remove, one layer further in — an authoritative-looking wrong answer.
+    """
+    conn = connect_ro(_arbitrary_db(tmp_path))
+    try:
+        loose = _columns_of(conn, "loose")["anything"]
+    finally:
+        conn.close()
+
+    assert loose.declared_type == ""
+    assert loose.python_type is None
