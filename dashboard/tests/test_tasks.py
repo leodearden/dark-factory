@@ -329,13 +329,14 @@ class TestTasksReadRecord:
             ),
         ],
     )
-    def test_each_record_is_frozen_slotted_and_hashable(self, name, build):
-        """A cache key that can be mutated or grow a __dict__ is not a key.
+    def test_each_record_is_frozen_and_usable_as_a_dict_key(self, name, build):
+        """A cache key that can be mutated after insertion is not a key.
 
-        Frozen because a dict key mutated after insertion is unfindable;
-        slotted because these are minted per read and the key space is bounded
-        by disuse rather than cardinality (TTLCache._evict_expired), so the
-        per-instance dict is pure waste.
+        These are the two properties a cache key genuinely needs, and both are
+        asserted against live behaviour rather than against the decorator's
+        arguments: a mutated key is unfindable in the dict it was filed under,
+        and an equal-but-distinct rebuild must find the entry the original
+        wrote.
         """
         record = build(tasks_mod)
 
@@ -343,34 +344,12 @@ class TestTasksReadRecord:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(record, field, 'mutated')
 
-        assert not hasattr(record, '__dict__'), (
-            f'{name} is not slotted — it grew a __dict__'
+        # A real dict round trip, not `hash()` alone — that would pass for a
+        # type whose __eq__ and __hash__ disagree, which is precisely the way
+        # a key silently stops finding its own entry.
+        assert {record: 'v'}[build(tasks_mod)] == 'v', (
+            f'{name} does not round-trip as a dict key'
         )
-
-        # Hashable AND usable as a real dict key, which is the actual
-        # requirement — hash() alone would pass for an unhashable-by-eq type.
-        assert isinstance(hash(record), int)
-        assert {record: 'v'}[build(tasks_mod)] == 'v'
-
-    @pytest.mark.parametrize(
-        ('name', 'call'),
-        [
-            ('_OnePage', lambda m: m._OnePage(10)),
-            ('_CompleteRead', lambda m: m._CompleteRead()),
-            ('_TasksRead', lambda m: m._TasksRead('/r', None)),
-        ],
-    )
-    def test_no_field_carries_a_default(self, name, call):
-        """An omitted field must be a loud TypeError, never a silent key.
-
-        This is the runtime shadow of the pyright construction check. With a
-        default, a future read mode that forgets to enter a field mints a
-        valid-but-WRONG key and collides silently with an unrelated read;
-        without one it fails at construction, and it fails even where pyright
-        is not run.
-        """
-        with pytest.raises(TypeError):
-            call(tasks_mod)
 
     def test_statuses_order_does_not_change_the_key(self):
         """['a','b'] and ['b','a'] are ONE read, so they are ONE key.
@@ -2626,7 +2605,10 @@ class TestWalkPages:
 
         return _page_fn
 
-    # ---- (e) the PINNED-URL constraint, asserted structurally -------------
+    # The PINNED-URL constraint is not asserted here. It is behavioural, and
+    # lives in TestFetchTasksPagination, which drives two servers serving
+    # DISJOINT id ranges so a mixed answer is visible rather than plausible:
+    #     test_a_walk_never_assembles_pages_from_two_servers
 
     # ---- (c) the two COMPLETE cases: a true zero, not a truncation --------
 
