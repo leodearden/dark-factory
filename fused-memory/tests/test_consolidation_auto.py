@@ -14,7 +14,6 @@ notice drift in its wording, backticks or punctuation.
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import subprocess
 import sys
 import uuid
@@ -429,30 +428,19 @@ class TestVerdictShapeAndGating:
         assert first.predicate_version == shipped.predicate_version
         assert second.predicate_version == '2'
 
-    def test_the_predicate_reads_no_store(self):
-        """The caller supplies every fact — there is nowhere to pass a service.
+    def test_the_predicate_returns_a_verdict_from_supplied_facts_alone(self):
+        """Supplied facts are enough: the predicate answers without reading anything.
 
-        C2's "never calls search" is pinned structurally rather than by
-        watching for I/O: the signature admits exactly six names and every one
-        of them is a plain fact. A verdict that could depend on a live read
-        would be a verdict that depends on WHEN it ran.
+        C2's "never calls search" is NOT asserted here. It is established
+        structurally, and far more strongly, by
+        ``TestImportLeafAndSingleHomes::test_module_is_import_light``: in a
+        fresh interpreter this module cannot even import
+        ``fused_memory.services.memory_service``, pydantic, yaml or mem0, so
+        there is nothing here to read a store WITH. Do not restore a signature
+        or parameter-name pin — a service could reach the predicate through
+        ``config``, a module global or a member record without any name set
+        changing by one character.
         """
-        params = inspect.signature(evaluate_auto_predicate).parameters
-
-        assert set(params) == {
-            'proposal',
-            'members',
-            'canonical_count',
-            'open_gate_id',
-            'existing_canonical_slugs',
-            'config',
-        }
-        assert [
-            name
-            for name, p in params.items()
-            if p.kind is not inspect.Parameter.KEYWORD_ONLY
-        ] == ['proposal']
-
         verdict = evaluate_auto_predicate(
             _proposal(('m1', 'm2')),
             members=_members(_member('m1'), _member('m2')),
