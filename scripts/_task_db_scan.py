@@ -14,7 +14,13 @@ importable-by-sibling-scripts only. It hosts three tiers:
 * **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
   :func:`resolve_project_roots`, :func:`discover_project_roots`,
   :func:`discover_db_paths`) — adopted by ALL FOUR sweep scripts, plus
-  ``census_tagger_debris.py`` (task 4525).
+  ``census_tagger_debris.py`` (task 4525). :func:`connect_ro`, with
+  :class:`TaskDbUnreadable` and :class:`TaskDbProblem`, is the same tier's
+  "…and OPEN it" half (task 5330): Tier 1 owned the path and nothing owned the
+  open, so ~10 call sites spell it themselves and none turns a wrong path into
+  an actionable message. Its callers are the forensic readers of ONE named
+  store; the sweep scripts keep their own opens because a sweep over many
+  projects wants the opposite policy — skip an unreadable store silently.
 * **Tier 2, leak-scanner CLI plumbing** (:func:`sweep_databases`,
   :func:`run_scan_cli`, :func:`add_db_discovery_args`,
   :data:`NO_DB_RESOLVED_MESSAGE`, :func:`format_json`, :func:`truncate`,
@@ -122,6 +128,7 @@ import os
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
+from enum import Enum
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -137,6 +144,57 @@ _DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
 def tasks_db_path(project_root: str) -> Path:
     """``<root>/.taskmaster/tasks/tasks.db`` — the live task store."""
     return Path(project_root) / ".taskmaster" / "tasks" / "tasks.db"
+
+
+class TaskDbProblem(Enum):
+    """Why :func:`connect_ro` refused a path — the discriminator to branch on.
+
+    An enum member rather than a substring of the message, so callers and
+    tests never grow an ad-hoc parser of prose that is free to improve.
+    """
+
+    ABSENT = "absent"
+
+
+_REFUSAL_REMEDY = {
+    TaskDbProblem.ABSENT: (
+        "no such file. The live task store is the MAIN checkout's "
+        ".taskmaster/tasks/tasks.db; .taskmaster/ is not tracked in git, so it "
+        "never exists inside a worktree. `git worktree list --porcelain` names "
+        "the main checkout on its first line."
+    ),
+}
+
+
+class TaskDbUnreadable(Exception):
+    """*path* is not a readable task store, for the structured *reason*.
+
+    Carries the resolved :attr:`path` and a :class:`TaskDbProblem`
+    :attr:`reason` as fields; the formatted message is for the human only.
+
+    Deliberately NOT a ``sqlite3.Error`` subclass. This module's sweep tiers
+    catch that to skip an unreadable store SILENTLY, which is the right policy
+    for a sweep over many projects and the exact opposite of what a reader
+    interrogating one named store needs.
+    """
+
+    def __init__(self, path: Path, reason: TaskDbProblem) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"{path}: {_REFUSAL_REMEDY[reason]}")
+
+
+def connect_ro(path: str | Path) -> sqlite3.Connection:
+    """Open *path* strictly read-only, or refuse with :class:`TaskDbUnreadable`.
+
+    Raises rather than returning a connection whose first query answers
+    ``no such table: tasks`` — an error that reads as "this store is empty"
+    when it in fact means "you are looking at the wrong file".
+    """
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        raise TaskDbUnreadable(resolved, TaskDbProblem.ABSENT)
+    raise NotImplementedError("the read-only open itself is not wired up yet")
 
 
 def resolve_project_roots(

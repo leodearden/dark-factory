@@ -60,7 +60,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-
 from _task_db_scan import (
     _DEFAULT_PROJECT_ROOTS,
     AUDIT_EXIT_FINDINGS,
