@@ -36,7 +36,12 @@ from pathlib import Path
 
 import pytest
 from _task_db_scan import connect_ro
-from tasks_db_schema import MainCheckoutUnresolved, introspect, resolve_live_db_path
+from tasks_db_schema import (
+    MainCheckoutUnresolved,
+    introspect,
+    main,
+    resolve_live_db_path,
+)
 
 # ---------------------------------------------------------------------------
 # Git fixtures. Real repositories rather than a stubbed `git worktree list`:
@@ -339,3 +344,99 @@ def test_a_column_with_no_declared_type_is_reported_as_unconstrained(tmp_path):
 
     assert loose.declared_type == ""
     assert loose.python_type is None
+
+
+# ---------------------------------------------------------------------------
+# main(argv) — the one-command answer, and its two refusals.
+#
+# Asserted on exit codes and stream separation, never on layout: the contract
+# is "the reader gets the shape, or a diagnosis, and never silence".
+# ---------------------------------------------------------------------------
+
+def _column_line(out: str, column_name: str) -> str:
+    """The single output line whose whitespace-separated tokens name *column_name*."""
+    lines = [line for line in out.splitlines() if column_name in line.split()]
+    assert len(lines) == 1, f"expected one line naming {column_name!r}, got {lines!r}"
+    return lines[0]
+
+
+def test_main_prints_every_table_and_its_columns_for_an_explicit_db(
+    make_tasks_db, capsys
+):
+    db = make_tasks_db([{"id": 1, "status": "done"}])
+    conn = connect_ro(db)
+    try:
+        reported = introspect(conn)
+    finally:
+        conn.close()
+
+    exit_code = main(["--db", str(db)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    for table in reported:
+        assert table.name in out
+        for column in table.columns:
+            line = _column_line(out, column.name)
+            assert column.declared_type in line
+            if column.python_type is not None:
+                assert column.python_type.__name__ in line
+
+
+def test_main_resolves_the_store_under_an_explicit_project_root(
+    tmp_path, make_tasks_db, capsys
+):
+    root = tmp_path / "some-project"
+    root.mkdir()
+    _seed_store(root, make_tasks_db)
+
+    exit_code = main(["--project-root", str(root)])
+
+    assert exit_code == 0
+    assert "tasks" in capsys.readouterr().out
+
+
+def test_main_with_no_path_arguments_resolves_from_the_cwd(
+    tmp_path, make_tasks_db, monkeypatch, capsys
+):
+    """The zero-argument spelling is the one a reader will actually type, and
+    it has to work from inside a task lane."""
+    main_checkout = _main_checkout(tmp_path)
+    worktree = _linked_worktree(main_checkout)
+    _seed_store(main_checkout, make_tasks_db)
+    monkeypatch.chdir(worktree)
+
+    exit_code = main([])
+
+    assert exit_code == 0
+    assert "tasks" in capsys.readouterr().out
+
+
+def test_main_exits_non_zero_and_says_why_when_the_store_is_absent(tmp_path, capsys):
+    """A forensic tool that exits 0 having reported nothing is worse than no
+    tool: it tells the reader the store has no tables."""
+    absent = tmp_path / "nowhere" / "tasks.db"
+
+    exit_code = main(["--db", str(absent)])
+
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert captured.out == ""
+    assert str(absent) in captured.err
+
+
+def test_main_diagnoses_a_zero_byte_stub_differently_from_an_absent_store(
+    tmp_path, capsys
+):
+    stub = tmp_path / "tasks.db"
+    stub.write_bytes(b"")
+
+    stub_exit = main(["--db", str(stub)])
+    stub_captured = capsys.readouterr()
+    absent_exit = main(["--db", str(tmp_path / "nowhere" / "tasks.db")])
+    absent_captured = capsys.readouterr()
+
+    assert (stub_exit, absent_exit) != (0, 0)
+    assert stub_captured.out == ""
+    assert str(stub) in stub_captured.err
+    assert stub_captured.err != absent_captured.err
