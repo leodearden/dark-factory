@@ -30,11 +30,13 @@ To run just this suite:
 """
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 
 import pytest
-from tasks_db_schema import MainCheckoutUnresolved, resolve_live_db_path
+from _task_db_scan import connect_ro
+from tasks_db_schema import MainCheckoutUnresolved, introspect, resolve_live_db_path
 
 # ---------------------------------------------------------------------------
 # Git fixtures. Real repositories rather than a stubbed `git worktree list`:
@@ -137,3 +139,110 @@ def test_resolve_live_db_path_refuses_a_start_outside_any_git_tree(tmp_path):
 
     assert excinfo.value.start == outside.resolve()
     assert str(excinfo.value.start) in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# introspect(conn) -> tuple[Table, ...]
+#
+# The tool must be right about a store it has never seen, so every expectation
+# below is derived from the SAME connection through PRAGMA table_info rather
+# than written down here. A test that spelled out the tasks columns would be
+# the fifth hand-maintained copy of them.
+# ---------------------------------------------------------------------------
+
+def _arbitrary_db(tmp_path: Path) -> Path:
+    """A store with shapes the tasks fixture does not have.
+
+    A composite primary key exercises the pk ORDINAL rather than a boolean,
+    and ``loose`` declares a column with no type at all — sqlite's dynamic
+    affinity, which the tool must report as unconstrained rather than guess.
+    """
+    path = tmp_path / "arbitrary.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE pair (
+                left_id  INTEGER NOT NULL,
+                right_id INTEGER NOT NULL,
+                note     TEXT,
+                PRIMARY KEY (left_id, right_id)
+            );
+            CREATE TABLE loose (anything);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _assert_report_matches_pragma(conn: sqlite3.Connection) -> None:
+    """The report equals what the database itself says, table for table."""
+    reported = introspect(conn)
+
+    listed = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    assert listed, "the fixture seeded no tables, so this check would be vacuous"
+    assert {table.name for table in reported} == listed
+
+    for table in reported:
+        pragma = conn.execute(f"PRAGMA table_info({table.name})").fetchall()
+        assert [
+            (column.name, column.declared_type, column.notnull, column.pk)
+            for column in table.columns
+        ] == [(row[1], row[2], bool(row[3]), row[5]) for row in pragma]
+
+
+def test_introspect_matches_pragma_table_info_for_a_task_store(make_tasks_db):
+    conn = connect_ro(make_tasks_db([{"id": 1, "status": "done"}]))
+    try:
+        _assert_report_matches_pragma(conn)
+    finally:
+        conn.close()
+
+
+def test_introspect_matches_pragma_table_info_for_an_arbitrary_store(tmp_path):
+    conn = connect_ro(_arbitrary_db(tmp_path))
+    try:
+        _assert_report_matches_pragma(conn)
+    finally:
+        conn.close()
+
+
+def test_introspect_reports_pk_ordinals_and_nullability(tmp_path):
+    """pk is a POSITION, not a flag — a composite key has a first and a second
+    column, and a reader joining on one of them needs to know which."""
+    conn = connect_ro(_arbitrary_db(tmp_path))
+    try:
+        tables = {table.name: table for table in introspect(conn)}
+        pair = {column.name: column for column in tables["pair"].columns}
+    finally:
+        conn.close()
+
+    assert (pair["left_id"].pk, pair["right_id"].pk, pair["note"].pk) == (1, 2, 0)
+    assert pair["left_id"].notnull is True
+    assert pair["note"].notnull is False
+
+
+def test_introspect_returns_records_rather_than_rendered_text(make_tasks_db):
+    """`introspect` produces DATA; formatting is `render`'s job.
+
+    Returning text would force every caller — including this suite — into an
+    ad-hoc parser of the tool's own layout (heuristic 12).
+    """
+    conn = connect_ro(make_tasks_db([{"id": 1}]))
+    try:
+        reported = introspect(conn)
+    finally:
+        conn.close()
+
+    assert not isinstance(reported, str)
+    first_column = reported[0].columns[0]
+    with pytest.raises(AttributeError):
+        first_column.name = "renamed"
