@@ -947,6 +947,24 @@ _NOT_REPRODUCED = (
     r"(?:\s+not|n['\u2019]t)\s+(?:be\s+)?reproduc\w*"
 )
 
+# What turns a negative probe report into a CLEARANCE CLAIM: it scopes the
+# negative to the fault's current existence rather than to the one probe that
+# was run. Without one of these in the same clause, "did not reproduce" is a
+# truthful per-probe observation \u2014 which is precisely the fine-grained
+# reporting the Stage 2 probe protocol asks for, and rejecting it would make
+# the rule reject the protocol's own output.
+_CLEARANCE_QUALIFIER = (
+    r'(?:this\s+(?:cycle|run)|no\s+longer|any\s?more|cleared|clear|'
+    r'resolved|gone|absent|healthy)'
+)
+_CLEARANCE_IN_CLAUSE = rf'(?=[^.;]*\b{_CLEARANCE_QUALIFIER}\b)'
+
+# At most a couple of determiners may sit between a negated `reproduce` and
+# the fault it is about. Anything wordier is a DIFFERENT subject wearing the
+# same words \u2014 "the stage1 stall bug did not reproduce after the Graphiti
+# degradation was fixed" asserts nothing this invariant forbids.
+_DETERMINER_GAP = r'(?:\s+(?:the|this|that|a|an|any|its|such)){0,2}\s+'
+
 # Sourced from the template the stage prompts render, so a rejected caller is
 # told the exact permitted wording and the two can never disagree.
 _NEGATIVE_PROBE_SET_DETAIL = (
@@ -1002,9 +1020,16 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (
         re.compile(
             '(?:'
-            + _PROBE_SUBJECT + _CLAUSE_GAP + _NOT_REPRODUCED
+            # <fault> did not reproduce ... this cycle
+            + _PROBE_SUBJECT + r'\s+' + _NOT_REPRODUCED + _CLEARANCE_IN_CLAUSE
             + '|'
-            + _NOT_REPRODUCED + _CLAUSE_GAP + _PROBE_SUBJECT
+            # did not reproduce the <fault> ... this cycle
+            + _NOT_REPRODUCED + _DETERMINER_GAP + _PROBE_SUBJECT
+            + _CLEARANCE_IN_CLAUSE
+            + '|'
+            # <fault> no longer reproduces — self-qualifying, and carries no
+            # negated auxiliary for the two arms above to hang on.
+            + _PROBE_SUBJECT + r'\s+no\s+longer\s+(?:be\s+)?reproduc\w*'
             + ')',
             re.IGNORECASE,
         ),

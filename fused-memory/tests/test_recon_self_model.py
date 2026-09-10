@@ -602,7 +602,7 @@ class TestNegativeProbeSetPremise:
     def _invariants(self, text: str) -> set[str]:
         return {v.invariant for v in m.premise_lint(text)}
 
-    def test_flags_unqualified_did_not_reproduce_premise(self):
+    def test_flags_cycle_scoped_clearance_claim(self):
         assert self.INVARIANT in self._invariants(
             'Stage 2 probed the mixed-store path and the degradation did not '
             'reproduce this cycle.'
