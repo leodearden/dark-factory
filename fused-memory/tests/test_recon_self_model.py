@@ -585,8 +585,16 @@ class TestPremiseLint:
 class TestNegativeProbeSetPremise:
     """Task 4644: a negative mixed-store probe set licenses "0 of N
     reproduced" and nothing stronger. Run cd53b227 promoted one negative probe
-    to an absence conclusion and wrote it into a task's `details`; these are
-    the two phrasings it used, and the two it must not swallow along with them.
+    to an absence conclusion and wrote it into a task's `details`.
+
+    The discriminator these cases encode: the rule rejects a CLEARANCE CLAIM —
+    an assertion about whether the fault currently exists — and permits a
+    per-probe OBSERVATION, however negative. "0 of 3 reproduced" and "the
+    limit=3 probe did not reproduce" are observations; "the degradation did not
+    reproduce this cycle" and "there is no persistent Graphiti problem" are
+    claims. Since `premise_lint_error` is a hard ValidationError at the
+    `submit_task` boundary for every `recon-stage-*` caller, a false positive
+    here is not noise — it is a rejected legitimate call.
     """
 
     INVARIANT = 'negative_probe_set_does_not_clear_intermittent_fault'
@@ -600,9 +608,54 @@ class TestNegativeProbeSetPremise:
             'reproduce this cycle.'
         )
 
+    def test_flags_clearance_claim_in_reverse_order(self):
+        """The cd53b227 phrasing with the subject AFTER the verb. The
+        cycle-scope qualifier is what makes it a clearance claim rather than a
+        per-probe report, and it must survive any narrowing of the rule."""
+        assert self.INVARIANT in self._invariants(
+            'The probe set did not reproduce the Graphiti degradation this cycle.'
+        )
+
+    def test_flags_no_longer_reproduces_claim(self):
+        """The pre-verbal clearance form, which the `did not` shape cannot
+        reach: no negation cue precedes `reproduces` at all."""
+        assert self.INVARIANT in self._invariants(
+            'The mixed-store degradation no longer reproduces.'
+        )
+
     def test_flags_no_persistent_graphiti_problem_premise(self):
         assert self.INVARIANT in self._invariants(
             'The probe was negative, so there is no persistent Graphiti problem.'
+        )
+
+    def test_per_probe_report_is_not_flagged(self):
+        """LOAD-BEARING: this is a truthful per-probe report, and it is exactly
+        the fine-grained reporting the Stage 2 probe protocol asks for. A rule
+        that exists to enforce the protocol must not reject the protocol's own
+        output."""
+        assert self.INVARIANT not in self._invariants(
+            'Probe at limit=3 did not reproduce the degradation; the limit=8 '
+            'probe did.'
+        )
+
+    def test_unrelated_subject_naming_graphiti_is_not_flagged(self):
+        """`_PROBE_SUBJECT` exists (per its own comment) so that "an unrelated
+        task reporting 'the flaky test did not reproduce' would not be
+        rejected". A bidirectional gap defeats that whenever the unrelated
+        sentence happens to mention Graphiti in a neighbouring clause — here
+        `" after the "` separates the negated verb from the subject, and the
+        sentence's actual claim is about the stage1 stall bug."""
+        assert self.INVARIANT not in self._invariants(
+            'The stage1 stall bug did not reproduce after the Graphiti '
+            'degradation was fixed.'
+        )
+
+    def test_mixed_outcome_report_is_not_flagged(self):
+        """Negation and subject in DIFFERENT clauses, where the sentence's
+        actual claim is a POSITIVE sighting. Guards clause scoping."""
+        assert self.INVARIANT not in self._invariants(
+            'Probe at limit=8 did not reproduce it; the limit=15 probe did '
+            'reproduce the degradation.'
         )
 
     def test_permitted_verdict_wording_is_not_flagged(self):
