@@ -1065,8 +1065,8 @@ def unstarted_budget(reading: GpuReading) -> BudgetVerdict:
 
     ONLY the two SUBTRACTION preconditions are absent.  The reading's own
     coherence is still enforced, through the same
-    :func:`_check_reading_coherent` :func:`evaluate_budget` uses: "nothing was
-    started" says nothing about whether the card reading makes sense, and a PASS
+    :func:`_check_reading_coherent` that :func:`evaluate_budget` calls: "nothing
+    was started" says nothing about whether the card reading makes sense, and a PASS
     verdict carrying nonsense figures is worse here than anywhere else, because
     it is the only verdict a placeholder-only report ever carries.
 
