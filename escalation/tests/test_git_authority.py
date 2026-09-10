@@ -18,7 +18,6 @@ from __future__ import annotations
 import enum
 
 import pytest
-
 from shared.merge_state import MergeState
 
 from escalation.git_authority import GitAuthorityOutcome, found_on_main_response

@@ -32,6 +32,7 @@ from shared.merge_state import MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
+from escalation import git_authority
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
@@ -4204,51 +4205,6 @@ def create_server(
 
         return None
 
-    def _found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
-        """Build the git-authority Tier-3.5 done/found_on_main response.
-
-        ``merge_sha`` is a commit ON MAIN on both resolution paths, with one
-        explicit exception stated below (task 3103):
-
-        - **Live-branch path** (``is_ancestor`` hit): the citation commit
-          discovered by ``validate_landing_evidence`` — a commit on main
-          whose subject cites the task.
-        - **Deleted-branch path** (``find_merge_marker`` hit): the
-          merge-commit SHA found on main via ``git log``.
-
-        Both are effect-present-checked against current main HEAD before
-        being returned, so ``merge_sha`` is safe to record as provenance
-        as-is.  (Before task 3103 the live-branch path returned the *branch
-        tip*, which for a ``--no-ff`` merge is a distinct commit that is not
-        on main's first-parent chain — callers were told to prefer the
-        deleted-branch path's value.  That caveat no longer applies.)
-
-        **The one exception — ``git.commit_citation_pattern == ''``.**  That
-        is the documented per-project opt-out for projects with no citation
-        convention (config.py; ``find_task_citation_commit`` honours it by
-        returning None for everything, so running the gate would reject
-        unconditionally and turn this tier into dead code).  On that setting
-        the live-branch path skips the citation gate entirely and
-        ``merge_sha`` is the raw BRANCH TIP, neither citation-discovered nor
-        effect-present-checked — i.e. exactly the pre-3103 ``--no-ff`` wart,
-        deliberately retained as the price of the opt-out (the degeneracy
-        guard still applies).  Do not read the paragraphs above as
-        unconditional: on such a project a caller stamping ``merge_sha`` as
-        provenance is recording a branch tip, and a reverted landing is
-        indistinguishable from a live one (review #4).  The opt-out is
-        ``''`` only; ``None`` means "use the built-in default pattern" and
-        keeps the full guarantee.  Both SKILL.md runbooks carry the same
-        exception.
-        """
-        return {
-            'state': MergeState.done,
-            'request_id': request_id,
-            'generation': 1,
-            'kind': 'found_on_main',
-            'merge_sha': merge_sha,
-            'outcome': 'found_on_main',
-        }
-
     async def _git_authority_task_metadata(tid: str, *, site: str) -> dict[str, Any]:
         """Best-effort task metadata for the git-authority guards (task 3103).
 
@@ -4339,8 +4295,9 @@ def create_server(
           ``git.commit_citation_pattern`` is ``''`` (the documented
           per-project opt-out) guard 3 is skipped and merge_sha is the branch
           tip — not a commit on main, and not effect-present-checked; guard 2
-          still applies.  See ``_found_on_main_response`` for what that costs
-          a caller stamping merge_sha as provenance.
+          still applies.  See
+          ``escalation/src/escalation/git_authority.py::found_on_main_response``
+          for what that costs a caller stamping merge_sha as provenance.
         - If the branch ref is gone (tip is None): calls ``find_merge_marker``
           which searches git log for the merge commit subject.  On hit, two
           further guards (task 3103, mirroring the harness marker arm):
@@ -4371,7 +4328,8 @@ def create_server(
         Terminal entries carry: outcome (raw state), finished_at.
         git-authority terminal shape: state='done', kind='found_on_main',
             merge_sha=<a commit ON MAIN — the discovered citation or the
-            merge marker; see ``_found_on_main_response``>,
+            merge marker; see
+            ``escalation/src/escalation/git_authority.py::found_on_main_response``>,
             outcome='found_on_main'.
         Unknown carries: hint.
         """
@@ -4511,11 +4469,12 @@ def create_server(
                                 # The returned merge_sha is therefore the raw BRANCH
                                 # TIP — not a commit on main, and NOT effect-present
                                 # checked.  That is the price of the opt-out, and it is
-                                # called out explicitly in _found_on_main_response's
-                                # docstring and in both SKILL.md runbooks so a caller
+                                # called out explicitly in git_authority.py::
+                                # found_on_main_response's docstring and in both
+                                # SKILL.md runbooks so a caller
                                 # on such a project does not stamp it as verified
                                 # provenance (review #4).
-                                return _found_on_main_response(request_id, tip)
+                                return git_authority.found_on_main_response(request_id, tip)
                             # DISCOVERY mode: a commit on main must positively cite the
                             # task (FIX 2) AND its effect must still be present at main
                             # HEAD (FIX 1', the task-1175 reverted-landing guard).  The
@@ -4553,11 +4512,11 @@ def create_server(
                             )
                             # `accepted` implies a non-None evidence_sha (see
                             # LandingEvidenceVerdict), but assert it explicitly:
-                            # _found_on_main_response's merge_sha is a hard `str`,
+                            # found_on_main_response's merge_sha is a hard `str`,
                             # and a contract violation must degrade to Tier-4
                             # unknown rather than emit a `done` with a null sha.
                             if verdict.accepted and verdict.evidence_sha is not None:
-                                return _found_on_main_response(
+                                return git_authority.found_on_main_response(
                                     request_id, verdict.evidence_sha,
                                 )
                     elif tip is None:
@@ -4607,7 +4566,7 @@ def create_server(
                                 # above: reject a null evidence sha into Tier-4
                                 # unknown rather than into a `done` response.
                                 if verdict.accepted and verdict.evidence_sha is not None:
-                                    return _found_on_main_response(
+                                    return git_authority.found_on_main_response(
                                         request_id, verdict.evidence_sha,
                                     )
                 except Exception:
