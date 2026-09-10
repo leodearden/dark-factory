@@ -1549,17 +1549,16 @@ def normalize_project_token(value: object) -> str:
     path would churn the slug namespace and desynchronize a documented
     mirror.
 
-    The cockpit -- the one consumer that unions the two record kinds onto a
-    single ``project_weights`` key and a single weight picker -- therefore
-    folds BOTH kinds at its READ boundary instead (task 3812):
-    ``cockpit/src/cockpit/registry_reader.py::_read_record_soft`` for
-    sessions and ``::scan_decisions`` for decisions, plus its
-    ``priorities.yaml`` ``project_weights`` KEYS at load
-    (``cockpit/src/cockpit/priority.py::_canonical_project_weights``) and
-    its picker candidates
-    (``cockpit/src/cockpit/panes/weight_editor.py::known_projects``). The
-    picker and the scorer key can no longer disagree, and the fix is
-    retroactive over every already-written record with no migration run.
+    The cockpit folds BOTH record kinds at its READ boundary instead (task
+    3812), so its picker and its scorer key can no longer disagree, and the
+    fix is retroactive over every already-written record with no migration
+    run. ``cockpit/src/cockpit/registry_reader.py`` IS that boundary and its
+    module docstring is where the reasoning lives; its entry points are
+    ``::_read_record_soft`` for sessions and ``::scan_decisions`` for
+    decisions, joined by the ``priorities.yaml`` ``project_weights`` KEYS at
+    load (``cockpit/src/cockpit/priority.py::_canonical_project_weights``)
+    and the picker candidates
+    (``cockpit/src/cockpit/panes/weight_editor.py::known_projects``).
 
     Do not read "canonical" here as "canonical fleet-wide": the on-disk
     session records themselves are still unnormalized (they are TTL-reaped

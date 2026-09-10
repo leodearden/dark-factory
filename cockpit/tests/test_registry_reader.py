@@ -335,14 +335,13 @@ class TestProjectTokenCanonicalization:
     stamps record.project raw (it is parsed from the literal terminal
     title), so 'dark-factory', 'DARK-Factory' and 'df' all sit on disk for
     the same project (measured 2026-09-07: 42,026 / 1,493 / 89 records).
-    The cockpit keys one project_weights lookup and one weight picker on
-    that token, so a split spelling silently partitions an operator's
-    weight across buckets that never compare equal.
+    Why a split spelling has to be folded at the cockpit's reader is argued
+    once, in registry_reader's module docstring.
 
-    registry_reader therefore folds every scanned record's .project through
-    session_registry.normalize_project_token (task 3807's one canonical
-    fold) inside _read_record_soft -- the single parse step shared by
-    scan_sessions and SessionScanner.scan -- so both scan paths, and the
+    What these tests pin is the MECHANISM: every scanned record's .project
+    goes through session_registry.normalize_project_token (task 3807's one
+    canonical fold) inside _read_record_soft -- the single parse step shared
+    by scan_sessions and SessionScanner.scan -- so both scan paths, and the
     mtime cache behind SessionScanner, yield one bucket by construction.
     """
 
@@ -490,10 +489,10 @@ class TestProjectTokenCanonicalization:
 class TestScanDecisions:
     """scan_decisions is the DECISION-side twin of scan_sessions (task 3812).
 
-    The cockpit unions both record kinds onto one project_weights key and
-    one weight picker, so both must enter through the same canonicalization
-    rule. The fold is idempotent and therefore a no-op for decisions written
-    after task 3807 (write-decision already stamps the canonical token); it
+    Both record kinds enter through the same canonicalization rule -- see
+    registry_reader's module docstring for why they must. The fold is
+    idempotent and therefore a no-op for decisions written after task 3807
+    (write-decision already stamps the canonical token); it
     exists for the legacy rows still on disk that
     migrate_decision_project_tokens has not been run over (measured
     2026-09-07: 19 OPEN 'df' + 2 OPEN 'dark-factory'), and so that the

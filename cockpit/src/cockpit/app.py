@@ -415,8 +415,9 @@ class CockpitApp(App):
         Decisions are read via registry_reader.scan_decisions, the folding
         wrapper over C1's list_decisions, so DecisionRecord.project arrives
         already canonicalized -- the same rule the scanner applies to
-        SessionRecord.project (task 3812). Both row kinds must fold together:
-        they share one project_weights key and one weight picker.
+        SessionRecord.project (task 3812). Why both row kinds must fold
+        together is argued in registry_reader's module docstring, the one
+        home for that rationale.
         """
         records = self._scanner.scan()
         decisions = scan_decisions(self.fleet_root)
