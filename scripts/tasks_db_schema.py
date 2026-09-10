@@ -15,6 +15,15 @@ store it is pointed at and prints what is actually there, which is the only
 answer that cannot rot: four hand-maintained copies of the tasks column list
 already exist in this repo and one of them is stale.
 
+SQLITE IS DYNAMICALLY TYPED, so the reported python type is a statement about
+AFFINITY — what a value is coerced to on the way in — and not a guarantee
+about every value already stored. Affinity is nonetheless the answer to the
+question that keeps being asked wrong: ``tasks.id`` is declared INTEGER, so a
+task id read out of the store arrives as ``int`` and ``.isdigit()`` on it
+raises. A declaration that carries no affinity rule of its own — none at all,
+or a NUMERIC-ish one that can come back as either int or float — is reported
+as unconstrained rather than guessed.
+
 WHY IT RESOLVES THE MAIN CHECKOUT ITSELF, rather than importing
 ``fused_memory.models.scope.resolve_main_checkout`` — a knowing duplication,
 recorded so it is not read as an oversight. That function is the right one and
@@ -94,12 +103,18 @@ class Column(NamedTuple):
 
     *pk* is a POSITION, not a flag: 0 for a column outside the primary key,
     otherwise its 1-based place within a possibly-composite one.
+
+    *python_type* is the type values of this column arrive as, derived from
+    *declared_type* by sqlite's affinity rules, or None when the declaration
+    constrains nothing (see this module's docstring). It is the field that
+    answers "can I call a string method on this?" before the query is written.
     """
 
     name: str
     declared_type: str
     notnull: bool
     pk: int
+    python_type: type | None
 
 
 class Table(NamedTuple):
@@ -109,9 +124,37 @@ class Table(NamedTuple):
     columns: tuple[Column, ...]
 
 
+# sqlite's affinity rules, in the order it applies them, keyed on the
+# SUBSTRINGS the rules are actually written in terms of. Matching on substrings
+# rather than on a table of exact declarations is what lets an unfamiliar
+# spelling — VARCHAR(20), DOUBLE, BIGINT — be classified instead of crashing or
+# silently defaulting to str.
+_AFFINITY_RULES: tuple[tuple[tuple[str, ...], type], ...] = (
+    (("INT",), int),
+    (("CHAR", "CLOB", "TEXT"), str),
+    (("BLOB",), bytes),
+    (("REAL", "FLOA", "DOUB"), float),
+)
+
+
+def _python_type(declared_type: str) -> type | None:
+    """The type *declared_type* coerces values to, or None if it constrains none."""
+    declared = declared_type.upper()
+    for needles, python_type in _AFFINITY_RULES:
+        if any(needle in declared for needle in needles):
+            return python_type
+    return None
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> tuple[Column, ...]:
     return tuple(
-        Column(name=name, declared_type=declared, notnull=bool(notnull), pk=pk)
+        Column(
+            name=name,
+            declared_type=declared,
+            notnull=bool(notnull),
+            pk=pk,
+            python_type=_python_type(declared),
+        )
         for _cid, name, declared, notnull, _default, pk in conn.execute(
             f'PRAGMA table_info("{table}")'
         )
