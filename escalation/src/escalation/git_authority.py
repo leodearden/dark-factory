@@ -39,9 +39,13 @@ a response field here to carry it.
 from __future__ import annotations
 
 import enum
+import logging
+from dataclasses import dataclass
 from typing import Any
 
 from shared.merge_state import MergeState
+
+logger = logging.getLogger(__name__)
 
 
 class GitAuthorityOutcome(enum.StrEnum):
@@ -109,3 +113,93 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
         'merge_sha': merge_sha,
         'outcome': 'found_on_main',
     }
+
+
+@dataclass(frozen=True)
+class TaskMetadataResult:
+    """Task metadata PLUS whether the fetch that produced it actually worked.
+
+    ``metadata == {}`` alone is not proof that a task carries no metadata —
+    it is equally what a missing harness, an absent scheduler or a raising
+    ``get_task`` produces.  Read it TOGETHER with ``unavailable``, which is
+    True only when the fetch FAILED.
+
+    Copies the shape of
+    ``orchestrator/src/orchestrator/task_ground_truth.py::TruthReport``
+    (``escalation_store_unavailable``), and its normative source
+    ``escalation/src/escalation/pins.py::classify_pins``
+    (``store_unavailable``), down to defaulting the flag False so
+    hand-construction of the healthy case stays ergonomic.
+
+    The distinction exists for the PRD's leaf η (task 4651), whose writer
+    must treat "could not read metadata" as "cannot verify the degeneracy
+    guard" rather than as "no degeneracy" — the collapse today's
+    ``{}``-on-everything forces.  ``merge_status`` and ``merge_request``
+    both deliberately still read only ``.metadata``.
+    """
+
+    metadata: dict[str, Any]
+    unavailable: bool = False
+
+
+async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataResult:
+    """Best-effort task metadata for the git-authority guards (task 3103).
+
+    Returns ``metadata == {}`` on EVERY failure mode — no harness, no
+    ``scheduler`` attribute, ``get_task`` raising, or a None/metadata-less
+    task — and never raises.  A scheduler fault must degrade a single guard,
+    not swallow the whole probe.
+
+    The ``{}`` is qualified by :attr:`TaskMetadataResult.unavailable`, which
+    separates a FAULT from a FACT: the first three modes above set it True
+    ("we could not read"), while a healthy read that finds no metadata — or
+    finds no such task — leaves it False ("there is genuinely nothing
+    there").  "No such task" is deliberately a fact, not a fault: the
+    discriminant is READ SUCCESS, because a present-but-metadata-less record
+    is equally unable to answer the degeneracy question yet is plainly not a
+    fault, and flagging an absent record True would make ``unavailable``
+    mean a fault OR a legitimately-absent task — the very conflation it
+    exists to remove.
+
+    ``{}`` deliberately FAILS OPEN out of the degeneracy check.  On the
+    ``merge_status`` path it then falls THROUGH to the citation gate,
+    which is git-only and needs no task metadata; on the
+    ``merge_request`` fast path there is no citation gate, so the block
+    simply reverts to its pre-3103 ancestry/patch-id behaviour.  Either
+    way this is exact parity with the harness, which treats an absent or
+    non-40-hex ``branch_base_sha`` as "no degeneracy signal" rather than
+    as grounds to reject: a metadata fault must never fabricate a
+    confident answer, and must never hard-fail a genuinely merged branch.
+
+    Args:
+        harness: The orchestrator harness, duck-typed — only
+            ``harness.scheduler.get_task`` is ever touched, and ``None`` is
+            a supported value.  It was a ``create_server`` capture with no
+            module-level fallback, so extraction makes it an explicit
+            parameter.
+        tid: Bare task id (no ``task/`` prefix).  Both callers derive it
+            from the branch ref they resolved the tip from, so the
+            metadata and the tip always describe the same branch.
+        site: The calling tool (``'merge_status'`` / ``'merge_request'``),
+            interpolated into the degradation warning.  Without it a
+            scheduler fault on the SUBMIT path was logged as a
+            merge_status failure, so an operator grepping for a
+            submit-path degradation would not find it (review #3).
+    """
+    if harness is None:
+        return TaskMetadataResult(metadata={}, unavailable=True)
+    scheduler = getattr(harness, 'scheduler', None)
+    if scheduler is None:
+        return TaskMetadataResult(metadata={}, unavailable=True)
+    try:
+        task = await scheduler.get_task(tid)
+    except Exception:
+        logger.warning(
+            '%s: scheduler.get_task(%s) failed — proceeding without task '
+            'metadata (degeneracy check skipped)',
+            site, tid, exc_info=True,
+        )
+        return TaskMetadataResult(metadata={}, unavailable=True)
+    if not task:
+        return TaskMetadataResult(metadata={})
+    return TaskMetadataResult(metadata=task.get('metadata') or {})

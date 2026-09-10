@@ -3274,10 +3274,18 @@ def create_server(
                     # what resolved_tip was read from.
                     _degenerate_verdict = await branch_is_degenerate(
                         git_ops_for_scan, full_branch,
-                        await _git_authority_task_metadata(
+                        # `.metadata` only, DISCARDING `.unavailable`:
+                        # preserves today's fail-open exactly (a metadata
+                        # fault degrades this one guard, not the whole
+                        # submission).  Task 4651's periodic writer is the
+                        # consumer that will read the flag instead, to tell
+                        # "no degeneracy observed" from "degeneracy
+                        # unverifiable".
+                        (await git_authority.task_metadata(
+                            harness,
                             full_branch.removeprefix(orch_config.git.branch_prefix),
                             site='merge_request',
-                        ),
+                        )).metadata,
                         branch_tip_sha=resolved_tip,
                     )
                 except Exception:
@@ -4205,52 +4213,6 @@ def create_server(
 
         return None
 
-    async def _git_authority_task_metadata(tid: str, *, site: str) -> dict[str, Any]:
-        """Best-effort task metadata for the git-authority guards (task 3103).
-
-        Returns ``{}`` on EVERY failure mode — no harness, no ``scheduler``
-        attribute, ``get_task`` raising, or a None/metadata-less task — and
-        never raises.  A scheduler fault must degrade a single guard, not
-        swallow the whole probe.
-
-        ``{}`` deliberately FAILS OPEN out of the degeneracy check.  On the
-        ``merge_status`` path it then falls THROUGH to the citation gate,
-        which is git-only and needs no task metadata; on the
-        ``merge_request`` fast path there is no citation gate, so the block
-        simply reverts to its pre-3103 ancestry/patch-id behaviour.  Either
-        way this is exact parity with the harness, which treats an absent or
-        non-40-hex ``branch_base_sha`` as "no degeneracy signal" rather than
-        as grounds to reject: a metadata fault must never fabricate a
-        confident answer, and must never hard-fail a genuinely merged branch.
-
-        Args:
-            tid: Bare task id (no ``task/`` prefix).  Both callers derive it
-                from the branch ref they resolved the tip from, so the
-                metadata and the tip always describe the same branch.
-            site: The calling tool (``'merge_status'`` / ``'merge_request'``),
-                interpolated into the degradation warning.  Without it a
-                scheduler fault on the SUBMIT path was logged as a
-                merge_status failure, so an operator grepping for a
-                submit-path degradation would not find it (review #3).
-        """
-        if harness is None:
-            return {}
-        scheduler = getattr(harness, 'scheduler', None)
-        if scheduler is None:
-            return {}
-        try:
-            task = await scheduler.get_task(tid)
-        except Exception:
-            logger.warning(
-                '%s: scheduler.get_task(%s) failed — proceeding without task '
-                'metadata (degeneracy check skipped)',
-                site, tid, exc_info=True,
-            )
-            return {}
-        if not task:
-            return {}
-        return task.get('metadata') or {}
-
     @mcp.tool()
     async def merge_status(
         request_id: str | None = None,
@@ -4443,9 +4405,14 @@ def create_server(
                         # just ran on, instead of re-reading the ref (review
                         # #2) — one subprocess fewer, and no window for a
                         # warm-lane reseed to split the two observations.
-                        metadata = await _git_authority_task_metadata(
-                            tid, site='merge_status',
-                        )
+                        # `.metadata` only — see the merge_request site's note:
+                        # discarding `.unavailable` is what keeps this extraction
+                        # behaviour-preserving.  Task 4651 reads the flag;
+                        # merge_status must not, and the response shape it would
+                        # need belongs to task 4831.
+                        metadata = (await git_authority.task_metadata(
+                            harness, tid, site='merge_status',
+                        )).metadata
                         if not await branch_is_degenerate(
                             git_ops, full_branch, metadata, branch_tip_sha=tip,
                         ):
@@ -4528,9 +4495,14 @@ def create_server(
                         # merge_sha = merge-commit SHA on main (via git log scan).
                         marker = await git_ops.find_merge_marker(full_branch)
                         if marker is not None:
-                            metadata = await _git_authority_task_metadata(
-                                tid, site='merge_status',
-                            )
+                            # `.metadata` only — see the merge_request site's note:
+                            # discarding `.unavailable` is what keeps this extraction
+                            # behaviour-preserving.  Task 4651 reads the flag;
+                            # merge_status must not, and the response shape it would
+                            # need belongs to task 4831.
+                            metadata = (await git_authority.task_metadata(
+                                harness, tid, site='merge_status',
+                            )).metadata
                             branch_base_sha = metadata.get('branch_base_sha')
                             # Predates-this-incarnation veto (task 3103, mirroring
                             # the harness marker arm): the branch was deleted and

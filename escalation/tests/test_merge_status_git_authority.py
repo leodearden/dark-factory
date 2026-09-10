@@ -122,7 +122,8 @@ def _stub_harness(
     """Return the standard merge_status harness stub wired to *git_ops*.
 
     By default the stub has NO ``scheduler`` attribute at all — which is the
-    fail-soft path task 3103's ``_git_authority_task_metadata`` helper is
+    fail-soft path task 3103's
+    ``escalation/src/escalation/git_authority.py::task_metadata`` helper is
     built for (metadata unavailable → skip the degeneracy check → still apply
     the citation gate), and the shape every pre-existing test in this module
     already uses.
