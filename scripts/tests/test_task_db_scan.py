@@ -156,6 +156,60 @@ def test_connect_ro_does_not_create_the_database_it_refuses(tmp_path):
     assert not absent.parent.exists()
 
 
+def test_connect_ro_refuses_a_zero_byte_stub_with_its_own_reason(tmp_path):
+    """A stub is a DIFFERENT mistake from an absent path, so it gets its own
+    discriminator: the reader pointed at a real file that is not a store."""
+    stub = tmp_path / "tasks.db"
+    stub.write_bytes(b"")
+
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro(stub)
+
+    assert excinfo.value.reason is TaskDbProblem.EMPTY_STUB
+    assert excinfo.value.path == stub.resolve()
+
+
+def test_connect_ro_tells_an_empty_stub_apart_from_an_absent_path(tmp_path):
+    """The two refusals must not read the same.
+
+    Collapsing them into one "unusable store" message would restore exactly
+    the unactionable signal this guard exists to remove — the remedies differ
+    (resolve the main checkout, versus you are one directory too high).
+    """
+    stub = tmp_path / "tasks.db"
+    stub.write_bytes(b"")
+    absent = tmp_path / "absent" / "tasks.db"
+
+    with pytest.raises(TaskDbUnreadable) as stub_refusal:
+        connect_ro(stub)
+    with pytest.raises(TaskDbUnreadable) as absent_refusal:
+        connect_ro(absent)
+
+    assert str(stub_refusal.value) != str(absent_refusal.value)
+
+
+def test_an_unguarded_read_only_open_of_a_stub_answers_no_such_table(tmp_path):
+    """WHY the guard earns its place — the error it replaces, reproduced.
+
+    ``mode=ro`` alone does not refuse a 0-byte file: it hands back a working
+    connection to a database with no tables in it. This is the state behind
+    the four ``no such table: tasks`` sightings in the confusion codebook, and
+    behind the verified decoy at the main checkout's ``.taskmaster/tasks.db``
+    — one directory above the real store, 0 bytes.
+    """
+    stub = tmp_path / "tasks.db"
+    stub.write_bytes(b"")
+
+    conn = sqlite3.connect(f"file:{stub}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            conn.execute("SELECT * FROM tasks")
+    finally:
+        conn.close()
+
+    assert "no such table: tasks" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # resolve_project_roots(project_roots, env) -> list[str]
 # ---------------------------------------------------------------------------
