@@ -401,8 +401,26 @@ drain_check_verdict() {
     # An `if` block, never `[[ -n ... ]] && printf ...`: as a trailing command
     # the latter returns non-zero when the knob is unset, which `set -e` would
     # take as this function failing.
+    #
+    # FAIL-SOFT BUT LOUD, and each half looks like a defect without the other.
+    # `|| true`: this function is only ever called via command substitution
+    # assigned to a plain variable (drain_await_fresh's _DRAIN_VERDICT,
+    # drain_gate's verdict), so under `set -euo pipefail` a failed `>>` that
+    # lands as this function's LAST command fails that assignment and aborts
+    # the whole fleet redeploy. A mis-typed operator trace path must never be
+    # able to do that. Measured, bash 5.2.21: last+unguarded exits 1,
+    # last+guarded does not, and a failure HERE -- mid-function, with the
+    # verdict printf after it -- is swallowed by the command substitution
+    # either way. So today this guard is redundant with that ordering, and it
+    # is here so the property survives a reorder rather than resting on one.
+    # Covered by scripts/tests/test_restart_all_orchestrators.py::
+    # test_an_unwritable_poll_trace_never_aborts_the_redeploy, which pins the
+    # observable property and so passes under both spellings.
+    # NO `2>/dev/null`: bash's own redirection diagnostic stays on stderr, so
+    # an operator who set the knob and got no trace is told why. Swallowing it
+    # is the silent fail-soft this repo's design invariants forbid.
     if [[ -n "$DRAIN_POLL_TRACE_FILE" ]]; then
-        printf '%s\t%s\n' "$verdict" "$1" >> "$DRAIN_POLL_TRACE_FILE"
+        printf '%s\t%s\n' "$verdict" "$1" >> "$DRAIN_POLL_TRACE_FILE" || true
     fi
     # LAST, so the function's exit status stays that of its contractual output.
     printf '%s\n' "$verdict"
