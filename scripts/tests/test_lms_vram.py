@@ -390,6 +390,31 @@ def test_an_unstarted_budget_accepts_a_reading_evaluate_budget_refuses():
     assert verdict.verdict == 'PASS'
 
 
+@pytest.mark.parametrize(
+    ('used_mib', 'total_mib'),
+    [
+        (7362, 0),       # no card
+        (-1, 24576),     # negative usage
+        (30000, 24576),  # used beyond the card
+    ],
+)
+def test_an_unstarted_budget_still_refuses_an_incoherent_reading(used_mib, total_mib):
+    """Dropping the SUBTRACTION preconditions does not drop the READING's own.
+
+    The two `evaluate_budget` preconditions this path deliberately sheds are
+    both about `used - baseline`; these three are about whether the reading
+    describes a card that could exist, and no subtraction is needed to ask
+    that.  `GpuReading` validates none of its three fields, and
+    `parse_nvidia_smi_csv` -- which enforces them upstream -- is only ONE of the
+    ways one gets built.  Without this, a test double or a future `--from-file`
+    mode turns nonsense into a PASS verdict carrying nonsense figures.
+    """
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_vram.unstarted_budget(
+            lms_vram.GpuReading(total_mib=total_mib, used_mib=used_mib, free_mib=0)
+        )
+
+
 def test_an_unstarted_verdict_still_carries_both_reference_figures():
     """Same contract as `evaluate_budget`: the deviation stays legible either way."""
     verdict = lms_vram.unstarted_budget(_UNSTARTED_READING)
