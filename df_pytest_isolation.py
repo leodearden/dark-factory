@@ -54,6 +54,18 @@ here: the defence must be suite-wide and impossible to opt out of, because the
 defect class is "a spawner that forgets the env var" and the next one has not
 been written yet.
 
+Task 5299 closed an asymmetry the guard's own message used to invite: the
+GUARD above is autoused into all nine conftests that import this module, but
+until this task the MITIGATION — redirecting ``ORCH_FLEET_DEPLOY_CLOCK`` and
+``FM_DEPLOY_CLOCK`` at a tmp file — existed only in
+``scripts/tests/conftest.py``.  Any other suite (``shared/tests``,
+``escalation/tests``, ...) that happened to be running when a REAL fleet
+redeploy fired watched the live path with nothing pointing it away, and failed
+for a cause entirely outside that task's control (incident esc-4892-7).  The
+redirect now lives inside ``_df_deploy_clocks_unwritten`` itself, below, rather
+than in a second fixture every conftest would need to import on top of the
+first — the shape that produced the gap in the first place.
+
 Unlike the ceiling, this one guards TWO roots when it runs inside a task
 worktree: that worktree AND the main checkout enclosing it.  The bash script
 derives its clock path from its own location (so a worktree run hits the
@@ -436,6 +448,16 @@ PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = (
     'data/fused-memory/last_redeploy_fused_memory.json',
 )
 
+# The env var a forgetful spawner needed to set to avoid stamping each relpath
+# above — the ONE table both the failure message (which names the fix) and the
+# suite-wide redirect fixture below read, so the two can never name different
+# vars for the same file (task 5299 folded a second table doing this by hand
+# with an `if 'fused-memory' in relpath` check into this one).
+PROTECTED_DEPLOY_CLOCK_ENV_VARS: dict[str, str] = {
+    'data/orchestrator/last_redeploy_orchestrator.json': 'ORCH_FLEET_DEPLOY_CLOCK',
+    'data/fused-memory/last_redeploy_fused_memory.json': 'FM_DEPLOY_CLOCK',
+}
+
 # A real clock body is ~70 bytes (`{"ts": <int>, "iso": "<timestamp>"}`), so this
 # truncates nothing legitimate; it exists only so a failure message stays
 # readable if the guard ever fires on a file that is not a clock at all.
@@ -574,9 +596,7 @@ def deploy_clock_violation_reason(
         kind = _clock_change_kind(before_entry, after_entry)
         if kind is None:
             continue
-        env_var = (
-            'FM_DEPLOY_CLOCK' if 'fused-memory' in relpath else 'ORCH_FLEET_DEPLOY_CLOCK'
-        )
+        env_var = PROTECTED_DEPLOY_CLOCK_ENV_VARS[relpath]
         where = relpath if root is None else str(Path(root) / relpath)
         return (
             f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
@@ -604,7 +624,7 @@ def deploy_clock_violation_reason(
 
 
 @pytest.fixture(scope='session', autouse=True)
-def _df_deploy_clocks_unwritten():
+def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
     """Fail the run if it falsified a REAL deploy clock in any guarded checkout.
 
     The roots come from :func:`deploy_clock_guard_roots`, seeded with
@@ -635,18 +655,86 @@ def _df_deploy_clocks_unwritten():
     A failure raised in teardown surfaces as a run-level ERROR with a non-zero
     exit code even when every test passed.  That is the intended loudness: the
     damage is to production state, not to any one test's result.
+
+    THE MITIGATION LIVES HERE TOO, as of task 5299.  Before task 3797's guard
+    above ever fires, both entries of :data:`PROTECTED_DEPLOY_CLOCK_ENV_VARS`
+    are pointed at a tmp file for the WHOLE session — the same redirect
+    ``scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect`` used to apply
+    for that one rootdir only.  The guard above is wired into all NINE
+    conftests that import this module (root plus the eight subproject
+    rootdirs), so a test that spawns ``restart-all-orchestrators.sh`` or
+    ``scripts/orchestrator-watchdog.py`` from ANY of them — not just
+    ``scripts/tests`` — now inherits a redirected env var instead of falling
+    through to the live checkout default. Folding the redirect into this
+    already-universally-wired fixture, rather than adding a second fixture that
+    every conftest would need to import separately, is what keeps mitigation
+    and guard from drifting apart again (heuristic 11, SPOT) — a second,
+    independently-wired mitigation fixture is exactly the shape that produced
+    the scripts-tests-only gap this task closes.
+
+    Deliberately does NOT close the gap for a GENUINE external redeploy: a real
+    ``restart-all-orchestrators.sh --drain`` (the deployed watchdog, or an
+    operator) runs as its own process with its own environment and writes the
+    literal default path directly, regardless of what this session's
+    ``os.environ`` says. This redirect only reaches processes THIS session
+    spawns. The guard's roots therefore still watch the literal live paths, and
+    a concurrent genuine redeploy can still trip it in a machine-operated
+    checkout — see the message's benign-alternative reading, and task 4823 for
+    improving that discrimination.
+
+    Restored EXACTLY on teardown — popping each key when it was absent rather
+    than setting an empty string, for the same reason
+    ``_df_git_ceiling_at_basetemp`` restores absence by deletion: an empty
+    value is not "unset" to the shell scripts' ``${VAR:-…}`` defaults.
     """
     roots = deploy_clock_guard_roots(Path(__file__).resolve().parent)
     before = [(root, deploy_clock_snapshot(root)) for root in roots]
+    saved_env = {
+        env_var: os.environ.get(env_var)
+        for env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.values()
+    }
+    redirect_dir = tmp_path_factory.mktemp('deploy-clock-redirect')
+    for relpath, env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.items():
+        os.environ[env_var] = str(redirect_dir / Path(relpath).name)
     try:
         yield
     finally:
+        for env_var, saved in saved_env.items():
+            if saved is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = saved
         for root, snapshot in before:
             reason = deploy_clock_violation_reason(
                 snapshot, deploy_clock_snapshot(root), root=root,
             )
             if reason is not None:
                 pytest.fail(reason, pytrace=False)
+
+
+@pytest.fixture(scope='session')
+def _df_fleet_deploy_clock_redirect(_df_deploy_clocks_unwritten) -> Path:
+    """The ``ORCH_FLEET_DEPLOY_CLOCK`` path this session's redirect resolved to.
+
+    NOT autouse: the redirect itself is applied unconditionally by
+    :func:`_df_deploy_clocks_unwritten`, which every conftest that imports this
+    module already binds.  This fixture exists only so a test that wants to
+    assert ON the redirected path (rather than merely benefit from it) can take
+    it BY NAME instead of reading ``os.environ`` bare — deleting the fixture
+    then fails collection with a message naming it, instead of quietly passing
+    off a leftover env var, mirroring ``_df_fleet_dir_redirect``'s convention.
+
+    Requesting ``_df_deploy_clocks_unwritten`` as a parameter (rather than
+    relying on its autouse ordering) makes the dependency explicit: pytest
+    resolves it before this fixture's body runs, so the env var this reads is
+    guaranteed already redirected.
+
+    Formerly ``scripts/tests/conftest.py``'s own fixture (task 3797); promoted
+    here and generalized to the whole-session redirect (task 5299) so
+    ``scripts/tests`` is no longer the only rootdir that mitigates what the
+    guard above catches everywhere.
+    """
+    return Path(os.environ[PROTECTED_DEPLOY_CLOCK_ENV_VARS[PROTECTED_DEPLOY_CLOCK_RELPATHS[0]]])
 
 
 # ---------------------------------------------------------------------------
