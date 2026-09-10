@@ -2892,6 +2892,61 @@ class TestSessionResumeGuard:
         assert kwargs['data']['archive_available'] is True
         assert harness._session_resume_fallback_streak == 0  # by design (D4)
 
+    async def test_restore_kill_switch_withholds_the_archive_from_eligibility(
+        self, harness: Harness
+    ):
+        """THE NARROW KILL SWITCH STILL REVERTS δ (task 3578's
+        ``restore_from_archive``, at δ's guard).
+
+        Same archive-backed, config-dir-less shape adopted two rows above, with
+        restoration disabled — the switch an operator pulls precisely when they
+        suspect a restore regression. It must put that session back on its
+        pre-δ path: an archive nothing will rehydrate does not make a session
+        reachable.
+
+        WHAT GOES WRONG IF ELIGIBILITY IGNORES THE SWITCH. The guard would
+        adopt the session and emit ``session_resume``; the arm site would then
+        skip rehydration (``restore_outcome='disabled'``), fail
+        re-corroboration against the fresh config dir, veto, and dispatch fresh
+        with ``session_resume_failed(stage='pre_flight')``. Every
+        archive-mediated session would move from ``session_resume_fallback`` to
+        ``session_resume`` while none of them actually resumed — so D8's ratio
+        recipe, and the OPERATIONS.md §14 instruction to watch
+        ``session_resume`` rise, would read 100% resumed at 0% resumed. The
+        switch would have made the signal it exists to preserve actively
+        misleading.
+
+        The INSTRUMENT is NOT withheld with it: ``archive_available`` still
+        reports what is on disk, because 'restore switched off' and 'no archive
+        at all' are different operator situations and this field is the only
+        thing in runs.db that tells them apart. That is the same field
+        ``restore_from_archive``'s own description promises not to go blind on.
+        """
+        cfg = SessionResumeConfig(restore_from_archive=False)
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-delta-norestore',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        _make_archive(harness.config.project_root, 'dz3', 'uuid-delta-norestore')
+
+        resume_id = await _drive_session_slot(harness, 'dz3', session)  # no config_dir
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        # EXACTLY the pre-δ answer for this shape (cf.
+        # test_the_archive_is_the_only_thing_that_changed_the_answer).
+        assert kwargs['data']['reasons'] == ['no_transcript', 'stale']
+        assert kwargs['data']['archive_available'] is True
+
 
 @pytest.mark.asyncio
 class TestSessionResumeStorm:

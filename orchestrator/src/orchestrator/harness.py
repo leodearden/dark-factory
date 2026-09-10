@@ -3559,11 +3559,16 @@ class Harness:
         # ELIGIBILITY input, so a caller that has not decided whether the
         # session is still in the durable archive must fail loudly rather than
         # silently inherit the pre-δ answer. Passed IN rather than looked up
-        # here so the predicate acquires no filesystem dependency of its own —
+        # here so the predicate acquires no filesystem dependency of its own:
         # a bool cannot raise, so the I3 totality contract below needs no new
-        # try/except — and so eligibility and the fallback event's
-        # `archive_available` field are structurally the SAME value. See the
-        # hoist in the _run_slot guard.
+        # try/except.
+        #
+        # It means REACHABLE VIA THE ARCHIVE, which is the on-disk lookup
+        # narrowed by `restore_from_archive` — an archive nothing will restore
+        # cannot make a session reachable. The _run_slot hoist composes the
+        # two; the fallback event reports the un-narrowed lookup beside these
+        # reasons, and the difference between them is exactly the operator
+        # having pulled that switch.
         archive_available: bool,
     ) -> frozenset[str]:
         """Return EVERY reason a recovered session is ineligible (task β/3728).
@@ -3765,47 +3770,48 @@ class Harness:
         # keeps the sidecar, so the config dir is gone and
         # _adopt_recovered_session's glob finds nothing. A reseed is not the
         # only way to arrive here, and it is not the common one. With an
-        # archive present this shape is NORMAL, not pathological — which is
-        # why the archive branch above returns before this discrimination is
-        # reached. Without an archive the session really is uncorroborable and
-        # the LOUD arm is still correct.
-        session_id = session.get('session_id')
-        if archive_available:
-            # REACHABLE via the durable archive, so neither corroboration
-            # reason applies and the live-dir discrimination below is not even
-            # asked (task 3730 / D2). 3578's arm site restores from the archive
-            # into the config dir it is about to export and RE-CORROBORATES
-            # there, dispatching fresh with a session_resume_failed(
-            # stage='pre_flight') if the restore did not land — so gating on
-            # archive PRESENCE here cannot arm --resume against a transcript
-            # that never arrived. Presence is also the only thing knowable at
-            # this point: the guard runs BEFORE this dispatch's worktree and
-            # config dir exist, so there is nothing to restore INTO yet.
-            pass
-        elif not config_dir or not session_id:
-            reasons.add('no_transcript')
-        elif not transcript_exists(Path(config_dir), session_id):
-            # Discriminate "PROVABLY gone" from "there but unreadable", and do
-            # it with an explicit stat rather than Path.exists(), which is
-            # wrong for this seam in both directions: it swallows exactly
-            # {ENOENT, ENOTDIR, EBADF, ELOOP} into False — so a symlink loop
-            # or bad fd would read as a wipe and land in the SILENT,
-            # storm-exempt 'reseeded' arm — and it RE-RAISES every other
-            # OSError (EACCES on a parent, ESTALE, EIO), which would escape
-            # this method and break the never-raises I3 contract above.
-            # Either way a genuine filesystem fault stops surfacing as the
-            # systematic breakage INV-4 exists to catch. So: only ENOENT/
-            # ENOTDIR earns 'reseeded'; everything else falls through to the
-            # LOUD arm, caught here so the method stays total (ValueError
-            # covers the NUL-bearing path that os.stat rejects outright).
-            wiped = False
-            try:
-                Path(config_dir).stat()
-            except (FileNotFoundError, NotADirectoryError):
-                wiped = True
-            except (OSError, ValueError):
-                pass  # unreadable/faulted != wiped — stay loud
-            reasons.add('reseeded' if wiped else 'no_transcript')
+        # archive present this shape is NORMAL, not pathological. Without an
+        # archive the session really is uncorroborable and the LOUD arm is
+        # still correct.
+        #
+        # So the discrimination is ASKED ONLY OF AN UNREACHABLE SESSION (task
+        # 3730 / D2): with an archive the session is corroborated by it,
+        # neither reason applies, and which live directory survived is not a
+        # question worth answering. 3578's arm site restores from the archive
+        # into the config dir it is about to export and RE-CORROBORATES there,
+        # dispatching fresh with a session_resume_failed(stage='pre_flight')
+        # if the restore did not land — so gating on archive PRESENCE here
+        # cannot arm --resume against a transcript that never arrived.
+        # Presence is also the only thing knowable at this point: the guard
+        # runs BEFORE this dispatch's worktree and config dir exist, so there
+        # is nothing to restore INTO yet.
+        if not archive_available:
+            session_id = session.get('session_id')
+            if not config_dir or not session_id:
+                reasons.add('no_transcript')
+            elif not transcript_exists(Path(config_dir), session_id):
+                # Discriminate "PROVABLY gone" from "there but unreadable",
+                # and do it with an explicit stat rather than Path.exists(),
+                # which is wrong for this seam in both directions: it swallows
+                # exactly {ENOENT, ENOTDIR, EBADF, ELOOP} into False — so a
+                # symlink loop or bad fd would read as a wipe and land in the
+                # SILENT, storm-exempt 'reseeded' arm — and it RE-RAISES every
+                # other OSError (EACCES on a parent, ESTALE, EIO), which would
+                # escape this method and break the never-raises I3 contract
+                # above. Either way a genuine filesystem fault stops surfacing
+                # as the systematic breakage INV-4 exists to catch. So: only
+                # ENOENT/ENOTDIR earns 'reseeded'; everything else falls
+                # through to the LOUD arm, caught here so the method stays
+                # total (ValueError covers the NUL-bearing path that os.stat
+                # rejects outright).
+                wiped = False
+                try:
+                    Path(config_dir).stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    wiped = True
+                except (OSError, ValueError):
+                    pass  # unreadable/faulted != wiped — stay loud
+                reasons.add('reseeded' if wiped else 'no_transcript')
         return frozenset(reasons)
 
     def _archive_available(self, task_id: str, session_id: str | None) -> bool:
@@ -3820,7 +3826,10 @@ class Harness:
         ``session_resume_fallback`` event that still reports it. 3727's
         measurement is what authorised the change: ~91% of post-3578 fallbacks
         (92 of 101, 2026-09-04) were recoverable and were dispatched fresh
-        anyway. Task 3578 is what consumes
+        anyway. What this method reports is what is ON DISK; the guard narrows
+        it by ``restore_from_archive`` before eligibility consumes it, and
+        reports it un-narrowed on the event, so an operator who disables
+        restoration reverts δ without losing the measurement. Task 3578 is what consumes
         :func:`~shared.transcript_archive.durable_archive_path` for the actual
         restore, one layer down at the arm site.
 
@@ -9270,11 +9279,13 @@ class Harness:
             # anything gated on it (INV-3 instrument-before-acting); the
             # measurement came back at ~91% (92 of 101 post-3578 fallbacks,
             # 2026-09-04), so δ acts on it. The lookup is HOISTED here, once
-            # per dispatch, and feeds two consumers that must never disagree:
-            # the predicate below and that same fallback emit. Two independent
-            # lookups would be two answers to one question — an archival pass
-            # landing between them would produce a fallback event whose
-            # archive_available contradicts the reasons printed beside it.
+            # per dispatch, and feeds two consumers that must never disagree
+            # about what is on disk: the predicate below (which narrows it by
+            # the restore kill switch — see the assignment) and that same
+            # fallback emit. Two independent lookups would be two answers to
+            # one question — an archival pass landing between them would
+            # produce a fallback event whose archive_available contradicts the
+            # reasons printed beside it.
             #
             # Hoisted INSIDE the `enabled` check (see the assignment below) so
             # the kill switch still costs zero filesystem I/O. The ELIGIBLE
@@ -9324,17 +9335,44 @@ class Harness:
                 # correct short-circuit value for that case — it is also what
                 # `_archive_available` degrades to on any fault, so the
                 # disabled path and the faulted path agree.
-                archive_available = (
+                archive_present = (
                     self._archive_available(
                         assignment.task_id, recovered_session.get('session_id')
                     )
                     if self.config.session_resume.enabled
                     else False
                 )
+                # ELIGIBILITY consumes the lookup NARROWED by the arm-site kill
+                # switch; the EVENT below reports it un-narrowed. The two
+                # readings differ only when an operator has pulled
+                # `restore_from_archive`, and they must:
+                #
+                #   - An archive can only make a session REACHABLE if
+                #     something will restore it. With restoration off, δ would
+                #     otherwise arm --resume for an archive-only session, the
+                #     arm site would skip rehydration, re-corroboration would
+                #     fail and it would dispatch fresh anyway — so pulling the
+                #     switch an operator pulls when they suspect a restore
+                #     regression would move every archive-mediated session from
+                #     session_resume_fallback to session_resume, and D8's ratio
+                #     recipe would read 100% resumed while 0% resumed. Narrowed
+                #     here, the switch reverts δ exactly: those sessions fall
+                #     back with their pre-δ reasons.
+                #   - The INSTRUMENT (task 3727) must not be narrowed with it.
+                #     `restore_from_archive`'s whole purpose is to disable
+                #     restoration WITHOUT going blind on the population it was
+                #     meant to fix, and that population is precisely the
+                #     fallbacks carrying archive_available=true. Narrowing the
+                #     event too would make "no archive on disk" and "restore
+                #     switched off" indistinguishable in runs.db.
+                archive_reachable = (
+                    archive_present
+                    and self.config.session_resume.restore_from_archive
+                )
                 reasons = self._session_resume_reasons(
                     recovered_session,
                     recovered_config_dir,
-                    archive_available=archive_available,
+                    archive_available=archive_reachable,
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {
@@ -9383,11 +9421,15 @@ class Harness:
                         # ones alike. The emit is shared by all of them, so no
                         # two sites can drift apart in what they report.
                         #
-                        # archive_available is the HOISTED value (task 3730),
-                        # not a second lookup: it is by construction the same
-                        # bool the predicate above consumed, so this event's
-                        # reasons and its archive_available can never
-                        # contradict each other. It stays on the fallback event
+                        # archive_available is the HOISTED lookup (task 3730),
+                        # not a second glob: one filesystem answer feeds both
+                        # this field and the predicate above, so the event's
+                        # reasons and its archive_available cannot contradict
+                        # each other about what is ON DISK. It is reported
+                        # UN-NARROWED by `restore_from_archive` — see the hoist
+                        # for why the instrument outlives the kill switch that
+                        # withholds the archive from eligibility. It stays on
+                        # the fallback event
                         # ONLY — session_resume and session_resume_capped are
                         # byte-identical to their pre-3727 shape, which is what
                         # keeps event_store.py's ratio recipe meaningful (D8).
@@ -9407,7 +9449,7 @@ class Harness:
                                     # census. A list, not a set — it has to
                                     # survive the JSON round-trip into runs.db.
                                     'reasons': sorted(reasons),
-                                    'archive_available': archive_available,
+                                    'archive_available': archive_present,
                                 },
                             )
                         # What FEEDS the storm streak is whatever survives
