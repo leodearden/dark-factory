@@ -2528,6 +2528,34 @@ def test_a_placeholder_only_run_reports_on_a_card_a_stranger_is_holding(
     assert report.vram.arm_footprint_mib == 0
 
 
+def test_a_placeholder_only_run_does_not_consult_a_supplied_baseline(
+    tmp_path, monkeypatch,
+):
+    """A parameter honoured on one branch and ignored on the other needs a pin.
+
+    `run_healthcheck`'s docstring says no baseline is consulted when nothing is
+    measurable, "not even one supplied through *baseline*" -- but nothing held
+    that.  A refactor hoisting the `baseline is not None` fallback above the
+    `if not measurable` check would keep every other test green (the
+    StaleBaselineError path stays closed either way) while reintroducing a
+    pre-start reading for a run that started nothing, so the block would report
+    a footprint no row can explain.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=lms_healthcheck.probe_arm,
+        baseline=_baseline(),
+    )
+
+    # The snapshot IS the pre-start card; the supplied 3312 MiB never lands.
+    assert report.vram.baseline_mib == MEASURED_USED_MIB
+    assert report.vram.baseline_mib != BASELINE_USED_MIB
+    assert report.vram.arm_footprint_mib == 0
+
+
 def test_a_placeholder_only_run_never_emits_the_unmeasured_sentinel(
     tmp_path, monkeypatch,
 ):
@@ -2607,6 +2635,25 @@ def test_a_real_arm_without_a_baseline_still_refuses_beside_a_placeholder(
             [_arm(), _placeholder_arm()],
             gpu_probe=lambda: _snapshot(),
             probe=_mixed_probe,
+        )
+
+
+def test_a_run_over_zero_arms_is_refused_rather_than_reported_green():
+    """The partition displaced a refusal; it must not have deleted it.
+
+    `lms_vram.read_baseline_records` caught the empty case ("a budget verdict
+    over zero arms would describe nothing") back when every arm id reached it.
+    With placeholders partitioned out, an empty run reaches the unstarted branch
+    instead, which has no reason to object to anything -- and would answer with
+    a rowless report reading PASS/PASS/EXIT_OK, a green "the slate was checked"
+    assembled from nothing.  The CLI cannot produce this today
+    (`ArmManifest.arms` has `min_length=1`, and `--active` over an empty
+    selection exits EXIT_NO_ACTIVE_ARMS), which is exactly why the library-level
+    contract needs its own guard.
+    """
+    with pytest.raises(lms_vram.VramProbeError, match='zero arms'):
+        lms_healthcheck.run_healthcheck(
+            [], gpu_probe=lambda: _snapshot(), probe=_passing_probe,
         )
 
 

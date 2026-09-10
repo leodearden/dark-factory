@@ -1094,7 +1094,19 @@ def run_healthcheck(
     When NOTHING in the run is measurable, no baseline is consulted at all --
     not even one supplied through *baseline*, because there is no footprint for
     it to be subtracted from -- and the pre-start card is the snapshot itself.
+    An EMPTY run is a different thing entirely and is refused: zero arms is not
+    a run in which nothing was started, it is a report about nothing.
     """
+    if not arms:
+        # The refusal the partition below displaced, restored in the function
+        # whose contract it belongs to.  `lms_vram.read_baseline_records` used
+        # to catch this, back when every arm id reached it; the unstarted branch
+        # that now takes an empty run has nothing to object to and would answer
+        # with a rowless PASS -- a green "the slate was checked" over nothing.
+        raise lms_vram.VramProbeError(
+            'no arms to report on; a report over zero arms would describe nothing'
+        )
+
     read_gpu = gpu_probe if gpu_probe is not None else lms_vram.probe_gpu_snapshot
     probe_one = probe if probe is not None else probe_arm
 
