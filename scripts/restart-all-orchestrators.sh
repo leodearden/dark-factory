@@ -77,6 +77,10 @@ set -euo pipefail
 #                                         script, which holds its lease for as
 #                                         long as the sweep takes
 #                                         (default: 7200 = 2h)
+#   ORCH_DRAIN_POLL_TRACE_FILE            append one <verdict>\t<unit> line per
+#                                         drain poll to this file (default:
+#                                         unset = off; no other behaviour
+#                                         changes)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
@@ -199,6 +203,7 @@ FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-600}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
+DRAIN_POLL_TRACE_FILE="${ORCH_DRAIN_POLL_TRACE_FILE:-}"
 # Return channel for drain_await_fresh -- never declare 'local' anywhere
 # (full contract and incident rationale live in drain_await_fresh's own
 # docstring, task 3852).
@@ -377,17 +382,30 @@ drain_check_verdict() {
     # must not become a hard dependency on drain_check.py always behaving.
     # stderr is left unsuppressed so a real failure is still visible in the
     # script's own output.
-    local raw
+    local raw verdict
     raw="$(python3 "$SCRIPT_DIR/drain_check.py" --unit "$1" --fleet-dir "$FLEET_DIR" \
         --fresh-window "$DRAIN_FRESH_WINDOW_SECS")" || raw="absent"
     case "$raw" in
-        idle|busy|stale|absent)
-            printf '%s\n' "$raw"
-            ;;
-        *)
-            printf '%s\n' "absent"
-            ;;
+        idle|busy|stale|absent) verdict="$raw" ;;
+        *)                      verdict="absent" ;;
     esac
+    # POLL LEDGER (task 4486), off unless ORCH_DRAIN_POLL_TRACE_FILE is set.
+    # Written HERE because this function is the single funnel every `python3
+    # drain_check.py` invocation passes through -- drain_await_fresh's opening
+    # poll, its in-loop re-polls, and drain_gate's busy poll loop all call it
+    # -- so this one write site yields a COMPLETE ledger of the poll loop.
+    # It records the COERCED verdict, not $raw, so the ledger's vocabulary is
+    # exactly the four tokens the gate branches on: a malformed or
+    # non-zero-exit reading appears as the "absent" the gate actually acted
+    # on, rather than as something no downstream comparison ever saw.
+    # An `if` block, never `[[ -n ... ]] && printf ...`: as a trailing command
+    # the latter returns non-zero when the knob is unset, which `set -e` would
+    # take as this function failing.
+    if [[ -n "$DRAIN_POLL_TRACE_FILE" ]]; then
+        printf '%s\t%s\n' "$verdict" "$1" >> "$DRAIN_POLL_TRACE_FILE"
+    fi
+    # LAST, so the function's exit status stays that of its contractual output.
+    printf '%s\n' "$verdict"
 }
 
 drain_await_fresh() {
@@ -399,6 +417,12 @@ drain_await_fresh() {
     # stale/absent verdict if the grace elapsed with no fresh reading
     # (fail-toward-convergence: the caller proceeds with the restart) --
     # returns 0, and prints nothing to stdout.
+    #
+    # That stdout silence is unchanged and load-bearing (see drain_gate's
+    # callers and test_idle_unit_restarts_transparently_with_no_defer_line):
+    # the poll loop's observability seam is drain_check_verdict's
+    # ORCH_DRAIN_POLL_TRACE_FILE ledger, which is a FILE precisely so this
+    # contract does not have to be traded away to see the loop iterate.
     #
     # MUST be invoked as a plain command, e.g. `drain_await_fresh "$unit"`
     # then read `$_DRAIN_VERDICT` -- and MUST NEVER be called via command
