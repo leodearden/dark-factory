@@ -26,8 +26,10 @@ checking that function layers on top.
 """
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 from _task_db_scan import tasks_db_path
 
@@ -85,3 +87,54 @@ def resolve_live_db_path(start: str | Path) -> Path:
     raise MainCheckoutUnresolved(
         resolved_start, "`git worktree list --porcelain` named no worktree at all"
     )
+
+
+class Column(NamedTuple):
+    """One column, exactly as the database describes it.
+
+    *pk* is a POSITION, not a flag: 0 for a column outside the primary key,
+    otherwise its 1-based place within a possibly-composite one.
+    """
+
+    name: str
+    declared_type: str
+    notnull: bool
+    pk: int
+
+
+class Table(NamedTuple):
+    """One table and its columns, in declaration order."""
+
+    name: str
+    columns: tuple[Column, ...]
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> tuple[Column, ...]:
+    return tuple(
+        Column(name=name, declared_type=declared, notnull=bool(notnull), pk=pk)
+        for _cid, name, declared, notnull, _default, pk in conn.execute(
+            f'PRAGMA table_info("{table}")'
+        )
+    )
+
+
+def introspect(conn: sqlite3.Connection) -> tuple[Table, ...]:
+    """Every table in *conn*, with the columns the database reports for it.
+
+    Asks the store and nothing else, so it is equally right about a live
+    tasks.db, a fixture, and a store whose DDL has since moved on. Produces
+    records; rendering them is :func:`render`'s job.
+
+    sqlite's own bookkeeping tables (``sqlite_master``, ``sqlite_sequence``…)
+    are left out: they are the same in every store and never the subject of
+    the question being asked.
+    """
+    names = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name"
+        )
+    ]
+    return tuple(Table(name=name, columns=_table_columns(conn, name)) for name in names)
