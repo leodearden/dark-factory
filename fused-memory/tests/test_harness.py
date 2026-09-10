@@ -13752,6 +13752,77 @@ async def test_maybe_remediate_phantom_citation_drop_storm_does_not_escalate_bel
     )
 
 
+@pytest.mark.asyncio
+async def test_maybe_remediate_mixed_phantom_and_placeholder_drops_below_threshold_neither_storm_escalates(
+    journal, event_buffer, mock_memory_service,
+):
+    """INDEPENDENCE PIN (reviewer_comprehensive, task 4781 amendment): the two
+    storm counters must never share a window — see the comment on
+    ``self._phantom_citation_drop_storm`` in
+    ``fused_memory/reconciliation/harness.py::ReconciliationHarness.__init__``
+    ("the two drop causes must never share a window, or a phantom-citation
+    outage could push the never-cited-placeholder alarm over threshold ... and
+    misattribute the cause").
+
+    Every OTHER phantom/placeholder storm test in this file drives a
+    SINGLE-cause batch, so none of them can tell "has its own independent
+    StormCounter" apart from "shares one counter nobody else has touched yet"
+    — verified by mutation: aliasing
+    ``self._phantom_citation_drop_storm = self._placeholder_drop_storm`` in
+    ``__init__`` leaves every other phantom/placeholder test in this file
+    green.
+
+    This test feeds (THRESHOLD - 2) phantom-cited drops AND (THRESHOLD - 2)
+    never-cited placeholder drops in the SAME batch — 3 + 3 = 6 total drops,
+    above either threshold's value of 5, but below each PER-CAUSE threshold
+    individually. With two genuinely independent counters, neither reaches 5
+    and neither storm escalates. Under the aliasing mutation above, both
+    causes accumulate in the one shared counter (the phantom-cited loop runs
+    first and contributes 3, then the placeholder loop's 2nd call reaches 5)
+    and 'recon_remediation_placeholder_storm' fires — misattributing
+    phantom-citation drops to "Stage 3 stopped citing".
+    """
+    from fused_memory.reconciliation.harness import (
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    mixed_findings = [
+        _make_phantom_cited_finding()
+        for _ in range(_PHANTOM_CITATION_DROP_STORM_THRESHOLD - 2)
+    ] + [
+        _make_placeholder_finding()
+        for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD - 2)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=mixed_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category'))
+        in (
+            'recon_remediation_phantom_citation_storm',
+            'recon_remediation_placeholder_storm',
+        )
+    ]
+    assert storm_calls == [], (
+        f'Expected zero storm escalations of either category — each drop '
+        f'cause is individually below its own threshold, and a shared/'
+        f'aliased counter is the only way either could fire here; '
+        f'got {storm_calls}'
+    )
+
+
 def test_record_phantom_citation_finding_drop_rolling_window(
     journal, event_buffer, mock_memory_service,
 ):
@@ -13760,9 +13831,18 @@ def test_record_phantom_citation_finding_drop_rolling_window(
     Mirrors test_record_placeholder_finding_drop_rolling_window's three phases
     (task 1970 amendment), applied to the phantom-citation-drop storm counter
     (task 4781). Driving the full threshold/rate-limit/re-arm sequence through
-    ONLY this recorder's own calls demonstrates it owns a complete, independent
-    StormCounter — not a stub, and not aliased onto _placeholder_drop_storm,
-    which this test never touches.
+    ONLY this recorder's own calls demonstrates the counter's own mechanics —
+    threshold crossing, per-window rate-limiting, and re-arming after the
+    window drains — all work end to end.
+
+    It does NOT by itself prove _phantom_citation_drop_storm is a separate
+    instance rather than an alias of _placeholder_drop_storm: a single-cause
+    batch cannot distinguish "has its own state" from "shares a counter
+    nobody else has touched yet".
+    test_maybe_remediate_mixed_phantom_and_placeholder_drops_below_threshold_neither_storm_escalates
+    above is the test that actually pins the separate-instance property, by
+    mixing both causes in one batch and asserting neither counter's threshold
+    is reached.
 
     Phase 1 — threshold crossing + per-project labels:
         _PHANTOM_CITATION_DROP_STORM_THRESHOLD calls in the window (alternating
