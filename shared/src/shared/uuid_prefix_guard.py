@@ -25,6 +25,21 @@ typed at all. Leaf β's ``fused_memory.services.id_resolver`` imports these
 three from here rather than defining its own — a second copy is exactly the
 lockstep duplication INV-5 forbids.
 
+WHAT ONE GUARDED CALL COSTS, stated because a middleware on every tool call
+owes its reader a bound. A call carrying no prefix pays ONE linear scan of its
+strings and nothing else — the INV-8 occupancy bound on that scan is
+``shared.uuid_prefix``'s to state. A call that DOES carry prefixes pays at most
+:data:`MAX_DISTINCT_PREFIXES_PER_CALL` resolver walks, overlapped
+:data:`MAX_CONCURRENT_RESOLUTIONS` at a time; beyond the ceiling it is
+forwarded unchanged with the reason on ``meta``. At the PRD's measured ~0.2s
+per walk that is ~0.4s of added latency in the worst case rather than the
+unbounded N x 0.2s a serial, uncapped resolve would have cost.
+
+The burst escape and the injected-sink discipline are NOT here: they are
+:mod:`shared.boundary_storm_escape`, composed. Mechanism that is the same for
+every boundary guard belongs in one place (INV-5); what stays here is what is
+this guard's own — WHICH outcomes are counted, and what a burst is called.
+
 They live in this module rather than in ``uuid_prefix`` so the detector stays
 stdlib-only and dependency-light for consumers — β's resolver, γ's
 ``tools.py`` — that want the detector or the override key without pulling
@@ -39,8 +54,8 @@ middleware.
 
 from __future__ import annotations
 
+import asyncio
 import enum
-import inspect
 import json
 import logging
 import time
@@ -57,7 +72,7 @@ from fastmcp.server.middleware import Middleware
 # reportMissingImports.
 from fastmcp.tools.base import ToolResult
 
-from shared.storm_counter import StormCounter
+from shared.boundary_storm_escape import BoundaryStormEscape, Sink, call_sink
 from shared.uuid_prefix import (
     PrefixToken,
     find_prefix_tokens,
@@ -69,6 +84,8 @@ from shared.uuid_prefix import (
 __all__ = [
     'FACT_OUTCOMES',
     'FACT_UUID_PREFIX_DETECTED',
+    'MAX_CONCURRENT_RESOLUTIONS',
+    'MAX_DISTINCT_PREFIXES_PER_CALL',
     'NAMESPACES',
     'POLICY_MATRIX',
     'RESOLUTION_OUTCOMES',
@@ -87,6 +104,12 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+#: How this guard names ITSELF in the log lines the shared
+#: :mod:`shared.boundary_storm_escape` collaborator writes on its behalf. "the
+#: fact sink failed" is not actionable in a repo with two such guards; "uuid
+#: prefix guard: the fact sink failed" is.
+_OWNER = 'uuid prefix guard'
 
 
 #: Where a candidate id lives. Both stores are always consulted (D4), so one
@@ -204,6 +227,34 @@ POLICY_MATRIX: Mapping[tuple[ResolutionOutcome, ToolClass], PrefixAction] = Mapp
 )
 
 
+#: The most DISTINCT prefixes one call will have resolved, and the guard's
+#: per-call cost bound — the companion to the INV-8 occupancy bound
+#: ``shared.uuid_prefix`` states for the DETECTOR.
+#:
+#: MEASURED (PRD §6): one resolver walk is ~0.2s (34,731 ids in 0.19-0.24s),
+#: and §4-C1's corpus says 33,076 of 47,209 prefix-shaped occurrences resolve
+#: to `none` — so the overwhelming majority of tokens cost a full two-store
+#: walk to learn nothing. Without a ceiling, N is bounded only by the size of
+#: the argument map: a session summary quoting thirty hashes would put thirty
+#: store walks on one tool call.
+#:
+#: A call carrying more forwards UNCHANGED with the reason on ``meta`` rather
+#: than resolving a prefix of them. Resolving the first sixteen would make WHICH
+#: citations got checked depend on where they sat in the document, which is
+#: worse than a stated, uniform "not checked".
+#:
+#: DATA, not a constant buried in a body, for :data:`POLICY_MATRIX`'s reason:
+#: the number is a policy an operator may want to read off the module.
+MAX_DISTINCT_PREFIXES_PER_CALL = 16
+
+#: How many of those resolutions are in flight at once. The resolutions run
+#: CONCURRENTLY — serial awaits would make the per-call bound 16 x ~0.2s ≈ 3.2s
+#: of latency on a single write — but not UNBOUNDED: an unlimited fan-out turns
+#: one verbose call into sixteen simultaneous two-store walks, which is a way
+#: to brown out the stores the guard depends on.
+MAX_CONCURRENT_RESOLUTIONS = 8
+
+
 #: The two FAIL-SOFT outcomes, and the only ones a storm counter ever sees
 #: (INV-4). Declared as DATA so no future edit can start counting a third by
 #: flipping a threshold somewhere: `expanded` is never handed to a counter at
@@ -235,10 +286,6 @@ PrefixResolver = Callable[[str, str], Awaitable[Resolution]]
 #: an escalation queue is addressed by project_root. Same two argument names,
 #: opposite answers.
 ProjectFor = Callable[[Mapping[str, Any]], str | None]
-
-#: Either channel may be a plain function OR an ``async def``: the machinery a
-#: registration site wires them to is largely async in this repo.
-Sink = Callable[[dict[str, Any]], Any | Awaitable[Any]]
 
 #: The two argument names a guarded tool spells its project scope with. Data,
 #: because which one a tool declares is a fact about the surface rather than a
@@ -375,6 +422,69 @@ class _Planned(NamedTuple):
     action: PrefixAction
 
 
+def _distinct_sites(tokens: tuple[PrefixToken, ...]) -> dict[str, PrefixToken]:
+    """Each DISTINCT token once, in document order, paired with its FIRST site.
+
+    Both halves are load-bearing and computing them together is what keeps them
+    consistent. Distinctness is C1's "one store read per cited id, not one per
+    occurrence"; document order is what makes the resolver's call sequence, the
+    fact stream and the token an outage is attributed to deterministic rather
+    than dict-iteration order. The first site is the one an outage names,
+    because the earliest occurrence is the one a reader finds first.
+
+    A dict rather than a tuple of pairs: insertion-ordered, so ``tuple(sites)``
+    IS the ordered distinct token list and no second structure can disagree
+    with it.
+    """
+    sites: dict[str, PrefixToken] = {}
+    for token in tokens:
+        sites.setdefault(token.token, token)
+    return sites
+
+
+def _applicable(prefix: str, resolution: Resolution) -> Resolution:
+    """Demote a `unique` answer this guard could not actually apply to a `none`.
+
+    The RESOLVER's contract, checked where its answer ARRIVES. C1's
+    substitution is MONOTONE — the token must be a literal prefix of its
+    replacement, so a wrong expansion stays visible and reversible — and
+    ``substitute`` enforces that by raising ``ValueError``.
+
+    That raise would arrive at the worst possible moment. The substitution fold
+    runs at the END of delivery, after the `expanded` facts have already been
+    published, so an injected resolver that normalised dashes out before
+    matching (the natural way to make a 12-char token like ``ccf73ca48240``
+    match the canonical ``ccf73ca4-8240-...``) would take the whole call down
+    with an unhandled ValueError while the fact stream already claimed the
+    substitution had happened. Both halves of that are outcomes this design
+    rules out: the call is LOST, and the record of it is a lie. The guard is
+    typed against a PORT, not against the one resolver that happens to use
+    ``STARTS WITH`` today, and it is the guard that pays.
+
+    A violating answer is a resolver bug, logged at ERROR rather than tolerated
+    quietly, and the citation is left exactly as its author wrote it — the same
+    thing the guard does for a prefix that matches nothing, which is the honest
+    reading of an answer it cannot use.
+
+    Only `unique` can violate this: `ambiguous` never substitutes, and `none`
+    carries no candidate at all. An empty ``candidates`` under `unique` is the
+    same class of violation and takes the same exit, so no arm downstream has
+    to defend against indexing it.
+    """
+    if resolution.outcome != 'unique':
+        return resolution
+    candidate = resolution.candidates[0] if resolution.candidates else None
+    if candidate is not None and candidate.id.startswith(prefix):
+        return resolution
+    logger.error(
+        'uuid prefix guard: RESOLVER CONTRACT VIOLATION — a unique answer of %r for '
+        'prefix %r does not extend it, so it cannot be applied; the citation is left '
+        'unexpanded and no expansion is reported',
+        candidate.id if candidate is not None else None, prefix,
+    )
+    return Resolution('none', ())
+
+
 def _field(token: PrefixToken) -> str:
     """The top-level argument name a token sits under.
 
@@ -450,10 +560,12 @@ class UuidPrefixGuardMiddleware(Middleware):
     *escalation_sink* and *fact_sink* are injected for the same reason the
     resolver is, and both are invoked DEFENSIVELY: the call's outcome is
     already decided by the time either runs, so a sink that raises is logged
-    and never changes what the caller sees. See :meth:`_call_sink`.
+    and never changes what the caller sees. See
+    :func:`shared.boundary_storm_escape.call_sink`.
 
-    The storm counters are held PER INSTANCE, so no burst state bleeds between
-    servers, or between tests in one process.
+    The storm counters are held PER INSTANCE — one
+    :class:`~shared.boundary_storm_escape.BoundaryStormEscape` per middleware —
+    so no burst state bleeds between servers, or between tests in one process.
     """
 
     def __init__(
@@ -476,23 +588,23 @@ class UuidPrefixGuardMiddleware(Middleware):
         self._project_for = project_for
         self.exempt_tools = frozenset(exempt_tools)
         self.forward_on_ambiguity_tools = frozenset(forward_on_ambiguity_tools)
-        self._escalation_sink = escalation_sink
         self._fact_sink = fact_sink
-        # Stored, then passed PER record() call — StormCounter's reload-safety
-        # contract, so a consumer whose threshold comes from a green-tier config
-        # leaf can read it live rather than capturing it at construction.
-        self._storm_threshold = storm_threshold
-        self._storm_window_seconds = storm_window_seconds
-        self._storm_time_provider = time_provider
-        # ONE COUNTER PER KEY, not one counter with a composed label. MEASURED
-        # (``mcp_markup_middleware``): StormCounter holds a single deque and a
-        # single _last_fire_ts, so its count spans EVERY event in the window
-        # regardless of label — a label buys per-key ATTRIBUTION, never a
-        # per-key THRESHOLD. Pooling here would fire an alarm naming a project
-        # or an outcome that never burst, and an operator sent chasing a burst
-        # that did not happen learns to ignore the alarm. The class itself is
-        # untouched and gains no fourth copy (INV-5).
-        self._storms: dict[str, StormCounter] = {}
+        # The burst escape is a COLLABORATOR, not a set of members on this
+        # class: the counting, the dormant sweep and the summary shape are the
+        # same for every boundary guard that absorbs a defect, and the version
+        # that lived here was a near-verbatim copy of the markup guard's
+        # (INV-5). What stays HERE is the part that is this guard's own —
+        # WHICH outcomes are counted (:data:`STORM_COUNTED_OUTCOMES`) and what
+        # a burst is called (:data:`UUID_PREFIX_STORM_ERROR_TYPE`).
+        self._storms = BoundaryStormEscape(
+            owner=_OWNER,
+            error_type=UUID_PREFIX_STORM_ERROR_TYPE,
+            log_event='uuid_prefix_guard_storm',
+            escalation_sink=escalation_sink,
+            threshold=storm_threshold,
+            window_seconds=storm_window_seconds,
+            time_provider=time_provider,
+        )
 
     # -- the hook ---------------------------------------------------------
 
@@ -504,7 +616,10 @@ class UuidPrefixGuardMiddleware(Middleware):
         costs ONE linear scan of its strings and nothing else — in particular
         no awaited resolver round-trip, which would put a store read on the
         event-loop thread for every call the factory makes. The INV-8 bound on
-        that scan is stated in ``shared.uuid_prefix``'s module docstring.
+        that scan is stated in ``shared.uuid_prefix``'s module docstring, and
+        the bound on the resolution a call that DOES carry prefixes pays is
+        :data:`MAX_DISTINCT_PREFIXES_PER_CALL` — enforced here, three lines
+        before the resolver is reached.
 
         The two DECLARED bypasses come first, both ahead of the scan, which is
         also ``MarkupGuardMiddleware.on_call_tool``'s ordering. Neither is a
@@ -556,8 +671,12 @@ class UuidPrefixGuardMiddleware(Middleware):
             # because an unscoped tool is a wiring fact and not a burst.
             return await self._forward(context, call_next, {'resolver': 'no_project'})
 
+        sites = _distinct_sites(tokens)
+        if len(sites) > MAX_DISTINCT_PREFIXES_PER_CALL:
+            return await self._forward_over_ceiling(context, call_next, name, len(sites))
+
         try:
-            resolutions = await self._resolve(project, tokens)
+            resolutions = await self._resolve(project, sites)
         except _Outage as outage:
             return await self._forward_outage(
                 context, call_next, name, arguments, project, outage
@@ -568,6 +687,42 @@ class UuidPrefixGuardMiddleware(Middleware):
             return await call_next(context)
 
         return await self._deliver(context, call_next, name, arguments, project, plan)
+
+    # -- the call whose resolution is not attempted ------------------------
+
+    async def _forward_over_ceiling(self, context, call_next, name: str, distinct: int):
+        """Too many distinct prefixes to resolve: forward unchanged, and say so.
+
+        The ``no_project`` arm's shape, for the same reason — the call is
+        forwarded byte-identical, ``meta`` states why its citations went
+        unchecked, and there is no fact and no storm.
+
+        NOT a fact, because nothing was detected in the fact stream's sense: no
+        resolution was attempted, so there is no `expanded` / `ambiguous` /
+        `unavailable` to report and the stream would have to invent a fifth
+        outcome for a non-event. NOT a storm either, and the line is the one
+        ``no_project`` already draws: a storm escape exists for absorption the
+        CALLER CANNOT SEE, and this caller is told on its own ``meta``. A run of
+        these is a fact about how a batch of writes was authored — someone
+        pasted a hash dump — not about the boundary degrading.
+
+        WARNING, so it is not operator-invisible either: a citation that went
+        unchecked is worth a log line even when the caller was told.
+        """
+        logger.warning(
+            'uuid prefix guard: %r carries %d distinct prefix-shaped tokens, over the '
+            'ceiling of %d; it is forwarded unchanged with its citations unresolved',
+            name, distinct, MAX_DISTINCT_PREFIXES_PER_CALL,
+        )
+        return await self._forward(
+            context,
+            call_next,
+            {
+                'resolver': 'too_many_prefixes',
+                'distinct_prefixes': distinct,
+                'ceiling': MAX_DISTINCT_PREFIXES_PER_CALL,
+            },
+        )
 
     # -- the author's override (B17 / D10) ---------------------------------
 
@@ -582,6 +737,25 @@ class UuidPrefixGuardMiddleware(Middleware):
         both layers. So whether the flag reaches the tool body decides whether
         the SECOND guard can see the declaration the first one already
         honoured.
+
+        A DELIBERATE DEVIATION from C3's literal wording, recorded here because
+        the plan text stays frozen. §4-C3's Override paragraph says the flag is
+        "stripped before dispatch"; this strips it only where the tool declares
+        no ``metadata``. Consuming it on a tool that DOES would leave an author
+        who did exactly what the rejection hint told them to bounced by the next
+        guard, with a hint telling them to set a flag they had already set — so
+        the paragraph's own purpose is served by forwarding it and its letter is
+        not. Filed as an ``escalate_info`` on this task.
+
+        THE OBLIGATION THAT DEVIATION HANDS LEAF γ, spelled out per tool rather
+        than left as "the write-time layer": ``add_memory``, ``submit_task`` AND
+        ``update_task`` each receive the flag intact, and the two task tools
+        PERSIST their ``metadata`` into the task metadata vocabulary. So γ must
+        call ``strip_uuid_prefix_override`` on all three and not only on the
+        memory write. A miss on either task tool lands ``allow_uuid_prefix`` in
+        stored task metadata, where nothing downstream can tell it was
+        call-time control — which is precisely what that helper's own docstring
+        says must never happen.
 
         * The tool DECLARES ``metadata`` — forward it UNCHANGED, flag
           included, in whichever shape the caller chose (a dict or the JSON
@@ -639,13 +813,18 @@ class UuidPrefixGuardMiddleware(Middleware):
         direction: the flag is lost and the write-time gate answers, where the
         other direction is a call fastmcp refuses outright.
 
-        ``MarkupGuardMiddleware._schema_properties`` reads the same two facts
-        for a different consumer (it needs the properties MAP, to coerce
-        recovered values against their declared types; this needs only the
-        NAMES). The two are near-twins and share no helper because extracting
-        one would mean editing that middleware, which is outside this leaf's
-        declared file scope — filed rather than dropped, as this task's
-        ``cleanup_needed`` note records.
+        THE RESIDUAL DUPLICATION, named in full so a reader is not told this
+        file is INV-5-clean when part of it is not. This method and
+        :meth:`_apply_override` are near-twins of
+        ``MarkupGuardMiddleware._schema_properties`` / ``_schema_params`` and
+        ``._apply_override``: same two substrate facts, same fail-safe
+        direction, same strip-or-forward decision keyed off ``metadata``. They
+        are NOT extracted, and the storm/sink members that used to sit in this
+        file WERE (see :mod:`shared.boundary_storm_escape`), for a reason that
+        is not arbitrary — an extraction that leaves both call sites intact can
+        be done from this leaf, while unifying these two would mean editing
+        that middleware, outside this leaf's declared file scope. Filed rather
+        than dropped, as this task's ``cleanup_needed`` note records.
         """
         try:
             tool = await context.fastmcp_context.fastmcp.get_tool(name)
@@ -661,15 +840,32 @@ class UuidPrefixGuardMiddleware(Middleware):
     # -- resolution -------------------------------------------------------
 
     async def _resolve(
-        self, project: str, tokens: tuple[PrefixToken, ...]
+        self, project: str, sites: Mapping[str, PrefixToken]
     ) -> dict[str, Resolution]:
-        """Resolve each DISTINCT token exactly once, in document order.
+        """Resolve each DISTINCT token exactly once, CONCURRENTLY.
 
-        C1 states the invariant and this is where it is kept. A call that
-        cites one id three times is one store read, not three, and each of
-        those reads is a full collection walk — so per-occurrence resolution
-        would multiply the cost of exactly the calls that discuss one record at
-        length.
+        C1 states the once-per-distinct-token invariant and this is where it is
+        kept. A call that cites one id three times is one store read, not
+        three, and each of those reads is a full collection walk — so
+        per-occurrence resolution would multiply the cost of exactly the calls
+        that discuss one record at length.
+
+        CONCURRENT, under a semaphore. Serially, a call citing sixteen distinct
+        prefixes would add sixteen ~0.2s store walks to one tool call, and the
+        corpus says the overwhelming majority of them cost that walk only to
+        arrive at `none`. So the walks overlap, up to
+        :data:`MAX_CONCURRENT_RESOLUTIONS` — bounded, because an unlimited
+        fan-out browns out the stores the guard depends on. Nothing here is
+        order-sensitive in its EFFECT: the answers are keyed by token and the
+        document order that matters downstream is *sites*', not completion
+        order.
+
+        The FIRST outage in DOCUMENT order is the one raised, not the first to
+        arrive, so the fact and the ``meta`` block a caller sees for an
+        unreachable store do not depend on which walk lost the race. Every
+        sibling walk is awaited to completion before that happens
+        (``return_exceptions=True``), so an outage leaves no orphaned task
+        writing to a store after the call has been answered.
 
         ALL of them, before ANY of them is applied. Three of C3's four outcomes
         state a guarantee about what the tool receives — an ambiguous call on a
@@ -680,14 +876,27 @@ class UuidPrefixGuardMiddleware(Middleware):
         and whose second was unresolvable would forward a half-applied
         argument map while reporting that it had changed nothing.
         """
+        limit = asyncio.Semaphore(MAX_CONCURRENT_RESOLUTIONS)
+
+        async def resolve_one(prefix: str) -> Resolution:
+            async with limit:
+                return _applicable(prefix, await self._resolver(project, prefix))
+
+        answers = await asyncio.gather(
+            *(resolve_one(prefix) for prefix in sites), return_exceptions=True
+        )
+
         resolutions: dict[str, Resolution] = {}
-        for token in tokens:
-            if token.token in resolutions:
-                continue
-            try:
-                resolutions[token.token] = await self._resolver(project, token.token)
-            except ResolverUnavailable as unreachable:
-                raise _Outage(token, unreachable) from unreachable
+        for prefix, answer in zip(sites, answers, strict=True):
+            if isinstance(answer, ResolverUnavailable):
+                raise _Outage(sites[prefix], answer) from answer
+            if isinstance(answer, BaseException):
+                # Not this guard's to interpret — a cancellation, or a bug in
+                # the injected resolver. Re-raised rather than folded into the
+                # degraded path, which is reserved for the one failure C2
+                # DECLARES (INV-11): a store that could not be reached.
+                raise answer
+            resolutions[prefix] = answer
         return resolutions
 
     # -- policy -----------------------------------------------------------
@@ -732,36 +941,6 @@ class UuidPrefixGuardMiddleware(Middleware):
             if action is not PrefixAction.INERT:
                 planned.append(_Planned(token, resolution, action))
         return tuple(planned)
-
-    # -- the injected channels --------------------------------------------
-
-    async def _call_sink(self, sink: Sink, record: dict[str, Any], channel: str) -> Any:
-        """Invoke one injected sink, AWAITING an async emitter, and never raise.
-
-        A registration site wires the concrete emitters, and the queue and
-        escalation machinery they will wire to is largely async in this repo —
-        so an ``async def`` emitter is a legitimate thing to be handed. Calling
-        one without awaiting it queues NOTHING while handing back a coroutine
-        that looks like a result, and the sole trace would be a bare
-        ``coroutine was never awaited`` RuntimeWarning. So an awaitable is
-        awaited rather than trusted to be a value.
-
-        Never raises. The call's outcome is already decided by the time either
-        sink runs, so both channels are purely ADDITIVE: a sink outage costs an
-        operator visibility rather than turning a working guard into an outage
-        of its own. Logged via ``logger.exception``, never swallowed.
-        """
-        try:
-            result = sink(record)
-            if inspect.isawaitable(result):
-                result = await result
-        except Exception:
-            logger.exception(
-                'uuid prefix guard: the %s sink failed for %r; the outcome stands',
-                channel, record.get('error_type') or record.get('fact'),
-            )
-            return None
-        return result
 
     # -- delivery ---------------------------------------------------------
 
@@ -961,7 +1140,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         )
         if self._fact_sink is None:
             return
-        await self._call_sink(self._fact_sink, fact, 'fact')
+        await call_sink(self._fact_sink, fact, 'fact', owner=_OWNER)
 
     # -- the one degraded path (INV-11) -----------------------------------
 
@@ -997,7 +1176,7 @@ class UuidPrefixGuardMiddleware(Middleware):
             outage.store, name,
         )
         report: dict[str, Any] = {'resolver': 'unavailable', 'store': outage.store}
-        storm = await self._record_storm(
+        storm = await self._storms.record(
             _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project
         )
         if storm is not None:
@@ -1028,70 +1207,6 @@ class UuidPrefixGuardMiddleware(Middleware):
         """
         absorbed = {_FACT_OUTCOME[planned.action] for planned in plan} & STORM_COUNTED_OUTCOMES
         for outcome in sorted(absorbed):
-            storm = await self._record_storm(outcome, project)
+            storm = await self._storms.record(outcome, project)
             if storm is not None:
                 report['storm'] = storm
-
-    async def _record_storm(self, outcome: str, project: str) -> dict[str, Any] | None:
-        """Count this outcome; escalate and return a summary iff a burst fired.
-
-        Keyed by ``(project, outcome)`` as a single string, which is the key
-        the counter dict is indexed by and the label the summary is attributed
-        with — one spelling, so the two cannot disagree.
-
-        Threshold and window are passed PER CALL, honouring ``StormCounter``'s
-        reload-safety contract, so a registration site backed by a green-tier
-        config leaf can read them live rather than capturing them here.
-        """
-        key = f'{project}\x1f{outcome}'
-        counter = self._storms.get(key)
-        if counter is None:
-            counter = StormCounter(time_provider=self._storm_time_provider)
-            self._storms[key] = counter
-
-        summary = counter.record(
-            threshold=self._storm_threshold,
-            window_seconds=self._storm_window_seconds,
-            label=key,
-        )
-
-        # One counter per key means one object per key ever seen, and `project`
-        # is caller-supplied — so sweep the dormant ones, exactly as the
-        # MemoryService consumer StormCounter.prune() was written for.
-        for other, dormant in list(self._storms.items()):
-            if other != key and dormant.prune(self._storm_window_seconds) == 0:
-                del self._storms[other]
-
-        if summary is None:
-            return None
-
-        storm = {
-            'count': summary['count'],
-            'threshold': summary['threshold'],
-            'window_seconds': summary['window_seconds'],
-            'outcome': outcome,
-            'project': project,
-        }
-        # ERROR and greppable. The summary folded into the response reaches
-        # ONLY the caller, which is the one party that already knows something
-        # happened, so the operator-facing half cannot ride on it.
-        logger.error(
-            'uuid_prefix_guard_storm: %d %s outcome(s) in %ss for project=%r',
-            storm['count'], outcome, storm['window_seconds'], project,
-        )
-        await self._file_storm_escalation(storm)
-        return storm
-
-    async def _file_storm_escalation(self, storm: dict[str, Any]) -> None:
-        """Hand the burst to the injected sink; never change an outcome.
-
-        No dedup here. Dedup is against an OPEN escalation in the target queue,
-        which is knowledge this layer does not have and must not guess at.
-        """
-        if self._escalation_sink is None:
-            return
-        await self._call_sink(
-            self._escalation_sink,
-            {'error_type': UUID_PREFIX_STORM_ERROR_TYPE, **storm},
-            'escalation',
-        )

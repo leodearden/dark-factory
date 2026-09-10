@@ -35,8 +35,10 @@ No test here asserts on docstring or comment prose.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
+import logging
 from collections.abc import Callable, Mapping
 from typing import Any, get_args
 
@@ -294,6 +296,7 @@ def build_harness(
     *,
     answers: Mapping[str, guard.Resolution] | None = None,
     raises: Mapping[str, Exception] | None = None,
+    resolver: _FakeResolver | None = None,
     project_for: Callable[[Mapping[str, Any]], str | None] | None = None,
     **guard_kwargs: Any,
 ) -> Harness:
@@ -373,7 +376,11 @@ def build_harness(
         rec.record('delete_memory', memory_id=memory_id, store=store, project_id=project_id)
         return 'deleted'
 
-    resolver = _FakeResolver(answers or {}, raises)
+    # A ready-made resolver overrides the table, for the two contracts a table
+    # cannot express: WHEN an answer arrives (the cost bound below) and what a
+    # resolver that breaks C2's own contract does to the guard.
+    if resolver is None:
+        resolver = _FakeResolver(answers or {}, raises)
     guard_kwargs.setdefault('fact_sink', facts.append)
     guard_kwargs.setdefault('escalation_sink', escalations.append)
     mcp.add_middleware(
@@ -1047,6 +1054,27 @@ class TestAMixedCallIsRejectedWhole:
         h = self.harness()
         payload = await self._reject(h)
         assert payload['token'] == AMB
+
+    async def test_the_stream_records_only_the_rejection_never_the_unmade_expansion(
+        self,
+    ) -> None:
+        """The one non-obvious decision in ``_deliver``, pinned directly.
+
+        On a rejection the facts are emitted for the REJECTIONS only, not for
+        the whole plan. The BFF token here resolved uniquely and would have
+        been expanded — but the call was refused, so nothing was written, and
+        an `expanded` fact for it would be a lie in the stream about a
+        substitution that never reached the tool. The mirror of
+        ``TestAnOutageAbandonsAnAlreadyResolvedExpansion::
+        test_no_expanded_fact_is_emitted_for_the_abandoned_token``: same
+        principle, other arm.
+
+        Without this, deleting the ``rejections`` filter and emitting the whole
+        plan leaves every other assertion in this file green.
+        """
+        h = self.harness()
+        await self._reject(h)
+        assert [(f['outcome'], f['token']) for f in h.facts] == [('rejected', AMB)]
 
 
 # ---------------------------------------------------------------------------
@@ -1865,3 +1893,314 @@ class TestTheNoProjectArm:
         h = no_project_harness()
         await h.call('add_memory', {'content': f'see {AMB}', 'agent_id': AGENT})
         assert h.recorder.args['content'] == f'see {AMB}'
+
+
+# ---------------------------------------------------------------------------
+# The injected channels — additive, never load-bearing.
+# ---------------------------------------------------------------------------
+#
+# Both sinks are wired by a registration site to machinery this layer cannot
+# import, and both run AFTER the call's outcome is already decided. So the two
+# contracts `call_sink` states are the ones that keep a sink from becoming an
+# outage of its own: an ``async def`` emitter is AWAITED, and a raising one
+# changes nothing the caller sees. The default harness wires `list.append` for
+# both, which exercises neither branch — hence these.
+
+
+def raises_sink(_record: dict[str, Any]) -> None:
+    raise RuntimeError('the sink is unavailable')
+
+
+async def async_raises_sink(_record: dict[str, Any]) -> None:
+    raise RuntimeError('the sink is unavailable')
+
+
+class TestAnAsyncSinkIsAwaited:
+    """Called-but-not-awaited records NOTHING while returning a coroutine.
+
+    The only trace would be a bare ``coroutine was never awaited``
+    RuntimeWarning — the silent fail-soft this guard exists to end, committed
+    by the guard. This repo's queue and escalation machinery is largely async,
+    so an ``async def`` emitter is a legitimate thing to be handed.
+    """
+
+    async def test_an_async_fact_sink_receives_the_record(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        async def sink(fact: dict[str, Any]) -> None:
+            recorded.append(fact)
+
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, fact_sink=sink)
+        await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert [fact['outcome'] for fact in recorded] == ['expanded']
+
+    async def test_an_async_escalation_sink_receives_the_fired_burst(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        async def sink(record: dict[str, Any]) -> None:
+            recorded.append(record)
+
+        h = ambiguity_harness(time_provider=_Clock(), escalation_sink=sink)
+        await drive_forwards(h, 3)
+        assert [record['error_type'] for record in recorded] == [
+            'uuid_prefix_boundary_storm'
+        ]
+
+
+class TestARaisingSinkChangesNothing:
+    """A sink outage costs an operator visibility, never a caller's write."""
+
+    async def test_an_expansion_still_reaches_the_tool(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, fact_sink=raises_sink)
+        result = await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+        assert repair_of(result) == {
+            'substitutions': [
+                {
+                    'field': 'content',
+                    'path': ['content'],
+                    'from': BFF,
+                    'to': BFF_FULL,
+                    'namespace': 'mem0',
+                }
+            ]
+        }
+
+    async def test_a_rejection_is_still_a_rejection(self) -> None:
+        h = build_harness(answers={AMB: AMBIGUOUS}, fact_sink=raises_sink)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_memory', {'content': f'see {AMB}', 'project_id': PROJECT})
+        assert rejection_payload(excinfo)['outcome'] == 'rejected'
+        assert h.recorder.calls == []
+
+    async def test_an_async_sink_that_raises_is_caught_too(self) -> None:
+        """The never-raises contract has to survive the AWAIT, not just the call."""
+        h = build_harness(answers={BFF: unique(BFF_FULL)}, fact_sink=async_raises_sink)
+        await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+
+    async def test_a_raising_escalation_sink_leaves_the_storm_on_meta(self) -> None:
+        """The burst still reaches the caller and the ERROR log, and every call lands."""
+        h = ambiguity_harness(time_provider=_Clock(), escalation_sink=raises_sink)
+        results = await drive_forwards(h, 3)
+        repair = repair_of(results[-1]) or {}
+        assert repair['storm']['count'] == 3
+        assert len(h.recorder.calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# The resolver is a PORT, and a port's answers are checked.
+# ---------------------------------------------------------------------------
+#
+# `substitute` is MONOTONE — a token must be a literal prefix of what replaces
+# it — and it enforces that by raising. The fold runs at the END of delivery,
+# after the `expanded` facts are already published, so a `unique` answer that
+# does not extend its token would take the whole call down while the fact
+# stream claimed the substitution had happened: the call LOST and the record of
+# it a lie. The shipped C2 resolver uses STARTS WITH and cannot produce one —
+# but the guard is typed against the port, not against that implementation, and
+# it is the guard that pays.
+
+#: The natural way to produce one: a resolver that normalises dashes out before
+#: matching answers a 12-char token with the canonical dashed id.
+DASHLESS = 'bff815301a2b'
+
+
+class TestAUniqueAnswerThatCannotBeAppliedIsNotApplied:
+    CALL = {
+        'content': f'the {DASHLESS} record already answers this',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={DASHLESS: unique(BFF_FULL)})
+
+    async def test_the_call_still_reaches_the_tool(self) -> None:
+        """Losing the call is the one outcome worse than not repairing it."""
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == self.CALL['content']
+
+    async def test_nothing_claims_an_expansion(self) -> None:
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) is None
+        assert h.facts == []
+
+    async def test_a_unique_answer_with_no_candidate_takes_the_same_exit(self) -> None:
+        """The same class of violation, and no arm downstream has to index it."""
+        h = build_harness(answers={DASHLESS: guard.Resolution('unique', ())})
+        result = await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == self.CALL['content']
+        assert repair_of(result) is None
+
+    async def test_the_violation_is_loud(self, caplog: Any) -> None:
+        """Demoted, never quietly tolerated: it is a bug in the injected port."""
+        h = self.harness()
+        with caplog.at_level(logging.ERROR, logger='shared.uuid_prefix_guard'):
+            await h.call('add_memory', dict(self.CALL))
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+        assert 'RESOLVER CONTRACT VIOLATION' in caplog.records[0].getMessage()
+
+    async def test_an_extending_answer_is_untouched_by_the_check(self) -> None:
+        """The check is a port contract, not a second policy: valid answers pass."""
+        h = build_harness(answers={BFF: unique(BFF_FULL)})
+        await h.call('add_memory', dict(TestB1UniqueExpansion.CALL))
+        assert h.recorder.args['content'] == f'the {BFF_FULL} record already answers this'
+
+
+# ---------------------------------------------------------------------------
+# What one guarded call COSTS.
+# ---------------------------------------------------------------------------
+#
+# PRD §6 measures one resolver walk at ~0.2s, and §4-C1's corpus says 33,076 of
+# 47,209 prefix-shaped occurrences resolve to `none` — so most tokens cost a
+# full two-store walk to learn nothing. Serial and uncapped, a prose-heavy
+# write citing N distinct runs would add N x 0.2s to one tool call, with N
+# bounded only by the size of the argument map.
+
+
+def hex_tokens(count: int) -> list[str]:
+    """*count* distinct, well-separated tokens the C1 grammar accepts."""
+    return [f'{0xAAAA0000 + index:08x}' for index in range(count)]
+
+
+def prose(tokens: list[str]) -> dict[str, Any]:
+    return {'content': ' and '.join(tokens), 'project_id': PROJECT, 'agent_id': AGENT}
+
+
+class _ConcurrencyProbe(_FakeResolver):
+    """Answers only once *expected* callers have arrived AT THE SAME TIME.
+
+    A resolver that resolved serially would sit in the first call waiting for a
+    second that cannot arrive until it returns, and the wait would time out —
+    so "these overlapped" is a fact this fake can establish rather than a
+    duration a test has to eyeball. ``peak`` additionally records how many were
+    ever in flight together, which is the semaphore's bound made observable.
+    """
+
+    def __init__(self, expected: int) -> None:
+        super().__init__({})
+        self.expected = expected
+        self.in_flight = 0
+        self.peak = 0
+        self._all_arrived = asyncio.Event()
+
+    async def __call__(self, project: str | None, prefix: str) -> guard.Resolution:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        if self.in_flight >= self.expected:
+            self._all_arrived.set()
+        try:
+            await asyncio.wait_for(self._all_arrived.wait(), timeout=10)
+        finally:
+            self.in_flight -= 1
+        return await super().__call__(project, prefix)
+
+
+class _DelayedResolver(_FakeResolver):
+    """A resolver whose answers arrive OUT of document order.
+
+    ``calls`` therefore records COMPLETION order here, which is what makes
+    "the outage reported is the first in DOCUMENT order" a real assertion
+    rather than one both implementations would satisfy.
+    """
+
+    def __init__(
+        self,
+        raises: Mapping[str, Exception],
+        delays: Mapping[str, float],
+    ) -> None:
+        super().__init__({}, raises)
+        self.delays = dict(delays)
+
+    async def __call__(self, project: str | None, prefix: str) -> guard.Resolution:
+        await asyncio.sleep(self.delays.get(prefix, 0.0))
+        return await super().__call__(project, prefix)
+
+
+class TestTheDistinctTokensResolveConcurrently:
+    async def test_a_full_batch_is_in_flight_together(self) -> None:
+        """Serial resolution deadlocks this probe; concurrent resolution passes."""
+        probe = _ConcurrencyProbe(guard.MAX_CONCURRENT_RESOLUTIONS)
+        h = build_harness(resolver=probe)
+        await h.call('add_memory', prose(hex_tokens(guard.MAX_CONCURRENT_RESOLUTIONS)))
+        assert probe.peak == guard.MAX_CONCURRENT_RESOLUTIONS
+
+    async def test_the_fan_out_is_capped(self) -> None:
+        """Unlimited overlap browns out the very stores the guard depends on."""
+        probe = _ConcurrencyProbe(guard.MAX_CONCURRENT_RESOLUTIONS)
+        h = build_harness(resolver=probe)
+        await h.call('add_memory', prose(hex_tokens(guard.MAX_DISTINCT_PREFIXES_PER_CALL)))
+        assert len(h.resolver.prefixes) == guard.MAX_DISTINCT_PREFIXES_PER_CALL
+        assert probe.peak == guard.MAX_CONCURRENT_RESOLUTIONS
+
+    async def test_the_concurrency_bound_never_exceeds_the_call_bound(self) -> None:
+        assert guard.MAX_CONCURRENT_RESOLUTIONS <= guard.MAX_DISTINCT_PREFIXES_PER_CALL
+
+    async def test_the_outage_reported_is_the_first_in_document_order(self) -> None:
+        """Not the first to ARRIVE. What a caller is told must not depend on
+        which of two overlapping store walks lost the race."""
+        first, second = BFF, F1C
+        resolver = _DelayedResolver(
+            raises={
+                first: guard.ResolverUnavailable('mem0'),
+                second: guard.ResolverUnavailable('graphiti'),
+            },
+            delays={first: 0.05},
+        )
+        h = build_harness(resolver=resolver)
+        result = await h.call('add_memory', prose([first, second]))
+        assert h.resolver.prefixes == [second, first], 'the second answered first'
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': 'mem0'}
+        assert [fact['token'] for fact in h.facts] == [first]
+
+
+class TestTheCeilingOnDistinctPrefixes:
+    """Beyond the ceiling the citations go UNCHECKED — said, not inferred."""
+
+    def over(self) -> dict[str, Any]:
+        return prose(hex_tokens(guard.MAX_DISTINCT_PREFIXES_PER_CALL + 1))
+
+    async def test_the_call_is_forwarded_byte_identical(self) -> None:
+        h = build_harness()
+        call = self.over()
+        await h.call('add_memory', dict(call))
+        assert h.recorder.args['content'] == call['content']
+
+    async def test_the_resolver_is_never_awaited(self) -> None:
+        """The whole point: the ceiling is a bound on COST, so it has to be
+        enforced before the first walk, not after the sixteenth."""
+        h = build_harness()
+        await h.call('add_memory', self.over())
+        assert h.resolver.calls == []
+
+    async def test_meta_names_the_reason_the_count_and_the_ceiling(self) -> None:
+        h = build_harness()
+        result = await h.call('add_memory', self.over())
+        assert repair_of(result) == {
+            'resolver': 'too_many_prefixes',
+            'distinct_prefixes': guard.MAX_DISTINCT_PREFIXES_PER_CALL + 1,
+            'ceiling': guard.MAX_DISTINCT_PREFIXES_PER_CALL,
+        }
+
+    async def test_no_fact_and_no_escalation(self) -> None:
+        """No resolution was attempted, so there is no outcome to report — the
+        ``no_project`` arm's line, and the caller was told on its own meta."""
+        h = build_harness()
+        await h.call('add_memory', self.over())
+        assert h.facts == []
+        assert h.escalations == []
+
+    async def test_the_ceiling_is_inclusive(self) -> None:
+        h = build_harness()
+        await h.call('add_memory', prose(hex_tokens(guard.MAX_DISTINCT_PREFIXES_PER_CALL)))
+        assert len(h.resolver.prefixes) == guard.MAX_DISTINCT_PREFIXES_PER_CALL
+
+    async def test_repeated_citations_of_one_id_never_approach_it(self) -> None:
+        """The ceiling counts DISTINCT tokens, so a call quoting one id fifty
+        times is one walk — the same invariant `_resolve` keeps."""
+        h = build_harness(answers={BFF: unique(BFF_FULL)})
+        await h.call('add_memory', prose([BFF] * 50))
+        assert h.resolver.prefixes == [BFF]
