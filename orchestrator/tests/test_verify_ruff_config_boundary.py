@@ -33,6 +33,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -1116,8 +1117,23 @@ class TestProbeDoesNotBlockTheEventLoop:
 
     @pytest.mark.asyncio
     async def test_the_loop_keeps_running_during_the_probe(self, geometry, tmp_path):
+        """The blocking body runs on a worker thread, never the loop's own.
+
+        Thread identity IS the property ``_report_ruff_config_escape`` claims
+        for itself ("runs on a worker thread via ``asyncio.to_thread`` so it
+        cannot stall the event loop"), so assert it directly.  An earlier
+        revision instead asserted a FLOOR on how many times a background
+        ticker was scheduled inside a fixed window — the load-flaky shape
+        (task 4520 / esc-4520-6: a floor on work completed reds under host
+        contention; only a ceiling is safe), and doubly so here because the
+        awaited call queues on the shared default executor.  The ticker
+        survives as a non-asserting diagnostic: it reports how badly the loop
+        was starved when the identity claim fails, and gates nothing.
+        """
         parent, worktree, _target = geometry
         _write_project(worktree, 'wtproj', declares_ruff=False)
+        loop_thread = threading.current_thread()
+        probe_thread: threading.Thread | None = None
         ticks = 0
 
         async def ticker():
@@ -1127,9 +1143,11 @@ class TestProbeDoesNotBlockTheEventLoop:
                 await asyncio.sleep(0.005)
 
         def slow_blocking_probe(wt, target=None):
-            # Stands in for the real subprocess.run: blocking, and long enough
-            # that an on-loop call is unmistakable in the tick count.
-            time.sleep(0.25)
+            # Stands in for the real subprocess.run: records where it ran, and
+            # blocks briefly so an on-loop call also shows in the tick count.
+            nonlocal probe_thread
+            probe_thread = threading.current_thread()
+            time.sleep(0.05)
             return parent / 'pyproject.toml'
 
         with patch('orchestrator.verify._ruff_settings_path', new=slow_blocking_probe):
@@ -1138,6 +1156,8 @@ class TestProbeDoesNotBlockTheEventLoop:
             await verify._report_ruff_config_escape(worktree)
             beat.cancel()
 
-        # On-loop the count is ~1; off-loop it is ~50. The threshold is far
-        # from both, so this is a structural claim, not a timing race.
-        assert ticks > 5, f'event loop was starved during the probe (ticks={ticks})'
+        assert probe_thread is not None, 'the probe never ran'
+        assert probe_thread is not loop_thread, (
+            f'the blocking probe ran ON the event loop thread '
+            f'({loop_thread.name}; loop starved to ticks={ticks})'
+        )
