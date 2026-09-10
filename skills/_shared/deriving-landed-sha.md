@@ -131,7 +131,7 @@ marker from a previous incarnation does not: it predates the recreated ref, so t
 
 (The escalation server layers a second guard on the same risk — the marker must not predate the
 recorded `branch_base_sha`; see
-`escalation/src/escalation/server.py::_found_on_main_response` and the `merge_status` Tier-3.5
+`escalation/src/escalation/git_authority.py::found_on_main_response` and the `merge_status` Tier-3.5
 docstring. The containment check above is the shell-side equivalent available to an agent.)
 
 <a id="step-3"></a>
@@ -265,7 +265,7 @@ output most-recent-first and take the first row whose **subject** cites this tas
   stamp the branch tip: on a sibling-covered branch the tip is main's own old base commit,
   carrying none of this task's work, and the server's only backstop
   ([below](#never-from-head)) passes it. This matches
-  `escalation/src/escalation/server.py::_found_on_main_response`, whose live-branch path returns
+  `escalation/src/escalation/git_authority.py::found_on_main_response`, whose live-branch path returns
   exactly this citation commit, discovered by `validate_landing_evidence` (task 3103 changed it
   from the branch tip for precisely this reason). Do **not** assert "fast-forward" in the note:
   this arm cannot distinguish a genuine fast-forward from a sibling-covered landing — recording
