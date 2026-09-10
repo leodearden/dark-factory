@@ -91,6 +91,14 @@ Measured 2026-09-09 against main:
   `<task>__<config>__<run_id>.json`. **Verified.**
 - The dispatch load gate is `scheduler.py::_phase_psi_gate` over `shared.psi::saturated`.
   **Verified.**
+- The EXECUTE phase already re-invokes the implementer while `artifacts.get_pending_steps()`
+  is non-empty, bounded by `config.max_execute_iterations` (`workflow.py::_execute_iterations`);
+  the brief is assembled by `briefing.py::build_implementer_prompt` from the plan's
+  `pending`/`done` steps and today ends "execute the next pending steps … stop at a logical
+  boundary"; `judge_after_each_iteration` exists; `EvalConfig` is a plain dataclass that
+  `build_eval_orch_config` maps onto per-role config. A one-step variant is therefore a brief
+  branch plus bound scaling, not a workflow change. **Verified.** No prior design or task for
+  step-wise execution exists in plans, docs, briefs, tasks or memory (searched 2026-09-10).
 - The harness's `_maybe_auto_eval` sibling-task redo hook has fired **0 times ever**
   (`plans/author-declared-complexity-prd.md` §Out of scope) and files real tasks; it is
   **not** reused (decision 3).
@@ -119,7 +127,16 @@ an escalation, a merge request or a memory write.
 | `end-to-end` | `phase_enter(PLAN)` | candidate architect **and** candidate implementer | base | as `implementer`, plus $/done |
 
 `architect-consequence` is the instrument for Leo's hypothesis: same task, same base, same
-implementer; only the plan differs. `architect` alone stays cheap and answers the decline
+implementer; only the plan differs.
+
+**Harness variant axis (decision 14).** A candidate name may carry a harness variant,
+`<config>@<variant>` with `variant ∈ {whole-plan, one-step}` (`whole-plan` is today's
+brief and the default). Under `one-step` the implementer brief instructs the agent to
+complete **exactly the next pending step**, commit, call `mark_step_done`, and stop; the
+EXECUTE loop's iteration cap and the per-invocation turn/budget ceilings scale to the plan.
+Listing `glm-5.3-endpoint`, `glm-5.3-endpoint@one-step` and `sonnet@one-step` in
+`shadow_eval.candidates` yields, per sampled task, a within-task set of production plus
+three cells, so the report reads model × variant as paired deltas. `architect` alone stays cheap and answers the decline
 question. `end-to-end` is the live confirm stage, opened only for a survivor candidate.
 
 ### Life of a cell
@@ -194,6 +211,17 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     the screen.
 13. **No production config change** is applied by anything in this PRD (as every eval
     PRD in this lineage).
+14. **(Leo) The one-step implementer harness variant is an eval axis, with a control.**
+    Hypothesis: cheap models fail as drop-in whole-plan implementers but may succeed when
+    each invocation does exactly one plan step. The variant is a per-role config knob
+    (`implementer_brief_variant`) consumed by `build_implementer_prompt`, carried on
+    `EvalConfig.harness_variant` and named `<config>@one-step`; under it
+    `max_execute_iterations` becomes `steps + prerequisites + slack` and the implementer's
+    per-invocation `max_turns`/`budget_usd` scale down (values: open question 7).
+    `sonnet@one-step` is always eligible as the control so a cheap-model result is read
+    against what the variant does for a capable model. The production consumer beyond this
+    PRD is a routing flip on a favourable report, filed by ruling as in decision 13; the
+    knob ships default `whole-plan` and changes nothing until then.
 
 ## Pre-conditions for activating
 
@@ -316,7 +344,8 @@ form: `--json` emits the same rows.
 ### C6 — config (`ShadowEvalConfig`, green-tier hot-reloadable, under `shadow_eval:`)
 
 `enabled` (default **false**), `sample_rate` (0..1, per candidate override map),
-`shapes` (enabled set), `candidates` (list of `EvalConfig` names), `end_to_end_candidates`,
+`shapes` (enabled set), `candidates` (list of `EvalConfig` names, optionally
+`<name>@<variant>`), `end_to_end_candidates`,
 `max_concurrent` (1), `daily_budget_usd` (50.0, the `auto_eval_redo_budget_usd` pattern),
 `settle_deadline_hours` (168), `failure_streak_pause` (5), `cost_ratio_ceiling` (3.0),
 `n_min` (12, provisional — see Open questions), `seed`.
@@ -339,6 +368,7 @@ form: `--json` emits the same rows.
 | 12 | Report renders from rows only | rows present, result JSON deleted for one cell | report prints the row with `result_missing`, exit non-zero; no log-scrape |
 | 13 | Shadow branch never reaches the lane | `shadow/<task>/<cell>` exists in `<root>-eval-worktrees/` (`snapshots.py::create_eval_worktree`), outside `.worktrees/` | no `merge_request` is ever filed for it (the coordinator holds no merge client); the worktree reapers' enumeration is asserted to exclude the eval-worktree root or ε2 adds the exclusion; the assertion is executed, not read from prose |
 | 14 | Runner failure is contained | the shape runner raises | cell `failed` with exception class in `reason`; the production slot's `TaskReport` is unchanged |
+| 15 | One-step variant is honoured | candidate `X@one-step`, a plan with N pending steps | the cell's config carries `implementer_brief_variant=one-step`; every implementer invocation's brief names exactly one step; on a clean run `iterations == N` and each iteration's `iteration_log` entry lists exactly one `steps_completed`; the iteration cap equals `N + prerequisites + slack` |
 
 ## Decomposition plan
 
@@ -371,6 +401,17 @@ coordinator; SPOT for the reason vocabulary).
   green against the new constants; `get_config_by_name` resolves every new name;
   `claude_endpoint_price_table()` has an entry for every non-incumbent model.
   Modules: `orchestrator/evals`, `orchestrator/tests`. Prereqs: none.
+- **ν — one-step implementer brief variant** *(leaf)*. `implementer_brief_variant`
+  per-role config knob (green tier; default `whole-plan`), the `one-step` branch in
+  `briefing.py::build_implementer_prompt`, bound scaling in `_execute_iterations` and the
+  per-invocation implementer `max_turns`/`budget_usd` under the variant,
+  `EvalConfig.harness_variant` plus the `<name>@<variant>` resolver in
+  `get_config_by_name`, and `build_eval_orch_config` mapping the field onto the knob.
+  **Signal:** boundary row 15 executed against a real `TaskWorkflow` in eval mode on a
+  synthetic 3-step plan; with the knob at its default the rendered brief and every bound
+  are byte-identical to today's (the parity tripwire). G7: `contracts-machine-checked` —
+  the variant is a validated enum, not prose in the brief. Modules: `orchestrator`,
+  `orchestrator/agents`, `orchestrator/evals`. Prereqs: none.
 - **δ — shadow invocation profile** *(leaf)*. `build_shadow_orch_config` =
   `build_eval_orch_config` + `strict_mcp_config=True` + null memory endpoint + shadow
   branch naming; plus the **deterministic isolation probe** the coordinator consults
@@ -403,7 +444,8 @@ coordinator; SPOT for the reason vocabulary).
   unchanged. G7: `status-matches-liveness` — a cell whose runner dies writes `failed`
   through the coordinator before the slot returns; `loop-thread-occupancy-bounded` —
   the runner is awaited as a separate task, never inline in the slot. Modules:
-  `orchestrator`, `orchestrator/evals`. Prereqs: β, δ, ε1.
+  `orchestrator`, `orchestrator/evals`. Prereqs: β, δ, ε1, ν (row 15 runs as a shadow
+  cell here).
 - **θ1 — minimal report** *(leaf)*. `eval-shadow report` over the `implementer` shape:
   pairs, paired mean difference with bootstrap CI, `$ per usable`, counts, `UNDERPOWERED`
   tag, `--json`. Row 12. **Signal:** against a seeded `shadow_cells` fixture the report
@@ -477,3 +519,7 @@ coordinator; SPOT for the reason vocabulary).
 6. **Consequence leg 2 reviewer.** Whether leg 2 runs the reviewer (adds cost, gives
    `review_blocking_issues`) or stops at verify. **Suggested resolution:** run it —
    review outcome is half the signal for "better plan". Decide in ζ.
+7. **One-step bound values.** The per-invocation `max_turns`/`budget_usd` under
+   `one-step` and the iteration `slack`. **Suggested resolution:** turns and budget at
+   one third of the whole-plan role defaults, slack of 3; ν records the chosen values
+   with their basis and θ2 reports iterations-per-step so κ can recalibrate.
