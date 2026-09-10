@@ -170,7 +170,8 @@ makes that distinction machine-readable. Every run emits:
   "undrainable_count": 2,
   "undrainable_ids": ["u1", "m1"],
   "max_backlog": 0,
-  "gate_unsatisfiable": true
+  "gate_unsatisfiable": true,
+  "gate_evaluated": true
 }
 ```
 
@@ -203,13 +204,33 @@ directions:
 Before task 4436 the WARNING was keyed on the raw count, so the first case
 told operators to raise `--max-backlog` when the true floor was 0.
 
-- **`gate_unsatisfiable: true`** — `undrainable_count > max_backlog`: this
-  gate can never pass, and re-running it will never clear it. Computed on
-  every run against the effective `--max-backlog` (default `0`), so a
-  nightly `--apply --terminal-drain` records the fact in its journal JSON;
-  the matching ERROR is logged only when `--check` is actually being
-  evaluated, so that service gains no spurious ERROR for a gate it never
-  runs.
+- **`gate_unsatisfiable: true`** — `undrainable_count > max_backlog`: no
+  re-run of this sweep can ever clear this gate. Computed on every run
+  against the effective `--max-backlog` (default `0`), so a nightly
+  `--apply --terminal-drain` records the fact in its journal JSON too.
+- **`gate_evaluated`** — mirrors `--check`, and is the discriminator between
+  the two things `gate_unsatisfiable` can mean. `true`: a gate really ran
+  and can never pass. `false`: no gate was configured, and this is what the
+  *default* ceiling would have done — the nightly service's shape, which is
+  why `gate_unsatisfiable: true` there is not a failing check. Without this
+  field the block would mix an evaluated verdict with a hypothetical one and
+  give a consumer no way to tell them apart. The matching ERROR is logged
+  only when `gate_evaluated` is `true`, so the nightly service gains no
+  spurious ERROR line for a gate it never runs.
+
+**Clearing the floor is NECESSARY, not sufficient.** `--check` resolves its
+verdict through `_resolve_check_exit_code`, which compares
+`after.total_source` on an `--apply` run and falls back to
+`before.total_source` otherwise — and
+`scripts/fused-memory-flag-marker-check.sh` hardcodes `--check` with no
+`--apply`, so **its** verdict compares the whole enumerated residual rather
+than the floor. Concretely: 10 enumerated members with a floor of 1 under
+`--check --max-backlog 0` reports `gate_unsatisfiable: true`, but raising
+the ceiling to 1 still exits 1, because the comparand is 10. Raise the
+ceiling to at least `undrainable_count` to make the gate *satisfiable at
+all*; raise it to the resolved residual to make *this* run pass. Both
+figures are in the emitted JSON (`structural_floor.undrainable_count` and
+`before.total_source` / `after.total_source`), and the ERROR names them.
 - **The exit code is unchanged by design.** `rc` is the sweep's own, and the
   orchestrator's `before_done` path renders any `rc != 0` identically as a
   predicate violation, so a distinct code would buy separability nowhere it
@@ -475,13 +496,16 @@ systemd `failed` state on every run, forever, whenever that floor is nonzero
 recurring service lets each nightly drain exit 0 on a normal run.
 
 Since task 4436 this is a **checked constraint rather than an unenforced
-caveat**: the nightly run still computes and reports the floor and whether a
-hypothetical gate could pass, and an invocation that *does* pass `--check`
-with a ceiling below the floor is told so with an ERROR naming the floor,
-the ceiling and the per-arm remedy, instead of failing indistinguishably
-from a transient over-backlog. Note the floor is not equal to
-`undated_kept_count`, which is why keying a gate on that count was itself a
-footgun.
+caveat**: the nightly run still computes and reports the floor and what a
+hypothetical default-ceiling gate would have done (marked
+`gate_evaluated: false`, so it is never mistaken for a failing check), and an
+invocation that *does* pass `--check` with a ceiling below the floor is told
+so with an ERROR naming the floor, the ceiling and the per-arm remedy,
+instead of failing indistinguishably from a transient over-backlog. Note the
+floor is not equal to `undated_kept_count`, which is why keying a gate on
+that count was itself a footgun — and that clearing the floor is necessary
+but not sufficient for a gate to pass, which is why the ERROR names the
+resolved residual as well.
 
 ## Backstop for residual backlog
 

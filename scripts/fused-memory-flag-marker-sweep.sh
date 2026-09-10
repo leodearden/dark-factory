@@ -14,14 +14,16 @@
 # maintenance action must run under the SERVICE env, not a bare shell, or
 # the census silently narrows.
 #
-# Runs `--apply --terminal-drain` WITHOUT `--check` on purpose: some records
-# cannot be drained by ANY invocation of the sweep (undated markers no age
-# cutoff reaches AND protected mirrors the delete choke point refuses), so a
-# `--check --max-backlog 0` recurring service would enter systemd `failed`
-# state forever whenever that floor is nonzero. Since task 4436 each run
-# still REPORTS the floor and whether a hypothetical gate could pass
-# (structural_floor.gate_unsatisfiable in the JSON below), without the
-# ERROR that a run actually evaluating --check would emit.
+# Runs `--apply --terminal-drain` WITHOUT `--check` on purpose: part of the
+# enumerated population cannot be drained by ANY invocation of the sweep, so
+# a `--check --max-backlog 0` recurring service would enter systemd `failed`
+# state forever whenever that floor is nonzero. The arms and their remedies
+# are stated once in docs/flag-marker-sweep-recurring.md -- the single copy.
+# Since task 4436 each run still REPORTS the floor here (structural_floor in
+# the JSON below). Read gate_evaluated with it: this service publishes
+# `gate_evaluated: false`, marking gate_unsatisfiable as a verdict on the
+# HYPOTHETICAL default-ceiling gate it never runs -- which is why no ERROR
+# accompanies it, and why a `true` here is not a failing check.
 # Backlog visibility is instead left to the existing reconciliation
 # Stage-1/2 re-flag net (the mechanism that filed this task).
 #

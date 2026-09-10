@@ -622,57 +622,30 @@ def find_undrainable_markers(
 
     The enumerated members no invocation of this sweep can reach, minus the
     ones *drained_ids* — this run's finished delete set — already covers.
-    ``run()`` reports the result as ``structural_floor.undrainable_count``,
-    and :func:`unsatisfiable_backlog_gate` turns it into the checked
-    constraint that a ``--check --max-backlog N`` below this floor can never
-    pass (task 4436).
+    ``run()`` publishes it as ``structural_floor.undrainable_count``, which
+    :func:`unsatisfiable_backlog_gate` turns into the checked constraint
+    (task 4436).
 
-    TWO STRUCTURALLY DIFFERENT ARMS compose the floor, and the difference
-    matters to the remedy:
+    The two arms treat *drained_ids* differently, which is the only thing
+    about the body that is not self-evident:
 
-    - The UNDATED arm (:func:`find_undated_markers`) is INVOCATION-RELATIVE.
-      ``find_stale_markers`` fail-safe KEEPs a missing/unparseable
-      ``created_at`` at every ``max_age_days`` including ``0``, and the
-      in-cycle collector ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool``
-      applies the same KEEP-on-uncertainty posture, so no age cutoff reaches
-      these members — but ``--delete-ids`` and ``--terminal-drain`` still
-      can. That is why this arm is subtracted by *drained_ids*: a member the
-      run is about to delete floors nothing, and its remedy is another
-      invocation.
-    - The PROTECTED arm (:func:`find_protected_markers`) is ABSOLUTE. Those
-      records are refused unconditionally at the delete choke point,
-      overriding even ``--delete-ids`` (task 3041/4435), so no flag of this
-      script drains them; the remedy is the fused-memory MCP
-      ``delete_memory`` tool or a corrected ``source`` enumeration. This arm
-      is therefore NOT subtracted by *drained_ids*: a protected member sits
-      in ``after.total_source`` whatever a caller believes it is deleting,
-      so subtracting it would UNDER-report the floor — the exact
-      false-negative this constraint exists to eliminate. The distinction is
-      unobservable from ``run()``, which removes protected members from the
-      delete set before calling this, so the two arms agree there; keeping
-      the arm absolute is what makes the predicate independent of its caller
-      having done that subtraction correctly.
+    - UNDATED (:func:`find_undated_markers`) is INVOCATION-RELATIVE — no age
+      cutoff reaches these, but ``--delete-ids`` and ``--terminal-drain`` do,
+      so a member this run deletes floors nothing and IS subtracted.
+    - PROTECTED (:func:`find_protected_markers`) is ABSOLUTE — refused
+      unconditionally at the delete choke point, overriding even
+      ``--delete-ids`` (task 3041/4435), so it is NOT subtracted: a protected
+      member sits in ``after.total_source`` whatever a caller believes it is
+      deleting, and subtracting it would UNDER-report the floor.
 
-    ``undated_kept_count`` is NOT the floor, and keying a constraint on it
-    manufactures false "unsatisfiable" verdicts:
-    ``find_orphan_markers`` / ``find_taskless_markers`` /
-    ``find_terminal_task_markers`` never consult ``created_at``, so an
-    undated member any of them catches IS drained this run and floors
-    nothing. The two counts can now differ in BOTH directions — an undated
-    kind-orphan is drained and floors nothing; a fully dated protected
-    mirror floors permanently while contributing ``0`` to the raw count.
-
-    EXTENSION: this predicate is defined over the KEEP-sets, not over an
-    enumerated list of floor sources. When task 5129 adds the second
-    protected predicate :func:`find_protected_markers`' docstring names
-    (``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS``,
-    task 4375) and it joins the same subtraction, its records become floor
-    here by construction rather than by someone remembering to widen a list.
+    ``undated_kept_count`` is NOT this floor, and the two differ in both
+    directions. That divergence, the per-arm remedies, and the extension
+    path when task 5129 adds a second protected predicate are stated once in
+    ``docs/flag-marker-sweep-recurring.md`` §``structural_floor`` — the
+    single copy, not restated here.
 
     Pure, sync, no I/O. Composed from the two keep-predicates rather than
-    re-deriving either rule, so neither can drift from its floor
-    consequence. Census figures and operator guidance live in
-    ``docs/flag-marker-sweep-recurring.md``, not here.
+    re-deriving either rule, so neither can drift from its floor consequence.
 
     Args:
         members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
@@ -971,28 +944,22 @@ async def run(
               unobserved population must never be asserted as a blind spot.
             - structural_floor (dict): the PERMANENT floor on the residual
               backlog (task 4436) — ``{'undated_kept_count',
-              'undrainable_count', 'undrainable_ids'}``. Diagnostic only,
-              NEVER part of the delete set: it exists so a ``--check``
-              violation that no re-run can ever clear is legible as such
-              rather than as a transient over-backlog. Composed of two
-              structurally different arms (see
-              :func:`find_undrainable_markers`): the UNDATED arm, which
-              ``--delete-ids``/``--terminal-drain`` can still reach and
-              which is therefore relative to THIS invocation's delete set,
-              and the PROTECTED arm, which no flag of this script drains at
-              all. ``undated_kept_count`` is repeated here beside
-              ``undrainable_count`` deliberately — the raw count is not the
-              floor, and the two can differ in both directions.
-              ``max_backlog`` is the EFFECTIVE ceiling (default ``0`` when
-              the namespace carries no ``--max-backlog``) and
-              ``gate_unsatisfiable`` is
-              :func:`unsatisfiable_backlog_gate` over the two. Both are
-              computed UNCONDITIONALLY, so a run without ``--check`` still
-              records the hypothetical gate's satisfiability into the
-              journal JSON; the loud ERROR is reserved for a gate actually
-              being evaluated. The exit code is unchanged either way — this
-              block is the machine-readable discriminator, as
-              ``cross_check`` is for the blind spot.
+              'undrainable_count', 'undrainable_ids', 'max_backlog',
+              'gate_unsatisfiable', 'gate_evaluated'}``. Diagnostic only,
+              NEVER part of the delete set, and the exit code is unchanged
+              either way: this block is the machine-readable discriminator
+              between a ``--check`` violation no re-run can clear and a
+              transient over-backlog, as ``cross_check`` is for the blind
+              spot. ``max_backlog`` is the EFFECTIVE ceiling (default ``0``
+              when the namespace carries no ``--max-backlog``) and
+              ``gate_unsatisfiable`` is :func:`unsatisfiable_backlog_gate`
+              over it and ``undrainable_count``, computed unconditionally —
+              so ``gate_evaluated`` (``args.check``) is what separates a
+              verdict on a gate that RAN from one on the hypothetical gate
+              the nightly drain never evaluates. Arms, remedies and why
+              ``undated_kept_count`` is republished beside the floor:
+              :func:`find_undrainable_markers` and
+              ``docs/flag-marker-sweep-recurring.md``.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
             - tombstoned (int, only when apply=True): task-3041 ledger rows
@@ -1282,79 +1249,61 @@ async def run(
     # --- Structural floor (task 4436) ---
     #
     # Diagnostic only — computed FROM the finished delete set and never fed
-    # back into it. Deliberately placed AFTER the protected subtraction
-    # above: `seen_ids` from the union loop is now a strict SUPERSET of what
-    # is actually deleted, so a protected member some automatic predicate
-    # also catches (a `cycle_summary` mirror is a kind-orphan too) would be
-    # classified as drained and the floor under-reported — the false
-    # negative this block exists to eliminate. `orphan_ids` is the report's
-    # own published delete set, so deriving the floor from it also keeps the
-    # block consistent with `orphan_count` by construction rather than by a
-    # second, drifting derivation.
+    # back into it. The PLACEMENT is load-bearing: it must follow the
+    # protected subtraction above, because the union loop's `seen_ids` is a
+    # strict SUPERSET of what is actually deleted (a `cycle_summary` mirror
+    # is a kind-orphan too), so deriving the floor from it would classify a
+    # protected member as drained and UNDER-report the floor. Using the
+    # report's own published `orphan_ids` also keeps the block consistent
+    # with `orphan_count` by construction rather than by a second derivation.
     #
-    # `undated_kept_count` is duplicated INSIDE the block on purpose, so the
-    # block reads self-describingly in a journal or a done_provenance.note
-    # with the raw count and the true floor side by side — exactly the
-    # distinction operators have been getting wrong. After task 4435 the two
-    # can differ in BOTH directions: an undated kind-orphan is drained and
-    # floors nothing, while a dated protected mirror floors permanently
-    # while contributing 0 to the raw count.
+    # Gate config is read with the module's defensive getattr idiom (see
+    # project_id/max_age_days/delete_ids above), NOT bare attribute access:
+    # ~40 existing callers build a namespace carrying neither field.
     #
-    # The gate config is read with the module's established defensive idiom
-    # (see project_id/max_age_days/delete_ids above), NOT bare attribute
-    # access: ~40 existing callers build a namespace carrying neither field,
-    # and gate_unsatisfiable is computed unconditionally so a run without
-    # --check still records the hypothetical gate's satisfiability.
+    # Why `undated_kept_count` is republished inside the block, and how the
+    # two counts diverge: docs/flag-marker-sweep-recurring.md.
     max_backlog: int = getattr(args, 'max_backlog', 0)
     check: bool = getattr(args, 'check', False)
     drained_ids = set(orphan_ids)
     undated_kept = find_undated_markers(members)
     undrainable = find_undrainable_markers(members, drained_ids)
     gate_unsatisfiable = unsatisfiable_backlog_gate(len(undrainable), max_backlog)
-    # Keyed on the undated members this run does NOT delete, not on the raw
-    # undated count: find_orphan_markers/find_taskless_markers/
-    # find_terminal_task_markers never consult created_at, so an undated
-    # member any of them catches IS drained here and floors nothing. Keying
-    # on the raw count told operators to raise --max-backlog against a
-    # population that drains to 0 perfectly well (task 4436).
-    #
-    # Scoped to the UNDATED arm specifically, NOT to the whole `undrainable`
-    # list: that list also carries protected mirrors, for which
-    # "missing/unparseable created_at" is simply false. The protected arm
-    # keeps its own WARNING above, which already states its floor correctly.
-    # Each line therefore has one well-defined subject and one remedy.
-    #
-    # A member the sweep is about to delete is not a finding, so the drained
-    # case gets no second WARNING of its own.
+    # Keyed on the undated members this run does NOT delete, and scoped to
+    # the UNDATED arm alone: the other predicates never consult created_at,
+    # so an undated member they catch is drained here and floors nothing,
+    # and "missing/unparseable created_at" is simply false of a protected
+    # mirror — which keeps its own WARNING above. One subject and one remedy
+    # per line. A member the sweep is about to delete is not a finding, so
+    # the drained case gets no WARNING of its own.
     undated_undrained = [m for m in undated_kept if m['id'] not in drained_ids]
     if undated_undrained:
         logger.warning(
             'sweep_orphan_flag_markers: %d of %d enumerated markers have a '
             'missing/unparseable created_at AND are uncovered by this run\'s '
-            'delete set — find_stale_markers keeps them at every '
-            '--max-age-days (including 0), so they are a permanent floor on '
-            'after.total_source that age-draining alone can never reach '
-            'below. Remedies: name them in --delete-ids, add --terminal-drain '
-            'if they cite terminal tasks, or set --max-backlog to at least '
-            'the reported structural_floor.undrainable_count. See '
+            'delete set, so they are a permanent floor on the residual that '
+            'no --max-age-days (including 0) reaches below. Remedies: name '
+            'them in --delete-ids, or add --terminal-drain if they cite '
+            'terminal tasks. Raising --max-backlog to at least '
+            'structural_floor.undrainable_count is NECESSARY but NOT '
+            'sufficient — a --check verdict compares this run\'s whole '
+            'residual, not the floor. See '
             'docs/flag-marker-sweep-recurring.md.',
             len(undated_undrained), len(members),
         )
 
-    # The exit code is deliberately NOT changed: `structural_floor` is the
-    # machine-readable discriminator, exactly as `cross_check` is for the
-    # enumeration blind spot (design decision 3, and the already-adjudicated
-    # ruling in scripts/fused-memory-flag-marker-check.sh's header — rc is
-    # this script's own, and the orchestrator's before_done path renders any
-    # rc != 0 identically as a predicate violation). The constraint refines
-    # the REASON, never the code, and can never flip a passing verdict:
-    # every floor member matches the `source` filter and survives the delete,
-    # so after.total_source >= len(undrainable) always.
+    # The exit code is deliberately NOT changed (design decision 3, and the
+    # already-adjudicated ruling in
+    # scripts/fused-memory-flag-marker-check.sh's header): `structural_floor`
+    # IS the machine-readable discriminator, exactly as `cross_check` is for
+    # the blind spot. It can never flip a passing verdict either — every
+    # floor member matches the `source` filter and survives the delete, so
+    # the residual is always >= len(undrainable).
     #
     # Field vs. log splits on `check` so both audiences are right: the
-    # nightly --apply --terminal-drain service (which passes no --check) gets
-    # the fact in its journal JSON without a spurious ERROR for a gate it
-    # never evaluates, while an operator who IS evaluating one gets an
+    # nightly --apply --terminal-drain service records the fact in its
+    # journal JSON, flagged `gate_evaluated: false`, without a spurious ERROR
+    # for a gate it never runs; an operator who IS evaluating one gets an
     # unmissable "stop re-running this".
     if check and gate_unsatisfiable:
         # Partitioned on PROTECTED-ness, not on undated-ness: a member that
@@ -1366,21 +1315,23 @@ async def run(
         logger.error(
             'sweep_orphan_flag_markers: --check --max-backlog %d is '
             'STRUCTURALLY UNSATISFIABLE against this population: %d '
-            'enumerated markers can never be drained by this script, which '
-            'is already above the ceiling, so this gate can NEVER pass and '
-            're-running it will never clear it. Undrainable: %s. Remedies '
-            'differ by arm — undated ids (%s) can be named in --delete-ids, '
-            'or reached with --terminal-drain if they cite terminal tasks; '
-            'protected ids (%s) cannot be drained by this script AT ALL and '
-            'need the fused-memory MCP delete_memory tool or a corrected '
-            'source enumeration (see delete_orphan_markers). Sufficient fix '
-            'either way: raise --max-backlog to at least %d. See '
+            'enumerated markers can never be drained by this script, so no '
+            're-run of it can ever clear this gate. Undrainable: %s. '
+            'Remedies differ by arm — undated ids (%s) can be named in '
+            '--delete-ids, or reached with --terminal-drain if they cite '
+            'terminal tasks; protected ids (%s) need the fused-memory MCP '
+            'delete_memory tool or a corrected source enumeration (see '
+            'delete_orphan_markers). Raising --max-backlog to at least %d is '
+            'NECESSARY but NOT sufficient: the verdict compares this run\'s '
+            'whole residual total_source — before.total_source (%d) on a '
+            'dry-run --check, which deletes nothing, or after.total_source '
+            'on an --apply run. See '
             'docs/flag-marker-sweep-recurring.md.',
             max_backlog, len(undrainable),
             ', '.join(m['id'] for m in undrainable),
             ', '.join(undated_floor_ids) or 'none',
             ', '.join(protected_floor_ids) or 'none',
-            len(undrainable),
+            len(undrainable), before['total_source'],
             extra={'project_id': project_id},
         )
 
@@ -1422,6 +1373,7 @@ async def run(
             'undrainable_ids': [m['id'] for m in undrainable],
             'max_backlog': max_backlog,
             'gate_unsatisfiable': gate_unsatisfiable,
+            'gate_evaluated': check,
         },
     }
 
@@ -1714,16 +1666,15 @@ def _build_parser() -> argparse.ArgumentParser:
             'Residual stage1_flag_marker ceiling checked by --check '
             '(default: 0). Negative values are rejected (a negative '
             'ceiling reached by typo would make backlog_verdict violate '
-            'on any residual, forever, with no explanation). A '
-            'before_done predicate wired with the default 0 may never be '
-            'satisfiable: set it to at least the reported '
-            'structural_floor.undrainable_count, which is the population no '
-            'invocation of this script can drain. Do NOT read '
-            'undated_kept_count as that floor — an undated marker another '
-            'predicate catches IS drained, and a dated protected mirror is '
-            'not, so the two differ in both directions. A run whose ceiling '
-            'is below the floor reports gate_unsatisfiable: true and logs an '
-            'ERROR saying so.'
+            'on any residual, forever, with no explanation). A predicate '
+            'wired with the default 0 may never be satisfiable: '
+            'structural_floor.undrainable_count is the population no '
+            'invocation of this script can drain, so a ceiling below it '
+            'reports gate_unsatisfiable: true and logs an ERROR. Clearing '
+            'that floor is NECESSARY but not sufficient — the verdict '
+            'compares the whole residual (before.total_source on a dry-run '
+            '--check). Do NOT read undated_kept_count as the floor. Block '
+            'reference: docs/flag-marker-sweep-recurring.md.'
         ),
     )
     parser.add_argument(
