@@ -833,6 +833,80 @@ def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
     )
 
 
+def test_an_unwritable_poll_trace_never_aborts_the_redeploy(tmp_path):
+    """A mis-typed ORCH_DRAIN_POLL_TRACE_FILE must not take down the fleet.
+
+    The ledger is an OBSERVABILITY knob; nothing about a fleet redeploy
+    depends on it succeeding. The hazard is that restart-all-orchestrators.sh
+    runs under `set -euo pipefail` while drain_check_verdict is only ever
+    invoked via command substitution assigned to a plain variable --
+    `_DRAIN_VERDICT="$(...)"` in drain_await_fresh, `verdict="$(...)"` in
+    drain_gate -- so a failed `>>` that lands as that function's LAST command
+    fails the assignment and aborts the ENTIRE run. An operator who
+    fat-fingers a path would lose the redeploy, not just the trace.
+
+    MEASURED on bash 5.2.21, all three configurations, because the middle one
+    is not what it looks like: the failed write LAST and unguarded exits 1;
+    the same write last and guarded with `|| true` does not; and a failed
+    write in the MIDDLE of the function -- today's shape, since the
+    contractual verdict printf follows it -- is swallowed by the command
+    substitution either way, the function's status being its last command's.
+
+    So what this pins is the OBSERVABLE property, not one spelling of the
+    guard: however drain_check_verdict is ordered internally, a mis-typed
+    path costs the operator the trace and nothing else. It therefore passes
+    both with and without the guard in today's ordering -- which is precisely
+    the argument FOR the guard, since without it the property rests on
+    statement order that nothing else pins.
+
+    Fresh + IDLE heartbeat, so the run completes on drain_gate's shortest path
+    -- which still makes drain_await_fresh's ONE opening drain_check_verdict
+    call, so the trace write IS exercised.
+
+    The knob points inside a directory that does not exist, which is the
+    likeliest operator typo and needs no permissions games to reproduce.
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "no-such-dir" / "drain-poll-trace.tsv"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"an unwritable trace path must never take down a fleet redeploy; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"the redeploy must not merely survive the failed trace write, it "
+        f"must still do its JOB; got calls={state['calls']!r} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # LOUD, not silent: the operator set the knob and gets no trace, so the
+    # reason must reach stderr (no-silent-fail-soft). Asserted on the PATH
+    # rather than on libc's wording, which is locale- and bash-version
+    # dependent.
+    assert str(trace_path) in result.stderr, (
+        f"a swallowed trace-write failure leaves the operator with no trace "
+        f"and no reason; expected {str(trace_path)!r} to appear in stderr. "
+        f"got stderr={result.stderr!r}"
+    )
+    assert not trace_path.exists(), (
+        f"nothing should have been created at {str(trace_path)!r} -- if it "
+        f"exists, this test is no longer exercising the unwritable path"
+    )
+
+
 def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
     """STALE (I4 fail-toward-convergence): a unit whose heartbeat exists but
     is older than the freshness window still restarts once
