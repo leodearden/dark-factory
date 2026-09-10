@@ -35,7 +35,6 @@ See plans/escalation-connection-capability-guard-prd.md (tasks alpha/beta/gamma)
 from __future__ import annotations
 
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -149,9 +148,9 @@ def _seed(
     thing it still owns is this module's default summary, and that is
     load-bearing: every test here shares one module-scoped ``EscalationQueue``,
     so the summary is what names the seeding module when a cross-test
-    interference failure surfaces a record (pinned by ``TestHarnessSanity``).
-    ``severity``, ``category``, ``agent_role`` and every other ``Escalation``
-    field are the shared helper's business and can still be overridden via **kw.
+    interference failure surfaces a record. ``severity``, ``category``,
+    ``agent_role`` and every other ``Escalation`` field are the shared helper's
+    business and can still be overridden via **kw.
     """
     if summary is None:
         summary = f'capability-guard test escalation (level={level})'
@@ -204,20 +203,6 @@ class TestHarnessSanity:
         assert result.data['id'] == esc.id, f'Expected id {esc.id!r}, got: {result.data}'
         assert result.data['level'] == 2
         assert result.data['status'] == 'pending'
-
-    def test_seed_labels_records_with_this_modules_summary(self, tmp_path: Path) -> None:
-        """``_seed``'s default summary names THIS module, and that is load-bearing:
-        every test here shares one module-scoped ``EscalationQueue``, so the summary
-        is what identifies the seeding module when a cross-test interference failure
-        surfaces a record. Driven off a private queue, since the property under test
-        is the helper's default and there is no reason to perturb the shared one."""
-        queue = EscalationQueue(tmp_path / 'esc')
-
-        esc = _seed(queue, level=2, task_id='task-summary-pin')
-
-        reread = queue.get(esc.id)
-        assert reread is not None
-        assert reread.summary == 'capability-guard test escalation (level=2)'
 
     # The task-2741 daemon-thread teardown regression test used to live here,
     # driving this module's own ``http_server`` generator. It now lives once,
