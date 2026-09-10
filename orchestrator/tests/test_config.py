@@ -3480,15 +3480,18 @@ class TestSessionResumeConfig:
 
         # INVERTED FROM EITHER SIDE — the operator can reach the bad pair by
         # raising freshness or by lowering the backstop, and both are rejected.
-        for kwargs in (
-            {'freshness_window_secs': cfg.absolute_resume_age_secs + 1},
-            {'absolute_resume_age_secs': cfg.freshness_window_secs - 1},
-        ):
-            with pytest.raises(ValidationError) as excinfo:
-                SessionResumeConfig(**kwargs)
-            message = str(excinfo.value)
+        with pytest.raises(ValidationError) as freshness_raised:
+            SessionResumeConfig(
+                freshness_window_secs=cfg.absolute_resume_age_secs + 1
+            )
+        with pytest.raises(ValidationError) as backstop_raised:
+            SessionResumeConfig(
+                absolute_resume_age_secs=cfg.freshness_window_secs - 1
+            )
+        for raised in (freshness_raised, backstop_raised):
             # The message names BOTH values, so an operator reading a failed
             # load or a rolled-back reload can see which knob to move.
+            message = str(raised.value)
             assert 'absolute_resume_age_secs' in message
             assert 'freshness_window_secs' in message
 
