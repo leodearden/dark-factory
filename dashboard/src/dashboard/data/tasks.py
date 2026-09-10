@@ -485,7 +485,7 @@ async def _walk_pages(
     *page_fn* is injected and already bound to ONE url. That binding is
     load-bearing rather than stylistic: ``first_success`` tries urls in order,
     so a walk free to fan out mid-walk would assemble pages from DIFFERENT
-    servers and silently invalidate the grown-``total`` coherence check below —
+    servers and silently invalidate the changed-``total`` coherence check below —
     pages from two different states of the world, with every counter still
     self-consistent. Hence no url/config parameter here.
 
@@ -571,14 +571,24 @@ async def _walk_pages(
             # pages is misbehaving in exactly the way that amplifies the
             # walk, and is caught here rather than paid for.
             page_budget = math.ceil(total / max(chunk_size, 1)) + 2
-        elif total > first_total:
-            # A `total` that GROWS mid-walk means the tree changed underneath
-            # the read: the pages in hand are from different states of the
-            # world, so the assembled list is not a coherent snapshot of
-            # either.  It also un-bounds the budget derived above.
+        elif total != first_total:
+            # A `total` that CHANGES mid-walk — in EITHER direction — means the
+            # tree changed underneath the read: the pages in hand are from
+            # different states of the world, so the assembled list is not a
+            # coherent snapshot of either.
+            #
+            # The check is on inequality rather than growth because the
+            # SHRINKING case is the worse of the two.  A growing `total`
+            # un-bounds the budget derived above and so trips something; a
+            # shrinking one terminates the loop EARLY on `walk_offset >= total`
+            # with every counter still self-consistent, and hands the assembled
+            # prefix back as a plain `list` — which `collect_snapshot` triages
+            # on `isinstance(result, list)` and writes into the append-only
+            # `snapshots` table as fact.  The server re-slices from the now
+            # shorter list, so the pages after the change skip rows outright.
             raise ValueError(
                 f'get_tasks pagination for {project_root} raced a write '
-                f'at offset {walk_offset}: total grew from {first_total} to '
+                f'at offset {walk_offset}: total changed from {first_total} to '
                 f'{total} mid-walk'
             )
         if returned <= 0:
@@ -865,9 +875,11 @@ async def fetch_tasks(
     envelope; an empty page while the server still claims rows remain; a
     ``returned`` counter disagreeing with the number of rows actually delivered
     (the walk advances on that counter, so an unchecked one skips or re-reads
-    rows silently); a ``total`` that GROWS mid-walk (the tree changed underneath
-    the read, so the assembled pages are not one coherent snapshot); and a walk
-    exceeding the page budget derived from the first response's ``total``.  A
+    rows silently); a ``total`` that CHANGES mid-walk in EITHER direction (the
+    tree changed underneath the read, so the assembled pages are not one
+    coherent snapshot — and a SHRINKING total ends the walk early with the
+    prefix looking complete); and a walk exceeding the page budget derived from
+    the first response's ``total``.  A
     truncated ``list`` would be indistinguishable from a complete one at every
     call site, and ``collect_snapshot`` would write that undercount into an
     append-only history table as fact.  An empty page with no rows still owed

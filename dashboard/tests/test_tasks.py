@@ -1744,7 +1744,7 @@ class TestFetchTasksPagination:
 
         `first_success` tries urls IN ORDER, so a walk free to fan out per page
         would assemble one list from DIFFERENT servers and silently invalidate
-        the grown-`total` coherence check: pages from two states of the world,
+        the changed-`total` coherence check: pages from two states of the world,
         with every counter still self-consistent. Binding ONE url for the whole
         walk is what makes that unrepresentable. The two servers here serve
         DISJOINT id ranges, so a mixed answer is visible rather than plausible —
@@ -2145,8 +2145,62 @@ class TestFetchTasksPagination:
         assert result.get('offline') is True, result
         error = str(result.get('error', ''))
         assert '/proj/racing' in error, error
-        assert 'grew from 20 to 50' in error, (
-            f'the error must report the observed growth so the race is '
+        assert 'changed from 20 to 50' in error, (
+            f'the error must report the observed change so the race is '
+            f'diagnosable; got {error!r}'
+        )
+
+    async def test_a_total_that_shrinks_mid_walk_yields_the_marker(
+        self, dummy_client, dummy_config,
+    ):
+        """A SHRINKING ``total`` is the same incoherence with a worse ending.
+
+        The grow case at least un-bounds the page budget, so it trips something
+        either way.  A shrink does not: the loop terminates EARLY on
+        ``walk_offset >= total`` with every counter self-consistent and hands
+        the assembled prefix back as a plain ``list``, which
+        ``collect_snapshot`` triages on ``isinstance(result, list)`` and writes
+        into the append-only ``snapshots`` table as fact.  The server re-slices
+        the now-shorter list, so the pages after the deletion skip rows
+        outright — the undercount is not even a prefix of the real tree.  Hence
+        the coherence check is on INEQUALITY, not growth.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 101)]
+
+        async def _shrinking(_client, _url, tool, args, **_kwargs):
+            offset = args.get('offset', 0)
+            page_size = args.get('page_size') or 0
+            # The 45 lowest-id tasks are deleted once the walk is under way,
+            # so pages after the first are sliced out of a 55-task tree.
+            live = tasks if offset == 0 else tasks[45:]
+            page = live[offset:offset + page_size]
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(live), 'offset': offset,
+                    'page_size': page_size, 'returned': len(page),
+                    'has_more': True,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_shrinking),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/deleting', chunk_size=10,
+            )
+
+        assert isinstance(result, dict), (
+            f'55 rows sliced out of a shrinking tree are not the whole tree, '
+            f'and a list here would be written to snapshots as one; got {result!r}'
+        )
+        assert result.get('offline') is True, result
+        error = str(result.get('error', ''))
+        assert '/proj/deleting' in error, error
+        assert 'changed from 100 to 55' in error, (
+            f'the error must report the observed change so the race is '
             f'diagnosable; got {error!r}'
         )
 
@@ -2679,6 +2733,7 @@ class TestWalkPages:
             assert read.wire_arguments(window)['statuses'] == ['done']
 
     # ---- (b) the five completeness failures, all-or-nothing ---------------
+    #      Six rows, five failures: the changed-`total` check fires both ways.
 
     @pytest.mark.parametrize(
         ('label', 'pages'),
@@ -2696,12 +2751,25 @@ class TestWalkPages:
                 [([{'id': '1'}], {'returned': 10, 'total': 99})],
             ),
             (
-                'total grew mid-walk',
+                'total changed mid-walk — grew',
                 [
                     ([{'id': '1'}, {'id': '2'}, {'id': '3'}],
                      {'returned': 3, 'total': 9}),
                     ([{'id': '4'}, {'id': '5'}, {'id': '6'}],
                      {'returned': 3, 'total': 99}),
+                ],
+            ),
+            (
+                'total changed mid-walk — shrank',
+                # The check is on INEQUALITY, so this fires on page 2. Left to
+                # a `>` check it would not: the loop would break at
+                # `walk_offset >= 4` and hand back 6 of 9 rows as a complete
+                # list, which is the worse of the two endings.
+                [
+                    ([{'id': '1'}, {'id': '2'}, {'id': '3'}],
+                     {'returned': 3, 'total': 9}),
+                    ([{'id': '4'}, {'id': '5'}, {'id': '6'}],
+                     {'returned': 3, 'total': 4}),
                 ],
             ),
             (
