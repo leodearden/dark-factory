@@ -525,3 +525,82 @@ class TestRunnerCrossFamilyThreading:
         assert 'r1' not in result.reviews
         assert len(result.errors) == 1
         assert 'MISSING_TOK' in result.errors[0]
+
+
+class TestRunnerIsolation:
+    """The trial runs under bypassPermissions at a cwd that carries the
+    project .mcp.json (live escalation + fused-memory servers). Only
+    ``--strict-mcp-config`` keeps the reviewer scoped to its verdict-tools
+    server, so the runner must pass it and the argv it builds must carry it.
+    """
+
+    @staticmethod
+    def _variant() -> VariantConfig:
+        return VariantConfig(
+            name='iso_variant', description='Test',
+            reviewers=[ReviewerSpec(name='r1', model='opus', specialization='Testing.')],
+        )
+
+    @staticmethod
+    def _diff() -> CorpusDiff:
+        return CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_strict_mcp_config_reaches_the_built_argv(self) -> None:
+        from shared.cli_invoke import build_claude_argv
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
+            await run_panel(self._variant(), self._diff(), stagger_secs=0)
+
+        kwargs = mock_invoke.call_args.kwargs
+        assert kwargs['strict_mcp_config'] is True
+        assert {'Edit', 'Write'} <= set(kwargs['disallowed_tools'])
+
+        cmd, temp_files = build_claude_argv(
+            model=kwargs['model'], max_budget_usd=kwargs['max_budget_usd'],
+            system_prompt=kwargs['system_prompt'], max_turns=kwargs['max_turns'],
+            permission_mode='bypassPermissions',
+            allowed_tools=kwargs['allowed_tools'], disallowed_tools=kwargs['disallowed_tools'],
+            mcp_config=kwargs['mcp_config'], output_schema=None, effort=kwargs['effort'],
+            resume_session_id=None, session_id=None,
+            strict_mcp_config=kwargs['strict_mcp_config'],
+        )
+        for f in temp_files:
+            Path(f).unlink(missing_ok=True)
+        assert '--strict-mcp-config' in cmd
+        assert cmd.index('--strict-mcp-config') == cmd.index('--mcp-config') + 2
+
+    @pytest.mark.asyncio
+    async def test_usage_gate_routes_through_cap_retry(self) -> None:
+        """With a gate the reviewer draws on the account pool via
+        invoke_with_cap_retry (failover on cap hits) instead of the CLI's
+        default login; the isolation kwarg rides along."""
+        gate = object()
+        captured: dict = {}
+
+        async def _cap_retry(usage_gate, label, *, invoke_fn, backend, **kwargs):
+            captured.update(usage_gate=usage_gate, label=label, invoke_fn=invoke_fn, backend=backend, **kwargs)
+            return await _make_verdict_writing_invoke(verdict='PASS')(**kwargs)
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_with_cap_retry', side_effect=_cap_retry),
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+        ):
+            result = await run_panel(self._variant(), self._diff(), stagger_secs=0, usage_gate=gate)
+
+        mock_invoke.assert_not_awaited()
+        assert captured['usage_gate'] is gate
+        assert captured['backend'] == 'claude'
+        assert captured['strict_mcp_config'] is True
+        assert 'oauth_token' not in captured
+        assert result.reviews['r1']['verdict'] == 'PASS'
+
+    def test_diff_cap_is_a_parameter_and_zero_lifts_it(self) -> None:
+        big = 'x' * 60_000
+        assert '[diff truncated]' in _build_reviewer_prompt(big)
+        assert '[diff truncated]' not in _build_reviewer_prompt(big, diff_cap_chars=0)
+        assert '[diff truncated]' in _build_reviewer_prompt(big, diff_cap_chars=1_000)

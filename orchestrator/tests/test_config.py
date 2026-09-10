@@ -3151,7 +3151,7 @@ class TestOrchestratorConfigPrices:
     _MODEL_COSTS).
     """
 
-    _SEED_KEYS = {'gpt-5.4', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
+    _SEED_KEYS = {'gpt-5.4', 'gpt-6-astra', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
 
     def test_prices_seeded_with_expected_rates(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -3160,6 +3160,8 @@ class TestOrchestratorConfigPrices:
         assert set(config.prices) == self._SEED_KEYS
         assert config.prices['gpt-5.4'].input_per_1m == 2.50
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
+        assert config.prices['gpt-6-astra'].input_per_1m == 10.00
+        assert config.prices['gpt-6-astra'].output_per_1m == 50.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25

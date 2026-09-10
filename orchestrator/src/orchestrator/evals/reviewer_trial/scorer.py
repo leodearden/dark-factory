@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shared.cli_invoke import no_mcp_servers_config
+
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
@@ -210,7 +212,12 @@ Output your matches as JSON.
         max_budget_usd=0.50,
         output_schema=_MATCH_SCHEMA,
         effort='low',
-        allowed_tools=[],  # no tools needed — all context is in the prompt
+        # The matcher needs no tools: deny the built-ins and scope MCP to an
+        # empty server set so the .mcp.json at cwd is never ambient-merged
+        # (allowed_tools=[] does not restrict under bypassPermissions).
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
     )
 
     match_cost = result.cost_usd

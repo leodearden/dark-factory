@@ -352,3 +352,25 @@ class TestScorePanelRunCost:
         # 1 true positive out of 1 finding → precision == 1.0
         assert score.precision == pytest.approx(1.0)
         assert score.f1 == pytest.approx(1.0)
+
+
+class TestMatcherIsolation:
+    """The haiku matcher runs at the project root under bypassPermissions;
+    it must deny the built-ins and scope MCP to an empty server set so the
+    project .mcp.json is never ambient-merged (allowed_tools=[] alone does
+    not restrict under bypassPermissions)."""
+
+    @pytest.mark.asyncio
+    async def test_matcher_denies_tools_and_strict_scopes_mcp(self) -> None:
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_matcher_result(structured={'matches': []})
+            await match_issues(
+                reviewer_issues=[{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}],
+                ground_truth=[_make_gt('gt1')],
+                diff_text='diff',
+            )
+        kwargs = mock_invoke.call_args.kwargs
+        assert kwargs['disallowed_tools'] == ['*']
+        assert kwargs['strict_mcp_config'] is True
+        assert kwargs['mcp_config'] == {'mcpServers': {}}
+        assert kwargs['mcp_config'], 'must stay truthy or --strict-mcp-config is never emitted'
