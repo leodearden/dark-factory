@@ -936,12 +936,6 @@ _GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
 # would be rejected under an invariant that says nothing about it.
 _PROBE_SUBJECT = r'(?:graphiti|falkordb|mixed[- ]store|degradation)'
 
-# Stays inside one clause, like _GAP_NO_NEGATION, but deliberately DOES cross a
-# negation cue: the premises these two rules match are themselves phrased as
-# negations ("did not reproduce", "no persistent problem"), so a gap that
-# refused to cross `not` could never reach them.
-_CLAUSE_GAP = r'[^.;]{0,40}?'
-
 _NOT_REPRODUCED = (
     r"\b(?:did|does|do|was|were|is|are|has|have|had|could|would)"
     r"(?:\s+not|n['\u2019]t)\s+(?:be\s+)?reproduc\w*"
@@ -964,6 +958,15 @@ _CLEARANCE_IN_CLAUSE = rf'(?=[^.;]*\b{_CLEARANCE_QUALIFIER}\b)'
 # same words \u2014 "the stage1 stall bug did not reproduce after the Graphiti
 # degradation was fixed" asserts nothing this invariant forbids.
 _DETERMINER_GAP = r'(?:\s+(?:the|this|that|a|an|any|its|such)){0,2}\s+'
+
+# The other shape a clearance claim takes: asserting the fault's absence
+# outright. Both halves must be present and the scope word must GOVERN the
+# fault noun — "no current Graphiti failure" is a clearance claim, "no current
+# owner for the ... degradation problem" is a statement about ownership.
+_FAULT_SCOPE = (
+    r'(?:persistent|persisting|ongoing|active|current|systemic|underlying)'
+)
+_FAULT_NOUN = r'\b(?:problem|issue|degradation|fault|defect|failure)s?\b'
 
 # Sourced from the template the stage prompts render, so a rejected caller is
 # told the exact permitted wording and the two can never disagree.
@@ -1038,11 +1041,15 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     ),
     (
         re.compile(
-            r'\bno\s+(?:persistent|persisting|ongoing|active|current|systemic|'
-            r'underlying)\b'
+            r'\bno\s+' + _FAULT_SCOPE + r'\b'
+            # Still only fires on sentences about THIS fault.
             + f'(?=[^.;]*{_PROBE_SUBJECT})'
-            + _CLAUSE_GAP
-            + r'\b(?:problem|issue|degradation|fault|defect|failure)s?\b',
+            # At most the probe subject may sit between the scope word and the
+            # noun it governs, so `no ongoing mixed-store degradation` matches
+            # while `no ongoing WORK on the ... degradation issue` does not:
+            # there the scope word governs the work, not the fault.
+            + f'(?:\\s+{_PROBE_SUBJECT})?'
+            + r'\s+' + _FAULT_NOUN,
             re.IGNORECASE,
         ),
         'negative_probe_set_does_not_clear_intermittent_fault',
