@@ -98,9 +98,11 @@ class AutoReasonCode(StrEnum):
     canonical_category_mismatch = 'canonical_category_mismatch'
     multiple_canonicals = 'multiple_canonicals'
     canonical_count_unavailable = 'canonical_count_unavailable'
+    canonical_count_contradicted = 'canonical_count_contradicted'
     slug_near_collision = 'slug_near_collision'
     incumbent_canonical_stripped = 'incumbent_canonical_stripped'
     already_consolidated = 'already_consolidated'
+    no_retained_members = 'no_retained_members'
 
 
 @dataclass(frozen=True)
@@ -487,6 +489,16 @@ def _canonical_hazards(
     """
     reasons: list[AutoReason] = []
 
+    # ONE home for "who is this topic's incumbent", computed before the count
+    # chain because that chain now reads it too. The per-member loop below
+    # iterates this tuple rather than re-deriving `_is_incumbent`, so the three
+    # rules keyed on the incumbent cannot drift apart (SPOT).
+    incumbents = tuple(
+        member_id
+        for member_id in proposal.member_ids
+        if _is_incumbent(members.get(member_id), proposal.topic)
+    )
+
     if canonical_count is None:
         # Fail closed. Zero is the MINT path, so reading "I could not find out"
         # as "there is none" is exactly how a topic gets a second canonical.
@@ -511,15 +523,42 @@ def _canonical_hazards(
                 ),
             ),
         )
+    elif canonical_count == 0 and incumbents:
+        # The same reasoning as the `None` arm, one case over. There the count
+        # was missing; here it is present and CONTRADICTED — it says the topic
+        # has no canonical while a member the proposal named IS that canonical.
+        # Zero is the MINT path, so trusting it would mint a second canonical
+        # for a topic whose incumbent is visible in this very member list.
+        #
+        # Reachable WITHOUT a caller bug: `canonical_count` and the per-member
+        # reads are two separate, non-atomic reads of the store. A count scoped
+        # differently, or taken before a canonical landed, disagrees with a
+        # record the caller can nonetheless see. Fail closed for the reason the
+        # `None` arm does — a count that cannot be trusted must never be read as
+        # zero, and here it demonstrably cannot be.
+        named = ', '.join(incumbents)
+        reasons.append(
+            AutoReason(
+                code=AutoReasonCode.canonical_count_contradicted,
+                ids=incumbents,
+                detail=(
+                    f'topic `{proposal.topic}` is reported to have no canonical, but '
+                    f'{named} is stamped as its canonical; the count and the '
+                    'per-member reads disagree, so the canonical state of the topic '
+                    'is not decidable here'
+                ),
+            ),
+        )
 
     categories = {category for _, category in _member_categories(proposal, members)}
     sole_category = next(iter(categories)) if len(categories) == 1 else None
 
-    for member_id in proposal.member_ids:
+    # Only an incumbent of THIS topic contradicts THIS topic's count. A member
+    # that is the canonical of a DIFFERENT topic is `member_already_canonical`
+    # (`_member_hazards`), and the two codes stay disjoint — `_is_incumbent`'s
+    # docstring draws that same line.
+    for member_id in incumbents:
         record = members.get(member_id)
-        if not _is_incumbent(record, proposal.topic):
-            continue
-
         metadata = _metadata(record)
         present = sorted(key for key in CORRECTION_METADATA_KEYS if key in metadata)
         banner = CORRECTION_BANNER_RE.search(_content(record)) is not None
@@ -622,20 +661,26 @@ def evaluate_auto_predicate(
     1. ``already_gated`` -> NOOP. A topic a human already owns collects no
        second filing.
     2. Hazards -> FAIL, collecting EVERY offender rather than stopping at the
-       first, so one human sitting names every problem.
+       first, so one human sitting names every problem. Among them: a
+       *canonical_count* of zero CONTRADICTED by a named member that is this
+       topic's canonical — two non-atomic reads disagreeing, which leaves the
+       topic's canonical state undecidable here.
     3. An incumbent canonical of THIS topic named in the member list is
        STRIPPED from the retained set and disclosed.
     4. ``already_consolidated`` -> NOOP, judged over the RETAINED set.
     5. A retained member not yet stamped with the topic, beside exactly one
        canonical -> PASS_TAG_ONLY.
-    6. No canonical at all -> PASS.
+    6. No canonical at all, and at least one RETAINED member to index -> PASS.
+       A mint over an empty cluster is refused instead: the executor is never
+       told to write a canonical that would index nothing.
 
     The order is the contract, not an optimisation (PRD D4). Two cases fix it:
     a NEW member carrying a correction banner must FAIL even when the topic has
     a healthy live canonical — so hazards outrank the tag-only rung — and an
     incumbent canonical appearing in the member list is STRIPPED rather than
     failed, or PRD B2's re-emission-with-regrowth (the majority verdict over
-    time) could never pass.
+    time) could never pass. Both refusals named above live INSIDE an existing
+    rung rather than adding a seventh, so that binding order is untouched.
 
     What this function deliberately does NOT check: the benign shape codes
     ``member_count_out_of_range``, ``invalid_slug`` and
@@ -757,6 +802,43 @@ def evaluate_auto_predicate(
         )
 
     if canonical_count == 0:
+        if not retain_ids:
+            # The write-bearing guard. Never tell the executor to mint a
+            # canonical that would index nothing.
+            #
+            # Reachability, stated honestly because it is the non-obvious part:
+            # a STRIPPED incumbent can no longer empty the retained set here —
+            # that fires `canonical_count_contradicted` back at rung 2 — so the
+            # surviving path is a proposal that named no members at all. That is
+            # the emit boundary's `member_count_out_of_range` (C1) and this
+            # predicate deliberately does not re-derive it (PRD D6), but an aged
+            # ledger row or a mis-wired caller can still put one in front of us,
+            # and a predicate whose contract is fail-closed must not answer it
+            # with a write-bearing PASS. Heuristic 10: the invariant enforced
+            # redundantly at the point where it would otherwise be silently
+            # violated — the same stance as the loud `AssertionError` below.
+            #
+            # `reasons` is provably empty on this path (no strip can have
+            # happened), but pass it through rather than dropping it, so the
+            # guard stays correct if a future rung discloses something above it.
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.no_retained_members,
+                    detail=(
+                        f'topic `{proposal.topic}` has no canonical and this '
+                        'proposal retains no member to index; minting a canonical '
+                        'over an empty cluster is not something to do'
+                    ),
+                ),
+            )
+            return AutoVerdict(
+                outcome=AutoOutcome.FAIL,
+                reasons=tuple(reasons),
+                retain_ids=(),
+                stripped_ids=(),
+                predicate_version=config.predicate_version,
+            )
+
         # Rung 6. Mint the canonical and fold the members. Reached with members
         # already stamped too: task theta's migration stamps a topic before any
         # canonical exists, and a NOOP there would leave a scroll with members
