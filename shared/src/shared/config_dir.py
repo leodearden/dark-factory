@@ -246,17 +246,28 @@ def sweep_stale_pid_dirs_once(
     rebuilding — and ``on_failure`` receives the exception INSTANCE, so a caller
     can interpolate it or let ``exc_info`` pick it up. Both are optional.
 
-    *sweep* is REQUIRED and keyword-only, and is deliberately NOT defaulted to
-    :func:`sweep_stale_pid_dirs`. A default binds THIS module's global at ``def``
-    time, which would make ``shared.config_dir`` the single interception point;
-    three existing fixtures instead patch each CALLER's module-level
-    ``sweep_stale_pid_dirs`` name, and one of them
+    *sweep* is REQUIRED and keyword-only. Two alternatives were rejected, for
+    DIFFERENT reasons. A def-time default (``sweep = sweep_stale_pid_dirs``)
+    binds this module's global at ``def`` time and so cannot be intercepted at
+    all: three existing fixtures patch each CALLER's module-level
+    ``sweep_stale_pid_dirs``, and one of them
     (``test_startup_completion_probe.py::_confine_stale_dir_sweep``, autouse and
     module-wide) is the only thing stopping that suite from rmtree-ing real
-    ``/tmp/claude-config-startup-probe-*`` dirs. Under a def-time default all
-    three would silently stop intercepting: green tests, real deletions. Callers
-    therefore pass their own module-level name explicitly, which is a call-time
-    global lookup and keeps every existing patch target working.
+    ``/tmp/claude-config-startup-probe-*`` dirs — under a default all three
+    silently stop intercepting: green tests, real deletions. Calling the global
+    by NAME in the body would NOT have that problem — that is a call-time
+    lookup, so ``patch('shared.config_dir.sweep_stale_pid_dirs')`` intercepts it
+    and the fixtures would simply move their target one module over. It is
+    rejected on blast radius instead: it collapses both callers onto ONE
+    interception point, so a fixture confining the PROBE's sweep to a tmp root
+    would necessarily rebind ``usage_gate``'s too, for every gate built anywhere
+    in that process — the same containment argument
+    :func:`reset_sweep_once_state`'s ``prefix`` argument makes, one level down.
+    Passing the caller's own name keeps that containment and adds no NEW
+    dimension of variability, since reporting is already injected (above) for
+    reasons that have nothing to do with tests. The cost is real and worth
+    naming: every caller must supply a sweep, and one that supplies the wrong
+    one gets no warning.
 
     Extra keyword arguments are forwarded verbatim to *sweep*.
     """

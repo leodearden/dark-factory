@@ -1431,9 +1431,11 @@ class TestStaleProbeDirSweep:
 
         That confinement works by monkeypatching THIS module-level name. If the
         hoisted helper ever resolved the sweep out of ``shared.config_dir``'s own
-        globals instead — which is exactly what giving it a def-time default
-        parameter would do — the fixture would silently stop intercepting: green
-        tests, real deletions.
+        globals instead — whether by a def-time default parameter, which cannot
+        be intercepted at all, or by calling that module's global by name, which
+        merely moves the single interception point there — the fixture would
+        silently stop intercepting: green tests, real deletions.  Both routes and
+        why each was rejected are in ``sweep_stale_pid_dirs_once``'s docstring.
         """
         calls: list[str] = []
 

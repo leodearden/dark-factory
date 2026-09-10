@@ -886,8 +886,10 @@ class TestProbeConfigDirLeakSweep:
         The ANTI-REGRESSION guard for the whole hoist, written BEFORE the rewire
         so the guarantee is pinned rather than asserted after the fact. If the
         helper ever resolves the sweep out of `shared.config_dir`'s own globals
-        instead — which is exactly what giving it a def-time default parameter
-        would do — then `_keep_gates_off_the_real_tmp` and the ~dozen sibling
+        instead — whether by a def-time default parameter, which cannot be
+        intercepted at all, or by calling that module's global by name, which
+        merely moves the single interception point there — then
+        `_keep_gates_off_the_real_tmp` and the ~dozen sibling
         `patch('shared.usage_gate.sweep_stale_pid_dirs', ...)` sites in this
         class silently stop intercepting, and this suite starts scandir-ing and
         deleting the developer's real /tmp.
