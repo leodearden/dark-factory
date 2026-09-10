@@ -7,7 +7,11 @@ server._tool_manager.call_tool('add_memory', {...}).
 
 from __future__ import annotations
 
+import ast
+import inspect
+import json
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,9 +35,13 @@ from test_config_schema import (
     STRADDLING_WRITE_FIXTURE,
 )
 
-from fused_memory.config.schema import ProceduralTopicCluster, ReconciliationConfig
+from fused_memory.config.schema import (
+    Mem0UpdateConfig,
+    ProceduralTopicCluster,
+    ReconciliationConfig,
+)
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.memory import MemoryResult
+from fused_memory.models.memory import AddMemoryResponse, MemoryResult
 from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import RRF_K
@@ -43,6 +51,10 @@ _CONTENT = 'canonical .task gitignore gotcha'
 
 # Content matching the injected test cluster's phrases ('plan-tools' + 'create_plan').
 _TOPIC_MATCH_CONTENT = 'run create_plan against the missing plan-tools MCP server'
+
+# A peer for `consolidate_memories`' `retain` arm (task 3134). Full 36-char
+# UUID: the op refuses anything shorter by name, per slot.
+_RETAINED_PEER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 
 
 def _topic_cluster(
@@ -110,6 +122,33 @@ def _configure_pass_through_add_memory(mock_service: AsyncMock) -> None:
     mem_result = MagicMock()
     mem_result.model_dump.return_value = {'id': 'ok'}
     mock_service.add_memory.return_value = mem_result
+
+
+def _configure_triage_and_reconciliation(mock_service: AsyncMock, **reconciliation_fields) -> None:
+    """Stand in for memory_service.config with BOTH write_triage (enabled)
+    and reconciliation namespaces, for exercising the triage-supersedes-gate
+    path (task 3127 PRD D2: redirect supersedes reject).
+
+    ``_configure_reconciliation`` alone cannot express this: it builds only
+    the ``reconciliation`` section, which is exactly why ``write_triage.enabled``
+    reads False (attribute absent -> resolver default) in every other test in
+    this module. ``judge_enabled=False`` here is REQUIRED, not cosmetic:
+    omitting the attribute makes the resolver default it True, and
+    OPENAI_API_KEY is set in this environment, so a middle-band write would
+    place a real billed LLM call. Mirrors — without importing, since that
+    file sits outside this task's declared 2-file set —
+    test_add_memory_write_triage_gate.py's ``_configure_config`` helper shape.
+    """
+    mock_service.config = types.SimpleNamespace(
+        write_triage=types.SimpleNamespace(
+            enabled=True,
+            candidate_k=20,
+            t_high=0.90,
+            t_low=0.70,
+            judge_enabled=False,
+        ),
+        reconciliation=types.SimpleNamespace(**reconciliation_fields),
+    )
 
 
 class TestAddMemoryNearDuplicateGate:
@@ -399,17 +438,23 @@ class TestAddMemoryNearDuplicateGate:
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_guard_exempts_recon_stage_agents(self):
-        """recon-stage-* agents are exempt from the near-duplicate guard.
+    async def test_guard_applies_to_recon_stage_agents(self):
+        """recon-stage-* agents are NOT exempt: they triage like any other caller.
 
-        Stage-1 consolidation writes a merged/canonical procedural_knowledge
-        entry through this same add_memory tool with an
-        agent_id='recon-stage-*' (see reconciliation/prompts/stage1.py). That
-        canonical entry is expected to closely resemble the duplicate
-        entries it replaces, and there is no guarantee those duplicates are
-        deleted before the canonical write lands -- so recon-stage writes
-        must not be blocked by this guard, mirroring the trust boundary the
-        other recon-stage-scoped guards in this file already use.
+        The exemption rested on one premise, and task 3134 retired it. Stage 1
+        no longer hand-writes a merged canonical through this tool -- it calls
+        `consolidate_memories`, whose canonical write goes through
+        ``memory_service.add_memory`` directly (see
+        ``server/tools.py::consolidate_memories``) and therefore never meets
+        this tool-layer guard at all. The op also writes the canonical BEFORE
+        any delete, which supplies exactly the ordering guarantee whose
+        absence the exemption cited. With no merged-canonical write arriving
+        here, a recon-stage near-duplicate write is an ordinary duplicate and
+        is soft-blocked as one.
+
+        Note the search assertion INVERTS with the behaviour: the cosine
+        round-trip is now REACHED, where the exemption previously
+        short-circuited above it.
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
@@ -426,11 +471,11 @@ class TestAddMemoryNearDuplicateGate:
             },
         )
 
-        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
-            f'Gate must not fire for recon-stage-* agents; got: {result!r}'
+        assert result.get('error') == 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'Gate must now fire for recon-stage-* agents too; got: {result!r}'
         )
-        mock_service.search.assert_not_called()
-        mock_service.add_memory.assert_called_once()
+        mock_service.search.assert_called_once()
+        mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_pre_check_search_pins_to_mem0_store(self):
@@ -627,14 +672,29 @@ class TestAddMemoryNearDuplicateGateConfig:
 
 
 class TestAddMemoryTopicClusterGate:
-    """Write-gate: known-contradictory topic clusters are soft-blocked BEFORE the cosine search."""
+    """Write-gate: known-contradictory topic clusters are soft-blocked BEFORE
+    the cosine search.
+
+    Parametrized over every category `_TOPIC_GUARD_GATED_CATEGORIES` covers
+    (task 3430 widened the set from procedural_knowledge-only to also include
+    preferences_and_norms) wherever the two categories' expected behaviour is
+    identical, so a future change to the shared exemptions can't silently
+    diverge between two near-duplicate test classes without a test noticing
+    (reviewer: test-duplication). Where the categories' observable behaviour
+    genuinely differs — the cosine-search fallthrough is procedural_knowledge
+    -only, and an empty clusters list therefore still triggers `search` for
+    procedural_knowledge but not for preferences_and_norms — those stay
+    separate, explicitly-named cases instead of a same-body parametrize.
+    """
 
     @pytest.mark.asyncio
-    async def test_blocks_matching_topic_before_cosine_search(self):
-        """A write matching a cluster's phrases is blocked; search is NOT called.
-
-        The topic pre-check is deterministic (no embedding round-trip) and must
-        short-circuit before the cosine near-dup search.
+    @pytest.mark.parametrize('category', ['procedural_knowledge', 'preferences_and_norms'])
+    async def test_blocks_matching_topic_before_cosine_search(self, category):
+        """A write matching a cluster's phrases is blocked; search is NOT
+        called. The topic pre-check is deterministic (no embedding
+        round-trip) and must short-circuit before the cosine near-dup
+        search. Also pins the `category` echo on the block dict for both
+        gated categories.
         """
         mock_service = AsyncMock()
         _configure_reconciliation(
@@ -651,29 +711,39 @@ class TestAddMemoryTopicClusterGate:
             'add_memory',
             {
                 'content': _TOPIC_MATCH_CONTENT,
-                'category': 'procedural_knowledge',
+                'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
             },
         )
 
         assert result.get('error_type') == 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'Expected topic-cluster block, got: {result!r}'
+            f'category={category}: expected topic-cluster block, got: {result!r}'
         )
         assert result.get('error') == 'procedural_knowledge_known_topic_cluster_write_blocked', (
-            f'Expected topic-cluster error key, got: {result!r}'
+            f'category={category}: expected topic-cluster error key, got: {result!r}'
         )
-        assert result.get('topic_id') == 'test-topic', f'Expected topic_id echoed, got: {result!r}'
-        assert result.get('matched_phrases'), f'Expected matched_phrases, got: {result!r}'
+        assert result.get('topic_id') == 'test-topic', (
+            f'category={category}: expected topic_id echoed, got: {result!r}'
+        )
+        assert result.get('matched_phrases'), (
+            f'category={category}: expected matched_phrases, got: {result!r}'
+        )
         assert result.get('agent_id') == 'claude-interactive'
         assert result.get('content_excerpt') == _TOPIC_MATCH_CONTENT[:200]
-        assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
+        assert result.get('hint'), f'category={category}: expected a non-empty hint, got: {result!r}'
+        assert result.get('category') == category, (
+            f'category={category}: expected the category echo on the block dict, got: {result!r}'
+        )
         mock_service.search.assert_not_called()
         mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_allow_near_duplicate_override_bypasses_topic_gate(self):
-        """metadata={'allow_near_duplicate': True} bypasses the topic gate."""
+    @pytest.mark.parametrize('category', ['procedural_knowledge', 'preferences_and_norms'])
+    async def test_allow_near_duplicate_override_bypasses_topic_gate(self, category):
+        """metadata={'allow_near_duplicate': True} bypasses the topic gate
+        for either gated category — the override is evaluated before the
+        category branch and works for any agent/category."""
         mock_service = AsyncMock()
         _configure_reconciliation(
             mock_service,
@@ -689,7 +759,7 @@ class TestAddMemoryTopicClusterGate:
             'add_memory',
             {
                 'content': _TOPIC_MATCH_CONTENT,
-                'category': 'procedural_knowledge',
+                'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
                 'metadata': {'allow_near_duplicate': True},
@@ -697,14 +767,31 @@ class TestAddMemoryTopicClusterGate:
         )
 
         assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'Override must bypass the topic gate; got: {result!r}'
+            f'category={category}: override must bypass the topic gate; got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_recon_stage_agent_exempt_from_topic_gate(self):
-        """recon-stage-* agents are exempt: Stage-1 consolidation writes the canonical
-        merged entry, which by construction contains the cluster's phrases."""
+    @pytest.mark.parametrize('category', ['procedural_knowledge', 'preferences_and_norms'])
+    async def test_recon_stage_agent_is_subject_to_the_topic_gate(self, category):
+        """recon-stage-* agents are NOT exempt from the topic gate (task 3134).
+
+        Holds for EITHER gated category -- task 3430 widened the topic gate
+        to cover preferences_and_norms alongside procedural_knowledge, and
+        the retirement below is orthogonal to that widening.
+
+        Same retirement as ``test_guard_applies_to_recon_stage_agents``: the
+        merged-canonical write that motivated the exemption now goes through
+        ``consolidate_memories``, whose canonical write reaches
+        ``memory_service.add_memory`` directly and never meets this
+        tool-layer gate. A recon-stage write arriving HERE is an ordinary
+        add and is blocked as one.
+
+        ``search`` is still never called -- but now for the OPPOSITE reason.
+        The deterministic topic gate fires ABOVE the cosine round-trip, so
+        the write is rejected before any embedding work, where before it was
+        the exemption that short-circuited.
+        """
         mock_service = AsyncMock()
         _configure_reconciliation(
             mock_service,
@@ -719,21 +806,26 @@ class TestAddMemoryTopicClusterGate:
             'add_memory',
             {
                 'content': _TOPIC_MATCH_CONTENT,
-                'category': 'procedural_knowledge',
+                'category': category,
                 'agent_id': 'recon-stage-memory_consolidator',
                 'project_id': _PROJECT_ID,
             },
         )
 
-        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'recon-stage agents must be exempt from the topic gate; got: {result!r}'
+        assert result.get('error_type') == 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'category={category}: recon-stage agents must now be subject to the topic gate; '
+            f'got: {result!r}'
         )
         mock_service.search.assert_not_called()
-        mock_service.add_memory.assert_called_once()
+        mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_matching_content_falls_through_to_cosine_search(self):
-        """Content matching NO cluster falls through to the existing cosine path."""
+        """Content matching NO cluster falls through to the existing cosine
+        path. procedural_knowledge-specific: the cosine guard stays scoped to
+        this category alone, so this behaviour has no preferences_and_norms
+        counterpart — see test_non_matching_content_does_not_trigger_cosine_search.
+        """
         mock_service = AsyncMock()
         _configure_reconciliation(
             mock_service,
@@ -762,8 +854,52 @@ class TestAddMemoryTopicClusterGate:
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_non_procedural_category_leaves_topic_gate_inert(self):
-        """The topic gate is scoped to category='procedural_knowledge' only."""
+    async def test_non_matching_content_does_not_trigger_cosine_search(self):
+        """The discriminating regression test for task 3430's restructure.
+
+        A naive fix that merely widens the SHARED condition (swapping
+        `category == 'procedural_knowledge'` for `category in
+        _TOPIC_GUARD_GATED_CATEGORIES` on one fused block) would fall through
+        into the procedural-only cosine search for a preferences_and_norms
+        write too. A correct two-block split must not: the cosine block
+        (Block B) stays gated on `category == 'procedural_knowledge'` alone,
+        so a non-matching preferences_and_norms write is written straight
+        through with no `search` call at all.
+        """
+        mock_service = AsyncMock()
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.92,
+            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+        )
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': 'a totally unrelated note about coffee brewing temperatures',
+                'category': 'preferences_and_norms',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'Non-matching content must not hit the topic gate; got: {result!r}'
+        )
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_observations_and_summaries_stays_inert(self):
+        """The topic gate is inert for a category outside
+        _TOPIC_GUARD_GATED_CATEGORIES. Task 3430 widened that set to also
+        include preferences_and_norms; observations_and_summaries stays
+        outside it deliberately — extending there is sibling task 4729's
+        call, with its own false-positive analysis this task has not done.
+        """
         mock_service = AsyncMock()
         _configure_reconciliation(
             mock_service,
@@ -785,14 +921,30 @@ class TestAddMemoryTopicClusterGate:
         )
 
         assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'Topic gate must be inert for a non-procedural_knowledge category; got: {result!r}'
+            f'Topic gate must be inert for a category outside _TOPIC_GUARD_GATED_CATEGORIES; '
+            f'got: {result!r}'
         )
         mock_service.search.assert_not_called()
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_empty_clusters_list_leaves_topic_gate_inert(self):
-        """An empty clusters list disables the topic guard; the cosine path still runs."""
+    @pytest.mark.parametrize(
+        'category, expect_cosine_fallthrough',
+        [
+            ('procedural_knowledge', True),
+            ('preferences_and_norms', False),
+        ],
+    )
+    async def test_empty_clusters_list_leaves_topic_gate_inert(
+        self, category, expect_cosine_fallthrough
+    ):
+        """An empty clusters list disables the topic guard for both gated
+        categories — but only procedural_knowledge has a cosine path to fall
+        through to afterwards. preferences_and_norms has none, so `search`
+        must never be called for it: the two categories cannot share a single
+        `search` assertion here despite sharing everything else, which is why
+        this case parametrizes the expectation rather than just the category.
+        """
         mock_service = AsyncMock()
         _configure_reconciliation(
             mock_service,
@@ -808,21 +960,27 @@ class TestAddMemoryTopicClusterGate:
             'add_memory',
             {
                 'content': _TOPIC_MATCH_CONTENT,
-                'category': 'procedural_knowledge',
+                'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
             },
         )
 
         assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'Empty clusters list must leave the topic gate inert; got: {result!r}'
+            f'category={category}: empty clusters list must leave the topic gate inert; '
+            f'got: {result!r}'
         )
-        mock_service.search.assert_called_once()
+        if expect_cosine_fallthrough:
+            mock_service.search.assert_called_once()
+        else:
+            mock_service.search.assert_not_called()
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_master_kill_switch_disables_topic_gate(self):
-        """procedural_knowledge_near_dup_guard_enabled=False disables BOTH guards."""
+    @pytest.mark.parametrize('category', ['procedural_knowledge', 'preferences_and_norms'])
+    async def test_master_kill_switch_disables_topic_gate(self, category):
+        """procedural_knowledge_near_dup_guard_enabled=False disables BOTH
+        guards, for either gated category."""
         mock_service = AsyncMock()
         _configure_reconciliation(
             mock_service,
@@ -837,16 +995,57 @@ class TestAddMemoryTopicClusterGate:
             'add_memory',
             {
                 'content': _TOPIC_MATCH_CONTENT,
-                'category': 'procedural_knowledge',
+                'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
             },
         )
 
         assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'Master kill-switch must disable the topic gate; got: {result!r}'
+            f'category={category}: master kill-switch must disable the topic gate; got: {result!r}'
         )
         mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('category', ['preferences_and_norms', 'procedural_knowledge'])
+    async def test_triage_supersedes_topic_gate_for_both_gated_categories(self, category):
+        """Write triage (task 3127, PRD D2: redirect supersedes reject)
+        retires the topic-cluster soft-block for BOTH categories the gate
+        now covers — exactly as it already does for procedural_knowledge
+        alone. Mirrors test_add_memory_write_triage_gate.py::
+        test_a_topic_cluster_match_lands_rather_than_bouncing.
+
+        Parametrized (rather than a manual `for` loop over both categories,
+        reviewer: test-quality) so a regression affecting only one category
+        is reported as its own failure instead of being masked by — or
+        masking — the other's, and each iteration gets its own fresh
+        mock/server rather than sharing state across loop iterations.
+        """
+        mock_service = AsyncMock()
+        _configure_triage_and_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.92,
+            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+        )
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _TOPIC_MATCH_CONTENT,
+                'category': category,
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'category={category}: triage must supersede the topic gate, got: {result!r}'
+        )
         mock_service.add_memory.assert_called_once()
 
 
@@ -941,8 +1140,20 @@ class TestAddMemorySufficientPhraseGate:
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_recon_stage_agent_still_exempt_from_a_sufficient_block(self):
-        """Stage-1 consolidation writes the canonical entry, which contains the phrase."""
+    async def test_recon_stage_agent_is_subject_to_a_sufficient_block(self):
+        """recon-stage-* agents are NOT exempt from a sufficient-phrase block (task 3134).
+
+        The third and last site of the same retirement. Stage-1's merged
+        canonical is written by ``consolidate_memories`` through
+        ``memory_service.add_memory``, not through this tool, so no
+        consolidation write reaches this gate to be exempted -- and the op's
+        write-before-delete ordering supplies the guarantee the exemption
+        cited as missing.
+
+        ``search`` stays uncalled for the same OPPOSITE reason as the
+        count-only topic case above: the sufficient-phrase match is
+        deterministic and blocks before the cosine round-trip.
+        """
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
         _configure_pass_through_add_memory(mock_service)
@@ -958,11 +1169,11 @@ class TestAddMemorySufficientPhraseGate:
             },
         )
 
-        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'recon-stage agents must stay exempt; got: {result!r}'
+        assert result.get('error_type') == 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'recon-stage agents must no longer be exempt; got: {result!r}'
         )
         mock_service.search.assert_not_called()
-        mock_service.add_memory.assert_called_once()
+        mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unrelated_note_still_falls_through_to_the_cosine_path(self):
@@ -988,3 +1199,123 @@ class TestAddMemorySufficientPhraseGate:
         )
         mock_service.search.assert_called_once()
         mock_service.add_memory.assert_called_once()
+
+
+class TestConsolidateMemoriesIsNotCaughtByThisGuard:
+    """Anti-over-correction for the recon-stage exemption's retirement (task 3134).
+
+    Retiring the exemption is only SAFE because the sanctioned path does not
+    meet this guard: a merged canonical is BY DESIGN near-identical to the
+    entries it replaces, so a ``consolidate_memories`` that routed through the
+    guarded MCP ``add_memory`` TOOL body would soft-block every Stage-1
+    consolidation -- the exact opposite of the intent.
+
+    Read what each half below actually pins, because they are NOT the same
+    claim and neither one alone is the safety property:
+
+    * ``test_a_recon_stage_canonical_write_still_lands`` pins that the op
+      reaches ``memory_service.add_memory`` WITHOUT passing through the MCP
+      ``add_memory`` tool body -- which it could, since that closure is
+      defined in the same ``create_mcp_server`` scope -- and that it does so
+      with the guards' config ARMED rather than switched off. It cannot say
+      anything about where the guard code lives: ``mock_service`` is an
+      ``AsyncMock``, so ``memory_service.add_memory`` is a bare mock that
+      contains no guard no matter what the real one does.
+    * ``test_the_guard_entrypoints_are_absent_from_the_service_layer`` is the
+      structural half, and it is the one that would catch the guard being
+      MOVED down onto ``MemoryService.add_memory``. Behavioural coverage of
+      that move is unavailable here for the mock reason above.
+    """
+
+    def test_the_guard_entrypoints_are_absent_from_the_service_layer(self) -> None:
+        """The guards belong to the tool layer, structurally, not by convention.
+
+        Read by AST rather than by substring so a prose mention in a comment
+        or docstring does not count -- ``memory_service.py`` legitimately
+        NAMES ``near_duplicate_guard`` in comments today, and a test that
+        tripped on that would be deleted rather than heeded.
+
+        Catches the realistic drift (a move that carries the guard
+        entrypoints with it), not a hand-reimplementation under new names.
+        """
+        from fused_memory.services import memory_service as _service_module
+
+        source_path = inspect.getsourcefile(_service_module)
+        assert source_path is not None
+        tree = ast.parse(Path(source_path).read_text(encoding='utf-8'))
+        referenced = {
+            node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+        } | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+
+        for symbol in ('resolve_near_dup_guard_enabled', 'find_matching_topic_cluster'):
+            assert symbol not in referenced, (
+                f'{symbol} is referenced from the service layer; the near-duplicate '
+                f'guards must stay in the MCP add_memory tool body, or every '
+                f'consolidate_memories canonical write starts soft-blocking'
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_recon_stage_canonical_write_still_lands(self):
+        mock_service = AsyncMock()
+        # The guards are ARMED -- same config the inverted exemption tests
+        # above use -- so a pass here means the path misses them, not that
+        # they were switched off.
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.92,
+            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+        )
+        # `consolidate_memories` authorizes through resolve_mem0_update_authorization,
+        # whose fail-closed resolver rejects bare Mock leaves; a REAL config
+        # object keeps this case failing (or passing) for the reason under
+        # test rather than for `Mem0UpdateNotAuthorized`.
+        mock_service.config.mem0_update = Mem0UpdateConfig()
+        # Content that WOULD trip both deterministic guards at the tool layer:
+        # it carries the injected cluster's phrases, and search is primed with
+        # a 0.97 cosine near-duplicate.
+        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        mock_service.add_memory.return_value = AddMemoryResponse(
+            memory_ids=['canonical-1'], message='ok'
+        )
+        # The `retain` arm (the ratified default, gate 3200) is the cheapest
+        # arm that exercises the canonical write: the op refuses a call with
+        # NEITHER arm ("a canonical with neither arm is just add_memory"), and
+        # `retain` reaches the write without dragging in the delete machinery
+        # this test is not about.
+        mock_service.get_memory_by_id.return_value = {
+            'id': _RETAINED_PEER,
+            'content': 'an existing peer',
+            'metadata': {},
+        }
+        mock_service.update_memory.return_value = {'status': 'updated'}
+        mock_service.get_memories_by_metadata.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'consolidate_memories',
+            {
+                'canonical_content': _TOPIC_MATCH_CONTENT,
+                'topic': 'test-topic',
+                'project_id': _PROJECT_ID,
+                'category': 'procedural_knowledge',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'retain': [_RETAINED_PEER],
+            },
+        )
+        if isinstance(result, list):
+            result = json.loads(result[0].text)
+
+        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'The sanctioned path must not meet the cosine guard; got: {result!r}'
+        )
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'The sanctioned path must not meet the topic guard; got: {result!r}'
+        )
+        # The load-bearing one: the canonical write actually reached the
+        # SERVICE method. Without this, both negatives above would also hold
+        # for a call that was refused before it ever got there.
+        mock_service.add_memory.assert_awaited_once()
+        assert result.get('canonical_id') == 'canonical-1', (
+            f'Expected the canonical write to have landed; got: {result!r}'
+        )

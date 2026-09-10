@@ -236,9 +236,16 @@ def apply_budgets(candidates: list[Any], budgets: dict[str, float]) -> list[Any]
 # literally only because that constant is defined below), and it belongs in this
 # tuple for exactly the reason the others do: it is the report layer's number,
 # surfaced verbatim, never a second derivation.
+#
+# ``declined`` / ``no_plan_declined`` (task 4760) join the tuple on identical
+# terms: they are the report layer's admitted-pool counts, surfaced verbatim.
+# They say WHY the ``no_plan`` beside them is what it is — how many of those
+# cells took an explicit plan-tools decline exit, which is the architect
+# CORRECTLY refusing an unplannable fixture rather than failing to plan.
 _SUMMARY_FIELDS = (
-    'config_name', 'n', 'total', 'cap_excluded', 'no_plan', 'plan_rate',
-    'mean_plan_quality', 'judged_without_reference',
+    'config_name', 'n', 'total', 'cap_excluded', 'no_plan', 'declined',
+    'no_plan_declined', 'plan_rate', 'mean_plan_quality',
+    'judged_without_reference',
 )
 
 # The per-cell reference-validity marker. Producer is eval-revival σ (task
@@ -254,6 +261,13 @@ UNMEASURED_CELLS_KEY = 'judged_without_reference_unmeasured_cells'
 # never the ``-`` report.py uses for an empty mean: this one has to survive
 # being skimmed.
 UNMEASURED = 'unmeasured'
+
+# The per-candidate breakout of ``declined`` by terminal kind (task 4760).
+# Carried alongside the total rather than folded into it: an ``already_done``
+# and a ``false_premise`` are opposite findings ABOUT THE FIXTURE — one says the
+# work already landed, the other says the premise is false — and only one of
+# them says anything about the fixture corpus needing a refresh.
+DECLINE_KINDS_KEY = 'declined_by_kind'
 
 
 def marker_available(results: list[Any]) -> bool:
@@ -329,6 +343,21 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     PERSISTED ``plan_steps``, so it stays valid on exactly the fixtures where no
     reference diff exists and ``plan_quality`` therefore cannot be interpreted.
 
+    The task-4760 decline split (``declined``, ``no_plan_declined``,
+    ``declined_by_kind``) is surfaced on those same terms and for that same
+    reason. What it adds is the INTERPRETATION of the no-plan band, which
+    ``plan_rate`` alone cannot carry: a decline is the architect taking an
+    explicit plan-tools exit — ``report_false_premise``,
+    ``report_task_already_done`` and their three siblings — i.e. a CORRECT
+    REFUSAL of an unplannable task, not a failure to plan one. So
+    ``no_plan == no_plan_declined`` is a POSITIVE reliability result, and
+    reading it as a planning failure inverts the finding.
+    That is not hypothetical: tranche 1 reported an 89% planning failure over 47
+    ``plan_steps = 0`` cells of which 47 were adversarially-verified-true
+    declines. ``plan_rate`` itself is DELIBERATELY unchanged — it keeps its exact
+    historical derivation so every committed campaign artifact stays comparable,
+    and the split is reported alongside it.
+
     Rows are sorted by ``config_name`` so a committed report artifact diffs
     cleanly.
     """
@@ -347,6 +376,13 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
         # VALUE is single-sourced, which is the property that matters — two
         # surfaces must not answer one question differently.
         row[UNMEASURED_CELLS_KEY] = entry['judged_without_reference_unmeasured']
+        # The per-KIND breakout of the ``declined`` count already surfaced above
+        # (task 4760), copied from the same entry for the same reason — the
+        # kinds are not interchangeable, and a single total would let a corpus of
+        # stale fixtures ('already_done') read as one of ill-posed ones
+        # ('false_premise'). Key-sorted by the report layer, so a committed
+        # artifact diffs cleanly.
+        row[DECLINE_KINDS_KEY] = entry['declined_by_kind']
         rows.append(row)
     rows.sort(key=lambda r: r['config_name'])
     return rows
@@ -355,7 +391,18 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
 # The raw per-cell dump. v1's discipline (task_id / config_name / outcome /
 # trial / plan_quality / plan_steps / cost_usd) extended with judge_cost_usd and
 # cap_tainted, so the verdict is recomputable without re-parsing a log.
-_CELL_FIELDS = ('plan_quality', 'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted')
+#
+# ``terminal_kind`` (task 4760) is what makes a ``plan_steps = 0`` cell readable
+# AT ALL without forensics: the plan-tools decline artifacts that name the cause
+# live in the eval worktree's meta root, which ``cleanup_eval_worktree``
+# ``rmtree``s in ``run_architect_eval``'s ``finally``, so nothing downstream can
+# recover it afterwards. Reading tranche 1 required opening transcripts; with
+# the kind persisted per cell, an analyst splits the no-plan band straight off
+# this artifact.
+_CELL_FIELDS = (
+    'plan_quality', 'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted',
+    'terminal_kind',
+)
 
 
 def find_missing_cells(
@@ -501,13 +548,18 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     # is the mixed-case "unmeasured (N of M scored cells)", and a column narrower
     # than its own longest value overflows and drags the table's right edge out
     # of alignment on exactly the rows an operator most needs to read.
+    # ``declined`` sits IMMEDIATELY AFTER ``no_plan`` (task 4760): it is the
+    # explanation OF that number — how many of those cells were an explicit
+    # refusal rather than a failure to plan — and a column placed away from the
+    # one it qualifies is the version of this fix that does not work.
     header = (
         f'{"candidate":<26} {"n":>4} {"total":>6} {"cap_excl":>9} {"no_plan":>8} '
-        f'{"plan_rate":>10} {"mean_pq":>10} {MARKER_KEY:>32}'
+        f'{"declined":>9} {"plan_rate":>10} {"mean_pq":>10} {MARKER_KEY:>32}'
     )
     lines.append(header)
     lines.append('-' * len(header))
     unmeasured_marker = False
+    declined_any = False
     for row in report.get('candidates', []):
         marker = _fmt(row.get(MARKER_KEY))
         if row.get(MARKER_KEY) is None:
@@ -525,9 +577,12 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             missing = row.get(UNMEASURED_CELLS_KEY)
             if missing:
                 marker = f'{UNMEASURED} ({missing} of {row["n"]} scored cells)'
+        if row.get('declined'):
+            declined_any = True
         lines.append(
             f'{row["config_name"]:<26} {_fmt(row["n"]):>4} {_fmt(row["total"]):>6} '
             f'{_fmt(row["cap_excluded"]):>9} {_fmt(row["no_plan"]):>8} '
+            f'{_fmt(row["declined"]):>9} '
             f'{_fmt(row["plan_rate"]):>10} {_fmt(row["mean_plan_quality"]):>10} '
             f'{marker:>32}'
         )
@@ -603,6 +658,36 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             'intermittent',
             '  (RETAINED) on its own, never ceiling — so nothing is hidden by its '
             'keylessness here.',
+        ]
+
+    if declined_any:
+        # Printed only when at least one arm declined — a campaign where every
+        # candidate planned must not grow a paragraph about refusals it never
+        # made, and the gate is what keeps this byte-deterministic.
+        lines += [
+            '',
+            'LEGEND — declined: how many of that candidate\'s SCORED cells ended on an '
+            'explicit',
+            '  plan-tools decline exit (report_false_premise / report_task_already_done '
+            '/',
+            '  report_blocking_dependency / report_unactionable_task / '
+            'report_ready_to_merge).',
+            '  A DECLINE IS A CORRECT REFUSAL, not a planning failure: the architect '
+            'read the fixture',
+            '  and stated why it cannot be planned. Read against no_plan — when the two '
+            'match, that',
+            '  candidate emitted no plan ONLY where it explicitly refused, which is a '
+            'positive',
+            '  reliability result. Tranche 1 reported the opposite (an 89% planning '
+            'failure over 47',
+            '  cells that were 47 verified-true declines) because this column did not '
+            'exist.',
+            f'  plan_rate is UNCHANGED by any of this. The per-kind breakout '
+            f'({DECLINE_KINDS_KEY})',
+            '  and the no-plan intersection (no_plan_declined) ride in the JSON '
+            'artifact; a cell that',
+            '  planned and THEN declined counts here but not in no_plan, so the two '
+            'can differ.',
         ]
     return '\n'.join(lines)
 

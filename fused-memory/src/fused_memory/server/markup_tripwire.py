@@ -3,10 +3,12 @@
 A recurring harness serialization bug leaks raw MCP envelope fragments — the
 closing/opening tags of the tool-call wire format — into the *payload* of
 fused-memory writes. Two observed vectors: memory ``content`` arriving with a
-``</content>``/``</invoke>`` tail (permanent specimens now sitting in the mem0
-and Graphiti corpora), and task text arriving with a ``<parameter name=``
+``\x3c/content>``/``\x3c/invoke>`` tail (permanent specimens now sitting in the mem0
+and Graphiti corpora), and task text arriving with a ``\x3cparameter name=``
 fragment that the interceptor's description parser then mis-parses *silently*
-(reify task 3210 was filed ``priority=high`` and stored as ``medium``).
+(reify task 3210 was filed ``priority=high`` and stored as ``medium``). See the
+"Sentinel-literal hazard" section of ``shared/src/shared/toolcall_markup.py``
+— the owner of this escaping convention — for why.
 
 WHAT THIS MODULE IS NOW
 -----------------------

@@ -21,16 +21,20 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
---project shared``) has no MCP client and no live models, so every seam is
-ALWAYS faked in this module's own test suite; the deterministic core
-(duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
-manifestation matrix, census-state advance, codebook lifecycle transforms,
-report rendering) is unit-tested with no network. Note that httpx IS
-available there -- a direct dependency of ``shared``
-(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965) -- so the seams are
-what keep the suite off the network, not an absent HTTP client: an
-un-faked poster would really reach whatever is listening on
-``$FUSED_MEMORY_MCP_URL`` (default localhost:8002).
+--project shared``) has no live models. Every seam is ALWAYS faked in this
+module's own test suite for DETERMINISM -- to keep the suite off the
+network and make both the request shape and the failure path assertable
+regardless of what is installed or listening, never because a client
+library is absent: an MCP client IS importable there too, symmetrically
+with httpx below -- ``fastmcp>=3.2`` is a direct dependency of ``shared``
+(``shared/pyproject.toml``, task 3689), pulling in ``mcp>=1.24`` -- so an
+un-faked seam would really reach whatever is listening on
+``$FUSED_MEMORY_MCP_URL`` (default localhost:8002). The deterministic
+core (duplicate/dup_rate, the mining batch loop + saturation stop, the
+origin x manifestation matrix, census-state advance, codebook lifecycle
+transforms, report rendering) is unit-tested with no network. Note that
+httpx IS available there -- a direct dependency of ``shared``
+(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965).
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
@@ -826,16 +830,42 @@ def render_report(
         # Deliberately states only counts this function was actually handed:
         # the total number of ENUMERATED sessions is not knowable here
         # (batch_source is a generic injected iterable), and claiming
-        # "X of Y" would assert a number the code never measured.
-        sessions = sum(stats.total for stats in mining_result.batch_stats)
+        # "X of Y (enumerated)" would assert a number the code never
+        # measured.
         if mining_result.stop_reason == "capped":
-            lines.append(
-                f"- coverage: mined {sessions} session digest(s) across "
+            # Reports `succeeded`, not `total`, as the coverage count:
+            # `total` counts digests DRAWN into a batch, including any that
+            # failed to code and so contributed no signal to the codebook (a
+            # storm batch, PRD §8.6, is the extreme case) -- `succeeded` is
+            # what this run actually coded. `drawn` is still reported
+            # alongside it, labelled, so nothing previously visible is lost.
+            # Computed here, not at the outer `max_batches is not None`
+            # scope, because the "not reached" branch below never uses them.
+            coded = sum(stats.succeeded for stats in mining_result.batch_stats)
+            drawn = sum(stats.total for stats in mining_result.batch_stats)
+            coverage_line = (
+                f"- coverage: coded {coded} of {drawn} session digest(s) drawn across "
                 f"{len(mining_result.batch_stats)} batch(es); operator batch cap = "
                 f"{mining_result.max_batches} batch(es) -- mining was BOUNDED BY THE CAP, "
                 "not run to saturation: sessions beyond the cap were NOT mined, so this "
                 "census is PARTIAL coverage, not a full sweep."
             )
+            # Gated on the count discrepancy itself, not on any batch's
+            # status == "failure": sub-storm coding failures (below the >50%
+            # threshold, PRD §8.6) still make coded < drawn and still
+            # overstate coverage if left unsaid, and this line's job is the
+            # count, not the storm classification (run_census reports storm
+            # indices separately). Kept inside the same coverage line so the
+            # shortfall can never be read apart from the claim it qualifies;
+            # a healthy capped run (coded == drawn) renders no clause at all
+            # -- a line trained to be ignored is a line that will be ignored
+            # on the run that matters.
+            if drawn > coded:
+                coverage_line += (
+                    f" {drawn - coded} digest(s) FAILED TO CODE and contributed no "
+                    "signal (see the per-batch tallies below)."
+                )
+            lines.append(coverage_line)
             # PARTIAL is not the same as "the rest comes later" -- say which
             # one this is. run_census always calls advance_census_state, and
             # _census_window_dates anchors the NEXT window at last_census_at,

@@ -1,0 +1,1635 @@
+"""Tests for lms_slate_run — the committed slate-run driver (task 4301).
+
+PRD-MARKER:local-memory-models-eval serving
+
+EVERY TEST HERE IS OFFLINE.  The driver shells out through an injected
+`runner` seam, so no arm is started, no card is touched, and no artifact is
+written.  That is deliberate and load-bearing: the artifact
+`scripts/local-model-serving/verification/health-report.json` may only be
+produced by a live run on the 3090, and a test that could write it would be
+indistinguishable from the fabrication `test_lms_verification_artifact.py`
+exists to stop.
+
+No test in this file carries `@pytest.mark.integration` either.  The root
+`pyproject.toml` addopts deselect that marker, so an integration-marked gate
+would sit in the tree checked by nobody.
+
+PRD hazard 11 -- "long runs in transient `systemd --user` units, never bare
+background shells" -- is enforced here as a CHECKED PROPERTY of the built
+argv, mirroring `test_lms_fetch_weights.py`'s treatment of hazard 5.
+"""
+import ast
+import sys
+import tempfile
+from pathlib import Path
+
+import lms_fetch_weights
+import lms_slate_run
+import pytest
+
+_BACKGROUND_SHELL_TOKENS = ('nohup', 'setsid', 'disown', '&', ';', '|')
+
+
+# ---------------------------------------------------------------------------
+# PRD hazard 11 — the submit argv is a transient unit, built from the one
+# authored source of that form
+# ---------------------------------------------------------------------------
+
+
+def test_slate_argv_is_built_from_the_shared_transient_unit_prefix(tmp_path):
+    """Not merely "looks like" a transient unit: it IS the shared builder's
+    output, so the compliant form has one authored source in the repo."""
+    parts = tmp_path / 'parts'
+    output = tmp_path / 'health-report.json'
+
+    argv = lms_slate_run.slate_argv(parts, output, env={})
+
+    prefix = lms_fetch_weights.transient_unit_prefix(
+        lms_slate_run.SLATE_UNIT_NAME, [],
+    )
+    assert argv[:len(prefix)] == prefix
+    assert argv[:2] == ['systemd-run', '--user']
+    assert '--collect' in argv
+    assert f'--unit={lms_slate_run.SLATE_UNIT_NAME}' in argv
+    assert f'--working-directory={lms_fetch_weights.REPO_ROOT}' in argv
+
+
+def test_the_slate_unit_name_is_the_documented_one():
+    """The README tells an operator to follow
+    `journalctl --user -u lms-slate-run -f`; a drifted constant would send
+    them to a unit that does not exist."""
+    assert lms_slate_run.SLATE_UNIT_NAME == 'lms-slate-run'
+
+
+# ---------------------------------------------------------------------------
+# the payload
+# ---------------------------------------------------------------------------
+
+
+def _payload(argv):
+    return argv[argv.index('--') + 1:]
+
+
+def test_the_payload_invokes_an_absolute_interpreter_on_an_absolute_script(tmp_path):
+    """`systemd --user` gets a minimal PATH and none of the caller's venv, so
+    a bare `python` either misses or resolves to a different interpreter than
+    the one that built the argv."""
+    payload = _payload(lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json', env={},
+    ))
+
+    assert payload[0] == sys.executable
+    assert payload[0].startswith('/')
+    assert payload[1].endswith('lms_slate_run.py')
+    assert payload[1].startswith('/')
+    assert payload[1] == str(lms_slate_run.MODULE_PATH)
+
+
+def test_the_payload_re_enters_in_unit_mode(tmp_path):
+    """Without `--in-unit` the unit would re-submit itself, recursively."""
+    payload = _payload(lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json', env={},
+    ))
+
+    assert '--in-unit' in payload
+
+
+def test_parts_dir_and_output_are_passed_as_absolute_resolved_paths(tmp_path):
+    """The unit runs with `--working-directory=<REPO_ROOT>`, not the caller's
+    cwd, and derives no path of its own -- both layers must name the same
+    directory or a resume silently reads somewhere else."""
+    payload = _payload(lms_slate_run.slate_argv(
+        tmp_path / 'parts' / '..' / 'parts', tmp_path / 'out.json', env={},
+    ))
+
+    parts_value = payload[payload.index('--parts-dir') + 1]
+    output_value = payload[payload.index('--output') + 1]
+
+    assert parts_value == str((tmp_path / 'parts').resolve())
+    assert output_value == str((tmp_path / 'out.json').resolve())
+    assert parts_value.startswith('/')
+    assert output_value.startswith('/')
+
+
+def test_the_ready_timeout_is_forwarded(tmp_path):
+    payload = _payload(lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json', ready_timeout=123.0, env={},
+    ))
+
+    assert payload[payload.index('--ready-timeout') + 1] == '123.0'
+
+
+@pytest.mark.parametrize('token', _BACKGROUND_SHELL_TOKENS)
+def test_slate_argv_never_backgrounds_through_a_shell(tmp_path, token):
+    """PRD hazard 11.  A bare background shell is unsupervised, unloggable,
+    and dies with the invoking session -- which for a ~30 minute slate sweep
+    means losing every arm measured so far."""
+    argv = lms_slate_run.slate_argv(tmp_path / 'parts', tmp_path / 'out.json', env={})
+
+    for element in argv:
+        assert token not in element, f'{token!r} appears in {element!r}'
+
+
+def test_the_payload_is_not_a_shell(tmp_path):
+    payload = _payload(lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json', env={},
+    ))
+
+    assert payload[0] not in ('sh', 'bash', '/bin/sh', '/bin/bash')
+    assert '-c' not in payload
+
+
+# ---------------------------------------------------------------------------
+# the env allowlist — the subtlest hazard of the transient-unit form
+#
+# `systemd --user` propagates NONE of the caller's environment, so anything
+# unstated is silently ABSENT inside the unit: not empty, not inherited.  The
+# consequence is specific and quiet.  `lms_ctl start` writes the VRAM baseline
+# through `lms_vram.baseline_dir()`, which reads `$LMS_BASELINE_DIR`; the
+# healthcheck reads it back through the same function.  If the two disagree the
+# healthcheck exits 8 (`EXIT_STALE_BASELINE`) and writes no file at all -- so
+# the whole sweep produces nothing, and the reason is a variable nobody
+# mentioned.
+#
+# The other direction matters just as much: the list is a WHITELIST, never a
+# copy of os.environ.  A blanket copy would push OPENAI_API_KEY, HF_TOKEN and
+# the rest into the unit's recorded systemd properties and the journal.
+# ---------------------------------------------------------------------------
+
+
+def test_a_set_baseline_dir_is_propagated_into_the_unit(tmp_path):
+    argv = lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json',
+        env={'LMS_BASELINE_DIR': '/run/user/1000/lms-baselines'},
+    )
+
+    assert '--setenv=LMS_BASELINE_DIR=/run/user/1000/lms-baselines' in argv
+
+
+def test_an_absent_baseline_dir_emits_no_setenv_at_all(tmp_path):
+    """Not an empty one.  `''` is not "unset" to `os.environ.get(...)`'s
+    fallback, so an empty setenv would send `baseline_dir()` to Path('') --
+    a different directory than the default it was supposed to fall back to."""
+    argv = lms_slate_run.slate_argv(tmp_path / 'parts', tmp_path / 'out.json', env={})
+
+    assert not any(a.startswith('--setenv=LMS_BASELINE_DIR') for a in argv)
+
+
+def test_the_propagated_key_is_the_one_lms_vram_actually_reads():
+    """Pinned against `lms_vram`'s own constant rather than a literal, so a
+    rename there cannot leave this driver propagating a dead name."""
+    import lms_vram
+
+    assert lms_vram.BASELINE_DIR_ENV in lms_slate_run.PROPAGATED_ENV_KEYS
+
+
+@pytest.mark.parametrize('secret_key', ['OPENAI_API_KEY', 'HF_TOKEN', 'VIRTUAL_ENV'])
+def test_unlisted_caller_variables_never_reach_the_unit(tmp_path, secret_key):
+    """A whitelist, not a passthrough: `systemd-run --setenv` puts a value in
+    the unit's recorded properties and the journal, so a blanket copy of
+    os.environ is a secret-leak surface for zero benefit."""
+    argv = lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json',
+        env={
+            'LMS_BASELINE_DIR': '/run/user/1000/lms-baselines',
+            secret_key: 'sensitive-measured-value',
+        },
+    )
+
+    assert not any(secret_key in element for element in argv)
+    assert not any('sensitive-measured-value' in element for element in argv)
+
+
+def test_the_allowlist_is_a_whitelist_not_a_copy_of_os_environ(tmp_path, monkeypatch):
+    """The default env is the real one; with no injected dict the ONLY
+    setenv flags that may appear are allowlisted keys."""
+    monkeypatch.setenv('LMS_SLATE_RUN_CANARY', 'must-not-propagate')
+
+    argv = lms_slate_run.slate_argv(tmp_path / 'parts', tmp_path / 'out.json')
+
+    setenvs = [a for a in argv if a.startswith('--setenv=')]
+    for flag in setenvs:
+        key = flag[len('--setenv='):].split('=', 1)[0]
+        assert key in lms_slate_run.PROPAGATED_ENV_KEYS, f'{key} is not allowlisted'
+    assert not any('must-not-propagate' in element for element in argv)
+
+
+# ---------------------------------------------------------------------------
+# the in-unit sweep — one arm at a time, strictly serialized
+#
+# `lms_ctl start` is exclusive BY DEFAULT and REFUSES (exit 4) when a sibling
+# arm holds the card; it never evicts.  So overlapping two arms does not
+# degrade to a slow sweep, it produces a refusal — which makes the ordering
+# below a correctness property rather than a stylistic one.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCompleted:
+    def __init__(self, returncode: int):
+        self.returncode = returncode
+
+
+class _FakeRunner:
+    """Records every argv and returns a scripted returncode.
+
+    Stands in for `subprocess.run`, which is how every test in this file stays
+    offline: no arm is started and no card is touched.
+
+    *writes* maps a stage key to the text that stage's `--output` file receives,
+    modelling the ONE thing the real producer does that a returncode cannot
+    express: `lms_healthcheck --arm X --output p` writes its report BEFORE
+    returning the verdict's exit code, so a stage can leave a file behind while
+    still exiting non-zero -- and, just as load-bearing, a stage that is NOT
+    listed here leaves the parts dir exactly as it found it (which is what
+    `EXIT_STALE_BASELINE` does: it exits 8 having written nothing).  Whether a
+    run left a file behind is the whole staleness question, so it cannot be
+    simulated by returncodes alone.
+    """
+
+    def __init__(self, codes=None, raises=None, writes=None):
+        self.calls: list[list[str]] = []
+        self._codes = dict(codes or {})
+        self._raises = dict(raises or {})
+        self._writes = dict(writes or {})
+
+    def __call__(self, argv: list[str]) -> _FakeCompleted:
+        self.calls.append(list(argv))
+        key = _stage_key(argv)
+        if key in self._raises:
+            raise self._raises[key]
+        if key in self._writes:
+            out = Path(argv[argv.index('--output') + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(self._writes[key])
+        return _FakeCompleted(self._codes.get(key, 0))
+
+    def stages(self):
+        return [_stage_key(argv) for argv in self.calls]
+
+
+def _stage_key(argv):
+    """('ctl', verb, arm_id) / ('healthcheck', arm_id) / ('merge',)."""
+    if str(lms_slate_run.CTL_PATH) in argv:
+        tail = argv[argv.index(str(lms_slate_run.CTL_PATH)) + 1:]
+        return ('ctl', tail[0], tail[1] if len(tail) > 1 else None)
+    if str(lms_slate_run.HEALTHCHECK_PATH) in argv:
+        if '--merge' in argv:
+            return ('merge',)
+        return ('healthcheck', argv[argv.index('--arm') + 1])
+    raise AssertionError(f'unrecognised argv: {argv}')
+
+
+class _FakeArm:
+    """Only the manifest fields the driver reads.
+
+    `served_model_name` mirrors `_one_row_report`, which writes the arm id into
+    that field, so a part built there matches the arm it is named for and the
+    staleness check below is exercised by an EDIT rather than by the fixture
+    simply disagreeing with itself.
+    """
+
+    def __init__(self, arm_id, *, is_placeholder=False, served_model_name=None):
+        self.arm_id = arm_id
+        self.is_placeholder = is_placeholder
+        self.served_model_name = (
+            arm_id if served_model_name is None else served_model_name
+        )
+
+
+class _FakeManifest:
+    def __init__(self, *arms):
+        self.arms = [a if isinstance(a, _FakeArm) else _FakeArm(a) for a in arms]
+
+    def arm_ids(self):
+        return [a.arm_id for a in self.arms]
+
+
+@pytest.fixture
+def two_arms(monkeypatch):
+    manifest = _FakeManifest('arm-one', 'arm-two')
+    monkeypatch.setattr(lms_slate_run, 'load_arms', lambda: manifest)
+    return manifest
+
+
+def test_each_arm_runs_start_wait_healthcheck_stop_in_that_order(tmp_path, two_arms):
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert runner.stages()[:9] == [
+        ('ctl', 'stop-all', None),
+        ('ctl', 'start', 'arm-one'),
+        ('ctl', 'wait-ready', 'arm-one'),
+        ('healthcheck', 'arm-one'),
+        ('ctl', 'stop', 'arm-one'),
+        ('ctl', 'start', 'arm-two'),
+        ('ctl', 'wait-ready', 'arm-two'),
+        ('healthcheck', 'arm-two'),
+        ('ctl', 'stop', 'arm-two'),
+    ]
+
+
+def test_the_arms_are_strictly_serialized(tmp_path, two_arms):
+    """Arm two's `start` may appear only AFTER arm one's `stop`.  Overlapping
+    them does not merely slow the sweep: `lms_ctl start` refuses rather than
+    evicting, so arm two would fail with exit 4 on a healthy card."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert stages.index(('ctl', 'start', 'arm-two')) > stages.index(
+        ('ctl', 'stop', 'arm-one')
+    )
+
+
+def test_start_is_left_exclusive(tmp_path, two_arms):
+    """`--no-exclusive` would let a second arm onto a card that fits one.  The
+    sweep never needs it: it stops each arm before starting the next."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    for argv in runner.calls:
+        assert '--no-exclusive' not in argv
+
+
+def test_wait_ready_carries_the_ready_timeout(tmp_path, two_arms):
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(
+        tmp_path / 'parts', tmp_path / 'out.json', ready_timeout=42.0, runner=runner,
+    )
+
+    waits = [a for a in runner.calls if _stage_key(a)[:2] == ('ctl', 'wait-ready')]
+    assert waits
+    for argv in waits:
+        assert argv[argv.index('--timeout') + 1] == '42.0'
+
+
+def test_the_default_ready_timeout_is_the_one_lms_ctl_documents():
+    """Pinned against `lms_ctl`'s constant, not a literal: a driver that
+    silently waited less than the CLI's own default would report arms as
+    not-ready that were merely slow to load."""
+    import lms_ctl
+
+    assert lms_slate_run.DEFAULT_READY_TIMEOUT_S == lms_ctl.DEFAULT_READY_TIMEOUT_S
+
+
+def test_each_arms_healthcheck_writes_its_own_part_file(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    for arm_id in ('arm-one', 'arm-two'):
+        argv = next(a for a in runner.calls if _stage_key(a) == ('healthcheck', arm_id))
+        assert argv[argv.index('--output') + 1] == str(parts_dir / f'{arm_id}.json')
+
+
+def test_the_parts_directory_is_created(tmp_path, two_arms):
+    parts_dir = tmp_path / 'nested' / 'parts'
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=_FakeRunner())
+
+    assert parts_dir.is_dir()
+
+
+def test_every_helper_script_is_invoked_by_absolute_path_with_sys_executable(
+    tmp_path, two_arms,
+):
+    """The unit has a minimal PATH and none of the caller's venv, so a bare
+    `python` or a relative script path resolves to something nobody reviewed --
+    or to nothing."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert runner.calls
+    for argv in runner.calls:
+        assert argv[0] == sys.executable
+        assert argv[1].startswith('/')
+        assert argv[1] in (str(lms_slate_run.CTL_PATH), str(lms_slate_run.HEALTHCHECK_PATH))
+
+
+def test_the_helper_script_paths_are_the_sibling_modules():
+    serving_dir = lms_slate_run.MODULE_PATH.parent
+
+    assert serving_dir / 'lms_ctl.py' == lms_slate_run.CTL_PATH
+    assert serving_dir / 'lms_healthcheck.py' == lms_slate_run.HEALTHCHECK_PATH
+    assert lms_slate_run.CTL_PATH.exists()
+    assert lms_slate_run.HEALTHCHECK_PATH.exists()
+
+
+# ---------------------------------------------------------------------------
+# a failed arm still releases the card
+#
+# This is what makes a ~30 minute sweep survivable.  `lms_ctl start` refuses
+# (exit 4) rather than evicting, so ONE arm left running by a failed
+# healthcheck poisons every arm after it: one bad arm becomes six spurious
+# refusals, and the operator reads a slate of failures that never happened.
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_healthcheck_still_stops_its_arm(tmp_path, two_arms):
+    """Exit 8 is `EXIT_STALE_BASELINE` — the healthcheck wrote no file, so
+    nothing downstream will notice this arm unless the stop happens anyway."""
+    runner = _FakeRunner(codes={('healthcheck', 'arm-one'): 8})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert ('ctl', 'stop', 'arm-one') in runner.stages()
+
+
+def test_a_failing_arm_does_not_abandon_the_rest_of_the_sweep(tmp_path, two_arms):
+    runner = _FakeRunner(codes={('healthcheck', 'arm-one'): 8})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert ('ctl', 'start', 'arm-two') in stages
+    assert ('healthcheck', 'arm-two') in stages
+
+
+def test_a_raising_healthcheck_still_stops_its_arm(tmp_path, two_arms):
+    """The guarantee is try/finally, not `if rc`.  A runner that RAISES —
+    OSError on a missing interpreter, a KeyboardInterrupt mid-sweep — must
+    still release the card, or the next run starts against a held one."""
+    runner = _FakeRunner(raises={('healthcheck', 'arm-one'): OSError('boom')})
+
+    with pytest.raises(OSError):
+        lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert ('ctl', 'stop', 'arm-one') in runner.stages()
+
+
+def test_an_arm_that_never_became_ready_is_not_probed_but_is_still_stopped(
+    tmp_path, two_arms,
+):
+    """Probing an arm that never came ready only produces a misleading FAIL
+    row: it would record "the model is broken" for a model that never loaded."""
+    runner = _FakeRunner(codes={('ctl', 'wait-ready', 'arm-one'): 1})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert ('healthcheck', 'arm-one') not in stages
+    assert ('ctl', 'stop', 'arm-one') in stages
+    assert ('ctl', 'start', 'arm-two') in stages
+
+
+def test_a_refused_start_is_not_waited_on_or_probed_but_is_still_stopped(
+    tmp_path, two_arms,
+):
+    """Exit 4 is `EXIT_ARM_REFUSED`: nothing was started. The stop is issued
+    anyway — it is idempotent, and skipping it here would make the guarantee
+    conditional on correctly guessing which failures left the card held."""
+    runner = _FakeRunner(codes={('ctl', 'start', 'arm-one'): 4})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert ('ctl', 'wait-ready', 'arm-one') not in stages
+    assert ('healthcheck', 'arm-one') not in stages
+    assert ('ctl', 'stop', 'arm-one') in stages
+
+
+def test_the_card_is_released_before_the_first_arm_starts(tmp_path, two_arms):
+    """ONE arm left running by an earlier hand-driven session -- the workflow
+    this script replaces -- would turn the whole sweep into seven `start`
+    refusals (exit 4: `lms_ctl start` refuses rather than evicting), no parts,
+    and a merge that refuses on coverage.  The per-arm `finally` cannot help:
+    it only releases arms THIS sweep started."""
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    stages = runner.stages()
+    assert stages[0] == ('ctl', 'stop-all', None)
+    assert stages.count(('ctl', 'stop-all', None)) == 1
+
+
+def test_the_pre_sweep_release_names_no_arm(tmp_path, two_arms):
+    """`lms_ctl stop-all` takes no arm id (`nargs='?'`), so passing an empty
+    string would make it an arm id of `''` rather than an omitted one."""
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    argv = runner.calls[0]
+    assert argv == [sys.executable, str(lms_slate_run.CTL_PATH), 'stop-all']
+
+
+def test_a_failing_pre_sweep_release_is_reported_but_not_fatal(tmp_path, two_arms):
+    """Not swallowed: a non-zero `stop-all` is the difference between a clean
+    card and one this sweep could not clear.  Not fatal either: if nothing was
+    actually held the sweep runs fine, and if something was, the per-arm
+    refusals name it."""
+    runner = _FakeRunner(codes={('ctl', 'stop-all', None): 1})
+
+    failures = lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    assert (lms_slate_run.RELEASE_SUBJECT, 'stop-all', 1) in failures
+    assert ('ctl', 'start', 'arm-one') in runner.stages()
+
+
+def test_the_release_subject_is_not_mistakable_for_an_arm(two_arms):
+    """The failure line reads `<subject>: stop-all failed`; a subject that
+    looked like an arm id would send an operator to debug an arm that is
+    fine."""
+    assert lms_slate_run.RELEASE_SUBJECT not in two_arms.arm_ids()
+
+
+def test_a_failing_release_makes_the_run_non_zero(tmp_path, two_arms):
+    runner = _FakeRunner(codes={('ctl', 'stop-all', None): 1})
+
+    code = lms_slate_run.run_slate(
+        tmp_path / 'parts', tmp_path / 'out.json', runner=runner,
+    )
+
+    assert code != 0
+
+
+def test_per_arm_failures_are_collected_and_reported_by_arm_id(tmp_path, two_arms):
+    """A sweep that failed somewhere must say WHERE.  A bare non-zero exit
+    sends an operator back through 30 minutes of journal to find out which arm
+    and which stage."""
+    runner = _FakeRunner(codes={('healthcheck', 'arm-one'): 8})
+
+    failures = lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    assert failures == [('arm-one', 'healthcheck', 8)]
+
+
+def test_a_clean_sweep_collects_no_failures(tmp_path, two_arms):
+    failures = lms_slate_run.sweep_arms(tmp_path / 'parts', runner=_FakeRunner())
+
+    assert failures == []
+
+
+# ---------------------------------------------------------------------------
+# resumability — per-arm part files
+#
+# A failed arm must not force a whole ~30 minute re-sweep.  The resume unit is
+# the part file `lms_healthcheck --arm X --output p` already writes: a full
+# HealthReport whose `arms` list holds exactly one row.  Validating it through
+# the PRODUCER'S OWN pydantic model is what stops the driver and the producer
+# ever disagreeing about what a report is.
+# ---------------------------------------------------------------------------
+
+
+def _one_row_report(arm_id):
+    """A real single-row `HealthReport`, built through the producer's model.
+
+    Hand-writing the JSON here would let this fixture drift from the schema the
+    driver actually has to accept -- and a drifted fixture makes the resume
+    test pass against a part shape that never occurs.
+    """
+    import lms_healthcheck
+
+    return lms_healthcheck.HealthReport(
+        schema_version=lms_healthcheck.REPORT_SCHEMA_VERSION,
+        measured_at='2026-08-31T00:00:00+00:00',
+        gpu=lms_healthcheck.GpuBlock(
+            name='NVIDIA GeForce RTX 3090', driver_version='580.00', total_mib=24576,
+        ),
+        arms=[lms_healthcheck.ArmRow(
+            arm_id=arm_id,
+            axis='llm',
+            stack='vllm',
+            endpoint='http://127.0.0.1:8410/v1',
+            served_model_name=arm_id,
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            detail='',
+            latency_ms=1.0,
+            measured_at='2026-08-31T00:00:00+00:00',
+            arm_footprint_mib=1024,
+            reasoning='off',
+        )],
+        vram=lms_healthcheck.VramBlock(
+            total_mib=24576, used_mib=8192, free_mib=16384,
+            baseline_mib=7168, budget_mib=17408, arm_footprint_mib=1024,
+            used_gib=8.0, free_gib=16.0, baseline_gib=7.0, budget_gib=17.0,
+            arm_footprint_gib=1.0, nominal_ceiling_gib=19.5,
+            operating_budget_gib=17.0, headroom_gib=16.0,
+            verdict='PASS', reason='',
+        ),
+        overall='PASS',
+    )
+
+
+def _write_part(parts_dir, arm_id, text=None):
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    path = parts_dir / f'{arm_id}.json'
+    if text is None:
+        text = _one_row_report(arm_id).model_dump_json()
+    path.write_text(text)
+    return path
+
+
+def test_an_arm_with_a_valid_part_is_skipped_entirely(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    stages = runner.stages()
+    assert not [s for s in stages if s[-1] == 'arm-one' or s == ('healthcheck', 'arm-one')]
+    assert ('ctl', 'start', 'arm-two') in stages
+    assert ('healthcheck', 'arm-two') in stages
+
+
+@pytest.mark.parametrize('body', [
+    '',
+    'not json at all',
+    '{"schema_version": 5}',
+])
+def test_an_unusable_part_is_not_trusted_and_the_arm_is_re_run(tmp_path, two_arms, body):
+    """A half-written part from a killed sweep is the realistic failure. It
+    must fall through to a re-run, never be read as a completed arm."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one', text=body)
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_a_valid_part_describing_a_different_arm_is_not_accepted(tmp_path, two_arms):
+    """The file name says arm-one; the row inside says arm-two. Trusting the
+    name would let a mis-copied part stand in for an arm never measured."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one', text=_one_row_report('arm-two').model_dump_json())
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_part_is_complete_accepts_the_producers_own_output(tmp_path):
+    path = _write_part(tmp_path / 'parts', 'arm-one')
+
+    assert lms_slate_run.part_is_complete(path, 'arm-one')
+
+
+def test_part_is_complete_returns_false_for_a_missing_file_rather_than_raising(tmp_path):
+    """An OSError here would abort the sweep on the ordinary first-run case."""
+    assert not lms_slate_run.part_is_complete(tmp_path / 'nope.json', 'arm-one')
+
+
+def test_a_multi_row_report_is_not_a_part(tmp_path):
+    """A merged artifact accidentally dropped into the parts dir is not a
+    part: resuming off it would skip an arm whose row came from elsewhere."""
+    import lms_healthcheck
+
+    single = _one_row_report('arm-one')
+    merged = lms_healthcheck.HealthReport(
+        schema_version=single.schema_version,
+        measured_at=single.measured_at,
+        gpu=single.gpu,
+        arms=[*single.arms, _one_row_report('arm-two').arms[0]],
+        vram=single.vram,
+        overall=single.overall,
+    )
+    path = tmp_path / 'arm-one.json'
+    path.write_text(merged.model_dump_json())
+
+    assert not lms_slate_run.part_is_complete(path, 'arm-one')
+
+
+def _failed_part(arm_id):
+    """A part exactly as `lms_healthcheck --arm X --output p` leaves one when
+    the probe FAILS: the report is written BEFORE the non-zero exit code is
+    returned, so a failed arm leaves a fully valid file on disk."""
+    import lms_healthcheck
+
+    report = _one_row_report(arm_id)
+    failed_row = report.arms[0].model_copy(update={
+        'verdict': 'FAIL',
+        'reason': lms_healthcheck.Reason.MALFORMED_RESPONSE,
+        'detail': 'the probe returned junk',
+    })
+    return report.model_copy(update={'arms': [failed_row], 'overall': 'FAIL'})
+
+
+def test_a_part_whose_row_failed_is_re_measured_not_reused(tmp_path, two_arms):
+    """`lms_healthcheck` writes the report BEFORE returning the verdict's exit
+    code, so a FAILED arm leaves a perfectly valid part behind.  Reusing it
+    would hand an operator who FIXED that arm a byte-identical artifact still
+    carrying the stale FAIL row -- with only a SKIPPED line to say why, and
+    `--force` (all seven arms, ~30 minutes) as the only escape."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one', text=_failed_part('arm-one').model_dump_json())
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_part_is_complete_rejects_a_failed_row(tmp_path):
+    path = tmp_path / 'arm-one.json'
+    path.write_text(_failed_part('arm-one').model_dump_json())
+
+    assert not lms_slate_run.part_is_complete(path, 'arm-one')
+
+
+def test_a_part_for_a_different_served_model_is_stale_and_re_measured(tmp_path):
+    """An `arms.yaml` edit that changes what an arm SERVES invalidates its
+    part: reusing it would leave the artifact describing a model the manifest
+    no longer commissions under that id."""
+    path = _write_part(tmp_path / 'parts', 'arm-one')
+
+    assert lms_slate_run.part_is_complete(
+        path, 'arm-one', served_model_name='arm-one',
+    )
+    assert not lms_slate_run.part_is_complete(
+        path, 'arm-one', served_model_name='some/other-model',
+    )
+
+
+def test_the_sweep_checks_the_part_against_the_manifests_served_model(
+    tmp_path, monkeypatch,
+):
+    """The staleness check is wired to the MANIFEST, not merely available."""
+    manifest = _FakeManifest(_FakeArm('arm-one', served_model_name='new/model'))
+    monkeypatch.setattr(lms_slate_run, 'load_arms', lambda: manifest)
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')  # served_model_name == 'arm-one'
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_force_re_runs_an_arm_that_already_has_a_valid_part(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, force=True, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_a_skip_says_which_part_it_is_reusing(tmp_path, two_arms, capsys):
+    """A resumed sweep that silently does less looks identical to one that
+    measured everything."""
+    parts_dir = tmp_path / 'parts'
+    path = _write_part(parts_dir, 'arm-one')
+
+    lms_slate_run.sweep_arms(parts_dir, runner=_FakeRunner())
+
+    out = capsys.readouterr().out
+    assert 'arm-one' in out
+    assert str(path) in out
+
+
+# ---------------------------------------------------------------------------
+# the artifact is written by `lms_healthcheck --merge`, never by this driver
+#
+# `merge_reports`' manifest-coverage check is THE enforcement point against an
+# artifact assembled from a partial slate — it refuses by NAME ("arms [...]
+# carry no row ... would describe a NARROWER slate than the manifest
+# commissions while reading as a complete one") and writes nothing.  The driver
+# must route into it rather than pre-empting it, and must not be able to
+# bypass it.
+# ---------------------------------------------------------------------------
+
+
+def _merge_call(runner):
+    return next(a for a in runner.calls if _stage_key(a) == ('merge',))
+
+
+def test_the_sweep_ends_in_exactly_one_merge(tmp_path, two_arms):
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    merges = [a for a in runner.calls if _stage_key(a) == ('merge',)]
+    assert len(merges) == 1
+    assert runner.calls[-1] is merges[0]
+
+
+def test_the_merge_writes_the_artifact_and_the_driver_never_does(tmp_path, two_arms):
+    output = tmp_path / 'health-report.json'
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, output, runner=runner)
+
+    argv = _merge_call(runner)
+    assert argv[argv.index('--output') + 1] == str(output)
+    # The runner is a fake: nothing actually ran. If the artifact exists, the
+    # driver wrote it itself -- which is the fabrication this task must not do.
+    assert not output.exists()
+
+
+def _bound_and_called_names(tree):
+    """Every name the module IMPORTS and every name it CALLS, at any scope.
+
+    An AST walk rather than a substring scan over the source text.  The scan it
+    replaces was coupled to prose: this module discusses `merge_reports` at
+    length (it has to explain why it shells out instead), so a future comment
+    written as ``merge_reports(parts, expected_arm_ids=...)`` would have failed
+    it with no defect present.  The walk also catches what the scan's companion
+    `hasattr` check could not -- a FUNCTION-LOCAL `from lms_healthcheck import
+    merge_reports`, which binds no module attribute at all.
+    """
+    imported: set[str] = set()
+    called: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update((a.asname or a.name).split('.')[0] for a in node.names)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                called.add(func.attr)
+    return imported, called
+
+
+def test_the_driver_never_calls_merge_reports_as_a_library():
+    """`merge_reports`' `expected_arm_ids` parameter DEFAULTS TO None, which
+    SKIPS the coverage check entirely. A library call is one forgotten keyword
+    away from writing exactly the short artifact that must never exist, so the
+    binding is pinned ABSENT rather than merely unused.
+
+    Prose ABOUT `merge_reports` is deliberately still allowed — the module
+    explains why it shells out instead — so this asserts on the AST: no import
+    binding that name at any scope, and no call to it.
+    """
+    tree = ast.parse(lms_slate_run.MODULE_PATH.read_text())
+    imported, called = _bound_and_called_names(tree)
+
+    assert 'merge_reports' not in imported
+    assert 'merge_reports' not in called
+    assert not hasattr(lms_slate_run, 'merge_reports')
+
+
+def test_the_ast_guard_would_catch_a_function_local_import():
+    """Guard on the guard.  The check it replaced -- a `merge_reports(` scan
+    plus a module-level `hasattr` -- is pinned here as INSUFFICIENT against the
+    shape it most needs to catch, so a future simplification back to it cannot
+    look equivalent."""
+    sneaky = ast.parse(
+        'def run():\n'
+        '    from lms_healthcheck import merge_reports\n'
+        '    return merge_reports(parts)\n'
+    )
+    imported, called = _bound_and_called_names(sneaky)
+
+    assert 'merge_reports' in imported
+    assert 'merge_reports' in called
+
+
+def test_the_ast_guard_tolerates_prose_about_merge_reports():
+    """The constraint is a binding, not a mention: a comment or docstring
+    naming `merge_reports(...)` must not fail the guard."""
+    prosaic = ast.parse(
+        '"""Never call merge_reports(parts, expected_arm_ids=None) here."""\n'
+        '# merge_reports(parts) would skip the coverage check\n'
+    )
+    imported, called = _bound_and_called_names(prosaic)
+
+    assert 'merge_reports' not in imported | called
+
+
+def test_only_the_parts_that_exist_on_disk_are_passed_to_the_merge(tmp_path, two_arms):
+    """Passing a manifest-derived path that does not exist would route the
+    refusal through an OSError on a missing file. Passing only what exists
+    routes it through the coverage check, which names the uncovered arms."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    argv = _merge_call(runner)
+    merged = argv[argv.index('--merge') + 1:argv.index('--output')]
+    assert merged == [str(parts_dir / 'arm-two.json')]
+
+
+def test_the_merged_parts_are_in_manifest_order(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-two')
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    argv = _merge_call(runner)
+    merged = argv[argv.index('--merge') + 1:argv.index('--output')]
+    assert merged == [str(parts_dir / 'arm-one.json'), str(parts_dir / 'arm-two.json')]
+
+
+def test_a_partial_set_still_reaches_the_merge_rather_than_being_pre_empted(
+    tmp_path, two_arms,
+):
+    """The driver adds no coverage check of its own. A second check could
+    drift from the manifest and would then either block a legitimate merge or,
+    worse, permit a short artifact that reads as a complete slate."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner(codes={('merge',): 6})
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert ('merge',) in runner.stages()
+    assert code != 0
+
+
+def test_zero_parts_still_reaches_the_merge(tmp_path, two_arms):
+    """The all-arms-failed case. Skipping the merge here would end a totally
+    failed sweep with no refusal recorded anywhere."""
+    runner = _FakeRunner(
+        codes={('ctl', 'start', 'arm-one'): 4, ('ctl', 'start', 'arm-two'): 4,
+               ('merge',): 6},
+    )
+
+    code = lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    argv = _merge_call(runner)
+    assert argv[argv.index('--merge') + 1:argv.index('--output')] == []
+    assert code != 0
+
+
+def test_a_clean_sweep_and_a_clean_merge_return_zero(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    _write_part(parts_dir, 'arm-two')
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=_FakeRunner())
+
+    assert code == 0
+
+
+def test_a_failed_arm_makes_the_run_non_zero_even_when_the_merge_succeeds(
+    tmp_path, two_arms,
+):
+    """`--merge` can only judge the parts it was handed. An arm that failed
+    and left no part is invisible to a merge that happened to be given a
+    complete set from a previous run."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner(codes={('ctl', 'start', 'arm-one'): 4})
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# a stale part is never handed to the merge
+#
+# `existing_parts` selects by `Path.exists()` ALONE, so anything left in the
+# parts dir is handed to `--merge` regardless of which run put it there.  An
+# arm selected for RE-MEASUREMENT whose re-measure aborts before the probe
+# writes anything therefore leaves the PREVIOUS sweep's part exactly where it
+# was — and a merge handed a full manifest's worth of rows SUCCEEDS, silently
+# overwriting the committed artifact with a row of another vintage (old
+# `measured_at`, old verdict, possibly a served_model_name the manifest no
+# longer commissions) presented as part of this slate.  That is precisely the
+# mixed-vintage artifact `merge_reports`' coverage check and
+# `test_lms_verification_artifact.py` exist to prevent, arriving by the one
+# route neither of them can see: they judge the parts they are HANDED, and
+# nothing else knows when a part was written.
+#
+# The rule is by VINTAGE and never by verdict.  A part THIS sweep wrote stays,
+# even one carrying a FAIL row — a `part_is_complete`-style PASS filter applied
+# here would turn a genuinely red slate into a coverage refusal and throw away
+# the rows saying why it is red.
+# ---------------------------------------------------------------------------
+
+
+#: The three ways a re-measure aborts BEFORE anything is written for that arm,
+#: each reproduced on this branch as MERGED == [arm-one.json, arm-two.json].
+_ABORT_BEFORE_ANYTHING_IS_WRITTEN = {
+    # `lms_ctl start` is exclusive and refuses (exit 4) while a sibling holds
+    # the card; nothing is started, so nothing is probed.
+    'start': {('ctl', 'start', 'arm-two'): 4},
+    # the arm never came ready. Deliberately not probed — see
+    # `sweep_arms` — so no report is written for it at all.
+    'wait-ready': {('ctl', 'wait-ready', 'arm-two'): 1},
+    # `lms_healthcheck` EXIT_STALE_BASELINE: it reads the VRAM baseline BEFORE
+    # probing and raises, so it exits 8 having written NO file. The one abort
+    # that runs the producer and still leaves the old part untouched.
+    'healthcheck': {('healthcheck', 'arm-two'): 8},
+}
+
+
+def _merged_parts(runner):
+    argv = _merge_call(runner)
+    return argv[argv.index('--merge') + 1:argv.index('--output')]
+
+
+@pytest.mark.parametrize('stage', sorted(_ABORT_BEFORE_ANYTHING_IS_WRITTEN))
+def test_an_aborted_re_measure_leaves_no_part_behind(tmp_path, two_arms, stage):
+    """arm-two's part is a FAIL row from a previous sweep, so it is correctly
+    re-measured — and the re-measure aborts. The old part must not survive the
+    decision to replace it."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    stale = _write_part(
+        parts_dir, 'arm-two', text=_failed_part('arm-two').model_dump_json(),
+    )
+
+    lms_slate_run.sweep_arms(
+        parts_dir, runner=_FakeRunner(codes=_ABORT_BEFORE_ANYTHING_IS_WRITTEN[stage]),
+    )
+
+    assert not stale.exists()
+
+
+@pytest.mark.parametrize('stage', sorted(_ABORT_BEFORE_ANYTHING_IS_WRITTEN))
+def test_a_stale_part_is_not_merged_into_this_slate(tmp_path, two_arms, stage):
+    """With the stale part gone the merge is handed a SHORT set, so
+    `merge_reports`' coverage check refuses by name and the committed artifact
+    is left intact — the behaviour the README, `run_slate`'s docstring and
+    `part_is_complete`'s "A FAIL ROW IS NOT A RESUME POINT" already promise."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    _write_part(parts_dir, 'arm-two', text=_failed_part('arm-two').model_dump_json())
+    runner = _FakeRunner(
+        codes={**_ABORT_BEFORE_ANYTHING_IS_WRITTEN[stage], ('merge',): 6},
+    )
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert _merged_parts(runner) == [str(parts_dir / 'arm-one.json')]
+    assert code != 0
+
+
+@pytest.mark.parametrize('stage', sorted(_ABORT_BEFORE_ANYTHING_IS_WRITTEN))
+def test_force_over_a_passing_part_has_the_identical_hole(tmp_path, two_arms, stage):
+    """`--force` re-measures an arm whose part is a perfectly good PASS, so the
+    same abort strands a PASSING row of the previous vintage in the merge.
+    `--force` means "measure everything NOW", and a slate assembled half from
+    this run and half from the last is exactly the laundered vintage it is
+    supposed to rule out."""
+    parts_dir = tmp_path / 'parts'
+    stale = _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner(
+        codes={**_ABORT_BEFORE_ANYTHING_IS_WRITTEN[stage], ('merge',): 6},
+        # arm-one is re-measured too and its probe SUCCEEDS, so it writes a
+        # part of this run's vintage — the control that keeps this test about
+        # arm-two's stale file rather than about `--force` emptying the dir.
+        writes={('healthcheck', 'arm-one'): _one_row_report('arm-one').model_dump_json()},
+    )
+
+    code = lms_slate_run.run_slate(
+        parts_dir, tmp_path / 'out.json', force=True, runner=runner,
+    )
+
+    assert not stale.exists()
+    assert _merged_parts(runner) == [str(parts_dir / 'arm-one.json')]
+    assert code != 0
+
+
+def test_a_skipped_arm_keeps_its_part_and_it_reaches_the_merge(tmp_path, two_arms):
+    """The positive control for the SKIP path. Removal belongs on the
+    re-measure path only: an arm skipped on a valid PASS part must keep it, or
+    resuming would delete the very rows it exists to preserve and every resume
+    would end in a coverage refusal."""
+    parts_dir = tmp_path / 'parts'
+    kept = _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner(
+        writes={('healthcheck', 'arm-two'): _one_row_report('arm-two').model_dump_json()},
+    )
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert kept.exists()
+    assert _merged_parts(runner) == [
+        str(parts_dir / 'arm-one.json'), str(parts_dir / 'arm-two.json'),
+    ]
+    assert code == 0
+
+
+def test_a_fail_row_written_by_this_sweep_still_reaches_the_merge(tmp_path, two_arms):
+    """The positive control for VERDICT. `lms_healthcheck` writes its report
+    before returning the verdict's exit code, so a genuinely red arm leaves a
+    real, current row. Dropping it would turn a red slate into a coverage
+    refusal and lose the reason it is red — the artifact is allowed to say
+    FAIL, it is only forbidden to say it about a run that did not happen."""
+    parts_dir = tmp_path / 'parts'
+    runner = _FakeRunner(
+        codes={('healthcheck', 'arm-two'): 1},
+        writes={
+            ('healthcheck', 'arm-one'): _one_row_report('arm-one').model_dump_json(),
+            ('healthcheck', 'arm-two'): _failed_part('arm-two').model_dump_json(),
+        },
+    )
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert _merged_parts(runner) == [
+        str(parts_dir / 'arm-one.json'), str(parts_dir / 'arm-two.json'),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# ...and when the removal ITSELF fails, the driver stops instead of merging
+#
+# Removing the old part is a filesystem mutation, and a filesystem mutation can
+# fail: a read-only mount, an immutable attribute, the path having become a
+# directory.  On failure the stale part survives and `existing_parts` hands it
+# straight back to `--merge` with full manifest coverage — reintroducing the
+# overwrite the removal exists to make impossible.  So the driver must refuse
+# to merge at all when it cannot vouch for an input's VINTAGE.
+#
+# `Path.unlink` is MONKEYPATCHED rather than the file made unwritable by
+# `chmod`: a root-owned test runner ignores permission bits entirely, and the
+# test would silently stop testing anything while still passing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unremovable_arm_two_part(monkeypatch, tmp_path):
+    """arm-two holds a part from a previous sweep whose removal always fails."""
+    parts_dir = tmp_path / 'parts'
+    stale = _write_part(
+        parts_dir, 'arm-two', text=_failed_part('arm-two').model_dump_json(),
+    )
+    real_unlink = Path.unlink
+
+    def refusing_unlink(self, *args, **kwargs):
+        if self == stale:
+            raise OSError(30, 'Read-only file system')
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', refusing_unlink)
+    return parts_dir, stale
+
+
+def test_an_unremovable_part_is_reported_under_a_stage_that_names_the_removal(
+    tmp_path, two_arms, unremovable_arm_two_part,
+):
+    """Not `start`, not `healthcheck`. Blaming a probe stage would send an
+    operator to debug a model that was never loaded, for a fault that is
+    entirely in the parts directory."""
+    parts_dir, stale = unremovable_arm_two_part
+
+    failures = lms_slate_run.sweep_arms(parts_dir, runner=_FakeRunner())
+
+    assert ('arm-two', lms_slate_run.STALE_PART_STAGE, 1) in failures
+    assert lms_slate_run.STALE_PART_STAGE not in ('start', 'wait-ready', 'healthcheck')
+    assert stale.exists()
+
+
+def test_an_arm_whose_part_cannot_be_removed_is_never_started(
+    tmp_path, two_arms, unremovable_arm_two_part,
+):
+    """There is nothing to gain from ~4 minutes of model load for a result that
+    cannot be written into a directory already holding a file hostage."""
+    parts_dir, _ = unremovable_arm_two_part
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    stages = runner.stages()
+    assert ('ctl', 'start', 'arm-two') not in stages
+    assert ('ctl', 'wait-ready', 'arm-two') not in stages
+    assert ('healthcheck', 'arm-two') not in stages
+    # the rest of the sweep is unaffected — one hostage part is not a reason
+    # to stop measuring the arms whose parts are fine.
+    assert ('ctl', 'start', 'arm-one') in stages
+
+
+def test_an_unremovable_part_stops_the_run_before_the_merge(
+    tmp_path, two_arms, unremovable_arm_two_part,
+):
+    """The one case where the driver refuses to merge at all: it cannot vouch
+    for the vintage of a file it would hand `--merge`, and handing it over
+    anyway lets a stale row land in the committed artifact under a merge that
+    reports SUCCESS."""
+    parts_dir, _ = unremovable_arm_two_part
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert ('merge',) not in runner.stages()
+    assert code != 0
+
+
+def test_the_pre_merge_refusal_names_the_arm_and_the_part(
+    tmp_path, two_arms, unremovable_arm_two_part, capsys,
+):
+    """The part is a file a human has to go and deal with, so the refusal has
+    to say which one — an operator who has to grep the journal for the path is
+    being asked to re-derive what the driver already knew."""
+    parts_dir, stale = unremovable_arm_two_part
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=_FakeRunner())
+
+    err = capsys.readouterr().err
+    assert 'arm-two' in err
+    assert str(stale) in err
+
+
+@pytest.mark.parametrize('prewritten, failing_starts, merged', [
+    # zero parts — every arm refused its start, nothing on disk
+    ((), ('arm-one', 'arm-two'), []),
+    # a partial set — arm-one resumes off a valid part, arm-two never starts
+    (('arm-one',), ('arm-two',), ['arm-one.json']),
+])
+def test_the_refusal_keys_on_vintage_and_never_on_completeness(
+    tmp_path, two_arms, prewritten, failing_starts, merged,
+):
+    """The narrowness that stops this becoming a second coverage check. With no
+    removal failure, BOTH an empty and a partial set still reach the merge —
+    the existing `test_zero_parts_still_reaches_the_merge` and
+    `test_a_partial_set_still_reaches_the_merge_rather_than_being_pre_empted`
+    invariants — because those paths still record a refusal, in
+    `merge_reports`' own words and naming the uncovered arms. An unremovable
+    part is the only case that records one ONLY if the driver stops."""
+    parts_dir = tmp_path / 'parts'
+    for arm_id in prewritten:
+        _write_part(parts_dir, arm_id)
+    runner = _FakeRunner(
+        codes={('ctl', 'start', a): 4 for a in failing_starts} | {('merge',): 6},
+    )
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert ('merge',) in runner.stages()
+    assert _merged_parts(runner) == [str(parts_dir / name) for name in merged]
+
+
+# ---------------------------------------------------------------------------
+# a manifest carrying TBD placeholders is refused UP FRONT
+#
+# Measured on this branch, not assumed.  `lms_ctl start` refuses a placeholder
+# before touching the card (exit 4), and `lms_healthcheck --arm <placeholder>`
+# cannot cover it either: `run_healthcheck` reads the VRAM baseline for every
+# arm BEFORE probing, the only writer of a baseline is `lms_ctl start`, so with
+# no start it raises StaleBaselineError -> exit 8 and writes NO file.  The
+# PLACEHOLDER_ARM refusal row therefore never reaches disk, and `merge_reports`
+# refuses without a row for every manifest arm.  So the slate is unassemblable
+# either way -- and the only thing the driver can improve is WHEN it says so.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def one_placeholder(monkeypatch):
+    manifest = _FakeManifest('arm-one', _FakeArm('tbd-arm', is_placeholder=True))
+    monkeypatch.setattr(lms_slate_run, 'load_arms', lambda: manifest)
+    return manifest
+
+
+def test_a_placeholder_manifest_is_refused_before_the_card_is_touched(
+    tmp_path, one_placeholder,
+):
+    """Not after ~30 minutes of sweeping the other arms for an artifact that
+    could never have been written: this is decidable from the manifest alone,
+    before anything starts."""
+    runner = _FakeRunner()
+
+    code = lms_slate_run.run_slate(
+        tmp_path / 'parts', tmp_path / 'out.json', runner=runner,
+    )
+
+    assert code != 0
+    assert runner.calls == []
+
+
+def test_the_placeholder_refusal_names_the_arms_and_the_reason(
+    tmp_path, one_placeholder, capsys,
+):
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json',
+                            runner=_FakeRunner())
+
+    err = capsys.readouterr().err
+    assert 'tbd-arm' in err
+    assert 'arms.yaml' in err
+
+
+def test_the_placeholder_refusal_writes_no_artifact(tmp_path, one_placeholder):
+    """It returns BEFORE the merge -- the one thing that does.  A merge here
+    could only refuse on coverage, and refusing twice explains once."""
+    output = tmp_path / 'out.json'
+
+    lms_slate_run.run_slate(tmp_path / 'parts', output, runner=_FakeRunner())
+
+    assert not output.exists()
+
+
+def test_the_refusal_exit_code_is_the_one_lms_ctl_uses_for_a_bad_manifest():
+    """Pinned to the sibling CLI's vocabulary rather than a fresh literal: a
+    placeholder slate is a manifest problem, and the tools an operator runs
+    side by side should not spell that two different ways."""
+    import lms_ctl
+
+    assert lms_slate_run.EXIT_MANIFEST_ERROR == lms_ctl.EXIT_MANIFEST_ERROR
+
+
+def test_a_manifest_without_placeholders_sweeps_normally(tmp_path, two_arms):
+    """The guard must not fire on the ordinary case -- all seven arms in
+    `arms.yaml` are non-placeholder today."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert ('ctl', 'start', 'arm-one') in runner.stages()
+
+
+def test_placeholder_arm_ids_reads_the_manifest(one_placeholder):
+    assert lms_slate_run.placeholder_arm_ids() == ['tbd-arm']
+
+
+def test_the_committed_manifest_carries_no_placeholder_today():
+    """Not a duplicate of the guard: it records the premise the guard is
+    latent under, so the day an arm goes TBD this file says which behaviour
+    the operator has just moved into."""
+    from lms_manifest import load_arms
+
+    assert [a.arm_id for a in load_arms().arms if a.is_placeholder] == []
+
+
+# ---------------------------------------------------------------------------
+# the CLI surface
+#
+# Two layers, and the split is the guard: the DEFAULT path submits a transient
+# unit, `--in-unit` is what the unit's own payload passes back in.  Without the
+# flag the unit would re-submit itself, recursively.
+# ---------------------------------------------------------------------------
+
+
+class _SubmitRecorder:
+    """Records what the submit layer would run. Nothing is executed."""
+
+    def __init__(self, returncode=0):
+        self.calls: list[list[str]] = []
+        self._returncode = returncode
+
+    def __call__(self, argv: list[str]) -> _FakeCompleted:
+        self.calls.append(list(argv))
+        return _FakeCompleted(self._returncode)
+
+
+def test_a_bare_invocation_submits_the_transient_unit(tmp_path, two_arms):
+    runner = _SubmitRecorder()
+
+    code = lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    assert code == 0
+    assert len(runner.calls) == 1
+    assert runner.calls[0][:2] == ['systemd-run', '--user']
+
+
+def test_a_bare_invocation_does_not_run_the_sweep_in_process(tmp_path, two_arms):
+    """The sweep belongs in the unit. Running it here would be the bare
+    background shell PRD hazard 11 forbids, only worse: in the foreground of
+    whatever session invoked it."""
+    runner = _SubmitRecorder()
+
+    lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    for argv in runner.calls:
+        assert '--arm' not in argv
+        assert 'start' not in argv
+
+
+def test_dry_run_prints_the_compliant_command_and_runs_nothing(
+    tmp_path, two_arms, capsys,
+):
+    runner = _SubmitRecorder()
+
+    code = lms_slate_run.main(
+        ['--dry-run', '--parts-dir', str(tmp_path / 'parts'),
+         '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    assert code == 0
+    assert runner.calls == []
+    out = capsys.readouterr().out
+    assert 'systemd-run' in out
+    assert lms_slate_run.SLATE_UNIT_NAME in out
+
+
+def test_dry_run_is_rejected_under_in_unit_rather_than_ignored(tmp_path, two_arms):
+    """`--in-unit` is handled before the submit layer ever sees `dry_run`, so
+    silently ignoring the flag means a live ~30 minute sweep that starts and
+    stops arms on the card -- the exact opposite of "prints the command and
+    runs nothing"."""
+    runner = _FakeRunner()
+
+    with pytest.raises(SystemExit) as exit_info:
+        lms_slate_run.main(
+            ['--in-unit', '--dry-run', '--parts-dir', str(tmp_path / 'parts'),
+             '--output', str(tmp_path / 'o.json')],
+            runner=runner,
+        )
+
+    assert exit_info.value.code == 2  # argparse usage error
+    assert runner.calls == []
+
+
+def test_the_dry_run_rejection_says_which_flag_to_drop(tmp_path, two_arms, capsys):
+    with pytest.raises(SystemExit):
+        lms_slate_run.main(['--in-unit', '--dry-run'], runner=_FakeRunner())
+
+    err = capsys.readouterr().err
+    assert '--dry-run' in err
+    assert '--in-unit' in err
+
+
+def test_the_echoed_command_pastes_back_into_a_shell(tmp_path, two_arms, capsys):
+    """The echo is the whole point of `--dry-run`, and `' '.join` breaks it:
+    an operator-supplied path with a space in it renders as two arguments, so
+    the printed "compliant command" does not reproduce the invocation."""
+    import shlex
+
+    parts = tmp_path / 'parts dir'
+    output = tmp_path / 'health report.json'
+
+    lms_slate_run.main(
+        ['--dry-run', '--parts-dir', str(parts), '--output', str(output)],
+        runner=_SubmitRecorder(),
+    )
+
+    printed = capsys.readouterr().out.strip()
+    assert shlex.split(printed) == lms_slate_run.slate_argv(
+        parts, output, ready_timeout=lms_slate_run.DEFAULT_READY_TIMEOUT_S,
+    )
+
+
+def test_a_metacharacter_in_a_propagated_value_is_quoted(tmp_path, capsys):
+    """`--setenv=LMS_BASELINE_DIR=...` carries a caller value verbatim; an
+    unquoted `;` or `$` in it would make the printed line do something other
+    than what ran."""
+    import shlex
+
+    argv = lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'o.json',
+        env={'LMS_BASELINE_DIR': '/tmp/base; rm -rf $HOME'},
+    )
+
+    lms_slate_run._submit(argv, dry_run=True)
+
+    assert shlex.split(capsys.readouterr().out.strip()) == argv
+
+
+def test_dry_run_prints_no_follow_hint_for_a_unit_it_never_created(
+    tmp_path, two_arms, capsys,
+):
+    """A `journalctl --user -u lms-slate-run -f` line for a unit that was
+    never created sends an operator to watch nothing, indefinitely."""
+    lms_slate_run.main(
+        ['--dry-run', '--parts-dir', str(tmp_path / 'parts'),
+         '--output', str(tmp_path / 'o.json')],
+        runner=_SubmitRecorder(),
+    )
+
+    assert 'journalctl' not in capsys.readouterr().out
+
+
+def test_a_real_submit_prints_the_follow_hint(tmp_path, two_arms, capsys):
+    lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=_SubmitRecorder(),
+    )
+
+    out = capsys.readouterr().out
+    assert f'journalctl --user -u {lms_slate_run.SLATE_UNIT_NAME} -f' in out
+
+
+def test_the_submit_path_propagates_a_failing_systemd_run(tmp_path, two_arms):
+    """Swallowing this would report a slate run as started when systemd
+    refused it -- e.g. because a unit of the same name is already active."""
+    code = lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=_SubmitRecorder(returncode=1),
+    )
+
+    assert code == 1
+
+
+def test_in_unit_runs_the_sweep_and_does_not_resubmit(tmp_path, two_arms):
+    """The recursion guard: without it, the unit's payload would submit
+    another unit, which would submit another."""
+    runner = _FakeRunner()
+
+    lms_slate_run.main(
+        ['--in-unit', '--parts-dir', str(tmp_path / 'parts'),
+         '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    stages = runner.stages()
+    assert ('ctl', 'start', 'arm-one') in stages
+    assert not any('systemd-run' in argv for argv in runner.calls)
+
+
+def test_in_unit_forwards_the_parts_dir_output_and_ready_timeout(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    output = tmp_path / 'artifact.json'
+    runner = _FakeRunner()
+
+    lms_slate_run.main(
+        ['--in-unit', '--parts-dir', str(parts_dir), '--output', str(output),
+         '--ready-timeout', '7.5'],
+        runner=runner,
+    )
+
+    wait = next(a for a in runner.calls if _stage_key(a)[:2] == ('ctl', 'wait-ready'))
+    assert wait[wait.index('--timeout') + 1] == '7.5'
+    probe = next(a for a in runner.calls if _stage_key(a) == ('healthcheck', 'arm-one'))
+    assert probe[probe.index('--output') + 1] == str(parts_dir / 'arm-one.json')
+    merge = _merge_call(runner)
+    assert merge[merge.index('--output') + 1] == str(output)
+
+
+def test_in_unit_force_re_runs_an_arm_that_has_a_valid_part(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.main(
+        ['--in-unit', '--force', '--parts-dir', str(parts_dir),
+         '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_the_output_defaults_to_the_committed_artifact_path(tmp_path, two_arms):
+    """The whole point is to regenerate THAT file; making an operator retype
+    its path is how a slate run lands somewhere nobody reads."""
+    runner = _SubmitRecorder()
+
+    lms_slate_run.main(['--parts-dir', str(tmp_path / 'parts')], runner=runner)
+
+    argv = runner.calls[0]
+    assert argv[argv.index('--output') + 1] == str(lms_slate_run.DEFAULT_ARTIFACT)
+
+
+def test_the_default_parts_dir_is_absolute_and_needs_no_flag(tmp_path, two_arms):
+    """`systemd --user` propagates no caller environment, so an
+    XDG_RUNTIME_DIR derived on BOTH sides would name two different
+    directories and the resume would silently do nothing. It is resolved once,
+    here in the submit layer, and passed explicitly."""
+    runner = _SubmitRecorder()
+
+    lms_slate_run.main([], runner=runner)
+
+    argv = runner.calls[0]
+    parts_value = argv[argv.index('--parts-dir') + 1]
+    assert parts_value.startswith('/')
+    assert parts_value == str(Path(parts_value).resolve())
+
+
+def test_the_default_parts_dir_prefers_the_runtime_dir(tmp_path):
+    """The property the docstring argues for: parts belong to ONE boot's run,
+    and a tmpfs that empties on reboot says so by construction."""
+    assert lms_slate_run.default_parts_dir(
+        {'XDG_RUNTIME_DIR': '/run/user/1000'},
+    ) == Path('/run/user/1000/lms-slate-parts')
+
+
+def test_the_default_parts_dir_falls_back_to_the_temp_dir(tmp_path):
+    """On a host with no `XDG_RUNTIME_DIR` this fallback is the WHOLE
+    behaviour. It must not be `Path('')`, which would put the parts in the
+    unit's working directory -- the repo root."""
+    assert lms_slate_run.default_parts_dir({}) == (
+        Path(tempfile.gettempdir()) / 'lms-slate-parts'
+    )
+
+
+def test_an_empty_runtime_dir_is_not_treated_as_a_directory():
+    """`''` is not "unset" to `dict.get`, but it is not a directory either;
+    treating it as one would resolve the parts dir to `lms-slate-parts`
+    RELATIVE to wherever the unit happens to be working."""
+    assert lms_slate_run.default_parts_dir({'XDG_RUNTIME_DIR': ''}) == (
+        Path(tempfile.gettempdir()) / 'lms-slate-parts'
+    )
+
+
+def test_the_committed_artifact_is_never_touched_by_the_default_cli_path(two_arms):
+    """Guard on this test suite itself: a bare `main([])` must not be able to
+    write `verification/health-report.json`, whose only legitimate source is a
+    live run on the 3090."""
+    before = lms_slate_run.DEFAULT_ARTIFACT.read_bytes()
+
+    lms_slate_run.main([], runner=_SubmitRecorder())
+
+    assert lms_slate_run.DEFAULT_ARTIFACT.read_bytes() == before

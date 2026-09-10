@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -15,7 +15,6 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.citation_verifier import verify_cited_memories
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
 )
@@ -36,6 +35,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_false_absence_flags,
     filter_stale_bulk_get_statuses_flags,
     filter_stale_count_snapshot_corrections,
+    filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
@@ -87,6 +87,16 @@ STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
+class RequiredSection(NamedTuple):
+    """One payload section every Stage-1 payload builder must emit (task 4708).
+
+    See :attr:`MemoryConsolidator.REQUIRED_SECTIONS` for the inclusion criterion.
+    """
+
+    header: str  # exact markdown header the shipped Stage-1 prompt names
+    renderer: str  # name of the MemoryConsolidator method that renders it
+
+
 async def write_stage1_cycle_summary(
     memory_service: MemoryService,
     project_id: str,
@@ -126,6 +136,36 @@ async def write_stage1_cycle_summary(
 
 class MemoryConsolidator(BaseStage):
     """Stage 1: Review and consolidate memories across Graphiti and Mem0."""
+
+    # ── Inference-bearing payload sections (task 4708) ──────────────────────
+    # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
+    # tells the model to draw an inference from that section's ABSENCE. Today
+    # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
+    # payload, all three signals are False for every task; no live-workflow
+    # suppression applies …". That makes absence load-bearing: a payload builder
+    # that omits the section does not merely produce a terser payload, it makes
+    # the model conclude something FALSE. Every builder therefore renders these
+    # via _render_required_sections() — adding a section is ONE edit here, not
+    # one edit per builder. Enforced by
+    # tests/reconciliation/test_stage1_payload_section_parity.py.
+    #
+    # Replaces the drift mechanism behind three hand-fixed instances of the same
+    # defect — tasks 2150, 2552 and 3839 each wired ONE section into ONE missed
+    # builder after the fact.
+    #
+    # Deliberately NOT registered:
+    #   * _build_task_tree_section — 2 of 3 by design; registering it would dump
+    #     the whole task tree into the findings-only remediation payload.
+    #   * _build_task_count_census_section — 2 of 3 by design; its own contract
+    #     returns '' when task_count_verification is None, which is exactly the
+    #     remediation-pass state, so registering it would be a no-op.
+    #   * _build_project_root_directive — required in all three payloads, but as
+    #     an unconditional directive with NO absence-inference in any prompt, so
+    #     it falls outside this tuple's inclusion criterion. It keeps its own
+    #     dedicated tests instead (task 2552).
+    REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
+        RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
+    )
 
     # Tier limits — set by harness before run(); None until explicitly assigned
     episode_limit: int | None = None
@@ -199,21 +239,13 @@ class MemoryConsolidator(BaseStage):
             resume_session_id=resume_session_id,
         )
 
-        # ── Phantom-citation verification (task 2978) ─────────────────────────
-        # Re-resolve every flagged finding's cited Mem0 memories against the
-        # live store and strip any that no longer exist, so a finding is never
-        # silently backed by an id that never existed (or whose queued
-        # add_memory write later failed).  Placed HERE — right after
-        # super().run() assembles items_flagged (converging BOTH the
-        # RRS-assembled and the structured-output JSON-fallback citation lists,
-        # the latter of which bypasses cite_memory's existence check) and BEFORE
-        # the remediation early-return below — so full AND remediation passes are
-        # both verified and the stage1_* citation stats are always present on
-        # report.stats.
-        _cite_stats = await verify_cited_memories(
-            report.items_flagged or [], self.memory, self.project_id,
-        )
-        report.stats.update(_cite_stats)
+        # Phantom-citation verification (task 2978) used to run here. Task 2979
+        # HOISTED it into BaseStage.run(), which performs it on the shared
+        # items_flagged assembly for all three stages — see the rationale
+        # comment there. The stage1_* citation stats therefore arrive on
+        # report.stats via super().run() above, already present on full AND
+        # remediation passes. Do not re-add a call here: it would double-count
+        # every stage1_* citation stat and double the get_memory_by_id load.
 
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
@@ -448,6 +480,33 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['systemic_pattern_already_tracked_dropped'] = (
                 _before_already_tracked_filter - len(report.items_flagged)
+            )
+            # ── Style-only authorship guard (task 3138): drop ─────────────────────
+            # injection/fabrication flags whose cited entries turn out to have been
+            # written by our OWN agents.  Closes reify esc-5564-1, in which Stage 1
+            # flagged its own earlier consolidator output (agent_id
+            # recon-stage-memory_consolidator) as "possibly injected/fabricated"
+            # purely because the imperative writing style looked foreign — it never
+            # read the stored agent_id.  Provenance comes from
+            # memory.get_memory_by_id, whose metadata is the raw Qdrant payload and
+            # so still carries the top-level agent_id that mem0 promotes out of
+            # metadata on the search/get paths.  Fail-safe: drops only on
+            # positively-confirmed wholly-house authorship; foreign, missing, mixed
+            # or unresolvable provenance all KEEP the flag (and get annotated with
+            # the agent_ids actually checked).  Surfaces the dropped count as
+            # report.stats['style_only_authorship_flags_dropped'].
+            #
+            # Placement before dedup_flags is load-bearing: it is what routes a
+            # dropped flag through the marker-reclaim tail below, so its Stage-2
+            # disposition marker is acknowledged rather than stranded.
+            _before_authorship_filter = len(report.items_flagged)
+            report.items_flagged = await filter_style_only_authorship_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                flags=report.items_flagged,
+            )
+            report.stats['style_only_authorship_flags_dropped'] = (
+                _before_authorship_filter - len(report.items_flagged)
             )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
@@ -972,9 +1031,6 @@ class MemoryConsolidator(BaseStage):
         # 7b. Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
-        # 7c. Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
-        live_workflow_section = self._build_live_workflow_section()
-
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
@@ -997,7 +1053,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1067,9 +1123,6 @@ Review the above data and perform memory consolidation:
         # Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
-        # Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
-        live_workflow_section = self._build_live_workflow_section()
-
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
@@ -1087,7 +1140,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1097,6 +1150,28 @@ Review the above data and perform memory consolidation:
 5. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+
+    def _render_required_sections(self) -> str:
+        """Render every inference-bearing payload section, in registry order.
+
+        Every Stage-1 payload builder MUST interpolate this — enforced
+        structurally by
+        ``tests/reconciliation/test_stage1_payload_section_parity.py``, which
+        discovers the builders by AST introspection so a fourth builder is in
+        scope the day it is added. See :attr:`REQUIRED_SECTIONS` for which
+        sections qualify and why three others deliberately do not.
+
+        Each registered renderer keeps its own conditional-empty contract, so
+        ``''`` is a normal result and keeps the payload tight — that is why this
+        adds no separator of its own. Note the sections DO render on remediation
+        passes: the harness sets ``filtered_task_tree`` there too
+        (``ReconciliationHarness._configure_consolidator``), a measured fact from
+        task 3839 — the remediation call site is not a no-op.
+
+        Adding a section is a single :attr:`REQUIRED_SECTIONS` edit rather than
+        one edit per builder; that is the whole point of routing through here.
+        """
+        return ''.join(getattr(self, section.renderer)() for section in self.REQUIRED_SECTIONS)
 
     def _build_project_root_directive(self) -> str:
         """Return the project_root directive line for payload footers.
@@ -1182,16 +1257,11 @@ Review the above data and perform memory consolidation:
         """Focused payload for remediation runs — findings only, no full data."""
         self._entity_summary_snapshot_lines_stripped = 0
         findings = self.remediation_findings or []
-        # Live-Workflow Signals — parity with assemble_payload / _format_assembled_payload
-        # (task 3839, gate 3833). The harness DOES set filtered_task_tree on remediation
-        # passes (_configure_consolidator, harness.py:3949-3953), so this renders for real;
-        # it is not a no-op. Returns '' when nothing is live, keeping the payload tight.
-        live_workflow_section = self._build_live_workflow_section()
         return f"""## Remediation Run — Stage 1: Targeted Memory Fixes
 ## Project: {self.project_id}
 
 ### Actionable Findings to Remediate ({len(findings)})
-{_format_findings(findings)}{live_workflow_section}
+{_format_findings(findings)}{self._render_required_sections()}
 
 ## Your Task
 This is a focused remediation run. Address ONLY the specific findings listed above:

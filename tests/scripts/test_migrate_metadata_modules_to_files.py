@@ -588,11 +588,12 @@ REJECTION_REPLIES = [
 ]
 
 #: The two shapes the TRANSPORT stamps rather than the tool body — kept in
-#: their own vector because the sibling script's classifier does NOT yet reject
-#: them (see the drift guard at the bottom of this file). Both are NON-EMPTY
-#: dicts with no `error` and no `success` key, so before these checks existed
-#: they reached the success branch: a silent success inside the very predicate
-#: added to abolish silent successes.
+#: their own vector because they entered this predicate later than the four
+#: above and are the shapes the sibling script's classifier USED to accept
+#: (task 4608 closed that by delegation; see the drift guard at the bottom of
+#: this file). Both are NON-EMPTY dicts with no `error` and no `success` key,
+#: so before these checks existed they reached the success branch: a silent
+#: success inside the very predicate added to abolish silent successes.
 TRANSPORT_REJECTION_REPLIES = [
     # `call_tool`'s not-JSON fallback. FastMCP-level failures that never enter
     # an `@mcp_tool_errors`-decorated body — argument validation, the
@@ -609,6 +610,38 @@ def _reply_ids() -> list[str]:
 
 def _transport_reply_ids() -> list[str]:
     return ['raw_unparsed_text', 'mcp_is_error_flag']
+
+
+#: What the SIBLING's second axis must say about each vector above, keyed by
+#: the ids from :func:`_reply_ids` / :func:`_transport_reply_ids`.
+#:
+#: WHY THIS EXISTS. `write_failure_reason` returns a bare `str | None` and has
+#: no need of an `answered` axis, so `classify_reply` RE-SPELLS two of this
+#: predicate's probes — `bool(reply.get('error'))` and
+#: `not reply.get('success', True)` — to compute it. That re-spelling is the
+#: one fragment of the old transcribed twin the delegation could not remove,
+#: and the `.ok` guards below cannot see it drift: they compare only the first
+#: axis. So the expectation is carried per vector here and asserted alongside
+#: `.ok`. If a change to THIS module's marker set — a new structured rejection
+#: key, a narrowed falsy-`success` rule — should have moved `answered`, one of
+#: these goes red, instead of silently shifting `repair_project`'s
+#: SKIP_MISSING-vs-FAILED_LIVE_READ split
+#: (scripts/repair_wiped_metadata_files.py::repair_project). The divergence
+#: direction happens to be fail-safe today; that is luck, not construction, and
+#: this is the construction.
+#:
+#: THE RULE BEING PINNED: True means the server EXPLAINED ITSELF with an
+#: explicit `error` / falsy `success` marker. False means it said nothing
+#: usable — an empty or non-dict reply, or one wearing only a TRANSPORT stamp,
+#: which is the envelope talking rather than the tool body's verdict.
+EXPECTED_ANSWERED = {
+    'lock_charter_error': True,
+    'success_false': True,
+    'empty_dict': False,
+    'non_dict': False,
+    'raw_unparsed_text': False,
+    'mcp_is_error_flag': False,
+}
 
 
 def test_a_rejected_write_is_counted_as_a_failure_not_as_a_migration():
@@ -1196,55 +1229,126 @@ def test_call_tool_leaves_an_ordinary_success_reply_unmarked():
     assert migrate_mod.write_failure_reason(reply) is None
 
 
+def test_clip_passes_a_str_through_unquoted_and_reprs_everything_else():
+    '''THE CANONICAL PIN for `_clip`'s one surprising rule — kept HERE, where it lives.
+
+    `_clip` is this module's, so its operator-facing wording is pinned in this
+    module's tests. The sibling script INHERITS that wording through
+    :func:`write_failure_reason` (scripts/repair_wiped_metadata_files.py::
+    classify_reply delegates to it), and its own truth table deliberately
+    asserts only the COMPONENTS — type named, value present, not `repr`-quoted
+    — so a reword made entirely in THIS file can never turn a test red over
+    there. One place owns the prose; the other owns the decision.
+
+    THE RULE: a `str` goes through AS-IS, everything else through `repr`. That
+    is what makes a non-dict `str` reply read `... str: boom` rather than
+    `... str: 'boom'` — the single wording change task 4608's delegation
+    brought to the repair side, accepted rather than worked around because
+    nothing parses this text and an operator staring at a stringified HTML
+    error page does not need it quoted.
+    '''
+    assert migrate_mod._clip('boom') == 'boom'
+    assert migrate_mod._clip(None) == 'None'
+    assert migrate_mod._clip(['a']) == "['a']"
+
+    # End to end: the wording the predicate actually hands the operator, which
+    # is what the sibling's component assertions are the loose counterpart of.
+    assert migrate_mod.write_failure_reason('boom') == (
+        'server reply was not a dict: str: boom'
+    )
+
+    # The truncation `_clip` exists for, asserted so the pass-through pin above
+    # cannot be read as "the value always survives whole": an unreadable reply
+    # can be an entire HTML error page, and a failure line that scrolls the
+    # real ones off the terminal is its own kind of silence.
+    clipped = migrate_mod._clip('x' * 300)
+    assert clipped.endswith('…')
+    assert len(clipped) == 201
+
+
 # ---------------------------------------------------------------------------
 # Amendment pass: drift guard against the sibling script's copy.
 # ---------------------------------------------------------------------------
 
 
 def test_the_two_reply_classifiers_agree_on_every_shared_shape():
-    """DRIFT GUARD. ``write_failure_reason`` and ``classify_reply`` are twins.
+    """DRIFT GUARD. ``write_failure_reason`` is the one implementation.
 
-    ``scripts/repair_wiped_metadata_files.py:classify_reply`` implements the
-    same four load-bearing checks in the same order, with the same
-    ``error_type`` naming and the same falsy-``success`` rule. Deduplicating
-    them is not available in the obvious direction — repair imports
-    :class:`FusedMemoryClient` FROM this script's module, so importing back
-    would invert the layering — and the reverse (repair delegating to this one)
-    is a change to a file this task holds no lock on.
+    ``scripts/repair_wiped_metadata_files.py::classify_reply`` used to be a
+    TRANSCRIBED TWIN — the same four load-bearing checks in the same order,
+    with the same ``error_type`` naming and the same falsy-``success`` rule.
+    Task 4608 deduplicated them: it now DELEGATES to this function and wraps
+    the ``str | None`` in its own ``ReplyVerdict``. Delegation runs in that
+    direction and not the reverse because repair imports
+    :class:`FusedMemoryClient` FROM this script's module — importing
+    ``classify_reply`` back would make this base module depend on its
+    subclass's module.
 
-    So the copies stay, and this pins them together instead: the house pattern
-    already used for the other deliberate duplicate in this repo
-    (``shared/locking`` vs ``lock_charter_guard.py``, held by explicit equality
-    drift-guard tests). Feed the shared vector through both, assert the
-    verdicts match. Without it, one copy can move and nothing goes red.
+    So this no longer guards a second copy of the cascade; it guards the
+    WRAPPER, which is still repair-side code that could short-circuit ahead of
+    the delegate or mis-map its result. Feed the shared vector through both,
+    assert the verdicts match. Without it, the wrapper can move and nothing
+    goes red. It is also the STABLE CONTROL for task 4608's own change: these
+    shapes were never the drift, so this test stays green throughout.
+
+    BOTH AXES, not just ``ok``. The wrapper still re-spells two of this
+    predicate's probes to compute ``answered`` — the one fragment of the old
+    transcribed twin delegation could not remove — and a guard that compared
+    only ``ok`` would let that fragment drift out from under
+    ``repair_project``'s SKIP_MISSING-vs-FAILED_LIVE_READ split with nothing
+    going red. The per-vector expectations live in :data:`EXPECTED_ANSWERED`.
     """
+    # A vector added later must DECLARE its `answered` expectation rather than
+    # silently opting out of the second axis by not appearing in the table.
+    assert set(EXPECTED_ANSWERED) == set(_reply_ids() + _transport_reply_ids())
+
     for reply, name in zip(REJECTION_REPLIES, _reply_ids(), strict=True):
         assert migrate_mod.write_failure_reason(reply) is not None, name
-        assert classify_reply(reply).ok is False, name
+        verdict = classify_reply(reply)
+        assert verdict.ok is False, name
+        assert verdict.answered is EXPECTED_ANSWERED[name], name
 
     for reply in [{'success': True}, {'id': '9', 'status': 'pending'}]:
         assert migrate_mod.write_failure_reason(reply) is None, reply
-        assert classify_reply(reply).ok is True, reply
+        verdict = classify_reply(reply)
+        assert verdict.ok is True, reply
+        # A reply this predicate accepts is by construction one the server
+        # answered; the wrapper's success arm must not claim otherwise.
+        assert verdict.answered is True, reply
 
 
-def test_the_known_divergence_between_the_two_classifiers_is_pinned_not_assumed():
-    """The drift the guard above cannot fix, recorded as an executable fact.
+def test_the_two_classifiers_now_agree_on_the_transport_stamped_shapes_too():
+    """The drift the guard above could not fix, now closed — and kept red-able.
 
-    This script's classifier is STRICTLY STRICTER than the sibling's: it
-    rejects the two transport-stamped shapes, and ``classify_reply`` still
-    passes them. That is real drift and it is one-directional — the sibling has
-    the hole this amendment closed here.
+    This script's classifier used to be STRICTLY STRICTER than the sibling's:
+    it rejects the two transport-stamped shapes, and ``classify_reply``
+    accepted them, so a script that repairs LIVE task metadata reported both as
+    a repair that never happened. That divergence was pinned here as an
+    executable fact rather than left implicit, precisely so the follow-up would
+    have to flip it instead of changing behaviour silently.
 
-    Pinned rather than left implicit so the follow-up that makes
-    ``classify_reply`` delegate to :func:`write_failure_reason` FLIPS these
-    assertions and is forced to notice, instead of a silent behaviour change in
-    a script that repairs live task metadata. The divergence is safe in the
-    meantime because it is one-way: nothing this script accepts is rejected
-    over there.
+    Task 4608 is that follow-up: ``classify_reply`` now delegates to
+    :func:`write_failure_reason`, so the hole closed by construction and these
+    assertions flipped.
+
+    The vector is KEPT rather than folded into the agreement guard above,
+    because these are the shapes that WERE the hole: this is the executable
+    record that both of them reach the sibling's classifier as FAILURES. A
+    future author who "simplifies" the delegation back into a transcribed copy
+    goes red here as well as in that script's own structural delegation guard
+    (tests/scripts/test_repair_wiped_metadata_files.py::
+    test_classify_reply_delegates_to_the_migrations_predicate_rather_than_restating_it).
     """
     for reply, name in zip(
         TRANSPORT_REJECTION_REPLIES, _transport_reply_ids(), strict=True,
     ):
         assert migrate_mod.write_failure_reason(reply) is not None, name
-        # The DEBT, asserted: the sibling copy still reads these as successes.
-        assert classify_reply(reply).ok is True, name
+        verdict = classify_reply(reply)
+        # The closed hole, asserted: the sibling rejects these too now.
+        assert verdict.ok is False, name
+        # And on the SECOND axis, which the delegate does not compute: a
+        # transport stamp is the envelope talking, not the server explaining
+        # itself, so neither shape may be read as an answer. See
+        # :data:`EXPECTED_ANSWERED` for why this is asserted rather than left
+        # to the wrapper's re-spelled probes.
+        assert verdict.answered is EXPECTED_ANSWERED[name], name

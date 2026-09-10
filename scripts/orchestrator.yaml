@@ -19,7 +19,29 @@
 # scripts/tests/. No --directory, so cwd stays at the worktree root and BOTH
 # relative target paths still resolve. Mirrors the other subprojects'
 # --project <member> convention.
-test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300"
+#
+# Pin --import-mode=importlib EXPLICITLY, do not rely on inheriting it from the
+# root pyproject.toml's addopts (esc-4377-3). The two-directory UNION below is
+# only collision-free under importlib import mode: tests/scripts/ and
+# scripts/tests/ share the basenames conftest.py,
+# test_restart_all_orchestrators.py and test_reviewer_redundancy_diagnostic.py,
+# and neither directory has an __init__.py, so under pytest's default prepend
+# mode the second copy of each basename fails collection with "import file
+# mismatch". The root pyproject.toml DOES set
+# addopts = "--import-mode=importlib ...", but that is not a guarantee this
+# command can lean on: orchestrator.verify::_serial_pytest_str rewrites every
+# pytest invocation to `-p no:xdist -o addopts=` when it re-runs a leg serially
+# (task 2045's shared-venv-mutation recovery, which means to clear `-n auto`),
+# and blanking addopts drops the import mode as COLLATERAL. Measured on this
+# repo: the serial-rewritten command collects 4197 tests + 2 collection errors,
+# rc=2; the same command with --import-mode=importlib restored collects 4218
+# and the suite is 4216 passed / 0 failed. Stating the flag here makes the
+# command self-sufficient under any addopts clearing. The general fix — deriving
+# the serial override from root addopts and stripping only the xdist tokens,
+# per cockpit/tests/test_root_config_smoke_deselection.py::_addopts_without_marker_filter
+# — belongs to _serial_pytest_str and is tracked separately; it would make this
+# flag redundant but not wrong.
+test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300 --import-mode=importlib"
 
 # COVERAGE GAP CLOSED (task 3460, opened and recorded by task 3445). Kept as a
 # closure record rather than deleted, because the reason this is a UNION and

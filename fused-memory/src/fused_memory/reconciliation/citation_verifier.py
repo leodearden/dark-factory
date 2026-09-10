@@ -5,11 +5,13 @@ resolve.** It covers both halves of that invariant *within the current run*, so
 there is one owner rather than two mechanisms that can drift. The closed-run
 half lives next door — see "Where this module stops" below.
 
-Half 1 — recon-report citations (task 2978). ``verify_cited_memories`` walks
-each finding's ``cited_memories`` list and re-resolves every cited Mem0 id
-against the live store, so a finding's claim can never be silently backed by an
-id that does not (or no longer) exist. Its stats carry the ``stage1_`` prefix
-because ``MemoryConsolidator.run()`` merges them into ``report.stats``.
+Half 1 — recon-report citations (task 2978, hoisted in 2979).
+``verify_cited_memories`` walks each finding's ``cited_memories`` list and
+re-resolves every cited Mem0 id against the live store, so a finding's claim can
+never be silently backed by an id that does not (or no longer) exist. Its stats
+carry a caller-supplied ``stageN_`` prefix (``STAGE_STAT_PREFIX``, defaulting to
+``stage1``) because ``BaseStage.run()`` merges them into the running stage's own
+flat ``report.stats`` — for all three stages, not just Stage 1.
 
 Half 2 — task-metadata citations (task 3108). ``find_citation_occurrences`` /
 ``find_live_citation_occurrences`` / ``repoint_metadata`` /
@@ -40,6 +42,21 @@ thing that can reach the finding, and it rewrites the journal blob. It reuses
 this module's lookup primitive and its three-way found/absent/raised verdict on
 purpose, so the two owners cannot disagree about what a backend timeout means.
 
+**Where this module also stops: PROSE** (task 4818). Everything above acts on
+STRUCTURED citations — a finding's ``cited_memories`` list, or a task's metadata
+pointers. A finding's ``description`` and ``suggested_action`` are free text, and
+a fabricated memory UUID embedded *there* is resolved by nothing: the hoist task
+2979 performed widens the structured guard to Stages 2 and 3, it does not widen
+it to prose. That gap is real and has already cost — a fabricated id escaped
+recon Stage-2 run ``ab330f59`` into gate task 4423's description and needed a
+hand-written hygiene note so a reader would not chase it. Task 2979's charter
+asked for the prose scan as items 4 and 5; they were split out to task 4818
+rather than dropped, and 4818 carries the near-miss specimen pair (the fabricated
+and real ids differ only mid-string) plus the requirement that a warning fire
+only on the FABRICATED branch of ``get_memory_by_id``'s three-way contract — a
+two-way found/not-found test would report every deliberately-tombstoned memory as
+a phantom.
+
 **A tombstone is provenance, never a live pointer.** This is the one rationale
 the rest of the module refers back to rather than restating.
 ``X_CITATION_TOMBSTONE_KEY`` records exist precisely to name a dead id (that is
@@ -65,10 +82,21 @@ import logging
 from typing import Any
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
+
+# Which ``stageN_`` prefix each stage's citation counters carry when
+# ``BaseStage.run()`` merges them into that stage's flat ``report.stats``
+# (task 2979). The verifier owns its own stat vocabulary, so the map lives
+# beside the function that emits the names rather than in ``stages/base.py``.
+STAGE_STAT_PREFIX: dict[StageId, str] = {
+    StageId.memory_consolidator: 'stage1',
+    StageId.task_knowledge_sync: 'stage2',
+    StageId.integrity_check: 'stage3',
+}
 
 # The recon-stage caller identity the repoint writes are attributed to.
 # Matches the `recon-stage-` prefix that recon_write_policy scopes on — see
@@ -88,6 +116,8 @@ async def verify_cited_memories(
     findings: list[dict[str, Any]],
     memory_service: Any,
     project_id: str,
+    *,
+    stat_prefix: str = 'stage1',
 ) -> dict[str, int]:
     """Verify each finding's cited Mem0 memories still resolve; drop phantoms.
 
@@ -109,7 +139,31 @@ async def verify_cited_memories(
     false-flag every graphiti citation as a phantom).
 
     Mirrors ``standing_decision_writer.resolve_evidence_refs``'s found/None
-    branching. Returns ``stage1_*`` stats for ``report.stats``.
+    branching.
+
+    Returns three counters for the calling stage's ``report.stats``, named
+    ``<stat_prefix>_phantom_citations_dropped`` / ``_citations_verified`` /
+    ``_citation_verification_errors``. ``stat_prefix`` is caller-supplied
+    because ``BaseStage.run()`` runs this pass for EVERY stage and merges the
+    result into that stage's own flat stats block, where an unprefixed (or
+    wrongly-prefixed) name would collide across stages — pass
+    ``STAGE_STAT_PREFIX[stage_id]``. It defaults to ``'stage1'`` so the
+    Stage-1 key names, and every consumer and assertion pinned to them, stay
+    byte-identical to the task-2978 shape.
+
+    All three keys are ALWAYS present in the dict THIS function returns, on
+    every path, so a caller merging it into ``report.stats`` never needs a
+    ``.get(..., 0)`` fallback. Scoped deliberately to this return value rather
+    than to "every ``StageReport``": whether a given report carries the triple
+    is ``BaseStage.run()``'s contract, not this function's — see the
+    zeroed-triple stamp on its ``start_report_failed`` early return, which is
+    what makes the report-level claim hold on the one path that never calls
+    this function at all.
+
+    Each distinct ``memory_id`` is resolved AT MOST ONCE per call: outcomes are
+    memoised in a per-call cache, so an id cited by N findings costs one point
+    read, not N. The counters are unaffected — they count CITATIONS, not
+    lookups, so a memoised hit increments exactly as a fresh one does.
     """
     # Why re-verify at all, at report-assembly time? Two root causes this pass
     # closes that a cite-time check cannot:
@@ -121,11 +175,41 @@ async def verify_cited_memories(
     #       the cite-time-only check structurally cannot catch (it validates at
     #       cite-time, not at report-assembly-time). This run()-time
     #       re-verification is the only check that closes it.
-    stats = {
-        'stage1_phantom_citations_dropped': 0,
-        'stage1_citations_verified': 0,
-        'stage1_citation_verification_errors': 0,
-    }
+    # Bind the three prefixed key names once, so the increment sites below stay
+    # as readable as the hard-coded literals they replace.
+    dropped_key = f'{stat_prefix}_phantom_citations_dropped'
+    verified_key = f'{stat_prefix}_citations_verified'
+    errors_key = f'{stat_prefix}_citation_verification_errors'
+    stats = {dropped_key: 0, verified_key: 0, errors_key: 0}
+
+    # Per-call memo of each mem0 id's resolution OUTCOME, so an id cited by N
+    # findings costs ONE Qdrant point read instead of N. get_memory_by_id is a
+    # network round trip on the stage's critical path, and task 2979 put this
+    # pass on ALL THREE stages, so the repeat-citation case is now three times
+    # as common as it was.  Values: ('found', None) | ('missing', None) |
+    # ('error', '<ExcTypeName>').
+    #
+    # Scoped to the CALL, never module-level: a longer-lived cache would
+    # reintroduce exactly the stale-read TOCTOU this pass exists to close.
+    # Caching the 'error' outcome too is deliberate — a backend that just
+    # failed for this id will almost certainly fail again within the same
+    # assembly, and re-raising it per citation only hammers a sick store while
+    # producing the identical marker.
+    resolution_cache: dict[Any, tuple[str, str | None]] = {}
+
+    async def _resolve(memory_id: Any) -> tuple[str, str | None]:
+        cached = resolution_cache.get(memory_id)
+        if cached is not None:
+            return cached
+        try:
+            record = await memory_service.get_memory_by_id(project_id, memory_id)
+        except Exception as exc:  # noqa: BLE001
+            outcome: tuple[str, str | None] = ('error', type(exc).__name__)
+        else:
+            outcome = ('found', None) if record else ('missing', None)
+        resolution_cache[memory_id] = outcome
+        return outcome
+
     for finding in findings:
         cited = finding.get('cited_memories') or []
         if not cited:
@@ -154,10 +238,9 @@ async def verify_cited_memories(
                 continue
             memory_id = entry.get('memory_id')
             store = entry.get('store')
-            try:
-                record = await memory_service.get_memory_by_id(project_id, memory_id)
-            except Exception as exc:
-                # A raised backend error is 'unknown', not 'absent': dropping the
+            outcome, error_type = await _resolve(memory_id)
+            if outcome == 'error':
+                # A backend error is 'unknown', not 'absent': dropping the
                 # citation here would itself be a silent-fail (the exact
                 # anti-pattern this fix forbids). KEEP it, surface the
                 # uncertainty via a marker, and never propagate — the stage must
@@ -168,19 +251,19 @@ async def verify_cited_memories(
                         'memory_id': memory_id,
                         'store': store,
                         'reason': 'verification_error',
-                        'error_type': type(exc).__name__,
+                        'error_type': error_type,
                     },
                 )
-                stats['stage1_citation_verification_errors'] += 1
+                stats[errors_key] += 1
                 continue
-            if record:
+            if outcome == 'found':
                 kept.append(entry)
-                stats['stage1_citations_verified'] += 1
+                stats[verified_key] += 1
             else:
                 finding.setdefault('citation_failures', []).append(
                     {'memory_id': memory_id, 'store': store, 'reason': 'memory_not_found'},
                 )
-                stats['stage1_phantom_citations_dropped'] += 1
+                stats[dropped_key] += 1
         finding['cited_memories'] = kept
     return stats
 
@@ -568,11 +651,14 @@ async def repoint_task_citations(
     project would need ``list_tags()`` aggregation. Out of scope here.
 
     Returns a stats dict whose keys are ALWAYS present, on every path. Scalar
-    counters carry the module's ``stage1_*`` prefix (as
-    :func:`verify_cited_memories`'s do), because they are merged into the same
-    flat Stage-1 stats block where an unprefixed name would collide; the
-    detail LISTS (``terminal_citations``, ``unrepointed``) are consumed
-    structurally by the delete gate and stay unprefixed.
+    counters carry a HARD-CODED ``stage1_*`` prefix, because they are merged
+    into the flat Stage-1 stats block where an unprefixed name would collide.
+    Unlike :func:`verify_cited_memories` — which is now per-stage and takes a
+    ``stat_prefix`` — this sweep is genuinely Stage-1-only: it runs from the
+    ``delete_memory`` MCP tool handler's citation-repoint gate, never from any
+    stage's ``run()``, so there is no second stage for it to serve. The detail
+    LISTS (``terminal_citations``, ``unrepointed``) are consumed structurally
+    by the delete gate and stay unprefixed.
     """
     log = log or logger
     stats: dict[str, Any] = {

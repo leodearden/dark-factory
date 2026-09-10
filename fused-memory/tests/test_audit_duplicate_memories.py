@@ -5170,7 +5170,20 @@ def _span_days(earlier: str, later: str) -> float:
 # below read `{sentinel}` no matter what the clauses say. The values are
 # unforgeable for a second reason too: `<` and `>` are outside
 # `_LIVE_FIELD_SCAN_RE`'s bare value class, so no content can produce them.
-_SENTINEL_CORE_FACT = 'status=<sentinel-one>|status=<sentinel-two>'
+#
+# It also names the SAME THREE field names -- `claimant_run_id`,
+# `heartbeat_at`, `status` -- as every real record it is seeded against.
+# `liveness_snapshot_subject_facts`'s field-vocabulary gate only ADDS a
+# clause-derived key when the clause names the SAME field-NAME set as the
+# seeded core_fact, so a sentinel with a narrower vocabulary (`status` alone,
+# say) would close that second gate regardless of what the real record's
+# clauses say, and every assertion below would silently degrade to
+# `{sentinel}` for a FIXTURE reason rather than the behaviour these classes
+# claim to measure.
+_SENTINEL_CORE_FACT = (
+    'claimant_run_id=<sentinel>|heartbeat_at=<sentinel>|'
+    'status=<sentinel-one>|status=<sentinel-two>'
+)
 
 
 class TestLivenessSnapshotSubjectFacts:
@@ -5417,8 +5430,11 @@ class TestLivenessSubjectFactsIsAdditive:
     A record whose union key is COHERENT, like both of these, is now given no
     clause-scoped key at all -- a second guard on the same invariant, and the
     one that keeps grouping from turning on where the author put a full stop.
-    The partial key survives only where it earns its keep, on a DIVERGENT
-    record, and the test below pins that the seed still sits beside it there.
+    A clause key earns a bucket of its own only by naming the record's FULL
+    field vocabulary; a PARTIAL one is dropped everywhere, DIVERGENT record
+    included, and the divergent-record test below pins what survives that
+    drop -- the seed is never swapped out, so its subject keeps the
+    whole-record bucket it would have had anyway.
     """
 
     def _pair(self) -> list[dict]:
@@ -5464,14 +5480,16 @@ class TestLivenessSubjectFactsIsAdditive:
             'invisible -- the group itself is the only observable'
         )
 
-    def test_a_divergent_records_incomplete_clause_keeps_the_seed_beside_it(self):
-        """Where the partial key DOES survive, the seed survives with it.
+    def test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own(self):
+        """An INCOMPLETE clause earns no bucket; the seed is never swapped out.
 
         Task 94's clause here names only `status`; task 96's names all three.
-        The union is a chimera, so clause scoping engages -- and the partial
-        `status=in-progress` is ADDED, not swapped in. Swapping would vacate
-        the whole-record bucket 94 shares with any other record asserting the
-        same chimera, which is the regression this class exists to catch.
+        The union is a chimera, so clause scoping engages -- but 94's clause
+        names a strict SUBSET of the record's field vocabulary, so it earns no
+        clause key of its own (`TestLivenessClauseFragmentFalseGroup` pins the
+        harm this prevents). The invariant this class exists for still holds:
+        the seed is never SWAPPED OUT -- 94 keeps the whole-record union it
+        shares with any other record asserting the same chimera.
         """
         record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
                          category=_OS, metadata={'task_id': '94'})
@@ -5479,9 +5497,14 @@ class TestLivenessSubjectFactsIsAdditive:
         assert extract_liveness_snapshot_fact(record) == _CORE_FACT_DIVERGENT
 
         assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
-            '94': {_CORE_FACT_DIVERGENT, 'status=in-progress'},
+            '94': {_CORE_FACT_DIVERGENT},
             '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
-        }, 'the incomplete clause key sits BESIDE the seed, never in place of it'
+        }, (
+            "94's incomplete clause earns no bucket of its own, but its seed "
+            '-- the whole-record union -- is never swapped out; '
+            "96's clause names the record's full field vocabulary and keeps "
+            'its clause key beside the seed'
+        )
 
 
 # A record whose whole-record key names `status` TWICE -- the chimera that
@@ -5503,6 +5526,14 @@ _CORE_FACT_DIVERGENT = (
     'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
 )
 _CORE_FACT_DONE = 'claimant_run_id=null|heartbeat_at=null|status=done'
+
+# A record whose WHOLE-record key is exactly the one field `status`. Used to
+# show that a clause-scoped key naming only a STRICT SUBSET of its own
+# record's fields must not join this record's bucket -- a collision the
+# whole-record key would never have produced, because it names only that one
+# field to begin with.
+_LIVENESS_WEAK_WHOLE_94 = ('Point-in-time liveness check performed 2026-07-26 '
+                           'on task 94: status="in-progress".')
 
 
 class TestLivenessOneSubjectOneGroupPerMemberSet:
@@ -5929,6 +5960,76 @@ class TestLivenessPartialKeyFalseGroup:
         assert set(disclosure.values()) == {0}, 'and not a counted loss either'
 
 
+class TestLivenessClauseFragmentFalseGroup:
+    """A clause-scoped key built from a FRAGMENT of its record must never
+    manufacture a group the whole-record key could not have produced.
+
+    A clause key naming a STRICT SUBSET of the fields its own record was
+    recognised to speak about is the same "key built from a fragment of what
+    the record asserts" that `_classify_liveness_snapshot`'s survivors-only
+    refusal already forbids at the record level -- just reached through
+    clause scoping instead of an unread field. `liveness_snapshot_recurrences`
+    is an ARMED `higher_is_worse` count, so a false group here is a false
+    accretion signal, not a cosmetic one.
+    """
+
+    def test_a_fragment_clause_key_never_joins_an_unrelated_whole_record_bucket(self):
+        # (a) PREMISE, asserted first: the weak-whole record classifies for
+        # the reason this test needs it to, not because it failed to
+        # classify at all.
+        assert _classify_liveness_snapshot(_LIVENESS_WEAK_WHOLE_94) == (
+            True, 'status=in-progress',
+        ), 'the fixture must reach the collision by classifying cleanly'
+
+        # (b) PREMISE: task 94's clause in the divergent-partial record
+        # earns no clause-derived key of its own (the full projection,
+        # including 96's surviving clause key beside the seed, is pinned by
+        # TestLivenessSubjectFactsIsAdditive::
+        # test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own
+        # -- not re-asserted here). Checking it here too means the corpus
+        # below can only produce (c)'s harm through the unconditional seed,
+        # never a surviving clause key.
+        record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
+                         category=_OS, metadata={'task_id': '94'})
+
+        subject_facts = liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT)
+        assert subject_facts['94'] == {_CORE_FACT_DIVERGENT}, (
+            "94's clause names only `status`, a strict subset of the "
+            "record's {claimant_run_id, heartbeat_at, status} vocabulary, "
+            'so it must earn no clause key of its own'
+        )
+
+        # (c) THE HARM, at the level the ARMED metric counts. D is the
+        # divergent-partial record; W's WHOLE-record key is exactly the one
+        # field `status=in-progress`. D's own RECORD-level vocabulary is
+        # three fields wide -- claimant_run_id, heartbeat_at, status -- but
+        # that width comes entirely from what D says about task 96; D's own
+        # clause about 94 says only `status`, the same one field W's whole
+        # record says. Pre-fix, D's clause key for 94 joined W's
+        # whole-record bucket anyway, because the gate compares against
+        # D's RECORD-level vocabulary, not what is complete for subject 94
+        # specifically (see liveness_snapshot_subject_facts's docstring for
+        # that trade-off).
+        corpus = [
+            _dated('D', _LIVENESS_DIVERGENT_PARTIAL_94, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('W', _LIVENESS_WEAK_WHOLE_94, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            "a subject named in a clause that omits two of its record's "
+            'three fields must not join an unrelated record whose whole '
+            'assertion is that one field'
+        )
+        assert set(disclosure.values()) == {0}, (
+            'the gate drops an ADDED key while the unconditional seed '
+            'stays, so nothing is vacated and no counter moves'
+        )
+
+
 # The plan keys that existed before task 3098. Pinned so an additive change
 # stays additive: no pre-existing key may be dropped or renamed.
 _PRE_3098_PLAN_KEYS = frozenset({
@@ -6144,6 +6245,74 @@ class TestLivenessRecurrenceMetrics:
             corpus_counts={c: len(v) for c, v in records.items()},
             run_stamp='20260731T000000Z',
         ))
+
+
+class TestLivenessRecurrenceMetricsUnderDualKeying:
+    """A corpus that has not changed must not read higher because one
+    subject is now keyed twice over the same members.
+
+    Every fixture in `TestLivenessRecurrenceMetrics` runs the REAL corpus,
+    whose four records are COHERENT -- the divergence gate never opens,
+    dual keying is never exercised, and nothing at the metrics layer guards
+    the number `liveness_snapshot_recurrences` actually reports. This class
+    arms that guarantee: the count is GROUPS PER SUBJECT, not buckets per
+    (subject, key), at the layer the regression alarm actually reads --
+    not just at the detector level
+    (`TestLivenessOneSubjectOneGroupPerMemberSet`).
+    """
+
+    def _fixture(self):
+        # Same shape TestLivenessOneSubjectOneGroupPerMemberSet._divergent
+        # builds, so the detector-level and metrics-level pins exercise one
+        # corpus: two identical divergent records, D1/D2, over subjects
+        # 94 and 96 -- four buckets that collapse to two groups.
+        corpus = [
+            _dated('D1', _LIVENESS_DIVERGENT_94_96, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('D2', _LIVENESS_DIVERGENT_94_96, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        plan = build_sweep_plan(corpus)
+        records = {_OS: corpus, _PK: []}
+        return plan, records, split_plan_by_category(plan, (_OS, _PK))
+
+    def test_plan_level_cluster_count_is_collapsed_too(self):
+        plan, _records, _plans = self._fixture()
+
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2, (
+            'four buckets, two findings -- the plan-level count is '
+            'collapsed too, not just the detector return'
+        )
+
+    def test_the_armed_metric_reads_two_not_four(self):
+        _plan, records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        metric = _by_id(metrics)[f'liveness_snapshot_recurrences.{_OS}']
+
+        assert metric.kind == 'count', (
+            "the docstring's ARMED claim, checked here rather than only "
+            'asserted in prose'
+        )
+        assert metric.direction == 'higher_is_worse'
+        assert metric.value == 2.0, (
+            'one subject keyed twice over the SAME two members must read '
+            'as ONE group, not two'
+        )
+        assert metric.n == 2, 'n is the exposure: the category corpus size'
+
+    def test_details_table_has_no_duplicate_row(self):
+        _plan, records, plans = self._fixture()
+
+        _metrics, details = compute_cluster_metrics(records, plans, {})
+        table = details['categories'][_OS]['liveness_snapshot_recurrences']
+
+        assert len(table) == 2, 'no duplicate row for the human reader'
+        assert len({(row['subject_task_id'], tuple(row['member_ids']))
+                    for row in table}) == 2, (
+            'two distinct (subject, member_ids) pairs -- the other half of '
+            'the harm a structural doubling would cause'
+        )
 
 
 def _liveness_raw_corpus() -> dict[str, list[dict]]:

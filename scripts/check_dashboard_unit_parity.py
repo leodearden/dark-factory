@@ -116,9 +116,15 @@ are split by CLASS, because one rule cannot fit all of them:
 One unit has THREE sites, not two: ``setup-host.sh`` installs
 ``dark-factory-dashboard.service`` by RENDERING
 ``scripts/dashboard.service.template`` (``__REPO_ROOT__`` / ``__UV_PATH__``
-substitution), and only ``cp``s the two watchdog units verbatim — so the
-committed ``dashboard/dark-factory-dashboard.service`` this checker treats as
-truth is not the source of the copy it compares against.  The two repo-side
+substitution, performed by ``scripts/render_dashboard_unit.py`` since task
+4793 — no longer an inline ``sed``), and only ``cp``s the two watchdog units
+verbatim — so the committed ``dashboard/dark-factory-dashboard.service`` this
+checker treats as truth is not the source of the copy it compares against.
+That renderer also PRESERVES the installed copy's host-local ``Environment=``
+values across a re-install, which is why the remediation this report prints
+("run scripts/setup-host.sh") is now safe to follow on a host carrying nine
+aggregation roots; see the DASHBOARD_KNOWN_PROJECT_ROOTS entry in
+``DIVERGENCE_ALLOWLIST`` below.  The two repo-side
 files are held in lockstep by
 ``tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file``,
 which renders the template with setup-host.sh's own substitutions and asserts
@@ -160,7 +166,6 @@ import argparse
 import dataclasses
 import pathlib
 import re
-import shlex
 import sys
 from collections.abc import Sequence
 
@@ -191,7 +196,19 @@ DIVERGENCE_ALLOWLIST: dict[str, str] = {
         "committed one carries this repo only. Value-comparing it would "
         "therefore report drift on every run of a correctly-configured host, "
         "and a gate that is always red gets switched off — taking the "
-        "accidental drift it exists to catch with it."
+        "accidental drift it exists to catch with it. "
+        "SECOND CONSUMER (task 4793): scripts/render_dashboard_unit.py now "
+        "PRESERVES this variable's installed value when setup-host.sh "
+        "re-renders the unit. Its HOST_LOCAL_ENVIRONMENT is the host-local "
+        "SUBSET of this allowlist, not the allowlist itself — the two entries "
+        "here are on it for opposite reasons, and preserving the other one "
+        "would pin the data root at the previous checkout. Held by "
+        "tests/scripts/test_render_dashboard_unit.py::"
+        "test_host_local_environment_is_a_subset_of_the_divergence_allowlist "
+        "and ::test_host_local_environment_excludes_project_root. So editing "
+        "THIS dict has a second blast radius: adding a name here does not make "
+        "it preserved, but removing one that the renderer preserves turns this "
+        "gate red on every correctly-configured host."
     ),
     "DASHBOARD_PROJECT_ROOT": (
         "The dashboard's data root. The committed unit hardcodes "
@@ -462,50 +479,29 @@ def _compare_exec_start_flags(
     return drifts
 
 
-def _environment_map(
-    directives: dict[str, dict[str, list[str]]],
-    section: str,
-) -> dict[str, str]:
-    """Return ``{VAR: value}`` for every ``Environment=`` line in *section*.
-
-    Each LINE is split the way systemd reads it, not the way the simplest
-    parser would: ``Environment=`` accepts SEVERAL space-separated assignments
-    on one line, and values may be quoted.  ``shlex.split`` handles both, so
-    these three spellings all yield ``{A: 1, B: 2}``::
-
-        Environment=A=1 B=2
-        Environment="A=1" "B=2"
-        Environment=A=1
-        Environment=B=2
-
-    Before this used shlex, ``Environment=A=1 B=2`` parsed as the single
-    variable ``A`` with value ``1 B=2``, and ``Environment="A=1"`` produced a
-    variable literally named ``"A``.  Compared against a copy using the
-    one-per-line spelling, either mis-parse invented drift out of a pure
-    reformat — and an unexplainable red on a warn-only gate is exactly how the
-    gate loses the credibility it exists to have.  Neither committed unit uses
-    those forms today; the point is that reformatting one must not fire.
-
-    Each assignment is then split on its FIRST ``=`` — ``A=b=c`` sets A to
-    ``b=c``.  A later occurrence of the same variable wins, matching systemd,
-    which applies the directives in file order.  A token carrying no ``=`` at
-    all is skipped rather than guessed at.
-    """
-    env: dict[str, str] = {}
-    for line in directives.get(section, {}).get("Environment", []):
-        try:
-            tokens = shlex.split(line)
-        except ValueError:
-            # Unbalanced quotes: systemd would reject the line too. Fall back
-            # to the whole line as one token so a malformed value still shows
-            # up as a variable rather than vanishing into silent parity.
-            tokens = [line]
-        for assignment in tokens:
-            name, sep, value = assignment.partition("=")
-            if not sep:
-                continue
-            env[name.strip()] = value
-    return env
+# _environment_map lives in scripts/systemd_unit_parity.py and is RE-EXPORTED
+# here under its existing PRIVATE name, on the same terms as the parser and
+# find_dropins above.  The THIRD lift, and the first whose second consumer is
+# not another checker: scripts/render_dashboard_unit.py must read the INSTALLED
+# unit's Environment= map to preserve this host's host-local
+# DASHBOARD_KNOWN_PROJECT_ROOTS when setup-host.sh re-renders that unit, and a
+# value this checker can SEE has to be exactly a value the installer can
+# PRESERVE -- two readers with two ideas of what an Environment= line means is
+# how the installer silently drops a variable this gate then reports as fine.
+#
+# The renderer deliberately does NOT import this module to get it: the
+# section-8 harness in tests/scripts/test_check_dashboard_unit_parity.py builds
+# a tmp repo where write_checker(body=...) replaces this file with an argparse
+# stub (and with_checker=False omits it entirely), so a renderer importing it
+# would ImportError under the two tests asserting the install still happens
+# when the gate did not run.  Hence DOWN into the shared module, not sideways.
+#
+# Kept under the private name because this suite reads mod._environment_map
+# directly (test_check_dashboard_unit_parity.py's registry-staleness guards),
+# so that surface stays intact and IS the extraction's regression net.
+from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
+    environment_map as _environment_map,  # noqa: F401  (re-exported: read by the test suite)
+)
 
 
 def _compare_environment(

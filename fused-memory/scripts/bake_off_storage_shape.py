@@ -162,7 +162,10 @@ A thick **pure core** (loaders, arm materialization, read transforms,
 metrics, report rendering) with zero network, fully exercised in the merge
 lane, plus a thin **live driver** (``seed_arm`` / ``run_arm`` /
 ``run_bake_off`` / ``_run``) that is the only part touching Qdrant or an
-embedder.
+embedder ON THE LIVE PATH, i.e. absent ``--replay-fetches``.  A replay
+touches neither: ``run_bake_off`` takes its replay short-circuit and returns
+via ``bake_off_storage_shape.py::_replay_bake_off`` before any of the driver's
+substrate contact happens.
 
 WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE (an observation, task 4293)
 ------------------------------------------------------------------------
@@ -188,8 +191,9 @@ a standing exemption for whatever it becomes:
     see ``seed_arm``'s own docstring).  So the capability the preflight probes
     for is not one the seeding path needs.
 
-THE RESIDUAL, stated rather than papered over: ``run_bake_off`` builds a real
-``MemoryService(config)`` and awaits ``memory.initialize()``, which runs
+THE RESIDUAL, stated rather than papered over — and scoped to the LIVE path
+(i.e. absent ``--replay-fetches``): on that path ``run_bake_off`` builds a
+real ``MemoryService(config)`` and awaits ``memory.initialize()``, which runs
 Graphiti startup maintenance — index creation plus the W6-ε dup-uuid-edge
 scan-and-REPAIR — against the production FalkorDB, under no prefix bound at
 all.  That is NOT covered by anything above, and it is not specific to this
@@ -197,6 +201,15 @@ script: no ``run()``-level guard in any of the scripts task 4293 guarded
 dominates ``initialize()`` either, because ``initialize()`` runs before
 ``run()`` is called.  It is a systemic gap tracked by tasks 4318 and 4350, and
 is deliberately not claimed as handled here.
+
+The scoping is a narrowing of the CLAIM, not a weakening of the warning: on a
+live run the residual above applies in full.  It is stated because the
+unqualified form was false in the safe direction — ``run_bake_off`` takes its
+replay short-circuit and returns via
+``bake_off_storage_shape.py::_replay_bake_off`` BEFORE ``MemoryService`` is
+ever constructed, so a replay reaches no ``initialize()`` and inherits none of
+this.  In a file whose whole point is honest disclosure of unprobed
+mutations, overstating one is still drift.
 """
 from __future__ import annotations
 
@@ -4332,24 +4345,100 @@ def _read_fetch_cache(path: str | Path) -> tuple[Path, dict[str, Any]]:
     return target, doc
 
 
-def load_fetch_provenance(path: str | Path) -> dict[str, Any]:
-    """The dump's provenance block — the live-only half of a replayed report.
+@dataclass(frozen=True)
+class FetchCache:
+    """One decode of a cache document, carried to every consumer that needs it.
 
-    Separate from :func:`load_fetches` because the driver needs it BEFORE it
-    has materialized anything (``guard_threshold`` and ``embedder_model`` go
-    into the protocol block), and because reading it must not require the
-    caller to have already built every arm.
+    The committed E2 fixture is a 32k-line JSON document, and the replay path
+    has several consumers that each want a different piece of it — the
+    provenance block for the live-only protocol values, the ``arms`` block
+    for the rankings, and the provenance block AGAIN for the fingerprint,
+    depth and fixture guards.  Threading the decoded document is what keeps
+    that one read rather than one read per consumer.
+
+    Deliberately NOT a path-keyed memo: several tests rewrite the same file
+    between calls, and a cache keyed on the path would serve them stale bytes
+    and silently invert what they assert.  Freshness stays the caller's
+    decision — a new :func:`read_fetch_cache` on a path always re-reads.
     """
-    _, doc = _read_fetch_cache(path)
+
+    path: Path
+    doc: dict[str, Any]
+    provenance: dict[str, Any]
+
+
+def _extract_provenance(target: Path, doc: dict[str, Any]) -> dict[str, Any]:
+    """The provenance block of an already-decoded cache document."""
     provenance = doc.get('provenance')
     if not isinstance(provenance, dict):
         raise FetchCacheError(
-            f'fetch cache at {Path(path)} carries no provenance block, so the '
+            f'fetch cache at {target} carries no provenance block, so the '
             f'guard threshold and embedder model this run was measured at are '
             f'unknown. Defaulting either would feed the threshold replay a '
             f'number the store never produced.'
         )
     return provenance
+
+
+def read_fetch_cache(path: str | Path | FetchCache) -> FetchCache:
+    """Decode a cache document once, or pass an already-decoded one through.
+
+    Idempotent on a :class:`FetchCache` so threading one through a second
+    consumer cannot double-read it — that is the whole point of the type, and
+    a consumer that re-read what it was handed would quietly undo it.
+    """
+    if isinstance(path, FetchCache):
+        return path
+    target, doc = _read_fetch_cache(path)
+    return FetchCache(
+        path=target, doc=doc, provenance=_extract_provenance(target, doc),
+    )
+
+
+def load_fetch_provenance(path: str | Path | FetchCache) -> dict[str, Any]:
+    """The dump's provenance block — the live-only half of a replayed report.
+
+    A convenience accessor for a caller that wants ONLY the provenance and
+    holds nothing else from the cache; it is exactly
+    ``read_fetch_cache(path).provenance``.  It no longer has a production
+    caller: ``_replay_bake_off`` used to reach for it before it had
+    materialized any arm, but it now decodes the document once up front and
+    reads ``.provenance`` off the threaded :class:`FetchCache` instead —
+    which is the point of threading one.  Kept because it names that read for
+    the tests that only want the block, and because it costs one line over
+    the accessor they would otherwise spell out.
+    """
+    return read_fetch_cache(path).provenance
+
+
+def _check_kind_coverage(
+    target: Path, shape: str, kind: str, cached: dict[str, Any],
+    expected: list[str],
+) -> None:
+    """Refuse a cache that is short of the *kind* of ranking being requested.
+
+    Both halves of a cached arm need this, and for the same reason: the
+    consumers index them BARE.  ``measure_arm`` does
+    ``fetched['probes'][cluster_id]``, so an unguarded truncation of the
+    probes half escapes the ``FetchCacheError`` -> exit-3 contract entirely
+    and surfaces instead as an unnamed ``KeyError`` raised from inside the
+    metric code — naming neither the cache nor how to re-dump it.
+
+    Parameterised by *kind* rather than written twice so the two halves
+    cannot drift apart in wording: an operator reading the refusal has to be
+    able to tell a short QUERIES half from a short PROBES half without
+    reading code, which is the whole reason this is a named refusal.
+    """
+    missing = [key for key in expected if key not in cached]
+    if not missing:
+        return
+    raise FetchCacheError(
+        f'fetch cache at {target} is TRUNCATED for shape {shape!r}: '
+        f'{len(missing)} of {len(expected)} requested '
+        f'{kind} have no cached ranking, e.g. {missing[:5]}. '
+        f'Measuring the arm anyway would score it over a subset of '
+        f'the {kind} while the report claimed the whole one.'
+    )
 
 
 def _check_corpus_fingerprint(
@@ -4434,10 +4523,11 @@ def _check_fixture_digests(
 
 
 def load_fetches(
-    path: str | Path,
+    path: str | Path | FetchCache,
     seeded_by_shape: dict[str, SeededArm],
     *,
     expect_query_ids: list[str] | None = None,
+    expect_probe_ids: list[str] | None = None,
     expect_limit: int | None = None,
     expect_fixtures: list[str | Path] | None = None,
 ) -> dict[str, dict[str, dict[str, list[ScoredHit]]]]:
@@ -4453,13 +4543,24 @@ def load_fetches(
     shapes is merely wider than this run needs, but a requested shape it does
     not carry would otherwise be measured as an arm with no queries.
 
-    *expect_query_ids*, *expect_limit* and *expect_fixtures* are the
-    truncation, depth and fixture-drift guards.  All three are opt-in so the
-    pure round-trip tests can exercise the join without a full query set, and
-    all three are supplied by the live driver.
+    *expect_query_ids*, *expect_probe_ids*, *expect_limit* and
+    *expect_fixtures* are the two truncation guards, the depth guard and the
+    fixture-drift guard.  All four are opt-in so the pure round-trip tests can
+    exercise the join without a full query or probe set, and all four are
+    supplied by the live driver.
+
+    The two halves are guarded SEPARATELY because they are separately
+    truncatable and separately consumed: ``measure_arm`` indexes
+    ``fetched['probes'][cluster_id]`` bare, so a probes half checked only via
+    the queries guard would fail as an unnamed ``KeyError`` inside the metric
+    code rather than as this module's named refusal.
+
+    *path* accepts an already-read :class:`FetchCache` as well as a path, so
+    a driver with several consumers decodes the document once and threads it
+    rather than re-parsing it per guard.
     """
-    target, doc = _read_fetch_cache(path)
-    provenance = load_fetch_provenance(path)
+    cache = read_fetch_cache(path)
+    target, doc, provenance = cache.path, cache.doc, cache.provenance
     cached_arms = doc.get('arms')
     if not isinstance(cached_arms, dict):
         raise FetchCacheError(
@@ -4499,17 +4600,16 @@ def load_fetches(
             )
         _check_corpus_fingerprint(target, provenance, shape, seeded)
 
-        cached_queries = block.get('queries') or {}
         if expect_query_ids is not None:
-            missing = [q for q in expect_query_ids if q not in cached_queries]
-            if missing:
-                raise FetchCacheError(
-                    f'fetch cache at {target} is TRUNCATED for shape {shape!r}: '
-                    f'{len(missing)} of {len(expect_query_ids)} requested '
-                    f'queries have no cached ranking, e.g. {missing[:5]}. '
-                    f'Measuring the arm anyway would score it over a subset of '
-                    f'the query set while the report claimed the whole one.'
-                )
+            _check_kind_coverage(
+                target, shape, 'queries', block.get('queries') or {},
+                expect_query_ids,
+            )
+        if expect_probe_ids is not None:
+            _check_kind_coverage(
+                target, shape, 'probes', block.get('probes') or {},
+                expect_probe_ids,
+            )
         replayed[shape] = {
             kind: {
                 key: _rehydrate_ranking(
@@ -5711,7 +5811,12 @@ async def _replay_bake_off(
     the two pass keys are then never requested, which is what keeps a cache
     dumped before this probe existed replayable for the six arms.
     """
-    provenance = load_fetch_provenance(cache_path)
+    # ONE decode of the cache document, threaded to every consumer below.
+    # Its refusals — missing file, bad JSON, wrong schema version, no
+    # provenance block — still fire FIRST and unchanged; they simply fire from
+    # here rather than from inside the first `load_fetches`.
+    cache = read_fetch_cache(cache_path)
+    provenance = cache.provenance
     for key in ('guard_threshold', 'embedder_model'):
         if provenance.get(key) is None:
             raise FetchCacheError(
@@ -5734,9 +5839,18 @@ async def _replay_bake_off(
         )
         for shape in ARM_SHAPES
     }
+    # *probes* is a PARAMETER of this function, so the probe expectation was
+    # available here all along — the queries/probes asymmetry was an omission,
+    # not a missing capability.  An EMPTY *probes* list (no cluster yielded a
+    # probing write) makes this a VACUOUS check rather than a refusal: no
+    # cluster can be missing from an empty expectation.  That is correct, and
+    # is the same shape as `--no-regrowth` rendering an empty `injections`
+    # list rather than a skipped guard — do NOT convert `[]` to `None`.
+    expect_probe_ids = [cluster_id for cluster_id, _probe in probes]
     replayed = load_fetches(
-        cache_path, seeded_by_shape,
+        cache, seeded_by_shape,
         expect_query_ids=[query.query_id for query in queries],
+        expect_probe_ids=expect_probe_ids,
         expect_limit=limit,
         # The same five paths, in the same order, that the protocol block
         # stamps below (:4197-4199) and that the live dump records.
@@ -5781,8 +5895,14 @@ async def _replay_bake_off(
         # which `read_transform_selection` reads) carries no injection digest,
         # and a merged list would make it unloadable for the E2 arms.
         replayed_passes = load_fetches(
-            cache_path, seeded_by_pass,
+            cache, seeded_by_pass,
             expect_query_ids=[query.query_id for query in queries],
+            # For the same reason the fixture expectation is repeated here:
+            # the two calls guard two different sets of rankings and each has
+            # to verify on its own.  `measure_regrowth_arms` forwards the same
+            # *probes* list into `measure_arm`, so an unguarded regrowth pass
+            # has the identical bare-index failure.
+            expect_probe_ids=expect_probe_ids,
             expect_limit=limit,
             expect_fixtures=[DEFAULT_REGROWTH_INJECTION_PATH],
         )

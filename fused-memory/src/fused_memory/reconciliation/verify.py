@@ -17,6 +17,75 @@ logger = logging.getLogger(__name__)
 # than allowed to bloat the audit row's detail JSON.
 _MAX_FAILURE_TOKEN_LEN = 64
 
+# The failure token for a codebase root that is not a usable checkout.
+#
+# This is a CLOSED-VOCABULARY census value: it lands in the `detail` JSON of
+# a `verify|codebase|agent_failed` row (task 4343's audit contract) and is
+# what an operator GROUPs BY in reconciliation.db to size this failure mode.
+# Rename it only together with the dashboards and queries that read it, and
+# never let it become agent-controlled — every other token on this path goes
+# through _as_failure_token precisely because the agent can influence those.
+CODEBASE_ROOT_UNRESOLVED = 'codebase_root_unresolved'
+
+
+# Sub-reasons for a refused root.  They discriminate the populations hiding
+# behind the single CODEBASE_ROOT_UNRESOLVED token: 'no_dot_git' is a real
+# tree that merely is not a checkout ROOT (a monorepo subdirectory, or a
+# project not under git at all) and would refuse that project's every sparse
+# verification forever, which is a wholly different operational story from a
+# path that does not exist.  They ride the WARNING and the summary prose
+# ONLY — the census token stays closed-vocabulary and single-valued so an
+# operator's GROUP BY does not fragment when a sub-reason is added here.
+ROOT_DEFECT_UNRESOLVABLE = 'unresolvable'
+ROOT_DEFECT_MISSING = 'missing'
+ROOT_DEFECT_NOT_A_DIR = 'not_a_dir'
+ROOT_DEFECT_NO_DOT_GIT = 'no_dot_git'
+
+
+def _resolve_codebase_root(root: Path) -> tuple[Path, str | None]:
+    """Resolve ``root`` and say why it is not a checkout the agent can search.
+
+    Returns ``(resolved_root, None)`` when usable, else ``(root, <sub-reason>)``.
+    The resolve lives HERE, inside the guard, rather than at the call site: it
+    is the one step of the pre-flight that can RAISE, so leaving it outside
+    would make this function's fail-closed-by-construction claim true of the
+    checks but not of the pre-flight as a whole.
+
+    Stat-only by design (INV-8): verify() runs on the event loop, so a
+    ``git rev-parse --show-toplevel`` probe — stricter, but a subprocess —
+    is deliberately not used.
+
+    ``.exists()`` and not ``.is_dir()`` on the ``.git`` entry: in a
+    ``git worktree`` checkout — which is how this factory runs every task,
+    and how the non-dark_factory projects this check exists to serve are laid
+    out — ``.git`` is a FILE holding a ``gitdir:`` pointer.  Requiring a
+    directory would refuse exactly that population.
+    """
+    try:
+        resolved = Path(root).resolve()
+    except (OSError, ValueError):
+        # ``Path.resolve()`` RAISES where the stat calls below merely return
+        # False: ValueError('embedded null byte') for a path carrying a NUL,
+        # OSError for a resolution the OS refuses outright.  Since
+        # ``require_project_root`` validates SHAPE only (non-empty +
+        # ``os.path.isabs``), such a path really does reach verify() — and an
+        # exception escaping it would land in targeted.py's generic handler
+        # as a ``verify|codebase|error`` row instead of the structured
+        # refusal PRD D4 requires.  TypeError is deliberately NOT caught: a
+        # non-path argument is a caller bug, not a property of the root.
+        return root, ROOT_DEFECT_UNRESOLVABLE
+
+    # Ordered most-specific-last so the sub-reason names the FIRST thing that
+    # is wrong; each check swallows OSError/ValueError internally and returns
+    # False, so an unreadable path still fails closed.
+    if not resolved.exists():
+        return resolved, ROOT_DEFECT_MISSING
+    if not resolved.is_dir():
+        return resolved, ROOT_DEFECT_NOT_A_DIR
+    if not (resolved / '.git').exists():
+        return resolved, ROOT_DEFECT_NO_DOT_GIT
+    return resolved, None
+
 
 def _as_failure_token(value: object) -> str:
     """Coerce an AgentLoop warning value into a storable failure token.
@@ -57,7 +126,13 @@ class CodebaseVerifier:
     """Spawns an isolated explore agent to verify factual claims against the codebase."""
 
     def __init__(self, config: ReconciliationConfig):
-        self.codebase_root = Path(config.explore_codebase_root).resolve()
+        # PRD D3 (task 4722): NO codebase root is held here.  Reconciliation is
+        # multi-project, and the caller's already-validated ProjectScope is the
+        # single root authority (INV-9) — a root cached on the instance would
+        # be correct for at most one project per process.  `config` survives
+        # because it still carries the AGENT settings (model, provider,
+        # timeouts, max steps); `config.explore_codebase_root` is no longer
+        # read on this path at all.
         self.config = config
 
     async def verify(
@@ -65,9 +140,59 @@ class CodebaseVerifier:
         claim: str,
         context: str = '',
         scope_hints: list[str] | None = None,
+        *,
+        codebase_root: Path,
     ) -> VerificationResult:
-        """Verify a factual claim against the codebase."""
-        codebase_root = self.codebase_root
+        """Verify a factual claim against the codebase rooted at ``codebase_root``.
+
+        ``codebase_root`` is per-call and REQUIRED (keyword-only, no default):
+        the caller supplies the root of the project whose claim this is, and
+        that one value drives the tool closures, their path-escape guards, the
+        prompt, and the agent's cwd.  A default would silently reinstate the
+        process-global root for any caller that forgot the argument.
+
+        This reverses task 2548 item 2, which deleted verify()'s unused
+        ``project_id`` parameter as dead code: the parameter was not the
+        mistake, the missing wiring was — and the thing the verifier actually
+        needs is a filesystem root, not a logical id.
+        """
+        codebase_root, root_defect = _resolve_codebase_root(codebase_root)
+
+        # ── Fail-closed root pre-flight (PRD D4) ───────────────────────────
+        # Refuse BEFORE building any tools or constructing the agent.  The
+        # failure being closed is an agent pointed at the WRONG tree: it
+        # searches, finds nothing, and returns `contradicted` against
+        # genuinely-completed work — so a refusal that happened after the
+        # spawn would not close it at all.
+        #
+        # The refusal rides task 4343's existing audited agent-failure path
+        # unchanged: _on_task_done writes one census-visible
+        # `verify|codebase|agent_failed` row carrying the token, logs the
+        # summary, and writes NO memory.  No new model field, no new branch
+        # in targeted.py.
+        if root_defect is not None:
+            logger.warning(
+                'verification_root_unresolved root=%s reason=%s',
+                codebase_root, root_defect,
+            )
+            return VerificationResult(
+                verdict=VerificationVerdict.inconclusive,
+                confidence=0.0,
+                evidence=[],
+                # Task 1811's human-facing sentinel prefix, the offending
+                # path, and the sub-reason — so an operator grepping
+                # 'agent-failed:' still sees this failure, and can tell both
+                # WHICH root was refused and WHY without re-running anything.
+                # The structured failure_token stays the machine-readable
+                # channel (INV-2) — nothing branches on this prose.
+                summary=(
+                    f'agent-failed:{CODEBASE_ROOT_UNRESOLVED}: '
+                    f'{codebase_root} ({root_defect})'
+                ),
+                git_context=None,
+                agent_failed=True,
+                failure_token=CODEBASE_ROOT_UNRESOLVED,
+            )
 
         tools: dict[str, ToolDefinition] = {}
 
@@ -286,7 +411,7 @@ class CodebaseVerifier:
 {hint_text}
 
 ### Codebase Root
-{self.codebase_root}
+{codebase_root}
 
 Investigate this claim against the codebase and call `verification_complete` with your findings.
 """
@@ -296,6 +421,9 @@ Investigate this claim against the codebase and call `verification_complete` wit
             system_prompt=EXPLORE_AGENT_SYSTEM_PROMPT,
             tools=tools,
             terminal_tool='verification_complete',
+            # The agent explores the TARGET project (task 4722): its cwd, and
+            # so the CLAUDE.md the CLI auto-loads, must be that project's.
+            cwd=codebase_root,
         )
 
         result, _ = await agent.run(prompt)

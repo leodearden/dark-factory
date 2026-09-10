@@ -70,6 +70,37 @@ def _task_targeted_gate(
     return patch.object(LocalRunner, 'run_merge_verify', _patched)
 
 
+def _no_predecessor_interlock():
+    """Disable ``_merger_loop``'s train/predecessor interlock for a scenario.
+
+    ``SpeculativeMergeWorker._await_unadvanced_predecessor`` parks a dequeued
+    train until the previous merge commit has been CAS-advanced, because a
+    train — unlike a single — maps a lost CAS straight to ``blocked`` +
+    ``train_derailed`` with no reverify/retry path.
+
+    Scenarios 2 and 3 freeze their solo INSIDE run_merge_verify and hold it
+    there while asserting; that is a state the production pipeline never
+    produces (a verify that never returns), and the interlock correctly refuses
+    to start the train against it, so the scenario would deadlock.  Their
+    subject is the coalescing pass, not merge ordering — the interlock has its
+    own coverage in
+    ``test_merge_queue_coalesce.py::TestAwaitUnadvancedPredecessor`` and
+    end-to-end in ``::TestCoalesceAfterHealthyMerge``.  Scenario 2 additionally
+    CANNOT be reordered: its solo (ig_s23) overlaps the train tip's file by
+    construction, so if it advanced main first the train's rebase would
+    conflict and the scenario could no longer show a train landing at all.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from orchestrator.merge_queue import SpeculativeMergeWorker
+
+    return patch.object(
+        SpeculativeMergeWorker, '_await_unadvanced_predecessor',
+        AsyncMock(return_value=False),
+    )
+
+
+
 # ─── Scenario 1 ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -436,7 +467,9 @@ class TestScenario2:
         gate_release = asyncio.Event()
         gate_entered = asyncio.Event()
 
-        with _task_targeted_gate('ig_s23', gate_release, gate_entered):
+        with _no_predecessor_interlock(), _task_targeted_gate(
+            'ig_s23', gate_release, gate_entered,
+        ):
             worker_task = asyncio.create_task(worker.run())
 
             await asyncio.wait_for(gate_entered.wait(), timeout=120)
@@ -617,7 +650,9 @@ class TestScenario3:
         gate_release = asyncio.Event()
         gate_entered = asyncio.Event()
 
-        with _task_targeted_gate('ig_s31', gate_release, gate_entered):
+        with _no_predecessor_interlock(), _task_targeted_gate(
+            'ig_s31', gate_release, gate_entered,
+        ):
             worker_task = asyncio.create_task(worker.run())
 
             await asyncio.wait_for(gate_entered.wait(), timeout=120)

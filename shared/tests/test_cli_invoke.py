@@ -4457,7 +4457,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 ['fake'], cwd=tmp_path, env={}, model='opus',
                 timeout_seconds=0.05, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=0.3, absolute_cap_secs=10.0,
+                working_idle_secs=0.3, absolute_cap_secs=20.0,
             )
             wall = _time.monotonic() - t0
 
@@ -4465,22 +4465,27 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         terminate_pg_mock.assert_called_once()
         # idle_bound = max(0.3, 0.05) = 0.3s of no-progress, on top of the ~0.06s
         # growth phase → kill at ~0.36s.  Well past the old 0.05s ceiling (proves
-        # it wasn't killed there) and well under the 10s absolute cap (proves it
-        # wasn't killed there either; widened from 5.0s — task 2723).
+        # it wasn't killed there) and well under the 20s absolute cap (proves it
+        # wasn't killed there either; widened 5.0s → 10.0s in task 2723, then
+        # 10.0s → 20.0s in task 4234 — see the teardown-drift note below).
         assert wall >= 0.2, (
             f'Expected idle-kill at ~0.36s (after progress stalls), '
             f'killed too early at {wall:.3f}s — looks like the old ceiling fired'
         )
-        # Discriminates the correct ~0.36s idle-kill from the WRONG 10.0s absolute
+        # Discriminates the correct ~0.36s idle-kill from the WRONG 20.0s absolute
         # cap. wall additionally captures real post-kill teardown (unmocked
         # snapshot_process_group /proc walk, comm_task cancellation/await, the
-        # second communicate() call, event-loop scheduling), observed to drift to
-        # ~2.5s under heavy host load. 5.0s keeps full discriminating power against
-        # the 10.0s wrong ceiling while tolerating that teardown latency — same
-        # load-drift de-flake shape as the sibling tests in this class (commits
-        # f1aae9678e, fda97df621af, and the grace-not-ceiling fix in this task).
-        assert wall < 5.0, (
-            f'Expected idle-kill well under the 10s absolute cap, got {wall:.3f}s'
+        # second communicate() call, event-loop scheduling), which under a full
+        # parallel verify run drifts far past the kill itself: ~2.5s when this
+        # bound was last widened (519331f59f), then 6.215s observed during task
+        # 4234's verify attempt-1 — with the captured log confirming the watchdog
+        # fired correctly at 0.4s, so every excess second was teardown, not a
+        # missed kill. 10.0s keeps full discriminating power against the 20.0s
+        # wrong ceiling while tolerating that teardown latency — same load-drift
+        # de-flake shape as the sibling tests in this class (commits fda97df621af,
+        # 2b2916a663, 519331f59f).
+        assert wall < 10.0, (
+            f'Expected idle-kill well under the 20s absolute cap, got {wall:.3f}s'
         )
 
     async def test_b6_long_synchronous_tool_call_survives_between_ceiling_and_idle_bound(self, tmp_path):
@@ -4803,10 +4808,11 @@ class TestBackendForwarding:
     async def test_claude_default_shape_unchanged_and_no_backend_kwarg_with_gate(self):
         """Gated-path variant: invoke_claude_agent still gets no `backend` kwarg.
 
-        The forwarding guard (:895-896) sits once, before the no-gate/gate
-        branch, so it should cover both dispatch sites. This confirms the
-        gated cap-retry call site (:928) — not just the no-gate fast path
-        (:907) — actually honors it, and pins the gated call shape (adds
+        The forwarding guard (``if invoke_fn is not None:`` followed by
+        ``invoke_kwargs.setdefault('backend', backend)``) sits once, before
+        the no-gate/gate branch, so it should cover both dispatch sites. This
+        confirms the gated cap-retry call site — not just the no-gate fast
+        path — actually honors it, and pins the gated call shape (adds
         `oauth_token` from the leased slot) so a future change can't silently
         smuggle `backend` in alongside it.
         """

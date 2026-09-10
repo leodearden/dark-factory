@@ -262,6 +262,7 @@ the index reaches `OPERATIONAL` up to 594 ms later. Callers must not treat a suc
 ## Out of scope
 
 - **Any change to entity resolution's name-keyed candidate dict.** `existing_nodes_by_name = {node.name: node …}` (`node_operations.py:311`) is last-one-wins while the prompt answers with a `duplicate_name` *string*, and dark_factory holds **114 exact-duplicate normalized names** (233 nodes). BM25 makes name collisions in the candidate list *more* likely, so this is a real interaction — but it is esc-3375-1 / task 3375's territory, and this PRD must not pre-empt that ruling. Flagged in the cross-PRD table; the investigation evidence should be attached to that escalation.
+  *Deferral discharged 2026-09-01:* esc-3375-1 is ruled (see its resolution — merge as the end-state for graph identity, lossless and deliberate; tasks 4986 → 4987). Provisioning proceeds per this PRD's own gates **after** the gated dedup sitting (task 4987) consumes the duplicate-key evidence; the dependency 3708→4987 is wired in the task graph.
 - Junk-graph cleanup (21 `probe_e1_gw*` pytest-xdist leftovers, `_test_*`, `_probe`) and the
   three-spelling `know_live`/`knowlive`/`know-live` collision — separate task, not gated on this.
 - Re-running the `write_triage` calibration. Its 16-digit thresholds

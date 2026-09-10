@@ -36,7 +36,8 @@ import pytest
 # Duplicating them into the new module instead is what the origin module's own
 # docstring argued against, and for parse_sections it would have produced the
 # THIRD hand-copy in this directory: tests/scripts/test_orchestrator_watchdog.py
-# still carries a private _unit_sections copy of the same six lines.
+# carried a private _unit_sections copy of the same six lines at the time of
+# this decision. Task 3913 later retired that copy in favour of parse_sections.
 #
 # Neither helper carries a test function here (this module holds none); their
 # guards stay in test_orchestrator_service_files.py, which still owns

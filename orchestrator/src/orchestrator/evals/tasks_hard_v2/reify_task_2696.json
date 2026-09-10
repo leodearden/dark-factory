@@ -28,8 +28,10 @@
     "seed": 3631,
     "plan_source": "unavailable",
     "baseline_source": "status_autocommit",
+    "base_is_approximated": true,
+    "base_approximation_reason": "pre_task_commit came from baseline rung 'status_autocommit', not 'merge_first_parent'. Only 'merge_first_parent' yields the task's true branch point (M^1 of its landing merge); every weaker rung is an APPROXIMATION of where the work started, with an error that is unbounded and \u2014 absent a landing merge to measure against \u2014 unknowable. A readout that depends on the base being the real branch point should EXCLUDE this fixture rather than average it in.",
     "task_status": "done",
-    "reference_unavailable": "No single \"Merge task/2696 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+    "reference_unavailable": "No single landing merge for task 2696 exists in /home/leo/src/reify under EITHER accepted subject spelling \u2014 \"Merge task/2696 into main\" or \"Merge task/2696: <subject>\" (SPLIT / direct-landed, or several merges carry this id across the two spellings) \u2014 so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
   },
   "verify_outcome": {
     "source": "unavailable",

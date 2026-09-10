@@ -109,23 +109,50 @@ the same task renamed every PATH-exposed fixture unit to ``orchestrator-fake*``
 :func:`assert_synthetic_units`) — which is why the rename and the guard are one
 defence, not two.
 
+Task 3950 closed the last two exceptions to that claim —
+``scripts/tests/test_restart_orchestrator.py`` and
+``scripts/tests/test_deploy_w11_lane_lifecycle.py``, which task 3799 had to
+leave holding real unit names — so it now holds unqualified across all five
+members of the fake-``systemctl`` family.  HOW, because the mechanism is the
+reusable part: neither was convertible by renaming a constant.  The unit flowed
+SCRIPT → fake → assertion, so a synthetic name would only have broken the
+assertions while closing nothing; ``restart-orchestrator.sh``'s target had to
+become env-overridable (``ORCH_RESTART_UNIT``) FIRST, inverting the flow to
+FIXTURE → script → fake → assertion.  That inversion is the general remedy for
+any future harness in the same position.  THE COST, stated plainly rather than
+left to be rediscovered: retiring those two literals deleted the only pins on
+``restart-orchestrator.sh``'s production default, which is why
+``tests/scripts/test_orchestrator_watchdog.py::test_restart_orchestrator_unit_default_matches_across_tiers``
+exists.  Converting a fixture literal to a synthetic name silently DELETES
+whatever production contract that literal was also carrying — check for one,
+and replace it, before converting.  Finally, the seam in both files is
+``_run_script``, not the fake factory as in the other three harnesses, because
+both fakes parse argv and discard the unit token outright: the name never
+reaches the factory, only the real subprocess.  That divergence is deliberate;
+do not "fix" it back into line with the others.
+
 WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
 deliberately not.  Nine conftests import from this module; the git ceiling and
-the deploy-clock guard are in all nine, while ``_df_no_leaked_drain_processes``
-and task 3799's ``_df_fleet_dir_redirect`` /
-``_df_no_synthetic_heartbeats_in_live_fleet`` are wired only into the ROOT
-conftest (covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are
-exactly the two rootdirs that spawn the drain script — and they are the two the
-incident came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
-``escalation``, ``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) run
-as their own pytest sessions from their own venvs, so the root conftest does not
-reach them: no token is stamped, and ``leaked_drain_processes`` fails CLOSED on
-an absent token, so those sessions report all-clear unconditionally rather than
-falsely.  That is a real gap, not a proof of safety: ``orchestrator`` is the one
-to watch, since ``orchestrator/src/orchestrator/service_restart.py`` is the
-PRODUCTION caller of the drain script and its tests today only assert on config
-strings.  Widening the wiring is a mechanical edit to those seven files and is
-out of task 3798's locked scope; until then, read a green subproject run as
+the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
+wired only into the ROOT conftest (covering ``tests/``) and
+``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
+script, and the two the incident came from.  Task 3799's
+``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
+started on those same two and gained a THIRD in task 3951:
+``orchestrator/tests/conftest.py``, which is the fleet heartbeat's PRODUCER
+rootdir rather than a drain-script spawner (see the next two paragraphs).  Of
+the seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as their
+own pytest sessions from their own venvs, ``orchestrator`` therefore now carries
+the fleet-dir pair and the remaining six carry neither; none carries the
+drain-process guard, so the root conftest does not reach them: no token is
+stamped, and ``leaked_drain_processes`` fails CLOSED on an absent token, so
+those sessions report all-clear unconditionally rather than falsely.  That is a
+real gap, not a proof of safety: ``orchestrator`` was the one to watch, since
+``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller of
+the drain script and its tests today only assert on config strings.  Widening
+the drain-process wiring is a mechanical edit to those seven files and is out of
+task 3798's locked scope; until then, read a green subproject run as
 "unmeasured", never as "no leak".
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
@@ -139,17 +166,50 @@ so an orchestrator test that drives the run loop without setting
 cross-project directory, and with a REAL unit name that
 ``_df_no_synthetic_heartbeats_in_live_fleet`` is deliberately blind to.
 
-Accepted as latent, not safe, on a MEASURED basis: every producer call site in
-``orchestrator/tests/`` today takes an explicit env — both heartbeat-writing
-tests (``test_harness_merge_heartbeat.py``) ``monkeypatch.setenv`` the var first,
-and ``test_fleet_heartbeat.py``'s ``delenv`` case only computes a path and writes
-nothing.  So there is no live leak to fix, and wiring those two fixtures into
-``orchestrator/tests/conftest.py`` is a file outside task 3799's locked scope.
-What would invalidate this: the FIRST orchestrator test that writes a heartbeat
-without an explicit ``ORCH_FLEET_DIR``.  Wire the two fixtures there rather than
-patching that one test — the defect class is "a spawner that forgets", and this
-paragraph exists because the producer's rootdir is where the next forgetful one
-will be written.
+That gap was live, and CLOSED BY TASK 3951 exactly as this paragraph prescribed.
+Task 3799 accepted it as latent on the basis that every producer call site in
+``orchestrator/tests/`` took an explicit env, and named its own invalidation
+condition: the FIRST orchestrator test that writes a heartbeat without an
+explicit ``ORCH_FLEET_DIR``.  That condition was met.  MEASURED:
+``data/fleet/unknown-unit.json`` at mtime 2026-08-10 00:50:32 (esc-3799-6, which
+reproduced the advance INSIDE a ``pytest tests/`` run of this suite) and again
+2026-08-17 02:28:46 during task 3951 — the write comes not from the two
+heartbeat-writing test modules (which do set the var) but from the ~20 modules
+that drive ``harness.run()`` for real and never think about heartbeats at all,
+which is why per-test patching was never the tractable fix.  Worse than inert
+pollution whenever ``ORCH_UNIT`` is set: it is AMBIENT-SET in an
+orchestrator-dispatched agent session (measured: ``orchestrator-dark-factory.service``,
+inherited from the systemd unit), so there the same forgetful test overwrites the
+REAL unit's heartbeat — the file ``scripts/drain_check.py`` and
+``scripts/orchestrator-watchdog.py`` read BY NAME — rather than the inert
+``unknown-unit.json``, and ``_df_no_synthetic_heartbeats_in_live_fleet`` is
+deliberately blind to both.  Task 3951 wired the two fixtures into
+``orchestrator/tests/conftest.py`` rather than patching any one test, because
+the defect class is "a spawner that forgets" and the producer's rootdir is where
+the next forgetful one will be written.  Its own proofs — including the
+producer-side one, that ``resolve_fleet_dir()`` read against the ambient env
+lands in this run's basetemp — live in
+``orchestrator/tests/test_fleet_dir_isolation.py``.
+
+FIFTH DEFENCE — a leaked ``GIT_DIR`` can never redirect a test's git.
+
+Incident 2026-08-31.  ``git -C <path>`` reads as "act on <path>" but ``-C`` only
+changes directory; ``GIT_DIR`` and its siblings SKIP repository discovery, so an
+ambient ``GIT_DIR`` redirects every such call into the repository it names with
+the ``-C`` argument inert.  139 test files here run ``git config user.*`` or
+``git commit`` against a ``tmp_path`` repo; under a leaked ``GIT_DIR`` all 139
+write somewhere else.  Measured in the live checkout: placeholder content
+committed onto ``main`` and ``[user] name=Test email=test@example.com`` plus
+``commit.gpgsign = false`` written into the real ``.git/config``.
+
+This is NOT covered by the first defence, and the two are easy to conflate.  A
+``GIT_CEILING_DIRECTORIES`` ceiling bounds the upward WALK; an explicit
+``GIT_DIR`` never walks, so the ceiling is bypassed rather than weakened
+(verified against real git: ceiling armed at the basetemp AND ``GIT_DIR`` set
+still wrote to the ``GIT_DIR`` repo).  ``_df_git_env_hermetic`` is FUNCTION
+scoped, unlike all four siblings, because its hazard is introduced MID-session
+by another test rather than present at session start — task 4966 measured
+exactly that as a 1-in-3 flake, green standalone and green in its own file.
 
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
@@ -171,6 +231,7 @@ import signal
 import subprocess
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -197,9 +258,13 @@ def fixture_marker(fixture: object) -> Any:
     suite-wide defences needs the same "is it really session-scoped and autouse"
     pin, and the two test roots (``tests/scripts/`` and ``scripts/tests/``)
     cannot import each other's test modules — this module is the one place both
-    already import.  ``tests/scripts/test_deploy_clock_isolation.py`` still
-    carries a private copy that predates this; de-duplicating it onto this
-    symbol is a one-line edit in a file outside task 3799's locked scope.
+    already import.  Every caller now resolves THIS symbol: task 3960 deleted
+    the private copy ``tests/scripts/test_deploy_clock_isolation.py`` carried,
+    and with it a test-module-imports-test-module import in
+    ``test_drain_process_leak_isolation.py``.  That single-definition property
+    is held by ``test_deploy_clock_isolation.py::
+    test_fixture_marker_is_the_shared_one_not_a_local_copy``, so the next time
+    pytest moves its private fixture API there is exactly one place to fix.
 
     ``Any``, not ``object``, is the honest annotation and is load-bearing for the
     type gate: the two :data:`_FIXTURE_MARKER_ATTRS` spellings hang DIFFERENT
@@ -623,6 +688,28 @@ WAIT_PROOF_GRACE_FLOOR_SECS = 30
 # when someone edits it, which the tests here would catch anyway.
 LEAK_SELF_TERMINATION_CEILING_SECS = 90
 
+# The other half of that invariant, from the caller's side: the largest spawn
+# timeout a wait-proving test may use.
+#
+# DERIVED, not chosen. wait_proof_grace_secs(t) = max(FLOOR, ceil(t * MULTIPLIER)),
+# so with the values above t=22 -> 88 <= 90 (legal) and t=23 -> 92 > 90 (illegal).
+# 22 is therefore the largest spawn timeout whose derived grace still lets a
+# poller that escapes its kill expire inside the ceiling. The same arithmetic is
+# already spelled out inline at
+# ``scripts/tests/test_restart_all_orchestrators.py`` for the force-fire test's
+# own ``spawn_timeout = 22``; this constant is what stops the NEXT site
+# re-deriving it by hand -- which is how a grace gets chosen freehand, and how
+# 86 orphan pollers accumulated on 2026-08-06.
+#
+# Unlike LEAK_SELF_TERMINATION_CEILING_SECS above -- documented as DECLARATIVE,
+# with nothing computing from it -- this one IS computed from, so moving either
+# WAIT_PROOF_GRACE_MULTIPLIER or the ceiling must be reflected here.
+# ``tests/scripts/test_drain_process_leak_isolation.py::
+# TestWaitProofGraceSecs::test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits``
+# asserts BOTH that this value is legal and that value+1 is not, so it cannot
+# silently drift out of date in either direction.
+WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS = 22
+
 
 def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
     """The grace a wait-proving test should hand the script it spawns.
@@ -663,6 +750,79 @@ def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
     """
     derived = math.ceil(spawn_timeout_secs * WAIT_PROOF_GRACE_MULTIPLIER)
     return max(WAIT_PROOF_GRACE_FLOOR_SECS, derived)
+
+
+def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
+    """Scale a subprocess budget by host load-per-core, floored and capped.
+
+    The promoted, SHARED form of ``tests/scripts/test_spawn_claude.py``'s
+    module-private ``_load_scaled_grace`` (task 2733, promoted by task 4890).
+    Promoted rather than copied because ``scripts/tests/`` cannot import a
+    ``tests/scripts/`` test module -- the two test roots cannot import each
+    other's modules at all, for the reason already written down at
+    ``tests/scripts/test_orchestrator_watchdog.py::_boundary_run_drain_script``
+    -- and this module is where the cross-root helpers already live.
+
+    THE FLOOR IS THE POINT. An idle host (``loadavg_1min <= cpu_count``) gives
+    ``factor == 1.0`` exactly, and ``max(base, min(cap, ceil(base * 1.0)))``
+    is exactly ``base_secs`` for every ``base_secs <= cap_secs``. So adopting
+    this at an existing call site can only LENGTHEN that site's budget under
+    contention; it can never shorten one, and it cannot slow an unloaded run
+    by so much as a millisecond. That is what makes it safe to swap in under
+    a fixed literal without re-deriving the literal.
+
+    Capped at *cap_secs* so a pathologically loaded host stays bounded, and
+    fails safe to *base_secs* where the platform has no loadavg. Note the
+    ``max``/``min`` ORDER: a *cap_secs* below *base_secs* returns *base_secs*,
+    never the smaller cap, because callers derive caps from unrelated ceilings
+    rather than choosing them above every base.
+
+    That regime is SAFE but INERT, and it WARNS (task 4890 amendment). With
+    ``cap_secs < base_secs`` the ``min`` can never raise the result above the
+    cap and the ``max`` can never let it fall below the base, so the answer is
+    ``base_secs`` at every load: the call site gets exactly zero load
+    protection, which is the opposite of what adopting this function looks
+    like it bought. Returning the safe value SILENTLY would make a
+    mis-derived cap undiscoverable -- the silent-degradation failure this
+    repo's design invariants name -- so a ``RuntimeWarning`` is emitted and
+    the returned value is unchanged. A warning rather than a raise because
+    the regime is REACHABLE by construction, not a programming error: caps
+    here come from unrelated ceilings (a per-test timeout axe, a leak
+    self-termination bound) that a future base may legitimately outgrow, and
+    failing the caller outright would trade an inert budget for a red suite.
+
+    LOAD-PER-CORE, not worker count, is the right signal for the two test
+    roots that use this: they run SERIALLY (no xdist, no random ordering), so
+    the contention that stretches their subprocess spawns is EXTERNAL -- other
+    suites' workers on the same 32-core host. A worker-count heuristic would
+    see nothing and scale by 1.
+
+    Returns an ``int``: callers stringify these budgets into env vars that
+    bash's integer operators compare, and those reject ``30.0`` -- the same
+    constraint :func:`wait_proof_grace_secs` records.
+    """
+    if cap_secs < base_secs:
+        # BEFORE the loadavg read, so the warning does not depend on the
+        # platform having one: the inertness is a property of the two
+        # arguments alone and holds identically on the fail-safe path.
+        warnings.warn(
+            f'load_scaled_grace(base_secs={base_secs}, cap_secs={cap_secs}): '
+            f'cap_secs is BELOW base_secs, so this budget is INERT -- '
+            f'max(base, min(cap, ...)) returns {base_secs} at every load and '
+            f'this call site gets no load protection at all. The value '
+            f'returned is still safe (never shorter than base_secs), which is '
+            f'why this warns instead of raising. Fix by raising cap_secs or '
+            f'lowering base_secs; if the cap is derived from a ceiling the '
+            f'base has outgrown, that ceiling is the thing to revisit.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return base_secs
+    factor = max(1.0, load1 / (os.cpu_count() or 1))
+    return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
 
 
 def _unsafe_pgid_reason(pgid: int) -> str | None:
@@ -774,7 +934,7 @@ def run_in_new_session(
     pgid = p.pid
     try:
         out, err = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as expired:
         _kill_process_group(p, pgid)
         try:
             out, err = p.communicate(timeout=_POST_KILL_DRAIN_SECS)
@@ -782,10 +942,23 @@ def run_in_new_session(
             # Something still holds the pipe open despite the group kill.
             # Give up on the output rather than on the timeout: the caller
             # asked for a bound and gets one.
+            #
+            # Deliberately NOT bound with `as`: Python unbinds an `as` name at
+            # the end of its except block, so reusing the name here would clear
+            # the binding the re-raise below depends on.
             p.kill()
             _release_abandoned_child(p)
             out, err = ('', '') if text else (b'', b'')
-        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+        # `expired.timeout`, not the `timeout` parameter, and not by accident.
+        # The parameter is `float | None`, but typeshed pins both
+        # `TimeoutExpired.__init__(cmd, timeout: float, ...)` and the attribute
+        # `TimeoutExpired.timeout: float` — and reaching this handler already
+        # implies a real timeout was passed, since `communicate(timeout=None)`
+        # never raises. So sourcing it from the caught exception is the honest
+        # narrowing, and is runtime-identical: CPython raises
+        # `TimeoutExpired(self.args, orig_timeout)`. Do not "simplify" it back
+        # to `timeout` — that is a reportArgumentType error (task 3960).
+        raise subprocess.TimeoutExpired(cmd, expired.timeout, output=out, stderr=err) from None
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
@@ -1207,6 +1380,17 @@ def assert_synthetic_units(units: Iterable[str], *, where: str) -> None:
     every one of them and could only be silenced by an exclusion list, which is
     itself the thing that rots.)
 
+    WHEN THE NAME TRAVELS BY ENVIRONMENT rather than by argument, one call at the
+    construction point does not cover the seam -- check the EFFECTIVE value
+    immediately before the spawn as well.
+    ``scripts/tests/test_restart_orchestrator.py::_run_script`` and its
+    ``test_deploy_w11_lane_lifecycle.py`` twin do both: they hand
+    ``restart-orchestrator.sh`` its target through ``ORCH_RESTART_UNIT`` and merge
+    a caller-supplied ``env=`` LAST (so a per-test override wins), which makes the
+    keyword and the environment two independent routes to the same subprocess.
+    Only the second, post-merge check sees both; guarding the keyword alone ships
+    the guard together with a documented way around it.
+
     *where* is the caller's own ``<file>::<factory>`` label. It is required and
     keyword-only because the message is read far from here: a bare "a real unit
     name was used" leaves the reader grepping five files for the seam that fired.
@@ -1283,13 +1467,23 @@ def fleet_dir_redirect_violation_reason(
     ``None`` when the redirect is sound: a non-empty path, inside this run's
     *basetemp*, and neither the live fleet dir nor anything under it.
 
-    THE RULE LIVES HERE, not in the tests, because BOTH test roots must prove
-    their own wiring and each therefore has its own copy of the test function.
-    Two copies of a ~20-line assertion body drift — these two already had, at
+    THE RULE LIVES HERE, not in the tests, because EVERY test root must prove
+    its own wiring and each therefore has its own copy of the test function.
+    Two copies of a ~20-line assertion body drift — the first two already had, at
     birth, in the text of the basetemp message.  Each root keeps the one-line
     test (which is what proves ITS conftest binding is real) and shares the
     comparison and the messages, exactly as ``scripts/tests/`` already reuses
     :func:`deploy_clock_snapshot` rather than re-implementing it.
+
+    BOTH DIRECTIONS, since task 3951: this is the rule a READER's rootdir fails
+    by (``scripts/restart-all-orchestrators.sh``'s ``${VAR:-…}`` default and
+    ``drain_check``, which then decide the real fleet's drain state from other
+    projects' live heartbeats) AND the rule a WRITER's fails by
+    (``orchestrator.fleet_heartbeat.resolve_fleet_dir``, called from
+    ``Harness._write_merge_heartbeat``, reads the same bare ``os.environ`` and
+    falls back to the same default — so an orchestrator test driving the run
+    loop OVERWRITES a live heartbeat).  The messages name both, because the
+    rootdir that trips this rule is as likely to be a producer as a consumer.
 
     Ordered most-specific-first: a value pointing AT the live dir is reported as
     that, not as the generic "outside basetemp" it also happens to be.
@@ -1297,9 +1491,11 @@ def fleet_dir_redirect_violation_reason(
     if not value:
         return (
             f'{_FLEET_DIR_ENV} is {value!r}. Unset AND empty both fall through '
-            "the script's ${VAR:-…} default to the machine-global "
+            "the script's ${VAR:-…} default — and fleet_heartbeat."
+            'resolve_fleet_dir\'s — to the machine-global '
             f'{LIVE_FLEET_DIR}, so a test-spawned drain gate reads other '
-            "projects' LIVE production heartbeats. "
+            "projects' LIVE production heartbeats, and a test that drives the "
+            'harness run loop OVERWRITES one. '
             'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
         )
 
@@ -1310,7 +1506,9 @@ def fleet_dir_redirect_violation_reason(
             f'{_FLEET_DIR_ENV}={resolved} is the live fleet dir {live} (or '
             'inside it). That directory is a MACHINE-GLOBAL, CROSS-PROJECT '
             "rendezvous dir holding seven projects' live orchestrator "
-            'heartbeats. Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+            'heartbeats — read by scripts/drain_check.py and written by '
+            'Harness._write_merge_heartbeat. '
+            'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
         )
 
     basetemp = Path(basetemp).resolve()
@@ -1318,11 +1516,41 @@ def fleet_dir_redirect_violation_reason(
         return (
             f'{_FLEET_DIR_ENV}={resolved} is outside this run\'s basetemp '
             f'{basetemp}. The redirect must land in pytest tmp space, or the '
-            'suite is writing heartbeats somewhere that outlives it. '
+            'suite is reading or writing heartbeats somewhere that outlives it. '
             'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
         )
 
     return None
+
+
+def fleet_dir_redirect_target(
+    existing_value: str | None,
+    basetemp: str | os.PathLike[str],
+) -> Path | None:
+    """The already-sound ``ORCH_FLEET_DIR`` to ADOPT, or ``None`` to create one.
+
+    Defined ON TOP of :func:`fleet_dir_redirect_violation_reason`: adopt
+    *existing_value* exactly when that rule finds no violation in it. One rule,
+    not two -- a second copy of the soundness test would drift, and adoption is
+    the one place where accepting a value the tests reject would silently undo
+    the whole defence.
+
+    WHY ADOPTION EXISTS (task 4398): :func:`_df_fleet_dir_redirect` is
+    session-scoped AND autouse, and each test root's conftest binds its own
+    copy. A session collecting two roots runs BOTH instances; without adoption
+    each unconditionally ``mktemp``s and overwrites the env var, so the root
+    whose fixture ran first yields a path that no longer matches
+    ``ORCH_FLEET_DIR`` and its per-root identity assertion fails. One basetemp
+    per session, so "inside this run's basetemp" is well-defined for the check.
+
+    A value from a PREVIOUS session is not adopted: it lands outside this run's
+    basetemp, which the rule already refuses.
+    """
+    if not existing_value:
+        return None
+    if fleet_dir_redirect_violation_reason(existing_value, basetemp) is not None:
+        return None
+    return Path(existing_value)
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -1363,8 +1591,60 @@ def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     absent rather than setting an empty string — an empty ``ORCH_FLEET_DIR`` is
     not "unset" to a ``${VAR:-…}`` default, so leaking one would fall straight
     through to the production path, i.e. be its own bug.
+
+    IDEMPOTENT ACROSS TEST ROOTS (task 4398).  Each root's conftest binds its own
+    copy of this session-scoped fixture, so a session collecting two roots runs
+    both.  When :func:`fleet_dir_redirect_target` says the value already set is
+    sound for this run, this instance ADOPTS it and touches neither ``mktemp``
+    nor ``os.environ`` — otherwise the second instance to run would overwrite the
+    env var out from under the first, leaving the first yielding a path the var
+    no longer holds (which is exactly the failure 4398 reported), and its
+    teardown would then pop a value the owning instance still needs.
+
+    Adoption is NOT the weakening the paragraph above warns against, and the
+    distinction is precise: it is gated on the value already satisfying the very
+    rule every one of these tests asserts, so it can never accept something
+    :func:`fleet_dir_redirect_violation_reason` would reject.  All three
+    properties survive it — hermeticity (the adopted value is inside this run's
+    basetemp and is not the live dir), the per-root PROOF (each root's test still
+    takes this fixture BY NAME, so deleting a conftest binding still fails
+    collection), and per-call ``env=`` overrides still winning.
+
+    WHAT THE RULE CHECKS IS THE PATH, NOT THE FILESYSTEM, so the adopting branch
+    re-establishes the "directory is CREATED" contract itself with an idempotent
+    ``mkdir`` (task 4890 amendment) rather than trusting that whoever set the
+    variable had already made the directory.  A second soundness test here would
+    drift from :func:`fleet_dir_redirect_violation_reason`; simply making the
+    directory cannot, and is a no-op in the ordinary case where the owning
+    instance ``mktemp``'d it.
+
+    NOT gated on an ownership flag, deliberately.  The failure such a flag would
+    guard — some unrelated code leaving a basetemp-internal value behind for this
+    to inherit — needs that value to be present when this SESSION-scoped fixture
+    first runs, i.e. set by another root's instance of this very fixture, which
+    is the case adoption exists for.  A module-global flag would add mutable
+    process state whose own correctness then needs pinning, in exchange for
+    refusing a value that already satisfies the shared rule.  The branch is
+    instead proven end-to-end, in a real two-root session, by
+    ``tests/scripts/test_fleet_dir_isolation.py::TestTheAdoptBranchHoldsInARealSession``.
     """
     saved = os.environ.get(_FLEET_DIR_ENV)
+    adopted = fleet_dir_redirect_target(saved, tmp_path_factory.getbasetemp())
+    if adopted is not None:
+        # Another root's instance already established a sound redirect for this
+        # session. Yield IT and touch os.environ NOT AT ALL: creating a second
+        # dir here would overwrite the env var out from under the instance that
+        # owns it, and popping it on teardown would strip a value that instance
+        # still needs.
+        #
+        # The one thing this branch does do is make the directory, because
+        # fleet_dir_redirect_target rules on the PATH and cannot know whether it
+        # exists -- see the docstring. Idempotent, and a no-op for the owning
+        # instance's mktemp'd dir.
+        adopted.mkdir(parents=True, exist_ok=True)
+        yield adopted
+        return
+
     fleet_dir = tmp_path_factory.mktemp('fleet-dir')
     os.environ[_FLEET_DIR_ENV] = str(fleet_dir)
     try:
@@ -1500,3 +1780,100 @@ def _df_no_synthetic_heartbeats_in_live_fleet():
         reason = leaked_fleet_heartbeat_reason(new)
         if reason is not None:
             pytest.fail(reason, pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+# Ambient git redirection (incident 2026-08-31)
+# ---------------------------------------------------------------------------
+
+# The vars that retarget git WITHOUT walking anywhere. Deliberately NARROW:
+# only names that change WHICH repository (or which config) a command acts on.
+# Identity vars (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change
+# what a commit says, never where it lands, and tests legitimately set them for
+# determinism.
+#
+# GIT_CEILING_DIRECTORIES is NOT here and must never be: it is the first
+# defence's own mechanism (:func:`_df_git_ceiling_at_basetemp`), so scrubbing it
+# would disarm the guard above this one.
+_GIT_REDIRECT_ENV = (
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE',
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_SYSTEM',
+    'GIT_CONFIG_COUNT',
+)
+
+# `git -c` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0, ...),
+# so they cannot be enumerated by name.
+_GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+
+
+def git_redirect_env(env: Iterable[str]) -> list[str]:
+    """The names in *env* that would retarget git away from the path it is given.
+
+    Pure and total over the key set, so the fixture below and any harness
+    building a subprocess env can share one definition of "redirecting" instead
+    of maintaining two lists that drift.
+    """
+    return sorted(
+        key for key in env
+        if key in _GIT_REDIRECT_ENV
+        or key.startswith(_GIT_REDIRECT_ENV_PREFIXES)
+    )
+
+
+@pytest.fixture(autouse=True)
+def _df_git_env_hermetic():
+    """FIFTH DEFENCE — a leaked ``GIT_DIR`` can never redirect a test's git.
+
+    Incident 2026-08-31.  ``git -C <path>`` READS as "act on <path>", but ``-C``
+    only changes directory: ``GIT_DIR`` and its siblings SKIP repository
+    discovery outright, so a single ambient ``GIT_DIR`` silently redirects every
+    such call into whatever repository it names, with the ``-C`` argument inert.
+    139 test files in this repo run ``git config user.*`` / ``git commit``
+    against a ``tmp_path`` repo they created; under a leaked ``GIT_DIR`` all 139
+    write to the leaked repository instead.  Measured outcome in the live
+    checkout: placeholder content committed onto ``main``, and ``[user] name=Test
+    email=test@example.com`` plus ``commit.gpgsign = false`` written into the real
+    ``.git/config`` -- the literal values from one harness's tmp-pinned fixture.
+
+    WHY THE FIRST DEFENCE DOES NOT COVER THIS, since the two look alike and one
+    is directly above the other.  ``GIT_CEILING_DIRECTORIES`` bounds the upward
+    WALK of repository discovery.  An explicit ``GIT_DIR`` never walks, so the
+    ceiling is not weakened by the leak -- it is bypassed entirely.  Verified
+    against real git before this fixture was written: with the ceiling armed at
+    the basetemp AND ``GIT_DIR`` set, ``git -C <under-basetemp> config
+    user.email`` still wrote to the ``GIT_DIR`` repo.  The two defences cover
+    disjoint halves of "git acted on a repo the caller did not name", and
+    neither subsumes the other.
+
+    FUNCTION scope, diverging from all four siblings, and the divergence is the
+    whole point.  Their hazard is ambient state present when the session STARTS,
+    which a session-scoped fixture fixes once.  This one's hazard is a leak
+    introduced MID-SESSION -- task 4966 measured it as a 1-in-3 flake that is
+    green standalone and green when its own file runs alone, i.e. produced by an
+    earlier test in the same process mutating ``os.environ`` and not restoring
+    it.  A session-scoped scrub would run before that leaker and close nothing.
+    The cost objection those siblings answer does not apply: this is a handful of
+    dict lookups with no subprocess and no filesystem access.
+
+    Restores the pre-test value EXACTLY on teardown, including restoring absence
+    by deleting the key.  That keeps the fixture a shield rather than a cleaner:
+    a test that deliberately sets ``GIT_DIR`` for its own subprocess still sees
+    it, and a leak is contained to the test that produced it instead of being
+    silently repaired (which would hide the leaker from task 4966's hunt).
+    """
+    saved = {key: os.environ[key] for key in git_redirect_env(os.environ)}
+    for key in saved:
+        del os.environ[key]
+    try:
+        yield
+    finally:
+        for key in git_redirect_env(os.environ):
+            del os.environ[key]
+        os.environ.update(saved)

@@ -348,17 +348,14 @@ tasks:
       paths:
       - fused-memory/src/fused_memory/server/tools.py
       expect: present
-  - name: briefing-threads-caller-identity
-    binding: capability→consumer (wired) — the briefing assembler's mcp_call already
-      holds agent_id = claude-task-{id}-{role} (orchestrator/src/orchestrator/agents/briefing.py);
-      zeta's edit is purely additive per PRD §8's sequence note with 3131/iota-vocab
-    verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: caller_(agent|task)_id
-      paths:
-      - orchestrator/src/orchestrator/agents/briefing.py
-      expect: present
+  # 2026-08-30 (D12-A, gate esc-3212-3, Leo-ruled): removed the stale
+  # `briefing-threads-caller-identity` descriptor here — task 3212's live
+  # metadata.delivered_checks no longer carries it (that capability moved to
+  # task 3659 per the 2026-08-05 memory-briefing-and-fusion amendment). Hand-edited,
+  # not regenerated: commit_planning only copies sidecar -> task one way, so
+  # re-decomposing this PRD would RE-STAMP this stale check back onto 3212
+  # against a file it is now forbidden to touch. Do not "fix" this class of
+  # drift via regeneration.
   - name: writer-instructions-name-caller-params
     binding: INV-5 — _MEMORY_INSTRUCTIONS (orchestrator/src/orchestrator/agents/roles.py:218)
       documents passing the caller params, and a pinning assertion ties that prose

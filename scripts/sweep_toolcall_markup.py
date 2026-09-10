@@ -366,8 +366,8 @@ class ResolvedTarget(NamedTuple):
     #: The ``os.path.realpath``-resolved file. THIS is what ``os.replace``
     #: must land on. Landing on the LINK instead would replace it with a
     #: regular file and re-fork the lane and meta-root copies — the esc-5205-9
-    #: stale-plan divergence ``plan_tools._atomic_write_plan`` documents at
-    #: line 715.
+    #: stale-plan divergence ``TaskArtifacts._write_json`` documents
+    #: (orchestrator/src/orchestrator/artifacts.py).
     write_path: Path
 
 
@@ -1070,9 +1070,10 @@ def round_trips(raw: str, obj: Any) -> bool:
     time rather than asserted once in a test.
 
     It also fail-safes any hand-edited or unusually-formatted file for free.
-    Reusing ``plan_tools._atomic_write_plan`` was rejected for the same reason:
-    it stamps ``_schema_version`` and re-indents, which would put changes in
-    the diff that the corrupted strings did not cause.
+    Reusing ``TaskArtifacts.write_plan`` — the single plan.json writer — was
+    rejected for the same reason: it stamps ``_schema_version`` and re-indents,
+    which would put changes in the diff that the corrupted strings did not
+    cause.
     """
     return serialize_like(raw, obj) == raw
 
@@ -1117,7 +1118,8 @@ class WriteFailure(NamedTuple):
 def _target_file_mode(path: Path) -> int | None:
     """The target's current permission bits, or ``None`` if it does not exist.
 
-    Mirrors ``plan_tools._target_file_mode``. Without this the swapped-in file
+    Mirrors ``orchestrator.artifacts._existing_mode``. Without this the
+    swapped-in file
     inherits ``mkstemp``'s 0600 and the record silently becomes unreadable to
     every other process that shares the queue directory.
     """
@@ -1137,7 +1139,7 @@ def write_repaired(
     is either its old bytes or its new bytes — never a mixture, and never
     truncated.
 
-    The ordering is load-bearing and follows ``plan_tools._atomic_write_plan``:
+    The ordering is load-bearing and follows ``TaskArtifacts._write_json``:
 
     1. ``mkstemp`` in the RESOLVED TARGET'S OWN DIRECTORY — ``os.replace`` is
        only atomic within a filesystem, so a ``/tmp`` scratch file would

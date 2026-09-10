@@ -756,3 +756,165 @@ class TestSpeculationControllerLedgerRouting:
         await controller.acquire_for_lookahead()
 
         assert controller.snapshot()['slot_available'] == ledger.slot_available
+
+
+# ---------------------------------------------------------------------------
+# can_coalesce: the retro-coalescing gate (merge-train-coalesce-gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCanCoalesceGate:
+    """``SpeculationController.can_coalesce`` — the gate that replaced
+    ``is_idle()`` at ``merge_queue.py::SpeculativeMergeWorker._merger_loop``'s
+    retro-coalescing call site.
+
+    Regression context: ``is_idle()`` additionally required ``spec_base is
+    None``, and ``_merger_loop`` ends EVERY successful merge with a look-ahead
+    that leaves ``spec_base`` (queue non-empty) or ``pending_spec_base`` (queue
+    dry) set.  ``take_prefetched()`` clears ``prefetched`` but not
+    ``spec_base``, and ``on_dequeue()`` — the only other clearer on the success
+    path — is skipped exactly when a prefetched item was in hand.  So
+    ``is_idle()`` was permanently False while merges kept SUCCEEDING, and the
+    coalescer was reachable only after a merge that produced no merge commit
+    (``on_abort``/``on_transfer_terminal``) or on a worker's sterile first
+    iteration.  Every assertion below states the gate in terms of healthy
+    operation; none of them permits a failed merge as the opener.
+    """
+
+    def _make_ledger_and_controller(self, depth: int):
+        from orchestrator.merge_speculation_controller import (
+            PermitLedger,
+            SpeculationController,
+        )
+
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+        controller = SpeculationController(ledger=ledger, depth=depth)
+        return ledger, controller
+
+    async def test_fresh_controller_is_coalesce_eligible(self) -> None:
+        _, controller = self._make_ledger_and_controller(1)
+
+        assert controller.can_coalesce() is True
+
+    async def test_consumed_prefetch_is_coalesce_eligible_despite_stale_spec_base(
+        self,
+    ) -> None:
+        """THE defect pin.  Replay the merger loop's healthy steady state: a
+        successful merge, a look-ahead that found the next item, then that item
+        being consumed at the top of the following iteration.  ``spec_base``
+        survives (it is the base the consumed item merges against) — and the
+        gate must NOT read that as work in progress.
+
+        The paired ``is_idle()`` assertion is what makes this test fail against
+        the pre-fix behaviour: the old gate saw exactly this state and shut.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'PRED_MERGE_SHA')
+
+        assert controller.take_prefetched() is next_req
+
+        assert controller.spec_base == 'PRED_MERGE_SHA'
+        assert controller.can_coalesce() is True
+        # The condition the old gate tested — and why it never opened.
+        assert controller.is_idle() is False
+
+    async def test_prefetched_item_still_in_hand_is_not_coalesce_eligible(
+        self,
+    ) -> None:
+        """A look-ahead item that has been popped out of the lane buffers but
+        not yet consumed as the loop's ``req`` is invisible to the candidate
+        scan and not yet armed on the request-liveness ledger.  No train may
+        form while it is merely in hand.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        controller.on_lookahead_found(_make_pending_request('next'), 'SHA')
+
+        assert controller.can_coalesce() is False
+
+    async def test_armed_late_arrival_attach_is_not_coalesce_eligible(self) -> None:
+        """``on_lookahead_pending`` arms a task-1862 ATTACH: the very next
+        dequeue may attach to the predecessor's merge commit.  Gate stays shut
+        while that predecessor is genuinely in flight.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        predecessor = _make_pending_request('pred')
+        controller.on_lookahead_pending('PRED_MERGE_SHA', predecessor)
+
+        assert predecessor.result.done() is False
+        assert controller.can_coalesce() is False
+
+    async def test_drained_predecessor_reopens_the_gate(self) -> None:
+        """The drained-predecessor relaxation, mirroring ``on_dequeue``'s
+        condition (d): once the predecessor's result Future is done,
+        ``on_dequeue`` would take the FALLBACK branch anyway, so the pending
+        state is vestigial and must not keep the gate shut.
+
+        Note the predecessor drains with a SUCCESSFUL outcome — the gate opens
+        on a healthy merge completing, not on one failing.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        predecessor = _make_pending_request('pred')
+        controller.on_lookahead_pending('PRED_MERGE_SHA', predecessor)
+        assert controller.can_coalesce() is False
+
+        predecessor.result.set_result(MergeOutcome('done'))
+
+        assert controller.can_coalesce() is True
+
+    async def test_pending_base_without_a_predecessor_is_not_coalesce_eligible(
+        self,
+    ) -> None:
+        """Defensive: ``pending_spec_base`` set with no ``pending_predecessor``
+        is an inconsistent state the controller never produces on its own
+        (the pair is set/cleared in lockstep).  Read it as "attach armed,
+        liveness unknown" and keep the gate shut rather than guessing.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        controller.pending_spec_base = 'PRED_MERGE_SHA'
+        controller.pending_predecessor = None
+
+        assert controller.can_coalesce() is False
+
+    async def test_gate_opens_every_iteration_of_an_all_successful_run(self) -> None:
+        """The regression this task exists to prevent: NO merge in the
+        sequence fails, and the gate must still be open at each iteration's
+        coalesce point.
+
+        Replays four back-to-back healthy iterations of ``_merger_loop`` with a
+        non-empty queue — merge succeeds, ``on_transfer``, look-ahead finds the
+        next item, next iteration consumes it — and asserts the gate is open
+        every time.  ``on_abort``/``on_transfer_terminal`` (the merge-produced-
+        no-commit paths that were the ONLY openers before the fix) are never
+        called.
+        """
+        ledger, controller = self._make_ledger_and_controller(1)
+        # Iteration 1: sterile start — the one case that used to work.
+        assert controller.can_coalesce() is True
+
+        for i in range(4):
+            # merge succeeded → hand the item to the verifier
+            transferred = controller.on_transfer()
+            if transferred is not None:
+                # Stand in for the verifier draining the speculative item and
+                # releasing its permit — without this the depth-1 slot is never
+                # returned and the look-ahead below blocks forever.
+                ledger.release(transferred)
+            # → look-ahead, queue non-empty
+            await controller.acquire_for_lookahead()
+            controller.on_lookahead_found(
+                _make_pending_request(f'next{i}'), f'MERGE_SHA_{i}',
+            )
+            # → next iteration consumes the prefetched item
+            assert controller.take_prefetched() is not None
+            assert controller.can_coalesce() is True, (
+                f'gate shut at iteration {i + 2} of an all-successful run '
+                f'(spec_base={controller.spec_base!r}) — the coalescer is '
+                f'reachable only when merges FAIL'
+            )
+            assert controller.is_idle() is False
