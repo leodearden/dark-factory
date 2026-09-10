@@ -19,6 +19,7 @@ import dataclasses
 import enum
 import logging
 import types
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -27,8 +28,10 @@ from shared.merge_state import MergeState
 
 from escalation.git_authority import (
     GitAuthorityOutcome,
+    GitAuthorityVerdict,
     TaskMetadataResult,
     found_on_main_response,
+    probe_landing,
     task_metadata,
 )
 
@@ -253,3 +256,283 @@ class TestTaskMetadataResult:
         hand-construction ergonomic, so the common healthy case reads cleanly.
         """
         assert TaskMetadataResult(metadata={}).unavailable is False
+
+
+# ---------------------------------------------------------------------------
+# probe_landing — the extracted tier itself.
+#
+# Every case below runs with NO create_server and NO request_id, which IS
+# ζ's user-observable signal.  The stub shapes are LIFTED from
+# ``test_merge_status_git_authority.py`` rather than reinvented, so there is
+# one stub vocabulary for this tier and not two.
+#
+# HAZARD carried over from that module's ``_stub_git_ops`` docstring: any NEW
+# sub-method the real code starts calling must be given a default here, or it
+# raises inside the fire-safe wrapper and every case silently degrades to
+# ``no_signal`` — which looks like a passing guard.  That is why each test
+# below asserts POSITIVELY on its expected outcome instead of merely
+# asserting "not found_on_main".
+# ---------------------------------------------------------------------------
+
+_MAIN = 'm' * 40
+
+
+def _probe_git_ops(**overrides: Any) -> types.SimpleNamespace:
+    stub = types.SimpleNamespace(
+        resolve_branch_sha=AsyncMock(return_value=None),
+        is_ancestor=AsyncMock(return_value=False),
+        find_merge_marker=AsyncMock(return_value=None),
+        find_task_citation_commit=AsyncMock(return_value=None),
+        commit_effect_present_in_main=AsyncMock(return_value=True),
+    )
+    for name, fn in overrides.items():
+        setattr(stub, name, fn)
+    return stub
+
+
+def _ancestor_git_ops(
+    *, tip: str, citation: str | None = None, effect_present: bool = True,
+) -> types.SimpleNamespace:
+    return _probe_git_ops(
+        resolve_branch_sha=AsyncMock(
+            side_effect=lambda b: tip if b.startswith('task/') else _MAIN
+        ),
+        is_ancestor=AsyncMock(return_value=True),
+        find_task_citation_commit=AsyncMock(return_value=citation),
+        commit_effect_present_in_main=AsyncMock(return_value=effect_present),
+    )
+
+
+def _marker_git_ops(
+    *, marker: str | None, predates_base: bool = False, effect_present: bool = True,
+) -> types.SimpleNamespace:
+    return _probe_git_ops(
+        resolve_branch_sha=AsyncMock(return_value=None),   # branch ref gone
+        is_ancestor=AsyncMock(return_value=predates_base),
+        find_merge_marker=AsyncMock(return_value=marker),
+        commit_effect_present_in_main=AsyncMock(return_value=effect_present),
+    )
+
+
+def _config(tmp_path: Path, *, commit_citation_pattern: str | None = None) -> Any:
+    from orchestrator.config import (  # type: ignore[reportMissingImports]
+        GitConfig,
+        OrchestratorConfig,
+    )
+    return OrchestratorConfig(
+        project_root=tmp_path,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees',
+            commit_citation_pattern=commit_citation_pattern,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+class TestProbeLanding:
+    """The tier, called directly — no MCP server, no request_id."""
+
+    async def test_ancestor_arm_accept(self, tmp_path: Path) -> None:
+        verdict = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
+            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            '900',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        assert verdict.merge_sha == 'c' * 40, 'merge_sha is the CITATION commit on main'
+        assert verdict.arm == 'ancestor'
+
+    async def test_marker_arm_accept(self, tmp_path: Path) -> None:
+        verdict = await probe_landing(
+            _marker_git_ops(marker='d' * 40),
+            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            '801',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        assert verdict.merge_sha == 'd' * 40
+        assert verdict.arm == 'marker'
+
+    async def test_ancestor_effect_absent_is_landed_unconfirmed(
+        self, tmp_path: Path
+    ) -> None:
+        """THE MEASURED 95.4% COMMON CASE, and the reason both outcomes exist.
+
+        A citing commit was FOUND on main — git positively established this
+        branch's work landed — and only effect-survival failed.  Reporting
+        that as ``no_signal`` would claim we know nothing, which is false.
+        """
+        verdict = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False),
+            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            '901',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
+        assert verdict.reason == 'effect_absent'
+        assert verdict.evidence_sha == 'c' * 40
+        assert verdict.merge_sha is None, 'merge_sha is for ACCEPTED landings only'
+
+    async def test_ancestor_no_citation_is_landed_unconfirmed(
+        self, tmp_path: Path
+    ) -> None:
+        verdict = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation=None),
+            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            '3031',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.merge_sha is None
+
+    async def test_marker_effect_absent_is_landed_unconfirmed(
+        self, tmp_path: Path
+    ) -> None:
+        verdict = await probe_landing(
+            _marker_git_ops(marker='d' * 40, effect_present=False),
+            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            '803',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
+        assert verdict.arm == 'marker'
+        assert verdict.evidence_sha == 'd' * 40
+        assert verdict.merge_sha is None
+
+    @pytest.mark.parametrize(
+        'git_ops,task,label',
+        [
+            (
+                _ancestor_git_ops(tip='b' * 40, citation='c' * 40),
+                {'metadata': {'branch_base_sha': 'b' * 40}},
+                'degenerate branch — tip still at its creation point',
+            ),
+            (
+                _probe_git_ops(
+                    resolve_branch_sha=AsyncMock(return_value='a' * 40),
+                    is_ancestor=AsyncMock(return_value=False),
+                ),
+                {'metadata': {}},
+                'branch present but not an ancestor of main',
+            ),
+            (
+                _probe_git_ops(resolve_branch_sha=AsyncMock(return_value=_MAIN)),
+                {'metadata': {}},
+                'branch sitting at exactly main HEAD',
+            ),
+            (
+                _marker_git_ops(marker=None),
+                {'metadata': {}},
+                'branch deleted, no merge marker found',
+            ),
+            (
+                _marker_git_ops(marker='d' * 40, predates_base=True),
+                {'metadata': {'branch_base_sha': 'b' * 40}},
+                'marker PREDATES branch_base_sha',
+            ),
+        ],
+        ids=['degenerate', 'not_ancestor', 'at_main_head', 'no_marker', 'predates_base'],
+    )
+    async def test_genuinely_no_knowledge_paths_are_no_signal(
+        self, tmp_path: Path, git_ops: Any, task: Any, label: str
+    ) -> None:
+        """No landing was ESTABLISHED on any of these — nothing to be
+        unconfirmed about.
+
+        The predates-veto case is the sharpest: a marker belonging to a
+        PREVIOUS incarnation of a reused task id is evidence about a
+        different run entirely, so dressing it up as ``landed_unconfirmed``
+        would assert a landing this task never made.
+        """
+        verdict = await probe_landing(
+            git_ops, _config(tmp_path), _harness(task=task), '800',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, label
+        assert verdict.merge_sha is None, label
+
+    async def test_is_fire_safe(self, tmp_path: Path) -> None:
+        """A git fault degrades to the honest ``no_signal``, never propagates.
+
+        The wrapper lives INSIDE probe_landing so leaf η inherits the
+        fire-safety instead of having to re-add it.
+        """
+        verdict = await probe_landing(
+            _probe_git_ops(
+                resolve_branch_sha=AsyncMock(side_effect=RuntimeError('git exploded')),
+            ),
+            _config(tmp_path), _harness(task={'metadata': {}}), '905',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal
+
+    async def test_metadata_unavailable_is_threaded_onto_the_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """THE G7 PAYLOAD, and it can only be pinned here.
+
+        merge_status fails open identically whether the metadata read
+        succeeded-and-found-nothing or failed outright, so the distinction is
+        invisible through the MCP tool.  The two runs below differ ONLY in
+        that one's scheduler raises: the outcome is identical and the flag is
+        not.
+        """
+        healthy = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
+            _config(tmp_path), _harness(task={'metadata': {}}), '906',
+        )
+        faulted = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
+            _config(tmp_path), _harness(raises=True), '906',
+        )
+
+        assert healthy.outcome is faulted.outcome, (
+            'precondition: the fault must not change the OUTCOME, only the flag'
+        )
+        assert healthy.metadata_unavailable is False
+        assert faulted.metadata_unavailable is True
+
+
+class TestGitAuthorityVerdict:
+    def test_is_frozen(self) -> None:
+        verdict = GitAuthorityVerdict(outcome=GitAuthorityOutcome.no_signal)
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            verdict.merge_sha = 'x' * 40   # type: ignore[misc]
+
+
+def test_module_does_not_statically_import_orchestrator() -> None:
+    """THE LAYERING CONSTRAINT, pinned directly rather than trusted to a comment.
+
+    escalation/pyproject.toml declares no orchestrator dependency; the reverse
+    import resolves at runtime only because the escalation server is hosted
+    inside the orchestrator process.  Hoisting it to module level would turn
+    today's graceful Tier-4 degradation into a server-CONSTRUCTION failure —
+    a fail-open becoming a fail-closed, silently, on a refactor.
+
+    Checked in a FRESH subprocess because this test session has orchestrator
+    imported already, so an in-process ``sys.modules`` check would pass
+    vacuously.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        'import sys; import escalation.git_authority; '
+        "print(any(m == 'orchestrator' or m.startswith('orchestrator.') "
+        'for m in sys.modules))'
+    )
+    out = subprocess.run(
+        [sys.executable, '-c', probe],
+        capture_output=True, text=True, check=True,
+    )
+
+    assert out.stdout.strip() == 'False', (
+        f'escalation.git_authority must not import orchestrator at module '
+        f'level; got {out.stdout.strip()!r}'
+    )
