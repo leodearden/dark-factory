@@ -236,6 +236,34 @@ def test_events_outside_the_trailing_window_are_not_sampled(tmp_path, anchor):
     assert sample.span_days < rab.SAMPLE_WINDOW_DAYS
 
 
+def test_an_ancient_long_invocation_does_not_inflate_the_inflight_term(
+    tmp_path, anchor
+):
+    """(d) The IN-FLIGHT term is scoped to the SAME trailing window.
+
+    The sibling above seeds its ancient row with a 1-second duration, so it
+    pins only the downtime side and would stay green with an unbounded
+    ``MAX(duration_ms)``. Here the ancient row is a 40-HOUR completion — far
+    longer than anything in the recent corpus — and the term must ignore it:
+    one long-retired invocation would otherwise sit in the maximum forever,
+    ratcheting the bound up instead of letting it re-derive, and the sample
+    would report a term drawn from outside the ``span_days`` it advertises.
+    """
+    step = timedelta(minutes=5)
+    rows = _filler(rab.MIN_SAMPLE_TASKS, start=anchor, step=step)
+    recent_max_ms = 3 * 3600 * 1000
+    rows.append(_completed(anchor + timedelta(hours=20), recent_max_ms, 'done'))
+    ancient = datetime.now(UTC) - timedelta(days=rab.SAMPLE_WINDOW_DAYS + 30)
+    rows.append(_completed(ancient, 40 * 3600 * 1000, 'done'))
+    db = _make_db(tmp_path / 'runs.db', rows)
+
+    sample = rab.observed_resume_age_inputs(db)
+    assert sample is not None
+    assert sample.inflight_max_secs == recent_max_ms / 1000
+    # ...and the out-of-window row is not counted as a measured sample either.
+    assert sample.inflight_rows == rab.MIN_SAMPLE_TASKS + 1
+
+
 def test_sample_reports_what_was_actually_measured(tmp_path, anchor):
     """(e) Both maxima travel with their sample sizes and span.
 
@@ -304,13 +332,6 @@ def test_default_runs_db_path_is_env_overridable(tmp_path, monkeypatch):
 # CONSTRUCTION, the exact comparison the live guard makes is shown to fail for
 # a too-small bound and clear for an adequate one.
 # ---------------------------------------------------------------------------
-
-# The 2026-09-07 measurement recorded in resume_age_bound.RESUME_AGE_SAFETY_FACTOR's
-# provenance block, in seconds. Named here only as the reference point the
-# anti-inflation clamp doubles; re-derive from the block, never from these.
-_MEASURED_INFLIGHT_SECS = 32_052.087   # 8.90 h
-_MEASURED_DOWNTIME_SECS = 205_149.466  # 56.99 h
-
 
 def _known_corpus(tmp_path: Path, anchor: datetime, *, inflight: timedelta,
                   downtime: timedelta) -> rab.ResumeAgeSample:
@@ -418,20 +439,22 @@ def test_shipped_default_is_reachable_by_a_plausible_fleet():
     """
     shipped = SessionResumeConfig().absolute_resume_age_secs
     required_at_doubled = rab.required_absolute_resume_age_secs(
-        2 * _MEASURED_INFLIGHT_SECS,
-        2 * _MEASURED_DOWNTIME_SECS,
+        2 * rab.MEASURED_INFLIGHT_SECS,
+        2 * rab.MEASURED_DOWNTIME_SECS,
         rab.RESUME_AGE_SAFETY_FACTOR,
     )
     assert required_at_doubled > shipped, (
-        f'a fleet with a {2 * _MEASURED_INFLIGHT_SECS / 3600:.1f} h max '
-        f'in-flight duration and {2 * _MEASURED_DOWNTIME_SECS / 3600:.1f} h '
+        f'a fleet with a {2 * rab.MEASURED_INFLIGHT_SECS / 3600:.1f} h max '
+        f'in-flight duration and {2 * rab.MEASURED_DOWNTIME_SECS / 3600:.1f} h '
         f'max downtime requires {required_at_doubled} s but '
         f'absolute_resume_age_secs is {shipped} s — the shipped bound is now '
         'so large that no realistic fleet can trip the live derived-bound '
         'guard, which makes that guard vacuous. Either the bound was raised '
-        'far beyond its derivation, or these reference terms need re-deriving '
-        'from a fresh measurement (see the RESUME_AGE_SAFETY_FACTOR '
-        'provenance block in orchestrator/src/orchestrator/resume_age_bound.py).'
+        'far beyond its derivation, or the reference terms need re-deriving '
+        'from a fresh measurement — they are '
+        'resume_age_bound.MEASURED_INFLIGHT_SECS / MEASURED_DOWNTIME_SECS '
+        f'(measured {rab.MEASUREMENT_DATE}), read from the module rather than '
+        'copied here so one re-derivation updates one place.'
     )
 
 
@@ -518,9 +541,12 @@ def test_absolute_resume_age_is_derived_from_live_runs_db():
         '  1. orchestrator/src/orchestrator/config.py  '
         'SessionResumeConfig.absolute_resume_age_secs default (+ its '
         'description, which quotes the derived value)\n'
-        '  2. orchestrator/src/orchestrator/resume_age_bound.py  the '
-        'RESUME_AGE_SAFETY_FACTOR provenance block (measurement date, both '
-        'terms, requirement, margin, trip point)\n'
+        '  2. orchestrator/src/orchestrator/resume_age_bound.py  '
+        'MEASUREMENT_DATE, MEASURED_INFLIGHT_SECS and MEASURED_DOWNTIME_SECS '
+        '(the anti-inflation clamp doubles those two, so a re-derivation that '
+        'skips them leaves the clamp calibrated off the old fleet), plus the '
+        'RESUME_AGE_SAFETY_FACTOR block that reads off them (requirement, '
+        'margin, trip point)\n'
         '  3. orchestrator/tests/test_config.py  '
         'TestSessionResumeConfig::test_defaults\n'
         '  4. OPERATIONS.md  the session-resume subsection of §14\n'
