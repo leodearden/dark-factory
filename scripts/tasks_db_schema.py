@@ -35,14 +35,22 @@ checking that function layers on top.
 """
 from __future__ import annotations
 
+import argparse
 import sqlite3
 import subprocess
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-from _task_db_scan import tasks_db_path
+from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
 
 _GIT_TIMEOUT_SECS = 30
+
+EXIT_OK = 0
+# "I could not read a store", numbered as Tier 2/3 of _task_db_scan number
+# their own nothing-was-read exit.
+EXIT_UNREADABLE = 2
 
 
 class MainCheckoutUnresolved(Exception):
@@ -181,3 +189,91 @@ def introspect(conn: sqlite3.Connection) -> tuple[Table, ...]:
         )
     ]
     return tuple(Table(name=name, columns=_table_columns(conn, name)) for name in names)
+
+
+def _rendered_python_type(column: Column) -> str:
+    return column.python_type.__name__ if column.python_type is not None else "unconstrained"
+
+
+def _rendered_flags(column: Column) -> str:
+    marks = []
+    if column.pk:
+        marks.append(f"pk{column.pk}")
+    if column.notnull:
+        marks.append("not null")
+    return " ".join(marks)
+
+
+def render(tables: Sequence[Table]) -> str:
+    """One aligned block per table: column, declared type, python type, flags."""
+    blocks = []
+    for table in tables:
+        name_width = max((len(c.name) for c in table.columns), default=0)
+        type_width = max((len(c.declared_type) for c in table.columns), default=0)
+        lines = [f"{table.name} — {len(table.columns)} columns"]
+        lines += [
+            f"  {column.name:<{name_width}}  {column.declared_type:<{type_width}}  "
+            f"-> {_rendered_python_type(column)} {_rendered_flags(column)}".rstrip()
+            for column in table.columns
+        ]
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Print the tables, columns, declared types and python value types of "
+            "a task store — so a forensic query is written against the shape the "
+            "store actually has."
+        ),
+        epilog=(
+            "Strictly READ-ONLY: the store is opened mode=ro and this tool never "
+            "writes. Task writes go through the fused-memory MCP tools, which "
+            "emit the reconciliation events a direct sqlite write would skip."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    where = parser.add_mutually_exclusive_group()
+    where.add_argument("--db", help="a store to read; default: the live one for this checkout")
+    where.add_argument(
+        "--project-root", help="a project root, whose .taskmaster/tasks/tasks.db is read"
+    )
+    return parser
+
+
+def _resolve_db_path(args: argparse.Namespace) -> Path:
+    if args.db:
+        return Path(args.db)
+    if args.project_root:
+        return tasks_db_path(args.project_root)
+    return resolve_live_db_path(Path.cwd())
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Print the store's shape, or diagnose why it could not be read.
+
+    Only this module's own typed refusals are caught, and each exits non-zero
+    with its message on STDERR and NOTHING on stdout: reporting an empty
+    schema would tell the reader the store has no tables.
+    """
+    args = _build_parser().parse_args(argv)
+    try:
+        db_path = _resolve_db_path(args)
+        conn = connect_ro(db_path)
+    except (MainCheckoutUnresolved, TaskDbUnreadable) as refusal:
+        print(refusal, file=sys.stderr)
+        return EXIT_UNREADABLE
+
+    try:
+        tables = introspect(conn)
+    finally:
+        conn.close()
+
+    print(db_path)
+    print(render(tables))
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
