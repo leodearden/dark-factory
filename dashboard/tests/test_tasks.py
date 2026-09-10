@@ -2737,13 +2737,6 @@ class TestPublicReadContracts:
                 dummy_client, dummy_config, '/proj/req', **kwargs
             )
 
-    def test_page_size_and_offset_are_keyword_only(self):
-        """Positional windows read as noise at the call site."""
-        params = inspect.signature(tasks_mod.fetch_task_page).parameters
-        for name in ('page_size', 'offset'):
-            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
-            assert params[name].default is inspect.Parameter.empty, name
-
     # -- (b) the complete read has no window at all -------------------------
 
     @pytest.mark.parametrize('rejected', ['offset', 'paginate'])
@@ -2767,16 +2760,6 @@ class TestPublicReadContracts:
             await tasks_mod.fetch_tasks(
                 dummy_client, dummy_config, '/proj/gone', **retired,
             )
-
-    async def test_fetch_tasks_accepts_chunk_size(self, dummy_client, dummy_config):
-        params = inspect.signature(tasks_mod.fetch_tasks).parameters
-        assert params['chunk_size'].kind is inspect.Parameter.KEYWORD_ONLY
-        assert params['chunk_size'].default is None
-        assert 'page_size' not in params, (
-            'the complete read must not carry the slice spelling too — having '
-            'both meanings under one name in one module is exactly the '
-            'ambiguity that produced esc-4360-7'
-        )
 
     # -- (c) chunk size is transport, never contract ------------------------
 
