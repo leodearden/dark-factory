@@ -58,6 +58,14 @@ V = TypeVar('V')
 # TTLCache's KEY type. Defaulted to `str` and declared TRAILING so every
 # existing single-argument `TTLCache[V]` keeps checking unedited — a
 # defaulted TypeVar may not precede a non-defaulted one, so V stays first.
+#
+# THE TRADE, since the result reads backwards against every stdlib mapping
+# generic (`TTLCache[dict, _TasksRead]` looks like `Mapping[value, key]`):
+# declaring K FIRST with no default would read conventionally, at the cost of
+# editing all six single-argument `TTLCache[V]` annotations in src plus 32 in
+# test_mcp_fanout.py — churn across five modules, none of which cares what the
+# key type is. The default was chosen instead, and the inversion it forces is
+# deliberate rather than a typo.
 K = TypeVarD('K', default=str)
 
 
