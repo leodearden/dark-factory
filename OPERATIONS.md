@@ -1860,7 +1860,14 @@ whole `session_resume` submodel hot-reloads via `reload_config` ([§6](#6-config
 Distinct from `session_resume.enabled`, which kills the whole feature at the
 harness guard: turning restoration off alone keeps the veto, its WARNING and
 the events below, so you do not go blind on the population while you have it
-disabled. It deliberately does **not** consult `transcript_archive.enabled` —
+disabled. Since task 3730 it also withholds the archive from the *eligibility*
+predicate ([below](#reachability-outranks-freshness-and-the-age-bound-that-outranks-reachability)),
+so pulling it reverts that change in full — an archive-only-reachable session
+goes back to falling back rather than being armed for a resume this same switch
+has just told the arm site not to rehydrate. The `archive_available` field on
+the fallback event is deliberately **not** withheld with it: that field is the
+population you would otherwise go blind on, and it is the only thing in
+`runs.db` that tells "no archive at all" from "restoration switched off". It deliberately does **not** consult `transcript_archive.enabled` —
 with archival off there is simply nothing on disk to find, and gating on the
 flag would add a second source of truth that can disagree with the filesystem
 (archival on last week still leaves restorable archives today).
@@ -1949,7 +1956,11 @@ uncorroborated, because an archived transcript does not decay with wall-clock.
 archive exists**. The lookup is done once per dispatch by the guard
 (`orchestrator/src/orchestrator/harness.py::Harness._archive_available`) and
 feeds both the eligibility decision and the `archive_available` field on the
-fallback event, so the two can never disagree.
+fallback event, so the two can never disagree about what is on disk. They are
+not the same reading: eligibility additionally requires
+`session_resume.restore_from_archive` (the knob described in the previous
+subsection), because an archive nothing will rehydrate does not make a session
+reachable — while the event reports the on-disk answer either way.
 
 **The backstop.** `session_resume.absolute_resume_age_secs` (default
 `432000` = 5 days) rejects a sidecar past that age **regardless** of
@@ -1966,10 +1977,17 @@ stamped per *invocation*, so its age at re-dispatch is two terms, both measured
 from `runs.db` by
 `orchestrator/src/orchestrator/resume_age_bound.py::observed_resume_age_inputs`:
 
+Both terms are sampled over the same trailing 90 days, so neither can ratchet
+the bound up off history the fleet has already left behind:
+
 | term | what it is | measured 2026-09-07 |
 |---|---|---|
 | T1 in-flight | max `task_completed.duration_ms`, legitimate outcomes only (cancellations excluded — their durations reflect operator action) | 8.90 h over n=4,730 |
-| T2 downtime | max gap between consecutive `events` rows over the trailing 90 days: the sidecar ages while nothing runs | 56.99 h over n=303,040 gaps |
+| T2 downtime | max gap between consecutive `events` rows: the sidecar ages while nothing runs | 56.99 h over n=303,040 gaps |
+
+(The `n` for T1 is the pre-windowing population; scoping it to the same 90 days
+narrows the count — 2,993 rows on 2026-09-10 — without moving the maximum, so
+the derivation below is unchanged.)
 
 `required = ceil((T1 + T2) × 1.5)` = 355,803 s = 4.12 days; the shipped default
 is that rounded up to the next whole day. **T2 is why the bound must exceed the
@@ -2027,8 +2045,9 @@ at growing sample size and has not moved: 32/34 in the original disposition,
 sampling noise. Expect the
 fallback count to fall and `session_resume` to rise as the fleet redeploys onto
 it; a `session_resume` that does **not** rise means the archive-mediated path is
-not firing, and the query above (with `archive_available` true beside a
-non-`aged_out` reason) is where to look first.
+not firing. Check `session_resume.restore_from_archive` first — with it off the
+path is *meant* not to fire — then the query above (with `archive_available`
+true beside a non-`aged_out` reason).
 
 ---
 
