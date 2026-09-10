@@ -623,6 +623,35 @@ class TestProjectWeightKeyFolding:
         assert variant_first.project_weights == {'dark_factory': 1.0}
         assert other_order.project_weights == {'dark_factory': 1.0}
 
+    def test_a_collision_logs_the_discarded_weight_at_warning(self, tmp_path, caplog):
+        """A collision DISCARDS a weight the operator actually typed, and the
+        next save (which re-emits only the in-memory table) then deletes the
+        losing line from the file -- so the drop is announced, not silent.
+        Same visible-not-silent idiom as the empty-fold drop, and the repo's
+        loud-over-silent-degradation norm. Naming BOTH raw keys is what makes
+        it actionable: the operator has to know which line to edit."""
+        with caplog.at_level(logging.WARNING):
+            result = self._load(
+                tmp_path, 'project_weights:\n  dark-factory: 9.0\n  dark_factory: 1.0\n'
+            )
+
+        assert result.project_weights == {'dark_factory': 1.0}
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "'dark-factory'" in msg and "'dark_factory'" in msg and '9.0' in msg
+            for msg in warnings
+        ), f'Expected a WARNING naming both keys and the discarded 9.0; got: {warnings}'
+
+    def test_repairing_a_lone_drifted_key_stays_quiet(self, tmp_path, caplog):
+        """Folding a single drifted key loses NOTHING -- the operator's weight
+        still applies, just under the canonical token -- so the routine repair
+        makes no noise. The WARNING is reserved for a discard."""
+        with caplog.at_level(logging.WARNING):
+            result = self._load(tmp_path, 'project_weights:\n  dark-factory: 2.0\n')
+
+        assert result.project_weights == {'dark_factory': 2.0}
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
     def test_severity_and_category_weights_are_not_folded(self, tmp_path):
         """Scope: only project_weights holds PROJECT TOKENS. severity and
         category are unrelated key vocabularies -- folding them would

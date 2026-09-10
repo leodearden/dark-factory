@@ -247,6 +247,17 @@ def _canonical_project_weights(table: dict[Any, Any]) -> dict[str, float]:
     exactly that -- non-canonical keys are applied first, so a canonical key,
     if present, is the last write into the fresh dict.
 
+    A collision DISCARDS the losing key's weight, so each one is logged at
+    WARNING naming both raw keys, the winner and the dropped value -- the
+    same visible-not-silent idiom as the empty-fold drop below. Silence here
+    would be the very failure this task exists to remove, merely relocated
+    from the lookup to the load: an operator who typed ``dark-factory: 9.0``
+    months ago and ``dark_factory: 1.0`` today loses the 9.0 outright, and
+    the next save (which re-emits only the in-memory table) then deletes the
+    losing line from the file. The rule itself is right -- a weights table
+    cannot hold two weights for one project -- but the operator has to be
+    told which one survived.
+
     SCOPE: ``project_weights`` only. ``severity_weights`` and
     ``category_weights`` are deliberately NOT folded -- they are unrelated
     key vocabularies (an escalation severity, an operator's own category
@@ -291,6 +302,7 @@ def _canonical_project_weights(table: dict[Any, Any]) -> dict[str, float]:
     next save writes the canonical keys back.
     """
     canonical: dict[str, float] = {}
+    winning_key: dict[str, Any] = {}
     for key in sorted(table, key=lambda k: (normalize_project_token(k) == k, str(k))):
         folded = normalize_project_token(key)
         if not folded:
@@ -302,7 +314,22 @@ def _canonical_project_weights(table: dict[Any, Any]) -> dict[str, float]:
                 type(key).__name__,
             )
             continue
+        if folded in canonical:
+            logger.warning(
+                'load_priorities: project_weights keys %r and %r both name project %r -- '
+                'keeping %r=%r and DROPPING %r=%r. Keep one key per project, spelled %r; '
+                'saving from the cockpit rewrites the file with that key alone.',
+                winning_key[folded],
+                key,
+                folded,
+                key,
+                table[key],
+                winning_key[folded],
+                canonical[folded],
+                folded,
+            )
         canonical[folded] = table[key]
+        winning_key[folded] = key
     return canonical
 
 
