@@ -258,8 +258,7 @@ def test_introspect_returns_records_rather_than_rendered_text(make_tasks_db):
 
     assert not isinstance(reported, str)
     first_column = reported[0].columns[0]
-    with pytest.raises(AttributeError):
-        first_column.name = "renamed"
+    pytest.raises(AttributeError, setattr, first_column, "name", "renamed")
 
 
 # ---------------------------------------------------------------------------
