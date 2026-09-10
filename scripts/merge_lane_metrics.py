@@ -57,17 +57,17 @@ from __future__ import annotations
 
 import argparse
 import ast
-import contextlib
 import dataclasses
 import json
-import os
 import sys
-import tempfile
 import tokenize
 from io import StringIO
 from pathlib import Path
 
-# NOTE: module scope is stdlib-only ON PURPOSE. complexipy and radon are
+from shared import safe_io
+
+# NOTE: module scope imports only the stdlib and the ``shared`` workspace member
+# (present in every project venv) ON PURPOSE. complexipy and radon are
 # imported lazily inside the functions that need them (see
 # ``_import_complexipy``), so this module stays importable and type-checkable in
 # environments whose dev group does not carry them -- notably the ``shared``
@@ -448,7 +448,7 @@ def _version_parts(version: str) -> tuple[int, ...]:
     """Leading numeric release segments of *version*, e.g. '6.2.0rc1' -> (6, 2, 0).
 
     Deliberately hand-rolled rather than reaching for ``packaging``: this module
-    is stdlib-only at import time (see the note at the top), and a two-clause
+    imports no third-party package at import time (see the note at the top), and a two-clause
     ``>=X,<Y`` range over release segments needs nothing more.
     """
     parts: list[int] = []
@@ -1088,28 +1088,6 @@ def render_baseline(report: dict) -> str:
     return '{\n' + ',\n'.join(entries) + '\n}\n'
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write *text* to *path* via a same-directory tempfile plus os.replace.
-
-    Mirrors ``scripts/census_tagger_debris.py::_atomic_write_text``. A reader --
-    or a concurrently running ratchet -- can never observe a half-written
-    baseline, and a failed write leaves the previous file intact rather than
-    truncated.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            handle.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
-
-
 def write_baseline(path: Path, report: dict) -> Path:
     """Render *report* and write it to *path* atomically.
 
@@ -1120,7 +1098,7 @@ def write_baseline(path: Path, report: dict) -> Path:
     """
     text = render_baseline(report)
     target = Path(path)
-    _atomic_write_text(target, text)
+    safe_io.atomic_write_text(target, text, mkdir=True)
     return target
 
 
