@@ -56,13 +56,9 @@ this guard constrains the Canonical column only. Parser BEHAVIOUR for the
 individual keys is pinned by ``shared/tests/test_task_metadata.py``; neither
 implies the other.
 
-MARKER-SPAN EXTRACTION IS SHARED (task 4999). The begin/end marker-count and
-inversion assertions, and the slice between them, used to be a near-verbatim
-copy of the same machinery in ``test_task_authoring_blessed_keys_drift.py``
-(task 3780); both now call ``task_authoring_marker_span.marked_span``. This
-guard's OWN extraction of the table content — the Canonical column's
-backticked names — stays here, unmerged with that guard's fenced-listing
-extraction.
+Marker plumbing lives in ``task_authoring_marker_span.marked_span`` (task 4999),
+shared with the task-3780 guard next door; read that module for why the markers
+are explicit and why every failure is loud.
 """
 from __future__ import annotations
 
@@ -77,10 +73,10 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 TASK_AUTHORING_PATH = REPO_ROOT / "docs" / "task-authoring.md"
 
-# The full HTML-comment forms, not the bare slug: the begin literal is not a
-# substring of the end literal (the `/` differs), so `.count()` on each is
-# unambiguous. Distinct slug from the `tier-a-blessed-keys-mirror` pair higher
-# up the same document — the two marker pairs are independent.
+# The full HTML-comment forms, not the bare slug: `marked_span` requires the two
+# literals not to overlap as substrings, and the bare slug sits inside both.
+# Distinct slug from the `tier-a-blessed-keys-mirror` pair higher up the same
+# document — the two marker pairs are independent.
 MARKER_BEGIN = "<!-- tier-b-canonical-keys -->"
 MARKER_END = "<!-- /tier-b-canonical-keys -->"
 
@@ -95,20 +91,9 @@ _SEPARATOR = re.compile(r"^\|[\s:|-]+\|$")
 def _table_rows(markdown_text):
     """The markdown table rows between the Tier-B markers, header/separator dropped.
 
-    Anchored on an EXPLICIT marker pair rather than positionally ("the table
-    after the Tier-B heading"). A positional match quietly guards nothing the
-    moment the section is renamed, reordered, or gains a second table; an
-    explicit marker fails loudly instead, and the failure names what to restore.
-    The marker-count/inversion/slice machinery itself is shared with the
-    task-3780 guard next door via ``task_authoring_marker_span.marked_span``
-    (task 4999) — everything below the ``marked_span`` call is this guard's OWN
-    table-content extraction, which stays here rather than in the shared module.
-
-    Every failure is a loud ``AssertionError`` naming the marker literal and the
-    doc, never a ``[]``/``None`` return. That is the vacuity hazard and the whole
-    point: an extractor that silently yields nothing turns the invariant
-    downstream green while pinning nothing at all — strictly worse than having no
-    guard, because the suite still reports success.
+    Everything below the ``marked_span`` call is this guard's OWN table-content
+    extraction; it raises loudly rather than returning ``[]`` for the same reason
+    ``marked_span`` does.
     """
     marked = marked_span(
         markdown_text,
@@ -116,8 +101,7 @@ def _table_rows(markdown_text):
         MARKER_END,
         doc_path="docs/task-authoring.md",
         task="task 4303",
-        label="Tier-B",
-        content="the Tier-B table",
+        delimits="the Tier-B table",
     )
     rows = [
         line.strip()
@@ -301,9 +285,22 @@ def test_canonical_keys_fails_loudly_on_a_broken_marker(markdown_text, case):
     A silent ``[]`` would turn the invariant below green while pinning nothing —
     the vacuity failure that makes a guard worse than no guard, because the suite
     still reports success.
+
+    The message must tell a human what to restore and where, so the assertions
+    check the marker slug, the doc path and this guard's task are all named. That
+    is not prose-wording pedantry: ``doc_path`` and ``task`` are ARGUMENTS
+    threaded into ``marked_span``, so a copy-paste from the task-3780 caller next
+    door would otherwise leave all 11 tests here green while sending every
+    broken-marker reader to the wrong guard and the wrong document. Identifiers
+    only, so any rewording of the shared message templates stays green.
     """
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as excinfo:
         _canonical_keys(markdown_text)
+
+    message = str(excinfo.value)
+    assert "tier-b-canonical-keys" in message, case
+    assert "task-authoring.md" in message, case
+    assert "4303" in message, case
 
 
 def test_canonical_keys_fails_loudly_on_a_row_naming_no_canonical_key():

@@ -46,12 +46,9 @@ deliberately outside the marker and unpinned, and this guard must not be extende
 to them. Parser BEHAVIOUR is pinned by ``shared/tests/test_task_metadata.py``;
 neither implies the other.
 
-MARKER-SPAN EXTRACTION IS SHARED (task 4999). The begin/end marker-count and
-inversion assertions, and the slice between them, used to be a near-verbatim
-copy of the same machinery in ``test_task_authoring_tier_b_canonical_keys.py``
-(task 4303); both now call ``task_authoring_marker_span.marked_span``. This
-guard's OWN extraction of the fenced content — the comma-separated key list —
-stays here, unmerged with that guard's markdown-table extraction.
+Marker plumbing lives in ``task_authoring_marker_span.marked_span`` (task 4999),
+shared with the task-4303 guard next door; read that module for why the markers
+are explicit and why every failure is loud.
 """
 from __future__ import annotations
 
@@ -65,9 +62,8 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 TASK_AUTHORING_PATH = REPO_ROOT / "docs" / "task-authoring.md"
 
-# The full HTML-comment forms, not the bare slug: the begin literal is not a
-# substring of the end literal (the `/` differs), so `.count()` on each is
-# unambiguous.
+# The full HTML-comment forms, not the bare slug: `marked_span` requires the two
+# literals not to overlap as substrings, and the bare slug sits inside both.
 MIRROR_BEGIN = "<!-- tier-a-blessed-keys-mirror -->"
 MIRROR_END = "<!-- /tier-a-blessed-keys-mirror -->"
 
@@ -77,20 +73,9 @@ _FENCE = "```"
 def _documented_blessed_keys(markdown_text):
     """The comma-separated key names in the fence delimited by the mirror markers.
 
-    Anchored on an EXPLICIT marker pair rather than positionally ("the fenced
-    block after the Tier-A heading"). A positional match quietly guards nothing
-    the moment the section is renamed, reordered, or gains a second fence; an
-    explicit marker fails loudly instead, and the failure names what to restore.
-    The marker-count/inversion/slice machinery itself is shared with the
-    task-4303 guard next door via ``task_authoring_marker_span.marked_span``
-    (task 4999) — everything below the ``marked_span`` call is this guard's OWN
-    fence-content extraction, which stays here rather than in the shared module.
-
-    Every failure is a loud ``AssertionError`` naming the marker literal and the
-    doc, never a ``[]``/``None`` return. That is the vacuity hazard and the whole
-    point of this function: an extractor that silently yields nothing turns the
-    drift assertion downstream green while pinning nothing at all — strictly
-    worse than having no guard, because the suite still reports success.
+    Everything below the ``marked_span`` call is this guard's OWN fence-content
+    extraction; it raises loudly rather than returning ``[]`` for the same
+    reason ``marked_span`` does.
 
     Returns the names in DOCUMENT ORDER (a list, not a set) so the caller can
     also detect an accidental double-entry, which set equality alone cannot see.
@@ -101,8 +86,7 @@ def _documented_blessed_keys(markdown_text):
         MIRROR_END,
         doc_path="docs/task-authoring.md",
         task="task 3780",
-        label="Tier-A mirror",
-        content=(
+        delimits=(
             "the fenced Tier-A listing that mirrors _BLESSED_METADATA_KEYS in "
             "shared/src/shared/task_metadata.py"
         ),
@@ -240,7 +224,12 @@ def test_documented_blessed_keys_fails_loudly_on_a_broken_marker(markdown_text, 
     All five are the same failure at different depths: each would otherwise
     silently reduce this guard to a tautology while the suite kept reporting
     green. The message must tell a human what to restore and where, so the
-    assertions check the marker literal and the doc path are both named.
+    assertions check the marker literal, the doc path and this guard's task are
+    all named. ``doc_path`` and ``task`` are ARGUMENTS threaded into
+    ``marked_span``, so without these a copy-paste from the task-4303 caller
+    next door would leave this file green while sending every broken-marker
+    reader to the wrong guard and the wrong document. Identifiers only, so any
+    rewording of the shared message templates stays green.
     """
     with pytest.raises(AssertionError) as excinfo:
         _documented_blessed_keys(markdown_text)
@@ -248,6 +237,7 @@ def test_documented_blessed_keys_fails_loudly_on_a_broken_marker(markdown_text, 
     message = str(excinfo.value)
     assert "tier-a-blessed-keys-mirror" in message, case
     assert "task-authoring.md" in message, case
+    assert "3780" in message, case
 
 
 def test_task_authoring_marker_pair_is_present_and_non_empty():
