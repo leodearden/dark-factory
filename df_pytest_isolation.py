@@ -443,20 +443,35 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
 # LITERALS, not imports: see the module docstring's import constraint. All four
 # mirrors of these paths are pinned together by
 # tests/scripts/test_orchestrator_watchdog.py::test_fleet_deploy_clock_path_matches_across_tiers.
-PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = (
-    'data/orchestrator/last_redeploy_orchestrator.json',
-    'data/fused-memory/last_redeploy_fused_memory.json',
-)
+#
+# Each clock is NAMED as well as tabulated, so a reader — and the fleet-clock
+# fixture at the bottom of this section — can identify one by MEANING rather
+# than by its position in the table. Position carries no identity here: the
+# ordering below is the order deploy_clock_violation_reason reports offenders
+# in, and a future reorder for message-reading reasons must not silently
+# repoint anything that meant "the fleet clock, not the fused-memory one".
+FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
+FM_DEPLOY_CLOCK_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
 
-# The env var a forgetful spawner needed to set to avoid stamping each relpath
-# above — the ONE table both the failure message (which names the fix) and the
-# suite-wide redirect fixture below read, so the two can never name different
-# vars for the same file (task 5299 folded a second table doing this by hand
-# with an `if 'fused-memory' in relpath` check into this one).
+# The env var a forgetful spawner needed to set to avoid stamping each protected
+# relpath — and, since task 5299, the SINGLE table everything else in this
+# section derives from: the watched-relpath tuple below, the failure message
+# (which names the fix) and the suite-wide redirect fixture all read it, so no
+# two of them can name a different var — or a different SET of files — for the
+# same clock. Task 5299 folded a second table doing this by hand with an
+# `if 'fused-memory' in relpath` check into this one.
 PROTECTED_DEPLOY_CLOCK_ENV_VARS: dict[str, str] = {
-    'data/orchestrator/last_redeploy_orchestrator.json': 'ORCH_FLEET_DEPLOY_CLOCK',
-    'data/fused-memory/last_redeploy_fused_memory.json': 'FM_DEPLOY_CLOCK',
+    FLEET_DEPLOY_CLOCK_RELPATH: 'ORCH_FLEET_DEPLOY_CLOCK',
+    FM_DEPLOY_CLOCK_RELPATH: 'FM_DEPLOY_CLOCK',
 }
+
+# DERIVED, not a second literal list (heuristic 11, SPOT): a protected clock the
+# guard watches but the table above omits would have made the message path raise
+# KeyError from the session-teardown `finally` below — replacing the actionable
+# 3am message with a traceback at exactly the moment a REAL clock was falsified.
+# Deriving makes that state unrepresentable. Dicts preserve insertion order, so
+# the reporting order documented above is retained.
+PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = tuple(PROTECTED_DEPLOY_CLOCK_ENV_VARS)
 
 # A real clock body is ~70 bytes (`{"ts": <int>, "iso": "<timestamp>"}`), so this
 # truncates nothing legitimate; it exists only so a failure message stays
@@ -581,10 +596,10 @@ def deploy_clock_violation_reason(
 
     Reports the FIRST offending relpath in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`
     order, what happened to it, the before/after readings actually observed, and
-    both readings of that observation — a test that forgot to redirect its clock
-    (the common case, with the concrete remedy) and a genuine concurrent redeploy
-    in a machine-operated checkout (not a bug at all).  Naming only the first
-    would invite the reader to assume whichever one they thought of first.
+    both readings of that observation — a spawner that escaped the suite-wide
+    redirect (the common case, with the concrete remedy) and a genuine concurrent
+    redeploy in a machine-operated checkout (not a bug at all).  Naming only the
+    first would invite the reader to assume whichever one they thought of first.
 
     *root* is optional and cosmetic-but-load-bearing: pass the checkout the
     snapshots were taken against and the message names the ABSOLUTE file.  A run
@@ -607,12 +622,16 @@ def deploy_clock_violation_reason(
             'min-interval window is open (8h by default), so the stamp silently '
             'disarms staleness recovery for the rest of the day.\n'
             f'Fix (the usual cause): a test spawned a process that resolved its '
-            f'clock path from the environment and defaulted to the live checkout. '
-            f'Point {env_var} at a tmp file for the whole suite, as '
-            'scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect does, or '
-            'per call, as tests/scripts/test_orchestrator_watchdog.py::'
-            '_boundary_run_drain_script does with its REQUIRED clock_file '
-            'parameter.\n'
+            f'clock path from the environment and reached the live checkout '
+            f'anyway. Since task 5299 the suite-wide redirect in '
+            f'df_pytest_isolation.py::_df_deploy_clocks_unwritten already points '
+            f'{env_var} at a tmp file for EVERY rootdir, so nobody "forgot to '
+            'set it" — the spawner either built its subprocess env without '
+            'copying os.environ, or hardcoded the path. Copy os.environ (as '
+            'scripts/tests/test_restart_all_orchestrators.py::_run_script does), '
+            'or pass the clock path explicitly per call (as tests/scripts/'
+            'test_orchestrator_watchdog.py::_boundary_run_drain_script does with '
+            'its REQUIRED clock_file parameter).\n'
             'Benign alternative, worth ruling out first in a machine-operated '
             'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
             'operator running restart-all-orchestrators.sh --drain) fired while '
@@ -694,6 +713,9 @@ def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
         for env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.values()
     }
     redirect_dir = tmp_path_factory.mktemp('deploy-clock-redirect')
+    # THE SUITE-WIDE REDIRECT (task 5299) — the answer to "who sets
+    # ORCH_FLEET_DEPLOY_CLOCK / FM_DEPLOY_CLOCK for this suite?", which this
+    # fixture's name (about DETECTION) does not advertise. Grep lands here.
     for relpath, env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.items():
         os.environ[env_var] = str(redirect_dir / Path(relpath).name)
     try:
@@ -733,8 +755,13 @@ def _df_fleet_deploy_clock_redirect(_df_deploy_clocks_unwritten) -> Path:
     here and generalized to the whole-session redirect (task 5299) so
     ``scripts/tests`` is no longer the only rootdir that mitigates what the
     guard above catches everywhere.
+
+    Identifies its clock by :data:`FLEET_DEPLOY_CLOCK_RELPATH`, never by
+    position in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`: that tuple's order is
+    the guard message's reporting order, so a reorder made for readability
+    must not silently repoint this fixture at the fused-memory clock.
     """
-    return Path(os.environ[PROTECTED_DEPLOY_CLOCK_ENV_VARS[PROTECTED_DEPLOY_CLOCK_RELPATHS[0]]])
+    return Path(os.environ[PROTECTED_DEPLOY_CLOCK_ENV_VARS[FLEET_DEPLOY_CLOCK_RELPATH]])
 
 
 # ---------------------------------------------------------------------------
