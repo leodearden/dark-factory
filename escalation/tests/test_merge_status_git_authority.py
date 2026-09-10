@@ -56,6 +56,21 @@ async def _call_merge_status(server, **kwargs) -> dict:
     return await tool.fn(**kwargs)
 
 
+async def _call_merge_request(server, **kwargs) -> dict:
+    """Invoke the merge_request MCP tool (async tool).
+
+    Mirrors ``_call_merge_status`` above, and
+    ``test_server_chokepoint.py::_call_merge_request``.  The ``server``
+    parameter is deliberately left untyped: ``get_tool`` is declared to
+    return ``Tool | None`` and ``Tool`` exposes no ``.fn``, so invoking a
+    precisely-typed server's tool trips pyright at every call site.  Funnelling
+    the invocation through one untyped-seam helper keeps that concession in a
+    single place instead of scattering per-call suppressions.
+    """
+    tool = await server.get_tool('merge_request')
+    return await tool.fn(**kwargs)
+
+
 def _stub_git_ops(**overrides) -> types.SimpleNamespace:
     """Return a SimpleNamespace stub for git_ops unit tests.
 
@@ -1529,8 +1544,8 @@ async def _run_merge_request_fast_path(
         harness=harness,
         merge_inflight_registry=InFlightMergeRegistry(),
     )
-    tool = await server.get_tool('merge_request')
-    return await tool.fn(
+    return await _call_merge_request(
+        server,
         task_id=task_id, branch=branch,
         worktree=str(tmp_path / 'wt'), description='', wait_secs=5,
     )
