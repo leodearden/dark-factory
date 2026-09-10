@@ -27,6 +27,7 @@ import pytest
 from shared.merge_state import MergeState
 
 from escalation.git_authority import (
+    GitAuthorityArm,
     GitAuthorityOutcome,
     GitAuthorityVerdict,
     TaskMetadataResult,
@@ -114,6 +115,31 @@ class TestGitAuthorityOutcome:
     ) -> None:
         assert member == spelling
         assert isinstance(member, str)
+
+
+class TestGitAuthorityArm:
+    """The other closed set on the verdict — which git signal reached it."""
+
+    def test_is_a_str_enum(self) -> None:
+        assert issubclass(GitAuthorityArm, enum.StrEnum)
+
+    def test_has_exactly_two_members(self) -> None:
+        """There are two git signals and no third: the branch ref still
+        exists and its tip is an ancestor of main, or the ref is gone and a
+        merge marker was found.  A third arm must not appear without a
+        reviewer seeing this move.
+        """
+        assert {m.value for m in GitAuthorityArm} == {'ancestor', 'marker'}
+
+    def test_members_round_trip_as_their_plain_spelling(self) -> None:
+        """``arm`` was a bare ``str`` before, and every existing pin compares
+        it against a plain spelling.  ``StrEnum`` is what keeps those pins —
+        and any JSON a consumer builds from a verdict — byte-identical while
+        the type becomes a closed set (heuristic 12).
+        """
+        assert GitAuthorityArm.ancestor == 'ancestor'
+        assert GitAuthorityArm.marker == 'marker'
+        assert isinstance(GitAuthorityArm.ancestor, str)
 
 
 def _harness(
@@ -336,25 +362,68 @@ class TestProbeLanding:
 
     async def test_ancestor_arm_accept(self, tmp_path: Path) -> None:
         verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
-            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
-            '900',
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '900',
+            orch_config=_config(tmp_path),
+            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
         assert verdict.merge_sha == 'c' * 40, 'merge_sha is the CITATION commit on main'
-        assert verdict.arm == 'ancestor'
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.citation_gate_skipped is False, (
+            'the gate RAN here — the flag is the discriminator a provenance '
+            'writer branches on, so the fully-guarded case must clear it'
+        )
 
     async def test_marker_arm_accept(self, tmp_path: Path) -> None:
         verdict = await probe_landing(
-            _marker_git_ops(marker='d' * 40),
-            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
-            '801',
+            _marker_git_ops(marker='d' * 40), '801',
+            orch_config=_config(tmp_path),
+            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
         assert verdict.merge_sha == 'd' * 40
-        assert verdict.arm == 'marker'
+        assert verdict.arm is GitAuthorityArm.marker
+        assert verdict.citation_gate_skipped is False, (
+            'the marker arm never runs the citation gate to begin with, so it '
+            'must not claim the gate was SKIPPED — that flag means the '
+            'commit_citation_pattern opt-out weakened merge_sha'
+        )
+
+    async def test_citation_gate_opt_out_arm(self, tmp_path: Path) -> None:
+        """``commit_citation_pattern == ''`` — the ONLY path that answers
+        ``found_on_main`` with a sha that is not a commit discovered on main.
+
+        ``test_merge_status_git_authority.py`` covers this through the MCP
+        tool, where all that is observable is ``state == 'done'`` and the
+        sha.  The verdict shape is what leaf η and task 4831 consume, so the
+        weakening has to be pinned HERE: ``merge_sha`` is the raw branch tip,
+        neither citation-discovered nor effect-present-checked, and
+        ``citation_gate_skipped`` is the executable discriminator that says
+        so.  Without this pin a future edit could drop the flag, repoint
+        ``merge_sha``, or relabel the arm and every other test in both files
+        would still pass while a provenance writer silently changed what it
+        stamps.
+        """
+        tip = 'a' * 40
+        git_ops = _ancestor_git_ops(tip=tip, citation=None)
+
+        verdict = await probe_landing(
+            git_ops, '904', orch_config=_config(tmp_path, commit_citation_pattern=''),
+            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        assert verdict.merge_sha == tip, 'merge_sha is the raw BRANCH TIP here'
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.citation_gate_skipped is True, (
+            'a caller stamping provenance must be able to SEE that the gate '
+            'was skipped, rather than inferring it from evidence_sha is None'
+        )
+        assert verdict.evidence_sha is None
+        assert verdict.reason is None
+        git_ops.find_task_citation_commit.assert_not_called()
 
     async def test_ancestor_effect_absent_is_landed_unconfirmed(
         self, tmp_path: Path
@@ -367,8 +436,8 @@ class TestProbeLanding:
         """
         verdict = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False),
-            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
-            '901',
+            '901', orch_config=_config(tmp_path),
+            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
@@ -380,9 +449,9 @@ class TestProbeLanding:
         self, tmp_path: Path
     ) -> None:
         verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation=None),
-            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
-            '3031',
+            _ancestor_git_ops(tip='a' * 40, citation=None), '3031',
+            orch_config=_config(tmp_path),
+            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
@@ -394,13 +463,13 @@ class TestProbeLanding:
         self, tmp_path: Path
     ) -> None:
         verdict = await probe_landing(
-            _marker_git_ops(marker='d' * 40, effect_present=False),
-            _config(tmp_path), _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
-            '803',
+            _marker_git_ops(marker='d' * 40, effect_present=False), '803',
+            orch_config=_config(tmp_path),
+            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
-        assert verdict.arm == 'marker'
+        assert verdict.arm is GitAuthorityArm.marker
         assert verdict.evidence_sha == 'd' * 40
         assert verdict.merge_sha is None
 
@@ -450,7 +519,8 @@ class TestProbeLanding:
         would assert a landing this task never made.
         """
         verdict = await probe_landing(
-            git_ops, _config(tmp_path), _harness(task=task), '800',
+            git_ops, '800',
+            orch_config=_config(tmp_path), harness=_harness(task=task),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.no_signal, label
@@ -466,10 +536,61 @@ class TestProbeLanding:
             _probe_git_ops(
                 resolve_branch_sha=AsyncMock(side_effect=RuntimeError('git exploded')),
             ),
-            _config(tmp_path), _harness(task={'metadata': {}}), '905',
+            '905', orch_config=_config(tmp_path),
+            harness=_harness(task={'metadata': {}}),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.no_signal
+
+    async def test_site_labels_every_degradation_this_probe_logs(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``site`` defaults to merge_status, and a NON-merge_status consumer
+        must be able to find its own faults in the log.
+
+        Task 3103 review #3 added the label for exactly this: an unlabelled
+        degradation is invisible to an operator grepping for the caller they
+        actually invoked.  The extraction's whole purpose is a second
+        consumer (leaf η's periodic writer, task 4651), so hardcoding
+        ``merge_status`` here would re-create that defect for the new caller
+        on day one — its faults would be logged against a tool nobody ran.
+        Both warnings this probe can emit are checked: its own fire-safe
+        wrapper, and the one ``task_metadata`` emits underneath it.
+        """
+        with caplog.at_level(logging.WARNING):
+            await probe_landing(
+                _probe_git_ops(
+                    resolve_branch_sha=AsyncMock(side_effect=RuntimeError('git exploded')),
+                ),
+                '4651', orch_config=_config(tmp_path),
+                harness=_harness(raises=True), site='landed_reconciler',
+            )
+
+        assert 'landed_reconciler' in caplog.text, (
+            f'the fire-safe warning must name the CALLER, got: {caplog.text!r}'
+        )
+        assert 'merge_status' not in caplog.text
+
+    async def test_site_reaches_the_metadata_fetch(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The label is threaded THROUGH to ``task_metadata``, not just used
+        by the wrapper — a scheduler fault under a reconciler probe is logged
+        against the reconciler.
+        """
+        with caplog.at_level(logging.WARNING):
+            verdict = await probe_landing(
+                _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '4651',
+                orch_config=_config(tmp_path), harness=_harness(raises=True),
+                site='landed_reconciler',
+            )
+
+        assert verdict.metadata_unavailable is True, 'precondition: the fetch faulted'
+        assert 'scheduler.get_task' in caplog.text
+        assert 'landed_reconciler' in caplog.text, (
+            f'the metadata degradation must name the CALLER, got: {caplog.text!r}'
+        )
+        assert 'merge_status' not in caplog.text
 
     async def test_metadata_unavailable_is_threaded_onto_the_verdict(
         self, tmp_path: Path
@@ -483,12 +604,12 @@ class TestProbeLanding:
         not.
         """
         healthy = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
-            _config(tmp_path), _harness(task={'metadata': {}}), '906',
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '906',
+            orch_config=_config(tmp_path), harness=_harness(task={'metadata': {}}),
         )
         faulted = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
-            _config(tmp_path), _harness(raises=True), '906',
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '906',
+            orch_config=_config(tmp_path), harness=_harness(raises=True),
         )
 
         assert healthy.outcome is faulted.outcome, (

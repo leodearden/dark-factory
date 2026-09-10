@@ -266,7 +266,7 @@ class TestMergeStatusGitAuthority:
         - state == 'done', kind == 'found_on_main', generation == 1
         - merge_sha == the citation commit discovered on main (task 3103; this
           assertion used to pin ``merge_sha == tip``, the documented
-          ``_found_on_main_response`` wart that the citation gate retires)
+          ``found_on_main_response`` wart that the citation gate retires)
         - the (tip, 'main') ancestry call is made
         - find_merge_marker was NOT called (cheaper-common-path ordering: skip
           the find_merge_marker scan when the branch ref is still live)
@@ -686,7 +686,7 @@ class TestMergeStatusGitAuthority:
         """TRUE POSITIVE: a cited, effect-present landing still resolves done.
 
         merge_sha must be the CITATION commit found on main, not the branch
-        tip — this pins the fix to the documented ``_found_on_main_response``
+        tip — this pins the fix to the documented ``found_on_main_response``
         wart (for a --no-ff merge the branch tip is a different commit from
         the one on main).
         """
@@ -1299,7 +1299,7 @@ class TestMergeStatusGitAuthorityIntegration:
         """Live-branch path: merge_sha is the citation commit ON MAIN.
 
         Inverts the pre-3103 pin (``merge_sha == branch_tip``), which recorded
-        the documented ``_found_on_main_response`` wart: for a ``--no-ff``
+        the documented ``found_on_main_response`` wart: for a ``--no-ff``
         merge the branch tip is NOT a commit on main's first-parent chain, so
         provenance stamped from it pointed at the wrong commit.
 

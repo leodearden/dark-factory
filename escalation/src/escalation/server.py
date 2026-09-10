@@ -4228,58 +4228,16 @@ def create_server(
             → git-authority (is_ancestor / find_merge_marker against main)
             → {state:'unknown', hint}
 
-        The git-authority tier (Tier-3.5) fires when the durable tiers miss.
-        Its guards, their ordering and its fire-safety live in
+        The git-authority tier (Tier-3.5) fires when the durable tiers miss,
+        and is skipped entirely when ``harness.git_ops`` or ``orch_config``
+        are absent.  Its guards, their ordering and its fire-safety live in
         ``escalation/src/escalation/git_authority.py::probe_landing`` and are
-        not restated here; merge_status only RENDERS the verdict — a
-        ``found_on_main`` outcome becomes the done response, and BOTH
-        ``landed_unconfirmed`` and ``no_signal`` become the Tier-4 unknown.
-        The summary below is orientation only.
-        It derives the full branch ref from the passed ``branch`` or
-        ``task_id`` via ``canonical_queued_branch_name`` (prepending
-        ``orch_config.git.branch_prefix`` unless the value already starts
-        with the prefix — the same shape-tolerant rule shared with
-        ``recover_pending_merges``), then:
-        - If the branch still exists: calls ``is_ancestor(tip, main)``, then
-          applies THREE guards in order (task 3103 brought the last two to
-          parity with the orchestrator harness's already-landed dispatch
-          gate, which has had them since task 1226):
-            1. ``tip != main_tip`` — a branch sitting at exactly main's HEAD
-               satisfies ``is_ancestor`` trivially (a commit is its own
-               ancestor) but nothing has been merged;
-            2. NOT degenerate — a tip still equal to the recorded
-               ``branch_base_sha`` proves zero commits were ever pushed, so
-               the branch is merely parked at an OLD main commit (which IS an
-               ancestor of main and IS distinct from main_tip, so guard 1
-               does not catch it);
-            3. ``validate_landing_evidence`` DISCOVERY mode — a commit on
-               main must positively cite the task and its effect must still
-               be present at main HEAD.
-          On hit → state='done', kind='found_on_main',
-          merge_sha=<the citation commit on main>.
-          Guards 2 and 3 are independent and both required: a re-seeded
-          branch is non-degenerate yet uncited, while a degenerate branch may
-          still have a citing commit on main.  When
-          ``git.commit_citation_pattern`` is ``''`` (the documented
-          per-project opt-out) guard 3 is skipped and merge_sha is the branch
-          tip — not a commit on main, and not effect-present-checked; guard 2
-          still applies.  See
-          ``escalation/src/escalation/git_authority.py::found_on_main_response``
-          for what that costs a caller stamping merge_sha as provenance.
-        - If the branch ref is gone (tip is None): calls ``find_merge_marker``
-          which searches git log for the merge commit subject.  On hit, two
-          further guards (task 3103, mirroring the harness marker arm):
-          the marker must NOT predate the recorded ``branch_base_sha`` (else
-          the branch was deleted and recreated under the same id and the
-          marker belongs to a previous incarnation), and
-          ``validate_landing_evidence`` CANDIDATE mode must find the marker's
-          effect still present at main HEAD (the marker's subject match
-          already establishes attribution).
-          On hit → state='done', kind='found_on_main',
-          merge_sha=<merge-commit SHA on main>.
-        Fire-safe: any git failure degrades to the honest Tier-4 unknown
-        (``logger.warning(exc_info=True)``), never raises.  The tier is skipped
-        when ``harness.git_ops`` or ``orch_config`` are absent.
+        NOT restated here — merge_status only RENDERS the verdict it returns:
+        a ``found_on_main`` outcome becomes the done response below, while
+        BOTH ``landed_unconfirmed`` and ``no_signal`` become the Tier-4
+        unknown.  What a returned ``merge_sha`` may be stamped as, and the
+        one config setting that weakens it, are stated once in
+        ``escalation/src/escalation/git_authority.py::found_on_main_response``.
 
         Returns a dict with at minimum:
             state, request_id, generation (always 1 in α3).
@@ -4373,7 +4331,7 @@ def create_server(
             key = branch if branch is not None else task_id
             if key is not None:
                 verdict = await git_authority.probe_landing(
-                    git_ops, orch_config, harness, key,
+                    git_ops, key, orch_config=orch_config, harness=harness,
                 )
                 # `merge_sha is not None` is belt-and-braces: found_on_main
                 # always carries one, but found_on_main_response's merge_sha
