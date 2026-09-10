@@ -676,9 +676,13 @@ class _LazyRegistry:
         # not appear in 'recon_code_fix_premise_registry_path' (hyphen vs
         # underscore), which an existing test asserts on verbatim.
         self._label = label
-        # None means "not yet attempted"; [] means "loaded but empty or
-        # failed" — no hot-reload, a server restart is required to pick up
-        # YAML changes.
+        # _attempted (not _entries) is the not-yet-loaded-vs-settled signal
+        # — see entries() below. _entries holds the loader's result once
+        # settled, or None when the load raised and the guard failed open:
+        # None therefore means "not yet attempted" OR "load raised", while
+        # [] means only "loaded but empty". Every caller treats both falsy
+        # cases identically (`if not entries: return None`). No hot-reload
+        # — a server restart is required to pick up YAML changes.
         self._entries: list | None = None
         self._attempted = False
         # Guards the one-shot load. Needed because the load is offloaded via
