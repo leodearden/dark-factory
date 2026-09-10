@@ -998,7 +998,8 @@ verify_admission_task_slots: 1
 # PYTEST_XDIST_AUTO_NUM_WORKERS=8 that caps the offline lane and agent shells.
 # Green-tier (verify_env is in RELOADABLE_FIELDS).
 verify_env:
-  PYTEST_XDIST_AUTO_NUM_WORKERS: "16"
+  # A/B arm: PYTEST_XDIST_AUTO_NUM_WORKERS set to "8" at 2026-09-10T12:42:14Z by scripts/merge-pytest-n-ab-switch.sh
+  PYTEST_XDIST_AUTO_NUM_WORKERS: "8"
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
