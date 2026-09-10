@@ -4841,6 +4841,28 @@ class ReconciliationHarness:
             # changes is attribution: this drop is logged and (step-6) alarmed
             # under its own name, so it is never misfiled as "Stage 3 stopped
             # citing findings".
+            #
+            # COVERAGE TRADE-OFF (reviewer_comprehensive, task 4781 amendment):
+            # splitting one counter into two independently-thresholded counters
+            # is NOT coverage-neutral for a MIXED burst. Before this split, both
+            # causes fed one counter at threshold 5, so e.g. 3 never-cited drops
+            # + 3 phantom-cited drops in a window summed to 6 and fired (under
+            # the wrong label) the placeholder storm. Now each cause has its own
+            # threshold-5 counter, so that same 3+3 burst trips NEITHER alarm —
+            # six actionable findings can vanish from remediation in one window
+            # with no escalation at all. Accepted deliberately: correct
+            # attribution was judged more valuable than aggregate-sum
+            # sensitivity to a mixed burst (see this task's plan
+            # design_decisions), and a genuinely sustained single-cause outage
+            # still fires its own alarm at the same threshold as before the
+            # split. test_maybe_remediate_mixed_drop_causes_below_threshold_neither_storm_escalates
+            # (test_harness.py) pins the current, reduced-coverage-on-mixed-
+            # bursts behaviour so a future reader sees it as a decision, not a
+            # bug. If mixed-cause bursts under each per-cause threshold prove to
+            # matter operationally, the fix is a THIRD StormCounter fed by BOTH
+            # loops below, whose escalation names both per-cause counts — not
+            # raising these two thresholds, which would blunt each alarm's own
+            # single-cause sensitivity instead of restoring aggregate coverage.
             for finding in dropped_phantom_cited:
                 logger.warning(
                     'reconciliation.remediation_dropped_phantom_cited_finding',
