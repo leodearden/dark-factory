@@ -44,6 +44,20 @@ Environment=LANG=en_US.UTF-8
 # the blocking cross-unit path that would SIGTERM this process mid-deploy.
 Environment=ORCH_UNIT=orchestrator-dark-factory.service
 
+# Cap pytest-xdist `-n auto` for everything that inherits this unit's env and is
+# NOT a verify leg: the offline lane (`pytest -m warm_lane_bash` / `-m integration`
+# in _offline-deep, which builds its env from os.environ) and agent-shell pytest
+# runs inside task worktrees (agents/invoke.py passes dict(os.environ)). Both
+# resolved `-n auto` to 32 workers because psutil is absent from most venvs
+# (xdist falls back to sched_getaffinity). Verify legs are unaffected: task and
+# background legs carry an explicit `-n` from verify_admission_pytest_n, and the
+# merge leg is pinned by `verify_env` in dark-factory-orchestrator.yaml, which
+# overlays this value last. Measured 2026-09-07/08 (load-tuning session): the
+# offline lane ran 32 workers with 31 idle every ~40 min; one agent shell ran
+# 32 workers concurrently with three 8-wide task legs and a 16-wide merge leg.
+# Restart-tier: takes effect at the next unit restart (fleet redeploy cadence ~8h).
+Environment=PYTEST_XDIST_AUTO_NUM_WORKERS=8
+
 # Auto-restart on crash; back off up to 60s.
 # RestartSteps makes RestartMaxDelaySec effective (without it systemd warns and
 # ignores the cap): backoff 10s -> 60s over 4 steps.

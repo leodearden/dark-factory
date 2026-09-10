@@ -37,8 +37,8 @@ climbing back. Operator-observable outcome when the batch lands:
 ## Background
 
 Definition ratified 2026-09-03: **quality is the cost and risk of the next change,
-and here the next change is made by an agent.** Leo's fourteen heuristics (memory
-`user-code-quality-heuristics`) are the review vocabulary for every task in this
+and here the next change is made by an agent.** Leo's fourteen heuristics
+(`docs/code-quality.md`, the single normative copy) are the review vocabulary for every task in this
 batch; the ones this PRD leans on hardest are *small function scopes*, *minimum data
 access scopes and lifetimes*, *deep modules with narrow interfaces*, *files make
 internal sense in isolation*, *no file too large — and no cheating by stitching

@@ -115,10 +115,19 @@ RESULTS_DIR = Path(__file__).parent / 'results'
 # exactly one place, `_check_cap_wait`, which runs in the cap-hit branch AFTER
 # an invocation returned and was classified as a cap. It bounds cap-RETRY
 # patience and nothing else — the unbounded `_open.wait()` above is out of its
-# reach, and raising it does not change that. Making a fully-capped park
-# VISIBLE (rather than indistinguishable from a slow campaign) is filed as
-# follow-up; it is the "fail loud" the original comment wanted, implemented in
-# the wrong place.
+# reach, and raising it does not change that. That remains true, and it is why
+# the park needed a separate remedy rather than a bigger number here.
+#
+# THE PARK IS NO LONGER SILENT (task 4945). It is still unbounded — by design,
+# since no wall-clock value makes a weekly exhaustion loud without also
+# aborting the 5-hour windows this constant exists to skate — but it now
+# ANNOUNCES itself: `shared/usage_gate.py::UsageGate.before_invoke` emits a
+# throttled `all_capped_park` WARNING carrying elapsed seconds, the account
+# count and the soonest expected reopen, for as long as the pool stays frozen.
+# So a parked campaign is distinguishable from a hung one by reading the log,
+# which is the "fail loud" the original comment wanted — delivered as
+# visibility rather than as an abort, because aborting a park throws away
+# banked spend that `--resume` would otherwise recover.
 _EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
 
 

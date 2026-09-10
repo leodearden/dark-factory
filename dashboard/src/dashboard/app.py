@@ -114,7 +114,7 @@ from dashboard.data.reconciliation import (
 )
 from dashboard.data.redux_api import _project_label
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
     get_memory_timeseries,
@@ -151,6 +151,17 @@ def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
 # ---------------------------------------------------------------------------
 
 _TASK_CARDS_TTL_SECONDS = 10.0
+
+# Whole-operation bound for ``_load_task_cards``, enforced with
+# ``asyncio.wait_for``. Bound to the shared default rather than restating the
+# literal, so the arithmetic lives in exactly one place; this site may later
+# TIGHTEN its own constant (the structural test enforces it can never widen
+# it). Single-root call whose fan-out happens at the CALLER via
+# ``asyncio.gather`` over root ids, so the handler cost is max-of-N rather
+# than sum-of-N — no whole-loop deadline is needed as it is for
+# ``orchestrator.discover_orchestrators``' sequential walk.
+_TASK_CARDS_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
+
 _task_cards_cache: TTLCache[list[dict] | dict] = TTLCache(
     ttl_seconds=lambda: _TASK_CARDS_TTL_SECONDS
 )
@@ -177,14 +188,65 @@ async def _load_task_cards(
 
     Test hook: call ``_task_cards_cache_clear()`` to reset cache state between
     test cases.
+
+    **Bounded as a whole.** The whole operation is bounded by
+    ``_TASK_CARDS_BUDGET`` via ``asyncio.wait_for``. ``fetch_tasks``' own
+    *timeout* is a PER-HTTP-REQUEST budget — it bounds connect/read/write and
+    pool acquisition, never the operation as a whole — so without this layer a
+    hang that opens no socket (a connection-pool lock, say) is unbounded, and
+    that is exactly what wedged /api/v2/dashboard/escalations for 19.8 h. A
+    timeout returns the SAME ``[]``, so the tab renders cardless rather than
+    hanging, and nothing is cached on that path.
+
+    The ``wait_for`` deliberately encloses ``get_or_refresh`` rather than the
+    inner ``fetch_tasks``. ``TTLCache.get_or_refresh`` serializes cold callers
+    for one key behind a per-key lock and runs the refresh WHILE HOLDING it,
+    so an inner-only wrap would leave a QUEUED caller waiting unbounded for
+    the holder's full budget before paying its own: the pair costs 2x and N
+    waiters cost N x, and the dashboard's 3 s poll makes waiters routine.
+    Enclosing the outer call bounds the lock wait too, and is safe —
+    ``wait_for`` cancels the inner task, cancellation unwinds
+    ``async with lock``, and ``__aexit__`` releases it rather than leaking it.
+
+    The five-line ``wait_for``/``except TimeoutError``/warn/degrade construct
+    below, and the lock-placement rationale above, are duplicated verbatim at
+    the sibling call site (``merge_queue.load_task_titles``). That duplication is
+    KNOWN and deliberate for now: the mechanism is a property of
+    ``TTLCache`` — not of either call site — so the idiom belongs on
+    ``dashboard/src/dashboard/data/mcp_fanout.py::TTLCache`` as a
+    ``get_or_refresh_bounded`` that owns the timeout, the warning and the
+    degraded return. That file is outside this change's lock set, so the
+    extraction is left to the sibling TTLCache task referenced below.
+
+    This bounds THIS caller only. It does not fix the general TTLCache
+    queue-amplifier class across all of its call sites; that is the sibling
+    task filed in the same batch.
     """
 
     async def _refresh() -> list[dict] | dict:
         return await fetch_tasks(client, config, project_root)
 
-    result = await _task_cards_cache.get_or_refresh(
-        project_root, _refresh, cache_ok=lambda v: isinstance(v, list),
-    )
+    try:
+        result = await asyncio.wait_for(
+            _task_cards_cache.get_or_refresh(
+                project_root, _refresh, cache_ok=lambda v: isinstance(v, list),
+            ),
+            timeout=_TASK_CARDS_BUDGET,
+        )
+    except TimeoutError:
+        # Broader than the ``wait_for`` expiry, deliberately. On 3.11+
+        # ``asyncio.TimeoutError`` IS the builtin, and ``socket.timeout`` is
+        # too, so a ``TimeoutError`` raised INSIDE the refresh is folded into
+        # this same budget path rather than 500ing the escalations tab. The
+        # message below is therefore authoritative about the OUTCOME — the
+        # cards are unknown for this poll — and not about the cause.
+        logger.warning(
+            '_load_task_cards %s: exceeded the %.1fs whole-operation budget — '
+            "the escalation tab's task cards are UNKNOWN for this poll "
+            '(not absent)',
+            project_root, _TASK_CARDS_BUDGET,
+        )
+        return []
     return list(result) if isinstance(result, list) else []
 
 

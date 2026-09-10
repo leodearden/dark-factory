@@ -18,6 +18,22 @@ Design:
   - iter_first_party_files(repo_root) enumerates the first-party source tree
     (added in step-6).
 
+THIS MODULE IS THE ONE PLACE THE FIRST-PARTY TREE IS READ AND PARSED (task
+4520). ``parse_first_party_tree(repo_root)`` reads and ``ast.parse``s each
+enumerated file exactly once per session and memoizes the result; every gate
+module in ``shared/tests/`` walks those already-built ASTs READ-ONLY rather
+than growing its own scan. Before that consolidation two gates each did the
+whole thing privately — 461 files read twice, parsed three times, 922 parent
+maps where 24 sufficed — and because pytest-timeout arms its timer over the
+entire runtest protocol (``func_only=False``), the duplicated work was billed
+to whichever single test item happened to trigger the fixture: 23.68s of setup
+against a 60s budget. ``shared/tests/test_tree_scan_sharing.py`` pins the
+contract and carries an anti-regrowth ratchet against a third private parse.
+
+Consumers must not mutate a shared ``ast.Module``: the trees are handed to
+every gate in the session, so an in-place rewrite in one would silently change
+what the others see.
+
 References:
   - plans/silent-fallthrough-dedup-prd.md (PRD task σ)
   - orchestrator/tests/test_event_loop_antipattern_guard.py (guard pattern)
@@ -358,6 +374,12 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     Returns ``[]`` on ``SyntaxError`` (the file is not flagged but also not
     silently skipped — callers should track and report parse failures).
 
+    A thin parse-then-delegate wrapper over :func:`find_violations_in_tree`,
+    kept because ~40 unit tests feed it source strings directly. A caller that
+    already holds the parsed tree (every whole-tree gate, via
+    :func:`parse_first_party_tree`) should call the tree entry point instead
+    and not re-parse.
+
     Args:
         source: UTF-8 source text of the file.
         filename: Path string used in :class:`Violation` records (for display).
@@ -366,8 +388,47 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         tree = ast.parse(source, filename=filename)
     except SyntaxError:
         return []
+    return find_violations_in_tree(tree, filename, source)
 
-    parent_map = _build_parent_map(tree)
+
+def find_violations_in_tree(
+    tree: ast.Module,
+    filename: str,
+    source: str | None = None,
+) -> list[Violation]:
+    """Scan an ALREADY-PARSED *tree* for silent-fallthrough signatures.
+
+    The entry point the whole-tree gates use, so the ASTs built once by
+    :func:`parse_first_party_tree` are walked rather than re-parsed.
+
+    The parent map is built LAZILY — on the first violation this file actually
+    records, and at most once per call. It exists only to name a violation's
+    enclosing scope, and 451 of the real tree's 461 first-party files record
+    none, so building it eagerly spent 97.8% of 3.73s per pass on files that
+    never consulted it.
+
+    Args:
+        tree: Parsed module. Walked READ-ONLY: under
+            :func:`parse_first_party_tree` this object is shared with every
+            other gate in the session.
+        filename: Path string used in :class:`Violation` records (for display).
+            The caller's spelling is honoured verbatim — the gates key on a
+            repo-relative path, not on whatever ``ast.parse`` was told.
+        source: Unused by the scan (``content_hash`` is computed from
+            ``ast.unparse``, which needs no source text). Accepted so a caller
+            holding a :class:`ParsedFile` can pass the whole record through
+            without deciding what the scanner needs.
+    """
+    del source  # accepted for call-site symmetry; the scan works off the tree
+
+    _parent_map: dict[int, ast.AST] | None = None
+
+    def parent_map() -> dict[int, ast.AST]:
+        nonlocal _parent_map
+        if _parent_map is None:
+            _parent_map = _build_parent_map(tree)
+        return _parent_map
+
     violations: list[Violation] = []
 
     for node in ast.walk(tree):
@@ -393,7 +454,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                             f"bind the error to a named variable and "
                             f"escalate via resolver_failed() or raise"
                         ),
-                        qualname=_compute_qualname(node, parent_map),
+                        qualname=_compute_qualname(node, parent_map()),
                         content_hash=_content_hash(node),
                     ))
 
@@ -420,7 +481,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                     f"without logging WARN+ or re-raising — add "
                     f"logger.warning/error/exception(...) before the return"
                 ),
-                qualname=_compute_qualname(node, parent_map),
+                qualname=_compute_qualname(node, parent_map()),
                 content_hash=_content_hash(node),
             ))
 
@@ -484,3 +545,124 @@ def iter_first_party_files(repo_root: Path) -> Iterator[Path]:
             if name.startswith("test_") or name in _EXCLUDED_NAMES:
                 continue
             yield py_file
+
+
+# ---------------------------------------------------------------------------
+# Shared, memoized whole-tree provider (task 4520)
+# ---------------------------------------------------------------------------
+
+
+class ParsedFile(NamedTuple):
+    """One first-party source file, read and parsed exactly once per session.
+
+    Exactly one of *tree* / *syntax_error* is set — never both, never neither.
+    A file that parses carries its ``ast.Module``; one that does not carries
+    the ``SyntaxError`` so a consumer can REPORT it (see
+    ``test_silent_fallthrough_gate.test_no_unparseable_files``, which lists
+    every bad file at once) or RE-RAISE it (see
+    ``test_config_dir_archival_gate._scan``, whose contract is that a file it
+    actually needs must not be silently skipped).
+    """
+
+    path: Path              # absolute
+    relpath: str            # posix, relative to repo_root
+    source: str
+    tree: ast.Module | None
+    syntax_error: SyntaxError | None
+
+
+#: Memo keyed on the RESOLVED repo root, so two spellings of one tree share an
+#: entry. Module-level rather than an ``lru_cache`` so the tests can swap in a
+#: private dict (``test_tree_scan_sharing.isolated_parse_cache``) without
+#: evicting the session's warm entry for the real tree.
+_PARSE_CACHE: dict[Path, tuple[ParsedFile, ...]] = {}
+
+
+def _reset_parse_cache() -> None:
+    """Drop the memo — a test hook, not a runtime knob.
+
+    Mutates the dict in place rather than rebinding the global, so it also
+    clears a monkeypatched stand-in.
+    """
+    _PARSE_CACHE.clear()
+
+
+def parse_first_party_tree(repo_root: Path | str) -> tuple[ParsedFile, ...]:
+    """Read and parse every first-party source file ONCE, memoized on *repo_root*.
+
+    Enumeration is delegated verbatim to :func:`iter_first_party_files`, so the
+    7 scope roots, the ``mem0``/``graphiti``/``tests``/``conftest.py``
+    exclusions and the sentinel-dir validation that RAISES on a mis-resolved
+    root all keep their meaning here.
+
+    Failure modes are deliberately asymmetric, because the two consuming gates
+    have deliberately different contracts and both must survive:
+
+    * A read or decode error PROPAGATES. Reads use strict ``encoding='utf-8'``
+      (not ``errors='replace'``): a first-party file that cannot be read is a
+      real breakage, and silently skipping it would let a construction site
+      hide behind it — the archival gate's documented loudness contract.
+    * A ``SyntaxError`` is RECORDED on the file's :class:`ParsedFile` instead
+      of raised, because ``test_no_unparseable_files`` exists to report all of
+      them together. A consumer that needs a specific file re-raises the
+      recorded error itself.
+
+    COST — BOTH HALVES, because this trades CPU for resident memory and only
+    the CPU half is visible in a test duration. Measured on this worktree,
+    467 first-party files:
+
+    * CPU, the win: one cold read+parse of the whole tree is 5.0-5.6s, paid
+      ONCE per session. Before this provider the same tree was read twice and
+      parsed three times, and because pytest-timeout arms its timer over the
+      whole runtest protocol the duplicated work was charged to whichever
+      single test item happened to trigger a gate's fixture — 23.68s of setup
+      against a 60s budget (task 4520).
+    * MEMORY, the price: the returned records retain ~361 MB (peak 362 MB) —
+      ~21 MB of source text and ~340 MB of ``ast.Module`` — and, memoized for
+      the life of the process, they are never evicted. The pre-4520 ASTs were
+      TRANSIENT: each was parsed inside ``find_violations``, walked and
+      dropped, so steady-state retention was the violation list alone
+      (kilobytes). This is a step-change in a suite's RSS, and it lands
+      exactly when it is least welcome — on a host running several suites
+      concurrently, which is the oversubscription that made the CPU half a
+      problem in the first place.
+
+    The trade is deliberate and currently made in CPU's favour. If the memory
+    half starts to matter, the lever is to stop keeping every ``ast.Module``
+    alive — a per-record lazy parse, so files no gate ever walks are never
+    materialised. It is NOT ``_reset_parse_cache()`` on fixture teardown: a
+    session-scoped fixture finalises just before the process exits, so that
+    would release the memory moments before the OS did anyway, while making
+    any later ``parse_first_party_tree`` call re-read and re-parse all 467
+    files.
+
+    Returns:
+        An immutable tuple of :class:`ParsedFile`, in ``iter_first_party_files``
+        order. The same tuple object is returned on every subsequent call for
+        the same resolved root, so ``is`` identity is part of the contract.
+    """
+    key = Path(repo_root).resolve()
+    cached = _PARSE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    records: list[ParsedFile] = []
+    for py_file in iter_first_party_files(key):
+        source = py_file.read_text(encoding="utf-8")
+        tree: ast.Module | None = None
+        syntax_error: SyntaxError | None = None
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError as exc:
+            syntax_error = exc
+        records.append(ParsedFile(
+            path=py_file,
+            relpath=py_file.relative_to(key).as_posix(),
+            source=source,
+            tree=tree,
+            syntax_error=syntax_error,
+        ))
+
+    result = tuple(records)
+    _PARSE_CACHE[key] = result
+    return result

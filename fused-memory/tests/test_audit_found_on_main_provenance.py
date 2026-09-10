@@ -56,6 +56,7 @@ _git_is_ancestor = _mod._git_is_ancestor
 _git_find_revert = _mod._git_find_revert
 _git_files_missing_on_ref = _mod._git_files_missing_on_ref
 _git_commit_message = _mod._git_commit_message
+_git_second_parent_commits = _mod._git_second_parent_commits
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,7 @@ def _audit(
     commit_subject: str = '',
     commit_message: str = '',
     commit_files: list[str] | None = None,
+    second_parent_commits: list[tuple[str, str]] | None = None,
     revert_commit: str | None = None,
     declared_files_missing_on_main: list[str] | None = None,
     declared_files_inconclusive: list[str] | None = None,
@@ -115,6 +117,9 @@ def _audit(
         commit_subject=commit_subject,
         commit_message=commit_message,
         commit_files=list(commit_files) if commit_files is not None else [],
+        second_parent_commits=(
+            list(second_parent_commits) if second_parent_commits is not None else []
+        ),
         revert_commit=revert_commit,
         declared_files_missing_on_main=(
             list(declared_files_missing_on_main)
@@ -605,6 +610,235 @@ class TestCitationGatePositiveArmStampChoice:
         assert verdict == 'ok'
 
 
+class TestClassifyCoalescedMerge:
+    """The coalesce clearance: a cited merge's second parent can clear a
+    misattribution when the audited task cites itself somewhere in what
+    the merge actually brought in (see plan.json's "THE FIX" for task
+    4706). All pure classify() tests, no git."""
+
+    # -- Clearance --------------------------------------------------------
+
+    def test_self_citation_under_second_parent_is_not_misattributed(self):
+        """Merge subject cites only task 77; the second parent carries a
+        commit citing task 50 — the audited task's own work was coalesced
+        into someone else's merge, so this is not misattribution."""
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, 'impl(50): the audited task step')],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'ok'
+
+    def test_reason_records_why_it_was_cleared(self):
+        """A human sees WHY it was cleared: the clearing commit's sha and
+        the audited task id both appear in the reasons (task 4706's
+        requirement 3)."""
+        clearing_sha = 'b' * 40
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        _verdict, reasons = classify(audit)
+        joined = ' '.join(reasons)
+        assert clearing_sha in joined
+        assert '50' in joined
+
+    def test_reason_wording_when_cited_merge_subject_names_no_task_at_all(self):
+        """When the cited merge's own subject cites no task at all (`cited`
+        is empty) but a second-parent commit still self-cites, the reason
+        must not claim the subject "names another task" — that claim would
+        be false. Issue 2 of the task-4706 amendment pass: this reason
+        string is persisted via apply_audit_annotations and read by a
+        human triaging correct_found_on_main_backlog.py's output, so a
+        contradicted claim there is user-facing, not just cosmetic."""
+        clearing_sha = 'b' * 40
+        audit = _audit(
+            commit_message='chore: routine maintenance sweep',
+            second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'ok'
+        joined = ' '.join(reasons)
+        assert clearing_sha in joined
+        assert 'names another task' not in joined
+
+    def test_task_slash_form_under_second_parent_clears(self):
+        """The task/50 slash form is the ONLY one of the four real records
+        this mechanism actually clears — task 3103 / c7dcc4f9d4, see
+        esc-4706-1 — so it's pinned here by name as the load-bearing case."""
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('c' * 40, 'resolve: merge conflicts for task/50')],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict != 'misattributed'
+
+    def test_clearance_still_yields_reverted_when_the_commit_was_reverted(self):
+        """Clearance never changes which verdict wins the ladder — a
+        reverted commit still resolves to reverted, with the clearance
+        reason present alongside the revert reason."""
+        clearing_sha = 'b' * 40
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            revert_commit='f' * 40,
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'reverted'
+        joined = ' '.join(reasons)
+        assert 'revert' in joined.lower()
+        assert clearing_sha in joined
+
+    def test_clearance_still_yields_deliverable_absent_when_no_declared_file_landed(self):
+        """Clearance tightens on content lineage without loosening
+        deliverable_absent — a cleared task whose declared file never
+        landed is still deliverable_absent, with the clearance reason
+        present alongside."""
+        clearing_sha = 'b' * 40
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            declared_files=['src/f.py'], commit_files=['other.py'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'deliverable_absent'
+        assert clearing_sha in ' '.join(reasons)
+
+    # -- Negative controls (do not omit) -----------------------------------
+
+    def test_second_parent_citing_only_other_tasks_is_still_misattributed(self):
+        """Synthetic reproduction of the PRD's two proven fabrications —
+        task 2394 / b045a72de2 (12 commits under ^2, 0 self-citing) and
+        task 2531 / b929f4441d (16 commits under ^2, 0 self-citing) — both
+        stay misattributed after this fix: nothing under the second parent
+        cites the audited task at all."""
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[
+                ('b' * 40, 'impl(77): step one'),
+                ('c' * 40, 'test(77): step two'),
+            ],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    def test_empty_second_parent_commits_is_still_misattributed(self):
+        """`[]` covers non-merge, git failure, timeout, and missing binary
+        alike — a git failure must not change the verdict, at the
+        classifier level too."""
+        audit = _audit(
+            commit_message='Merge task/77 into main', second_parent_commits=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    def test_bare_paren_self_citation_under_second_parent_does_not_clear(self):
+        """Task 4705 retired the bare-paren citation form, and this walk
+        reuses the SAME extract_cited_task_ids — so a bare-paren self-
+        citation under the second parent does not clear either, keeping
+        the two siblings consistent."""
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, 'chore: sweep (50)')],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    def test_body_only_self_citation_under_second_parent_does_not_clear(self):
+        """The clearance scans only the SUBJECT line of each second-parent
+        commit, never the full body — closing the fail-open the module's
+        own header documents for the `task/{id}` form (body prose like
+        "rebased on top of task/50" would otherwise manufacture a false
+        CLEARANCE, which no human filters). A self-citation confined to
+        the body must still flag misattributed. Issue 1 of the task-4706
+        amendment pass."""
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[
+                ('b' * 40, 'fix(77): patch a leak\n\nrebased on top of task/50'),
+            ],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    # -- Real non-clearing shapes (measured limit, esc-4706-1) --------------
+
+    @pytest.mark.parametrize('message', [
+        pytest.param(
+            'feat(orchestrator): allowlist-gate terminal-subject sweep (task 50 step-8)',
+            id='task_2724_shape',
+        ),
+        pytest.param(
+            'amend: tighten the predicate\n\nAddresses the review pass on task 50.',
+            id='task_2949_shape',
+        ),
+        pytest.param(
+            'amend: repair assertions\n\nrestoring the pre-50 cost of two scans',
+            id='task_3610_shape',
+        ),
+    ])
+    def test_real_shapes_that_do_not_clear(self, message):
+        """Measured limit (esc-4706-1): these three real found_on_main
+        records — tasks 2724, 2949 and 3610 — are NOT cleared by this
+        change, correcting the task description's Details line. Recorded
+        as a measured fact, not an aspiration: each message mentions task
+        50 only as a raw substring, never in a form
+        extract_cited_task_ids accepts."""
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, message)],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    # -- Unverifiable arm ----------------------------------------------------
+
+    def test_clearance_with_no_declared_files_is_ok_not_unverifiable(self):
+        """Clearance and 'no declared files' both answer the same question
+        ('did this task's work actually ride in?') — answering differently
+        would emit a reasons list contradicting itself."""
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, 'impl(50): the audited task step')],
+            declared_files=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'ok'
+    def test_no_clearance_and_no_declared_files_is_still_unverifiable(self):
+        """No citation anywhere (not even of another task) and no
+        clearance — unverifiable stays unchanged."""
+        audit = _audit(
+            commit_message='chore: general cleanup', second_parent_commits=[],
+            declared_files=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'unverifiable'
+
+    # -- First-match determinism ----------------------------------------------
+
+    def test_first_matching_commit_in_walk_order_is_reported(self):
+        """When two commits under ^2 both cite 50, the reason names the
+        FIRST one in the given walk order, not the second."""
+        first_sha = 'b' * 40
+        second_sha = 'c' * 40
+        audit = _audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[
+                (first_sha, 'impl(50): first matching commit'),
+                (second_sha, 'impl(50): second matching commit'),
+            ],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        _verdict, reasons = classify(audit)
+        joined = ' '.join(reasons)
+        assert first_sha in joined
+        assert second_sha not in joined
+
+
 # ===========================================================================
 # Step-9/10: classify — reverted (post-hoc-revert blind spot)
 # ===========================================================================
@@ -815,6 +1049,7 @@ def _facts(
     commit_subject: str = '',
     commit_message: str = '',
     commit_files: list[str] | None = None,
+    second_parent_commits: list | None = None,
     revert_commit: str | None = None,
     declared_files_missing_on_main: list[str] | None = None,
 ) -> dict:
@@ -824,6 +1059,7 @@ def _facts(
         'commit_subject': commit_subject,
         'commit_message': commit_message,
         'commit_files': commit_files or [],
+        'second_parent_commits': second_parent_commits or [],
         'revert_commit': revert_commit,
         'declared_files_missing_on_main': declared_files_missing_on_main or [],
     }
@@ -983,6 +1219,25 @@ class TestBuildAuditReportShape:
         }
         assert report['total'] == 3
 
+    async def test_second_parent_commits_fact_is_copied_onto_the_audit(self):
+        """A canned second_parent_commits carrying a self-citation clears a
+        task whose merge subject cites a different task — proves the fact
+        reaches classify() through build_audit_report's orchestration, not
+        just through GitFacts.gather() directly."""
+        clearing_sha = 'e' * 40
+        tasks = [_fom_task('50', 'a' * 40, files=['src/f.py'])]
+        git = FakeGitFacts({
+            'a' * 40: _facts(
+                commit_message='Merge task/77 into main',
+                commit_files=['src/f.py'],
+                second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            ),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        detail = report['tasks'][0]
+        assert detail['verdict'] == 'ok'
+        assert clearing_sha in ' '.join(detail['reasons'])
+
 
 @pytest.mark.asyncio
 class TestBuildAuditReportMissingFactsDefaultSafe:
@@ -996,6 +1251,20 @@ class TestBuildAuditReportMissingFactsDefaultSafe:
         report = await build_audit_report(tasks, git, ref='main')
         assert report['tasks'][0]['verdict'] == 'commit_not_on_main'
         assert report['verdict_counts']['commit_not_on_main'] == 1
+
+    async def test_missing_second_parent_commits_key_defaults_to_empty(self):
+        """An alternate facts provider that omits second_parent_commits
+        entirely must reproduce the pre-change verdict (misattributed),
+        never silently clear a task — mirrors the conservative-default
+        policy this class already pins for is_ancestor."""
+        tasks = [_fom_task('50', 'a' * 40)]
+        git = FakeGitFacts({'a' * 40: {
+            'is_ancestor': True,
+            'commit_message': 'Merge task/77 into main',
+            # second_parent_commits omitted entirely.
+        }})
+        report = await build_audit_report(tasks, git, ref='main')
+        assert report['tasks'][0]['verdict'] == 'misattributed'
 
 
 # ===========================================================================
@@ -1040,6 +1309,26 @@ def _build_test_repo(root: Path) -> dict[str, str]:
          one commit, ``c_feature``, adding src/feature.py) into main. The
          "commit under test" for _git_show_files' merge-commit regression:
          plain ``git show --name-only`` reports NOTHING for a merge commit.
+      7. ``c_coalesce_merge`` — a no-ff merge of a ``coalesced`` branch (three
+         commits: ``c_coalesced_other`` citing only task 77, ``c_coalesced_self``
+         citing task 50 in conventional-commit form with a body line, and
+         ``c_coalesced_slash`` citing task 50 via the ``task/50`` slash form —
+         reproducing task 3103's real clearing shape) into main, itself
+         subjected ``Merge task/77 into main`` — i.e. the merge SUBJECT cites
+         only the *owning* task 77, while its second parent secretly carries
+         a commit citing the *audited* task 50.
+      8. ``c_fabrication_merge`` — a no-ff merge of a ``fabricated`` branch
+         (two commits, ``c_fabricated_one``/``c_fabricated_two``, both citing
+         ONLY task 77) into main, also subjected ``Merge task/77 into main``.
+         The negative control: nothing under its second parent cites task 50
+         at all, synthesizing the PRD's two proven fabrications (tasks 2394 /
+         2531).
+      9. ``c_prose_merge`` — a no-ff merge of a ``prose_cited`` branch (three
+         commits reproducing the real non-clearing shapes measured for tasks
+         2724, 2949 and 3610 — see esc-4706-1) into main, also subjected
+         ``Merge task/77 into main``. Each commit mentions task 50 as a raw
+         substring but not in a form ``extract_cited_task_ids`` accepts, so
+         the walk must not clear it either.
 
     Plus a sibling branch (``sidebranch``, off ``c_init``) holding one commit
     (``c_side``) that is never merged into ``main`` — not an ancestor of it.
@@ -1094,6 +1383,95 @@ def _build_test_repo(root: Path) -> dict[str, str]:
     _git(root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
     c_merge = _git(root, 'rev-parse', 'HEAD')
 
+    # --- Coalesce shape: merge subject cites only the owning task (77), but
+    # the second parent secretly carries a commit citing the audited task
+    # (50) — this is the real shape task 4706 exists to clear. Reproduces
+    # task 3103's real clearing form via the task/50 slash-citation commit.
+    _git(root, 'checkout', '-q', '-b', 'coalesced', 'main')
+    _write(root, 'src/coalesced_other.py', 'other = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'impl(77): unrelated step on the owning branch',
+    )
+    c_coalesced_other = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/coalesced_self.py', 'self_step = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        "impl(50): the audited task's own step commit\n\n"
+        'Brings in the deliverable this task actually shipped.',
+    )
+    c_coalesced_self = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/coalesced_slash.py', 'slash = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'resolve: merge conflicts for task/50')
+    c_coalesced_slash = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', '-q', 'main')
+    _git(root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge task/77 into main', 'coalesced')
+    c_coalesce_merge = _git(root, 'rev-parse', 'HEAD')
+
+    # --- Fabrication shape (negative control): merge subject cites only 77,
+    # and NOTHING under the second parent cites 50 in any form — synthesizes
+    # the PRD's two proven fabrications (tasks 2394 / 2531). Must stay
+    # misattributed after this task's fix.
+    _git(root, 'checkout', '-q', '-b', 'fabricated', 'main')
+    _write(root, 'src/fabricated_one.py', 'one = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'impl(77): step one')
+    c_fabricated_one = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/fabricated_two.py', 'two = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'test(77): step two')
+    c_fabricated_two = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', '-q', 'main')
+    _git(
+        root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge task/77 into main',
+        'fabricated',
+    )
+    c_fabrication_merge = _git(root, 'rev-parse', 'HEAD')
+
+    # --- Real non-clearing shapes (esc-4706-1): each commit mentions task 50
+    # as a raw substring, in exactly the forms measured on tasks 2724, 2949
+    # and 3610 — none of which extract_cited_task_ids accepts as a citation,
+    # so the walk must not clear these either.
+    _git(root, 'checkout', '-q', '-b', 'prose_cited', 'main')
+    _write(root, 'src/prose_2724.py', 'a = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'feat(orchestrator): allowlist-gate terminal-subject sweep (task 50 step-8)',
+    )
+    c_prose_2724 = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/prose_2949.py', 'b = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'amend: tighten the predicate\n\nAddresses the review pass on task 50.',
+    )
+    c_prose_2949 = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/prose_3610.py', 'c = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'amend: repair three assertions\n\nrestoring the pre-50 cost of two scans',
+    )
+    c_prose_3610 = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', '-q', 'main')
+    _git(
+        root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge task/77 into main',
+        'prose_cited',
+    )
+    c_prose_merge = _git(root, 'rev-parse', 'HEAD')
+
     return {
         'c_init': c_init,
         'c_keep_drop': c_keep_drop,
@@ -1103,6 +1481,17 @@ def _build_test_repo(root: Path) -> dict[str, str]:
         'c_side': c_side,
         'c_feature': c_feature,
         'c_merge': c_merge,
+        'c_coalesced_other': c_coalesced_other,
+        'c_coalesced_self': c_coalesced_self,
+        'c_coalesced_slash': c_coalesced_slash,
+        'c_coalesce_merge': c_coalesce_merge,
+        'c_fabricated_one': c_fabricated_one,
+        'c_fabricated_two': c_fabricated_two,
+        'c_fabrication_merge': c_fabrication_merge,
+        'c_prose_2724': c_prose_2724,
+        'c_prose_2949': c_prose_2949,
+        'c_prose_3610': c_prose_3610,
+        'c_prose_merge': c_prose_merge,
     }
 
 
@@ -1220,6 +1609,64 @@ class TestGitFilesMissingOnRef:
 
 
 @pytest.mark.asyncio
+class TestGitSecondParentCommits:
+    """_git_second_parent_commits walks the commits a cited merge's second
+    parent brought in — the new git fact task 4706 adds so the classifier
+    can tell a coalesced merge from a genuine misattribution.
+
+    Bound at module top-level (``_git_second_parent_commits`` above)
+    alongside the other ``_git_*`` module-level bindings at the top of
+    this file, now that the helper exists and the RED phase that used to
+    justify reaching through ``_mod.`` instead is over.
+    """
+
+    async def test_merge_returns_sha_message_pairs_for_second_parent(self, repo_facts):
+        """Covers exactly the three commits the coalesced branch brought
+        in — and, by being an exact-set match, implicitly excludes every
+        first-parent-side commit (main's own history, including c_merge)."""
+        root, shas = repo_facts
+        pairs = await _git_second_parent_commits(str(root), shas['c_coalesce_merge'])
+        result_shas = {sha for sha, _message in pairs}
+        assert result_shas == {
+            shas['c_coalesced_other'], shas['c_coalesced_self'], shas['c_coalesced_slash'],
+        }
+        # Full body, not just the subject line.
+        self_message = next(msg for sha, msg in pairs if sha == shas['c_coalesced_self'])
+        assert 'Brings in the deliverable this task actually shipped.' in self_message
+
+    async def test_single_parent_commit_returns_empty(self, repo_facts):
+        """`git log <sha>^1..<sha>^2` on a single-parent commit is
+        unresolvable — verified empirically: git exits 128 with `fatal:
+        ambiguous argument`, which the wrapper's `rc != 0` branch swallows
+        to the safe `[]` default rather than raising."""
+        root, shas = repo_facts
+        pairs = await _git_second_parent_commits(str(root), shas['c_keep_drop'])
+        assert pairs == []
+
+    async def test_bogus_sha_returns_empty(self, repo_facts):
+        root, _shas = repo_facts
+        pairs = await _git_second_parent_commits(str(root), 'f' * 40)
+        assert pairs == []
+
+    async def test_nonexistent_project_root_returns_empty(self, tmp_path):
+        """The never-raises contract the task demands: 'Never let a git
+        failure flip a verdict.'"""
+        pairs = await _git_second_parent_commits(
+            str(tmp_path / 'does-not-exist'), 'f' * 40,
+        )
+        assert pairs == []
+
+    async def test_walk_is_capped(self, repo_facts, monkeypatch):
+        """Pins that the cap is read at call time and actually passed to
+        git, not merely declared — c_coalesce_merge's second parent has
+        three commits; capping at two must yield exactly two pairs."""
+        root, shas = repo_facts
+        monkeypatch.setattr(_mod, '_SECOND_PARENT_WALK_CAP', 2)
+        pairs = await _git_second_parent_commits(str(root), shas['c_coalesce_merge'])
+        assert len(pairs) == 2
+
+
+@pytest.mark.asyncio
 class TestGitFactsGather:
     """GitFacts.gather() aggregates the four _git_* wrappers per commit, and
     short-circuits all of them when the commit is not on the ref at all."""
@@ -1245,8 +1692,26 @@ class TestGitFactsGather:
         assert facts['is_ancestor'] is True
         assert facts['commit_files'] == ['src/feature.py']
 
+    async def test_merge_commit_gathers_second_parent_commits(self, repo_facts):
+        """The new git fact task 4706 adds: gather() surfaces what a cited
+        merge's second parent brought in, end to end through the real
+        GitFacts facade."""
+        root, shas = repo_facts
+        git = GitFacts(str(root))
+        facts = await git.gather(shas['c_coalesce_merge'], 'main', [])
+        result_shas = {sha for sha, _message in facts['second_parent_commits']}
+        assert result_shas == {
+            shas['c_coalesced_other'], shas['c_coalesced_self'], shas['c_coalesced_slash'],
+        }
+
+    async def test_non_merge_gathers_empty_second_parent_commits(self, repo_facts):
+        root, shas = repo_facts
+        git = GitFacts(str(root))
+        facts = await git.gather(shas['c_keep_drop'], 'main', [])
+        assert facts['second_parent_commits'] == []
+
     async def test_non_ancestor_short_circuits_remaining_git_calls(self, repo_facts, monkeypatch):
-        """When is_ancestor is False, none of the other four subprocesses run
+        """When is_ancestor is False, none of the other five subprocesses run
         — classify() would ignore their facts anyway (commit_not_on_main wins
         at the very first precedence check), so gathering them is pure waste.
         """
@@ -1269,10 +1734,15 @@ class TestGitFactsGather:
             calls.append('files_missing')
             return list(files), []
 
+        async def _spy_second_parent(project_root, commit):
+            calls.append('second_parent')
+            return [('should-not-be-called' * 3, 'should not be called')]
+
         monkeypatch.setattr(_mod, '_git_commit_message', _spy_commit_message)
         monkeypatch.setattr(_mod, '_git_show_files', _spy_show_files)
         monkeypatch.setattr(_mod, '_git_find_revert', _spy_find_revert)
         monkeypatch.setattr(_mod, '_git_files_missing_on_ref', _spy_files_missing)
+        monkeypatch.setattr(_mod, '_git_second_parent_commits', _spy_second_parent)
 
         git = GitFacts(str(root))
         facts = await git.gather(shas['c_side'], 'main', ['src/keep.py'])
@@ -1282,11 +1752,50 @@ class TestGitFactsGather:
             'commit_subject': '',
             'commit_message': '',
             'commit_files': [],
+            'second_parent_commits': [],
             'revert_commit': None,
             'declared_files_missing_on_main': [],
             'declared_files_inconclusive': [],
         }
-        assert calls == []  # none of the other four wrappers ran
+        assert calls == []  # none of the other five wrappers ran
+
+
+@pytest.mark.asyncio
+class TestCoalescedMergeEndToEnd:
+    """End-to-end pins through the REAL git wrappers (no canned facts) — the
+    pin that would have caught the original defect, since mocking
+    subprocess hides it entirely."""
+
+    async def test_coalesced_merge_task_is_ok_end_to_end(self, repo_facts):
+        """task 50's merge subject cites only task 77, but its own step
+        commit rode in under the merge's second parent — must clear to ok,
+        not misattributed."""
+        root, shas = repo_facts
+        task = _fom_task('50', shas['c_coalesce_merge'], files=['src/coalesced_self.py'])
+        report = await build_audit_report([task], GitFacts(str(root)), ref='main')
+        assert report['tasks'][0]['verdict'] == 'ok'
+        assert report['verdict_counts']['misattributed'] == 0
+
+    async def test_fabricated_merge_task_is_still_misattributed_end_to_end(self, repo_facts):
+        """THE critical negative control, run through real git rather than
+        canned facts: nothing under the fabricated branch cites task 50 at
+        all, synthesizing the PRD's proven fabrications (tasks 2394/2531) —
+        must stay misattributed."""
+        root, shas = repo_facts
+        task = _fom_task('50', shas['c_fabrication_merge'])
+        report = await build_audit_report([task], GitFacts(str(root)), ref='main')
+        assert report['tasks'][0]['verdict'] == 'misattributed'
+
+    async def test_prose_only_merge_is_still_misattributed_end_to_end(self, repo_facts):
+        """Documents the measured real-world outcome for tasks 2724, 2949
+        and 3610 (see esc-4706-1): task 50 appears only as a raw substring
+        under the second parent, never in a form extract_cited_task_ids
+        accepts, so this stays misattributed too. NOT a defect in this
+        change — a measured, accepted limit."""
+        root, shas = repo_facts
+        task = _fom_task('50', shas['c_prose_merge'])
+        report = await build_audit_report([task], GitFacts(str(root)), ref='main')
+        assert report['tasks'][0]['verdict'] == 'misattributed'
 
 
 # ===========================================================================

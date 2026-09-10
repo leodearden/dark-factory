@@ -61,6 +61,7 @@ _SRC = Path(__file__).resolve().parent.parent / 'src'
 PURE_STDLIB_LEAVES = (
     'agent_result',
     'branch_names',
+    'cli_boundary',
     'config_dir',
     'locking',
     'mcp_envelope',
@@ -75,6 +76,7 @@ PURE_STDLIB_LEAVES = (
     'task_statuses',
     'task_transitions',
     'testing_reify_layout',
+    'testing_streams',
     'timestamps',
     'transcript_archive',
     'verify_admission',

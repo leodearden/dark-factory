@@ -48,6 +48,16 @@ Nothing enforces this mechanically, by choice — see `CONTRIBUTING.md` §2
 (esc-3815-7).
 <!-- line-pin-policy:end -->
 
+## Code quality
+
+`docs/code-quality.md` is the single normative definition of code quality
+for this repo and for every project the factory operates: quality is the
+cost and risk of the next change, and here the next change is made by an
+agent; fourteen named heuristics with their agreed readings; comments as a
+clarity smell; tests reaching a module's internals as an interface smell.
+Review, refactor and PRD work cite those heuristics by name from that file.
+Do not restate them elsewhere (INV-9). The `CONTRIBUTING.md` §4 gates are
+the floor, not the bar.
 
 ## Prerequisites
 
@@ -142,7 +152,7 @@ correct, and knowing which you are in is the whole point of asking.
 - **Decisions made** — immediately, don't wait until session end
 - **Conventions discovered** — coding patterns, naming rules, project norms
 - **Session end** — reflect and write observations, summaries of what was accomplished
-- **Before writing a gotcha-class `procedural_knowledge` entry** — `search()` first for existing coverage; if a near-duplicate already exists, consolidate into/update it instead of writing a new one. (`fused-memory/scripts/audit_duplicate_memories.py` is the automated backstop sweep for whatever slips through.) `add_memory` now ENFORCES this at write time: a `procedural_knowledge` write matching an existing entry at high similarity is soft-blocked; override with `metadata={'allow_near_duplicate': True}` only for genuinely distinct content.
+- **Before writing a gotcha-class `procedural_knowledge` or `preferences_and_norms` entry** — `search()` first for existing coverage; if a near-duplicate already exists, consolidate into/update it instead of writing a new one. (`fused-memory/scripts/audit_duplicate_memories.py` is the automated backstop sweep for whatever slips through.) `add_memory` now ENFORCES this at write time with two guards of different scope: (1) a deterministic topic-cluster guard covering BOTH categories, which soft-blocks content matching a known-contradictory topic cluster (error_type `ProceduralKnowledgeKnownTopicClusterWriteRejected`); and (2) a cosine near-duplicate guard that remains `procedural_knowledge`-only, which soft-blocks content matching an existing entry at high similarity. Both guards fire only on an explicit `category=` argument — a `category=None` write that auto-classifies to `procedural_knowledge` is covered by neither. Override either with `metadata={'allow_near_duplicate': True}` only for genuinely distinct content. Full statement: `fused-memory/src/fused_memory/server/tools.py::add_memory` docstring.
 
 ### Write operations
 

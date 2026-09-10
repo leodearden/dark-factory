@@ -63,6 +63,7 @@ import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import warnings
@@ -1155,18 +1156,18 @@ ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
 ROW5_HOLDER_TEARDOWN_CEILING_SECS: float = 5.0
 
 #: Worst-case FIXED (non-load-scaled) work in Row 5: the marker wait, the
-#: waiter subprocess's completion ceiling, and the finally block's holder
-#: teardown.  The marker term is counted TWICE because
-#: :func:`wait_for_marker_stable` spends its timeout on the existence gate and
-#: then a FRESH deadline on the settle loop -- worst case 40s, not 20s, a term
-#: the literal mark this replaced hid entirely.  (Deliberately excludes
-#: _setup_verify_repo's real git work and the in-process consumer half -- both
-#: small next to the headroom below, exactly as for Rows 1-4.)
+#: waiter subprocess's completion ceiling, and the finally block's TWO
+#: holder teardowns (waiter then holder).  The marker term is counted TWICE
+#: because :func:`wait_for_marker_stable` spends its timeout on the existence
+#: gate and then a FRESH deadline on the settle loop -- worst case 40s, not
+#: 20s, a term the literal mark this replaced hid entirely.  (Deliberately
+#: excludes _setup_verify_repo's real git work and the in-process consumer
+#: half -- both small next to the headroom below, exactly as for Rows 1-4.)
 _ROW5_WORST_CASE_FIXED_SECS: float = (
     2 * ROW_MARKER_CEILING_SECS
     + ROW5_WAITER_COMPLETION_CEILING_SECS
-    + ROW5_HOLDER_TEARDOWN_CEILING_SECS
-)  # 105.0
+    + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
+)  # 110.0
 
 #: Row 5's per-test opt-out from the inherited `timeout = 60`, in the same
 #: shape as ROW_PER_TEST_TIMEOUT_SECS above: 2x the FIXED terms (they do not
@@ -1177,7 +1178,7 @@ _ROW5_WORST_CASE_FIXED_SECS: float = (
 #: them as well would double-count the same elasticity.
 ROW5_PER_TEST_TIMEOUT_SECS: int = int(
     2 * _ROW5_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
-)  # 450
+)  # 460
 # ---------------------------------------------------------------------------
 
 
@@ -1574,7 +1575,8 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
     ``wait_subtree_gone`` kill confirmation -- so it cannot share their
     constant.  Its bounded terms are: two discovery waits (both on the
     load-scaled ceiling), the marker wait, the waiter subprocess's completion
-    ceiling, and the ``finally`` block's holder teardown.
+    ceiling, and the ``finally`` block's TWO holder teardowns (waiter then
+    holder).
 
     The marker term is counted TWICE on purpose:
     :func:`wait_for_marker_stable` spends its ``timeout`` on the
@@ -1590,13 +1592,13 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
         2 * ROW_DISCOVERY_CEILING_MAX_SECS
         + 2 * ROW_MARKER_CEILING_SECS
         + ROW5_WAITER_COMPLETION_CEILING_SECS
-        + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+        + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
     )
     assert required <= ROW5_PER_TEST_TIMEOUT_SECS, (
         f'ROW5_PER_TEST_TIMEOUT_SECS ({ROW5_PER_TEST_TIMEOUT_SECS}) does not cover '
         f"Row 5's bounded worst case ({required}) -- both discovery waits at the "
         f'MAX ceiling, the marker existence gate AND its settle loop, the waiter '
-        f"subprocess's completion ceiling, and the holder teardown"
+        f"subprocess's completion ceiling, and both holder teardowns"
     )
 
     applied = [
@@ -1775,20 +1777,80 @@ def _bare_kill_offenders(func_node, holder_names: set[str]) -> list[str]:
     return offenders
 
 
+def _untorn_down_holders(func_node, holder_names: set[str]) -> list[str]:
+    """``"func:holder"`` for every swept holder never passed to a
+    ``kill_holder_tree(...)`` call in a ``try`` handler/finalbody anywhere
+    in *func_node*.
+
+    Scoped to the WHOLE FUNCTION, across ALL of its ``try`` statements --
+    deliberately unlike :func:`_bare_kill_offenders`, which only excuses a
+    raw kill found in the SAME body of the SAME ``try`` -- because the
+    failure this catches is the ABSENCE of any teardown, which no per-``try``
+    rule can see: a holder torn down in a completely different ``try`` from
+    where it was bound is still torn down.
+
+    Only a call inside a ``finally``/``except`` body counts as teardown: a
+    ``kill_holder_tree(holder)`` reachable only along the happy path -- as
+    the last statement of a ``try`` BODY, or a bare statement outside any
+    ``try`` -- would not run if an earlier statement raises, which is
+    exactly the failure this check exists to catch, so it must not be
+    credited.  Only a DIRECT ``ast.Name`` argument of the call (positional
+    or keyword value) counts as teardown; the argument subtree is
+    deliberately not walked, so an indirection such as
+    ``kill_holder_tree(procs[0])`` is reported as a finding rather than
+    silently excused.  Keyword values are included because
+    ``kill_holder_tree``'s first parameter is named ``proc``, making
+    ``kill_holder_tree(proc=holder)`` a legal spelling.
+    """
+    torn_down: set[str] = set()
+    for try_node in ast.walk(func_node):
+        if not isinstance(try_node, ast.Try):
+            continue
+        bodies = [try_node.finalbody] + [handler.body for handler in try_node.handlers]
+        for body in bodies:
+            for stmt in body:
+                for node in ast.walk(stmt):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == 'kill_holder_tree'
+                    ):
+                        continue
+                    for arg in node.args:
+                        if isinstance(arg, ast.Name):
+                            torn_down.add(arg.id)
+                    for keyword in node.keywords:
+                        if isinstance(keyword.value, ast.Name):
+                            torn_down.add(keyword.value.id)
+    return sorted(f'{func_node.name}:{name}' for name in holder_names - torn_down)
+
+
 def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     """Every spawn_verify_merge-bound holder's teardown goes through kill_holder_tree.
 
     Enumeration-free sweep of this module's own AST (see the banner above
     :func:`test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark`).
     For every ``test_*`` function, collects the local names bound from a
-    bare ``X = spawn_verify_merge(...)`` call, then asserts that no ``try``
-    handler/finalbody in that function calls ``<holder>.kill()``,
-    ``<holder>.terminate()``, or ``os.kill``/``os.killpg`` (with a swept
-    holder name anywhere in the argument subtree) directly unless the SAME
-    body also calls ``kill_holder_tree`` -- any of those raw-kill spellings
-    SIGKILLs/terminates only the leader, orphaning any session-escaped
-    descendant (e.g. one of verify.py's ``start_new_session`` build
-    commands) for the rest of its natural life (task 4092).
+    bare ``X = spawn_verify_merge(...)`` call, then makes TWO independent
+    claims about every such holder:
+
+    (i) no ``try`` handler/finalbody in that function calls
+    ``<holder>.kill()``, ``<holder>.terminate()``, or ``os.kill``/
+    ``os.killpg`` (with a swept holder name anywhere in the argument
+    subtree) directly unless the SAME body also calls ``kill_holder_tree``
+    -- any of those raw-kill spellings SIGKILLs/terminates only the leader,
+    orphaning any session-escaped descendant (e.g. one of verify.py's
+    ``start_new_session`` build commands) for the rest of its natural life
+    (task 4092); and
+
+    (ii) every swept holder is passed to a ``kill_holder_tree(...)`` call
+    inside a ``try``'s ``finally``/``except`` body SOMEWHERE in that function
+    (:func:`_untorn_down_holders`) -- (i) only judges the quality of a
+    teardown that exists, so a holder with no exception-safe teardown
+    anywhere satisfies (i) vacuously; (ii) closes that silent-pass hole
+    (task 4946), including the narrower case of a ``kill_holder_tree`` call
+    that is textually present but reachable only along the happy path (e.g.
+    the last statement of a ``try`` body, never its ``finally``/``except``).
 
     Carries the sibling sweep's anti-vacuity discipline: a matcher that
     silently stops matching is a guard reporting PASS while guarding
@@ -1799,6 +1861,7 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
     swept: dict[str, set[str]] = {}
     offenders: list[str] = []
+    untorn: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -1809,6 +1872,7 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
             continue
         swept[node.name] = holder_names
         offenders.extend(_bare_kill_offenders(node, holder_names))
+        untorn.extend(_untorn_down_holders(node, holder_names))
 
     missing = sorted(_KNOWN_HOLDER_TEARDOWN_ROWS - set(swept))
     assert not missing, (
@@ -1823,6 +1887,190 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
         'so a session-escaped descendant (e.g. a verify.py '
         "start_new_session build command) survives the leader's own death "
         'as an orphan:\n  ' + '\n  '.join(offenders)
+    )
+
+    assert not untorn, (
+        'these spawn_verify_merge-bound holders are never passed to '
+        "kill_holder_tree from inside their test's try finally/except "
+        'bodies, so a raised communicate()/wait() timeout -- or any '
+        'failing assertion before the teardown -- leaks the leader AND '
+        'every session-escaped descendant verify.py started under it; a '
+        'holder with no exception-safe teardown must be a finding, not a '
+        'silent pass (the raw-kill sweep above only sees teardowns that '
+        'exist):\n  ' + '\n  '.join(untorn)
+    )
+
+
+def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree():
+    """_untorn_down_holders flags a swept holder iff it never reaches
+    kill_holder_tree from inside a try's finally/except body.
+
+    Deterministic AST-only cases (``ast.parse`` over a ``textwrap.dedent(...)``
+    source, zero subprocesses, zero timing).  ``holder_names`` is supplied
+    directly to each case, so this test pins ONLY the new helper, not
+    :func:`_spawn_verify_merge_bound_names`.
+
+    Case (d) is load-bearing: a matcher that merely asks "does this function
+    call kill_holder_tree anywhere?" would pass cases (a)-(c) AND vacuously
+    green Row 5 (which already calls ``kill_holder_tree(holder, ...)``) while
+    catching nothing -- (d) is the only case that kills that implementation,
+    because ``other``'s teardown must not excuse ``holder``'s absence.
+
+    Case (f) is equally load-bearing, for the finally/except requirement:
+    a matcher that credits a ``kill_holder_tree`` call reachable anywhere in
+    the function -- including the happy path, e.g. the last statement of a
+    ``try`` BODY -- would pass every other case here while still leaving a
+    holder unprotected against an earlier statement in that same body
+    raising before the call is reached.
+
+    Cases (g) and (h) pin two properties this helper's own docstring already
+    claims but that no case previously exercised: (g) that an indirect
+    argument (not a direct ``ast.Name``) is reported as a finding rather
+    than silently excused, and (h) that the whole-function scope credits a
+    teardown living in a completely different ``try`` from where the holder
+    was bound.
+    """
+
+    def parse_func(source: str) -> ast.FunctionDef:
+        tree = ast.parse(textwrap.dedent(source))
+        (func,) = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+        return func
+
+    # (a) holder bound, no kill_holder_tree call at all.
+    func_a = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+    """)
+    assert _untorn_down_holders(func_a, {'holder'}) == ['f:holder'], (
+        'a holder with NO kill_holder_tree call anywhere in its function '
+        'must be flagged'
+    )
+
+    # (b) holder passed positionally in a finally:.
+    func_b = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_b, {'holder'}) == [], (
+        'a holder passed positionally to kill_holder_tree in a finally: '
+        'must not be flagged'
+    )
+
+    # (c) holder passed inside a nested `if holder is not None:` guard
+    # within the finally: -- pins that the helper walks nested bodies; this
+    # is the exact shape step-5 uses for Row 5's `waiter`.
+    func_c = parse_func("""
+        def f():
+            holder = None
+            try:
+                holder = spawn_verify_merge()
+                do_work()
+            finally:
+                if holder is not None:
+                    kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_c, {'holder'}) == [], (
+        'a holder passed to kill_holder_tree inside a nested if-guard '
+        'within the finally: must not be flagged -- the helper must walk '
+        'nested bodies'
+    )
+
+    # (d) ANTI-VACUITY (load-bearing, do not drop): two holders, only
+    # `other` passed to kill_holder_tree -- `holder` must still be flagged.
+    func_d = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            other = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(other, timeout=5)
+    """)
+    assert _untorn_down_holders(func_d, {'holder', 'other'}) == ['f:holder'], (
+        "kill_holder_tree(other) must not excuse holder's absence -- a "
+        'matcher that merely checks "is kill_holder_tree called anywhere?" '
+        'would wrongly return [] here'
+    )
+
+    # (e) keyword spelling: kill_holder_tree's first parameter is named `proc`.
+    func_e = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(proc=holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_e, {'holder'}) == [], (
+        'a holder passed as the proc= keyword must not be flagged -- '
+        "kill_holder_tree's first parameter is named proc"
+    )
+
+    # (f) LOAD-BEARING for the finally/except requirement: kill_holder_tree
+    # is called with `holder`, but only as the last statement of the try
+    # BODY itself -- never inside a finally/except.  An earlier statement in
+    # that same try body raising would skip this call entirely, which is
+    # exactly the failure this whole check exists to catch, so it must
+    # still be flagged even though a kill_holder_tree(holder) call is
+    # textually present in the function.
+    func_f = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+                kill_holder_tree(holder, timeout=5)
+            except RuntimeError:
+                pass
+    """)
+    assert _untorn_down_holders(func_f, {'holder'}) == ['f:holder'], (
+        'a kill_holder_tree call reachable only along the happy path (the '
+        'last statement of a try BODY, not its finally/except) must still '
+        'be flagged -- an earlier statement in the same try body raising '
+        'would skip it entirely'
+    )
+
+    # (g) indirection defeats the matcher: kill_holder_tree(procs[0]) does
+    # not count as tearing down `holder`, even though `procs` holds it at
+    # runtime -- only a DIRECT ast.Name argument counts, so an indirection
+    # is reported as a finding rather than silently excused.
+    func_g = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            procs = [holder]
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(procs[0], timeout=5)
+    """)
+    assert _untorn_down_holders(func_g, {'holder'}) == ['f:holder'], (
+        'kill_holder_tree(procs[0]) is an indirection, not a direct '
+        'ast.Name argument -- it must not excuse holder, even though procs '
+        'holds it at runtime'
+    )
+
+    # (h) whole-function scope: holder is bound before one try and torn down
+    # in a COMPLETELY DIFFERENT, later try's finally -- unlike
+    # _bare_kill_offenders (which is per-try), this check must not flag it.
+    func_h = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            except RuntimeError:
+                pass
+            try:
+                do_more_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_h, {'holder'}) == [], (
+        'a holder torn down in a completely different try from where it '
+        'was bound is still torn down -- this check is scoped to the '
+        'whole function, not per-try'
     )
 
 
@@ -3505,7 +3753,17 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         # subprocess completion past a short deadline; the discriminating
         # invariant is the FLOCK_WAIT_CEILING_SECS assertion below (task
         # 3369), never this ceiling, which only bounds a wedged child.
-        stdout, stderr = proc.communicate(timeout=60)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        finally:
+            # task 4092/4946: kill_holder_tree so a communicate() timeout
+            # here does not leak the child leader -- and any
+            # start_new_session build command verify.py spawned under it --
+            # while we still hold the flock; a child killed before the
+            # unlock below can never win the lock and proceed.  Free on the
+            # success path: communicate() has already reaped the child, so
+            # the ALREADY-REAPED SHORT CIRCUIT returns at once.
+            kill_holder_tree(proc, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(held_fd, fcntl.LOCK_UN)
@@ -4236,6 +4494,10 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     # ~9s). Pair it with a live heartbeat, mirroring Row 3, so it survives
     # for the whole span the test needs it.
     heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
+    # task 4946: bound before the try so the finally below can tear it down
+    # even if wait_for_pgid_file/wait_subtree_live/wait_for_marker_stable
+    # raises before the waiter is ever spawned.
+    waiter = None
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
         wait_subtree_live(holder_pgid_val, proc=holder)
@@ -4301,6 +4563,14 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         )
     finally:
         heartbeat_holder.stop_heartbeats()
+        # task 4946: a TimeoutExpired from waiter.communicate() above, or
+        # any of the six assertions before this finally failing, previously
+        # left the waiter leader -- and its session-escaped descendants --
+        # alive.  Tear the waiter down BEFORE the holder: it is the process
+        # contending for the lock the holder owns.  Free on the success
+        # path via kill_holder_tree's already-reaped short circuit.
+        if waiter is not None:
+            kill_holder_tree(waiter, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta

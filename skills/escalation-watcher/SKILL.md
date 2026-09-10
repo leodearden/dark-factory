@@ -622,10 +622,27 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
      task_id=..., branch=..., worktree=..., description=..., wait_secs=100
    )
    ```
+   <!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
    A return within the window yields a terminal outcome shape (`status` ∈
-   `done | conflict | blocked | already_merged | unknown_branch | failed`).
+   `done | conflict | blocked | already_merged | done_wip_recovery | unknown_branch |
+   unmerged_state | stash_failed | wip_halted | wip_recovery_no_advance | error |
+   superseded`).
+   <!-- merge-state-vocab:end -->
+   The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
+   `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
+   `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
+   observed by polling — handle them as `blocked`. (`failed`, which this list named
+   until task 4829, is not a value the server ever returns; the real one is `error`.)
+   <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
    A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
    snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   <!-- merge-state-vocab:end -->
    Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
    intent persists even if the MCP session drops mid-bounded-wait.
    - `status='attached'` on a coalesced submission means the merge is already queued under the
@@ -636,7 +653,16 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    mcp__escalation__merge_status(request_id=...)
    ```
    Back off 15 s → 60 s, using `eta_seconds` as the hint when present. Terminal states:
-   `done | conflict | blocked | already_merged`. After an orchestrator restart,
+   <!-- merge-state-vocab:begin partition=TERMINAL_STATES
+        Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
+   `done | conflict | blocked | abandoned | superseded`.
+   <!-- merge-state-vocab:end -->
+   (`already_merged`, which this list named until task 4829, is a *submit* status the
+   server collapses to `done` when observed by polling — see step 1 and
+   `escalation/src/escalation/server.py::_map_terminal_state`.)
+   After an orchestrator restart,
    `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
 
 3. **To abandon** a queued entry before it is picked up:

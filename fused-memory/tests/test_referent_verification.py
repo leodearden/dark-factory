@@ -25,6 +25,7 @@ be determined is RECORDED and LEFT ALONE, never guessed at.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -38,12 +39,15 @@ from _fm_helpers import (
     install_identity_mocks,
 )
 
+from fused_memory.services import memory_service as memory_service_module
 from fused_memory.services.memory_service import (
     REFERENT_CHECKS,
+    REFERENT_FINDING_AXES,
     MemoryService,
     ReferentFinding,
     ReferentStats,
 )
+from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
 
 
@@ -107,10 +111,14 @@ class TestReferentRecordVocabulary:
         assert finding.new_endpoint_uuid is None
         assert finding.resolvable is False
         assert finding.reason == ''
+        # DEFAULTED, so every existing construction site — including
+        # tests/test_referent_repair.py's `_finding()` and leaf eta's landed
+        # repair path — keeps constructing unchanged.
+        assert finding.cited == ()
 
     def test_is_keyword_only(self):
-        """Positional construction of an eleven-field evidence record is how a
-        field silently lands in the wrong slot."""
+        """Positional construction of a record this wide is how a field
+        silently lands in the wrong slot."""
         with pytest.raises(TypeError):
             ReferentFinding('edge-1', 'source', 'set-membership')  # type: ignore[misc]
 
@@ -1622,6 +1630,24 @@ def _one_membership_finding_episode() -> MockAddEpisodeResult:
     )
 
 
+def _three_findings_one_referent_episode() -> MockAddEpisodeResult:
+    """Three edge ends landed on Task 3129 while the write declared 3127.
+
+    Three findings sharing ONE intended referent, so the second pass issues
+    exactly one backend lookup and the other two findings read its CACHED
+    verdict — the shape both the caching contract and its degradation contract
+    are pinned on.
+    """
+    return _episode(
+        edges=[_edge('e1', source='n-3129', target='n-x'),
+               _edge('e2', source='n-3129', target='n-y'),
+               _edge('e3', source='n-y', target='n-3129')],
+        nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+               MockNode(name='deploy pipeline', uuid='n-x'),
+               MockNode(name='merge lane', uuid='n-y')],
+    )
+
+
 class TestNewEndpointUuidResolution:
     """Read-only, lazy, and never issued on the clean path."""
 
@@ -1712,17 +1738,10 @@ class TestNewEndpointUuidResolution:
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
             return_value=_rows('n-3127'),
         )
-        result = _episode(
-            edges=[_edge('e1', source='n-3129', target='n-x'),
-                   _edge('e2', source='n-3129', target='n-y'),
-                   _edge('e3', source='n-y', target='n-3129')],
-            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
-                   MockNode(name='deploy pipeline', uuid='n-x'),
-                   MockNode(name='merge lane', uuid='n-y')],
-        )
 
         stats = await service._verify_episode_referents(
-            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            _three_findings_one_referent_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
         )
 
         assert len(stats.findings) == 3
@@ -1788,10 +1807,21 @@ class TestReferentFindingCounters:
     """
 
     def test_every_bucket_exists_from_construction(self, service):
-        """A reader never has to distinguish "zero" from "absent"."""
+        """A reader never has to distinguish "zero" from "absent".
+
+        Keyed off the CONSTANTS, not a literal, so the bucket vocabulary lives
+        at ONE site (INV-5) — a fourth bucket has to be REGISTERED rather than
+        spelled here and at the construction site and hoped to match.
+        """
         assert service.referent_finding_counts() == dict.fromkeys(
-            (*REFERENT_CHECKS, 'unresolvable'), 0,
+            (*REFERENT_CHECKS, *REFERENT_FINDING_AXES), 0,
         )
+
+    def test_the_axes_are_the_two_orthogonal_ones_not_checks(self):
+        """The axis vocabulary is closed too, and its members answer questions
+        ABOUT a finding rather than naming which check produced it."""
+        assert REFERENT_FINDING_AXES == ('unresolvable', 'corroborated')
+        assert not set(REFERENT_FINDING_AXES) & set(REFERENT_CHECKS)
 
     def test_the_counter_exists_even_with_no_write_journal(self, service):
         """Unconditional construction: the escape must not go dark in exactly
@@ -1847,10 +1877,50 @@ class TestReferentFindingCounters:
 
         assert set(service.referent_finding_counts().values()) == {0}
 
+    @pytest.mark.asyncio
+    async def test_a_corroborated_finding_moves_the_new_axis_too(self, service):
+        """ALONGSIDE the check bucket, never instead of it.
+
+        S1's fix is that leaf iota can SUBTRACT corroborated rows from the
+        membership rate — which needs the denominator still there. Folding them
+        out of `set-membership` instead would silently change what iota's
+        existing rate means, and would break the "buckets are orthogonal axes,
+        not a partition" contract the counter documents.
+        """
+        stats = await service._verify_episode_referents(
+            _corroborated_membership_episode(), group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+        )
+
+        assert [f.corroborated for f in stats.findings] == [True]
+        counts = service.referent_finding_counts()
+        assert counts['corroborated'] == 1
+        assert counts['set-membership'] == 1
+        assert counts['unresolvable'] == 1
+        assert counts['per-edge-pairing'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_finding_leaves_the_corroborated_bucket_at_zero(
+        self, service,
+    ):
+        """The bucket covers the `endpoint in cited` veto ONLY. A misattached
+        edge nothing corroborates is the defect the pass exists to catch, and
+        must stay fully visible in iota's rate."""
+        await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        counts = service.referent_finding_counts()
+        assert counts['set-membership'] == 1
+        assert counts['corroborated'] == 0
+
     def test_the_accessor_returns_a_copy(self, service):
         service.referent_finding_counts()['set-membership'] = 99
+        service.referent_finding_counts()['corroborated'] = 99
 
         assert service.referent_finding_counts()['set-membership'] == 0
+        assert service.referent_finding_counts()['corroborated'] == 0
 
 
 class TestReferentFindingOperatorLog:
@@ -1880,7 +1950,27 @@ class TestReferentFindingOperatorLog:
         assert 'set-membership' in payload
 
     @pytest.mark.asyncio
-    async def test_no_finding_is_reported_at_debug_only(self, service, caplog):
+    async def test_the_finding_is_reported_at_warning_and_not_at_debug(
+        self, service, caplog,
+    ):
+        """BOTH halves of the claim, inside ONE debug-level capture.
+
+        The shape this replaces (`test_no_finding_is_reported_at_debug_only`)
+        was NEGATIVE-ONLY: capturing at DEBUG, it asserted merely that no DEBUG
+        record named the check. That is trivially true of a `logger.debug` this
+        pass never makes, so it passed unchanged with the `logger.warning`
+        emission deleted outright — precisely the regression its name claimed to
+        guard. Verified by mutation before this rewrite landed: with the
+        emission removed the old test still passed and this one fails. Do not
+        restore the negative-only shape; "not at DEBUG" means nothing unless it
+        sits beside "and IS at WARNING".
+
+        The fixture is deliberately NON-CORROBORATED (its fact cites nothing),
+        so the INFO demotion does not apply to it, and it produces ONE finding,
+        so the per-episode warning cap does not either. Both would otherwise
+        change the expected level for reasons that have nothing to do with what
+        this test pins.
+        """
         with caplog.at_level(logging.DEBUG,
                              logger='fused_memory.services.memory_service'):
             await service._verify_episode_referents(
@@ -1888,10 +1978,9 @@ class TestReferentFindingOperatorLog:
                 referents=(Referent(number='3127'),),
             )
 
-        debug_only = [r for r in caplog.records
-                      if r.levelno == logging.DEBUG and 'set-membership' in
-                      r.getMessage()]
-        assert not debug_only
+        emitted = _records_for(caplog, 'e1')
+        assert [r.levelno for r in emitted] == [logging.WARNING]
+        assert 'set-membership' in emitted[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_a_clean_episode_logs_no_warning(self, service, caplog):
@@ -1909,3 +1998,965 @@ class TestReferentFindingOperatorLog:
             )
 
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+class TestPerEdgeFactScanIsLazy:
+    """The per-edge fact scan runs only when an endpoint IS a task label.
+
+    esc-3671-1's efficiency item. The scan's only consumers — the corroboration
+    veto, the pairing arm's `cited_declared` guard and `_candidate_pool`'s
+    intersection — are reached exclusively from the endpoint loop, and that loop
+    `continue`s immediately for an endpoint whose name is not a canonical task
+    label, which is the overwhelming majority of edges. Scanning every fact up
+    front therefore spends a regex pass per edge to produce a value nothing
+    reads, and it spends it SERIALIZED inside the per-group
+    `_identity_lock_for` critical section that other same-group writes queue
+    behind.
+
+    Deferring must not cost the "scanned ONCE per edge, not once per endpoint"
+    property the eager comment defends, so the two-task-endpoint case is pinned
+    explicitly: laziness is memoized per edge, not recomputed per end.
+    """
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[str]:
+        """Every text `_verify_episode_referents` hands `scan_content`.
+
+        Patches the name as imported INTO `memory_service` (line 93), which is
+        the binding the pass actually calls, and delegates to the real scanner
+        so the findings under test are the production ones.
+        """
+        scanned: list[str] = []
+        real = memory_service_module.scan_content
+
+        def _recording(text, **kwargs):
+            scanned.append(text)
+            return real(text, **kwargs)
+
+        monkeypatch.setattr(memory_service_module, 'scan_content', _recording)
+        return scanned
+
+    @pytest.mark.asyncio
+    async def test_an_edge_with_no_task_endpoint_is_never_scanned(
+        self, service, monkeypatch,
+    ):
+        """The ~99% shape: two plain entity endpoints, nothing to check.
+
+        The fact deliberately DOES cite a task, so an eager implementation
+        really does pay for the scan here. Laziness is decided by the
+        ENDPOINTS, not by whether the fact happens to be scannable.
+        """
+        scanned = self._spy(monkeypatch)
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3129 blocked the deploy pipeline',
+                         source='n-x', target='n-y')],
+            nodes=[MockNode(name='deploy pipeline', uuid='n-x'),
+                   MockNode(name='merge lane', uuid='n-y')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        # The edge was WALKED — laziness bounds the scan, never the coverage.
+        assert stats.edges_scanned == 1
+        assert stats.findings == []
+        assert scanned == []
+
+    @pytest.mark.asyncio
+    async def test_an_endpointless_edge_is_never_scanned(
+        self, service, monkeypatch,
+    ):
+        """The other half of the same shape: this episode's result does not
+        NAME either endpoint, so neither can be parsed at all."""
+        scanned = self._spy(monkeypatch)
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3129 blocked the deploy pipeline',
+                         source='n-absent', target='n-also-absent')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.edges_scanned == 1
+        assert stats.endpoints_unresolved == 2
+        assert scanned == []
+
+    @pytest.mark.asyncio
+    async def test_an_edge_with_two_task_endpoints_is_scanned_exactly_once(
+        self, service, monkeypatch,
+    ):
+        """ONCE PER EDGE, NOT ONCE PER ENDPOINT — the property the eager
+        placement bought and the deferral must not give back. Both ends parse,
+        so both reach the citation rules; one scan must serve them."""
+        scanned = self._spy(monkeypatch)
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3128 supersedes Task 3129',
+                         source='n-3128', target='n-3129')],
+            nodes=[MockNode(name='Task 3128', uuid='n-3128'),
+                   MockNode(name='Task 3129', uuid='n-3129')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.endpoints_checked == 2
+        assert scanned == ['Task 3128 supersedes Task 3129']
+
+    @pytest.mark.asyncio
+    async def test_the_deferral_changes_no_finding(self, service, monkeypatch):
+        """Byte-for-byte equality with the eager behaviour on the mixed
+        membership + pairing fixture, so the deferral is provably an
+        efficiency change and not a semantic one.
+
+        The expected values were captured from the eager implementation before
+        the deferral landed; `reason` is pinned in full because it is the field
+        that would drift first if `cited` were ever computed from the wrong
+        text or at the wrong time.
+        """
+        scanned = self._spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            _mixed_findings_episode(), group_id='dark_factory',
+            referents=_MIXED_REFERENTS,
+        )
+
+        # One scan per edge: each of the two edges has a task-labelled end.
+        assert scanned == ['the deploy pipeline was retried',
+                           'Task 3075 blocks the merge lane']
+
+        membership, pairing = stats.findings
+        assert (membership.edge_uuid, membership.which_end, membership.check,
+                membership.old_endpoint_uuid, membership.old_endpoint_name,
+                membership.endpoint_referent, membership.referent_set,
+                membership.intended_referent, membership.resolvable) == (
+            'e1', 'source', 'set-membership', 'n-3129', 'Task 3129',
+            Referent(number='3129'), ('Task 3074', 'Task 3075'), None, False)
+        assert membership.reason == (
+            "more than one candidate target survives (['Task 3074', "
+            "'Task 3075']) and the edge fact does not discriminate between "
+            'them; recorded, not guessed at')
+
+        assert (pairing.edge_uuid, pairing.which_end, pairing.check,
+                pairing.old_endpoint_uuid, pairing.old_endpoint_name,
+                pairing.endpoint_referent, pairing.referent_set,
+                pairing.intended_referent, pairing.resolvable,
+                pairing.reason) == (
+            'e2', 'source', 'per-edge-pairing', 'n-3074', 'Task 3074',
+            Referent(number='3074'), ('Task 3074', 'Task 3075'),
+            Referent(number='3075'), True, '')
+
+
+def _corroborated_membership_episode() -> MockAddEpisodeResult:
+    """esc-3671-3's reachable shape, verbatim from `_candidate_pool`'s docstring.
+
+    The edge hangs off the `Task 2500` node and its fact names BOTH that node
+    and the declared referent 3668 — "the same legitimate ambient-task write one
+    sentence longer". Membership fires (2500 is not declared), and the
+    corroboration veto empties the pool because the fact cites the very node the
+    edge landed on.
+    """
+    return _episode(
+        edges=[_edge('e1',
+                     fact='Task 2500 was completed as part of task 3668 by '
+                          'the merge worker',
+                     source='n-2500', target='n-worker')],
+        nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+               MockNode(name='merge worker', uuid='n-worker')],
+    )
+
+
+class TestFindingCarriesTheCitationsThatDecidedIt:
+    """S3 (esc-3671-3): a finding must carry the evidence that made it fire.
+
+    `referent_set` is the DECLARED set. On the PAIRING arm the discriminating
+    input is not that set but the edge fact's own citations — the arm fires
+    precisely on `cited_declared and endpoint_referent not in cited` — and
+    before this field those citations were recoverable nowhere on the record.
+    An operator reading a pairing warning could see which referents the write
+    declared but not which ones the fact named, i.e. not the input that decided
+    the verdict.
+    """
+
+    def test_the_field_defaults_to_empty_and_is_a_tuple(self):
+        """A TUPLE for the reason `referent_set` is one: `frozen=True` blocks
+        rebinding only, so a list would leave `finding.cited.append(...)` open
+        on evidence for destructive edge surgery."""
+        assert _finding().cited == ()
+        assert isinstance(_finding().cited, tuple)
+        assert isinstance(_finding(cited=('Task 3075',)).cited, tuple)
+
+    def test_to_dict_renders_cited_as_a_json_safe_list(self):
+        payload = _finding(cited=('Task 3075', 'Task 3668')).to_dict()
+
+        assert payload['cited'] == ['Task 3075', 'Task 3668']
+        assert json.loads(json.dumps(payload)) == payload
+        # The self-maintaining key-set contract: a field the payload omits is a
+        # field the operator log silently drops.
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    async def test_a_pairing_finding_carries_the_facts_citations(self, service):
+        """The arm whose evidence was missing. `cited == ('Task 3075',)` is
+        exactly what made `cited_declared` non-empty and fired the check."""
+        stats = await service._verify_episode_referents(
+            _mixed_findings_episode(), group_id='dark_factory',
+            referents=_MIXED_REFERENTS,
+        )
+
+        pairing = [f for f in stats.findings if f.check == 'per-edge-pairing']
+        assert [f.cited for f in pairing] == [('Task 3075',)]
+
+    @pytest.mark.asyncio
+    async def test_a_membership_finding_carries_them_too(self, service):
+        """Recorded on BOTH arms, not just the one that reads them, so a reader
+        never has to know which arm carries which evidence."""
+        stats = await service._verify_episode_referents(
+            _corroborated_membership_episode(), group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.endpoint_referent == Referent(number='2500')
+        assert finding.cited == ('Task 2500', 'Task 3668')
+        # And the declared set stays what it always was — the two fields are
+        # different questions, which is the whole point of recording both.
+        assert finding.referent_set == ('Task 3668',)
+
+    @pytest.mark.asyncio
+    async def test_a_fact_citing_nothing_records_no_citations(self, service):
+        """Empty is a real answer here, not an absence: an uninformative fact is
+        why the pairing arm's `cited_declared` guard refuses to fire."""
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].cited == ()
+
+    @pytest.mark.asyncio
+    async def test_the_citations_render_in_a_deterministic_order(self, service):
+        """`cited` is a FROZENSET internally, whose iteration order is not
+        stable across processes under hash randomization. Sorted for the same
+        reason `_candidate_targets` sorts its survivors: a finding must be
+        stable across runs and diffable in eta's audit."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3129 supersedes Task 3128',
+                         source='n-3129', target='n-3128')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='Task 3128', uuid='n-3128')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 2
+        # Both ends of one edge share ONE scan, so both carry the same rendering
+        # — and it follows the fact's numeric order, not its textual one.
+        assert {f.cited for f in stats.findings} == {('Task 3128', 'Task 3129')}
+
+
+class TestCorroboratedIsDerivedFromTheRecordedEvidence:
+    """S1 (esc-3671-3): the READ side of `_candidate_pool`'s corroboration veto.
+
+    A fact that names the very node its edge landed on is the strongest
+    available evidence the attachment is CORRECT, so `_candidate_pool` empties
+    the pool for it (`if endpoint in cited: return frozenset()`). The finding is
+    still recorded — "recorded and left alone, never guessed at" — but it is a
+    no-observable-defect row, and the counter and the operator log both need to
+    be able to tell it apart from a genuine misattachment.
+
+    DERIVED, never stored. A stored boolean set at the construction site would
+    be a second site that must agree byte-for-byte with that guard — the INV-5
+    lockstep duplication whose drift produced esc-3671-3's blocking bug, where a
+    guard sat one position away from where its own rationale assumed. Deriving
+    it from evidence the record now carries makes disagreement unrepresentable,
+    and it is the discipline `ReferentStats` already documents for its own
+    counts.
+    """
+
+    def test_it_is_true_exactly_when_the_fact_names_the_endpoint(self):
+        assert _finding(
+            endpoint_referent=Referent(number='2500'),
+            cited=('Task 2500', 'Task 3668'),
+        ).corroborated is True
+
+        assert _finding(
+            endpoint_referent=Referent(number='2500'),
+            cited=('Task 3668',),
+        ).corroborated is False
+
+        assert _finding(
+            endpoint_referent=Referent(number='2500'), cited=(),
+        ).corroborated is False
+
+    def test_it_compares_canonical_node_names_not_spellings(self):
+        """`cited` renders through `Referent.node_name`, so a foreign-qualified
+        citation is a DIFFERENT referent and must not corroborate a local
+        endpoint — the same discrimination `local_referent` exists to make."""
+        assert _finding(
+            endpoint_referent=Referent(number='2500'),
+            cited=('other_project:2500',),
+        ).corroborated is False
+
+    def test_node_name_is_injective_over_the_registered_kinds(self):
+        """The PRECONDITION this property is derived under, pinned so that
+        registering a second referent kind REDS this suite instead of silently
+        weakening the guard.
+
+        `_candidate_pool`'s veto compares `Referent` OBJECTS — equality on the
+        `(kind, project_id, number)` triple — while `corroborated` compares
+        their `node_name` RENDERINGS, because rendered names are what `cited`
+        carries. The two agree only while distinct referents cannot render
+        alike, and `Referent.node_name` drops `kind` entirely for a FOREIGN
+        referent (`f'{project_id}:{number}'`), so today's injectivity rests
+        wholly on `_KIND_LABELS` holding exactly one kind. Add a second and a
+        foreign citation of the new kind corroborates a foreign 'task' endpoint
+        of the same number: a genuine misattachment demoted to INFO and booked
+        into the 'corroborated' counter axis.
+
+        WHEN THIS REDS, DO NOT RELAX IT. Two repairs are admissible: qualify the
+        kind in the foreign rendering so `node_name` stays injective, or change
+        `corroborated` to compare referent IDENTITY (carry the cited referents
+        on the record beside their renderings). The derivation exists to make
+        the property and the veto unable to disagree, and a name collision is
+        precisely a disagreement.
+
+        Lives here rather than in tests/test_canonical_labels.py because it pins
+        a precondition of THIS property; task 4506 holds no lock on that file
+        (esc-3671-3 amendment pass).
+        """
+        kinds = sorted(canonical_labels._KIND_LABELS)
+        # BOTH renderings, because they fail differently: the local form
+        # discriminates on the kind LABEL ('Task 2500' vs a second label) and
+        # stays injective, while the foreign form drops the kind and is the one
+        # that collides.
+        for project_id in ('', 'other_project'):
+            rendered = {
+                Referent(number='2500', kind=kind, project_id=project_id).node_name
+                for kind in kinds
+            }
+            assert len(rendered) == len(kinds), (
+                f'Referent.node_name collides across registered kinds {kinds} '
+                f'for project_id={project_id!r}: rendered {sorted(rendered)}. '
+                'ReferentFinding.corroborated compares renderings and would '
+                'now disagree with _candidate_pool\'s object-identity veto.'
+            )
+
+    def test_it_is_not_a_key_in_the_payload(self):
+        """The key set is contractually the DATACLASS FIELD NAMES, and a derived
+        property is not a field. Nothing is lost: the payload already carries
+        `cited` and `endpoint_referent`, so an operator reads the corroboration
+        straight off the log line."""
+        payload = _finding(cited=('Task 2520',)).to_dict()
+
+        assert 'corroborated' not in payload
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    async def test_it_agrees_with_the_pool_veto_on_the_reachable_shape(
+        self, service,
+    ):
+        """esc-3671-3's shape, driven end-to-end rather than hand-built.
+
+        The property and the veto must answer the same question about the same
+        edge, which is the entire reason it is derived from `cited` rather than
+        stored beside it.
+        """
+        from fused_memory.services.memory_service import _candidate_pool
+
+        stats = await service._verify_episode_referents(
+            _corroborated_membership_episode(), group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.corroborated is True
+        # The veto's own verdict on the same inputs: an EMPTY pool.
+        assert _candidate_pool(
+            referents=frozenset({Referent(number='3668')}),
+            cited=frozenset({Referent(number='2500'), Referent(number='3668')}),
+            endpoint=Referent(number='2500'),
+            ambiguous=frozenset(),
+            source='derived',
+        ) == frozenset()
+        # Recorded and left alone — the finding survives, it just cannot be
+        # acted on.
+        assert finding.resolvable is False
+
+    @pytest.mark.asyncio
+    async def test_a_pairing_finding_can_never_be_corroborated(self, service):
+        """Structural, not incidental: the pairing arm is reached only when
+        `endpoint_referent not in cited`, so the property is False there by
+        construction."""
+        stats = await service._verify_episode_referents(
+            _mixed_findings_episode(), group_id='dark_factory',
+            referents=_MIXED_REFERENTS,
+        )
+
+        pairing = [f for f in stats.findings if f.check == 'per-edge-pairing']
+        assert pairing
+        assert [f.corroborated for f in pairing] == [False]
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_misattached_endpoint_is_not_corroborated(
+        self, service,
+    ):
+        """The shape the whole pass exists to catch: the fact says nothing about
+        the node the edge landed on, so nothing corroborates it and it resolves
+        normally."""
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].corroborated is False
+        assert stats.findings[0].resolvable is True
+
+
+def _corroborated_and_genuine_episode() -> MockAddEpisodeResult:
+    """One corroborated finding (e1) and one genuine misattachment (e2).
+
+    Both fire SET MEMBERSHIP against the same declared set, so the only thing
+    that distinguishes them is whether the edge's own fact names the node it
+    landed on. That is what makes this the right fixture for a PER-FINDING
+    policy: an episode-level rule cannot tell them apart.
+    """
+    return _episode(
+        edges=[_edge('e1',
+                     fact='Task 2500 was completed as part of task 3668 by '
+                          'the merge worker',
+                     source='n-2500', target='n-worker'),
+               _edge('e2', fact='the deploy pipeline was retried',
+                     source='n-3129', target='n-x')],
+        nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+               MockNode(name='merge worker', uuid='n-worker'),
+               MockNode(name='Task 3129', uuid='n-3129'),
+               MockNode(name='deploy pipeline', uuid='n-x')],
+    )
+
+
+def _records_for(caplog, edge_uuid: str) -> list[logging.LogRecord]:
+    """Every emitted finding line whose payload names *edge_uuid*."""
+    return [r for r in caplog.records
+            if f"'edge_uuid': '{edge_uuid}'" in r.getMessage()]
+
+
+class TestCorroboratedFindingsAreNotOperatorWarnings:
+    """S1 (esc-3671-3): the membership arm's counterpart of the discipline the
+    pairing arm already keeps.
+
+    `test_no_counter_moves_and_no_warning_is_emitted_for_that_shape` is the
+    normative statement: a finding unactionable BY CONSTRUCTION must not raise
+    an operator WARNING for an endpoint with no observable defect. The pairing
+    arm achieves that by refusing to fire (`cited_declared` narrowing). The
+    membership arm CANNOT refuse — a corroborated endpoint really is outside the
+    declared set, and the PRD's postcondition is that it be RECORDED — so it
+    keeps the same discipline the only other way available: it records the
+    finding and demotes the line.
+
+    DEMOTED, NOT DROPPED. The evidence still reaches the log, one level down;
+    silently discarding it would be the fail-soft path INV-4 forbids.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_corroborated_finding_raises_no_warning(self, service, caplog):
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _corroborated_membership_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        assert [r for r in caplog.records
+                if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_it_is_still_logged_one_level_down(self, service, caplog):
+        """Demoted, never dropped: an operator who goes looking still finds the
+        full structured payload."""
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _corroborated_membership_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        emitted = _records_for(caplog, 'e1')
+        assert [r.levelno for r in emitted] == [logging.INFO]
+        message = emitted[0].getMessage()
+        assert 'set-membership' in message
+        assert 'Task 2500' in message
+
+    @pytest.mark.asyncio
+    async def test_the_return_value_keeps_the_finding_in_full(
+        self, service, caplog,
+    ):
+        """The LOG is the operator surface; `ReferentStats.findings` is the
+        machine surface leaf eta reads in-process. A log-level policy must never
+        cost eta a finding."""
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _corroborated_membership_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        assert len(stats.findings) == 1
+        payload = stats.findings[0].to_dict()
+        assert payload['edge_uuid'] == 'e1'
+        assert payload['check'] == 'set-membership'
+        assert payload['cited'] == ['Task 2500', 'Task 3668']
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    async def test_the_demotion_is_per_finding_not_per_episode(
+        self, service, caplog,
+    ):
+        """A corroborated finding and a genuine misattachment in ONE episode
+        must land on DIFFERENT levels. An episode-level rule — "this write looks
+        like ambient-task noise, quiet it down" — would swallow the defect the
+        pass exists to surface."""
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _corroborated_and_genuine_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        assert [f.corroborated for f in stats.findings] == [True, False]
+        assert [r.levelno for r in _records_for(caplog, 'e1')] == [logging.INFO]
+        assert [r.levelno for r in _records_for(caplog, 'e2')] == [logging.WARNING]
+
+
+def _warn_cap() -> int:
+    """The per-episode warning cap, READ FROM THE CONSTANT.
+
+    Every expectation below is computed from this rather than from a literal,
+    so retuning a log-volume policy number can never red the suite. Imported
+    locally, the idiom this file already uses for module-private symbols
+    (`_candidate_targets`).
+    """
+    from fused_memory.services.memory_service import _REFERENT_FINDING_WARN_CAP
+
+    return _REFERENT_FINDING_WARN_CAP
+
+
+def _finding_storm_episode(
+    warn_findings: int, corroborated_findings: int = 0,
+) -> MockAddEpisodeResult:
+    """*warn_findings* genuine findings plus *corroborated_findings* vetoed ones.
+
+    The corroborated edges come FIRST, deliberately: a cap that counted every
+    finding rather than every WARN-LEVEL one would spend part of its budget on
+    them and visibly shortchange the genuine defects that follow.
+    """
+    edges = [_edge(f'c{i}',
+                   fact=f'Task {8000 + i} was completed as part of task 3127 '
+                        'by the merge worker',
+                   source=f'n-{8000 + i}', target='n-worker')
+             for i in range(corroborated_findings)]
+    edges += [_edge(f'w{i}', fact='the deploy pipeline was retried',
+                    source=f'n-{9000 + i}', target='n-x')
+              for i in range(warn_findings)]
+    nodes = [MockNode(name='deploy pipeline', uuid='n-x'),
+             MockNode(name='merge worker', uuid='n-worker')]
+    nodes += [MockNode(name=f'Task {8000 + i}', uuid=f'n-{8000 + i}')
+              for i in range(corroborated_findings)]
+    nodes += [MockNode(name=f'Task {9000 + i}', uuid=f'n-{9000 + i}')
+              for i in range(warn_findings)]
+    return _episode(edges=edges, nodes=nodes)
+
+
+def _finding_lines(caplog, level: int) -> list[logging.LogRecord]:
+    return [r for r in caplog.records
+            if r.levelno == level
+            and r.getMessage().startswith('Referent verification finding:')]
+
+
+def _storm_lines(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records
+            if 'Referent verification finding storm' in r.getMessage()]
+
+
+class TestTheOperatorWarningIsCappedPerEpisode:
+    """A2 (esc-3671-1), the headline item: an unbounded per-finding WARNING.
+
+    One `logger.warning` per finding, with no cap, no dedup and no warn-once. A
+    single malformed episode can carry hundreds of edges, and `replay_from_store`
+    re-writing a backlog multiplies that across every episode in the queue — so
+    the surface that exists to make a defect VISIBLE is also the surface that
+    can bury every other line an operator needs.
+
+    THE CAP BOUNDS THE LOG, NEVER THE RECORD. `ReferentStats.findings` is what
+    leaf eta reads in-process and the counters are what leaf iota samples;
+    capping the operator surface must cost neither. And the truncation ANNOUNCES
+    itself — a silently shortened log is a fail-soft path with nothing to hear
+    it, which is what INV-4 forbids.
+    """
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_cap_findings_are_logged_individually(
+        self, service, caplog,
+    ):
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+
+    @pytest.mark.asyncio
+    async def test_the_suppression_announces_itself_exactly_once(
+        self, service, caplog,
+    ):
+        """The storm signal INV-4 asks for. The counter is the machine half of
+        the escape; this line is the operator half."""
+        cap, overflow = _warn_cap(), 5
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap + overflow), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        storm = _storm_lines(caplog)
+        assert len(storm) == 1
+        assert storm[0].levelno == logging.WARNING
+        message = storm[0].getMessage()
+        # How many were suppressed — matched as a PHRASE, not as a bare digit,
+        # which any other number in the line would satisfy.
+        assert f'{overflow} further finding' in message
+        assert 'suppressed' in message
+        # ...and the per-check totals for the episode, so the shape of the
+        # storm is legible without the suppressed lines.
+        assert f"'set-membership': {cap + overflow}" in message
+        assert "'per-edge-pairing': 0" in message
+
+    @pytest.mark.asyncio
+    async def test_the_return_value_keeps_every_finding_in_full(
+        self, service, caplog,
+    ):
+        """Leaf eta reads this in-process, inside the same critical section. A
+        log-volume policy must never cost it a finding."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(stats.findings) == cap + 5
+        field_names = {f.name for f in dataclasses.fields(ReferentFinding)}
+        assert all(set(f.to_dict()) == field_names for f in stats.findings)
+        assert {f.edge_uuid for f in stats.findings} == {
+            f'w{i}' for i in range(cap + 5)
+        }
+
+    @pytest.mark.asyncio
+    async def test_suppression_costs_no_counter_signal(self, service, caplog):
+        """Leaf iota's rate must not silently deflate the moment an episode
+        crosses a LOG-volume threshold."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert service.referent_finding_counts()['set-membership'] == cap + 5
+
+    @pytest.mark.asyncio
+    async def test_an_episode_under_the_cap_emits_no_aggregate_line(
+        self, service, caplog,
+    ):
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == 1
+        assert _storm_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_an_episode_exactly_at_the_cap_emits_no_aggregate_line(
+        self, service, caplog,
+    ):
+        """The boundary: nothing was suppressed, so there is nothing to
+        announce. An off-by-one here would page on every full-budget episode."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+        assert _storm_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_corroborated_findings_do_not_consume_the_warning_budget(
+        self, service, caplog,
+    ):
+        """The budget is spent on findings that indicate a defect, not on the
+        dominant legitimate ambient-task shape. The corroborated edges come
+        first in this fixture, so a cap counting every finding would emit fewer
+        than `cap` genuine warnings — and would announce a suppression that
+        never happened."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap, corroborated_findings=3),
+                group_id='dark_factory', referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+        assert len(_finding_lines(caplog, logging.INFO)) == 3
+        assert _storm_lines(caplog) == []
+
+
+def _count_payload_builds(monkeypatch) -> list[str]:
+    """Record every `ReferentFinding.to_dict()` call, by edge uuid.
+
+    A frozen dataclass freezes INSTANCES, not the class, so the method can be
+    wrapped for the duration of one test.
+    """
+    built: list[str] = []
+    original = ReferentFinding.to_dict
+
+    def counting(self) -> dict:
+        built.append(self.edge_uuid)
+        return original(self)
+
+    monkeypatch.setattr(ReferentFinding, 'to_dict', counting)
+    return built
+
+
+class TestTheFindingPayloadIsBuiltOnlyWhenTheLevelIsEnabled:
+    """`%s` lazy formatting defers the string rendering, NEVER the `to_dict()`
+    that produces its argument.
+
+    So the dict is allocated per finding even where the record is thrown away,
+    unless the emission is guarded by `isEnabledFor` — and that guard is what
+    makes the deliberately UNCAPPED INFO half of the log (see
+    `_REFERENT_FINDING_WARN_CAP`) free on a process that never asked for INFO.
+    It matters here specifically because this loop runs serialized inside the
+    per-group `_identity_lock_for` critical section every other same-group write
+    queues behind, and because the demoted half is the DOMINANT shape.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_level_builds_no_payload_at_all(
+        self, service, caplog, monkeypatch,
+    ):
+        built = _count_payload_builds(monkeypatch)
+
+        with caplog.at_level(logging.CRITICAL,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert built == []
+        assert _records_for(caplog, 'e1') == []
+        # THE MACHINE SURFACES ARE UNTOUCHED by the log level — INV-2. Leaf eta
+        # reads this return value in-process, and it must never depend on how a
+        # handler happens to be configured.
+        assert [f.edge_uuid for f in stats.findings] == ['e1']
+        assert service.referent_finding_counts()['set-membership'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_demoted_half_costs_nothing_when_only_warning_is_on(
+        self, service, caplog, monkeypatch,
+    ):
+        """The uncapped INFO half's whole defence: at the default level it does
+        no per-finding work, while the warn half still emits in full."""
+        built = _count_payload_builds(monkeypatch)
+
+        with caplog.at_level(logging.WARNING,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _corroborated_and_genuine_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        corroborated = [f.edge_uuid for f in stats.findings if f.corroborated]
+        assert corroborated == ['e1']
+        assert built == ['e2']
+        assert [r.levelno for r in _records_for(caplog, 'e2')] == [logging.WARNING]
+
+
+class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
+    """S2 (esc-3671-3): "could not look" must not read as "not there".
+
+    `_intended_endpoint_uuid` collapses ABSENT and DUPLICATE-NAME-GROUP to
+    `new_endpoint_uuid=None` on purpose — leaf eta's `ensure_entity_node`
+    resolves-or-mints and handles both identically. A transient backend error
+    degrades to the same `None`, which is where the collapse stops being
+    deliberate: eta reads that field at exactly one site,
+    `minted=finding.new_endpoint_uuid is None`, so a FalkorDB blip books as
+    minted=True telemetry — a made-up node reported where an unavailable lookup
+    happened.
+
+    Zeta's job is to PRODUCE the discriminator; acting on it is eta's, and is
+    filed separately. Detection stays the primary result either way: the flag
+    EXTENDS `test_a_lookup_failure_never_loses_the_finding` rather than
+    replacing it, so the evidence still survives a backend that will not answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_transient_error_is_recorded_without_losing_the_finding(
+        self, service,
+    ):
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.uuid_lookup_degraded is True
+        # EXTENDS the existing contract, never replaces it: the uuid is still
+        # None and the finding is still resolvable and still recorded in full.
+        assert finding.new_endpoint_uuid is None
+        assert finding.resolvable is True
+
+    @pytest.mark.asyncio
+    async def test_every_finding_sharing_one_degraded_lookup_reports_it(
+        self, service,
+    ):
+        """The DRIFT the tuple-caching exists to prevent, in the only shape that
+        can exhibit it: a second finding reading `degraded=False` off a lookup
+        that never re-ran.
+
+        Three findings, ONE distinct intended referent, so exactly one backend
+        call is made and the other two read its cached verdict. Every other test
+        in this class drives `_one_membership_finding_episode`, which yields a
+        single finding — so an implementation that set the flag only on the
+        finding whose call actually raised would pass all of them, and
+        `test_one_lookup_per_distinct_intended_referent` next door covers the
+        multi-finding case only on the SUCCESSFUL path (uuid, not degradation).
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _three_findings_one_referent_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 3
+        assert all(f.uuid_lookup_degraded for f in stats.findings)
+        # The verdict is SHARED, not re-derived — the flag rides with the uuid
+        # on one cache entry, so a single failed call marks all three.
+        assert all(f.new_endpoint_uuid is None for f in stats.findings)
+        assert service.graphiti.get_nodes_by_exact_name.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_clean_lookup_finding_nothing_is_not_degraded(self, service):
+        """ABSENT is a real answer the backend gave. eta mints; that is the
+        documented collapse and it stays exactly as it was."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid is None
+        assert stats.findings[0].uuid_lookup_degraded is False
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_name_group_is_not_degraded_either(self, service):
+        """The PRD measured 38 live name keys carrying more than one node.
+        Picking a survivor is `_resolve_or_create_entity`'s job under the
+        identity lock, so zeta declines — deliberately, not for lack of an
+        answer."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127', 'n-3127-dup'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid is None
+        assert stats.findings[0].uuid_lookup_degraded is False
+
+    @pytest.mark.asyncio
+    async def test_a_successful_lookup_is_not_degraded(self, service):
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid == 'n-3127'
+        assert stats.findings[0].uuid_lookup_degraded is False
+
+    def test_the_flag_defaults_false_and_the_payload_carries_it(self):
+        """Fail-closed like `resolvable`: a record that never looked is not a
+        record whose lookup was degraded."""
+        assert _finding().uuid_lookup_degraded is False
+
+        payload = _finding(uuid_lookup_degraded=True).to_dict()
+        assert payload['uuid_lookup_degraded'] is True
+        assert json.loads(json.dumps(payload)) == payload
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_lookup_never_swallows_cancellation(self, service, exc_type):
+        """The `except (CancelledError, KeyboardInterrupt, SystemExit): raise`
+        arm ahead of the broad handler, mirroring the sibling contract test for
+        `_reconcile_episode_identity`.
+
+        Pins EXISTING behaviour that nothing in this file pinned: a
+        best-effort degradation that also swallowed cancellation would keep a
+        shutting-down process inside an identity-lock critical section.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=exc_type('interrupted'),
+        )
+
+        with pytest.raises(exc_type):
+            await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+

@@ -394,6 +394,94 @@ MARKUP_RESIDUE_ERROR_TYPES = frozenset({
 #: A rate alarm about the window, carrying no payload of its own.
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
+
+#: The most of ONE attribution axis that reaches a record, a log line or a
+#: caller-facing payload. The marker below is appended PAST it, so a bounded
+#: axis is at most this plus three characters.
+#:
+#: These axes are argument VALUES — the exact things this guard fires on — so
+#: the pathological case is not hypothetical: a leak that put a multi-KB markup
+#: blob in ``agent_id`` would otherwise ride whole into an operator-facing
+#: escalation body, into every bounce payload for the rest of the window, AND
+#: into the ``StormCounter``'s retained event list, once per event. 80 is
+#: generous for a real task id, agent id or role (the longest this fleet mints
+#: is ~30 characters, e.g. ``claude-task-4805-implementer``) and small enough
+#: that three of them beside a caller list cannot dominate a record a human
+#: reads.
+_ATTRIBUTION_AXIS_MAXLEN = 80
+
+#: ASCII, deliberately. A bounded axis is rendered by ``!r`` into an escalation
+#: detail AND ``json.dumps``-ed into the caller-facing payload, and the latter
+#: escapes non-ASCII — a ``…`` would reach the leaking caller as ``\u2026``,
+#: which reads as corruption rather than as truncation.
+_ATTRIBUTION_TRUNCATION_MARKER = '...'
+
+
+def _bounded_axis(value: str | None) -> str | None:
+    """One attribution axis, bounded to something an operator can read.
+
+    Truncation is VISIBLE and never silent: without the marker a shortened id
+    is indistinguishable from a real one, so a triager could compare it against
+    the true id, find they differ, and conclude the record names a caller that
+    does not exist. With it, the value says of itself that it is a prefix.
+
+    ``None`` passes through as ``None`` — absent is not empty, and the whole
+    present-and-null contract on the record depends on it staying that way.
+    A non-string (nothing here produces one today; ``_identity`` and
+    ``_subject`` both return ``str | None``) is returned untouched rather than
+    coerced, because guessing at a shape is how this layer would start
+    inventing values.
+    """
+    if not isinstance(value, str) or len(value) <= _ATTRIBUTION_AXIS_MAXLEN:
+        return value
+    return value[:_ATTRIBUTION_AXIS_MAXLEN] + _ATTRIBUTION_TRUNCATION_MARKER
+
+
+def _caller_label(
+    agent_id: str | None,
+    subject_task_id: str | None,
+    subject_agent_role: str | None,
+) -> str | None:
+    """One human-legible string naming a leaking caller, or ``None``.
+
+    The ATTRIBUTION dimension ``StormCounter`` documents — "the label
+    dimension is load-bearing, not decoration" — rendered from the two
+    disjoint axes ``_identity`` and ``_subject`` resolve. Both are folded into
+    one string because ``StormCounter`` takes a single opaque label; keeping
+    the axis names in it is what stops a bare ``'4805'`` reading as an
+    ``agent_id`` on a boundary where only the subject axis resolved.
+
+    Axes that came back ``None`` are OMITTED rather than rendered as nulls, so
+    a label carries only what a caller actually declared. All three ``None``
+    yields ``None``: ``StormCounter``'s contract is that an unlabelled event
+    still counts toward the burst and is simply not named, which is what makes
+    an empty ``callers`` beside a non-zero ``count`` correct rather than a bug.
+
+    Each axis is BOUNDED before it is rendered (:func:`_bounded_axis`): these
+    are argument values, so the axis a leak lands in can itself be the leaked
+    blob, and this label is retained per-event by ``StormCounter`` for the
+    whole window as well as being rendered into a record.
+
+    Values are ``!r``-rendered, and that is not cosmetic. The label lands
+    verbatim in an operator-facing escalation ``detail``, and the axes are
+    caller-supplied strings — a raw newline would inject a line into a body
+    ``markup_tripwire._recorded_outcome`` parses back for its ``outcome=``
+    key, silently disabling the outcome-mismatch warning that is an operator's
+    only sign a burst folded into a record naming a different outcome. ``!r``
+    escapes newlines and is what every existing diagnostic line in both sinks
+    already uses.
+    """
+    parts = [
+        f'{key}={_bounded_axis(value)!r}'
+        for key, value in (
+            ('agent_id', agent_id),
+            ('task_id', subject_task_id),
+            ('agent_role', subject_agent_role),
+        )
+        if value is not None
+    ]
+    return ' '.join(parts) if parts else None
+
 #: The queue CATEGORY a boundary guard's burst alarm is filed under — one
 #: spelling for every ``MarkupGuardMiddleware`` registration site, because a
 #: burst on the escalation server and a burst on verdict-tools are the same
@@ -816,13 +904,18 @@ class MarkupGuardMiddleware(Middleware):
             # Identity from the RAW arguments: no recovery validated, so
             # nothing from the tail may be believed.
             identity = self._identity(arguments)
+            # Hoisted, not re-computed at the refusal: ONE resolution feeds
+            # both the burst record and the residue record, so the two cannot
+            # disagree about who leaked. ``_subject`` is pure over an
+            # unmutated ``arguments``, so this is behaviour-preserving.
+            subject = self._subject(arguments)
             await self._emit_fact(
                 name, identity, param, pattern,
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
             )
-            storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
+            storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity, subject)
             await self._refuse_unrepairable(
-                name, identity, self._subject(arguments),
+                name, identity, subject,
                 param, value, pattern, storm,
             )
 
@@ -883,18 +976,26 @@ class MarkupGuardMiddleware(Middleware):
                 name, identity, param, pattern,
                 outcome=_OUTCOME_REJECTED, misclose=fix.misclose, recovered=fix.recovered,
             )
-            storm = await self._record_storm(_OUTCOME_REJECTED, identity[1])
+            # The REPAIRED view, matching the ``identity`` resolved from that
+            # same merged map one line above — if the leak ate the caller's own
+            # ``task_id`` the pre-repair read would lose it. This path does not
+            # file a residue record, so this is the one caller-attribution it
+            # gets at all.
+            storm = await self._record_storm(
+                _OUTCOME_REJECTED, identity, self._subject({**arguments, **fix.recovered}),
+            )
             return self._reject(name, arguments, param, fix, storm)
 
         await self._emit_fact(
             name, identity, param, pattern,
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
         )
-        storm = await self._record_storm(_OUTCOME_REPAIRED, identity[1])
+        subject = self._subject({**arguments, **fix.recovered})
+        storm = await self._record_storm(_OUTCOME_REPAIRED, identity, subject)
         residue_id = None
         if unrecovered:
             residue_id = await self._preserve_unrecovered(
-                name, identity, self._subject({**arguments, **fix.recovered}),
+                name, identity, subject,
                 param, pattern, unrecovered,
             )
         return await self._forward(
@@ -1007,7 +1108,12 @@ class MarkupGuardMiddleware(Middleware):
 
     # -- the storm escape (INV-4) -----------------------------------------
 
-    async def _record_storm(self, outcome: str, project: str | None) -> dict[str, Any] | None:
+    async def _record_storm(
+        self,
+        outcome: str,
+        identity: tuple[str | None, str | None],
+        subject: tuple[str | None, str | None],
+    ) -> dict[str, Any] | None:
         """Count this outcome; escalate and return a summary iff a burst fired.
 
         Repair is a FAIL-SOFT path, so it owes the rate/streak escalation. One
@@ -1026,17 +1132,48 @@ class MarkupGuardMiddleware(Middleware):
         Threshold and window are passed PER CALL, honouring ``StormCounter``'s
         reload-safety contract, so a registration site backed by a green-tier
         config leaf can read them live rather than capturing them here.
+
+        ``identity`` and ``subject`` are the SAME ``(agent_id, project)`` /
+        ``(task_id, agent_role)`` tuples :meth:`_emit_fact`,
+        :meth:`_refuse_unrepairable` and :meth:`_preserve_unrecovered` already
+        take, so this reads like its three sibling record builders and one
+        hoisted local can feed both this and the residue filer — which is also
+        what stops the storm record and the residue record disagreeing about
+        who leaked. Taken as tuples rather than four scalars for exactly that
+        reason: they are threaded, not re-resolved.
+
+        They are recorded because a burst record that cannot name a caller is
+        an alarm with no address. Measured on four real
+        ``esc-plan-tools-markup-storm-*`` records: the only route to the caller
+        was a grep of this method's own log line, and they were read 6-7 days
+        old — past this host's ~72h ``journald --user`` retention, on a server
+        whose stderr never reaches journald at all.
         """
+        agent_id, project = identity
+        subject_task_id, subject_agent_role = subject
+
         key = f'{project}\x1f{outcome}'
         counter = self._storms.get(key)
         if counter is None:
             counter = StormCounter(time_provider=self._storm_time_provider)
             self._storms[key] = counter
 
+        # The label was ``key`` — the very string this counter is keyed by —
+        # so the distinct-label set ``StormCounter.record`` returns was
+        # DEGENERATE by construction: one element, always, however many
+        # callers leaked. Not a tally being ignored, an attribution slot wired
+        # to a constant; no consumer read it. ``StormCounter``'s own docstring
+        # states "the label dimension is load-bearing, not decoration", which
+        # is exactly the slot reclaimed here — so do not "simplify" this back
+        # to ``label=key``.
+        #
+        # This buys per-key ATTRIBUTION and never a per-key THRESHOLD (that
+        # contract is stated in ``record``'s docstring), so nothing about WHEN
+        # a burst fires changes: the key above is untouched.
         summary = counter.record(
             threshold=self._storm_threshold,
             window_seconds=self._storm_window_seconds,
-            label=key,
+            label=_caller_label(agent_id, subject_task_id, subject_agent_role),
         )
 
         # One counter per key means one object per key ever seen, and `project`
@@ -1049,21 +1186,72 @@ class MarkupGuardMiddleware(Middleware):
         if summary is None:
             return None
 
+        # BOUNDED once, here, so the record, the caller-facing fold and the log
+        # line below cannot disagree about what this call declared. Same reason
+        # ``_caller_label`` bounds its own: an ``agent_id`` is an argument
+        # VALUE, and the value that tripped a MARKUP guard is exactly the one
+        # that may be a multi-KB blob.
+        crossing_agent_id = _bounded_axis(agent_id)
+        crossing_task_id = _bounded_axis(subject_task_id)
+        crossing_agent_role = _bounded_axis(subject_agent_role)
+
         storm = {
             'count': summary['count'],
             'threshold': summary['threshold'],
             'window_seconds': summary['window_seconds'],
             'outcome': outcome,
             'project': project,
+            # ``crossing_``, and the prefix is the whole claim. ``project`` is
+            # the counter's own key, so every event in this window shares it
+            # and the bare name is honest. These three describe ONE call — the
+            # one that happened to cross the threshold — and have no such
+            # guarantee: on a shared, long-lived server (the escalation server,
+            # fused-memory) a burst can be several agents at once. A field
+            # named plainly ``agent_id`` on a burst record would read as "the
+            # agent that caused the burst", a claim this layer cannot make, and
+            # shipping it would replace an unattributed record with a
+            # confidently misattributed one — trading the reported defect for a
+            # worse one. ``_identity``'s own rule, applied to the record shape.
+            #
+            # PRESENT-AND-NULL, never absent, and never guessed or defaulted:
+            # a consumer must not have to tell "no caller declared" apart from
+            # "that emitter forgot the key".
+            'crossing_agent_id': crossing_agent_id,
+            'crossing_subject_task_id': crossing_task_id,
+            'crossing_subject_agent_role': crossing_agent_role,
+            # The WINDOW-wide answer, under its own key so the two questions
+            # are never conflated: already sorted, already de-duplicated and
+            # already excluding ``None`` by ``StormCounter.record``.
+            #
+            # A distinct SET, deliberately not per-identity COUNTS. A tally
+            # would need new state inside ``StormCounter`` and a fourth
+            # consumer contract; this set is already computed on every fire
+            # and was simply discarded. Recorded here so the difference is not
+            # re-litigated as an oversight.
+            'callers': summary['labels'],
         }
         # ERROR, and greppable: markup_tripwire's split again — the summary
-        # folded into the response reaches ONLY the leaking caller, which is
-        # the one party that already knows, so the operator-facing half cannot
-        # ride on it.
+        # folded into the response reaches ONLY the leaking caller, so the
+        # operator-facing half cannot ride on it.
+        #
+        # That fold is no longer purely "telling the caller what it already
+        # knows": ``callers`` names the OTHER agents seen in the window. Stated
+        # deliberately rather than trimmed, per the plan's design decision to
+        # carry one storm shape — the values are in-fleet task ids and agent
+        # roles that already sit in the shared escalation queue every agent's
+        # own records land in, they are bounded above, and a caller that learns
+        # it is not alone in a burst learns something true and useful. Two
+        # shapes for one record is the INV-5 lockstep-duplication defect; one
+        # shape with a stated disclosure is not.
+        # The ``markup_guard_storm:`` prefix stays EXACTLY where it is —
+        # markup_tripwire's dedup-fold path and several tests grep that token.
+        # The crossing caller is appended, not interpolated into the prefix.
         logger.error(
             'markup_guard_storm: %d %s outcome(s) in %ss for project=%r — the '
-            'serialization leak is ACTIVE (see DF 3083)',
+            'serialization leak is ACTIVE (see DF 3083); crossing call '
+            'agent_id=%r task_id=%r agent_role=%r',
             storm['count'], outcome, storm['window_seconds'], project,
+            crossing_agent_id, crossing_task_id, crossing_agent_role,
         )
         await self._file_storm_escalation(storm)
         return storm

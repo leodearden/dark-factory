@@ -1083,13 +1083,14 @@ class TaskCurator:
                             load_premise_registry, raw_path,
                         )
                     except Exception as exc:
-                        # load_premise_registry documents "never raises", but it
-                        # only catches FileNotFoundError/OSError on read_text and
-                        # yaml.YAMLError on parse — a registry that is not valid
-                        # UTF-8 raises UnicodeDecodeError (a ValueError, not an
-                        # OSError). asyncio.to_thread adds a further raise path
-                        # the guard module's internal excepts cannot cover. Fail
-                        # OPEN (guard disabled) rather than escaping into
+                        # load_premise_registry documents "never raises" and,
+                        # since task 4483, actually honours it for the whole
+                        # read/parse path (FileNotFoundError, OSError,
+                        # UnicodeDecodeError, yaml.YAMLError all degrade to []).
+                        # This wrapper is still required: asyncio.to_thread is a
+                        # raise path of its own (thread-pool failure/shutdown)
+                        # that the guard module's internal excepts cannot cover.
+                        # Fail OPEN (guard disabled) rather than escaping into
                         # curate()/curate_batch_prepared, which call this
                         # unguarded — an escape fails the whole task submission.
                         logger.warning(

@@ -572,6 +572,14 @@ kind, so a future fifth structural path is covered by construction.
 # they cannot yet distinguish "swept a complete corpus" from "swept what we
 # could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
 #
+# A THIRD CONSUMER, outside this file: scripts/measure_plural_enum_guard_recall.py
+# (task 4576) pages through _paged_ro_query and composes both its Cypher
+# strings from _ALL_VALID_EDGES_MATCH, so the read-only recall probe measures
+# the same population this module enumerates.  It supplies its OWN projection
+# and its own count(DISTINCT e.uuid) census — it decides completeness in
+# distinct EDGES, not in rows — and so re-derives its own verdict rather than
+# reading paged.complete.  Comment only; nothing here changes on its account.
+#
 # MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
 # 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
 # whole enumeration (census + every page), page_size 5000:

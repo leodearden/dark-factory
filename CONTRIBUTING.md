@@ -269,11 +269,21 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   Reversing this decision means updating this section, `CLAUDE.md` and
   `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
-  picks up that package's `[tool.pyright]` block):
+  picks up that package's `[tool.pyright]` block) — the same seven workspace
+  members the merge gate checks:
+  <!-- type-check-command-mirror:begin
+       Mirrors the package DIRECTORIES walked by `type_check_command` in
+       dark-factory-orchestrator.yaml. The RUNNER deliberately differs —
+       `uv run pyright` here, `npx pyright` there — and both resolve the
+       same pinned version (see below). Pinned by
+       tests/scripts/test_contributing_type_check_command_drift.py: widen
+       the yaml chain and this block goes red until it is updated to
+       match. -->
   ```bash
-  cd fused-memory && uv run pyright   # also: orchestrator, dashboard
+  cd fused-memory && uv run pyright && cd ../orchestrator && uv run pyright && cd ../dashboard && uv run pyright && cd ../shared && uv run pyright && cd ../escalation && uv run pyright && cd ../sampler && uv run pyright && cd ../cockpit && uv run pyright
   ```
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs all seven
+  <!-- type-check-command-mirror:end -->
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same seven
   workspace members via `npx pyright` (needs Node 22+) — either invocation
   works, and both resolve the SAME pyright version: `uv run pyright` resolves
   the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
@@ -322,6 +332,12 @@ two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
 in the machine-operated main checkout (see `OPERATIONS.md` §"Working in
 the main checkout").
+
+These gates are the **floor**. The **bar** is `docs/code-quality.md` — the
+single normative definition of code quality (quality as the cost and risk of
+the next change, fourteen named heuristics, and the comment and test
+stances). Reviewers cite its heuristics by name; a change can pass every gate
+above and still be correctly rejected against it.
 
 ---
 

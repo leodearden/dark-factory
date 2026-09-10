@@ -67,11 +67,22 @@ Parameters:
 
 The call returns with **either** a **terminal** status **or** a **non-terminal** status:
 
-- **Terminal at submit time** (`done`, `already_merged`, `conflict`, `blocked`, `unknown_branch`, `failed`, `superseded`): the merge resolved within the bounded wait. Jump straight to step 4.
+<!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+     Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+     scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
+     enum and this list goes red until it matches. -->
+- **Terminal at submit time** (`done`, `already_merged`, `done_wip_recovery`, `conflict`, `blocked`, `unknown_branch`, `unmerged_state`, `stash_failed`, `wip_halted`, `wip_recovery_no_advance`, `error`, `superseded`): the merge resolved within the bounded wait. Jump straight to step 4.
+  <!-- merge-state-vocab:end -->
+  - The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`, `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare; `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when observed by polling (`escalation/src/escalation/server.py::_map_terminal_state`) — handle them as `blocked`. (`failed`, which this list named until task 4829, is not a value the server ever returns; the real one is `error`.)
   - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done` **only when** the response carries a `commit`, or the [canonical ancestry check](#canonical-ancestry-check)'s exact-subject marker search finds the merge on main. A branch that never advanced past its creation point is an ancestor of main too, so the ancestry fact alone does not establish that anything landed: when `commit` is falsy **and** that search comes back empty, do not stamp done — run that check and treat "nothing on main cites the task" as not landed.
   - `superseded` means your request was replaced by a successor before it could be individually processed. The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`. See [Follow the superseded successor](#follow-the-superseded-successor) below to determine how to resolve it.
 
+  <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+       Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+       scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
+       enum and this list goes red until it matches. -->
 - **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
+  <!-- merge-state-vocab:end -->
   - `attached` means your submission was coalesced with an already-in-flight request for the same branch. Whether you share that in-flight entry's `request_id` depends on the response's own disclosure — see "Poll for completion" below, which branches on the `poll_by` field the response carries alongside `source`, `inflight_request_id`, `inflight_task_id`, and `pollable`.
 
 ### Poll for completion
@@ -99,9 +110,19 @@ Whichever handle you poll, the cadence and state handling below are the same for
 
 **Backoff:** start at **15 s**, cap at **60 s**. When the response contains an `eta_seconds` field whose value is a **positive number**, use that value as the sleep duration (capped at 60 s); if `eta_seconds` is absent or `null`, fall back to the 15 s→60 s backoff schedule.
 
+<!-- merge-state-vocab:begin partition=LIVE_STATES
+     Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
+     scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
+     enum and this list goes red until it matches. -->
 **Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
+<!-- merge-state-vocab:end -->
 
+<!-- merge-state-vocab:begin partition=TERMINAL_STATES
+     Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
+     scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
+     enum and this list goes red until it matches. -->
 **Terminal states** (`done`, `conflict`, `blocked`, `abandoned`, `superseded`) — proceed to step 4. (Unlike the other four, `superseded` doesn't tell you the actual outcome by itself — it names a successor you still need to resolve; see [Follow the superseded successor](#follow-the-superseded-successor) below.)
+<!-- merge-state-vocab:end -->
 
 **`state: "superseded"`** — Your request was superseded by a successor. The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`. **Never fall back to direct merge, and never resubmit, while that successor is unresolved** — it may already be in flight, and either would race it. The successor isn't always pollable the same way your own request was; see below for the shape branch.
 

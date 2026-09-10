@@ -27,11 +27,7 @@ from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    LEGACY_SNAPSHOT_WRITTEN_STAT_KEY,
-    SNAPSHOT_WRITTEN_STAT_KEY,
-    TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
-)
+from fused_memory.reconciliation.task_count_snapshot_cadence import SNAPSHOT_WRITTEN_STAT_KEY
 
 
 def _scope(project_id: str, project_root: str) -> ProjectScope:
@@ -17384,21 +17380,18 @@ def _snapshot_stage_reports(stat: int | None, key: str = SNAPSHOT_WRITTEN_STAT_K
     Raw-dict shape (not a StageReport model) — extract_snapshot_written
     handles both, and the raw shape keeps these test doubles lightweight.
 
-    *key* selects the stat spelling (task 3045). Journal rows persisted
-    before the Mem0-namespacing rename carry
-    LEGACY_SNAPSHOT_WRITTEN_STAT_KEY, and the harness reads its miss streak
-    straight out of those historical blobs — so the cases below whose
-    outcome turns on key resolution are run against both spellings via
-    _both_stat_key_spellings.
+    *key* selects the stat spelling. It survives the task-3488 retirement of
+    the pre-rename alias for exactly one caller — _make_prior_run, used by
+    TestPreRenameJournalRowIsNoLongerHonored to build a fixture carrying the
+    old spelling, in order to assert it is now read as UNKNOWN rather than as
+    a miss. Every other caller takes the default.
     """
     if stat is None:
         return {}
     return {'task_knowledge_sync': {'stats': {key: stat}}}
 
 
-def _make_current_run(
-    run_id: str, stat: int | None, key: str = SNAPSHOT_WRITTEN_STAT_KEY,
-) -> ReconciliationRun:
+def _make_current_run(run_id: str, stat: int | None) -> ReconciliationRun:
     """Build a real ReconciliationRun (not a SimpleNamespace stand-in) so it
     type-checks against _maybe_escalate_stale_task_count_snapshot's ``run:
     ReconciliationRun`` parameter — mirrors the ``_make_fake_rfc`` convention
@@ -17410,7 +17403,7 @@ def _make_current_run(
         run_type=RunType.full,
         trigger_reason='test',
         started_at=datetime.now(UTC),
-        stage_reports=_snapshot_stage_reports(stat, key),
+        stage_reports=_snapshot_stage_reports(stat),
     )
 
 
@@ -17431,23 +17424,6 @@ def _make_prior_run(
     )
 
 
-_both_stat_key_spellings = pytest.mark.parametrize(
-    'stat_key',
-    [SNAPSHOT_WRITTEN_STAT_KEY, LEGACY_SNAPSHOT_WRITTEN_STAT_KEY],
-    ids=['new_key', 'legacy_key'],
-)
-"""Run a case under both the post-3045 and pre-3045 stat spellings.
-
-Applied per-method, NOT to the whole class: a case whose outcome does not
-depend on key resolution (the current-stat-absent case builds an EMPTY
-stage_reports dict, so no key is ever read; the blocked-project case returns
-before any stat is read) gains no coverage from a second run, and the
-'legacy_key' id would over-promise what it exercises. Mixed-spelling
-histories — the real post-rename journal shape — are covered separately by
-TestSnapshotMissStreakBridgesTheRenameBoundary below.
-"""
-
-
 class TestMaybeEscalateStaleTaskCountSnapshot:
     """_maybe_escalate_stale_task_count_snapshot(project_id, run_id, run).
 
@@ -17465,18 +17441,17 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         finding = call.kwargs.get('finding')
         return category, run_id, finding
 
-    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_two_consecutive_full_cycle_misses_escalates(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
         """(a) current miss + 1 prior full/completed miss -> streak 2 -> escalate."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         project_id = 'test-project'
         run_id = 'run-current'
-        run = _make_current_run(run_id, 0, stat_key)
+        run = _make_current_run(run_id, 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100, key=stat_key),
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
         ])
         harness._escalate = MagicMock()
 
@@ -17488,14 +17463,13 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         assert esc_run_id == run_id
         assert finding['affected_ids'] == [f'task_count_snapshot:{project_id}']
 
-    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_single_miss_below_threshold_not_called(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
         """(b) current miss + no prior full-cycle misses -> streak 1 -> NOT called."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, stat_key)
+        run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[])
         harness._escalate = MagicMock()
 
@@ -17503,16 +17477,15 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
         harness._escalate.assert_not_called()
 
-    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_current_written_not_called(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
         """(c) current cycle wrote the snapshot -> NOT called, regardless of priors."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 1, stat_key)
+        run = _make_current_run('run-current', 1)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100, key=stat_key),
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
         ])
         harness._escalate = MagicMock()
 
@@ -17571,18 +17544,17 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         assert harness._escalate.call_count == 0
         harness.journal.get_recent_runs.assert_not_awaited()
 
-    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_remediation_run_interleaved_ignored_still_escalates(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
         """(f1) A remediation-run miss interleaved with a full-run miss is ignored
         (not counted), but the full-run miss still contributes -> streak 2 -> escalate."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, stat_key)
+        run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50, key=stat_key),
-            _make_prior_run('run-prior-full', 'full', 'completed', 0, offset_seconds=100, key=stat_key),
+            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50),
+            _make_prior_run('run-prior-full', 'full', 'completed', 0, offset_seconds=100),
         ])
         harness._escalate = MagicMock()
 
@@ -17590,17 +17562,16 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
         harness._escalate.assert_called_once()
 
-    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_remediation_run_only_does_not_reach_threshold(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
         """(f2) Only a remediation-run miss in history (no full-cycle prior) ->
         filtered out entirely -> streak 1 -> NOT called."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, stat_key)
+        run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50, key=stat_key),
+            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50),
         ])
         harness._escalate = MagicMock()
 
@@ -17608,18 +17579,17 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
         harness._escalate.assert_not_called()
 
-    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_failed_full_run_skipped_streak_bridges_to_next_completed(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
         """(g) A failed full run is skipped (not counted, not a reset); the
         streak bridges across it to the next completed full run's miss."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, stat_key)
+        run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-failed', 'full', 'failed', 0, offset_seconds=50, key=stat_key),
-            _make_prior_run('run-prior-completed', 'full', 'completed', 0, offset_seconds=100, key=stat_key),
+            _make_prior_run('run-prior-failed', 'full', 'failed', 0, offset_seconds=50),
+            _make_prior_run('run-prior-completed', 'full', 'completed', 0, offset_seconds=100),
         ])
         harness._escalate = MagicMock()
 
@@ -17628,64 +17598,60 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         harness._escalate.assert_called_once()
 
 
-class TestSnapshotMissStreakBridgesTheRenameBoundary:
-    """The miss streak must survive the task-3045 stat-key rename.
+class TestPreRenameJournalRowIsNoLongerHonored:
+    """A pre-rename journal row must resolve as UNKNOWN, not as a miss — task 3488.
 
-    Not parametrized like the class above — the whole point is a history
-    that MIXES spellings, which is exactly what the journal holds for the
-    first few cycles after the rename ships: prior runs were persisted with
-    LEGACY_SNAPSHOT_WRITTEN_STAT_KEY, the current run emits the new
-    Mem0-namespaced key.
+    This class pins the DELIBERATE post-retirement contract END TO END: a
+    pre-rename prior row plus a confirmed current miss must flow all the way
+    through _maybe_escalate_stale_task_count_snapshot without escalating.
+    That wiring — streak stops -> _escalate not called — is what this test
+    uniquely covers.
 
-    _maybe_escalate_stale_task_count_snapshot rebuilds prior_flags from
-    journal.get_recent_runs, so without extract_snapshot_written's legacy
-    fallback every pre-rename row reads as None (unknown),
-    compute_snapshot_miss_streak stops at the first of them, and
-    recon_stale_task_count_snapshot goes permanently silent — a
-    fail-quiet regression no other test in this file would catch.
+    It is NOT the primary guard on extract_snapshot_written itself. That is
+    test_pre_rename_key_0_is_unknown_on_stage_report (and its raw-dict twin)
+    in tests/reconciliation/test_task_count_snapshot_cadence.py, which catch
+    a re-introduced legacy-key fallback — or a `.get(...) or ...` chain that
+    recreates it — at the unit level, without standing up a harness, a
+    journal double and two ReconciliationRun models.
+
+    Direction matters, and it is fail-SAFE. A pre-rename blob now reads
+    None, and compute_snapshot_miss_streak STOPS on unknown rather than
+    counting it — so retirement can under-escalate by at most one cycle and
+    can never over-escalate. That is the safe side of a guard whose job is
+    to notice an absence.
+
+    Retirement was gated on a measurement, not an assumption: at the time
+    the alias was deleted, all 24 in-window full+completed pre-rename rows
+    (my_solar_challenge 11, pump_web_ui 13) carried value 1, and a value of
+    1 is indistinguishable from unknown to the streak — both break the loop.
+    Value 0 is the only value where the fallback could change a streak, and
+    no in-window row carried it. See task 3488 / esc-3488-2.
+
+    The fixture uses the RAW LITERAL pre-rename spelling rather than a
+    constant: the constant is gone, and the literal is what real journal
+    blobs actually contain, which makes this a true regression guard rather
+    than a tautology over a symbol.
     """
 
     @pytest.mark.asyncio
-    async def test_legacy_priors_plus_new_current_still_escalates(
+    async def test_legacy_keyed_prior_miss_no_longer_tips_the_streak(
         self, journal, event_buffer, mock_memory_service,
     ):
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, SNAPSHOT_WRITTEN_STAT_KEY)
-        # Exactly threshold-1 legacy-keyed prior misses: the current miss is
-        # the one that tips the streak over, so the escalation fires only if
-        # every legacy row was read as a CONFIRMED miss rather than unknown.
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run(
-                f'run-prior-legacy-{i}', 'full', 'completed', 0,
-                offset_seconds=100 * (i + 1),
-                key=LEGACY_SNAPSHOT_WRITTEN_STAT_KEY,
-            )
-            for i in range(TASK_COUNT_SNAPSHOT_MISS_THRESHOLD - 1)
-        ])
-        harness._escalate = MagicMock()
+        """Current run is a CONFIRMED miss under the new key; the single
+        prior full+completed run carries ONLY the pre-rename spelling, also
+        with value 0.
 
-        await harness._maybe_escalate_stale_task_count_snapshot(
-            'test-project', 'run-current', run,
-        )
-
-        harness._escalate.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_legacy_prior_write_still_resets_the_streak(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """Converse: a legacy-keyed prior WRITE must still reset the streak.
-
-        Guards against a fallback that only ever resolves misses — reading
-        the legacy 1 as unknown would leave a lone current miss escalating
-        one cycle early.
+        Before retirement the legacy 0 resolved False, the streak reached
+        1 (prior) + 1 (current) == TASK_COUNT_SNAPSHOT_MISS_THRESHOLD and
+        the escalation FIRED. After retirement the prior row is unknown, the
+        streak stops at 1 < 2, and nothing fires.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, SNAPSHOT_WRITTEN_STAT_KEY)
+        run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
             _make_prior_run(
-                'run-prior-legacy-written', 'full', 'completed', 1,
-                offset_seconds=100, key=LEGACY_SNAPSHOT_WRITTEN_STAT_KEY,
+                'run-prior-pre-rename', 'full', 'completed', 0,
+                offset_seconds=100, key='task_count_snapshot_written',
             ),
         ])
         harness._escalate = MagicMock()

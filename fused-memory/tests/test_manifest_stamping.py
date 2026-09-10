@@ -55,6 +55,37 @@ tasks:
           reason: 'no automated check available'
 """
 
+# Hand-written: carries a task-level `note:` (durable provenance,
+# shared.capability_manifest.ManifestTask.note) alongside a `verdict: OPEN`
+# capability row that has no delivered_check (OPEN records an undecided
+# binding, not a measured absence — see ManifestCapability's docstring) plus
+# one ordinary mechanical grep capability. Exercises the claim
+# ManifestTask's own docstring makes about this module's step-4 write-back:
+# a DECLARED field (note) survives yaml.safe_dump(raw, ...) where a YAML
+# comment would not. See test_round_trip_preserves_task_level_note_and_open_verdict.
+_NOTE_AND_OPEN_VERDICT_SIDECAR_YAML = """\
+prd: plans/note-prd.md
+schema_version: 1
+tasks:
+  - label: gamma
+    task_id: null
+    title: Task carrying a note and an OPEN verdict
+    note: "SPLIT 2026-08-19. The original gamma row was one task across four servers; this leaf carries fused-memory."
+    capabilities:
+      - name: open_check
+        binding: 'decision deferred to this leaf'
+        verdict: OPEN
+      - name: grep_check
+        binding: 'grep for the marker'
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'TODO(gamma)'
+          expect: absent
+          paths:
+            - src/gamma.py
+"""
+
 # Hand-written and deliberately INVALID (missing the grep check's required
 # `expect` field) — not a duplicate of the helper's always-valid output, so
 # not a helper candidate.
@@ -216,6 +247,85 @@ async def test_happy_path_stamps_file_and_copies_mechanical_checks(tmp_path):
     assert by_kind['script']['script'] == 'scripts/check_alpha.sh'
     assert by_kind['script']['args'] == ['--strict']
     assert by_kind['script']['timeout_secs'] == 30
+
+
+@pytest.mark.asyncio
+async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
+    """Task 4489 (follow-up from 4471, ticket tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD):
+    the round-trip counterpart to shared's LOAD-only
+    TestLoader::test_load_sidecar_with_task_level_note. ManifestTask's
+    docstring claims a DECLARED `note` field survives this module's step-4
+    ``yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)`` write-back
+    where a YAML comment would not — that claim can only be asserted here,
+    on the stamping side, since shared/ has no write path of its own. Stamp
+    a sidecar carrying a task-level `note:` and a `verdict: OPEN` capability
+    row through the real helper and confirm both survive byte-for-byte
+    (as decoded values) in the rewritten file, unstamped fields included.
+    """
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'note-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_NOTE_AND_OPEN_VERDICT_SIDECAR_YAML, encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    ids = ['401']
+    tasks_data = [
+        {
+            'id': '401',
+            'metadata': {
+                'prd_path': 'plans/note-prd.md',
+                'prd_task_label': 'gamma',
+            },
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+        agent_id='claude-test',
+    )
+
+    assert report == {
+        'path': 'plans/note-prd.capability-manifest.yaml',
+        'stamped': ['gamma'],
+        'missing_labels': [],
+        'errors': [],
+    }
+
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+
+    # Whole-document equality against the fixture (task_id patched from
+    # null to the stamped value) is both shorter and strictly stronger than
+    # spot-checking individual leaves: it also covers doc-level keys (prd,
+    # schema_version), the task's title, and the grep row's full
+    # delivered_check body, none of which a narrower per-field check would
+    # re-read after the rewrite.
+    expected = yaml.safe_load(_NOTE_AND_OPEN_VERDICT_SIDECAR_YAML)
+    expected['tasks'][0]['task_id'] = 401
+    assert reloaded == expected
+
+    # Named check for the specific claim this test exists to verify: the
+    # task-level `note:` survives the safe_dump write-back verbatim.
+    # Subsumed by the whole-document equality above; kept as documentation
+    # of intent, derived from the parsed fixture rather than retyped so it
+    # can't silently desync from it.
+    assert reloaded['tasks'][0]['note'] == expected['tasks'][0]['note']
+
+    # An OPEN row has no delivered_check, so only the sibling grep check
+    # copies into metadata.delivered_checks — mirrors
+    # test_happy_path_stamps_file_and_copies_mechanical_checks's manual-check
+    # exclusion, one row over.
+    task_interceptor.update_task.assert_called_once()
+    call = task_interceptor.update_task.call_args
+    assert call.args[0] == '401'
+    payload = json.loads(call.kwargs['metadata'])
+    checks = payload['delivered_checks']
+    assert len(checks) == 1
+    assert checks[0]['name'] == 'grep_check'
+    assert checks[0]['kind'] == 'grep'
 
 
 @pytest.mark.asyncio

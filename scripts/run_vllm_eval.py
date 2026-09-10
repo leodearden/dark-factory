@@ -219,48 +219,70 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_eval_accounts_file() -> Path:
-    """Create a temp accounts YAML = shared accounts + eval-only account A.
+def _pool_token_env_vars(accounts_file: Path) -> list[str]:
+    """The ``oauth_token_env`` names in *accounts_file*, in roster order.
 
-    RULING 2026-08-30 (task 4741): account A is reserved for INTERACTIVE use
-    only, not eval use — it is excluded from the shared
-    ``config/usage-accounts.yaml`` so orchestrators don't cap it, but evals
-    have no dedicated account of their own and are supposed to share the
-    fleet pool and tolerate cap/429 events. This function still appends A
-    below, which is exactly the stale behavior the ruling retires; fixing
-    it is tracked in the follow-up task filed from 4741, not done here.
+    Order is preserved because it is meaningful: UsageGate fails over in
+    list order, so the first rostered account whose token is present is
+    also the account the fleet itself would reach for first.
+
+    Returns ``[]`` when the file is absent or names no usable accounts —
+    the caller turns that into a loud abort rather than guessing a
+    credential. A malformed YAML raises out of here on purpose: a roster
+    this launcher cannot read is not a condition to paper over.
     """
-    import tempfile
-
     import yaml
 
-    base_path = PROJECT_ROOT / "config" / "usage-accounts.yaml"
-    base = yaml.safe_load(base_path.read_text()) if base_path.exists() else {}
-    accounts = list(base.get("accounts", []))
-
-    # Append A if not already present
-    if not any(a.get("name") == "max-a" for a in accounts):
-        accounts.append({
-            "name": "max-a",
-            "oauth_token_env": "CLAUDE_OAUTH_TOKEN_A",
-        })
-
-    fd, tmp_path = tempfile.mkstemp(prefix="eval-accounts-", suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        yaml.safe_dump({"accounts": accounts}, f)
-
-    log(f"Eval accounts file: {tmp_path} ({len(accounts)} accounts, +max-a)")
-    return Path(tmp_path)
+    if not accounts_file.exists():
+        return []
+    roster = yaml.safe_load(accounts_file.read_text()) or {}
+    accounts = roster.get("accounts") or []
+    return [
+        acct["oauth_token_env"]
+        for acct in accounts
+        if isinstance(acct, dict) and acct.get("oauth_token_env")
+    ]
 
 
 def build_eval_env() -> dict[str, str]:
     """Build the env dict passed to ``orchestrator eval`` subprocesses.
 
-    Loads ``.env`` for OAuth tokens. Generates a temp accounts file that
-    includes the shared pool + account A, and sets ``USAGE_ACCOUNTS_FILE``
-    so orchestrator configs pick it up. NOTE: per the 2026-08-30 ruling
-    (task 4741) A is not actually an "eval-only" account — see
-    ``_build_eval_accounts_file`` above.
+    Loads ``.env`` for OAuth tokens and points ``USAGE_ACCOUNTS_FILE`` at
+    this checkout's own shared ``config/usage-accounts.yaml``.
+
+    THE ROSTER. Evals have NO dedicated account. They draw on the same
+    shared fleet pool as every other invocation and tolerate cap/429
+    events via ``invoke_with_cap_retry``'s 48h patience plus session
+    ``--resume`` (see ``orchestrator.evals.runner``), rather than via a
+    private reserve. Account A is reserved for INTERACTIVE use only —
+    Leo's own sessions exhaust its weekly cap most weeks, so it never
+    could serve as that reserve (ruling 2026-08-30, tasks 4741/4945).
+
+    WHY THE VAR IS SET RATHER THAN LEFT UNSET. Unsetting it would also
+    resolve to the shared pool, since ``dark-factory-orchestrator.yaml``
+    declares ``accounts_file:
+    "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"``.
+    The reason is NOT worktree self-consistency, an argument this
+    docstring used to make and which does not hold: ``PROJECT_ROOT`` is
+    itself a constant hardcoded to the main checkout, so the value
+    exported here is byte-identical to that default and a
+    worktree-launched run rosters main's file either way. Two reasons
+    that do hold:
+
+    1. IT OVERRIDES AN AMBIENT VALUE. ``env`` starts as
+       ``os.environ.copy()`` and the ``.env`` loader below writes into it
+       too, so a shell or dotenv still pointing at a retired campaign's
+       roster — the kind that carried the injected account this task
+       removed — would otherwise silently choose the accounts for this
+       run. Assigning last makes the roster this launcher's decision.
+    2. IT IS THE CROSS-PROJECT SEAM for "which roster does this run
+       use": ``shared.config_models.UsageCapConfig`` reads it, and so
+       does reify's orchestrator config. Setting it explicitly states
+       the roster in the run's own env and launch log rather than
+       leaving a reader to resolve a config default.
+
+    So the seam is kept, not deleted. What was retired is APPENDING an
+    account to the roster it points at.
     """
     env = os.environ.copy()
     dotenv_path = PROJECT_ROOT / ".env"
@@ -272,15 +294,39 @@ def build_eval_env() -> dict[str, str]:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip()
 
-    # Prefer account A (interactive token, confirmed uncapped) over G.
-    oauth_token = env.get("CLAUDE_OAUTH_TOKEN_A") or env.get("CLAUDE_OAUTH_TOKEN_G", "")
-    if not oauth_token:
-        log("WARNING: no CLAUDE_OAUTH_TOKEN found in .env")
-    env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    # Roster the shared fleet pool verbatim — no injection, no tempfile.
+    accounts_file = PROJECT_ROOT / "config" / "usage-accounts.yaml"
+    env["USAGE_ACCOUNTS_FILE"] = str(accounts_file)
+    log(f"Eval accounts file: {accounts_file} (shared fleet pool)")
 
-    # Inject eval-specific accounts file (shared pool + account A)
-    eval_accounts = _build_eval_accounts_file()
-    env["USAGE_ACCOUNTS_FILE"] = str(eval_accounts)
+    # THE BOOTSTRAP SEED IS DRAWN FROM THAT ROSTER, not hardcoded to one
+    # account. `CLAUDE_CODE_OAUTH_TOKEN` only bootstraps the run —
+    # per-invocation account selection is UsageGate's job, driven by
+    # USAGE_ACCOUNTS_FILE — so any valid POOL credential will do, and taking
+    # the first the roster names that is actually present honours failover
+    # order as the tie-break. Reading the roster is also what excludes
+    # account A STRUCTURALLY rather than by a hardcoded name: A is
+    # INTERACTIVE-only and is not in the shared pool, so it can never be
+    # reached here (ruling 2026-08-30, task 4741). A single hardcoded env
+    # var would instead strand the whole campaign the day that one account's
+    # token is rotated, revoked or simply absent from .env.
+    candidates = _pool_token_env_vars(accounts_file)
+    seed_var = next((name for name in candidates if env.get(name)), None)
+    if seed_var is None:
+        # Abort rather than seeding "". An empty seed is not a warning the
+        # operator gets to ignore: it also CLOBBERS any valid
+        # CLAUDE_CODE_OAUTH_TOKEN inherited from the environment, and the
+        # campaign then fails at the first invocation boundary with a far
+        # less legible error — after the pod is up and billing.
+        tried = ", ".join(candidates) if candidates else f"(no accounts in {accounts_file})"
+        raise SystemExit(
+            f"No shared-pool OAuth credential found — tried: {tried}. Set one "
+            f"in {dotenv_path} or in the environment. Account A is "
+            "INTERACTIVE-only and deliberately not rostered, so it is never "
+            "tried here (ruling 2026-08-30, task 4741)."
+        )
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = env[seed_var]
+    log(f"Eval bootstrap credential: {seed_var} (from the shared pool roster)")
 
     return env
 
