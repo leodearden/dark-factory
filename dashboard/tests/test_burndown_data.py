@@ -3093,23 +3093,11 @@ class TestCollectSnapshotPaginatesTheTaskRead:
     ):
         """NAMED regression pin: `chunk_size` must stay IN the cache key.
 
-        THE HAZARD. "Chunk size selects transport, never the contract" is true
-        of the ANSWER and false of the KEY, and acting on the first half alone
-        is a silent production regression. `_fetch_snapshot_tasks` probes
-        UNPAGINATED and falls back to the chunked walk only when the probe
-        returns the offline marker — which is exactly what an oversize tree
-        produces. `fetch_tasks` writes that marker into the NEGATIVE cache
-        under the read's key, and a fresh marker short-circuits the next read
-        without issuing any request. Probe and fallback are BOTH complete reads
-        differing only in chunk size, so a chunk-insensitive key makes them ONE
-        key: the fallback is suppressed by the probe's own failure, never
-        reaches the server, and precisely the large projects pagination exists
-        to serve write no snapshot row — a permanent hole in an APPEND-ONLY
-        table that no backfill repairs.
-
-        The asymmetry is irreducible: the POSITIVE cache is chunk-INsensitive,
-        the NEGATIVE cache is chunk-SENSITIVE, and both must share ONE key
-        (keying them separately is how they drift apart, INV-5).
+        THE HAZARD, stated once at `dashboard/src/dashboard/data/tasks.py::_CompleteRead`:
+        "chunk size selects transport, never the contract" is true of the
+        ANSWER and false of the KEY, and acting on the first half alone
+        suppresses the burndown fallback with the probe's own failure marker.
+        This test is the executable half of that statement.
 
         NO CACHE CLEAR between the two reads — that is the whole test. The
         autouse fixture clears around the test, not inside it, so the fallback

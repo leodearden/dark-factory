@@ -825,19 +825,9 @@ async def fetch_tasks(
     MCP WIRE argument is still ``page_size``; only the Python parameter differs.
 
     **``chunk_size`` is nevertheless PART OF THE CACHE KEY, and removing it is
-    a silent production regression rather than a simplification.**  Read this
-    before "tidying" a transport detail out of a key: the two caches are
-    asymmetric.  The POSITIVE cache is chunk-INsensitive — both transports
-    agree on the answer — but the NEGATIVE cache is chunk-SENSITIVE, because
-    the unpaginated read FAILS exactly where the walk succeeds.
-    ``burndown._fetch_snapshot_tasks`` probes UNPAGINATED and falls back to the
-    chunked walk only when the probe returns the offline marker, which is
-    exactly what an oversize tree produces.  Both caches share this one key
-    (keying them separately is how they drift apart), so a chunk-insensitive
-    key would collapse probe and fallback onto ONE key: the fallback would be
-    suppressed by the probe's own marker, never reach the server, and precisely
-    the large projects pagination exists to serve would write no snapshot row.
-    See :class:`_CompleteRead`, which carries the field.
+    a silent production regression rather than a simplification.**  Why, in
+    full, is stated once on :class:`_CompleteRead`, which carries the field —
+    read it before "tidying" a transport detail out of a key.
 
     The RETURN CONTRACT is what discriminates this read from a page read, and
     it does so structurally: the cache key's ``mode`` is a

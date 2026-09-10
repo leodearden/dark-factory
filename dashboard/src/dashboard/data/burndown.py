@@ -308,12 +308,9 @@ async def _fetch_snapshot_tasks(
     #
     # This read and the probe above deliberately key SEPARATELY, and that is
     # NOT an accident to tidy away: `chunk_size` is part of the cache key even
-    # though it is pure transport.  The probe's rejection writes an offline
-    # marker into the NEGATIVE cache under its own key, and a fresh marker
-    # short-circuits the next read without issuing a request — so if the two
-    # shared a key, this fallback would be suppressed by the probe's own
-    # failure, never reach the server, and exactly the oversize trees this
-    # path exists for would write no snapshot row into an APPEND-ONLY table.
+    # though it is pure transport.  Why removing it silently costs exactly the
+    # oversize trees this path exists for is stated once, at
+    # `dashboard/src/dashboard/data/tasks.py::_CompleteRead`.
     return await fetch_tasks(
         client, config, root,
         chunk_size=_SNAPSHOT_PAGE_SIZE,
