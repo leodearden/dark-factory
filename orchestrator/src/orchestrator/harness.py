@@ -3829,7 +3829,9 @@ class Harness:
         anyway. What this method reports is what is ON DISK; the guard narrows
         it by ``restore_from_archive`` before eligibility consumes it, and
         reports it un-narrowed on the event, so an operator who disables
-        restoration reverts δ without losing the measurement. Task 3578 is what consumes
+        restoration reverts δ without losing the measurement.
+
+        Task 3578 is what consumes
         :func:`~shared.transcript_archive.durable_archive_path` for the actual
         restore, one layer down at the arm site.
 
@@ -9365,14 +9367,10 @@ class Harness:
                 #     fallbacks carrying archive_available=true. Narrowing the
                 #     event too would make "no archive on disk" and "restore
                 #     switched off" indistinguishable in runs.db.
-                archive_reachable = (
-                    archive_present
-                    and self.config.session_resume.restore_from_archive
-                )
                 reasons = self._session_resume_reasons(
                     recovered_session,
                     recovered_config_dir,
-                    archive_available=archive_reachable,
+                    archive_available=archive_present,
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {
