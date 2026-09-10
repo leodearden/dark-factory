@@ -916,7 +916,10 @@ class SessionResumeConfig(BaseModel):
             'its data.reasons list — alongside any OTHER reason the same '
             'session failed, since the reasons are reported as a set rather '
             'than a first match (task 3728). '
-            'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
+            'Must be >= 1, and STRICTLY BELOW absolute_resume_age_secs '
+            '(enforced by a model_validator, so an inverted pair fails at load '
+            'and a hot reload that would invert it is rolled back). '
+            'Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'
         ),
@@ -934,8 +937,10 @@ class SessionResumeConfig(BaseModel):
             'an archive does not decay with wall-clock, so age is the wrong '
             'question for a session that is still reachable), while this '
             'backstop applies UNCONDITIONALLY, archive or not. It must '
-            'therefore sit ABOVE freshness_window_secs; below it, freshness '
-            'would be unreachable config. '
+            'therefore sit STRICTLY ABOVE freshness_window_secs — at or below '
+            'it, the backstop fires first on the no-archive path too and '
+            'freshness becomes unreachable config — which a model_validator '
+            'enforces rather than leaving to the shipped defaults. '
             'A DERIVED bound, not a chosen number. Two MEASURED terms: the '
             'longest legitimate in-flight invocation, plus the longest '
             'observed orchestrator downtime — a sidecar\'s started_at is '
@@ -1018,6 +1023,40 @@ class SessionResumeConfig(BaseModel):
             'is considered over.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _reject_backstop_at_or_below_freshness(self) -> 'SessionResumeConfig':
+        """The two age thresholds must stay ORDERED, at any operator setting.
+
+        ``freshness_window_secs`` is consulted only on the no-archive path,
+        ``absolute_resume_age_secs`` unconditionally (D2/D3), so the backstop
+        firing first would make freshness dead config: an operator could
+        retune it with no observable effect and no error anywhere, while
+        fallbacks silently switched from 'stale' to 'aged_out'. Equality is
+        rejected for the same reason — at equal values 'stale' can never fire
+        without 'aged_out' beside it, so the knob is still unreachable.
+
+        Enforced HERE rather than only on the shipped defaults because both
+        leaves are settable from dark-factory-orchestrator.yaml and both are
+        green-tier hot-reloadable: this is the boundary where the relation can
+        actually be violated. A reload that would invert the pair fails
+        validation and is rolled back whole by ``apply_reload``.
+        """
+        if self.absolute_resume_age_secs <= self.freshness_window_secs:
+            raise ValueError(
+                'SessionResumeConfig.absolute_resume_age_secs '
+                f'({self.absolute_resume_age_secs}s) must be > '
+                f'freshness_window_secs ({self.freshness_window_secs}s); the '
+                'absolute backstop applies unconditionally while freshness '
+                'applies only when no durable archive exists, so a backstop '
+                'at or below the freshness window fires first on the '
+                'no-archive path too and leaves freshness_window_secs '
+                'unreachable config. Raise absolute_resume_age_secs (it is a '
+                'DERIVED bound — see '
+                'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR) '
+                'or lower freshness_window_secs.'
+            )
+        return self
 
 
 class SpeculationProbeConfig(BaseModel):

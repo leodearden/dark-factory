@@ -3460,6 +3460,13 @@ class TestSessionResumeConfig:
         RELATIONAL on purpose: it tracks a retune of either knob rather than
         pinning two numbers that can be changed independently into an
         inconsistent pair.
+
+        Asserted against the VALIDATOR, not only the shipped defaults. Both
+        leaves are settable from dark-factory-orchestrator.yaml and both are
+        green-tier hot-reloadable, so the defaults are not the boundary where
+        this relation can be violated — an operator raising
+        freshness_window_secs past the backstop is, and that has to fail
+        loudly rather than silently turning 'stale' into 'aged_out'.
         """
         from orchestrator.config import SessionResumeConfig
 
@@ -3470,6 +3477,35 @@ class TestSessionResumeConfig:
             'the backstop fires first on the no-archive path and the freshness '
             'window becomes unreachable config'
         )
+
+        # INVERTED FROM EITHER SIDE — the operator can reach the bad pair by
+        # raising freshness or by lowering the backstop, and both are rejected.
+        for kwargs in (
+            {'freshness_window_secs': cfg.absolute_resume_age_secs + 1},
+            {'absolute_resume_age_secs': cfg.freshness_window_secs - 1},
+        ):
+            with pytest.raises(ValidationError) as excinfo:
+                SessionResumeConfig(**kwargs)
+            message = str(excinfo.value)
+            # The message names BOTH values, so an operator reading a failed
+            # load or a rolled-back reload can see which knob to move.
+            assert 'absolute_resume_age_secs' in message
+            assert 'freshness_window_secs' in message
+
+        # EQUALITY is rejected too: at equal values 'stale' can never fire
+        # without 'aged_out' beside it, so freshness is still unreachable —
+        # the failure this guards is dead config, not a crossed ordering.
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(
+                freshness_window_secs=cfg.absolute_resume_age_secs
+            )
+
+        # ...and a WIDER gap in the honest direction stays constructible, so
+        # the validator bounds the relation rather than pinning the defaults.
+        widened = SessionResumeConfig(
+            freshness_window_secs=cfg.freshness_window_secs // 2
+        )
+        assert widened.absolute_resume_age_secs > widened.freshness_window_secs
 
     def test_exposed_on_orchestrator_config(self):
         """A default OrchestratorConfig exposes `.session_resume` as a
