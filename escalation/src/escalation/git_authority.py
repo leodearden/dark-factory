@@ -43,6 +43,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from shared.branch_names import canonical_queued_branch_name
 from shared.merge_state import MergeState
 
 logger = logging.getLogger(__name__)
@@ -203,3 +204,287 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
     if not task:
         return TaskMetadataResult(metadata={})
     return TaskMetadataResult(metadata=task.get('metadata') or {})
+
+
+@dataclass(frozen=True)
+class GitAuthorityVerdict:
+    """What git authority established about one branch, and on what evidence.
+
+    ``landed_unconfirmed`` and ``no_signal`` are the whole reason this is a
+    verdict rather than a boolean.  ``landed_unconfirmed`` means git
+    POSITIVELY ESTABLISHED that this branch's work is on main — the branch
+    is an ancestor of main, or a merge marker for it was found — and only
+    ATTRIBUTION or EFFECT-SURVIVAL could not be confirmed.  ``no_signal``
+    means no landing was established at all.  A caller that cannot tell them
+    apart cannot tell "we found the landing but could not verify it" from
+    "we found nothing".
+
+    ``merge_status`` renders BOTH identically today, as the bare Tier-4
+    ``unknown``.  That is deliberate and behaviour-preserving: the
+    ``merge_status`` response vocabulary belongs to task **4831**
+    (``plans/merge-status-durable-non-landed-prd.md`` label β), which maps
+    these outcomes onto its epistemic states and reason codes.  This
+    dataclass is that task's INPUT, and leaf η's (task 4651).
+
+    ``merge_sha`` is populated on ``found_on_main`` ONLY — it is the sha a
+    caller may stamp as provenance.  ``evidence_sha`` is the weaker thing:
+    the commit the probe was reasoning ABOUT, and it is present on rejects
+    too.
+
+    ``reason`` stays a plain ``str | None`` carrying the landing verdict's
+    own spelling rather than
+    ``orchestrator.landing_evidence.LandingReason``, because importing that
+    enum would force exactly the static reverse import this module exists to
+    avoid.  ``LandingReason`` is a genuine ``str`` subclass, so the spelling
+    round-trips and JSON-encodes as itself.
+    """
+
+    outcome: GitAuthorityOutcome
+    merge_sha: str | None = None
+    arm: str | None = None
+    reason: str | None = None
+    evidence_sha: str | None = None
+    metadata_unavailable: bool = False
+
+
+def _reason_of(verdict: Any) -> str | None:
+    """The landing verdict's reason as a plain ``str`` — see GitAuthorityVerdict."""
+    return None if verdict.reason is None else str(verdict.reason)
+
+
+async def probe_landing(
+    git_ops: Any, orch_config: Any, harness: Any, key: str,
+) -> GitAuthorityVerdict:
+    """Ask git whether *key*'s branch landed on main, and how confidently.
+
+    *key* is a branch name or a bare task id; it is normalised through
+    ``canonical_queued_branch_name``.  Returns a VERDICT, not an MCP
+    response — which is what lets a periodic writer (PRD leaf η, task 4651)
+    reuse the fully-guarded decision ``merge_status`` computes and throws
+    away.  It is also why ``request_id`` is not a parameter: it was only
+    ever used to build the response, so moving the rendering out to
+    :func:`found_on_main_response` removed it from this body entirely.
+
+    FIRE-SAFE: every failure — including an ImportError from the runtime
+    reverse import below — degrades to ``no_signal`` and is logged; this
+    never raises.  The wrapper lives HERE rather than at the call site so
+    every consumer inherits the fire-safety instead of re-adding it.
+    """
+    metadata_unavailable = False
+
+    def _verdict(outcome: GitAuthorityOutcome, **fields: Any) -> GitAuthorityVerdict:
+        return GitAuthorityVerdict(
+            outcome=outcome, metadata_unavailable=metadata_unavailable, **fields,
+        )
+
+    try:
+        prefix = orch_config.git.branch_prefix
+        full_branch = canonical_queued_branch_name(key, prefix)
+        tip = await git_ops.resolve_branch_sha(full_branch)
+        main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
+        tid = full_branch.removeprefix(prefix)
+        # Runtime-only reverse import: orchestrator depends on escalation,
+        # not vice versa, so this lazy import deliberately avoids a static
+        # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
+        # at runtime because the escalation server is hosted inside the
+        # orchestrator process.  An ImportError is an Exception and therefore
+        # already degrades to the honest Tier-4 unknown via the wrapper below.
+        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+            branch_is_degenerate,
+            is_valid_sha_40,
+            validate_landing_evidence,
+        )
+        if (tip is not None and tip != main_tip
+                and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
+            # Live branch is already an ancestor of main (normal merged case).
+            # tip != main_tip guards against the no-op case: a branch sitting at
+            # exactly main's HEAD satisfies is_ancestor trivially (a commit is
+            # its own ancestor) but nothing has been merged.
+            # Degeneracy guard (task 3103): a tip still equal to the
+            # recorded branch_base_sha proves ZERO commits were ever
+            # pushed beyond the creation point.  Such a branch is parked
+            # at an OLD main commit, which makes it an ancestor of main
+            # AND distinct from main_tip — both conjuncts above pass — so
+            # without this guard the tier stamps a confident `done`
+            # against a commit containing none of the task's work.  A
+            # degenerate branch falls through to the honest Tier-4
+            # unknown.  Runs FIRST and independently of the citation gate:
+            # a degenerate branch whose task DOES have a citing commit on
+            # main (reify 5493) is caught only by this ordering.
+            # branch_tip_sha=tip: the probe judges degeneracy
+            # against the SAME tip the is_ancestor check above
+            # just ran on, instead of re-reading the ref (review
+            # #2) — one subprocess fewer, and no window for a
+            # warm-lane reseed to split the two observations.
+            # `.metadata` only — see the merge_request site's note:
+            # discarding `.unavailable` is what keeps this extraction
+            # behaviour-preserving.  Task 4651 reads the flag;
+            # merge_status must not, and the response shape it would
+            # need belongs to task 4831.
+            _fetch = await task_metadata(harness, tid, site='merge_status')
+            metadata_unavailable = _fetch.unavailable
+            metadata = _fetch.metadata
+            if not await branch_is_degenerate(
+                git_ops, full_branch, metadata, branch_tip_sha=tip,
+            ):
+                # Citation gate.  Read the pattern off orch_config.git for
+                # consistency with the adjacent .main_branch / .branch_prefix
+                # reads (same object as git_ops.config in production).
+                pattern = orch_config.git.commit_citation_pattern
+                if pattern == '':
+                    # Documented per-project opt-out (config.py
+                    # commit_citation_pattern): '' disables the citation
+                    # check entirely for projects without citation
+                    # conventions, and find_task_citation_commit honours it
+                    # by returning None for EVERYTHING.  Running the gate
+                    # here would therefore reject unconditionally and turn
+                    # Tier 3.5 into dead code rather than merely un-gated —
+                    # a silent capability loss for an explicit opt-in.
+                    # Note: None means "use the built-in
+                    # DEFAULT_COMMIT_CITATION_PATTERN" and is NOT the
+                    # opt-out.  The degeneracy guard above still applies in
+                    # this mode.
+                    # The returned merge_sha is therefore the raw BRANCH
+                    # TIP — not a commit on main, and NOT effect-present
+                    # checked.  That is the price of the opt-out, and it is
+                    # called out explicitly in git_authority.py::
+                    # found_on_main_response's docstring and in both
+                    # SKILL.md runbooks so a caller
+                    # on such a project does not stamp it as verified
+                    # provenance (review #4).
+                    return _verdict(
+                        GitAuthorityOutcome.found_on_main, merge_sha=tip,
+                        arm='ancestor',
+                    )
+                # DISCOVERY mode: a commit on main must positively cite the
+                # task (FIX 2) AND its effect must still be present at main
+                # HEAD (FIX 1', the task-1175 reverted-landing guard).  The
+                # accepted evidence_sha is a commit ON MAIN, which also
+                # retires the old wart of answering with the branch tip.
+                # No escalation on reject — mirrors the harness ancestor
+                # arm's silent-False, and merge_status is a read-only probe.
+                # delivered_checks is THREE-STATE (task 4498):
+                # None = "this call site is unwired", [] = "wired,
+                # and this task declares no checks".  This site IS
+                # wired, so `or []` never degrades to None — the
+                # capstone (task 4500) reads
+                # probe['delivered_checks_state'] to find sites
+                # that regressed to the default.  It is also the
+                # fail-safe direction: delivered_checks is
+                # consulted ONLY on the effect_absent reject path
+                # and can only ever UPGRADE a rejection to an
+                # acceptance, so [] simply leaves that second
+                # accept path unreachable — exactly today's
+                # behaviour, and a failed metadata fetch (which
+                # yields {}, hence []) cannot fabricate a
+                # confident `done`.  The awkward cell — a FAILED
+                # fetch reported as 'none_declared' rather than as
+                # genuinely-empty — is resolved OUT OF BAND by
+                # git_authority.TaskMetadataResult.unavailable,
+                # not by abusing the third state: the parameter
+                # has no fourth value, and sending None here would
+                # trade a mild probe-label inaccuracy for a false
+                # "unwired" claim in operator-facing prose.
+                verdict = await validate_landing_evidence(
+                    git_ops, tid, full_branch,
+                    branch_tip_sha=tip,
+                    pattern_template=pattern,
+                    delivered_checks=metadata.get('delivered_checks') or [],
+                )
+                # `accepted` implies a non-None evidence_sha (see
+                # LandingEvidenceVerdict), but assert it explicitly:
+                # found_on_main_response's merge_sha is a hard `str`,
+                # and a contract violation must degrade to Tier-4
+                # unknown rather than emit a `done` with a null sha.
+                if verdict.accepted and verdict.evidence_sha is not None:
+                    return _verdict(
+                        GitAuthorityOutcome.found_on_main,
+                        merge_sha=verdict.evidence_sha, arm='ancestor',
+                        reason=_reason_of(verdict),
+                        evidence_sha=verdict.evidence_sha,
+                    )
+                # NOT no_signal.  git POSITIVELY established this branch is
+                # an ancestor of main and it survived the degeneracy guard;
+                # only attribution or effect-survival failed.  evidence_sha
+                # comes from probe['citation'] because a REJECTED
+                # LandingVerdict carries evidence_sha is None STRUCTURALLY
+                # — landing_evidence.py::_reject_verdict, "a rejected
+                # verdict carrying a sha is an invalid state".
+                return _verdict(
+                    GitAuthorityOutcome.landed_unconfirmed, arm='ancestor',
+                    reason=_reason_of(verdict),
+                    evidence_sha=(verdict.probe or {}).get('citation'),
+                )
+        elif tip is None:
+            # Branch ref gone — the canonical 4352 deleted-branch shape.
+            # find_merge_marker internally gates on branch existence so it only
+            # fires when the ref is gone (consistent with the cheaper-common-path
+            # ordering: cheaper is_ancestor check first, find_merge_marker only
+            # when the branch has been deleted).
+            # merge_sha = merge-commit SHA on main (via git log scan).
+            marker = await git_ops.find_merge_marker(full_branch)
+            if marker is not None:
+                # `.metadata` only — see the merge_request site's note:
+                # discarding `.unavailable` is what keeps this extraction
+                # behaviour-preserving.  Task 4651 reads the flag;
+                # merge_status must not, and the response shape it would
+                # need belongs to task 4831.
+                _fetch = await task_metadata(harness, tid, site='merge_status')
+                metadata_unavailable = _fetch.unavailable
+                metadata = _fetch.metadata
+                branch_base_sha = metadata.get('branch_base_sha')
+                # Predates-this-incarnation veto (task 3103, mirroring
+                # the harness marker arm): the branch was deleted and
+                # recreated under the SAME task id, so a marker older
+                # than this incarnation's base attributes a previous
+                # run's merge to the current task.  is_valid_sha_40 sits
+                # on the LEFT of the `and` so a missing or malformed
+                # base never reaches is_ancestor with a bad argument.
+                if not (
+                    is_valid_sha_40(branch_base_sha)
+                    and await git_ops.is_ancestor(marker, branch_base_sha)
+                ):
+                    # CANDIDATE mode: the marker's subject match already
+                    # establishes attribution, so only the FIX 1'
+                    # effect-present guard remains — closing the
+                    # task-1175 clobber where a reverted merge still
+                    # read as a genuine landing.  No escalation on
+                    # reject (unlike the harness marker path):
+                    # merge_status is a read-only probe with no write
+                    # side, so a reject degrades to Tier-4 unknown.
+                    # Same three-state contract as the ancestor
+                    # arm above (task 4498): `or []` because this
+                    # site IS wired, never None which would report
+                    # delivered_checks_state == 'unwired' to the
+                    # task-4500 capstone.
+                    verdict = await validate_landing_evidence(
+                        git_ops, tid, full_branch,
+                        branch_tip_sha=None,
+                        candidate_sha=marker,
+                        delivered_checks=metadata.get('delivered_checks') or [],
+                    )
+                    # Same non-None assertion as the ancestor arm
+                    # above: reject a null evidence sha into Tier-4
+                    # unknown rather than into a `done` response.
+                    if verdict.accepted and verdict.evidence_sha is not None:
+                        return _verdict(
+                            GitAuthorityOutcome.found_on_main,
+                            merge_sha=verdict.evidence_sha, arm='marker',
+                            reason=_reason_of(verdict),
+                            evidence_sha=verdict.evidence_sha,
+                        )
+                    # Same reading as the ancestor arm's reject: a merge
+                    # marker WAS found on main and passed the
+                    # predates-this-incarnation veto, so a landing IS
+                    # established and only its effect went unconfirmed.
+                    return _verdict(
+                        GitAuthorityOutcome.landed_unconfirmed, arm='marker',
+                        reason=_reason_of(verdict),
+                        evidence_sha=(verdict.probe or {}).get('citation'),
+                    )
+    except Exception:
+        logger.warning(
+            'git-authority probe failed for %s, returning no_signal',
+            key, exc_info=True,
+        )
+    return _verdict(GitAuthorityOutcome.no_signal)
