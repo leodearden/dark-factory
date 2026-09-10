@@ -477,7 +477,7 @@ async def _fetch_page(
 
 async def _walk_pages(
     page_fn: Callable[[_OnePage], Awaitable[_Page]],
-    read: _TasksRead,
+    project_root: str,
     chunk_size: int,
 ) -> list[dict]:
     """Assemble the COMPLETE task set from repeated *page_fn* calls.
@@ -534,7 +534,7 @@ async def _walk_pages(
             # No usable counters: completeness is UNVERIFIABLE here, and an
             # unverifiable read must not be reported as a complete one.
             raise ValueError(
-                f'get_tasks pagination for {read.project_root} truncated at '
+                f'get_tasks pagination for {project_root} truncated at '
                 f'{len(shaped)} row(s), total={total!r}'
             )
         if returned != page.delivered:
@@ -554,7 +554,7 @@ async def _walk_pages(
             # with an unparseable id, so a legitimately-shaped page can be
             # shorter than what arrived.
             raise ValueError(
-                f'get_tasks pagination for {read.project_root} inconsistent '
+                f'get_tasks pagination for {project_root} inconsistent '
                 f'at offset {walk_offset}: server claims returned={returned} '
                 f'but sent {page.delivered} row(s)'
             )
@@ -577,7 +577,7 @@ async def _walk_pages(
             # world, so the assembled list is not a coherent snapshot of
             # either.  It also un-bounds the budget derived above.
             raise ValueError(
-                f'get_tasks pagination for {read.project_root} raced a write '
+                f'get_tasks pagination for {project_root} raced a write '
                 f'at offset {walk_offset}: total grew from {first_total} to '
                 f'{total} mid-walk'
             )
@@ -593,7 +593,7 @@ async def _walk_pages(
             # it cannot be paged past.  Detail lives in the exception rather
             # than a second WARNING for the same event.
             raise ValueError(
-                f'get_tasks pagination for {read.project_root} truncated at '
+                f'get_tasks pagination for {project_root} truncated at '
                 f'{len(shaped)} row(s) — empty page at offset {walk_offset}, '
                 f'total={total}'
             )
@@ -602,7 +602,7 @@ async def _walk_pages(
             break
         if page_budget is not None and pages >= page_budget:
             raise ValueError(
-                f'get_tasks pagination for {read.project_root} exceeded its '
+                f'get_tasks pagination for {project_root} exceeded its '
                 f'{page_budget}-page budget at offset {walk_offset} '
                 f'(total={total}, page_size={chunk_size}); refusing to keep '
                 f'walking'
@@ -611,11 +611,10 @@ async def _walk_pages(
 
 
 async def _cached_fanout(
-    client: httpx.AsyncClient,
     config: DashboardConfig,
     read: _TasksRead,
     strategy: Callable[[str], Awaitable[list[dict]]],
-    timeout: float,
+    label: str,
 ) -> list[dict] | dict:
     """Fan out *strategy* across the configured urls, through BOTH task caches.
 
@@ -629,18 +628,20 @@ async def _cached_fanout(
     the cache: a per-page public call would mint one entry and one lock per
     page, and let a failed page write a 5 s marker served mid-walk.
 
-    *client* and *timeout* are NOT read here — *strategy* already carries them.
-    They stay in the signature because *strategy* is opaque
-    (``Callable[[str], Awaitable[...]]``), so without them nothing at this
-    layer would show a reader that an HTTP client and a per-request budget are
-    what a read actually costs; and both public reads then call this with one
-    identical shape.
+    The bound *strategy* carries the HTTP client and the per-request timeout
+    budget a read actually costs; this layer neither needs nor receives them.
+
+    *label* NAMES THE CALLING READ, and is a parameter rather than a literal
+    because :func:`mcp_fanout.first_success` keys its per-url failure streak on
+    ``(log_label, url)``.  A shared literal would throttle both public reads as
+    one stream and log either failure under the other's name — the operator
+    debugging a page read would be told ``fetch_tasks`` had failed.
     """
     async def _refresh() -> list[dict] | dict:
         return await first_success(
             config.fused_memory_urls,
             strategy,
-            log_label=fanout_label('fetch_tasks', read.project_root),
+            log_label=fanout_label(label, read.project_root),
             offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
         )
 
@@ -788,7 +789,7 @@ async def fetch_task_page(
         # a correct answer rather than a truncation to detect.
         return (await _fetch_page(client, url, read, None, timeout)).rows
 
-    return await _cached_fanout(client, config, read, _call, timeout)
+    return await _cached_fanout(config, read, _call, 'fetch_task_page')
 
 
 async def fetch_tasks(
@@ -986,16 +987,13 @@ async def fetch_tasks(
             # a failed page cannot mint a per-page marker served mid-walk.
             # Both constraints now hold BY CONSTRUCTION: `_walk_pages` takes no
             # url/config and is reachable only from inside a bound strategy.
-            async def _page(window: _OnePage) -> _Page:
-                return await page_fn(window)
-
-            return await _walk_pages(_page, read, chunk_size)
+            return await _walk_pages(page_fn, read.project_root, chunk_size)
 
         # One unpaginated request: no chunk to walk, and the whole tree is the
         # answer.  The envelope, if any, is irrelevant — nothing is being paged.
         return (await page_fn(None)).rows
 
-    return await _cached_fanout(client, config, read, _call, timeout)
+    return await _cached_fanout(config, read, _call, 'fetch_tasks')
 
 
 async def fetch_external_statuses(

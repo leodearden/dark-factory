@@ -2484,7 +2484,7 @@ class TestPagePrimitive:
 
 
 class TestWalkPages:
-    """`_walk_pages(page_fn, read, chunk_size)` — assembly over an INJECTED page fn.
+    """`_walk_pages(page_fn, project_root, chunk_size)` — assembly over an INJECTED page fn.
 
     RED source (step-4): `_walk_pages` does not exist as a named unit.
 
@@ -2545,7 +2545,7 @@ class TestWalkPages:
         hole instead of its legitimate all-zero row.
         """
         page_fn = self._pager([([], {'returned': 0, 'total': 0})])
-        assert await tasks_mod._walk_pages(page_fn, self._read(), 3) == []
+        assert await tasks_mod._walk_pages(page_fn, '/proj/walk', 3) == []
 
     async def test_an_exhausted_tree_returns_its_rows(self):
         """`offset >= total` with an empty page is exhaustion, not truncation."""
@@ -2553,7 +2553,7 @@ class TestWalkPages:
         page_fn = self._pager([
             ([r for r in rows if r], {'returned': 2, 'total': 2}),
         ])
-        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        out = await tasks_mod._walk_pages(page_fn, '/proj/walk', 3)
         assert [r['id'] for r in out] == [1, 2]
 
     # ---- (d) a server that ignores paging ---------------------------------
@@ -2567,7 +2567,7 @@ class TestWalkPages:
         rows = [r for r in (_shape_task(_paged_task_raw(i)) for i in range(1, 8)) if r]
         page_fn = self._pager([(rows, None)], calls)
 
-        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        out = await tasks_mod._walk_pages(page_fn, '/proj/walk', 3)
         assert len(out) == 7
         assert len(calls) == 1, 'a bare-list server must be asked exactly once'
 
@@ -2588,7 +2588,7 @@ class TestWalkPages:
             calls,
         )
 
-        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        out = await tasks_mod._walk_pages(page_fn, '/proj/walk', 3)
         assert [r['id'] for r in out] == [1, 2, 3, 4]
         # Asked for 3, given 2 -> the next window starts at 2, NOT at 3.
         assert [(w.page_size, w.offset) for w in calls] == [(3, 0), (3, 2)]
@@ -2614,7 +2614,7 @@ class TestWalkPages:
             [(good, {'returned': 3, 'total': 3}, 3)], calls,
         )
 
-        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        out = await tasks_mod._walk_pages(page_fn, '/proj/walk', 3)
         assert [r['id'] for r in out] == [1, 3], (
             'the shaped rows are returned, minus the unparseable one'
         )
@@ -2635,7 +2635,7 @@ class TestWalkPages:
             calls,
         )
 
-        await tasks_mod._walk_pages(page_fn, read, 3)
+        await tasks_mod._walk_pages(page_fn, read.project_root, 3)
         assert len(calls) == 2
         for window in calls:
             assert read.wire_arguments(window)['statuses'] == ['done']
@@ -2698,7 +2698,7 @@ class TestWalkPages:
         # accumulated before the raise, and handing those back is exactly the
         # silent truncation this rule exists to prevent.
         outcome = await _returned_or_raised(
-            tasks_mod._walk_pages(page_fn, self._read(), 3)
+            tasks_mod._walk_pages(page_fn, '/proj/walk', 3)
         )
         assert isinstance(outcome, ValueError), (
             f'{label}: returned {outcome!r} instead of raising — '
@@ -2718,7 +2718,7 @@ class TestWalkPages:
             raise ValueError('transport said no')
 
         with pytest.raises(ValueError, match='transport said no'):
-            await tasks_mod._walk_pages(_page_fn, self._read(), 3)
+            await tasks_mod._walk_pages(_page_fn, '/proj/walk', 3)
 
 
 class TestPublicReadContracts:
@@ -2913,7 +2913,7 @@ class TestPublicReadContracts:
 
 
 class TestCachedFanoutCore:
-    """`_cached_fanout(client, config, read, strategy, timeout)` — the ONE place
+    """`_cached_fanout(config, read, strategy, label)` — the ONE place
     the fan-out / caching / marker policy lives.
 
     RED source (step-6): `_cached_fanout` does not exist as a named unit; the
@@ -2954,8 +2954,8 @@ class TestCachedFanoutCore:
             raise ValueError('every server is down')
 
         result = await tasks_mod._cached_fanout(
-            dummy_client, two_url_config, self._read('/proj/core-order'),
-            _strategy, 5.0,
+            two_url_config, self._read('/proj/core-order'),
+            _strategy, 'fetch_tasks',
         )
 
         assert seen == list(two_url_config.fused_memory_urls)
@@ -2977,8 +2977,8 @@ class TestCachedFanoutCore:
             return rows
 
         result = await tasks_mod._cached_fanout(
-            dummy_client, two_url_config, self._read('/proj/core-fallthrough'),
-            _strategy, 5.0,
+            two_url_config, self._read('/proj/core-fallthrough'),
+            _strategy, 'fetch_tasks',
         )
 
         assert result == rows
@@ -2998,10 +2998,10 @@ class TestCachedFanoutCore:
             return [{'id': 1, 'title': 'row'}]
 
         first = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _strategy, 5.0,
+            dummy_config, read, _strategy, 'fetch_tasks',
         )
         second = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _strategy, 5.0,
+            dummy_config, read, _strategy, 'fetch_tasks',
         )
 
         assert first == second == [{'id': 1, 'title': 'row'}]
@@ -3022,7 +3022,7 @@ class TestCachedFanoutCore:
             raise ValueError('down')
 
         marker = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _strategy, 5.0,
+            dummy_config, read, _strategy, 'fetch_tasks',
         )
 
         assert isinstance(marker, dict) and marker.get('offline') is True
@@ -3045,12 +3045,12 @@ class TestCachedFanoutCore:
             return [row]
 
         first = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _strategy, 5.0,
+            dummy_config, read, _strategy, 'fetch_tasks',
         )
         first.clear()
 
         second = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _strategy, 5.0,
+            dummy_config, read, _strategy, 'fetch_tasks',
         )
         assert len(second) == 1, 'list-level mutation must not reach the cache'
         assert second is not first
@@ -3076,7 +3076,7 @@ class TestCachedFanoutCore:
             raise ValueError('down')
 
         marker = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _fail, 5.0,
+            dummy_config, read, _fail, 'fetch_tasks',
         )
         assert tasks_mod._fetch_tasks_negative_cache.get_fresh(read) == marker, (
             'the marker must be written under the read record itself'
@@ -3094,7 +3094,7 @@ class TestCachedFanoutCore:
         assert tasks_mod._fetch_tasks_negative_cache.get_fresh(twin) == marker
 
         tasks_mod._fetch_tasks_negative_cache.clear()
-        await tasks_mod._cached_fanout(dummy_client, dummy_config, read, _ok, 5.0)
+        await tasks_mod._cached_fanout(dummy_config, read, _ok, 'fetch_tasks')
         assert tasks_mod._fetch_tasks_cache.get_fresh(twin) == rows
 
     # -- (d) marker precedence, BOTH directions -----------------------------
@@ -3119,7 +3119,7 @@ class TestCachedFanoutCore:
             return []
 
         result = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _strategy, 5.0,
+            dummy_config, read, _strategy, 'fetch_tasks',
         )
 
         assert result == marker, 'the marker is still RETURNED to the caller'
@@ -3141,7 +3141,7 @@ class TestCachedFanoutCore:
         async def _ok(_url):
             return rows
 
-        await tasks_mod._cached_fanout(dummy_client, dummy_config, read, _ok, 5.0)
+        await tasks_mod._cached_fanout(dummy_config, read, _ok, 'fetch_tasks')
 
         async def _mark():
             return {'offline': True, 'error': 'a concurrent failure'}
@@ -3157,7 +3157,7 @@ class TestCachedFanoutCore:
             return rows
 
         result = await tasks_mod._cached_fanout(
-            dummy_client, dummy_config, read, _strategy, 5.0,
+            dummy_config, read, _strategy, 'fetch_tasks',
         )
 
         assert result == rows, 'the fresh positive entry wins'
@@ -3176,12 +3176,11 @@ class TestCachedFanoutCore:
         """
         seen: list[tasks_mod._TasksRead] = []
 
-        async def _fake(client, config, read, strategy, timeout):
+        async def _fake(config, read, strategy, label):
             seen.append(read)
-            assert client is dummy_client
             assert config is dummy_config
             assert callable(strategy)
-            assert timeout == 7.5
+            assert label == 'fetch_tasks'
             return []
 
         monkeypatch.setattr(tasks_mod, '_cached_fanout', _fake)
@@ -3195,6 +3194,31 @@ class TestCachedFanoutCore:
                 '/proj/core-route', None, tasks_mod._CompleteRead(None)
             )
         ], 'exactly ONE core call, carrying the record the public read built'
+
+    async def test_each_public_read_fans_out_under_its_own_name(
+        self, dummy_client, dummy_config, monkeypatch
+    ):
+        """The fan-out label NAMES the read that failed, per read.
+
+        `first_success` keys its per-url failure streak on `(log_label, url)`
+        and `fanout_label` composes that key, so a label shared by both public
+        reads would throttle them as one stream and report a failed page read
+        under `fetch_tasks[...]` — telling an operator the wrong function
+        broke, which is precisely what naming the contract was meant to end.
+        """
+        labels: list[str] = []
+
+        async def _fake(config, read, strategy, label):
+            labels.append(label)
+            return []
+
+        monkeypatch.setattr(tasks_mod, '_cached_fanout', _fake)
+        await tasks_mod.fetch_tasks(dummy_client, dummy_config, '/proj/labelled')
+        await tasks_mod.fetch_task_page(
+            dummy_client, dummy_config, '/proj/labelled', page_size=5, offset=0,
+        )
+
+        assert labels == ['fetch_tasks', 'fetch_task_page']
 
 
 class TestFetchStatusesCache:
