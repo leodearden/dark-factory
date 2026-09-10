@@ -210,6 +210,51 @@ def test_an_unguarded_read_only_open_of_a_stub_answers_no_such_table(tmp_path):
     assert "no such table: tasks" in str(excinfo.value)
 
 
+def test_connect_ro_reads_the_rows_of_a_real_store(make_tasks_db):
+    db = make_tasks_db([{"id": 1, "status": "done"}, {"id": 2, "status": "pending"}])
+
+    conn = connect_ro(db)
+    try:
+        rows = conn.execute("SELECT id, status FROM tasks ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [(1, "done"), (2, "pending")]
+
+
+def test_connect_ro_connection_cannot_write_to_the_store(make_tasks_db):
+    """``mode=ro`` is actually in force, so a forensic reader can never mutate
+    the live store it is measuring — including by accident."""
+    db = make_tasks_db([{"id": 1, "status": "done"}])
+
+    conn = connect_ro(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as update_refusal:
+            conn.execute("UPDATE tasks SET status = 'cancelled'")
+        with pytest.raises(sqlite3.OperationalError) as insert_refusal:
+            conn.execute(
+                "INSERT INTO tasks (tag, id, title, status, updated_at) "
+                "VALUES ('master', 2, 't', 'done', 'now')"
+            )
+    finally:
+        conn.close()
+
+    assert "readonly" in str(update_refusal.value)
+    assert "readonly" in str(insert_refusal.value)
+
+
+def test_connect_ro_returns_a_plain_connection_not_a_wrapper(make_tasks_db):
+    """Callers keep the whole stdlib API — this helper adds guards, not a
+    facade with its own surface to learn and keep in sync."""
+    db = make_tasks_db([{"id": 1}])
+
+    conn = connect_ro(db)
+    try:
+        assert type(conn) is sqlite3.Connection
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # resolve_project_roots(project_roots, env) -> list[str]
 # ---------------------------------------------------------------------------
