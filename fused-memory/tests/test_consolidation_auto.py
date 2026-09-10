@@ -1080,6 +1080,132 @@ class TestCanonicalAndSlugHazards:
         assert relaxed.outcome is AutoOutcome.PASS
 
 
+class TestCountAndMemberSetContradictions:
+    """Two write-bearing paths that shipped without a guard (review finding 1).
+
+    MEASURED on this branch before the fix, by running the shipped predicate:
+
+    (i)   topic ``t-a``, members ``{m1 (topic=t-a), C (canonical=True,
+          topic=t-a)}``, ``canonical_count=0`` -> ``PASS``,
+          ``stripped_ids=('C',)``, ``retain_ids=('m1',)``. That is rung 6's
+          MINT path: it tells the executor to write a SECOND canonical for a
+          topic whose incumbent is visible in the very member list it was
+          handed. Canonical uniqueness ships in WARN mode
+          (``memory_metadata.enforce=False``, task 3626), so nothing downstream
+          refuses it — this is the +1-per-pass ratchet the feature exists to
+          end.
+    (ii)  members ``{C}`` alone, ``canonical_count=0`` -> ``PASS``,
+          ``retain_ids=()`` — mint a canonical over zero members.
+    (iii) ``member_ids=()``, ``members={}``, ``canonical_count=0`` -> ``PASS``,
+          ``retain_ids=()``, ``reasons=()`` — a write-bearing mint instruction
+          carrying not one reason. Reachable with no incumbent anywhere, which
+          is why the empty-retain guard is a SEPARATE fix rather than a
+          corollary of the first.
+    """
+
+    def test_a_named_incumbent_contradicting_a_zero_count_fails(self):
+        """Case (i): the count says none, a named member IS this topic's canonical.
+
+        The two are separate, non-atomic reads, so they can disagree without
+        any caller bug — and when they do, the topic's canonical state is not
+        decidable here. Fail closed, exactly as the unavailable-count arm does.
+        """
+        members = _members(
+            _member('m1', topic=TOPIC),
+            _member('C', topic=TOPIC, canonical=True),
+        )
+
+        verdict = _judge(members, canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert verdict.outcome is not AutoOutcome.PASS
+        contradictions = _reasons_for(verdict, AutoReasonCode.canonical_count_contradicted)
+        assert len(contradictions) == 1
+        assert contradictions[0].ids == ('C',)
+        assert verdict.stripped_ids == ()
+        assert verdict.retain_ids == ()
+
+    def test_a_proposal_of_only_the_incumbent_with_a_zero_count_fails(self):
+        """Case (ii): same defect, so the same code — the reads disagree.
+
+        Nothing about this cluster is decidable either: the one record the
+        proposal names is the canonical the count claims does not exist.
+        """
+        members = _members(_member('C', topic=TOPIC, canonical=True))
+
+        verdict = _judge(members, canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.canonical_count_contradicted in _codes(verdict)
+        assert verdict.retain_ids == ()
+        assert verdict.stripped_ids == ()
+
+    def test_a_zero_count_with_no_incumbent_named_still_passes(self):
+        """The over-refusal guard: the hazard keys on an INCUMBENT, not a stamp.
+
+        Task theta's migration stamps members with a topic BEFORE any canonical
+        exists, so a zero count beside stamped members is the migration's
+        ordinary shape. Refusing it would break PRD B1 outright. This is
+        ``test_stamped_members_with_no_canonical_still_pass`` re-asserted
+        against the new code's ABSENCE.
+        """
+        members = _members(_member('m1', topic=TOPIC), _member('m2', topic=TOPIC))
+
+        verdict = _judge(members, canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.PASS
+        assert AutoReasonCode.canonical_count_contradicted not in _codes(verdict)
+        assert verdict.retain_ids == ('m1', 'm2')
+
+    def test_a_canonical_of_another_topic_does_not_contradict_the_count(self):
+        """The two codes stay disjoint: only THIS topic's incumbent counts.
+
+        A canonical of some other topic is ``member_already_canonical`` — a
+        member-level hazard — and says nothing about how many canonicals THIS
+        topic has. ``_is_incumbent`` already draws that line and the new rung
+        must not blur it.
+        """
+        members = _members(
+            _member('m1'),
+            _member('x1', topic='some-other-topic', canonical=True),
+        )
+
+        verdict = _judge(members, canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.member_already_canonical in _codes(verdict)
+        assert AutoReasonCode.canonical_count_contradicted not in _codes(verdict)
+
+    def test_mint_over_zero_members_is_refused(self):
+        """Case (iii): a write-bearing rung reached with nothing to act on.
+
+        The emit boundary refuses an empty member list as
+        ``member_count_out_of_range`` (C1) and the predicate deliberately does
+        not re-derive it (PRD D6) — but an aged ledger row or a mis-wired
+        caller can still put one here, and a fail-closed predicate must not
+        answer it with a write-bearing PASS.
+        """
+        verdict = _judge({}, proposal_ids=(), canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert verdict.outcome is not AutoOutcome.PASS
+        assert AutoReasonCode.no_retained_members in _codes(verdict)
+        assert verdict.retain_ids == ()
+
+    def test_a_zero_member_proposal_beside_a_live_canonical_stays_a_noop(self):
+        """The deliberate scope boundary — measured, and left alone on purpose.
+
+        A NOOP is not write-bearing: it instructs the executor to do nothing,
+        which is safe. Only the write-bearing rung-6 PASS is guarded. Pinning
+        this stops a later reader tidying the guard upward into rung 4 and
+        turning a harmless no-op into a human gate.
+        """
+        verdict = _judge({}, proposal_ids=(), canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.NOOP
+        assert AutoReasonCode.already_consolidated in _codes(verdict)
+        assert AutoReasonCode.no_retained_members not in _codes(verdict)
+
 #: Every reason code, mapped to inputs that actually PRODUCE it.
 #:
 #: The table is the deliverable "one test per reason code" made
@@ -1160,6 +1286,16 @@ REASON_CODE_FIXTURES: dict[AutoReasonCode, Callable[[], AutoVerdict]] = {
     AutoReasonCode.already_consolidated: lambda: _judge(
         _members(_member('m1', topic=TOPIC), _member('m2', topic=TOPIC)),
         canonical_count=1,
+    ),
+    AutoReasonCode.canonical_count_contradicted: lambda: _judge(
+        _members(
+            _member('m1', topic=TOPIC),
+            _member('C', topic=TOPIC, canonical=True),
+        ),
+        canonical_count=0,
+    ),
+    AutoReasonCode.no_retained_members: lambda: _judge(
+        {}, proposal_ids=(), canonical_count=0,
     ),
 }
 
