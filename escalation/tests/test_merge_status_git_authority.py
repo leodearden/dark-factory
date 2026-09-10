@@ -20,6 +20,7 @@ import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
+from unittest.mock import call as mock_call
 
 import pytest
 
@@ -144,6 +145,47 @@ def _stub_harness(
             get_task=AsyncMock(return_value={'metadata': metadata}),
         )
     return harness
+
+
+def _record_validate_landing_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[Any]:
+    """Patch ``validate_landing_evidence`` with a DELEGATING recorder.
+
+    Returns the list of :class:`unittest.mock.call` objects it accumulates,
+    one per invocation, so a test can assert on the CALL CONTRACT.
+
+    This is the first mocking seam in this module, which otherwise steers the
+    real ``validate_landing_evidence`` entirely through ``_stub_git_ops``.
+    That strategy is right for behaviour but structurally cannot observe an
+    OPTIONAL keyword argument that is simply never passed — the exact
+    miswiring these tests exist to catch.  A recorder that DELEGATES to the
+    real function is the minimum-damage seam: the existing behavioural pins
+    keep running the real decision logic, and only the call contract is
+    additionally observed.
+
+    Patch the DEFINING module, not the importer: server.py's
+    ``from orchestrator.landing_evidence import ...`` is lazy and inside the
+    function body, so the module attribute is re-resolved on every call.
+
+    Read ``call.kwargs['delivered_checks']`` BY NAME rather than by positional
+    index, so the pin survives task 4500 flipping that parameter to
+    keyword-only.
+    """
+    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+        validate_landing_evidence as _real,
+    )
+
+    calls: list[Any] = []
+
+    async def _recorder(*args: Any, **kwargs: Any) -> Any:
+        calls.append(mock_call(*args, **kwargs))
+        return await _real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        'orchestrator.landing_evidence.validate_landing_evidence', _recorder,
+    )
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -888,6 +930,121 @@ class TestMergeStatusGitAuthority:
         assert result.get('state') == 'unknown', (
             f'A marker whose effect is absent at main HEAD must be unknown, '
             f'got: {result}'
+        )
+
+    # ── task 4498: delivered_checks wiring at both git-authority arms ────────
+    #
+    # ``validate_landing_evidence``'s ``delivered_checks`` parameter is
+    # THREE-STATE and the states are not interchangeable: ``None`` is the
+    # documented 'unwired' sentinel (recorded as
+    # ``probe['delivered_checks_state']``), while ``[]`` means "wired, and
+    # this task declares no checks".  That function's own docstring names
+    # these two arms as task 4498's, and task 4500 as the capstone that flips
+    # the parameter to required + keyword-only once all seven sites are wired,
+    # warning: "If ``delivered_checks_state == 'unwired'`` is still appearing
+    # in escalations after 4500 has landed, that is the bug: one of the seven
+    # sites regressed to the default."  Each arm is pinned INDEPENDENTLY —
+    # they are separate call sites and either can regress alone.
+
+    async def test_ancestor_arm_forwards_declared_delivered_checks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DISCOVERY arm: a task's declared checks reach the validator."""
+        calls = _record_validate_landing_evidence(monkeypatch)
+        declared = [{'kind': 'grep', 'pattern': 'def foo', 'expect': 'present'}]
+        server, _ = self._ancestor_arm_server(
+            tmp_path, '4498', tip='a' * 40, citation='c' * 40,
+            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
+        )
+
+        await _call_merge_status(server, task_id='4498')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        assert calls[0].kwargs['delivered_checks'] == declared, (
+            f"Ancestor arm must forward the task's declared delivered_checks, "
+            f'got: {calls[0].kwargs.get("delivered_checks")!r}'
+        )
+
+    async def test_ancestor_arm_forwards_empty_list_never_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DISCOVERY arm: an unavailable metadata fetch still reads as WIRED.
+
+        The load-bearing assertion.  With no ``.scheduler`` on the harness the
+        metadata fetch fails open to ``{}``, so there is no ``delivered_checks``
+        key to forward — but the site IS wired, and must therefore pass ``[]``
+        rather than the ``None`` that would make it report
+        ``delivered_checks_state == 'unwired'`` to task 4500.
+        """
+        calls = _record_validate_landing_evidence(monkeypatch)
+        server, _ = self._ancestor_arm_server(
+            tmp_path, '4499', tip='a' * 40, citation='c' * 40,
+            metadata=None,   # no .scheduler at all → metadata fetch yields {}
+        )
+
+        await _call_merge_status(server, task_id='4499')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        forwarded = calls[0].kwargs['delivered_checks']
+        assert forwarded == [], (
+            f'Ancestor arm must forward [], got: {forwarded!r}'
+        )
+        assert forwarded is not None, (
+            'None is the documented UNWIRED sentinel — a wired site must never '
+            'send it, or task 4500 loses the signal it acts on'
+        )
+
+    async def test_marker_arm_forwards_declared_delivered_checks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CANDIDATE arm: a task's declared checks reach the validator."""
+        calls = _record_validate_landing_evidence(monkeypatch)
+        declared = [{'kind': 'grep', 'pattern': 'def bar', 'expect': 'absent'}]
+        server, _ = self._marker_arm_server(
+            tmp_path, marker='d' * 40, marker_predates_base=False,
+            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
+        )
+
+        await _call_merge_status(server, task_id='4498')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        assert calls[0].kwargs['delivered_checks'] == declared, (
+            f"Marker arm must forward the task's declared delivered_checks, "
+            f'got: {calls[0].kwargs.get("delivered_checks")!r}'
+        )
+
+    async def test_marker_arm_forwards_empty_list_never_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CANDIDATE arm: an unavailable metadata fetch still reads as WIRED.
+
+        Same load-bearing assertion as the ancestor arm's, pinned separately
+        because these are two independent call sites.
+        """
+        calls = _record_validate_landing_evidence(monkeypatch)
+        server, _ = self._marker_arm_server(
+            tmp_path, marker='d' * 40, marker_predates_base=False,
+            metadata=None,   # no .scheduler at all → metadata fetch yields {}
+        )
+
+        await _call_merge_status(server, task_id='4499')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        forwarded = calls[0].kwargs['delivered_checks']
+        assert forwarded == [], (
+            f'Marker arm must forward [], got: {forwarded!r}'
+        )
+        assert forwarded is not None, (
+            'None is the documented UNWIRED sentinel — a wired site must never '
+            'send it, or task 4500 loses the signal it acts on'
         )
 
 
