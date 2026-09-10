@@ -101,6 +101,7 @@ class TestBuildHttpLimits:
 
         expiry = _build_http_limits(_config(tmp_path, escalation=1, fused=1)).keepalive_expiry
 
+        assert expiry is not None
         assert expiry == _HTTP_KEEPALIVE_EXPIRY_SECONDS, (
             f'keepalive_expiry={expiry} must equal the shipped '
             f'_HTTP_KEEPALIVE_EXPIRY_SECONDS={_HTTP_KEEPALIVE_EXPIRY_SECONDS} — '
