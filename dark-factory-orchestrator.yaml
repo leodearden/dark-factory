@@ -1046,9 +1046,25 @@ escalation:
 # turn cap, not the dollar cap, is the binding margin on large scope.
 # 180 = ~1.9x p99, matches reify's architect cap (raised 2026-08-19). The
 # dollar ceiling (15.0) still bounds true runaways independently.
+# implementer 80 -> 160, debugger 50 -> 100, merger 50 -> 100, simple_task
+# 50 -> 100 (2026-09-10, Leo ruling D4 of the agent-capacity study,
+# plans/agent-capacity-study-2026-09-09.md section 10). Same doctrine as the two
+# raises above: a cap is a runaway guard at ~2x the p99 of healthy runs, not a
+# throttle. Measured 2026-08-10..09-10 (invocation_end, appendix S5 section 1.1
+# and E-sweep 2a): implementer/sonnet at the 80 cap: p90=67 p95=77 max-successful
+# 99, cap-hit 14.8%, 17.3% of all implementer spend cap-killed all-time;
+# merger p50=48 p95=52 vs cap 50, cap-hit 29.4%; simple_task p95=42 max 51 vs 50,
+# cap-hit 6.3%; debugger/sonnet max successful 59 vs cap 50. The p99s are
+# censored BY these caps, so 160/100 are provisional; re-baseline after two
+# weeks once the uncensored p99 is visible (E-sweep 2a query). Dollar
+# ceilings below still bound true runaways.
 max_turns:
   architect: 180
   reviewer: 60
+  implementer: 160
+  debugger: 100
+  merger: 100
+  simple_task: 100
 
 # Per-role per-invocation dollar ceilings. reviewer 5.0 -> 12.0, same
 # investigation and same rationale as the max_turns.reviewer raise above.
@@ -1064,8 +1080,35 @@ max_turns:
 # cap masks the other.
 # EXPECTED TO REDUCE net spend: a cap-killed run burns the FULL ceiling, yields
 # nothing, and is then retried up to 4 more times.
+# implementer 10.0 -> 20.0, merger 5.0 -> 8.0 (2026-09-10, same ruling D4).
+# implementer/opus cost p95=$9.67, max=$10.00 (= the ceiling, so censored); 31
+# budget-cap kills in 30 days and 27 zero-output deaths worth $273 on reify at
+# the same $10 wall; the large-plan routing rules raise turns to 120 but never
+# raised the dollar ceiling, so exactly the runs judged to need more turns
+# were the ones dying on dollars. merger: cost p95=$3.01 but 29.4% turn-cap
+# kills at 50 turns -> 8.0 keeps the dollar cap above a 100-turn run.
 budgets:
   reviewer: 12.0
+  implementer: 20.0
+  merger: 8.0
+
+# Per-role model overrides (project-level; defaults.yaml is the fleet default).
+# implementer/debugger sonnet -> opus on dark-factory ONLY, for a two-week
+# canary from 2026-09-10 (Leo ruling D4). Basis: on the same task population
+# implementer/sonnet hit its turn cap 14.6% of the time vs 0.08% for
+# implementer/opus (178x), with p50 turns 42 vs 55 -- sonnet was not doing more
+# work per turn, it was failing to converge; and 73% of implementer/debugger
+# dispatches were ALREADY routed to opus by the large-plan-steps /
+# large-plan-modules rules (which at lock_depth 12 read "touches >= 3 files").
+# This makes those two rules no-ops here; they are left in defaults.yaml for
+# the fleet. Expected net cost ~ +$25/day (+4%) after subtracting cap-kill
+# retries. CANARY / REVERT RULE: revert to sonnet if opus cap-kill on the
+# ex-sonnet population exceeds 2% after ~500 invocations, or if opus
+# account cap_hit events (account_events) rise materially above the
+# 30-day baseline of ~13/day. Hot-reloadable (green tier).
+models:
+  implementer: opus
+  debugger: opus
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
