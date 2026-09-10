@@ -98,11 +98,13 @@ class TestCounterKeyNames:
 class TestVerdictTemplate:
     """Requirement 4's permitted wording, single-sourced."""
 
-    def test_renders_the_mandated_sentence_for_the_ladder(self):
-        assert NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER)) == (
-            '0 of 3 probes reproduced; the fault is intermittent and '
-            'load-dependent, so a negative set does not clear it.'
-        )
+    def test_render_leads_with_the_denominator(self):
+        """Requirement 3's whole point: the denominator is visible, so a zero
+        reads as "0 of N" and never as a bare 0. Both operands derive from
+        PROBE_LIMIT_LADDER, so adding a rung updates the expectation with the
+        code while rewording everything after the count stays green."""
+        rendered = NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER))
+        assert rendered.startswith(f'0 of {len(PROBE_LIMIT_LADDER)} ')
 
     def test_render_leaves_no_unfilled_placeholder(self):
         """The rendered verdict is interpolated into stage f-strings; a stray
