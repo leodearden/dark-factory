@@ -315,6 +315,32 @@ def _load_state(state_path):
     return json.loads(state_path.read_text())
 
 
+def _read_poll_trace(path):
+    """Read the drain poll ledger, as one ``(verdict, unit)`` pair per poll.
+
+    The ledger is written by restart-all-orchestrators.sh's
+    ``drain_check_verdict`` when ``ORCH_DRAIN_POLL_TRACE_FILE`` is set: one
+    append-only TSV line per drain poll, so its LENGTH is a load-independent
+    count of what the spawned script actually did inside the gate.
+
+    Returns the EMPTY LIST when the file does not exist, so a test whose
+    ledger never appeared fails on its own assertion message rather than on a
+    bare FileNotFoundError that says nothing about what was being proven.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    records = []
+    for raw_line in path.read_text().splitlines():
+        fields = raw_line.split("\t")
+        assert len(fields) == 2, (
+            f"poll-trace records are <verdict>\\t<unit>, exactly two fields; "
+            f"got {raw_line!r} in {path}"
+        )
+        records.append((fields[0], fields[1]))
+    return records
+
+
 def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     _df_fleet_dir_redirect, tmp_path_factory,
 ):
@@ -739,6 +765,74 @@ def test_absent_heartbeat_restarts_after_zero_grace(tmp_path):
     )
 
 
+def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
+    """ABSENT + BOUNDED: the unknown grace TERMINATES, and the restart follows.
+
+    The complement of test_unknown_grace_withholds_restart_while_absent below,
+    which proves the wait is REAL by being killed inside it and therefore can
+    never observe its end. Nothing covered that end today: the only top-level
+    absent-path elapse test is test_absent_heartbeat_restarts_after_zero_grace
+    above, whose grace of 0 makes
+    scripts/restart-all-orchestrators.sh::drain_await_fresh break on its FIRST
+    elapsed-check -- the loop never sleeps, so there is no bound to have held.
+    Here the grace is a small NONZERO 3s and the run is allowed to COMPLETE:
+    the ledger catches the poll loop iterating, the proceed line shows the
+    grace elapsed, and the restart shows the gate opened anyway (I4
+    fail-toward-convergence).
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    # No heartbeat file written for UNIT_R at all.
+
+    unknown_grace = 3
+    # This run must FINISH, so the budget covers the grace, its polls, the
+    # python3 spawns and the restart verify. load_scaled_grace with its DEFAULT
+    # cap, NOT WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS: that cap exists to bound a
+    # grace DERIVED from a spawn timeout via wait_proof_grace_secs, so an
+    # escaped poller self-terminates inside LEAK_SELF_TERMINATION_CEILING_SECS.
+    # Nothing here derives a grace from this number and nothing is killed, so
+    # borrowing that cap would only under-budget a loaded host.
+    timeout = load_scaled_grace(20)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(unknown_grace),
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+        timeout=timeout,
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert (
+        f"proceeding with restart of {UNIT_R}: heartbeat absent "
+        f"after {unknown_grace}s grace"
+    ) in result.stdout, (
+        f"the grace must ELAPSE and say so: that line is the only "
+        f"operator-visible evidence the bounded wait ended rather than never "
+        f"having started. got stdout={result.stdout!r}"
+    )
+    polls = _read_poll_trace(trace_path)
+    assert len(polls) >= 2 and all(p == ("absent", UNIT_R) for p in polls), (
+        f"the {unknown_grace}s grace must have been POLLED through rather "
+        f"than slept through in one shot -- >= 2 absent polls for {UNIT_R} is "
+        f"what proves drain_await_fresh's loop body ran. timeout={timeout}s "
+        f"ledger={polls!r} stdout={result.stdout!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"a bounded wait must END in the restart it was holding back; got "
+        f"calls={state['calls']!r} stdout={result.stdout!r}"
+    )
+
+
 def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
     """STALE (I4 fail-toward-convergence): a unit whose heartbeat exists but
     is older than the freshness window still restarts once
@@ -770,11 +864,29 @@ def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
 def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     """Proves the unknown-grace wait is a REAL bounded wait, not an instant
     fail-open: an absent heartbeat with a large ORCH_DRAIN_UNKNOWN_GRACE_SECS
-    is NOT restarted before the test's own short subprocess timeout fires.
-    This is the opposite fail-direction from the busy/defer path (which
-    protects an in-flight merge), but unknown status still gets a bounded
-    grace rather than restarting on the very first check."""
+    is NOT restarted before the test's own short subprocess timeout fires,
+    AND the script is caught POLLING while it withholds that restart. This is
+    the opposite fail-direction from the busy/defer path (which protects an
+    in-flight merge), but unknown status still gets a bounded grace rather
+    than restarting on the very first check.
+
+    WHAT PROVES WHAT (task 4486), because the negative assertion alone proves
+    nothing -- a subprocess killed before it ever reached the gate satisfies
+    it just as well. "Restarting 1 orchestrator unit(s)" is echoed by
+    scripts/restart-all-orchestrators.sh immediately BEFORE the per-unit
+    `drain_gate` loop, so it witnesses only bash start, script parse and the
+    fake systemctl's `list-units`: it says the subprocess reached the gate's
+    doorstep, not that it went in. The poll ledger says what happened inside.
+    ONE ledger entry would additionally prove the gate was ENTERED -- but one
+    poll is exactly what an instant fail-open (check once, return) produces,
+    so it cannot falsify the thing this test is named for. TWO prove
+    `drain_await_fresh`'s `while` body ran: sleep
+    ORCH_DRAIN_POLL_INTERVAL_SECS, then re-poll. That is the REAL bounded
+    wait, and the ledger witnesses it LOAD-INDEPENDENTLY -- it counts what the
+    script did, not how long the test's own clock happened to run.
+    """
     fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
@@ -804,23 +916,24 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
                     wait_proof_grace_secs(spawn_timeout)
                 ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+                "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
             },
             timeout=spawn_timeout,
         )
 
     stdout = _decode(exc_info.value.stdout)
-    # NON-VACUITY, without which the negative assertion below is satisfied just
-    # as well by a subprocess killed before it ever entered the wait (task 4890
-    # amendment). There is no drain line to assert on and that is by contract,
-    # not oversight: restart-all-orchestrators.sh's `drain_await_fresh` "prints
-    # nothing to stdout" while it polls, and the one line the absent path ever
-    # emits -- "proceeding with restart of <unit>: heartbeat absent after Ns
-    # grace" -- is printed when the grace ELAPSES, which must never happen
-    # here. So the strongest available witness is the last line before the
-    # gate: it is echoed immediately ahead of the per-unit loop that calls
+    # NON-VACUITY, part 1 of 2: the DOORSTEP. Without it the negative
+    # assertion below is satisfied just as well by a subprocess killed before
+    # it ever entered the wait (task 4890 amendment). There is no drain line
+    # to assert on and that is by contract, not oversight:
+    # restart-all-orchestrators.sh's `drain_await_fresh` "prints nothing to
+    # stdout" while it polls, and the one line the absent path ever emits --
+    # "proceeding with restart of <unit>: heartbeat absent after Ns grace" --
+    # is printed when the grace ELAPSES, which must never happen here. So the
+    # strongest witness AVAILABLE ON STDOUT is the last line before the gate:
+    # it is echoed immediately ahead of the per-unit loop that calls
     # `drain_gate`, so reaching it proves the subprocess cleared bash start,
-    # script parse and the fake systemctl's `list-units`, i.e. that the kill
-    # landed INSIDE the bounded wait rather than short of it.
+    # script parse and the fake systemctl's `list-units`.
     assert f"Restarting 1 orchestrator unit(s): {UNIT_R}" in stdout, (
         f"the script was killed before it reached the per-unit drain gate, so "
         f"the no-restart assertion below would hold VACUOUSLY. Raise nothing "
@@ -828,6 +941,24 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
         f"base 3, so check whether it hit the "
         f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS cap before touching a number. "
         f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
+    )
+    # NON-VACUITY, part 2 of 2: INSIDE the gate (task 4486). The doorstep
+    # witness above is silent about everything past it -- one python3 spawn,
+    # one poll interval, another python3 spawn -- which is a large fraction of
+    # this budget on a loaded host, so a kill landing in that window still
+    # proves no bounded wait. The ledger closes it: >= 2 polls, see the
+    # docstring for why not 1.
+    polls = _read_poll_trace(trace_path)
+    assert len(polls) >= 2 and all(p == ("absent", UNIT_R) for p in polls), (
+        f"the script was killed without polling the drain gate twice, so "
+        f"'a REAL bounded wait, not an instant fail-open' is UNPROVEN: one "
+        f"poll (or none) is exactly what a fail-open produces. Raise nothing "
+        f"by hand: spawn_timeout={spawn_timeout}s is already load-scaled from "
+        f"base 3, so check whether it hit the "
+        f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS "
+        f"(={WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s) cap before touching a "
+        f"number. ledger={polls!r} stdout={stdout!r} "
+        f"stderr={_decode(exc_info.value.stderr)!r}"
     )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
