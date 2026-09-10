@@ -31,6 +31,7 @@ from fused_memory.reconciliation.flag_dedup import (
     compute_content_fingerprint_signature,
     compute_flag_signature,
     dedup_flags,
+    filter_accounted_cluster_growth_flags,
     filter_already_tracked_systemic_patterns,
     filter_false_absence_flags,
     filter_stale_bulk_get_statuses_flags,
@@ -507,6 +508,39 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['style_only_authorship_flags_dropped'] = (
                 _before_authorship_filter - len(report.items_flagged)
+            )
+            # ── Accounted duplicate-cluster-growth guard (task 3476): drop ────────
+            # "cluster has grown beyond what gate task N tracks" findings whose
+            # cited memory UUIDs are ALREADY written into that task's CURRENT
+            # description body.  Stage 1 diffs the candidate UUID against a
+            # title-derived / remembered COUNT, so an addendum appended to the body
+            # since the title was written reads as unaccounted growth: in run
+            # df364849-21e9-4f54-b802-a126a49eba97 (finding 96a14765) 2 of 3 such
+            # flags were FALSE POSITIVES — task 3417's title still reads "(3
+            # primary + 3 secondary entries)" while its body already lists the
+            # "new" UUID verbatim as primary entry #3 of 3, and task 3468's
+            # "Cluster UUIDs (mem0)" list has the same shape.  Fail-safe: drops
+            # only when SOME single candidate task's body contains EVERY cited
+            # UUID; partial presence, a lookup error, a body-less result or no
+            # resolvable task id all KEEP the flag, so a genuine growth signal is
+            # never silenced.  project_root=, not the known_projects= that
+            # filter_already_tracked_systemic_patterns switched to under task 4381:
+            # this filter resolves ids in the RUNNING project's root only.
+            # Surfaces the dropped count as
+            # report.stats['accounted_cluster_growth_flags_dropped'].
+            #
+            # Position is load-bearing in both directions: before dedup_flags so a
+            # dropped flag never writes a stage1_flag_marker, and after the
+            # _pre_filter_flags snapshot above so drops join the task-2029
+            # flag-marker acknowledgment diff below for free.
+            _before_accounted_cluster_growth_filter = len(report.items_flagged)
+            report.items_flagged = await filter_accounted_cluster_growth_flags(
+                taskmaster=self.taskmaster,
+                project_root=self.project_root,
+                flags=report.items_flagged,
+            )
+            report.stats['accounted_cluster_growth_flags_dropped'] = (
+                _before_accounted_cluster_growth_filter - len(report.items_flagged)
             )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
