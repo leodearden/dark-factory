@@ -460,6 +460,13 @@ class TestSweepStalePidDirsOnce:
         Symmetric on purpose: the one-shot state is module-global, so a case that
         marked a prefix and did not clear it would leak into whichever test ran
         next and make it pass or fail by ordering.
+
+        The one place the UNSCOPED form is right: this class tests the
+        bookkeeping itself, over throwaway prefixes it invents, so clearing all
+        of them is the point. Every other reset site in the suite scopes itself
+        to the prefix its module owns — clearing a production prefix a module
+        does not own drops the mark that keeps a LATER module's first
+        ``UsageGate`` off the real /tmp.
         """
         reset_sweep_once_state()
         yield

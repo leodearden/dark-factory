@@ -122,6 +122,17 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> Iterator[None]:
     making a test's behaviour depend on which test ran first.  Cleared on the way
     out as well as in, because the mark lives in ``shared.config_dir`` and would
     otherwise leak past this module entirely.
+
+    SCOPED to this module's OWN prefix, never the bare ``reset_sweep_once_state()``
+    that clears every prefix.  The bare form also drops
+    ``claude-config-usage-gate-probe-``, which this module neither owns nor
+    protects: ``UsageGate.__init__`` sweeps at construction, and the mark left by
+    an earlier module is what keeps a LATER module's first gate from scandir-ing
+    and rmtree-ing the real /tmp.  Only ``test_usage_gate.py`` is autouse-guarded
+    against that (``_keep_gates_off_the_real_tmp``) — ``test_usage_gate_exhaustive
+    .py``, ``test_concurrency.py`` and four others build gates unprotected — so
+    clearing a prefix this module does not own would make whether they hit real
+    /tmp depend on pytest collection order.
     """
     real_sweep = probe.sweep_stale_pid_dirs
 
@@ -133,9 +144,9 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> Iterator[None]:
         return real_sweep(prefix, **kwargs)
 
     monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _confined_sweep, raising=False)
-    reset_sweep_once_state()
+    reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
     yield
-    reset_sweep_once_state()
+    reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
 
 
 def _encoded_is_clean(value: Any) -> bool:
@@ -1360,7 +1371,8 @@ def sweep_calls(monkeypatch, probe_recorder) -> list[str]:
 
     The reset matters: without it the mark's presence would depend on whether an
     earlier test in this process already consumed it, and these tests would pass
-    or fail by ordering rather than by behaviour.
+    or fail by ordering rather than by behaviour.  Scoped to the probe's own
+    prefix for the reason ``_confine_stale_dir_sweep``'s docstring gives.
     """
     calls: list[str] = []
 
@@ -1369,7 +1381,7 @@ def sweep_calls(monkeypatch, probe_recorder) -> list[str]:
         return 0
 
     monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _recording_sweep, raising=False)
-    reset_sweep_once_state()
+    reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
     return calls
 
 

@@ -853,10 +853,18 @@ class TestProbeConfigDirLeakSweep:
         on the way out too, keeping the promise symmetric: the state is
         module-global, so a case that marked the prefix and did not clear it
         would leak into whichever test ran next.
+
+        SCOPED to the gate's own prefix, never the bare
+        ``reset_sweep_once_state()``. The bare form would also drop
+        ``claude-config-startup-probe-``, which this class neither owns nor
+        protects, and it is a widening even for THIS prefix: what it replaced
+        was a monkeypatch that RESTORED the prior value on teardown rather than
+        clearing unconditionally. Only ``test_config_dir.py``, which tests the
+        helper itself, legitimately wants the whole state cleared.
         """
-        reset_sweep_once_state()
+        reset_sweep_once_state(PROBE_DIR_PREFIX)
         yield
-        reset_sweep_once_state()
+        reset_sweep_once_state(PROBE_DIR_PREFIX)
 
     def test_gate_construction_delegates_to_the_shared_once_helper(self):
         """The once-per-process bookkeeping lives in shared.config_dir now.
