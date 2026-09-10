@@ -628,6 +628,41 @@ class TestNegativeProbeSetPremise:
             'The probe was negative, so there is no persistent Graphiti problem.'
         )
 
+    def test_flags_bare_absence_of_the_fault(self):
+        """The fault noun and the probe subject are the same word here, so the
+        pattern must still reach it with nothing sitting between them."""
+        assert self.INVARIANT in self._invariants(
+            'There is no ongoing mixed-store degradation.'
+        )
+
+    def test_flags_absence_of_a_failure(self):
+        assert self.INVARIANT in self._invariants(
+            'Probes were clean; no current Graphiti failure exists.'
+        )
+
+    def test_absence_of_work_is_not_flagged(self):
+        """The scope word governs `work`, not the fault. A statement about what
+        is being DONE about the degradation asserts nothing about whether the
+        degradation exists."""
+        assert self.INVARIANT not in self._invariants(
+            'There is no ongoing work on the Graphiti degradation issue.'
+        )
+
+    def test_absence_of_an_owner_is_not_flagged(self):
+        """A statement about OWNERSHIP, not existence — and a sentence recon
+        has every reason to write when it files a task about the fault."""
+        assert self.INVARIANT not in self._invariants(
+            'No current owner for the mixed-store degradation problem.'
+        )
+
+    def test_absence_of_a_tracking_task_is_not_flagged(self):
+        """Third phrasing of the same shape: the scope word governs the
+        TRACKING ARTEFACT, and recon files exactly this sentence when opening a
+        task about the fault."""
+        assert self.INVARIANT not in self._invariants(
+            'No active tracking task for the Graphiti degradation defect.'
+        )
+
     def test_per_probe_report_is_not_flagged(self):
         """LOAD-BEARING: this is a truthful per-probe report, and it is exactly
         the fine-grained reporting the Stage 2 probe protocol asks for. A rule
