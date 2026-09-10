@@ -291,6 +291,40 @@ def _parent_key(module: Any) -> str:
     return key if isinstance(key, str) and key else 'parent_id'
 
 
+def _attach_id_for(module: Any, candidate: Any) -> Any:
+    """The id an attach to *candidate* MUST land on, with the ref's hoist applied.
+
+    "The attach honoured this candidate" is NOT "the attach id equals this
+    candidate's id": for a child it is the PARENT's id. ``_canonical_id_of``
+    documents that hoist as mandatory — attaching to a child creates a
+    grandchild that can never fold under the true canonical, which reads as
+    content loss — so a correct remedy that threads a designation still hoists
+    it, and a probe measuring literal equality would report that remedy as
+    broken.
+
+    Read from the REF's own ``_canonical_id_of`` where it exposes one, for the
+    same reason :func:`_child_kind` is read from the ref: a rule spelled here
+    is a second copy of the write side's, and a copy that drifts produces
+    exactly the unfoldable children that function exists to prevent. The
+    metadata rule below is the fallback for a ref that renamed it, not a second
+    opinion.
+    """
+    hoist = getattr(module, '_canonical_id_of', None)
+    if callable(hoist):
+        try:
+            resolved = hoist(candidate)
+        except Exception:  # noqa: BLE001 - a changed shape is not fatal
+            resolved = None
+        if isinstance(resolved, str) and resolved:
+            return resolved
+    meta = getattr(candidate, 'metadata', None) or {}
+    if meta.get('kind') == _child_kind(module):
+        parent_id = meta.get(_parent_key(module))
+        if isinstance(parent_id, str) and parent_id:
+            return parent_id
+    return getattr(candidate, 'id', None)
+
+
 class _VerdictObject:
     """A designating verdict spelled as a small object."""
 
@@ -475,26 +509,47 @@ def _make_counter(module: Any) -> tuple[Any, Callable[[], int]]:
     return fallback, fallback.live_count
 
 
-def _designated_ids(slate_ids: list[str], band_canonical: Any) -> list[str]:
-    """Slate ids usable as a designation: distinguishable from the band's own.
+def _designated_ids(
+    module: Any,
+    slate: list[Any],
+    band_canonical: Any,
+) -> list[str]:
+    """Slate ids usable as a designation. Two filters, each load-bearing.
 
-    A designation equal to the band canonical proves nothing — main already
-    attaches there — so those are dropped rather than measured. Two are needed
-    for the swap; see :func:`_swap_verdict`.
+    DISTINGUISHABLE FROM THE BAND'S OWN CANONICAL. A designation equal to it
+    proves nothing, because main already attaches there.
+
+    THEIR OWN CANONICAL ID. A child's attach target is its PARENT (see
+    :func:`_attach_id_for`), so designating one asks a correct remedy for two
+    contradictory things at once — honour the designation, and hoist it — and
+    the swap's FAIL would read "did not track the designated candidate", which
+    is an instruction to delete a mandatory hoist. The child stays on the
+    SLATE: it is the band's max-cosine winner, and hoisting it is what makes
+    the band canonical an id no candidate carries. It is barred only from being
+    designated.
+
+    Two are needed for the swap; see :func:`_swap_verdict`.
     """
     seen: dict[str, None] = {}
-    for ident in slate_ids:
-        if isinstance(ident, str) and ident and ident != band_canonical:
-            seen.setdefault(ident, None)
+    for candidate in slate:
+        ident = getattr(candidate, 'id', None)
+        if not isinstance(ident, str) or not ident or ident == band_canonical:
+            continue
+        if _attach_id_for(module, candidate) != ident:
+            continue
+        seen.setdefault(ident, None)
     return list(seen)
 
 
-def _measure(module: Any) -> tuple[_Run, list[str], Any]:
+def _measure(module: Any) -> tuple[_Run, list[Any], Any]:
     """A first run with a plain, valid verdict — what the module tells the judge.
 
-    Returns ``(run, slate_ids, band_canonical)``. The verdict is a bare outcome
-    str so the run cannot itself be rejected as an unrecognised payload; what is
-    being measured here is the module's inputs, not its consumption.
+    Returns ``(run, slate, band_canonical)``, the slate as the candidate
+    OBJECTS the module handed the judge rather than as bare ids: deciding where
+    an attach to one of them must land needs its metadata, not just its name.
+    The verdict is a bare outcome str so the run cannot itself be rejected as an
+    unrecognised payload; what is being measured here is the module's inputs,
+    not its consumption.
     """
     judge = _FakeJudge(_ATTACH_OUTCOME)
     run = _drive(module, judge)
@@ -513,9 +568,12 @@ def _measure(module: Any) -> tuple[_Run, list[str], Any]:
             'consumes',
         )
     call = run.calls[0]
-    slate_ids = [getattr(c, 'id', None) for c in call.get('candidates') or ()]
+    slate = [
+        candidate for candidate in call.get('candidates') or ()
+        if isinstance(getattr(candidate, 'id', None), str)
+    ]
     band_canonical = getattr(call.get('decision'), 'canonical_id', None)
-    return run, [i for i in slate_ids if isinstance(i, str)], band_canonical
+    return run, slate, band_canonical
 
 
 def _first_few(reasons: list[str], limit: int = 4) -> str:
@@ -544,6 +602,13 @@ def _swap_verdict(
     Both halves are necessary: matching one designation alone could be
     coincidence, and differing between runs without matching either means the
     attach is tracking something else entirely.
+
+    EXACT equality is right precisely BECAUSE the pool is filtered. Every
+    designation :func:`_designated_ids` yields is already its own canonical id,
+    so a remedy that hoists — as ``_canonical_id_of`` obliges it to — lands on
+    the designation itself and passes here unaltered. Also accepting the
+    hoisted form would therefore be dead code, and it would blur what a FAIL
+    means by blessing a module that never hoists at all.
     """
     for designated in designations:
         judge = _FakeJudge(spelling.payload(_ATTACH_OUTCOME, designated))
@@ -572,11 +637,11 @@ def _swap_verdict(
     return None
 
 
-def _announced_ids(
+def _announced_candidates(
     call: dict[str, Any],
     eligible: list[str],
-) -> list[tuple[str, str]]:
-    """Slate candidates the module NAMED to the judge, as ``(kwarg, id)`` pairs.
+) -> list[tuple[str, Any]]:
+    """Slate candidates the module NAMED to the judge, as ``(kwarg, candidate)``.
 
     An announcement counts only when it is BOTH beyond :data:`_JUDGE_KWARGS`
     and drawn from *eligible* — the ids that are distinguishable from the
@@ -586,18 +651,22 @@ def _announced_ids(
 
     A candidate may be named as its id or as the object itself; both are read,
     because which one a remedy would pass is a mechanism this probe may not pin.
+    The OBJECT is what comes back either way: honouring an announcement means
+    landing on :func:`_attach_id_for` of it, which reads its metadata.
     """
+    by_id = {getattr(c, 'id', None): c for c in call.get('candidates') or ()}
     found = []
     for name, value in call.items():
         if name in _JUDGE_KWARGS:
             continue
         ident = value if isinstance(value, str) else getattr(value, 'id', None)
         if isinstance(ident, str) and ident in eligible:
-            found.append((name, ident))
+            found.append((name, by_id[ident]))
     return found
 
 
 def _announced_target_branch(
+    module: Any,
     run: _Run,
     eligible: list[str],
 ) -> tuple[bool, str]:
@@ -608,7 +677,7 @@ def _announced_target_branch(
     skipped — the non-vacuity of "main does not satisfy it" is only legible if
     main's run says so out loud.
     """
-    announced = _announced_ids(run.calls[0], eligible)
+    announced = _announced_candidates(run.calls[0], eligible)
     observed = getattr(run.decision, 'canonical_id', None)
     if not announced:
         return False, (
@@ -616,17 +685,25 @@ def _announced_target_branch(
             f'{sorted(_JUDGE_KWARGS)}, so nothing was announced for the attach '
             'to honour'
         )
-    honoured = [name for name, ident in announced if ident == observed]
+    # Against _attach_id_for rather than the announced id verbatim, for the
+    # reason _designated_ids filters its pool: an announcing remedy that also
+    # hoists a child is honouring its announcement, and must not be read here
+    # as ignoring it.
+    honoured = [
+        (name, candidate) for name, candidate in announced
+        if _attach_id_for(module, candidate) == observed
+    ]
     if honoured:
+        name, candidate = honoured[0]
         return True, (
             f'{_ANNOUNCED_BRANCH}: satisfied — triage_write announced '
-            f'{observed!r} to the judge via {honoured[0]!r}, and the attach '
-            'landed there'
+            f'{getattr(candidate, "id", None)!r} to the judge via {name!r}, and '
+            f'the attach landed on {observed!r}'
         )
+    ignored = [f'{name}={getattr(c, "id", None)!r}' for name, c in announced]
     return False, (
-        f'{_ANNOUNCED_BRANCH}: triage_write announced '
-        f'{_first_few([f"{name}={ident!r}" for name, ident in announced])}, but '
-        f'the attach landed on {observed!r} — {_ANNOUNCEMENT_IGNORED}'
+        f'{_ANNOUNCED_BRANCH}: triage_write announced {_first_few(ignored)}, '
+        f'but the attach landed on {observed!r} — {_ANNOUNCEMENT_IGNORED}'
     )
 
 
@@ -681,17 +758,18 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     module = _import_triage(src_root, extra_paths)
     out.append(f'triage module: {getattr(module, "__file__", "<unknown>")}')
 
-    measured, slate_ids, band_canonical = _measure(module)
+    measured, slate, band_canonical = _measure(module)
+    slate_ids = [candidate.id for candidate in slate]
     out.append(
         f'slate: {slate_ids!r} — band canonical {band_canonical!r}',
     )
-    usable = _designated_ids(slate_ids, band_canonical)
+    usable = _designated_ids(module, slate, band_canonical)
 
     # The option-(b) branch first: it is decided by the run already measured,
     # and a module that satisfies it has no judge-side designation for the swap
     # to find, so searching for one would only spend the report on four
     # spellings none of which could ever have held.
-    announced, announced_line = _announced_target_branch(measured, usable)
+    announced, announced_line = _announced_target_branch(module, measured, usable)
     out.append(announced_line)
     if announced:
         out.append(_PASS_MARKER)
@@ -703,10 +781,11 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
         # distinguishable from the band's own canonical there is nothing here
         # that could tell a correct fix from a hard-coded position.
         raise _Unverifiable(
-            f'the slate {slate_ids!r} carries fewer than two candidates '
-            f'distinguishable from the band canonical {band_canonical!r}, so '
-            'no swap is possible and nothing here could tell a correct fix '
-            'from an attach that simply used a fixed slot',
+            f'the slate {slate_ids!r} carries fewer than two candidates that '
+            f'are their own canonical id and distinguishable from the band '
+            f'canonical {band_canonical!r}, so no swap is possible and nothing '
+            'here could tell a correct fix from an attach that simply used a '
+            'fixed slot',
         )
 
     # Chosen from the MEASURED slate at runtime rather than by fixed index, and
