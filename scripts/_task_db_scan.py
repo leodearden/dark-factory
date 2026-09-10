@@ -198,13 +198,22 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     Raises rather than returning a connection whose first query answers
     ``no such table: tasks`` — an error that reads as "this store is empty"
     when it in fact means "you are looking at the wrong file".
+
+    The URI is built from the RESOLVED absolute path, so a relative one cannot
+    be re-resolved against a different cwd by a subprocess or a later chdir —
+    the ``unable to open database file`` shape of the same confusion.
+
+    This is the single home for an idiom spelled at ~10 other sites. Migrating
+    them is deliberately a separate change: each is a sweep that drops an
+    unreadable store SILENTLY on purpose, so adopting this refusal needs a
+    judgement call per site rather than a rename.
     """
     resolved = Path(path).resolve()
     if not resolved.exists():
         raise TaskDbUnreadable(resolved, TaskDbProblem.ABSENT)
     if resolved.stat().st_size == 0:
         raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
-    raise NotImplementedError("the read-only open itself is not wired up yet")
+    return sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
 
 
 def resolve_project_roots(
