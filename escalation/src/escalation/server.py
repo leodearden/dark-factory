@@ -4523,10 +4523,33 @@ def create_server(
                             # retires the old wart of answering with the branch tip.
                             # No escalation on reject — mirrors the harness ancestor
                             # arm's silent-False, and merge_status is a read-only probe.
+                            # delivered_checks is THREE-STATE (task 4498):
+                            # None = "this call site is unwired", [] = "wired,
+                            # and this task declares no checks".  This site IS
+                            # wired, so `or []` never degrades to None — the
+                            # capstone (task 4500) reads
+                            # probe['delivered_checks_state'] to find sites
+                            # that regressed to the default.  It is also the
+                            # fail-safe direction: delivered_checks is
+                            # consulted ONLY on the effect_absent reject path
+                            # and can only ever UPGRADE a rejection to an
+                            # acceptance, so [] simply leaves that second
+                            # accept path unreachable — exactly today's
+                            # behaviour, and a failed metadata fetch (which
+                            # yields {}, hence []) cannot fabricate a
+                            # confident `done`.  The awkward cell — a FAILED
+                            # fetch reported as 'none_declared' rather than as
+                            # genuinely-empty — is resolved OUT OF BAND by
+                            # git_authority.TaskMetadataResult.unavailable,
+                            # not by abusing the third state: the parameter
+                            # has no fourth value, and sending None here would
+                            # trade a mild probe-label inaccuracy for a false
+                            # "unwired" claim in operator-facing prose.
                             verdict = await validate_landing_evidence(
                                 git_ops, tid, full_branch,
                                 branch_tip_sha=tip,
                                 pattern_template=pattern,
+                                delivered_checks=metadata.get('delivered_checks') or [],
                             )
                             # `accepted` implies a non-None evidence_sha (see
                             # LandingEvidenceVerdict), but assert it explicitly:
@@ -4569,10 +4592,16 @@ def create_server(
                                 # reject (unlike the harness marker path):
                                 # merge_status is a read-only probe with no write
                                 # side, so a reject degrades to Tier-4 unknown.
+                                # Same three-state contract as the ancestor
+                                # arm above (task 4498): `or []` because this
+                                # site IS wired, never None which would report
+                                # delivered_checks_state == 'unwired' to the
+                                # task-4500 capstone.
                                 verdict = await validate_landing_evidence(
                                     git_ops, tid, full_branch,
                                     branch_tip_sha=None,
                                     candidate_sha=marker,
+                                    delivered_checks=metadata.get('delivered_checks') or [],
                                 )
                                 # Same non-None assertion as the ancestor arm
                                 # above: reject a null evidence sha into Tier-4
