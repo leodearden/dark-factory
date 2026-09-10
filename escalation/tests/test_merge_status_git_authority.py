@@ -1471,3 +1471,136 @@ class TestMergeStatusGitAuthorityIntegration:
         assert result.get('merge_sha') == merge_result.merge_commit, (
             f'Expected merge_sha={merge_result.merge_commit!r}, got: {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# merge_request's use of the extracted tier (task 4887 / PRD label ζ)
+#
+# This module contained ZERO references to ``merge_request`` before this
+# class, which is the narrow sense in which ζ calls its degenerate-branch
+# fast path "uncovered".  At REPO level that is false — ``test_server_
+# chokepoint.py::TestMergeRequestDegenerateBranchFastPath`` is a 10-test
+# class covering the guard behaviourally, and those cases are the real
+# behaviour pin for this site.  So nothing here re-asserts behaviour they
+# already prove; what genuinely had no coverage is the SEAM the extraction
+# creates, and that is all this class pins.
+# ---------------------------------------------------------------------------
+
+
+async def _run_merge_request_fast_path(
+    tmp_path: Path,
+    *,
+    tip: str = 'a' * 40,
+    task_id: str = '591',
+    branch: str = '591',
+    metadata: dict[str, Any] | None = None,
+    scheduler_raises: bool = False,
+) -> dict[str, Any]:
+    """Drive merge_request's submit-time fast path once, ancestor arm.
+
+    Adapted from ``test_server_chokepoint.py::_run_fast_path_probe`` (which
+    threads far more knobs than this seam needs) down to the wiring these two
+    tests actually exercise.  ``is_ancestor`` always answers True, so the
+    ancestor arm hits and the tool returns ``already_merged`` before any
+    worker or queue interaction — which is why no fake worker is needed here.
+    """
+    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        InFlightMergeRegistry,
+    )
+
+    git_ops = types.SimpleNamespace(
+        resolve_branch_sha=AsyncMock(return_value=tip),
+        is_ancestor=AsyncMock(return_value=True),
+        find_inflight_merge_worktree=AsyncMock(return_value=None),
+    )
+    harness = types.SimpleNamespace(git_ops=git_ops)
+    harness.scheduler = types.SimpleNamespace(
+        get_task=(
+            AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
+            if scheduler_raises else AsyncMock(return_value={'metadata': metadata or {}})
+        ),
+    )
+
+    server = create_server(
+        EscalationQueue(tmp_path / 'esc'),
+        merge_queue=asyncio.Queue(),
+        orch_config=_make_config(tmp_path),
+        harness=harness,
+        merge_inflight_registry=InFlightMergeRegistry(),
+    )
+    tool = await server.get_tool('merge_request')
+    return await tool.fn(
+        task_id=task_id, branch=branch,
+        worktree=str(tmp_path / 'wt'), description='', wait_secs=5,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestMergeRequestUsesTheExtractedTier:
+    """merge_request reaches task metadata through the EXTRACTED seam."""
+
+    async def test_probes_with_the_merge_request_site_and_a_branch_derived_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two wiring facts one call proves, neither of them behavioural.
+
+        ``site='merge_request'`` — task 3103 review #3: a submit-path
+        scheduler fault logged as a ``merge_status`` failure is invisible to
+        an operator grepping for a submit-path degradation.
+
+        The id comes from ``full_branch.removeprefix(branch_prefix)``, NOT
+        from the independently-supplied ``task_id`` parameter (review #6).
+        merge_request takes the two as separate parameters; keying the
+        metadata off one and the tip off the other would compare task X's
+        recorded ``branch_base_sha`` against task Y's branch tip, silently
+        disabling the guard on every mismatched submission.  Passing
+        DIFFERING values is what makes the distinction observable at all.
+        """
+        import escalation.git_authority as git_authority
+        real = git_authority.task_metadata
+        calls: list[Any] = []
+
+        async def _recorder(*args: Any, **kwargs: Any) -> Any:
+            calls.append(mock_call(*args, **kwargs))
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(git_authority, 'task_metadata', _recorder)
+
+        await _run_merge_request_fast_path(
+            tmp_path, task_id='591', branch='777',
+            metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        assert len(calls) == 1, f'Expected exactly one probe, got: {calls}'
+        assert calls[0].kwargs['site'] == 'merge_request', (
+            f'got site={calls[0].kwargs.get("site")!r}'
+        )
+        assert '777' in calls[0].args, (
+            f'The id must be derived from the BRANCH (777), not from the '
+            f'task_id parameter (591); got args={calls[0].args!r}'
+        )
+        assert '591' not in calls[0].args, (
+            f'The caller-supplied task_id must not key the lookup; '
+            f'got args={calls[0].args!r}'
+        )
+
+    async def test_fails_open_when_the_fetch_reports_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        """Behaviour-preservation: merge_request reads ``.metadata`` and
+        IGNORES the new ``unavailable`` flag, exactly as today.
+
+        With a scheduler whose ``get_task`` raises, the extracted probe
+        reports ``unavailable=True`` — and the fast path must still answer
+        its legacy ``already_merged`` rather than raising or declining.  A
+        metadata fault must degrade a single guard, not the whole submission.
+        Surfacing the flag here is task 4651's, not this task's.
+        """
+        result = await _run_merge_request_fast_path(
+            tmp_path, scheduler_raises=True,
+        )
+
+        assert result.get('status') == 'already_merged', (
+            f'A scheduler fault must not change the fast path, got: {result}'
+        )
