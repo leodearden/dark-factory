@@ -62,6 +62,31 @@ _LONG_RUN = 'A' * 70
 _DEAD_PID = 4194305
 
 
+def _corpus_probe_run_ids() -> list[str]:
+    """Every distinct ``probe_run_id`` the committed raw capture actually holds.
+
+    DERIVED, never retyped: a hand-copied list would keep validating retired ids
+    and report green after a regeneration, which is precisely the drift the test
+    that consumes it claims to catch.  Read at import time because it feeds a
+    ``parametrize``, and read straight off ``scf.RAW_CAPTURE_PATH`` — the same
+    path and the same per-line parse
+    ``test_every_row_is_linked_to_a_raw_probe_run`` joins the curated corpus on,
+    so the two cannot disagree about what a run id is.
+    """
+    seen = {
+        json.loads(line)['probe_run_id']
+        for line in scf.RAW_CAPTURE_PATH.read_text(encoding='utf-8').splitlines()
+        if line.strip()
+    }
+    if not seen:
+        raise AssertionError(
+            f'{scf.RAW_CAPTURE_PATH.name} carries no probe_run_id: an empty '
+            f'parametrize collects ZERO cases and reports green, so the vacuity '
+            f'has to fail collection instead'
+        )
+    return sorted(seen)
+
+
 def _minimal_observation(**overrides: Any) -> dict[str, Any]:
     """The smallest observation shaped like what :func:`probe.observe` assembles.
 
@@ -588,19 +613,7 @@ class TestGateNeverRaisesOnGenericHit:
             json.dumps(result), source='synthetic:poisoned-row-wedge-shape'
         )
 
-    @pytest.mark.parametrize(
-        'probe_run_id',
-        # The REAL corpus values, read off the fixtures README's Provenance table
-        # (:129-135), so the validator is pinned against what the probe has
-        # actually written rather than against the regex's own assumptions.
-        [
-            'healthy-171d92bec337',
-            'healthy-e52685462d20',
-            'build_wedge-721c2ab8ebb1',
-            'uv_wedge-d178e0084890',
-            'mcp_wedge-7182760110c3',
-        ],
-    )
+    @pytest.mark.parametrize('probe_run_id', _corpus_probe_run_ids())
     def test_a_probe_authored_run_id_survives(self, monkeypatch, probe_run_id):
         """``probe_run_id`` is the key the curated corpus JOINS on.
 
@@ -608,6 +621,14 @@ class TestGateNeverRaisesOnGenericHit:
         whose ``probe_run_id`` is absent from the raw capture, and ``session_id``
         does not stand in for it — so a degraded row without one is unjoinable
         even though it is attributable.
+
+        Parametrized off the REAL capture rather than a hand-copied list, so the
+        validator is pinned against what the probe has actually written rather
+        than against the regex's own assumptions — and stays pinned: regenerate
+        or extend the raw capture with an id this validator rejects (a new mode
+        whose slug the regex does not admit, an operator-supplied
+        ``--probe-run-id``) and this test turns RED instead of quietly going on
+        to validate five retired ids.
         """
         monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
         result = probe._gate(self._dirty_observation(probe_run_id=probe_run_id))
