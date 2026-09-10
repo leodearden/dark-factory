@@ -13328,6 +13328,687 @@ def test_record_placeholder_finding_drop_rolling_window(
     assert storm3['count'] >= _PLACEHOLDER_DROP_STORM_THRESHOLD
 
 
+# ── Task 4781: phantom-cited vs never-cited placeholder-finding drops ──────
+#
+# citation_verifier.py::verify_cited_memories (hoisted into every stage via
+# stages/base.py::BaseStage.run, task 2979) can strip EVERY citation from an
+# otherwise-real finding when a cited mem0 id no longer resolves, leaving
+# cited_memories == [] and a citation_failures marker behind. That finding is
+# indistinguishable from a task-1970 never-cited placeholder to
+# _finding_has_reference alone — both have _derive_affected_ids() == [] — but
+# the two causes are different: one is "Stage 3 never cited anything", the
+# other is "Stage 3 cited something and the evidence evaporated afterward".
+# _finding_has_citation_failures is the second predicate that tells them
+# apart; _maybe_remediate uses both to route each drop to its own log event
+# and its own storm counter instead of misattributing every drop to a
+# runaway Stage 3.
+
+
+def _make_phantom_cited_finding() -> dict:
+    """Return the POST-VERIFICATION shape of a finding stripped by
+    citation_verifier.py::verify_cited_memories (task 4781 repro).
+
+    Mirrors a real Stage-3 finding that DID cite a mem0 memory, but whose
+    citation failed to re-resolve at report-assembly time: cited_memories is
+    left empty and citation_failures carries the memory_not_found marker.
+    See test_phantom_stripped_finding_is_referenceless_but_carries_citation_failures
+    below, which pins this exact shape against the real producer.
+    """
+    return {
+        'description': 'Stale edge X',
+        'severity': 'moderate',
+        'actionable': True,
+        'category': 'stale_edge',
+        'suggested_action': 'Investigate',
+        'cited_memories': [],
+        'citation_failures': [
+            {'memory_id': 'mem-gone-1', 'store': 'mem0', 'reason': 'memory_not_found'},
+        ],
+    }
+
+
+class TestFindingHasCitationFailures:
+    """_finding_has_citation_failures must distinguish a finding whose citations
+    were stripped/flagged by phantom-citation verification from one that was
+    never touched by that pass at all.
+
+    step-1 (RED): _finding_has_citation_failures does not exist yet.
+    step-2 (GREEN): add it to harness.py as bool(finding.get('citation_failures')).
+    """
+
+    def test_missing_citation_failures_key_returns_false(self):
+        """A finding with no citation_failures key was never touched by verification."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures(_make_placeholder_finding()) is False
+
+    def test_empty_citation_failures_list_returns_false(self):
+        """An empty citation_failures list carries no marker."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures({'citation_failures': []}) is False
+
+    def test_none_citation_failures_returns_false(self):
+        """A None citation_failures value carries no marker."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures({'citation_failures': None}) is False
+
+    def test_citation_failures_with_memory_not_found_marker_returns_true(self):
+        """A memory_not_found marker proves verification stripped a citation."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures(_make_phantom_cited_finding()) is True
+
+    def test_citation_failures_with_verification_error_marker_returns_true(self):
+        """A verification_error marker also proves verification touched this
+        finding's citations — the citation is KEPT (citation_verifier.py:248),
+        but the finding still counts as citation-failures-bearing."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        finding = {
+            'citation_failures': [
+                {
+                    'memory_id': 'mem-x',
+                    'store': 'mem0',
+                    'reason': 'verification_error',
+                    'error_type': 'TimeoutError',
+                },
+            ],
+        }
+        assert _finding_has_citation_failures(finding) is True
+
+
+@pytest.mark.asyncio
+async def test_phantom_stripped_finding_is_referenceless_but_carries_citation_failures():
+    """Producer-contract pin, tying _make_phantom_cited_finding() to what the
+    REAL verify_cited_memories emits.
+
+    The _maybe_remediate tests in this file mock stage.run directly, so
+    BaseStage.run's verify_cited_memories pass never fires in-cycle — the
+    hand-built _make_phantom_cited_finding() fixture could silently drift
+    into fiction. This test instead calls the real producer
+    (citation_verifier.py::verify_cited_memories) against a finding whose
+    only citation is a mem0 id that fails to resolve, and asserts the
+    resulting shape is exactly what the fixture assumes.
+    """
+    from fused_memory.reconciliation.citation_verifier import verify_cited_memories
+    from fused_memory.reconciliation.harness import (
+        _finding_has_citation_failures,
+        _finding_has_reference,
+    )
+
+    finding = {
+        'actionable': True,
+        'description': 'Stale edge X',
+        'cited_memories': [{'memory_id': 'mem-gone-1', 'store': 'mem0'}],
+    }
+    svc = AsyncMock()
+    svc.get_memory_by_id.return_value = None
+
+    stats = await verify_cited_memories([finding], svc, 'test-project', stat_prefix='stage3')
+
+    assert stats['stage3_phantom_citations_dropped'] == 1
+    assert finding['cited_memories'] == []
+    assert _finding_has_reference(finding) is False
+    assert _finding_has_citation_failures(finding) is True
+    assert finding['citation_failures'][0]['reason'] == 'memory_not_found'
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_logs_phantom_cited_drop_under_its_own_event(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """PHANTOM-CITED: a finding whose only citation was stripped by
+    phantom-citation verification must log under its OWN event name — not the
+    never-cited-placeholder event — and the marker's ids/reasons must ride
+    along in the log record's extra fields so an operator can see them.
+
+    RED on the current tree: _maybe_remediate has no branch for
+    citation_failures-bearing findings, so this finding falls into the
+    dropped_placeholders bucket and logs
+    'reconciliation.remediation_dropped_placeholder_finding' instead.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event('test-project'))
+
+    phantom_finding = _make_phantom_cited_finding()
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[phantom_finding])
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    phantom_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.remediation_dropped_phantom_cited_finding'
+    ]
+    assert len(phantom_records) >= 1, (
+        f'Expected at least one "reconciliation.remediation_dropped_phantom_cited_finding" '
+        f'log record; got records: {[r.getMessage() for r in caplog.records]}'
+    )
+
+    placeholder_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.remediation_dropped_placeholder_finding'
+    ]
+    assert placeholder_records == [], (
+        f'Phantom-cited drop must NOT log under the never-cited placeholder event; '
+        f'got: {[r.getMessage() for r in placeholder_records]}'
+    )
+
+    record = phantom_records[0]
+    assert getattr(record, 'project_id', None) == 'test-project'
+    assert getattr(record, 'parent_run_id', None) == run.id
+    assert getattr(record, 'finding_category', None) == phantom_finding['category']
+    assert getattr(record, 'description', None) == phantom_finding['description']
+    citation_failures = getattr(record, 'citation_failures', None)
+    assert citation_failures is not None, (
+        'phantom-cited drop log record is missing citation_failures'
+    )
+    assert citation_failures[0]['reason'] == 'memory_not_found'
+    assert citation_failures[0]['memory_id'] == 'mem-gone-1'
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_phantom_cited_drop_excluded_from_placeholder_counter(
+    journal, event_buffer, mock_memory_service,
+):
+    """The never-cited-placeholder storm counter must count ONLY never-cited
+    drops — a phantom-cited drop must not feed it, or a citation-verification
+    outage would be misattributed to 'Stage 3 stopped citing'.
+
+    RED on the current tree: _maybe_remediate treats the phantom-cited
+    finding as just another referenceless finding, so
+    _record_placeholder_finding_drop fires for BOTH findings, not just the
+    never-cited one.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._record_placeholder_finding_drop = MagicMock(return_value=None)
+
+    await event_buffer.push(_make_event('test-project'))
+
+    phantom_finding = _make_phantom_cited_finding()
+    placeholder_finding = _make_placeholder_finding()
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(
+        harness.stages[2], items_flagged=[phantom_finding, placeholder_finding],
+    )
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    assert harness._record_placeholder_finding_drop.call_count == 1, (
+        f'Expected _record_placeholder_finding_drop to fire exactly once (the '
+        f'never-cited placeholder only), got calls: '
+        f'{harness._record_placeholder_finding_drop.call_args_list}'
+    )
+
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert remediation_runs == [], (
+        f'Both findings cite nothing investigable; expected no remediation run, '
+        f'got {len(remediation_runs)}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_phantom_cited_finding_still_dropped_from_remediation_batch(
+    journal, event_buffer, mock_memory_service,
+):
+    """MIXED: a phantom-cited finding alongside a reference-bearing finding.
+
+    Remediation must still run (the reference-bearing finding is genuinely
+    actionable), and the phantom-cited finding must NOT reach Stage 1's
+    remediation_findings — it still cites nothing investigable, even though
+    its drop is now attributed and alarmed differently from a never-cited
+    placeholder.  This is the regression pin: re-attributing the drop must
+    not turn it into a leak into the remediation batch.
+
+    Passes today (the two-way partition already drops it, just under the
+    wrong label) — this pins that the three-way partition in step-4 does not
+    change that outcome.
+    """
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+
+    captured: dict = {}
+
+    async def capture_attrs(stage):
+        captured['remediation_findings'] = stage.remediation_findings
+
+    phantom_finding = _make_phantom_cited_finding()
+    reference_bearing_finding = _make_s3_findings()[0]  # carries affected_ids
+
+    _mock_stage_run(stage1, before_return=capture_attrs)
+    _mock_stage_run(stages[1])
+    _mock_stage_run(
+        stages[2], items_flagged=[phantom_finding, reference_bearing_finding],
+    )
+
+    await event_buffer.push(_make_event('test-project'))
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert len(remediation_runs) == 1, (
+        f'Expected exactly one remediation run (mixed batch has a real finding), '
+        f'got {len(remediation_runs)}'
+    )
+
+    assert captured.get('remediation_findings') == [reference_bearing_finding], (
+        f'Expected remediation_findings to contain only the reference-bearing finding, '
+        f'got {captured.get("remediation_findings")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_phantom_citation_drop_storm_escalates_at_threshold(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 4781: dropping _PHANTOM_CITATION_DROP_STORM_THRESHOLD phantom-cited
+    actionable findings in a single batch must wire to exactly ONE
+    'recon_remediation_phantom_citation_storm' escalation carrying
+    _PHANTOM_CITATION_DROP_STORM_FINDING, whose text names the real cause
+    (evaporated evidence) rather than 'Stage 3 stopped citing'.
+
+    RED on the current tree: the constants, the recorder, the category, and
+    the wiring in _maybe_remediate do not exist yet.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PHANTOM_CITATION_DROP_STORM_FINDING,
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    phantom_findings = [
+        _make_phantom_cited_finding() for _ in range(_PHANTOM_CITATION_DROP_STORM_THRESHOLD)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=phantom_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category'))
+        == 'recon_remediation_phantom_citation_storm'
+    ]
+    assert len(storm_calls) == 1, (
+        f'Expected exactly one recon_remediation_phantom_citation_storm call; '
+        f'got {harness._escalate.call_args_list}'
+    )
+    call = storm_calls[0]
+    assert call.kwargs.get('finding') is _PHANTOM_CITATION_DROP_STORM_FINDING, (
+        f"Expected the storm call's finding= kwarg to be "
+        f'_PHANTOM_CITATION_DROP_STORM_FINDING; got {call.kwargs.get("finding")!r}'
+    )
+    summary = call.args[2] if len(call.args) > 2 else call.kwargs.get('summary', '')
+    assert str(_PHANTOM_CITATION_DROP_STORM_THRESHOLD) in summary, (
+        f'Expected the drop count in the summary text; got: {summary!r}'
+    )
+    assert 'stopped citing' not in summary, (
+        f"Phantom-citation storm text must not blame a stage that 'stopped citing'; "
+        f'got: {summary!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_phantom_citation_drops_never_trip_placeholder_storm(
+    journal, event_buffer, mock_memory_service,
+):
+    """The task's headline defect, expressed as an assertion: a storm of
+    phantom-cited drops must NEVER fire the never-cited-placeholder storm
+    alarm — that alarm's text claims Stage 3 stopped citing, which is false
+    here.
+    """
+    from fused_memory.reconciliation.harness import _PHANTOM_CITATION_DROP_STORM_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    phantom_findings = [
+        _make_phantom_cited_finding() for _ in range(_PHANTOM_CITATION_DROP_STORM_THRESHOLD)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=phantom_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    placeholder_storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_remediation_placeholder_storm'
+    ]
+    assert placeholder_storm_calls == [], (
+        f'Expected zero recon_remediation_placeholder_storm calls from a pure '
+        f'phantom-citation-drop storm; got {placeholder_storm_calls}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_phantom_citation_drop_storm_does_not_escalate_below_threshold(
+    journal, event_buffer, mock_memory_service,
+):
+    """Below the storm threshold, phantom-cited drops must NOT trip the storm
+    alarm (off-by-one guard mirroring the placeholder counter's sibling test).
+    """
+    from fused_memory.reconciliation.harness import _PHANTOM_CITATION_DROP_STORM_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    phantom_findings = [
+        _make_phantom_cited_finding() for _ in range(_PHANTOM_CITATION_DROP_STORM_THRESHOLD - 1)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=phantom_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category'))
+        == 'recon_remediation_phantom_citation_storm'
+    ]
+    assert storm_calls == [], (
+        f'Expected zero recon_remediation_phantom_citation_storm calls below threshold; '
+        f'got {storm_calls}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_mixed_phantom_and_placeholder_drops_below_threshold_neither_storm_escalates(
+    journal, event_buffer, mock_memory_service,
+):
+    """INDEPENDENCE PIN (reviewer_comprehensive, task 4781 amendment): the two
+    storm counters must never share a window — see the comment on
+    ``self._phantom_citation_drop_storm`` in
+    ``fused_memory/reconciliation/harness.py::ReconciliationHarness.__init__``
+    ("the two drop causes must never share a window, or a phantom-citation
+    outage could push the never-cited-placeholder alarm over threshold ... and
+    misattribute the cause").
+
+    Every OTHER phantom/placeholder storm test in this file drives a
+    SINGLE-cause batch, so none of them can tell "has its own independent
+    StormCounter" apart from "shares one counter nobody else has touched yet"
+    — verified by mutation: aliasing
+    ``self._phantom_citation_drop_storm = self._placeholder_drop_storm`` in
+    ``__init__`` leaves every other phantom/placeholder test in this file
+    green.
+
+    This test feeds (THRESHOLD - 2) phantom-cited drops AND (THRESHOLD - 2)
+    never-cited placeholder drops in the SAME batch — 3 + 3 = 6 total drops,
+    above either threshold's value of 5, but below each PER-CAUSE threshold
+    individually. With two genuinely independent counters, neither reaches 5
+    and neither storm escalates. Under the aliasing mutation above, both
+    causes accumulate in the one shared counter (the phantom-cited loop runs
+    first and contributes 3, then the placeholder loop's 2nd call reaches 5)
+    and 'recon_remediation_placeholder_storm' fires — misattributing
+    phantom-citation drops to "Stage 3 stopped citing".
+    """
+    from fused_memory.reconciliation.harness import (
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    mixed_findings = [
+        _make_phantom_cited_finding()
+        for _ in range(_PHANTOM_CITATION_DROP_STORM_THRESHOLD - 2)
+    ] + [
+        _make_placeholder_finding()
+        for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD - 2)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=mixed_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category'))
+        in (
+            'recon_remediation_phantom_citation_storm',
+            'recon_remediation_placeholder_storm',
+        )
+    ]
+    assert storm_calls == [], (
+        f'Expected zero storm escalations of either category — each drop '
+        f'cause is individually below its own threshold, and a shared/'
+        f'aliased counter is the only way either could fire here; '
+        f'got {storm_calls}'
+    )
+
+
+def test_record_phantom_citation_finding_drop_rolling_window(
+    journal, event_buffer, mock_memory_service,
+):
+    """Unit tests for ReconciliationHarness._record_phantom_citation_finding_drop().
+
+    Mirrors test_record_placeholder_finding_drop_rolling_window's three phases
+    (task 1970 amendment), applied to the phantom-citation-drop storm counter
+    (task 4781). Driving the full threshold/rate-limit/re-arm sequence through
+    ONLY this recorder's own calls demonstrates the counter's own mechanics —
+    threshold crossing, per-window rate-limiting, and re-arming after the
+    window drains — all work end to end.
+
+    It does NOT by itself prove _phantom_citation_drop_storm is a separate
+    instance rather than an alias of _placeholder_drop_storm: a single-cause
+    batch cannot distinguish "has its own state" from "shares a counter
+    nobody else has touched yet".
+    test_maybe_remediate_mixed_phantom_and_placeholder_drops_below_threshold_neither_storm_escalates
+    above is the test that actually pins the separate-instance property, by
+    mixing both causes in one batch and asserting neither counter's threshold
+    is reached.
+
+    Phase 1 — threshold crossing + per-project labels:
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD calls in the window (alternating
+        'reify' / 'autopilot_video') → all but the last return None, the
+        threshold-crossing call returns a storm dict with
+        count>=_PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+        window_seconds==_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS, and
+        projects==sorted distinct project labels seen in the window.
+
+    Phase 2 — no re-fire in the same window:
+        Two more calls immediately after return None (rate limit: <=1 fire
+        per window).
+
+    Phase 3 — re-fire after a full window during a sustained storm:
+        A fresh burst of THRESHOLD calls at now=base + 2*WINDOW_SECONDS
+        re-fires.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+        _PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    # ── Phase 1: threshold crossing ──────────────────────────────────────────
+
+    projects = [
+        'reify' if i % 2 == 0 else 'autopilot_video'
+        for i in range(_PHANTOM_CITATION_DROP_STORM_THRESHOLD)
+    ]
+    results = [
+        harness._record_phantom_citation_finding_drop(proj, now=base + timedelta(seconds=i))
+        for i, proj in enumerate(projects)
+    ]
+
+    for i, r in enumerate(results[:-1]):
+        assert r is None, f'Call {i+1} should return None (below threshold), got {r!r}'
+
+    storm = results[-1]
+    assert storm is not None, 'Threshold-crossing call should return a storm dict'
+    assert storm['count'] >= _PHANTOM_CITATION_DROP_STORM_THRESHOLD, (
+        f'Expected count>=_PHANTOM_CITATION_DROP_STORM_THRESHOLD, got {storm["count"]}'
+    )
+    assert storm['window_seconds'] == _PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS, (
+        f'Expected window_seconds=={_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS}, '
+        f'got {storm["window_seconds"]}'
+    )
+    assert storm['projects'] == sorted(set(projects)), (
+        f'Expected sorted distinct project labels, got {storm["projects"]}'
+    )
+
+    # ── Phase 2: no re-fire in the same window ───────────────────────────────
+
+    n = _PHANTOM_CITATION_DROP_STORM_THRESHOLD
+    r_next = harness._record_phantom_citation_finding_drop(
+        'reify', now=base + timedelta(seconds=n),
+    )
+    r_next2 = harness._record_phantom_citation_finding_drop(
+        'reify', now=base + timedelta(seconds=n + 1),
+    )
+    assert r_next is None, f'Same-window call should return None (already fired), got {r_next!r}'
+    assert r_next2 is None, (
+        f'Same-window call should return None (already fired), got {r_next2!r}'
+    )
+
+    # ── Phase 3: re-fire after a full window (sustained storm) ───────────────
+
+    future_base = base + timedelta(seconds=_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS * 2)
+    results3 = [
+        harness._record_phantom_citation_finding_drop(proj, now=future_base + timedelta(seconds=i))
+        for i, proj in enumerate(projects)
+    ]
+
+    for i, r in enumerate(results3[:-1]):
+        assert r is None, (
+            f'Phase-3 call {i+1} should return None (new window builds up), got {r!r}'
+        )
+
+    storm3 = results3[-1]
+    assert storm3 is not None, (
+        'Phase-3 threshold-crossing call should return a storm dict (new window re-fires)'
+    )
+    assert storm3['count'] >= _PHANTOM_CITATION_DROP_STORM_THRESHOLD
+
+
+def test_phantom_citation_storm_alarm_folds_to_single_pending_escalation(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+):
+    """Two storm alarm submissions with the SAME stable finding identity must fold
+    to a SINGLE pending escalation (dedup via _RECON_DEDUP_CONFIG).
+
+    Direct mirror of test_dead_owner_storm_alarm_folds_to_single_pending_escalation,
+    applied to the new recon_remediation_phantom_citation_storm category (task 4781).
+    Simulates two consecutive storm windows firing different summaries/run_ids
+    but the same _PHANTOM_CITATION_DROP_STORM_FINDING.  The expected fingerprint is
+    compute_content_fingerprint('recon_remediation_phantom_citation_storm',
+        'recon_remediation_phantom_citation_storm',
+        ['remediation_phantom_citation_drop_storm'],
+        'actionable findings dropped from remediation after phantom-citation '
+        'verification stripped every citation').
+
+    RED:  'recon_remediation_phantom_citation_storm' not yet in
+          infra_dedupe_categories → submit_or_dedupe treats it like an
+          un-tracked category and creates two separate pending escalations.
+    GREEN (step-8): adding it to infra_dedupe_categories folds them to one.
+
+    Also asserts the storm escalation's severity is 'blocking' (new category
+    not in the info-category list in _escalate, so it maps to 'blocking').
+    """
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _PHANTOM_CITATION_DROP_STORM_FINDING
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Compute the expected fingerprint from the STABLE finding identity
+    expected_fp = compute_content_fingerprint(
+        'recon_remediation_phantom_citation_storm',
+        _PHANTOM_CITATION_DROP_STORM_FINDING['category'],
+        list(_PHANTOM_CITATION_DROP_STORM_FINDING['affected_ids']),
+        _PHANTOM_CITATION_DROP_STORM_FINDING['description'],
+    )
+
+    # First storm window
+    harness._escalate(
+        'recon_remediation_phantom_citation_storm',
+        'run-aaaa1111',
+        'phantom-cited finding drop storm: 5 in 60 min (projects: project-a) — '
+        'actionable findings are reaching remediation with every citation stripped '
+        'by phantom-citation verification',
+        detail='detail-a',
+        finding=_PHANTOM_CITATION_DROP_STORM_FINDING,
+    )
+
+    # Second storm window — different summary/run_id, same finding identity
+    harness._escalate(
+        'recon_remediation_phantom_citation_storm',
+        'run-bbbb2222',
+        'phantom-cited finding drop storm: 8 in 60 min (projects: project-a, project-b) — '
+        'actionable findings are reaching remediation with every citation stripped '
+        'by phantom-citation verification',
+        detail='detail-b',
+        finding=_PHANTOM_CITATION_DROP_STORM_FINDING,
+    )
+
+    # Exactly one pending escalation carrying the stable fingerprint
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == expected_fp]
+    assert len(pending_with_fp) == 1, (
+        f'Expected exactly one pending storm escalation (dedup fold); '
+        f'got {len(pending_with_fp)}: {pending_with_fp}'
+    )
+
+    # The storm escalation must be blocking (new category not in info list)
+    assert pending_with_fp[0].severity == 'blocking', (
+        f'Storm alarm must be blocking; got {pending_with_fp[0].severity!r}'
+    )
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 

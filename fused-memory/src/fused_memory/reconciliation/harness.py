@@ -152,6 +152,12 @@ _RECON_DEDUP_CONFIG = (
             # _record_placeholder_finding_drop).  Same fold rationale as
             # recon_watchdog_kill_storm above.
             'recon_remediation_placeholder_storm',
+            # Task 4781: aggregate storm alarm for actionable findings dropped
+            # from remediation after phantom-citation verification stripped
+            # every citation (see _PHANTOM_CITATION_DROP_STORM_FINDING /
+            # _record_phantom_citation_finding_drop).  Same fold rationale as
+            # the two storm categories above it.
+            'recon_remediation_phantom_citation_storm',
             # Task 2278: stable per-project finding identity (build_stale_snapshot_finding)
             # so a sustained task_count_snapshot cadence gap folds into a single pending
             # escalation per project instead of firing once per cycle.
@@ -241,8 +247,13 @@ _MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
 _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 
 # Task 1970 amendment (reviewer_comprehensive): coarse safety net for a
-# runaway Stage 3 that stops citing anything.  Each individual referenceless-
-# finding drop in _maybe_remediate is only logged
+# runaway Stage 3 that stops citing anything — i.e. a finding that was NEVER
+# cited at all.  Task 4781 gave the other referenceless cause (a finding that
+# WAS cited but had every citation phantom-stripped by
+# citation_verifier.py::verify_cited_memories) its own sibling counter,
+# _PHANTOM_CITATION_DROP_STORM_THRESHOLD below, so this one now covers only
+# never-cited drops.  Each individual never-cited-finding drop in
+# _maybe_remediate is only logged
 # (reconciliation.remediation_dropped_placeholder_finding) and, being noise
 # rather than a human-actionable integrity issue, is deliberately never
 # escalated on its own — see _maybe_remediate.  That means a systemic Stage 3
@@ -277,6 +288,26 @@ _PLACEHOLDER_DROP_STORM_FINDING: dict[str, Any] = {
     'description': (
         'Stage 3 is repeatedly filing actionable findings with no '
         'task/entity/edge/memory citation'
+    ),
+}
+
+# Task 4781: sibling rolling-window counter for actionable findings dropped
+# from remediation because phantom-citation verification
+# (citation_verifier.py::verify_cited_memories) stripped every citation —
+# NOT because the stage never cited anything (that is the counter above).
+# Same knob values and the same stable-identity/fold rationale as the
+# placeholder pair, deliberately kept parallel so an operator reads the two
+# alarms side by side; all variable data (count, window, projects) lives
+# only in summary/detail, never in these constants, so submit_or_dedupe
+# folds repeat windows into one pending escalation.
+_PHANTOM_CITATION_DROP_STORM_THRESHOLD = 5
+_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
+_PHANTOM_CITATION_DROP_STORM_FINDING: dict[str, Any] = {
+    'category': 'recon_remediation_phantom_citation_storm',
+    'affected_ids': ['remediation_phantom_citation_drop_storm'],
+    'description': (
+        'actionable findings dropped from remediation after phantom-citation '
+        'verification stripped every citation'
     ),
 }
 
@@ -335,8 +366,45 @@ def _finding_has_reference(finding: dict) -> bool:
 
     Task 1970: used by ``_maybe_remediate`` to drop referenceless actionable
     findings before they reach the production remediation batch.
+
+    Task 4781: "never followed up with a cite_* call" is not the only way a
+    finding ends up referenceless.  Since task 2979 hoisted
+    ``citation_verifier.py::verify_cited_memories`` into
+    ``stages/base.py::BaseStage.run``, a finding that WAS cited can also land
+    here if every citation was later phantom-stripped — which is why
+    ``_maybe_remediate`` consults ``_finding_has_citation_failures`` before
+    attributing a drop to either cause.
     """
     return bool(_derive_affected_ids(finding))
+
+
+def _finding_has_citation_failures(finding: dict) -> bool:
+    """Return True iff *finding* carries a ``citation_failures`` marker.
+
+    ``fused_memory/reconciliation/citation_verifier.py::verify_cited_memories``
+    is the sole writer of ``citation_failures`` (called from every stage via
+    ``stages/base.py::BaseStage.run``), and it only ever inspects a finding
+    that ALREADY had a ``cited_memories`` entry to check. So a truthy
+    ``citation_failures`` is positive evidence that the stage DID call a
+    ``cite_*`` follow-up — the opposite of what ``_finding_has_reference``
+    screens for, which is a finding that never cited anything at all.
+
+    Both marker reasons route here: ``memory_not_found`` (the citation is
+    DROPPED from ``cited_memories``) and ``verification_error`` (the citation
+    is KEPT, verification just couldn't confirm it). Neither reason changes
+    what a marker proves — verification touched this finding's citations —
+    so this predicate does not filter on ``reason``.
+
+    Plain truthiness is deliberate: a malformed non-list value (or any other
+    truthy junk) fails SAFE by routing to the phantom-cited branch, i.e. AWAY
+    from the never-cited-placeholder storm alarm, rather than being
+    mis-counted as evidence of a stage that stopped citing.
+
+    Task 4781: used by ``_maybe_remediate`` alongside ``_finding_has_reference``
+    to tell a phantom-cited drop (evidence evaporated after citing) apart from
+    a never-cited placeholder drop (never cited in the first place).
+    """
+    return bool(finding.get('citation_failures'))
 
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -685,6 +753,17 @@ class ReconciliationHarness:
         # in-process-lifetime caveat and rate-limited single-fire semantics as
         # the dead-owner suppression counter above.
         self._placeholder_drop_storm = StormCounter()
+
+        # Task 4781: sibling rolling-window counter for actionable findings
+        # dropped from remediation because phantom-citation verification
+        # stripped every citation (see _record_phantom_citation_finding_drop /
+        # _maybe_remediate).  Deliberately a SEPARATE StormCounter instance
+        # from _placeholder_drop_storm above — the two drop causes must never
+        # share a window, or a phantom-citation outage could push the
+        # never-cited-placeholder alarm over threshold (or vice versa) and
+        # misattribute the cause.  Same in-process-lifetime caveat and
+        # rate-limited single-fire semantics.
+        self._phantom_citation_drop_storm = StormCounter()
 
         # Task σ / 2717: rolling-window per-event counter of unresumable/failed
         # interrupted-run resume attempts (config-driven
@@ -2327,7 +2406,7 @@ class ReconciliationHarness:
     def _record_placeholder_finding_drop(
         self, project_id: str, *, now: datetime | None = None
     ) -> dict | None:
-        """Record one dropped referenceless-finding event and check for a storm.
+        """Record one dropped never-cited-finding event and check for a storm.
 
         Applied to reconciliation.remediation_dropped_placeholder_finding events
         instead of the dead_owner_shielded suppressions
@@ -2335,6 +2414,15 @@ class ReconciliationHarness:
         module constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
         _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS rather than ReconciliationConfig
         fields, since this counter is private to this module.
+
+        Task 4781: covers only findings _maybe_remediate classified as never
+        cited at all (``_finding_has_citation_failures`` is False).  A finding
+        that WAS cited but had every citation phantom-stripped by
+        ``citation_verifier.py::verify_cited_memories`` (a truthy
+        ``citation_failures`` marker) is routed to
+        :meth:`_record_phantom_citation_finding_drop` instead — a marker
+        proves the stage DID call cite_*, so counting it here would
+        misattribute an evidence-loss event as "Stage 3 stopped citing".
 
         The rolling-window mechanics — append, prune to the window, count,
         compare to the threshold, rate-limit to one fire per window, and report
@@ -2352,6 +2440,44 @@ class ReconciliationHarness:
             self._placeholder_drop_storm,
             threshold=_PLACEHOLDER_DROP_STORM_THRESHOLD,
             window_seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+            project_id=project_id,
+            now=now,
+        )
+
+    # ── Phantom-citation drop storm counter (task 4781) ─────────────────
+
+    def _record_phantom_citation_finding_drop(
+        self, project_id: str, *, now: datetime | None = None
+    ) -> dict | None:
+        """Record one dropped phantom-cited-finding event and check for a storm.
+
+        The complement of :meth:`_record_placeholder_finding_drop`: applied to
+        ``reconciliation.remediation_dropped_phantom_cited_finding`` events —
+        actionable findings dropped because
+        ``citation_verifier.py::verify_cited_memories`` stripped every citation
+        (the cited mem0 id(s) no longer resolve), NOT because the stage never
+        cited anything.  Thresholds are the plain module constants
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD /
+        _PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS, for the same
+        private-to-this-module reason as the placeholder counter's.
+
+        The rolling-window mechanics live in ``shared.storm_counter.StormCounter``
+        (INV-5); this method only supplies the knobs and the event, via the same
+        :meth:`_storm_summary` adapter the placeholder counter uses — but against
+        its OWN counter instance (``self._phantom_citation_drop_storm``), so a
+        phantom-citation outage and a never-cited-placeholder regression are
+        counted, thresholded, and alarmed independently.  Returns None below
+        the threshold and None when the alarm already fired within this
+        window, otherwise a storm summary dict with 'count', 'window_seconds',
+        and 'projects' (sorted distinct project labels seen in the window).
+
+        The now= parameter follows the same time-injection convention as
+        _record_placeholder_finding_drop, for deterministic unit tests.
+        """
+        return self._storm_summary(
+            self._phantom_citation_drop_storm,
+            threshold=_PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+            window_seconds=_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS,
             project_id=project_id,
             now=now,
         )
@@ -4685,13 +4811,101 @@ class ReconciliationHarness:
             # the leak.  Fail-open: _finding_has_reference only drops a
             # finding when _derive_affected_ids is clearly empty; anything
             # ambiguous (legacy affected_ids or any typed citation) passes.
+            # Task 4781: split the drop bucket a second way.  Precedence is
+            # deliberate — _finding_has_citation_failures is checked BEFORE
+            # falling back to "never cited", because a citation_failures
+            # marker can only exist on a finding that DID have a citation to
+            # verify (see _finding_has_citation_failures's docstring). A
+            # phantom-cited finding must never be miscounted as evidence that
+            # Stage 3 stopped citing.
             referenceable: list[dict] = []
+            dropped_phantom_cited: list[dict] = []
             dropped_placeholders: list[dict] = []
             for finding in actionable:
                 if _finding_has_reference(finding):
                     referenceable.append(finding)
+                elif _finding_has_citation_failures(finding):
+                    dropped_phantom_cited.append(finding)
                 else:
                     dropped_placeholders.append(finding)
+
+            # Task 4781: a phantom-cited finding is a REAL finding whose
+            # evidence evaporated after Stage 3 cited it (its cited mem0 id(s)
+            # no longer resolve — see citation_verifier.py::verify_cited_memories).
+            # It is still dropped here, same as a never-cited placeholder:
+            # _derive_affected_ids(finding) is empty either way, so a
+            # remediation agent would have no task/entity/edge/memory identity
+            # to investigate, and _escalate's fingerprint would fall back to a
+            # description-only hash that folds unrelated findings together —
+            # exactly the leak _finding_has_reference exists to close. What
+            # changes is attribution: this drop is logged and (step-6) alarmed
+            # under its own name, so it is never misfiled as "Stage 3 stopped
+            # citing findings".
+            #
+            # COVERAGE TRADE-OFF (reviewer_comprehensive, task 4781 amendment):
+            # splitting one counter into two independently-thresholded counters
+            # is NOT coverage-neutral for a MIXED burst. Before this split, both
+            # causes fed one counter at threshold 5, so e.g. 3 never-cited drops
+            # + 3 phantom-cited drops in a window summed to 6 and fired (under
+            # the wrong label) the placeholder storm. Now each cause has its own
+            # threshold-5 counter, so that same 3+3 burst trips NEITHER alarm —
+            # six actionable findings can vanish from remediation in one window
+            # with no escalation at all. Accepted deliberately: correct
+            # attribution was judged more valuable than aggregate-sum
+            # sensitivity to a mixed burst (see this task's plan
+            # design_decisions), and a genuinely sustained single-cause outage
+            # still fires its own alarm at the same threshold as before the
+            # split. test_maybe_remediate_mixed_drop_causes_below_threshold_neither_storm_escalates
+            # (test_harness.py) pins the current, reduced-coverage-on-mixed-
+            # bursts behaviour so a future reader sees it as a decision, not a
+            # bug. If mixed-cause bursts under each per-cause threshold prove to
+            # matter operationally, the fix is a THIRD StormCounter fed by BOTH
+            # loops below, whose escalation names both per-cause counts — not
+            # raising these two thresholds, which would blunt each alarm's own
+            # single-cause sensitivity instead of restoring aggregate coverage.
+            for finding in dropped_phantom_cited:
+                logger.warning(
+                    'reconciliation.remediation_dropped_phantom_cited_finding',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'description': finding.get('description', ''),
+                        'citation_failures': finding.get('citation_failures') or [],
+                    },
+                )
+                # Task 4781: coarse aggregate alarm for a sustained
+                # phantom-citation-verification outage (e.g. mem0/Qdrant
+                # health, a bad bulk-delete) — the sibling of the
+                # placeholder-storm alarm below, but for the OTHER drop
+                # cause. Without this, a real evidence-loss event would push
+                # findings out of every remediation batch with no alarm at
+                # all: an individual drop is logged-only, and a dropped
+                # finding never enters a remediation run, so it can no longer
+                # accumulate toward _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+                # either (same gap the module comment above
+                # _PLACEHOLDER_DROP_STORM_THRESHOLD documents for the other
+                # cause).
+                storm = self._record_phantom_citation_finding_drop(project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or project_id
+                    storm_summary = (
+                        f"phantom-cited finding drop storm: {storm['count']} in "
+                        f'{window_min:.0f} min (projects: {proj_label}) — actionable '
+                        f'findings are reaching remediation with every citation stripped '
+                        f'by phantom-citation verification (cited mem0 ids no longer '
+                        f'resolve); their evidence evaporated — check mem0/Qdrant health '
+                        f'and recent memory deletions'
+                    )
+                    storm_detail = f'project={project_id} parent_run={parent_run_id}'
+                    self._escalate(
+                        'recon_remediation_phantom_citation_storm',
+                        parent_run_id,
+                        storm_summary,
+                        storm_detail,
+                        finding=_PHANTOM_CITATION_DROP_STORM_FINDING,
+                    )
 
             for finding in dropped_placeholders:
                 logger.warning(
