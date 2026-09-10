@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import inspect
 import logging
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -318,12 +317,6 @@ class TestTasksReadRecord:
         ``s=a\x1fb`` vs ``s=b\x1fa``: two entries for one order-insensitive
         SQL ``IN`` list. ``frozenset`` collapses them.
     """
-
-    def test_the_three_records_exist(self):
-        """_OnePage, _CompleteRead and _TasksRead are importable records."""
-        assert dataclasses.is_dataclass(tasks_mod._OnePage)
-        assert dataclasses.is_dataclass(tasks_mod._CompleteRead)
-        assert dataclasses.is_dataclass(tasks_mod._TasksRead)
 
     @pytest.mark.parametrize(
         ('name', 'build'),
@@ -1744,6 +1737,67 @@ class TestFetchTasksPagination:
         )
         assert all(c.get('page_size') == 3 for c in calls), calls
 
+    async def test_a_walk_never_assembles_pages_from_two_servers(
+        self, dummy_client, two_url_config
+    ):
+        """A walk that fails mid-way RESTARTS on the next url; it never resumes.
+
+        `first_success` tries urls IN ORDER, so a walk free to fan out per page
+        would assemble one list from DIFFERENT servers and silently invalidate
+        the grown-`total` coherence check: pages from two states of the world,
+        with every counter still self-consistent. Binding ONE url for the whole
+        walk is what makes that unrepresentable. The two servers here serve
+        DISJOINT id ranges, so a mixed answer is visible rather than plausible —
+        which is the only way this property can be caught after the fact.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        first_url, second_url = two_url_config.fused_memory_urls
+        healthy = [_paged_task_raw(i) for i in range(101, 108)]
+        drops_out = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[tuple[str, dict]] = []
+
+        async def _call(_client, url, tool, args, **_kwargs):
+            assert tool == 'get_tasks', tool
+            calls.append((url, dict(args)))
+            if url == first_url and args.get('offset', 0) >= 3:
+                return {'error': 'this server drops out after one page'}
+            source = drops_out if url == first_url else healthy
+            offset, page_size = args.get('offset', 0), args['page_size']
+            page = source[offset:offset + page_size]
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(source),
+                    'offset': offset,
+                    'page_size': page_size,
+                    'returned': len(page),
+                    'has_more': offset + len(page) < len(source),
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_call),
+        ):
+            result = await fetch_tasks(
+                dummy_client, two_url_config, '/proj/split-brain', chunk_size=3,
+            )
+
+        assert isinstance(result, list)
+        first_offsets = [args['offset'] for url, args in calls if url == first_url]
+        assert first_offsets == [0, 3], (
+            'the scenario requires the first url to serve one page and THEN '
+            f'fail mid-walk; got {first_offsets!r}'
+        )
+        assert [t['id'] for t in result] == list(range(101, 108)), (
+            f'one server must serve the WHOLE walk; got a mixture: {result!r}'
+        )
+        second_offsets = [args['offset'] for url, args in calls if url == second_url]
+        assert second_offsets[0] == 0, (
+            'the surviving url restarts the walk rather than resuming it at the '
+            f'offset the first one died on; got {second_offsets!r}'
+        )
+
     async def test_default_call_is_byte_identical_to_today(
         self, dummy_client, dummy_config,
     ):
@@ -2520,22 +2574,6 @@ class TestWalkPages:
 
     # ---- (e) the PINNED-URL constraint, asserted structurally -------------
 
-    def test_walk_pages_cannot_fan_out(self):
-        """`_walk_pages` accepts no url/urls/config parameter.
-
-        Load-bearing, not style: `first_success` tries urls IN ORDER, so a walk
-        that could fan out mid-walk would assemble pages from DIFFERENT servers
-        and silently invalidate the grown-`total` coherence check — the pages
-        would be from different states of two different worlds while every
-        counter still looked self-consistent. A structural pin is what stops a
-        later edit reintroducing that quietly; a behavioural test cannot, since
-        the bug only shows up with two disagreeing servers.
-        """
-        params = set(inspect.signature(tasks_mod._walk_pages).parameters)
-        assert not (params & {'url', 'urls', 'config', 'client'}), (
-            'the walk must be bound to ONE already-pinned url by its caller'
-        )
-
     # ---- (c) the two COMPLETE cases: a true zero, not a truncation --------
 
     async def test_an_empty_tree_returns_empty_rather_than_raising(self):
@@ -2741,9 +2779,6 @@ class TestPublicReadContracts:
         tasks_mod._fetch_tasks_cache_clear()
 
     # -- (a) the partial read announces itself -----------------------------
-
-    def test_fetch_task_page_exists_and_is_a_coroutine_function(self):
-        assert inspect.iscoroutinefunction(tasks_mod.fetch_task_page)
 
     @pytest.mark.parametrize('omitted', ['page_size', 'offset'])
     async def test_page_size_and_offset_are_both_required(
