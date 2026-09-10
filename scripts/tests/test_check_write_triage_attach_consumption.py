@@ -118,6 +118,15 @@ _UNVERIFIABLE_VARIANTS = (
 #: followed the designation" from "the attach used the band's winner" — so the
 #: NOT-CONSUMED report has to name it for an operator to read the finding.
 _BAND_CANONICAL = 'parent-1'
+#: The slate's evidence child: the top-scoring candidate, and the one
+#: `_canonical_id_of` hoists to `_BAND_CANONICAL`. It is on the slate (that is
+#: what makes the band's canonical an id nobody carries) but it may never be
+#: DESIGNATED, because a correct remedy is obliged to hoist it.
+_EVIDENCE_CHILD = 'child-1'
+#: The report line that names the pair the swap was driven with. Scoped to that
+#: line rather than to the whole report: the slate line names the child too, and
+#: legitimately so.
+_DESIGNATED_PAIR = 'the judge designated'
 
 
 def _run_probe(src_root: Path, *, extra_paths: tuple[Path, ...] = ()):
@@ -248,6 +257,56 @@ class TestConsumptionProbe:
         assert _PASS not in proc.stdout, proc.stdout
         assert _FAIL_OPEN in proc.stdout, proc.stdout
         assert _ONE_FAIL_OPEN in proc.stdout, proc.stdout
+
+    def test_a_remedy_that_hoists_the_designation_is_not_false_failed(
+        self, tmp_path,
+    ):
+        """A correct option-(a) fix HOISTS, and must not be told to stop.
+
+        ``_canonical_id_of``'s own contract makes the hoist mandatory:
+        attaching to a child creates a grandchild that can never fold under the
+        true canonical, which reads as content loss. So a remedy that threads
+        the designation still has to hoist a designated CHILD to its parent —
+        and a probe demanding literal equality FAILs it with "did not track the
+        designated candidate", actively instructing the implementer to delete
+        the hoist. That is this gate family's false-FAIL class pointed at a real
+        content-loss defect, which is worse than the defect item 5 detects.
+
+        The two controls stay pinned by their own tests, and both must survive
+        the fix: `test_a_hardcoded_attach_position_is_not_consumption` (the
+        positional bug still FAILs) and
+        `test_the_tracking_requirement_does_not_fail_a_correct_fix` (a
+        non-hoisting remedy still PASSes — item 5 asserts CONSUMPTION, and must
+        not start policing the hoist as a second invariant).
+        """
+        src_root = write_fake_triage(
+            tmp_path / 'src', variant='consumes_designated_and_hoists',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS in proc.stdout, proc.stdout
+        assert _CHANNEL in proc.stdout, proc.stdout
+
+    def test_the_designated_pair_never_names_the_evidence_child(self, tmp_path):
+        """The swap designates only candidates that are their OWN canonical id.
+
+        This is the mechanism behind the test above, asserted where an operator
+        reads it. Designating the child asks a correct remedy for two
+        contradictory things at once — honour the designation, and hoist it —
+        so the pool has to exclude it. The child stays ON the slate: it is the
+        band's max-cosine winner, and its hoist is what makes the band canonical
+        an id no candidate carries.
+        """
+        src_root = write_fake_triage(tmp_path / 'src', variant='band_top1')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _EVIDENCE_CHILD in proc.stdout, proc.stdout
+        named = [
+            line for line in proc.stdout.splitlines() if _DESIGNATED_PAIR in line
+        ]
+        assert named, proc.stdout
+        for line in named:
+            assert _EVIDENCE_CHILD not in line, proc.stdout
 
     def test_an_honoured_announcement_satisfies_item_5(self, tmp_path):
         """The option-(b)-shaped remedy, and why item 5 may not require the swap.

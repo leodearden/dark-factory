@@ -469,6 +469,34 @@ triage_write = _make_designating_triage_write(_decode)
 '''
 
 
+#: A CORRECT option-(a) remedy — and the one shape a naive "the attach id
+#: equals the designated id" test false-FAILs. ``_canonical_id_of``'s own
+#: contract makes the hoist MANDATORY: attaching to a child would create a
+#: grandchild that can never fold under the true canonical, which reads as
+#: content loss. So a remedy that threads the designation must still hoist a
+#: designated CHILD to its parent before attaching, and a probe that demanded
+#: literal equality would tell its implementer to delete that hoist.
+_CONSUMES_AND_HOISTS = r'''
+
+def _decode(verdict):
+    """(outcome, candidate_id)."""
+    if isinstance(verdict, tuple) and len(verdict) == 2:
+        return verdict
+    return None
+
+
+def _attach_hoisted(candidate_id, candidates, decision):
+    """Honour the designation, then hoist it as _canonical_id_of mandates."""
+    for candidate in candidates or ():
+        if getattr(candidate, 'id', None) == candidate_id:
+            return _canonical_id_of(candidate)
+    return decision.canonical_id
+
+
+triage_write = _make_designating_triage_write(_decode, _attach_hoisted)
+'''
+
+
 #: The POSITIONAL BUG, relocated to the consumption side. It decodes the
 #: designation perfectly happily and then attaches to a fixed slot, so its
 #: attach id is neither the band's canonical nor anything the judge said. A
@@ -651,6 +679,7 @@ VARIANT_TAILS: dict[str, str] = {
     'consumes_designated_id': _CONSUMES_TUPLE,
     'consumes_designated_dict': _CONSUMES_DICT,
     'consumes_designated_object': _CONSUMES_OBJECT,
+    'consumes_designated_and_hoists': _CONSUMES_AND_HOISTS,
     'hardcodes_last_candidate': _HARDCODES_LAST,
     'fail_opens_on_designation': _FAIL_OPENS_ON_DESIGNATION,
     'announces_attach_target': _ANNOUNCES_TARGET,
