@@ -154,6 +154,7 @@ class TaskDbProblem(Enum):
     """
 
     ABSENT = "absent"
+    EMPTY_STUB = "empty_stub"
 
 
 _REFUSAL_REMEDY = {
@@ -162,6 +163,13 @@ _REFUSAL_REMEDY = {
         ".taskmaster/tasks/tasks.db; .taskmaster/ is not tracked in git, so it "
         "never exists inside a worktree. `git worktree list --porcelain` names "
         "the main checkout on its first line."
+    ),
+    TaskDbProblem.EMPTY_STUB: (
+        "0 bytes — an empty stub, not a task store. Opening it read-only would "
+        "succeed and then answer `no such table: tasks`. Two things produce "
+        "one: the decoy .taskmaster/tasks.db that sits one directory ABOVE the "
+        "live .taskmaster/tasks/tasks.db, and a read-write sqlite3.connect of a "
+        "path that did not exist."
     ),
 }
 
@@ -194,6 +202,8 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     resolved = Path(path).resolve()
     if not resolved.exists():
         raise TaskDbUnreadable(resolved, TaskDbProblem.ABSENT)
+    if resolved.stat().st_size == 0:
+        raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
     raise NotImplementedError("the read-only open itself is not wired up yet")
 
 
