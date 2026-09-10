@@ -59,6 +59,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+import pytest
+
 from _task_db_scan import (
     _DEFAULT_PROJECT_ROOTS,
     AUDIT_EXIT_FINDINGS,
@@ -67,7 +69,10 @@ from _task_db_scan import (
     AUDIT_EXIT_OK,
     NO_DB_RESOLVED_MESSAGE,
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
+    TaskDbProblem,
+    TaskDbUnreadable,
     add_db_discovery_args,
+    connect_ro,
     discover_db_paths,
     discover_project_roots,
     format_coverage_block,
@@ -97,6 +102,59 @@ def test_tasks_db_path_returns_a_path_not_a_str(tmp_path):
     """audit_wiped_metadata_files.py's public spelling returns Path, and its
     internal call sites (e.g. audit_project) depend on Path methods."""
     assert isinstance(tasks_db_path(str(tmp_path)), Path)
+
+
+# ---------------------------------------------------------------------------
+# connect_ro(path) -> sqlite3.Connection (task 5330)
+#
+# Tier 1 already owned the PATH; this is the missing "...and open it" half.
+# The contract under test is REFUSAL: a forensic reader who points at the
+# wrong file must be told which mistake they made, not handed a connection
+# whose first query answers `no such table: tasks`.
+# ---------------------------------------------------------------------------
+
+def test_connect_ro_refuses_a_path_that_does_not_exist(tmp_path):
+    absent = tmp_path / "absent" / "tasks.db"
+
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro(absent)
+
+    assert excinfo.value.reason is TaskDbProblem.ABSENT
+    assert excinfo.value.path == absent.resolve()
+
+
+def test_connect_ro_refusal_names_the_path_in_its_message(tmp_path):
+    """A reason a caller can branch on AND prose a human can act on.
+
+    The discriminator is the FIELD asserted above, never a substring of this
+    message — tests and callers that match on prose are an ad-hoc parser
+    (heuristic 12) and pin wording that is free to improve.
+    """
+    absent = tmp_path / "absent" / "tasks.db"
+
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro(absent)
+
+    assert str(excinfo.value.path) in str(excinfo.value)
+
+
+def test_connect_ro_does_not_create_the_database_it_refuses(tmp_path):
+    """The load-bearing one: refusing must not leave a store behind.
+
+    A read-WRITE ``sqlite3.connect`` on a path that does not exist silently
+    CREATES an empty database — which is how a worktree-relative guess turns
+    into a real 0-byte file whose every query then answers `no such table:
+    tasks`. That error is recorded four times in the confusion codebook, and
+    every one of them reads as "the store is empty" rather than "you are
+    looking in the wrong place".
+    """
+    absent = tmp_path / "absent" / "tasks.db"
+
+    with pytest.raises(TaskDbUnreadable):
+        connect_ro(absent)
+
+    assert not absent.exists()
+    assert not absent.parent.exists()
 
 
 # ---------------------------------------------------------------------------
