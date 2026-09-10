@@ -961,6 +961,51 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
             # of its own, so the per-line allow-list check below would
             # never see it — veto here instead of silently masking it.
             return False
+        # THIRD ACCEPTED LIMITATION, beside the two on _XDIST_SESSION_ABORTED_RE
+        # (esc-5082-3). The `node_id in crash_attributed` membership below is
+        # EXACT while its sibling clause `_is_known_load_flake_nodeid` is
+        # prefix-TOLERANT (`(?:^|/)`). That asymmetry is deliberate, not an
+        # oversight, and the tempting repair is unsound -- read on before
+        # "fixing" it.
+        #
+        # THE SKEW. `_pytest/config/__init__.py::Config.cwd_relative_nodeid`
+        # rewrites a nodeid from rootdir-relative to invocation-dir-relative,
+        # but ONLY `if invocation_params.dir != rootpath`. The FAILED
+        # short-summary line goes through it (`terminal.py::
+        # _get_node_id_with_markup`); xdist's crash notice carries the raw
+        # rootdir-relative nodeid untouched. So the two forms diverge -- and
+        # this clause silently no-ops -- exactly when pytest is handed path
+        # arguments from a cwd ABOVE the inifile dir, e.g. `pytest
+        # orchestrator/tests` run from the repo root.
+        #
+        # NO SERVED TARGET IS AFFECTED TODAY (steward, 2026-09-10, measured
+        # across every registered config on this host, not inferred): the 7
+        # module-scoped test_commands all `uv run --directory <module>`, so
+        # cwd == rootdir; `scripts/orchestrator.yaml` is the one config that
+        # passes path args from the repo root under a bare `--project`, and it
+        # is safe only because tests/scripts/ carries no inifile of its own, so
+        # rootdir resolves back to the repo root (measured, not assumed -- that
+        # is a latent coupling: adding an inifile under tests/scripts/ would
+        # make this clause go silent there). Of the other projects verify.py
+        # serves, reify is Cargo (no pytest at all) and the rest invoke pytest
+        # from their own root. Failure direction is fail-safe regardless: a
+        # miss returns False, i.e. pre-task behaviour -- the run routes to the
+        # debugger instead of the bounded infra retry. A missed improvement,
+        # never a masked failure.
+        #
+        # WHY NOT JUST SUFFIX-ANCHOR IT, as esc-5082-3 proposed. Because
+        # module-relative nodeids are NOT unique across this repo's suites, so
+        # a suffix match can bind a crash notice to a DIFFERENT test's genuine
+        # FAILED line and return True -- masking a real failure, the one thing
+        # this predicate must never do. Measured: `tests/test_config.py::
+        # test_defaults` exists in more than one module suite, as do
+        # test_full_yaml_override, test_overrides_accepted,
+        # test_not_in_reloadable_fields, test_disabled_returns_empty, and 5+
+        # more in test_harness.py. Note the two conditions co-occur rather than
+        # exclude each other: the invocation shape that CREATES the skew (path
+        # args from a parent dir) is also the natural way to name several
+        # module suites in ONE session. Any real repair must NORMALIZE both
+        # sides onto a common root, not merely relax the comparison.
         crash_attributed = _crash_attributed_nodeids(output)
         for line in failed_lines:
             match = _FAILED_LINE_NODEID_RE.match(line)
