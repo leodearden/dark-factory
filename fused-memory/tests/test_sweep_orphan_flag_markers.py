@@ -2741,11 +2741,20 @@ class TestUnsatisfiableGateIsChecked:
         assert len(errors) == 1, f'Expected exactly one ERROR, got: {errors!r}'
         message = errors[0]
         assert 'u1' in message, f'Expected the floor member named: {message!r}'
-        assert '--max-backlog' in message
-        # The floor (1) and the ceiling (0) are both named, and the message
-        # says plainly that re-running is futile. Assert on tokens, not prose.
-        assert '1' in message and '0' in message
-        assert 'never' in message.lower(), f'Expected a "can never pass": {message!r}'
+        # The floor and the ceiling are asserted IN CONTEXT. A bare
+        # `'1' in message and '0' in message` passed incidentally — the '1'
+        # from the fixture id 'u1' (already asserted above) and the '0' from
+        # the ceiling, which is formatted in regardless of the computed
+        # floor, so a floor that regressed to 0 still passed. Prose is not
+        # pinned: rewording the futility clause must not break a green test.
+        assert '--max-backlog 0 is' in message, (
+            f'Expected the evaluated ceiling named: {message!r}'
+        )
+        assert 'at least 1' in message, (
+            f'Expected the computed floor named: {message!r}'
+        )
+        for remedy in ('--delete-ids', '--terminal-drain', 'delete_memory'):
+            assert remedy in message, f'Expected {remedy} named: {message!r}'
 
     @pytest.mark.asyncio
     async def test_no_check_logs_no_error_but_still_reports_the_fact(self, caplog):
@@ -2778,6 +2787,112 @@ class TestUnsatisfiableGateIsChecked:
 
         assert report['structural_floor']['gate_unsatisfiable'] is False
         assert self._errors(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_gate_evaluated_separates_a_real_verdict_from_a_hypothetical(self):
+        """gate_unsatisfiable is computed unconditionally, so on its own it
+        cannot be read: the nightly --apply --terminal-drain service
+        publishes `true` for a gate it never runs. gate_evaluated is the
+        discriminator, as cross_check.probe_failed is for blind_spot."""
+        members = [self._undated('u1')]
+
+        evaluated = await _mod.run(
+            self._args(max_backlog=0, check=True),
+            self._service(members, apply=False), now=self._NEUTRAL_NOW,
+        )
+        hypothetical = await _mod.run(
+            self._args(max_backlog=0, check=False),
+            self._service(members, apply=False), now=self._NEUTRAL_NOW,
+        )
+
+        assert evaluated['structural_floor']['gate_unsatisfiable'] is True
+        assert hypothetical['structural_floor']['gate_unsatisfiable'] is True, (
+            'The field itself does not discriminate — that is the point'
+        )
+        assert evaluated['structural_floor']['gate_evaluated'] is True
+        assert hypothetical['structural_floor']['gate_evaluated'] is False, (
+            'A gate that never ran must not read as an evaluated verdict'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_error_does_not_present_the_floor_as_a_sufficient_ceiling(
+        self, caplog,
+    ):
+        """Raising --max-backlog to the floor is NECESSARY, not sufficient.
+
+        _resolve_check_exit_code falls back to before.total_source whenever
+        no 'after' key is present — every dry-run --check, which is exactly
+        the shape scripts/fused-memory-flag-marker-check.sh hardcodes. So a
+        10-member population with a floor of 1 STILL exits 1 at
+        --max-backlog 1, and the one message whose purpose is to stop
+        operators mis-tuning that ceiling must not imply otherwise.
+        """
+        members = [self._undated('u1')] + [_member(f'live{i}') for i in range(9)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        floor = report['structural_floor']['undrainable_count']
+        residual = report['before']['total_source']
+        assert (floor, residual) == (1, 10), 'Fixture drift'
+        # The trap, reproduced: the gate is unsatisfiable, but clearing the
+        # floor does not make this dry run pass.
+        assert _mod._resolve_check_exit_code(report, max_backlog=floor) == 1
+        assert _mod._resolve_check_exit_code(report, max_backlog=residual) == 0
+
+        message = self._errors(caplog)[0]
+        assert 'NECESSARY but NOT sufficient' in message, (
+            f'The floor must not read as a sufficient ceiling: {message!r}'
+        )
+        assert 'before.total_source (10)' in message, (
+            f"The verdict's actual comparand must be named: {message!r}"
+        )
+
+    def test_the_exit_code_ignores_the_structural_floor(self):
+        """The design's central safety claim, pinned as a regression rather
+        than only asserted in prose: the constraint refines the REASON, never
+        the code.
+
+        The obvious follow-up — "make the constraint ENFORCED" by wiring the
+        floor into _resolve_check_exit_code — would otherwise land green.
+        This builds a report by hand precisely because the combination is
+        unreachable from run() (the residual is always >= the floor), which
+        is what makes it a clean probe of what the resolver READS.
+        """
+        report = {
+            'before': {'total_source': 3, 'total_with_kind': 3},
+            'after': {'total_source': 3, 'total_with_kind': 3},
+            'structural_floor': {
+                'undated_kept_count': 0,
+                'undrainable_count': 2,
+                'undrainable_ids': ['m1', 'l1'],
+                'max_backlog': 0,
+                'gate_unsatisfiable': True,
+                'gate_evaluated': True,
+            },
+        }
+        assert _mod.unsatisfiable_backlog_gate(2, 0) is True, 'Fixture drift'
+
+        assert _mod._resolve_check_exit_code(report, max_backlog=3) == 0, (
+            'A satisfiable backlog must still resolve to 0 with an '
+            'unsatisfiable floor in the report'
+        )
+        # Indifferent to the FLOOR specifically, not indifferent in general:
+        # both inputs the resolver does read still move the code.
+        assert _mod._resolve_check_exit_code(report, max_backlog=2) == 1, (
+            'the backlog verdict still decides'
+        )
+        report['cross_check'] = {
+            'source_total': 3, 'flag_for_stage2_total': 61,
+            'blind_spot': True, 'probe_failed': False,
+        }
+        assert _mod._resolve_check_exit_code(report, max_backlog=3) == 1, (
+            'the blind-spot veto still decides'
+        )
 
 
 # ===========================================================================
