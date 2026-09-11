@@ -1,7 +1,12 @@
 # Dark Factory — project-specific orchestrator overrides.
 # Core defaults are in the orchestrator package (defaults.yaml).
 
-max_concurrent_tasks: 48
+# 48 -> 24 (Leo, 2026-09-11, note on esc-codex-mcp-config-3). With
+# verify_admission_task_slots: 1, most of the 48 slots were held by tasks that
+# had finished implementing and sat in verify, measured at 44 of 48, several for
+# 8h+. Each held its dispatch slot while contributing ~1.8 test legs to the
+# single-slot admission queue. Red tier: takes effect at restart.
+max_concurrent_tasks: 24
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
