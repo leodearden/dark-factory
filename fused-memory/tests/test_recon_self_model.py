@@ -71,6 +71,17 @@ class TestVocabularyConstants:
                 f'MCP_CALL_SIGNATURES[{key!r}] must be a non-empty str, got {sig!r}'
             )
 
+    def test_add_finding_contract_names_supersedes(self):
+        """task-4653: the hand-transcribed add_finding contract must name
+        supersedes.
+
+        An agent reading only this self-model would otherwise never learn that
+        a claim can be explicitly retired by a later finding — and the
+        (task_id, flag_type) dedup key it DOES describe cannot relate a claim
+        to its resolution, so it would have no reason to look for one.
+        """
+        assert 'supersedes' in m.MCP_CALL_SIGNATURES['add_finding']
+
 
 # --------------------------------------------------------------------------- #
 # MARKER_LIFECYCLE + consistency with recon_ledger.MARKER_KINDS (step-3/4)

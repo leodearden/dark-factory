@@ -4499,3 +4499,85 @@ class TestDeleteFindingViaFastMCP:
         assert report is not None
         assert report['flagged_items'] == []
 
+
+
+# ---------------------------------------------------------------------------
+# task-4653: the supersedes kwarg must reach the state method through the
+# FastMCP wrapper, and appear on the live tool signature.
+# ---------------------------------------------------------------------------
+
+
+class TestSupersedesViaFastMCP:
+    """The @mcp.tool() add_finding delegate forwards supersedes.
+
+    A kwarg that exists on ReconReportState but not on the wrapper is
+    unreachable by the agents the mechanism is for.
+    """
+
+    def _make(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        mcp = create_recon_report_server(state)
+        return state, mcp
+
+    async def _start_and_file(self, tm, flag_type, supersedes=None):
+        args = {
+            'run_id': 'r1',
+            'severity': 'low',
+            'category': 'cat',
+            'description': f'd {flag_type}',
+            'suggested_action': 'a',
+            'task_id': '42',
+            'flag_type': flag_type,
+        }
+        if supersedes is not None:
+            args['supersedes'] = supersedes
+        return await tm.call_tool('add_finding', args)
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_supersede_via_call_tool(self):
+        state, mcp = self._make()
+        tm = mcp._tool_manager
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 's1', 'project_id': 'dark_factory',
+        })
+
+        old = await self._start_and_file(tm, 'memory_mechanism_contradiction')
+        assert 'finding_id' in old, f'add_finding failed: {old}'
+        new = await self._start_and_file(
+            tm, 'memory_mechanism_contradiction_resolved', supersedes=old['finding_id']
+        )
+        assert 'finding_id' in new, f'supersede through the tool layer failed: {new}'
+
+        _e, target = state._resolve_finding('r1', old['finding_id'])
+        assert target.superseded_by == new['finding_id']
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_supersedes_returns_the_error_dict_through_the_tool(self):
+        state, mcp = self._make()
+        tm = mcp._tool_manager
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 's1', 'project_id': 'dark_factory',
+        })
+
+        result = await self._start_and_file(
+            tm, 'f', supersedes='11111111-2222-3333-4444-555555555555'
+        )
+        assert result == {'error': 'finding_unknown', 'error_type': 'ReconReportFindingUnknown'}
+        assert state.get_assembled_report('r1', 's1')['flagged_items'] == []
+
+    def test_live_signature_exposes_supersedes_as_optional(self):
+        from fused_memory.server.recon_report import get_recon_report_tool_signatures
+
+        params = get_recon_report_tool_signatures()['add_finding'].parameters
+        assert 'supersedes' in params, (
+            'supersedes is missing from the live add_finding signature — the '
+            'generated tool guidance is built from this, so agents would never '
+            'see the parameter.'
+        )
+        assert params['supersedes'].default is None, (
+            'supersedes must be optional with a None default; every existing '
+            'add_finding caller omits it.'
+        )
