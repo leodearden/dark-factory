@@ -34,16 +34,23 @@ is impossible at the git level even if the pre-flight is refactored away).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
+from orchestrator import git_ops as git_ops_module
 from orchestrator import rebase_recovery
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
 
 # ---------------------------------------------------------------------------
 # Real-git fixture scaffolding
@@ -658,3 +665,164 @@ class TestPreflightEndToEnd:
         assert result.verdict == 'clean'
         assert (repo / '.git' / 'MERGE_RR').read_bytes() == original
         assert list((repo / '.git').glob('MERGE_RR.quarantined-*')) == []
+
+
+# ---------------------------------------------------------------------------
+# git_ops wiring
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _git_command_spy():
+    """Record every command vector git_ops issues, delegating to the real ``_run``.
+
+    The ``_run`` seam is the only place a command vector is observable without
+    asserting on a rendered string, which is what lets these cases assert on
+    STRUCTURE — token order and membership — rather than on a formatted line
+    that a harmless reflow would break.
+    """
+    original_run = git_ops_module._run
+    recorded: list[list[str]] = []
+
+    async def recording_run(cmd, cwd=None, **kwargs):
+        recorded.append(list(cmd))
+        return await original_run(cmd, cwd=cwd, **kwargs)
+
+    with patch('orchestrator.git_ops._run', side_effect=recording_run):
+        yield recorded
+
+
+def _abort_vectors(recorded) -> list[list[str]]:
+    return [cmd for cmd in recorded if '--abort' in cmd]
+
+
+def _make_git_ops(repo: Path):
+    config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(config, repo)
+
+
+@pytest.mark.asyncio
+class TestGitOpsGuardedAbort:
+    """Every abort git_ops issues on a recovery path carries the guard."""
+
+    async def test_guarded_abort_recovers_a_dangling_mid_rebase_worktree(
+        self, tmp_path: Path,
+    ) -> None:
+        """The behavioural arm: real repo, real dangling ref, real recovery."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        rc, _, err = await git_ops_module._guarded_abort('rebase', repo)
+
+        assert rc == 0, err
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        backups = list((repo / '.git').glob('MERGE_RR.quarantined-*'))
+        assert len(backups) == 1
+        assert conflict_id.encode() in backups[0].read_bytes()
+
+    async def test_guarded_abort_emits_the_rerere_disabling_prefix(
+        self, tmp_path: Path,
+    ) -> None:
+        """Asserted by token ORDER, never by matching a rendered command line."""
+        repo, _ = build_mid_rebase_repo(tmp_path)
+
+        with _git_command_spy() as recorded:
+            await git_ops_module._guarded_abort('rebase', repo)
+
+        vectors = _abort_vectors(recorded)
+        assert len(vectors) == 1
+        assert vectors[0] == [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']
+        assert vectors[0].index('rerere.enabled=false') < vectors[0].index('rebase')
+
+    async def test_preflight_runs_BEFORE_the_abort(self, tmp_path: Path) -> None:
+        """Ordering is the contract: a preflight after the abort guards nothing.
+
+        The abort DELETES MERGE_RR, so a preflight that ran afterwards would
+        find an empty worktree, report clean, and quarantine nothing — passing
+        every state assertion while preserving no evidence at all.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        observed: list[str] = []
+
+        real_preflight = rebase_recovery.preflight_rebase_recovery
+
+        def spy_preflight(worktree, **kwargs):
+            observed.append('preflight')
+            return real_preflight(worktree, **kwargs)
+
+        original_run = git_ops_module._run
+
+        async def spy_run(cmd, cwd=None, **kwargs):
+            if '--abort' in cmd:
+                observed.append('abort')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch(
+            'orchestrator.rebase_recovery.preflight_rebase_recovery',
+            side_effect=spy_preflight,
+        ), patch('orchestrator.git_ops._run', side_effect=spy_run):
+            await git_ops_module._guarded_abort('rebase', repo)
+
+        assert observed == ['preflight', 'abort']
+
+    async def test_rebase_onto_main_failure_path_aborts_through_the_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        ops = _make_git_ops(repo)
+
+        with _git_command_spy() as recorded:
+            landed = await ops.rebase_onto_main(repo)
+
+        assert landed is False, 'fixture expected the rebase to conflict'
+        assert _abort_vectors(recorded) == [
+            [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'],
+        ]
+
+    async def test_abort_merge_aborts_through_the_same_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        """Included for UNIFORMITY, and the docstring says why.
+
+        ``git merge --abort`` was measured NOT to crash on a dangling ref
+        (rc 0), so this site needs no crash-avoidance.  It still consumes
+        MERGE_RR and can still hit the stale-lock rc 128, and a per-site
+        carve-out is a rule a future reader has to re-derive before they can
+        safely touch any of the four.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        ops = _make_git_ops(repo)
+
+        with _git_command_spy() as recorded:
+            await ops.abort_merge(repo)
+
+        assert _abort_vectors(recorded) == [
+            [*rebase_recovery.RECOVERY_GIT, 'merge', '--abort'],
+        ]
+
+    def test_no_unguarded_abort_vector_survives_anywhere_in_git_ops(self) -> None:
+        """SPOT, enforced against the file rather than against known call sites.
+
+        Four sites route through one helper precisely so a future edit cannot
+        fix three and miss the fourth.  A per-site spy cannot see that: it
+        asserts about the sites it already knows, so a newly ADDED fifth
+        unguarded abort passes it silently.  Scanning the source closes that,
+        and it is the only assertion here that gets stronger as the file grows.
+        """
+        source = Path(git_ops_module.__file__).read_text()
+        quoted_abort = re.compile(r"""['"]--abort['"]""")
+        offenders = [
+            line.strip()
+            for line in source.splitlines()
+            if quoted_abort.search(line) and 'RECOVERY_GIT' not in line
+        ]
+        assert offenders == []
