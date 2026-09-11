@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import logging
@@ -236,6 +237,7 @@ class WriteJournal:
     def __init__(self, data_dir: Path | str):
         self.data_dir = Path(data_dir)
         self._db: aiosqlite.Connection | None = None
+        self._dropped: collections.Counter[str] = collections.Counter()
 
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -405,6 +407,7 @@ class WriteJournal:
                     ),
                 )
         except Exception as e:
+            self._dropped[operation] += 1
             logger.warning(f'Failed to log write_op: {e}')
 
     async def log_backend_op(
@@ -441,7 +444,38 @@ class WriteJournal:
                     ),
                 )
         except Exception as e:
+            self._dropped[operation] += 1
             logger.warning(f'Failed to log backend_op: {e}')
+
+    def journal_drop_stats(self) -> dict:
+        """Return ``{'dropped_total': int, 'by_operation': dict}`` — rows LOST.
+
+        Both ``log_write_op`` and ``log_backend_op`` are fire-and-forget by
+        design, which means a burst of lost rows is otherwise indistinguishable
+        from a quiet period. That fail-soft became LOAD-BEARING the moment leaf
+        eta (task 3213) began computing a metric from these rows: a dropped
+        search row is a search the metric silently scores as "never asked",
+        which is a wrong answer rather than a missing one.
+
+        Process-local and reset by a restart, like every other in-process
+        counter here — this exists to make a live burst VISIBLE, not to keep
+        durable statistics. The returned dicts are copies, so a reader cannot
+        mutate the journal's internal state.
+        """
+        return {
+            'dropped_total': sum(self._dropped.values()),
+            'by_operation': dict(self._dropped),
+        }
+
+    def record_journal_drop(self, operation: str) -> None:
+        """Count a row lost by an OUT-OF-PACKAGE fallback on the same counter.
+
+        ``server/tools.py::_log_read`` has its own outer ``except``; it fires
+        rarely, because the two log methods above swallow their failures first,
+        but when it does the row is just as lost. It feeds this counter rather
+        than growing a second, divergent one (INV-5).
+        """
+        self._dropped[operation] += 1
 
     async def get_ops_by_causation(self, causation_id: str) -> list[dict]:
         """Return all write_ops and backend_ops for a causation_id."""
