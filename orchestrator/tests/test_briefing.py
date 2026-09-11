@@ -13,13 +13,18 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.roles import ARCHITECT
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.mcp import plan_tools
 
 
 @pytest.fixture
@@ -148,6 +153,32 @@ class TestFormatTaskIncludeFiles:
         assert '**Files:** orchestrator, shared' in out
 
 
+async def _build_tightening_prompt(
+    briefing: BriefingAssembler,
+    files: list[str] | None = None,
+    not_touched: list[str] | None = None,
+) -> str:
+    """Render the architect narrowing prompt with a stock flagged-file set.
+
+    Module-level rather than a method so ``TestPlanTighteningPromptToolGrants``
+    renders the SAME prompt the wording tests read, without either class
+    reaching into the other.
+    """
+    task = {
+        'id': '2656',
+        'title': 'Test task',
+        'description': 'Demo',
+    }
+    plan = {'files': files if files is not None else ['a.py', 'b.py', 'c.py']}
+    return await briefing.build_plan_tightening_prompt(
+        task,
+        plan,
+        not_touched if not_touched is not None else ['a.py', 'b.py'],
+        worktree=None,
+        context='',
+    )
+
+
 @pytest.mark.asyncio
 class TestBuildPlanTighteningPrompt:
     """Architect narrowing pass after the plan-files-not-touched gate.
@@ -158,28 +189,8 @@ class TestBuildPlanTighteningPrompt:
     self-conflict.
     """
 
-    async def _build(
-        self,
-        briefing: BriefingAssembler,
-        files: list[str] | None = None,
-        not_touched: list[str] | None = None,
-    ) -> str:
-        task = {
-            'id': '2656',
-            'title': 'Test task',
-            'description': 'Demo',
-        }
-        plan = {'files': files if files is not None else ['a.py', 'b.py', 'c.py']}
-        return await briefing.build_plan_tightening_prompt(
-            task,
-            plan,
-            not_touched if not_touched is not None else ['a.py', 'b.py'],
-            worktree=None,
-            context='',
-        )
-
     async def test_mentions_all_three_valid_actions(self, briefing: BriefingAssembler):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'update_plan_metadata' in prompt
         assert 'confirm_plan' in prompt
         assert 'drop_plan_file' in prompt
@@ -194,7 +205,7 @@ class TestBuildPlanTighteningPrompt:
         edit has no truthful move: dropping falsifies the provenance,
         confirming mislabels complete work as incomplete.
         """
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'drop_plan_file' in prompt
 
     async def test_third_action_names_the_correctly_declared_case(
@@ -204,7 +215,7 @@ class TestBuildPlanTighteningPrompt:
         steers architects to ``confirm_plan()`` — that dropping a correctly-
         declared entry would falsify the plan. Naming the tool is not enough
         if the prompt never names the case it serves."""
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'needed no change' in prompt
 
     async def test_option_a_no_longer_invites_keeping_flagged_entries(
@@ -215,7 +226,7 @@ class TestBuildPlanTighteningPrompt:
         DETERMINISTIC: the gate re-checks and the kept entry re-fires it.
         Pin the replacement statement of that consequence, positively, rather
         than asserting the removed sentence is absent."""
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'will re-fire' in prompt
         # The contract the removed sentence carried is load-bearing and must
         # survive the rewrite as its own statement.
@@ -227,7 +238,7 @@ class TestBuildPlanTighteningPrompt:
         """``confirm_plan()`` must stop reading as the only non-falsifying exit
         for a DELIVERED branch: it stays scoped to genuinely incomplete work,
         and points at ``drop_plan_file`` for the case that is not that."""
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'genuinely incomplete' in prompt
         confirm_para = prompt.split('b. **')[1].split('c. **')[0]
         assert 'genuinely incomplete' in confirm_para
@@ -238,11 +249,11 @@ class TestBuildPlanTighteningPrompt:
     ):
         """An empty files list is not a narrowed plan, it is an unchecked one:
         the gate has nothing left to re-check."""
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'never be narrowed to an empty' in prompt
 
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
-        prompt = await self._build(
+        prompt = await _build_tightening_prompt(
             briefing,
             files=['x.py', 'y.py', 'z.py'],
             not_touched=['x.py', 'y.py'],
@@ -255,7 +266,7 @@ class TestBuildPlanTighteningPrompt:
     async def test_forbids_creation_and_step_edits(
         self, briefing: BriefingAssembler,
     ):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         # Positive-directive assertions covering the forbidden tools.
         # The prompt mentions create_plan/add_plan_step/replace_plan_step
         # while listing them as off-limits — assert by section header
@@ -268,12 +279,63 @@ class TestBuildPlanTighteningPrompt:
     async def test_states_new_file_addition_will_be_rejected(
         self, briefing: BriefingAssembler,
     ):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'must NOT add new files' in prompt
 
     async def test_includes_agent_identity(self, briefing: BriefingAssembler):
-        prompt = await self._build(briefing)
+        prompt = await _build_tightening_prompt(briefing)
         assert 'claude-task-2656-architect' in prompt
+
+
+@pytest.mark.asyncio
+class TestPlanTighteningPromptToolGrants:
+    """Every plan tool the narrowing prompt prescribes must be granted.
+
+    ``test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names``
+    pins this same capability<->prompt coupling, but structurally cannot see
+    this prompt: it scans only ``role.system_prompt``, and the narrowing
+    prompt is assembled at dispatch time by
+    ``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_plan_tightening_prompt``.
+
+    The registry is the real one — built from
+    ``orchestrator/src/orchestrator/mcp/plan_tools.py::create_server`` — so a
+    tool that is registered but ungranted, or named in the prompt but never
+    registered, is caught without any hand-maintained list of tool names.
+    """
+
+    async def test_every_registered_tool_the_prompt_names_is_granted_to_architect(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        artifacts = TaskArtifacts(tmp_path / 'wt')
+        artifacts.init('4807', 'T', 'd')
+        server = plan_tools.create_server(artifacts)
+        registry = {tool.name for tool in await server.list_tools()}
+
+        prompt = await _build_tightening_prompt(briefing)
+
+        named = {n for n in registry if re.search(rf'\b{re.escape(n)}\b', prompt)}
+        assert named, (
+            'The narrowing prompt names no registered plan tool at all, which '
+            'makes this assertion vacuous — either the prompt stopped '
+            'prescribing tools or create_server stopped registering them.'
+        )
+
+        granted = set(ARCHITECT.allowed_tools)
+        missing = sorted(
+            qualified for qualified in (f'mcp__plan-tools__{n}' for n in named)
+            if not _tool_is_granted(qualified, granted)
+        )
+        assert not missing, (
+            f'build_plan_tightening_prompt prescribes plan tools absent from '
+            f"ARCHITECT.allowed_tools: {missing}. allowed_tools is passed to the "
+            'SDK as an allowlist (workflow.py::_try_narrow_plan -> '
+            '_invoke(ARCHITECT, ...)), and for the `pi` backend '
+            'agents/invoke.py builds `--tools <csv>` straight from it — so an '
+            'ungranted tool is not in the session registry at all and the '
+            'architect hits a denial following its own instructions. Either '
+            'grant the tool (directly or via a `mcp__<family>__*` wildcard) or '
+            'stop prescribing it.'
+        )
 
 
 @pytest.mark.asyncio
