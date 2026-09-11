@@ -10,6 +10,7 @@ Uses a persistent connection opened via open()/close() or the async context mana
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,26 @@ CREATE TABLE IF NOT EXISTS invocations (
     duration_ms         INTEGER NOT NULL DEFAULT 0,
     capped              INTEGER NOT NULL DEFAULT 0,
     started_at          TEXT NOT NULL,
-    completed_at        TEXT NOT NULL
+    completed_at        TEXT NOT NULL,
+    -- Task 4826.  `model` carries the caller's routing lineage ALIAS ('opus',
+    -- 'sonnet'); `model_id` carries the exact version the CLI actually served
+    -- ('claude-opus-5').  `capped_reason` disambiguates the widened `capped`
+    -- boolean: 'budget' | 'turns' | 'account' | NULL.
+    --
+    -- These MUST stay LAST, after completed_at, for the reason spelled out at
+    -- orchestrator/src/orchestrator/run_store.py::_SCHEMA: SQLite's ALTER
+    -- TABLE ADD COLUMN can only append, so declaring them anywhere else would
+    -- give a freshly-created runs.db a different physical column ORDER than
+    -- one migrated by _migrate_invocations_columns.  Every production reader
+    -- names its columns, but
+    -- orchestrator/tests/test_harness_module_tagger_cost.py's
+    -- `SELECT * FROM invocations` is positional.
+    --
+    -- Nullable with no NOT NULL DEFAULT on purpose: it keeps ADD COLUMN O(1)
+    -- with no table rewrite against a live table of tens of thousands of
+    -- rows, and NULL reads as the honest "this row predates task 4826".
+    model_id            TEXT,
+    capped_reason       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_inv_project
@@ -88,6 +108,15 @@ CREATE INDEX IF NOT EXISTS idx_acct_evt_created
 # pre-existing cap_hit/switch/resume rows.  Without a bare created_at index
 # that branch degrades to a full scan of an append-only table that grows for
 # the life of the deployment.
+
+# Columns added to `invocations` after the original 16-column schema shipped,
+# in the order _migrate_invocations_columns adds them.  `CREATE TABLE IF NOT
+# EXISTS` is a no-op against an existing runs.db, so these reach a live one
+# only via the migration.
+_ADDED_INVOCATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ('model_id', 'TEXT'),
+    ('capped_reason', 'TEXT'),
+)
 
 
 def _inclusive_end_bound(end_iso: str) -> str:
@@ -157,6 +186,71 @@ class CostStore(AsyncSqliteBase):
     def _schema(self) -> str:
         return _SCHEMA
 
+    # -- lifecycle ------------------------------------------------------------
+
+    async def open(self) -> None:
+        """Open, then bring an existing DB up to the current column set.
+
+        :data:`_SCHEMA` is applied with ``CREATE TABLE IF NOT EXISTS``, so an
+        ``invocations`` table created before task 4826 never gains ``model_id``
+        or ``capped_reason`` from the DDL edit alone — and the widened INSERT
+        in :meth:`save_invocation` would then fail on the first invocation
+        after deploy.  Migrating here, before any caller can write, is what
+        keeps a writer from ever meeting an un-migrated table.
+
+        Closes the connection on failure so a half-open store is never left
+        behind.  Safe because ``AsyncSqliteBase.open()`` releases
+        ``_lifecycle_lock`` before returning and assigns ``_conn`` only on
+        success, so ``close()`` here neither deadlocks nor races.
+        """
+        await super().open()
+        try:
+            await self._migrate_invocations_columns()
+            await self._require_conn().commit()
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _migrate_invocations_columns(self) -> None:
+        """Add the task-4826 columns to a pre-4826 ``invocations`` table.
+
+        Additive only: probes ``PRAGMA table_info`` and issues one
+        ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, and a
+        no-op on a fresh DB — :data:`_SCHEMA` already declares both there, so
+        the probe finds them present.  Never drops or rewrites anything, so
+        pre-existing rows keep their data and read NULL for the new columns,
+        which is exactly right: NULL means "row predates task 4826".
+
+        No ``PRAGMA user_version`` ladder, matching the convention for the
+        runs.db family stated at
+        ``orchestrator/src/orchestrator/flake_ledger.py`` — this DB has never
+        had a version header, and adding one to an existing un-versioned DB
+        would need a "version 0 means unknown" special case for no benefit.
+
+        The one plausible-and-benign failure — a concurrent ``CostStore``
+        construction that added the column between our ``table_info`` read and
+        this ``ALTER`` — is swallowed: ``duplicate column name`` means the
+        migration's goal is already met.  Everything else (a corrupt DB, a lock
+        we could not take inside the busy_timeout) still surfaces, because a
+        silent half-migrated schema would be worse.  The caller commits.
+        """
+        conn = self._require_conn()
+        cursor = await conn.execute('PRAGMA table_info(invocations)')
+        existing = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+        for column, ddl in _ADDED_INVOCATION_COLUMNS:
+            if column in existing:
+                continue
+            try:
+                # Column name and DDL are hard-coded literals, never caller input.
+                await conn.execute(f'ALTER TABLE invocations ADD COLUMN {column} {ddl}')
+            except sqlite3.OperationalError as exc:
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug('CostStore: invocations.%s already added concurrently', column)
+                continue
+            logger.info('CostStore: added invocations.%s (%s)', column, ddl)
+
     # -- internal helpers -----------------------------------------------------
 
     async def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
@@ -185,14 +279,30 @@ class CostStore(AsyncSqliteBase):
         capped: bool,
         started_at: str,
         completed_at: str,
+        model_id: str | None = None,
+        capped_reason: str | None = None,
     ) -> None:
-        """Insert one row into the invocations table."""
+        """Insert one row into the invocations table.
+
+        ``model`` is the caller's routing lineage ALIAS ('opus', 'sonnet') and
+        stays that way, so existing ``GROUP BY model`` consumers are
+        unaffected.  ``model_id`` is the exact version the CLI actually served
+        ('claude-opus-5'), or None when it could not be determined — for a
+        non-Claude backend, which writes no transcript to read it from, or for
+        a run whose transcript was unavailable.
+
+        ``capped`` means "ended by a configured ceiling"; ``capped_reason``
+        says which one — 'budget' | 'turns' | 'account' — or None when the run
+        was not capped.  Both default to None so a caller that has not been
+        widened yet still inserts, writing NULL.
+        """
         await self._execute(
             'INSERT INTO invocations '
             '(run_id, task_id, project_id, account_name, model, role, '
             ' cost_usd, input_tokens, output_tokens, cache_read_tokens, '
-            ' cache_create_tokens, duration_ms, capped, started_at, completed_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ' cache_create_tokens, duration_ms, capped, started_at, completed_at, '
+            ' model_id, capped_reason) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 run_id,
                 task_id,
@@ -209,6 +319,8 @@ class CostStore(AsyncSqliteBase):
                 int(capped),
                 started_at,
                 completed_at,
+                model_id,
+                capped_reason,
             ),
         )
 
