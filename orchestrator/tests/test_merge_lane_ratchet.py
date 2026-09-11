@@ -2238,11 +2238,37 @@ class TestReportCli:
         assert 'enumeration' in out
         assert 'complete' in out
 
+    def test_report_carries_the_test_tree_sweep_breadth(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The test-tree denominator is deliberately NOT ratcheted into the
+        # baseline (it is reported, never enforced -- same call this file already
+        # made for `mi`), so --report is the ONLY place a reader can see how
+        # broad the sweep was. If it is not here it exists nowhere in the RESULT.
+        assert metrics.main(['--report']) == 0
+        out = capsys.readouterr().out
+        test_tree = stub_measurement['enumeration']['test_tree']
+        # Read from the report, never hard-coded: the numbers churn with the
+        # tree, and pinning them would rebuild the hair trigger this removes.
+        assert str(test_tree['requested']) in out
+        assert str(test_tree['resolved']) in out
+
     def test_json_returns_zero_and_stdout_parses_as_the_report(
         self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
     ) -> None:
         assert metrics.main(['--json']) == 0
         assert json.loads(capsys.readouterr().out) == stub_measurement
+
+    def test_json_carries_the_test_tree_counts_untouched(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The count/path reduction is a STORAGE concern and must never reach
+        # --json, which is the machine-readable face of the measurement itself.
+        assert metrics.main(['--json']) == 0
+        emitted = json.loads(capsys.readouterr().out)
+        assert emitted['enumeration']['test_tree'] == (
+            stub_measurement['enumeration']['test_tree']
+        )
 
 
 class TestCheckCli:
