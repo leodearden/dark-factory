@@ -40,3 +40,39 @@
     - "stage-1 flag marker"
     - "delete-by-recorded-id"
     - "delete by recorded id"
+
+- name: verify_summary_glob_jsondecodeerror_refuted
+  reason: >
+    Leo ruled option (b) on esc-5120-2, 2026-09-08. The premise of task 5120
+    ("[legibility census] Verify-summary glob miss cascades into a generic
+    JSONDecodeError instead of a clear not-found") is refuted: it claimed an
+    agent guessed a wrong artifact name/location under .task/verify/, and that
+    the resulting glob miss cascaded into an opaque JSONDecodeError instead of
+    a clear not-found signal.
+
+    The refutation comes from reading the raw session transcript and must NOT
+    be re-derived here. The file existed under exactly the guessed name. The
+    real failure was CWD DRIFT: the agent had cd'd into .task/verify and then
+    used a worktree-relative glob, so the glob resolved against the wrong
+    directory. The agent self-corrected 19 seconds later. There is no
+    naming-convention defect and no error-cascade defect to fix.
+
+    The true cause is already catalogued as docs/legibility/confusion-codebook.yaml
+    entry entry-cand-20260729-4 ("Bash cwd persists across turns"), which is
+    where a genuine recurrence of this phenomenon belongs.
+
+    ANCHOR SAFETY, measured against the real matcher before this entry was
+    committed: it does NOT match task 5198 (this remediation task) nor task
+    5199 (the separately-filed, real, measured task-path verify-summary ARCHIVE
+    GAP defect). Both must stay fileable; both are pinned as controls in
+    fused-memory/tests/test_task_curator.py::TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise.
+
+    Any future recurrence must be dropped without an LLM call.
+  title_substrings:
+    - "verify"
+    - "glob"
+    - "jsondecodeerror"
+  description_substrings:
+    - "scripts.summary.json"
+    - "JSONDecodeError"
+    - "cannot access"
