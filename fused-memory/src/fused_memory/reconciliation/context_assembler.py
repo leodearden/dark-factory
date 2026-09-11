@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     Watermark,
 )
+from fused_memory.services.read_telemetry import summarize_search_results
 from fused_memory.utils.async_utils import gather_collect
 
 if TYPE_CHECKING:
@@ -30,6 +32,17 @@ if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
+
+#: Per-query result limit for a memory_hints execution. Named because the value
+#: is both PASSED to the search and JOURNALLED with it, and a journalled limit
+#: that disagrees with the real one would misreport what the search could have
+#: returned (SPOT).
+_HINT_SEARCH_LIMIT = 3
+
+#: `write_ops.source` for a memory_hints execution. A distinct value from the
+#: MCP boundary's 'mcp_tool' so a consumer can tell a reconciliation-originated
+#: read from an agent-originated one without re-deriving it from `operation`.
+_HINT_JOURNAL_SOURCE = 'reconciliation_hint'
 
 
 def estimate_tokens(text: str) -> int:
@@ -292,13 +305,19 @@ class ContextAssembler:
         # If task has memory hints with queries, search for each
         hints = (task.get('metadata') or {}).get('memory_hints', {})
         queries = hints.get('queries', []) if isinstance(hints, dict) else []
+        # Resolved ONCE, not per query, and via the public accessor rather than
+        # MemoryService's private attribute. None means an unwired deployment
+        # (and the AsyncMock-based assembler tests), which must journal nothing
+        # rather than fail.
+        journal = getattr(self.memory, 'write_journal', None)
         _hint_exc_logged = False
+        _hint_journal_exc_logged = False
         for query in queries[:3]:  # cap hint queries
             try:
                 results = await self.memory.search(
                     query=query,
                     project_id=project_id,
-                    limit=3,
+                    limit=_HINT_SEARCH_LIMIT,
                 )
                 for r in results:
                     items.append(ContextItem(
@@ -312,6 +331,44 @@ class ContextAssembler:
                     _hint_exc_logged = True
                 else:
                     logger.warning('memory.search failed for hint query; skipping')
+                continue
+            if journal is None:
+                continue
+            try:
+                # The THIRD producer of the shape whose single home is
+                # fused_memory/services/read_telemetry.py::summarize_search_results
+                # (INV-5).  Raw results — grouping is applied only at the MCP
+                # boundary, and reconciliation reads below it.
+                #
+                # `caller_task_id` is the ONE identity in scope here: the
+                # assembler has no run_id or causation_id at assemble() time,
+                # and gaining one would mean a 5th __init__ parameter that
+                # tests/test_harness.py's six assembler stubs do not accept.
+                await journal.log_write_op(
+                    write_op_id=str(uuid.uuid4()),
+                    source=_HINT_JOURNAL_SOURCE,
+                    operation='search',
+                    project_id=project_id,
+                    kind='read',
+                    params={
+                        'query': query,
+                        'limit': _HINT_SEARCH_LIMIT,
+                        'caller_task_id': str(task_id),
+                    },
+                    result_summary=summarize_search_results(results),
+                )
+            except Exception:
+                # Telemetry must never cost the caller its hint results. The
+                # rows lost here are counted by WriteJournal's drop counter, so
+                # a burst is visible rather than silently starving leaf eta.
+                if not _hint_journal_exc_logged:
+                    logger.warning(
+                        'journalling failed for hint query; hint results kept',
+                        exc_info=True,
+                    )
+                    _hint_journal_exc_logged = True
+                else:
+                    logger.warning('journalling failed for hint query; hint results kept')
         return items
 
     async def _ctx_task_deleted(
