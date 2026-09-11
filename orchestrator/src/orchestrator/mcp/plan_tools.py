@@ -460,6 +460,20 @@ def _repair_one_field(
     silent-wrong-value damage this whole PRD exists to end. Never partial,
     never guessed.
 
+    THE ONE ACCEPTED TRUNCATION, AND WHY IT IS ASYMMETRIC. A value ending in
+    the field's OWN closer is cut at that tag with nothing recovered, and
+    ``_read_plan_repaired`` persists the shorter string. That is chosen, not
+    overlooked — D10a in ``plans/toolcall-markup-containment-prd.md``: 212 of
+    212 invisible specimens are this shape, and the fact's ``misclose`` names
+    the deleted span, so the cut is reversible from the record rather than
+    silent. The same empty tail under a SIBLING's closer is refused and left
+    byte-identical instead, because the discriminator is evidence rather than
+    breadth — this value arrived as a named parameter of a known tool, so its
+    own closer is evidence about that parameter, while the sweep's
+    ``scripts/sweep_toolcall_markup.py::_repair_dict`` qualifies candidates
+    against every sibling KEY of the containing object, a far wider vocabulary
+    in which the same shape is likelier quotation than leak.
+
     A RECOVERY ONLY EVER FILLS A HOLE. ``supplied`` is computed as the sibling
     fields of this same record that already hold authored content, so a
     recovered parameter can land only in an EMPTY or ABSENT sibling and can
