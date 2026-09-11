@@ -162,6 +162,7 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # only way that gets corrected on the host is for this checker to report it.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     "Environment=MEM0_TELEMETRY=false",
+    "Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "WatchdogSec=120",
     "Restart=on-failure",
     "RestartSec=5",

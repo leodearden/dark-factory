@@ -44,6 +44,16 @@ Environment=TASKMASTER_DIR=/home/leo/src/dark-factory/taskmaster-ai
 # (belt-and-suspenders). NOTE: the live/deployed unit must carry this identical line.
 Environment=MEM0_TELEMETRY=false
 
+# Pin PATH explicitly rather than inheriting the systemd user manager's.
+# On 2026-08-13->08-18 this line was absent, the inherited manager PATH lacked
+# ~/.local/bin, and so the `claude` CLI the task curator shells out to did not
+# resolve: every curation degraded to 'create' and the fleet-wide dedupe
+# function was down for >=80h with no signal. The %h specifier keeps this
+# host-portable AND byte-identical between this file and the rendered unit --
+# scripts/render_dashboard_unit.py substitutes only __REPO_ROOT__/__UV_PATH__,
+# so the parity checker's exact match still holds.
+Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 # Restart policy: always restart on failure (including watchdog-triggered),
 # back off up to 60s. main() in fused_memory/server/main.py exits 0 only when
 # an operator-stop signal (SIGTERM/SIGINT) was received — cascades exit 1 so

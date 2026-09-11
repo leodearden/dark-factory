@@ -48,6 +48,15 @@ ExecStart=__UV_PATH__ run --project fused-memory \
 # Historical context: mem0 telemetry spawned ~8000 threads/day and pegged CPU at
 # 1400% when this line was absent. Both mechanisms (systemd + in-process) are kept.
 Environment=MEM0_TELEMETRY=false
+# Pin PATH explicitly rather than inheriting the systemd user manager's.
+# On 2026-08-13->08-18 this line was absent, the inherited manager PATH lacked
+# ~/.local/bin, and so the `claude` CLI the task curator shells out to did not
+# resolve: every curation degraded to 'create' and the fleet-wide dedupe
+# function was down for >=80h with no signal. The %h specifier keeps this
+# host-portable AND byte-identical between this file and the rendered unit --
+# scripts/render_dashboard_unit.py substitutes only __REPO_ROOT__/__UV_PATH__,
+# so the parity checker's exact match still holds.
+Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CONFIG_PATH=__REPO_ROOT__/fused-memory/config/config.yaml
 Environment=PROJECT_ROOT=__REPO_ROOT__
 Environment=TASKMASTER_DIR=__REPO_ROOT__/taskmaster-ai
