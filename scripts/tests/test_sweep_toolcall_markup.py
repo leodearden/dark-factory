@@ -2413,6 +2413,52 @@ def test_the_default_dry_run_reports_the_dead_lane_and_writes_nothing(meta_plans
     assert len(diffs) == 1 and '7001' in diffs[0]
 
 
+def test_a_skipped_file_is_still_SCANNED_and_counted(meta_plans_root):
+    """(b2) "Not looked at" must be distinguishable from "clean".
+
+    THE DEFECT. ``run_sweep`` applied the write gates BEFORE
+    ``repair_document``, so a plan under a live lane was counted in ``skipped``
+    and never scanned at all. New corruption is BY DEFINITION written by a
+    RUNNING task into a LIVE lane — so the check advertised as the silent-write
+    detector was structurally blind to exactly the population it claims to
+    detect, and reported a corrupt live plan identically to a clean one.
+
+    THE FIX IS COUNTING, NOT WRITING. ``repair_document`` is non-mutating and
+    returns a new object, so moving it ahead of the gates changes what is
+    COUNTED without changing what is WRITTEN. The rows below pin both halves:
+    the live-lane plan contributes to ``strings_detected`` and to a new
+    ``skipped_with_markup`` counter, while ``pending``, ``diffs`` and the exit
+    code are bit-for-bit what they were, and not one byte of the tree moves.
+    """
+    before = _fingerprint(meta_plans_root)
+
+    summary, diffs = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
+
+    # (a) the live-lane plan is SEEN. 7001 (dead, corrupt) and 7002 (live,
+    # corrupt) both carry one repairable string; 7003 is clean.
+    assert summary.strings_detected == 2, (
+        'the skipped live-lane plan must contribute — it was 1 while the '
+        'sweep gated the scan behind the write decision'
+    )
+
+    # (b) ...and "skipped WITH corruption" is reportable on its own, which is
+    # the signal whose absence made a corrupt live plan look like a clean one.
+    assert summary.skipped == {sweep.REASON_LIVE_LANE_PRESENT: 1}
+    assert summary.skipped_with_markup == 1
+
+    # (c) THE EXIT-CODE CONTRACT IS UNCHANGED. exit_code() reads only
+    # did_not_converge / failed / pending and never `skipped`, so scanning more
+    # cannot raise the status: the status answers "is there DEAD-lane work
+    # pending", and the report answers "is it still happening".
+    assert summary.pending == 1, 'only the dead lane is actionable'
+    assert summary.repaired == 1
+    assert len(diffs) == 1 and '7001' in diffs[0]
+    assert summary.exit_code() == sweep.EXIT_REPAIRABLE_REMAINS
+
+    # (d) and scanning a skipped file writes NOTHING — bytes and mtimes both.
+    assert _fingerprint(meta_plans_root) == before
+
+
 def test_apply_repairs_the_dead_lane_and_refuses_the_live_one(meta_plans_root):
     """(c) The corpus is PARTITIONED with plan-tools, never raced over it.
 
