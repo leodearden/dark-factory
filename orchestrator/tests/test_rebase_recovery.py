@@ -35,7 +35,9 @@ is impossible at the git level even if the pre-flight is refactored away).
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
@@ -434,3 +436,147 @@ class TestQuarantineMergeRr:
         assert f'{_HEX}.1' in logged
         assert other in logged
         assert backup is not None and str(backup) in logged
+
+
+# ---------------------------------------------------------------------------
+# Stale-lock sweep
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=UTC)
+_STALE = 3600
+
+
+def _plant_lock(git_dir: Path, name: str, *, age_seconds: float) -> Path:
+    git_dir.mkdir(parents=True, exist_ok=True)
+    lock = git_dir / name
+    lock.touch()
+    stamp = (_NOW - timedelta(seconds=age_seconds)).timestamp()
+    os.utime(lock, (stamp, stamp))
+    return lock
+
+
+def _swept(git_dir: Path):
+    return rebase_recovery.sweep_stale_locks(
+        git_dir=git_dir, now=_NOW, stale_after_seconds=_STALE,
+    )
+
+
+class TestSweepStaleLocks:
+    """Removal requires the CONJUNCTION of no holder AND age past threshold.
+
+    Age alone must never authorise removal: a legitimately held lock can be
+    arbitrarily old, and deleting it corrupts whatever still holds it.
+    """
+
+    def test_old_and_unheld_is_removed(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+
+        swept = _swept(tmp_path / 'gitdir')
+
+        assert [s.path for s in swept.removed] == [lock]
+        assert swept.retained == ()
+        assert not lock.exists()
+
+    def test_old_but_HELD_is_retained(self, tmp_path: Path) -> None:
+        """The case age alone gets wrong, and the reason the conjunction exists."""
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+
+        with lock.open('a'):
+            swept = _swept(tmp_path / 'gitdir')
+
+        assert swept.removed == ()
+        assert [s.path for s in swept.retained] == [lock]
+        assert swept.retained[0].holder_pids == (os.getpid(),)
+        assert lock.exists()
+
+    def test_young_and_unheld_is_retained(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=5)
+
+        swept = _swept(tmp_path / 'gitdir')
+
+        assert swept.removed == ()
+        assert [s.path for s in swept.retained] == [lock]
+        assert swept.retained[0].holder_pids == ()
+        assert lock.exists()
+
+    def test_young_and_held_is_retained(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=5)
+
+        with lock.open('a'):
+            swept = _swept(tmp_path / 'gitdir')
+
+        assert swept.removed == ()
+        assert lock.exists()
+
+    def test_verdict_ignores_the_mtime_of_the_operation_the_lock_blocks(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE ordering trap from incident 3517, pinned so it cannot come back.
+
+        That lock's mtime (16:52:47) was OLDER than the rebase-merge directory
+        it blocked (17:33:50).  So "newer than the operation" would have
+        cleared a lock it must keep, and "older than the operation" would have
+        kept one it must clear — the relative comparison is wrong in BOTH
+        directions and is banned outright.  With a rebase-merge dir planted
+        NEWER than each lock, both verdicts must be unchanged from the cases
+        above: the blocked operation's mtime is never consulted.
+        """
+        git_dir = tmp_path / 'gitdir'
+        old = _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        young = _plant_lock(git_dir, 'index.lock', age_seconds=5)
+        rebase_merge = git_dir / 'rebase-merge'
+        rebase_merge.mkdir()
+        fresh = _NOW.timestamp()
+        os.utime(rebase_merge, (fresh, fresh))
+
+        swept = _swept(git_dir)
+
+        assert [s.path for s in swept.removed] == [old]
+        assert [s.path for s in swept.retained] == [young]
+
+    def test_zero_byte_lock_is_not_treated_specially(self, tmp_path: Path) -> None:
+        """Size is not a liveness signal: git's locks are empty while held.
+
+        The incident's lock was 0 bytes AND stale; a 0-byte lock held right now
+        is indistinguishable by size and must still be retained.
+        """
+        git_dir = tmp_path / 'gitdir'
+        lock = _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        assert lock.stat().st_size == 0
+
+        with lock.open('a'):
+            held = _swept(git_dir)
+        unheld = _swept(git_dir)
+
+        assert held.removed == ()
+        assert [s.path for s in unheld.removed] == [lock]
+
+    def test_removal_logs_both_the_age_and_the_holder_finding(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Both halves of the conjunction are evidence, so both are reported."""
+        git_dir = tmp_path / 'gitdir'
+        lock = _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=7200)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            _swept(git_dir)
+
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(lock) in logged
+        assert '7200' in logged
+        assert 'holder' in logged.lower()
+
+    def test_only_lock_files_directly_under_the_git_dir_are_considered(
+        self, tmp_path: Path,
+    ) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_lock(git_dir, 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        nested = git_dir / 'refs'
+        plain = _plant_lock(git_dir, 'ORIG_HEAD', age_seconds=_STALE * 2)
+        deep = _plant_lock(nested, 'heads.lock', age_seconds=_STALE * 2)
+
+        swept = _swept(git_dir)
+
+        assert plain.exists()
+        assert deep.exists()
+        assert [s.path.name for s in swept.removed] == ['MERGE_RR.lock']
