@@ -1529,7 +1529,7 @@ _SIGHTING_PAYLOAD_FIELDS = (
 )
 
 
-def _t4892_sightings_for(holder: dict, session: str) -> list[dict]:
+def _sightings_for(holder: dict, session: str) -> list[dict]:
     return [s for s in holder.get("sightings") or [] if s.get("session") == session]
 
 
@@ -1598,12 +1598,12 @@ def test_live_codebook_carries_the_task_4892_corrections():
             f"invalid §7.3 coding record for session {session!r}"
         )
         for key, payload, holders in _t4892_carriers(codebook, record):
-            carrying = [h for h in holders if _t4892_sightings_for(h, session)]
+            carrying = [h for h in holders if _sightings_for(h, session)]
             assert len(carrying) == 1, (
                 f"expected exactly one live record under {key!r} to carry a "
                 f"{session!r} sighting, found {[h.get('id') for h in carrying]}"
             )
-            carried = _t4892_sightings_for(carrying[0], session)
+            carried = _sightings_for(carrying[0], session)
             assert len(carried) == 1, (
                 "the sole writer must not duplicate a sighting on a re-run — "
                 f"{session!r} appears {len(carried)}x on {carrying[0].get('id')!r}"
@@ -1648,3 +1648,156 @@ def test_live_codebook_carries_the_task_4892_corrections():
             f"re-applying session {record.get('session')!r} appended something — "
             f"its sightings are not already absorbed by the live codebook: {stats}"
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5198 (live-file guard, esc-5120-2) — the refuted task-5120 framing is
+# withdrawn from the committed registry, through the sole writer.
+# ---------------------------------------------------------------------------
+
+_T5198_ENTRY_ID = "entry-cand-20260831-16"
+_T5198_CORRECTION_SESSION = "task-5198-verify-summary-glob-refutation"
+_T5198_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-5198-corrections.jsonl"
+)
+
+# The three sightings the correction ANNOTATES. They observed a real symptom —
+# agents genuinely did hit an opaque JSONDecodeError — and only the cause they
+# were filed under was refuted, so each must survive, still carrying its date.
+_T5198_ORIGINAL_SIGHTINGS = {
+    "273579c5-e299-40c6-ab02-e4c0ab24213b": "2026-08-31",
+    "8a483603-92b1-460b-8af1-65c02d70a598": "2026-09-05",
+    "d83f509f-a7e5-4eeb-9e2b-74e80289204b": "2026-09-05",
+}
+
+# The token pair that made the entry self-ingesting: the census kept matching
+# its own quoted error string back to this title.
+_T5198_REFUTED_TOKENS = ("glob miss", "JSONDecodeError")
+
+
+def test_live_codebook_withdraws_the_refuted_task_5120_framing():
+    """The committed §7.3 record and the committed registry still agree, and
+    the refuted framing is no longer asserted to the coder.
+
+    `scripts/legibility/coder.py::build_codebook_index` renders one line per
+    entry — `- {id}: {title} — {cause}` — and deliberately keeps retired
+    entries in that index, so retirement alone would leave the refuted title
+    in front of the very loop esc-5120-2 diagnoses as self-ingesting. Six
+    properties:
+
+    (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
+        sighting carries the record's payload field for field. This is the
+        in-place-rewrite detector: a hand edit of the merger-owned YAML
+        surfaces here as drift between two committed artifacts.
+    (2) WITHDRAWN — the title no longer carries the distinctive token pair.
+    (3) RETIRED — status is 'retired'.
+    (4) NEVER-DELETE — all three original sightings survive, located by
+        session, still so dated.
+    (5) ORDER — the correction follows everything it annotates.
+    (6) NO-OP — re-applying the record changes nothing, which is what makes a
+        rebase onto a nightly-rewritten main resolvable by re-running one CLI
+        command instead of hand-editing 22k lines of generated YAML.
+
+    The entry's TOTAL sighting count is deliberately not pinned: retired
+    entries stay in the coder's index, so the nightly census can legitimately
+    append a fourth sighting after this amendment lands. Presence-of-each-
+    original plus (5) carries never-delete without that coupling. Nor is any
+    substring of the note's prose pinned — (1) already proves it is carried
+    verbatim — and schema shape stays owned by
+    `test_live_codebook_is_v2_and_validates_green`.
+    """
+    records = [
+        json.loads(line)
+        for line in _T5198_RECORD_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    by_session = {r.get("session"): r for r in records}
+    assert _T5198_CORRECTION_SESSION in by_session, (
+        f"{_T5198_RECORD_PATH} no longer records the task-5198 correction: "
+        f"{sorted(by_session)}"
+    )
+    record = by_session[_T5198_CORRECTION_SESSION]
+    assert mod.validate_coding_record(record) == [], (
+        f"invalid §7.3 coding record for session {_T5198_CORRECTION_SESSION!r}"
+    )
+    corrections = record.get("corrections") or []
+    assert len(corrections) == 1, (
+        f"expected exactly one correction in {_T5198_RECORD_PATH}, got {len(corrections)}"
+    )
+    correction = corrections[0]
+    assert correction.get("entry_id") == _T5198_ENTRY_ID
+
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+    entries = [e for e in codebook.get("entries") or [] if e.get("id") == _T5198_ENTRY_ID]
+    assert len(entries) == 1, f"expected exactly one {_T5198_ENTRY_ID!r} entry"
+    entry = entries[0]
+
+    # (1) AGREEMENT — entry fields, then the provenance sighting.
+    field_drift = {
+        field: (correction[field], entry.get(field))
+        for field in ("title", "cause", "status")
+        if correction.get(field) and correction[field] != entry.get(field)
+    }
+    assert field_drift == {}, (
+        f"{_T5198_ENTRY_ID!r} no longer carries the committed correction — a "
+        f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
+        f"{field_drift}"
+    )
+
+    carried = _sightings_for(entry, _T5198_CORRECTION_SESSION)
+    assert len(carried) == 1, (
+        f"expected exactly one {_T5198_CORRECTION_SESSION!r} sighting on "
+        f"{_T5198_ENTRY_ID!r}, found {len(carried)}"
+    )
+    sighting_drift = {
+        field: (correction[field], carried[0].get(field))
+        for field in _SIGHTING_PAYLOAD_FIELDS
+        if correction.get(field) and correction[field] != carried[0].get(field)
+    }
+    assert sighting_drift == {}, (
+        f"the {_T5198_CORRECTION_SESSION!r} sighting no longer matches the "
+        f"committed record {{field: (record, codebook)}}: {sighting_drift}"
+    )
+
+    # (2) WITHDRAWN — the framing the census kept re-ingesting is gone from the
+    #     one field build_codebook_index actually renders.
+    title_lower = entry["title"].lower()
+    still_asserted = [t for t in _T5198_REFUTED_TOKENS if t.lower() in title_lower]
+    assert still_asserted == [], (
+        f"{_T5198_ENTRY_ID!r} still asserts the refuted framing via "
+        f"{still_asserted} — build_codebook_index renders this title to the "
+        f"coder every night: {entry['title']!r}"
+    )
+
+    # (3) RETIRED.
+    assert entry.get("status") == "retired", (
+        f"{_T5198_ENTRY_ID!r} is {entry.get('status')!r}, not 'retired'"
+    )
+
+    # (4) NEVER-DELETE and (5) ORDER.
+    sightings = entry.get("sightings") or []
+    order = {s.get("session"): i for i, s in enumerate(sightings)}
+    for session, date in _T5198_ORIGINAL_SIGHTINGS.items():
+        assert session in order, (
+            f"the {session!r} sighting was deleted from {_T5198_ENTRY_ID!r} — "
+            "sightings are immutable dated observations, and the correction "
+            "annotates them rather than retracting them"
+        )
+        original = sightings[order[session]]
+        assert original.get("date") == date, (
+            f"the {session!r} sighting was re-dated to {original.get('date')!r} "
+            f"(was {date!r}) — a dated observation is not editable"
+        )
+    assert order[_T5198_CORRECTION_SESSION] > max(
+        order[s] for s in _T5198_ORIGINAL_SIGHTINGS
+    ), (
+        f"the {_T5198_CORRECTION_SESSION!r} sighting does not follow the "
+        "sightings it annotates"
+    )
+
+    # (6) NO-OP — the committed YAML is exactly what the sole writer produces.
+    _, stats = mod.apply_coding_record(codebook, record)
+    assert stats == _NO_CHANGES, (
+        f"re-applying session {_T5198_CORRECTION_SESSION!r} changed something — "
+        f"the committed codebook has not fully absorbed the record: {stats}"
+    )
