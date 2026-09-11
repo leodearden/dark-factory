@@ -3407,6 +3407,128 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_ht
     assert envelope.get("params", {}).get("arguments") == {"a": 1}
 
 
+
+
+# ---------------------------------------------------------------------------
+# task 5279 W1: a pytest process never POSTs to a real MCP endpoint through
+# this module. `_post_mcp_tool_call` is the single transport boundary for BOTH
+# `escalate_info` (:8103) and `submit_task` (:8002), and `main()`'s fail-loud
+# catch-all reaches it with no test-mode gate -- so a main()-level test whose
+# monkeypatched `run_census` raises UNEXPECTEDLY files a real escalation into
+# the live operator queue. The recorder below is installed on
+# `census_trigger.post_mcp_tool_call` -- the layer BELOW census's delegate --
+# precisely so the guard under test cannot be the thing that hides the
+# evidence.
+# ---------------------------------------------------------------------------
+
+def _make_transport_recorder():
+    """Record every call that reaches `census_trigger.post_mcp_tool_call`,
+    the real transport below `census._post_mcp_tool_call`.
+
+    A RECORDER, never a raiser: `_build_default_escalate_fn`'s best-effort
+    `except Exception` would swallow a raise and turn a leak into a passing
+    test. Recording makes the leak assertable on the calls list instead."""
+    calls = []
+
+    def _recorder(url, tool_name, arguments, **kwargs):
+        calls.append((url, tool_name, arguments))
+        return {}
+
+    _recorder.calls = calls
+    return _recorder
+
+
+def test_main_hard_failure_under_pytest_reaches_no_real_mcp_endpoint(tmp_path, monkeypatch):
+    """The live leak, reproduced through the path it actually travelled:
+    `main()` --force -> `run_census` raises UNEXPECTEDLY -> the fail-loud
+    catch-all calls the REAL `_build_default_escalate_fn` poster, which POSTs
+    `escalate_info` to `http://localhost:8103/mcp` -- the production
+    escalation queue, because `_write_legibility_yaml` writes the production
+    `escalation_port: 8103` into its tmp_path config.
+
+    `mod._post_mcp_tool_call` is deliberately NOT monkeypatched here (unlike
+    `test_main_failure_files_escalation`, which fakes it): the real poster
+    must run, so that what is pinned is the GUARD rather than the test's own
+    fixture discipline. A test-minted escalation is indistinguishable at
+    triage from a genuine census failure -- same synthetic `task_id`, same
+    `agent_role` -- which is how `esc-legibility-census-dark_factory-2`
+    reached dedupe_count=21.
+
+    The exit contract is asserted alongside: refusing the POST must not
+    change `main()`'s authoritative signal (tasks 2951/2952/3644)."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    def raising_run_census(**kwargs):
+        raise RuntimeError("codebook merge produced an invalid codebook")
+
+    monkeypatch.setattr(mod, "run_census", raising_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert recorder.calls == [], (
+        "a pytest run must reach no real MCP endpoint through census.py; "
+        f"these POSTs escaped: {recorder.calls}"
+    )
+    assert exit_code == 1, "refusing the POST must not change main()'s exit contract"
+
+
+def test_post_mcp_tool_call_outside_pytest_still_reaches_the_transport(monkeypatch):
+    """The production path is untouched: with no `PYTEST_CURRENT_TEST` in the
+    environment the guard no-ops and the delegate forwards url, tool name and
+    arguments to `census_trigger.post_mcp_tool_call` verbatim.
+
+    This is the half of the contract that keeps tasks 2951/2952/3644 intact --
+    a real census hard failure on a real run must still file its escalation."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+
+    mod._post_mcp_tool_call("http://localhost:9/mcp", "escalate_info", {"a": 1})
+
+    assert recorder.calls == [("http://localhost:9/mcp", "escalate_info", {"a": 1})]
+    # Pin the GUARD as the no-op, not just the reachability of the transport:
+    # asserting only on `recorder.calls` would pass equally against a guard
+    # that had simply been deleted, which is the regression this test exists
+    # to be the counterweight to.
+    assert mod._refuse_real_post_under_test("http://localhost:9/mcp", "escalate_info") is None
+
+
+def test_refuse_real_post_under_test_is_the_named_escape_hatch(monkeypatch):
+    """Entitlement to post for real under pytest is DECLARED, not inferred.
+
+    No automatic signal separates "a server this test brought up on an
+    ephemeral port" from "the ambient production server on 8103" -- the
+    leaking tests use 8103 too. So a caller that serves or fakes its OWN
+    endpoint neutralises `mod._refuse_real_post_under_test` at the call site,
+    which is what `escalation/tests/test_legibility_census_escalation_e2e.py`
+    (task 3644's live-server acceptance suite) does. Pinning the seam by NAME
+    is what keeps that opt-out from silently turning into "the guard stopped
+    working"."""
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_refuse_real_post_under_test (call)")
+
+    # Without the opt-out: refused, and the refusal explains itself.
+    with pytest.raises(mod.CensusPostRefusedUnderTest) as excinfo:
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    assert recorder.calls == []
+    message = str(excinfo.value)
+    # A future e2e author gets a self-explaining failure, not a mystery: the
+    # tool, the target and the way out are all named in the message itself.
+    assert "escalate_info" in message
+    assert "http://localhost:8103/mcp" in message
+    assert "_refuse_real_post_under_test" in message
+
+    # With the opt-out declared at the call site: the transport is reached.
+    monkeypatch.setattr(mod, "_refuse_real_post_under_test", lambda url, tool_name: None)
+    mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})]
+
+
 # ---------------------------------------------------------------------------
 # _build_stage_invokes — each census stage gets its OWN claude-CLI subprocess
 # timeout, threaded through the invoke(prompt, model) seam via
