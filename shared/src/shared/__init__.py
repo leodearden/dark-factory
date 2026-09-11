@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         count_transcript_turns,
         detect_ended_awaiting_background,
         detect_resumable_progress,
+        detect_transcript_model_id,
         ended_awaiting_background_for_session,
         invoke_claude_agent,
         invoke_with_cap_retry,
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
         require_non_blank_prompt,
         resumable_progress_for_session,
         transcript_exists,
+        transcript_model_id_for_session,
     )
     from shared.config_models import AccountConfig, UsageCapConfig
     from shared.cost_store import CostStore
@@ -109,6 +111,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'count_transcript_turns': 'cli_invoke',
     'detect_ended_awaiting_background': 'cli_invoke',
     'detect_resumable_progress': 'cli_invoke',
+    'detect_transcript_model_id': 'cli_invoke',
     'ended_awaiting_background_for_session': 'cli_invoke',
     'invoke_claude_agent': 'cli_invoke',
     'invoke_with_cap_retry': 'cli_invoke',
@@ -121,6 +124,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'require_non_blank_prompt': 'cli_invoke',
     'resumable_progress_for_session': 'cli_invoke',
     'transcript_exists': 'cli_invoke',
+    'transcript_model_id_for_session': 'cli_invoke',
     # shared.config_models
     'AccountConfig': 'config_models',
     'UsageCapConfig': 'config_models',
@@ -227,6 +231,7 @@ __all__ = [
     'note_unreadable_transcript',
     'detect_ended_awaiting_background',
     'detect_resumable_progress',
+    'detect_transcript_model_id',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -238,6 +243,7 @@ __all__ = [
     'require_non_blank_prompt',
     'resumable_progress_for_session',
     'transcript_exists',
+    'transcript_model_id_for_session',
     'AccountConfig',
     'UsageCapConfig',
     'CostStore',
