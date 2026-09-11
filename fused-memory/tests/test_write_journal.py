@@ -1219,3 +1219,204 @@ async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
     joined = ' '.join(r.getMessage() for r in errors)
     assert op_id in joined
     assert 'dead' in joined
+
+
+# ------------------------------------------------------------------
+# write_ops retention (task 3212 item 4)
+#
+# Unlike its two siblings this prune runs against a table measured at
+# 35.4M rows / 16 GB on 2026-09-11, so it is BATCHED and doubly bounded —
+# by a row budget and by a wall-clock deadline. Both bounds are asserted
+# here, because an unbounded startup DELETE would hold the write lock past
+# the watchdog's 120 s startup grace and silently drop journal rows while
+# it ran (busy_timeout is 5000 ms and log_write_op swallows its errors).
+# ------------------------------------------------------------------
+
+
+def _days_ago(days: float) -> str:
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+
+async def _seed_write_op(journal, *, operation, kind, created_at=None) -> str:
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=op_id,
+        source='mcp_tool',
+        operation=operation,
+        project_id='test-project',
+        kind=kind,
+        params={'query': 'q'},
+        result_summary={'count': 0},
+    )
+    if created_at is not None:
+        await journal._db.execute(
+            'UPDATE write_ops SET created_at = ? WHERE id = ?', (created_at, op_id)
+        )
+        await journal._db.commit()
+    return op_id
+
+
+async def _surviving_ids(journal) -> set[str]:
+    async with journal._db.execute('SELECT id FROM write_ops') as cursor:
+        return {row[0] for row in await cursor.fetchall()}
+
+
+@pytest.mark.asyncio
+async def test_prune_write_ops_keeps_rows_inside_the_cutoff(journal):
+    """(a)+(d) Only rows beyond a horizon are deleted; the return value is the count."""
+    fresh = await _seed_write_op(journal, operation='get_task', kind='read')
+    stale = await _seed_write_op(
+        journal, operation='get_task', kind='read', created_at=_days_ago(90)
+    )
+
+    deleted = await journal.prune_write_ops()
+
+    assert deleted == 1, f'RED: expected exactly the 1 stale row deleted, got {deleted}'
+    remaining = await _surviving_ids(journal)
+    assert fresh in remaining, 'RED: a row inside the retention window must survive'
+    assert stale not in remaining, 'RED: a row beyond the read horizon must be deleted'
+
+
+@pytest.mark.asyncio
+async def test_prune_write_ops_honours_three_independent_horizons(journal):
+    """(b) search reads outlive task reads; writes outlive both."""
+    aged = _days_ago(100)
+    search_row = await _seed_write_op(
+        journal, operation='search', kind='read', created_at=aged
+    )
+    task_read_row = await _seed_write_op(
+        journal, operation='get_task', kind='read', created_at=aged
+    )
+    write_row = await _seed_write_op(
+        journal, operation='add_memory', kind='write', created_at=aged
+    )
+
+    deleted = await journal.prune_write_ops()
+
+    remaining = await _surviving_ids(journal)
+    assert search_row in remaining, (
+        'RED: a search row older than read_older_than_days but inside '
+        'search_older_than_days must survive — it is leaf eta\'s sole data source'
+    )
+    assert task_read_row not in remaining, (
+        'RED: a non-search read beyond read_older_than_days must be deleted — task '
+        'reads are 97.9% of the table and have no downstream consumer'
+    )
+    assert write_row in remaining, (
+        'RED: a write row is the durable audit trail and is kept until '
+        'write_older_than_days'
+    )
+    assert deleted == 1, f'RED: expected exactly 1 deletion, got {deleted}'
+
+
+@pytest.mark.asyncio
+async def test_prune_write_ops_search_horizon_is_a_horizon_not_an_exemption(journal):
+    """(c) A search row past search_older_than_days IS deleted."""
+    ancient = await _seed_write_op(
+        journal, operation='search', kind='read', created_at=_days_ago(400)
+    )
+    recent = await _seed_write_op(
+        journal, operation='search', kind='read', created_at=_days_ago(100)
+    )
+
+    deleted = await journal.prune_write_ops()
+
+    remaining = await _surviving_ids(journal)
+    assert ancient not in remaining, (
+        'RED: search rows get a LONGER horizon, not an exemption from retention'
+    )
+    assert recent in remaining
+    assert deleted == 1, f'RED: expected exactly 1 deletion, got {deleted}'
+
+
+@pytest.mark.asyncio
+async def test_prune_write_ops_row_budget_bounds_a_single_run(journal, caplog):
+    """(e) `max_rows` caps a run, the remainder survives, and the cap is DISCLOSED."""
+    import logging
+
+    from fused_memory.services import write_journal as wj
+
+    aged = _days_ago(90)
+    for _ in range(5):
+        await _seed_write_op(journal, operation='get_task', kind='read', created_at=aged)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await journal.prune_write_ops(batch_size=1, max_rows=2)
+
+    assert deleted == 2, f'RED: max_rows must bound the run to 2, got {deleted}'
+    assert len(await _surviving_ids(journal)) == 3, (
+        'RED: rows beyond the budget must survive to a later run, not vanish'
+    )
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, 'RED: exhausting the row budget with rows still eligible must be loud'
+    assert 'read' in ' '.join(r.getMessage() for r in warnings), (
+        'RED: the WARNING must name WHICH horizon still has a backlog'
+    )
+
+
+@pytest.mark.asyncio
+async def test_prune_write_ops_deadline_bounds_a_single_run(journal, caplog, monkeypatch):
+    """(f) The wall-clock deadline is enforced BETWEEN batches, not merely documented."""
+    import logging
+
+    from fused_memory.services import write_journal as wj
+
+    aged = _days_ago(90)
+    for _ in range(5):
+        await _seed_write_op(journal, operation='get_task', kind='read', created_at=aged)
+
+    # A clock that jumps far past max_seconds on its second read, so the
+    # deadline — not the row budget — is what stops the loop.
+    class _JumpingClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            reading = self.now
+            self.now += 1000.0
+            return reading
+
+    monkeypatch.setattr(wj, '_monotonic', _JumpingClock())
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await journal.prune_write_ops(batch_size=1, max_rows=1_000_000)
+
+    assert 0 < deleted < 5, (
+        'RED: the deadline must stop the loop between batches with work remaining; '
+        f'got {deleted} of 5 eligible rows'
+    )
+    assert len(await _surviving_ids(journal)) == 5 - deleted
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, 'RED: stopping early on the deadline with rows eligible must be loud'
+
+
+@pytest.mark.asyncio
+async def test_prune_write_ops_never_raises(journal):
+    """(g) A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    journal._db = None
+    assert await journal.prune_write_ops() == 0
+
+
+def test_prune_write_ops_defaults_match_write_journal_config():
+    """The retention numbers exist twice; a drift guard keeps the copies equal."""
+    import inspect
+
+    from fused_memory.config.schema import WriteJournalConfig
+
+    defaults = inspect.signature(WriteJournal.prune_write_ops).parameters
+    config = WriteJournalConfig()
+    for parameter, field in (
+        ('read_older_than_days', 'read_retention_days'),
+        ('search_older_than_days', 'search_retention_days'),
+        ('write_older_than_days', 'write_retention_days'),
+        ('batch_size', 'prune_batch_size'),
+        ('max_rows', 'prune_max_rows_per_run'),
+        ('max_seconds', 'prune_max_seconds'),
+    ):
+        assert defaults[parameter].default == getattr(config, field), (
+            f'RED: prune_write_ops({parameter}=...) and '
+            f'WriteJournalConfig.{field} must not diverge'
+        )
