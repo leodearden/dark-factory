@@ -1852,7 +1852,7 @@ class TestStarvationWatchdogConfig:
       (c) partial override — overriding only `enabled: false` keeps skip_threshold and
           idle_secs at their defaults (deep-merge / no clobber).
 
-    Every (a)-shaped test here carries @pytest.mark.usefixtures('code_default_config'),
+    Every (a)-shaped test here carries @pytest.mark.usefixtures("code_default_config"),
     without exception: the autouse _isolate_orch_config pins ORCH_CONFIG_PATH at the
     operational dark-factory-orchestrator.yaml, which now carries a starvation_watchdog
     block (a47b5a506e), so ANY leaf an operator parks in it bleeds into a bare
@@ -1862,7 +1862,7 @@ class TestStarvationWatchdogConfig:
     instead; they need no fixture.
     """
 
-    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults(self):
         """Bare OrchestratorConfig() exposes starvation_watchdog with correct defaults."""
         from orchestrator.config import StarvationWatchdogConfig
@@ -1927,7 +1927,7 @@ class TestStarvationWatchdogConfig:
             f'got {cfg.starvation_watchdog.idle_secs!r}'
         )
 
-    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.usefixtures("code_default_config")
     def test_idle_only_secs_default(self):
         """Bare OrchestratorConfig() exposes idle_only_secs == 259200.0 (== idle_secs default).
 
