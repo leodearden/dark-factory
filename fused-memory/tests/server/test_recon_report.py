@@ -3937,6 +3937,137 @@ class TestReconReportDeleteFinding:
         )
         assert cite_result['error_type'] == 'ReconReportFindingUnknown'
 
+# ---------------------------------------------------------------------------
+# task-4653: explicit finding-id supersession.  add_finding(...,
+# supersedes=<finding_id>) stamps the TARGET finding's superseded_by with the
+# NEW finding's id, so a later finding can mark an earlier one historical.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportSupersedes:
+    """``add_finding(..., supersedes=<finding_id>)`` stamps the named TARGET's
+    ``superseded_by`` with the NEW finding's id.
+
+    In-run dedup keys on ``(task_id, flag_type)``, and a finding that RESOLVES
+    an earlier claim legitimately carries a DIFFERENT flag_type
+    (``memory_mechanism_contradiction`` vs ``..._resolved``), so dedup
+    structurally cannot relate the pair — the claim and its own refutation both
+    survive as live rows and an in-order consumer acts on the first.
+    Supersession is the explicit, finding-id-keyed assertion that relates them.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def _file(self, state, run_id='r1', task_id='42', flag_type='f', description='d'):
+        added = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='c',
+            description=description,
+            suggested_action='a',
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        assert 'finding_id' in added, f'add_finding failed: {added}'
+        return added['finding_id']
+
+    def test_fresh_finding_is_not_superseded(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        fid = self._file(state)
+
+        resolved = state._resolve_finding('r1', fid)
+        assert resolved is not None
+        _entry, finding = resolved
+        assert finding.superseded_by is None
+
+    def test_supersedes_stamps_the_target_with_the_new_finding_id(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        old_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=old_fid,
+        )
+        assert 'finding_id' in added, f'expected a normal success dict, got: {added}'
+        assert 'error' not in added
+        new_fid = added['finding_id']
+        assert new_fid != old_fid
+
+        # The stamp lands on the TARGET, pointing FORWARD to the superseder —
+        # not the other way round.
+        _e_old, old_finding = state._resolve_finding('r1', old_fid)
+        _e_new, new_finding = state._resolve_finding('r1', new_fid)
+        assert old_finding.superseded_by == new_fid
+        assert new_finding.superseded_by is None
+
+    def test_supersedes_stamps_it_does_not_purge_the_target(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        old_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        entry = state._state[('r1', 's1')]
+        assert len(entry.findings) == 1
+
+        state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=old_fid,
+        )
+
+        # +1 for the superseder; the superseded row is STILL there, readable.
+        assert len(entry.findings) == 2
+        assert old_fid in {f.finding_id for f in entry.findings}
+        assert state._resolve_finding('r1', old_fid) is not None
+
+    def test_supersedes_works_cross_stage_within_one_run(self):
+        """The production repro: Stage 1 flags a contradiction, Stage 2 resolves
+        it in the same run.  The two flag_types deliberately do NOT collide
+        under the ``(task_id, flag_type)`` dedup key, which is exactly why the
+        supersession has to be asserted explicitly.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        stage1_fid = self._file(
+            state, flag_type='memory_mechanism_contradiction', description='mechanism X contradicts Y'
+        )
+
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='mechanism X was fixed; the contradiction no longer holds',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=stage1_fid,
+        )
+        assert 'finding_id' in added, f'cross-stage supersede failed: {added}'
+        stage2_fid = added['finding_id']
+
+        # The superseder lives in Stage 2's entry; the stamp lands on Stage 1's row.
+        stage1_entry, stage1_finding = state._resolve_finding('r1', stage1_fid)
+        stage2_entry, _stage2_finding = state._resolve_finding('r1', stage2_fid)
+        assert stage1_entry.stage == 'memory_consolidator'
+        assert stage2_entry.stage == 'task_knowledge_sync'
+        assert stage1_finding.superseded_by == stage2_fid
+
 
 # ---------------------------------------------------------------------------
 # task-2410 step-7: delete_finding registered via FastMCP — RED until
