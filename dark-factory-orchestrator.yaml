@@ -1212,6 +1212,18 @@ orchestrator_restart_watch_prefixes:
   - "orchestrator/uv.lock"
   - "escalation/pyproject.toml"
 
+# Starvation watchdog idle-only backstop, effectively OFF until task 3821 deploys
+# (Leo, 2026-09-11, L2 docket option A). Its eligibility clock is in-memory, so
+# every restart re-anchors the whole pending pool, and idle_only_secs (72h in
+# defaults.yaml) later the entire cohort fires at once: 489 records on 09-07
+# (esc-4851-3) and 368 on 09-10 (esc-4507-5). With deploys paused, processes now
+# routinely outlive 72h. 30 days satisfies the idle_only_secs >= idle_secs
+# validator and leaves the dual gate (skip_threshold AND idle_secs) armed.
+# Green tier: applied by hot reload. REVERT by deleting this block once 3821's
+# restart-safe clock is deployed, or when deploys resume (task 5020).
+starvation_watchdog:
+  idle_only_secs: 2592000.0
+
 # Verify-scope inversion — σ capstone (plans/verify-scope-inversion-prd.md).
 # Flips the broad merge-role verify gate on and enables merge-train formation
 # now that ξ (boundary suite) is green and 2501 (per-project verify-slot
