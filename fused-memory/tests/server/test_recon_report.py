@@ -4156,6 +4156,77 @@ class TestReconReportSupersedes:
         _e, old_finding = state._resolve_finding('r1', old_fid)
         assert old_finding.superseded_by == retry['finding_id']
 
+    def test_supersedes_a_finding_whose_owning_entry_is_already_completed(self):
+        """The production shape: Stage 1 closes, THEN Stage 2 retires its claim.
+
+        Guarding the target's owning entry the way delete_finding does would
+        make the mechanism dead on arrival, since the only real use is a later
+        stage superseding an earlier — already-completed — stage's finding.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        stage1_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        completed = state.complete('r1', 'stage 1 done')
+        assert completed['flagged_count'] == 1
+
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='the contradiction no longer holds',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=stage1_fid,
+        )
+        assert 'finding_id' in added, f'supersede of a completed target rejected: {added}'
+        _e, stage1_finding = state._resolve_finding('r1', stage1_fid)
+        assert stage1_finding.superseded_by == added['finding_id']
+
+        # The deliberate asymmetry: delete_finding STILL rejects exactly this
+        # case, because purging a row corrupts complete()'s cached
+        # flagged_count.  A future refactor must not collapse the two paths.
+        deleted = state.delete_finding('r1', stage1_fid)
+        assert deleted == {
+            'error': 'report_already_completed',
+            'error_type': 'ReconReportAlreadyCompleted',
+        }
+
+        # Stamping perturbs no count: the Stage-1 entry still holds exactly the
+        # findings complete() cached.
+        repeat = state.start_report(
+            run_id='r1', stage='memory_consolidator', project_id='dark_factory'
+        )
+        assert repeat['already_started'] is True
+        assert repeat['completed'] is True
+        assert repeat['finding_count'] == completed['flagged_count']
+
+    def test_supersedes_still_rejected_when_the_FILING_entry_is_completed(self):
+        """The pre-existing post-complete() guard is on the entry being WRITTEN
+        to, and supersession does not weaken it."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        old_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        state.complete('r1', 'done')
+
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=old_fid,
+        )
+        assert result == {
+            'error': 'report_already_completed',
+            'error_type': 'ReconReportAlreadyCompleted',
+        }
+        _e, old_finding = state._resolve_finding('r1', old_fid)
+        assert old_finding.superseded_by is None
+
 
 # ---------------------------------------------------------------------------
 # task-2410 step-7: delete_finding registered via FastMCP — RED until
