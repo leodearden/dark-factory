@@ -3144,6 +3144,19 @@ Usage pattern (per PRD §9.2):
                   trigger condition) -- pass actionable=True explicitly
                   if a null-task_id/cross_project* finding must still
                   surface there.
+                  supersedes=<finding_id> marks an EARLIER finding of this
+                  run historical: use it when your finding RESOLVES or
+                  refutes that claim rather than restating it.  Dedup
+                  cannot do this for you — a resolving finding carries a
+                  different flag_type, so without supersedes the claim and
+                  its refutation both stay live and a reader acts on
+                  whichever comes first.  The target is STAMPED, not
+                  removed: it stays readable with a forward pointer and
+                  stops being actionable.  Prefer it over tool 5 below,
+                  which destroys the row; and unlike tool 5 it works on a
+                  target whose stage has already completed, which is the
+                  usual case.  An unresolvable supersedes fails the whole
+                  call — nothing is filed.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
@@ -3245,6 +3258,7 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
+        supersedes: str | None = None,
     ) -> dict:
         """Append a diagnostic finding.
 
@@ -3270,6 +3284,21 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         get_assembled_report for the exact trigger condition, and pass
         actionable=True explicitly if a null-task_id/cross_project*
         finding must still surface there.
+
+        supersedes (task-4653): the finding_id of an earlier finding in this
+        run that this one makes HISTORICAL — use it when your finding
+        RESOLVES or refutes an earlier claim rather than restating it.  Keyed
+        on the explicit finding_id, because the (task_id, flag_type) dedup
+        above cannot relate a claim to its resolution: the resolving finding
+        legitimately carries a different flag_type, so both otherwise survive
+        as live rows and a reader acts on whichever comes first.  The target
+        is STAMPED, not retracted — it stays readable in flagged_items with a
+        forward pointer, and is projected actionable=False so nothing acts on
+        it again.  Contrast delete_finding, which is irreversible and refuses
+        a target whose stage has completed; supersedes deliberately accepts
+        one, since retiring an earlier stage's claim is its whole purpose.
+        A supersedes that does not resolve in this run fails the WHOLE call
+        with finding_unknown — nothing is filed.
         """
         return state.add_finding(
             run_id=run_id,
@@ -3280,6 +3309,7 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
             actionable=actionable,
             task_id=task_id,
             flag_type=flag_type,
+            supersedes=supersedes,
         )
 
     @mcp.tool()
