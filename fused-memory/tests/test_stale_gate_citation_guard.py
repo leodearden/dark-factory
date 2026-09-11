@@ -181,3 +181,139 @@ class TestTerminalOutcomeEscape:
             'external deps 3658/3659 landing so this task can finally be '
             'dispatched once everything is done'
         ) == {3658, 3659}
+
+
+# Recon-stage agent_id — the only caller class this guard polices. Matches
+# test_recon_write_policy.py's AGENT_ID.
+AGENT_ID = 'recon-stage-task_knowledge_sync'
+
+# Task 3708's real dependencies array, re-confirmed against the live store
+# (tag=master) on 2026-09-11. `dependencies` is the separate relational table
+# dependencies(tag, task_id, depends_on), not a task column.
+LIVE_DEPS = [3658, 3659, 3707, 4856, 4987]
+
+
+class TestStaleGateCitationError:
+    """The predicate: does a gate assertion cite an id absent from the live
+    `dependencies` array? Flat ``dict | None``, mirroring
+    ``premise_lint_guard.premise_lint_error``."""
+
+    def test_stale_a_is_rejected(self):
+        err = stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_A, AGENT_ID, live_dependencies=LIVE_DEPS,
+        )
+        assert err is not None
+        assert err['error_type'] == 'ReconStaleGateCitationRejected'
+        assert '3660' in err['error']
+
+    def test_stale_b_is_rejected(self):
+        err = stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_B, AGENT_ID, live_dependencies=LIVE_DEPS,
+        )
+        assert err is not None
+        assert err['error_type'] == 'ReconStaleGateCitationRejected'
+        assert '3660' in err['error']
+
+    def test_rejection_names_the_corrective_path(self):
+        err = stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_A, AGENT_ID, live_dependencies=LIVE_DEPS,
+        )
+        assert err is not None
+        assert 'dependencies' in err['hint']
+        assert 're-derive' in err['hint'].lower()
+
+    def test_rejection_carries_the_live_array_so_no_second_read_is_needed(self):
+        # The whole reason blocking does not lose the evidence: Stage 2 can
+        # rewrite the one sentence and retry in the same turn.
+        err = stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_A, AGENT_ID, live_dependencies=LIVE_DEPS,
+        )
+        assert err is not None
+        message = err['error'] + err['hint']
+        for dep in LIVE_DEPS:
+            assert str(dep) in message
+
+    # --- fail-open: no violation ------------------------------------------- #
+
+    def test_correct_relays_are_not_rejected(self):
+        for text in (CORRECTION, TRANSITIVE, PARENTHETICAL, CAPS_GATING, ARROW_LEVERS):
+            assert stale_gate_citation_guard.stale_gate_citation_error(
+                text, AGENT_ID, live_dependencies=LIVE_DEPS,
+            ) is None
+
+    def test_non_recon_callers_are_not_policed(self):
+        for agent_id in ('claude-task-4919-implementer', None, ''):
+            assert stale_gate_citation_guard.stale_gate_citation_error(
+                STALE_A, agent_id, live_dependencies=LIVE_DEPS,
+            ) is None
+
+    def test_absent_or_non_str_details_is_a_no_op(self):
+        for details in (None, '', 123, ['external deps 3660']):
+            assert stale_gate_citation_guard.stale_gate_citation_error(
+                details, AGENT_ID, live_dependencies=LIVE_DEPS,
+            ) is None
+
+    def test_uninterpretable_dependencies_fails_open(self):
+        for deps in (None, 'reify:6508', {3658: True}, ['reify:6508', 'nope']):
+            assert stale_gate_citation_guard.stale_gate_citation_error(
+                STALE_A, AGENT_ID, live_dependencies=deps,
+            ) is None
+
+    def test_text_without_a_marker_is_a_no_op(self):
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            'actual_total=2 / expected_total=38 (36 missing)',
+            AGENT_ID,
+            live_dependencies=[],
+        ) is None
+
+    # --- normalisation: load-bearing, not defensive padding ----------------- #
+    #
+    # sqlite_task_backend._row_to_task types `dependencies` as list[int] on
+    # READ while TaskBackend.update_task(..., dependencies: list[str] | None)
+    # takes list[str] on WRITE, so this predicate genuinely receives both
+    # shapes depending on which source the interceptor picks.
+
+    def test_string_dependencies_behave_identically_to_ints(self):
+        as_strings = ['3658', '3659', '3707', '4856', '4987']
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            CORRECTION, AGENT_ID, live_dependencies=as_strings,
+        ) is None
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            CORRECTION, AGENT_ID, live_dependencies=LIVE_DEPS,
+        ) is None
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_A, AGENT_ID, live_dependencies=as_strings,
+        ) is not None
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_A, AGENT_ID, live_dependencies=LIVE_DEPS,
+        ) is not None
+
+    def test_mixed_int_and_str_dependencies_are_accepted(self):
+        err = stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_A, AGENT_ID, live_dependencies=[3658, '3659', 3707],
+        )
+        assert err is not None
+        assert '3660' in err['error']
+
+    def test_cross_project_dependency_spelling_is_skipped_not_raised(self):
+        # 'reify:6508' is the cross-project external-dep spelling; the numeric
+        # entries alongside it must still be honoured.
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            TRANSITIVE, AGENT_ID, live_dependencies=[3659, 'reify:6508', 4856],
+        ) is None
+
+    def test_empty_dependencies_still_enforces(self):
+        # An empty array is interpretable, not missing: citing pending gates
+        # when there are none is exactly the invariant violation.
+        err = stale_gate_citation_guard.stale_gate_citation_error(
+            STALE_A, AGENT_ID, live_dependencies=[],
+        )
+        assert err is not None
+        assert err['error_type'] == 'ReconStaleGateCitationRejected'
+
+    def test_retrospective_against_an_empty_array_is_allowed(self):
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            'external deps 3658/3659 have landed and this task is unblocked',
+            AGENT_ID,
+            live_dependencies=[],
+        ) is None
