@@ -25,5 +25,38 @@
       "description": "focusOnBounds() applies a padding multiplier (default 1.2) to maxDim before computing camera distance, while the existing fitToView() and flyToEntity() do not. This means focusOnBounds-based views will have 20% more whitespace around the target than direct calls, creating inconsistent zoom behavior.",
       "mutation_type": "obvious_copy"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Add bounding-box and multi-entity camera focus to the viewport selection manager",
+      "description": "The measurement tool needs to frame the geometry it has just measured, but the selection manager in `gui/src/viewport/selection.ts` only exposes whole-scene and single-entity framing. Add two functions to the selection-manager factory and surface them on `SelectionContext`: `focusOnBounds(bounds: Box3, padding?: number)`, which centres the perspective camera on an arbitrary world-space box along the current view direction, and `focusOnEntities(entityPaths: string[])`, which builds the combined box of the named meshes from `getMeshes()` and frames it. Both must also move the orbit-controls target to the box centre when `controls` is supplied, so the next drag orbits around what was framed. An empty box \u2014 no bounds, or no path in the list resolving to a live mesh \u2014 is a no-op and must leave the camera where it is.",
+      "test_strategy": "Unit-test both helpers against a stub `PerspectiveCamera` and `controls`: framing a known box puts the camera on the current view axis at the expected distance, leaves `camera.lookAt` on the box centre, and copies that centre into `controls.target`. Cover the no-op paths \u2014 an empty `Box3`, and an entity-path list whose paths are absent from `getMeshes()` \u2014 by asserting the camera position is unchanged. Run `npm run typecheck` and `npm run test` in `gui/`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "gui/src/viewport/selection.ts"
+    ],
+    "base_sha": "02e7115b4fae524314f1119a97710453e0d03871",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git log --all --format='%H %cI' --before=2026-04-08 -- gui/src/viewport/selection.ts to enumerate candidates newest-first; for each, GIT_INDEX_FILE=<tmp> git read-tree <candidate> && GIT_INDEX_FILE=<tmp> git apply --recount --cached --check ts_obvious_copy.diff, stopping at the first (newest) that returned rc=0; re-verified with a fresh temporary index.",
+      "applies_cleanly": true,
+      "tolerance_flags": [
+        "recount_required_hunk_header_undercounts_old_side"
+      ],
+      "candidates_tested": 18,
+      "reason": "diff --git paths (a/gui/src/viewport/selection.ts, b/gui/src/viewport/selection.ts) already carry the full gui/ prefix matching the repo layout, so no --directory=gui was needed. gui/src/viewport/selection.ts was touched by only 18 commits on main before 2026-04-08 (git log --all -- <path>, since --first-parent found only 5 of those on the strict first-parent mainline). The declared hunk header (@@ -246,6 +246,43 @@) undercounts old-side lines relative to actual hunk content (4 context + 0 removed = 4, not 6), so a literal `git apply --cached --check` fails on every candidate with 'corrupt patch at line 50'. With --recount, the patch applies cleanly (exit 0) against the 5 newest candidates touching this file (02e7115b .. e26758ba, 2026-03-21T17:21-21:09 UTC) and fails on every older one (19993ce and earlier: 'patch does not apply' at line 246 -- an older revision of the surrounding createSelectionManager body). Per the 'prefer the newest applying commit' rule, the base is 02e7115b4fae524314f1119a97710453e0d03871 (2026-03-21T21:09:34+00:00, 'resolve: merge conflicts for task/114'), confirmed an ancestor of main via git merge-base --is-ancestor.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

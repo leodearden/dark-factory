@@ -25,5 +25,38 @@
       "description": "lower_single_quoted_string() is defined but there's no corresponding case in the lower_expr() match dispatch for single-quoted strings. The function will never be called from the main lowering path.",
       "mutation_type": "missing_error_propagation"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Lower single-quoted string literals in the tree-sitter parser",
+      "description": "Reify sources can write string literals with single quotes, but `TsParser` in `crates/reify-syntax/src/ts_parser.rs` only lowers the double-quoted `string_literal` node kind, so a `'text'` literal never reaches `ExprKind::StringLiteral` and downstream evaluation sees nothing. Add `lower_single_quoted_string` next to `lower_string_literal` and wire single-quoted literals through the same expression-lowering path. Observable outcome: `'abc'` and `\"abc\"` in a .rfy source produce the same `Expr` \u2014 `ExprKind::StringLiteral(\"abc\")` with the span of the literal node \u2014 so the two quote styles are interchangeable everywhere a string literal is accepted today.",
+      "test_strategy": "Add `reify-syntax` unit tests that parse a binding for each quote style and assert both yield `ExprKind::StringLiteral` with the same payload and a span covering the literal node, plus a case where a single-quoted literal appears nested inside a larger expression. Re-run the existing `reify-syntax` parser suites to confirm no regression: `cargo test -p reify-syntax`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "crates/reify-syntax/src/ts_parser.rs"
+    ],
+    "base_sha": "7cc4491fef47244cfc66e5e1f9d67d069f5a0bc8",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index",
+      "applies_cleanly": true,
+      "tolerance_flags": [
+        "hunk header new-line count wrong: declared +1971,31, actual +1971,27; fixed by --recount"
+      ],
+      "candidates_tested": 1,
+      "reason": "Newest first-parent main commit before the corpus commit time (2026-04-07T16:36:49+01:00; commit dated 2026-04-07T16:34:57+01:00, 'chore(tasks): auto-commit after set_task_status(1005=blocked)'). Plain `git apply --cached --check` failed with 'corrupt patch at line 56' because the hunk's declared new-side line count (+1971,31) does not match the actual new-side body (11 context + 16 added = 27 lines); the old side (13/13, including the 2 removed lines) was already correct, confirming the insertion point itself is genuine. `--recount` recalculates the header and the hunk applies cleanly, with `fn lower_string_literal`'s body (including the `.unwrap_or(text)` -> `.unwrap()` change) and the new `lower_single_quoted_string` function matching real ts_parser.rs content exactly at this commit.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

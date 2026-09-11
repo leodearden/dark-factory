@@ -32,5 +32,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "test_scheduler_state_tools: de-flake 50ms perf assertion",
+      "description": "The 50ms median latency test with 9 samples is flake-prone on loaded CI. Mark @perf or measure helper directly.",
+      "test_strategy": "",
+      "details": "From post-merge review of task 1230 (reviewer_comprehensive).\n\n**Location:** `fused-memory/tests/test_scheduler_state_tools.py:343-362` (`TestSnapshotPerformance`)\n\n**Issue:** The 50 ms median latency test is timing-sensitive and prone to flake under loaded CI (file is hundreds of KB; JSON parse + `asyncio.to_thread` roundtrip can easily exceed 50 ms on a busy runner). 9 samples after a one-sample warm-up is too small for a tail-sensitive assertion. A flake here will block unrelated PRs.\n\n**Suggested fix:** One of:\n(a) Loosen threshold (150-250 ms) with a comment noting it's a regression canary.\n(b) Mark with `@pytest.mark.perf` and exclude from default CI.\n(c) Measure only the synchronous helper (`read_scheduler_state`) directly to remove asyncio/MCP overhead from the budget.\n\n**Acceptance:**\n- Either threshold raised + comment, or `@pytest.mark.perf` excluded from default CI, or test rewritten against the sync helper.\n- No flake under 5 consecutive CI runs on a typical loaded runner.",
+      "authored": false,
+      "id": "1335",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-14T18:15:46.282Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/tests/test_scheduler_state_tools.py"
+    ],
+    "base_sha": "f682641e7ee3155832eb5724aaed8d1f82b6a3a1",
+    "branch_sha": "303a6d0f70adacc9b8597f4b9d8feb5e498e23fc",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "9fbc0e02d68df4e309050d6757e5d891aeb66e0b",
+      "merge_base_sha": "f682641e7ee3155832eb5724aaed8d1f82b6a3a1",
+      "diff_reproduces_from": "git diff f682641e7e 9fbc0e02d6",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

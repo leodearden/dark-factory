@@ -25,5 +25,29 @@
       "description": "validate_simplex() is defined but never called. If it were used to validate the output of build_simplex, it would catch the off-by-one bug at runtime.",
       "mutation_type": "off_by_one"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Make the Nelder-Mead initial simplex step scale configurable",
+      "description": "`build_simplex` in `crates/reify-constraints/src/solver.rs` hard-codes the initial perturbation at 10% of each parameter's effective range, which is too coarse for tightly-bounded problems and too fine for wide ones, and the solve path has no way to pick a different step. Thread the step fraction through as a `scale: f64` argument and use it in place of the literal `0.1`, preserving the documented simplex shape: the initial point plus exactly one perturbation per dimension, each perturbation offset along its own dimension and clamped into that parameter's effective bounds. Add a `validate_simplex(simplex: &[Vec<f64>], n: usize) -> bool` predicate that checks a built simplex has the vertex count and per-vertex dimensionality Nelder-Mead requires, so the solve path and tests can reject a malformed simplex before it reaches the optimizer. Observable outcome: callers choose the step fraction per problem and the simplex shape is checkable at the boundary.",
+      "test_strategy": "Unit-test `build_simplex` for 1-, 2- and 3-dimensional inputs at two different `scale` values: assert `validate_simplex` accepts each result, that vertex `i + 1` differs from the initial point only in dimension `i` and by `(hi - lo) * scale` before clamping, and that a perturbation landing outside the bounds is clamped. Add negative cases for `validate_simplex` (wrong vertex count, short vertex) and confirm the existing solver convergence tests still pass with the default scale. `cargo test -p reify-constraints`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "crates/reify-constraints/src/solver.rs"
+    ],
+    "base_sha": null,
+    "branch_sha": null,
+    "base_sha_reason": "Unrecoverable. Tested 16 candidates (TIP 7cc4491f plus the 15 first-parent-main commits touching crates/reify-constraints/src/solver.rs between 2026-03-27T11:31:10+00:00 and 2026-04-01T12:18:55+01:00) -- every one fails, even with --recount, with 'patch failed: crates/reify-constraints/src/solver.rs:457'. Root cause is a fictional pre-image, not a recoverable count drift: the hunk's @@-line names the preceding function as `fn reflect_vertex(centroid: &[f64], worst: &[f64], alpha: f64) -> Vec<f64>`, but `git log --all -S'fn reflect_vertex' -- '*.rs'` returns zero commits across every branch in the repository -- that function never existed in reify. Separately, the hunk's leading context (`///`, `/// Creates N+1 vertices...`, `/// (one per dimension)...`) is missing the actual first line of the real doc comment (`/// Build the initial simplex for N-dimensional Nelder-Mead.`), and where the hunk assumes two nested closing braces (`        }` then `    }`) immediately before the doc comment, every real candidate has only a single closing brace there. The `fn build_simplex` function BODY the diff modifies (the old 2-arg signature, `for i in 0..n`, `let delta = (hi - lo) * 0.1;`) matches real historical solver.rs verbatim -- content was copied from genuine code -- but the diff's surrounding context/header was hand-spliced against a version of the file that never existed, so no commit's tree can satisfy the hunk's declared position.",
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": null
+  }
 }
