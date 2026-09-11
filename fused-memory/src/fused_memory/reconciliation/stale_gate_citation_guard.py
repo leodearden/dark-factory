@@ -99,6 +99,8 @@ from __future__ import annotations
 
 import re
 
+from fused_memory.reconciliation.task_filter import TERMINAL_OUTCOME_RE
+
 __all__ = [
     'GATE_CITATION_MARKER',
     'GATE_CITATION_RE',
@@ -152,6 +154,15 @@ GATE_CITATION_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# How far past the captured id list to look for a terminal-outcome cue. The
+# width is measured, not chosen: it must be wide enough to span
+# " have landed and this task is unblocked" (38 chars) yet narrow enough that
+# the live stale spelling's tail — " landing so this task (γ) can be dispat" —
+# still carries no cue. `\blanded\b` does not match "landing", so widening this
+# would not break the true positives, but a wider window absorbs incidental
+# later prose ("… once everything is done") into the decision.
+_TERMINAL_TAIL_WINDOW = 40
+
 
 def find_gate_citation_ids(text: str) -> set[int]:
     """Return the task ids cited as this task's pending external gates in `text`.
@@ -164,5 +175,15 @@ def find_gate_citation_ids(text: str) -> set[int]:
         return set()
     cited: set[int] = set()
     for m in GATE_CITATION_RE.finditer(text):
+        # A retrospective ("external deps 3658/3659 have landed") is not an
+        # assertion that those gates are still pending, so it is a legitimate
+        # relay even once `dependencies` has been emptied. Blocking it is the
+        # false-positive class this escape removes — the fail-open direction.
+        # TERMINAL_OUTCOME_RE is imported rather than re-spelled so this shares
+        # one "framed as a terminal outcome" vocabulary with task_filter's
+        # detectors.
+        tail = text[m.end():m.end() + _TERMINAL_TAIL_WINDOW]
+        if TERMINAL_OUTCOME_RE.search(tail):
+            continue
         cited.update(int(t) for t in re.findall(r'\d{2,5}', m.group(1)))
     return cited
