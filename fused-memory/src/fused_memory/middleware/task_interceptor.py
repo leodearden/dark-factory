@@ -125,6 +125,9 @@ from fused_memory.reconciliation.consolidation_gate import (
     resolve_unstamped_live_ids,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.stale_gate_citation_guard import (
+    stale_gate_citation_error,
+)
 
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
@@ -5517,9 +5520,12 @@ class TaskInterceptor:
             # `before` before the lock, which let the live task status drift
             # between the check and the write). snapshot_token is extracted
             # from the incoming metadata payload so gate 3 (stale-snapshot)
-            # can fire on this path. This same `before` read is reused below
-            # (task 2624) as the lifecycle-reset guard's before-snapshot, so
-            # a recon-stage write never issues two before-reads.
+            # can fire on this path. This same `before` read is reused by
+            # TWO other consumers, so a recon-stage write never issues two
+            # before-reads: the lifecycle-reset guard's before-snapshot
+            # (task 2624) below, and the stale-gate-citation guard's live
+            # `dependencies` array (task 4919) immediately after the verdict
+            # check.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -5564,6 +5570,29 @@ class TaskInterceptor:
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
+
+                # Task 4919: reject a relay that cites a pending external gate
+                # absent from the task's live `dependencies`. Incident: task
+                # 3708's relay prose kept naming 3660 as a live blocker for
+                # three cycles after 3660 was coalesced into 4856, because each
+                # relay copied the gate list forward from the previous relay's
+                # prose instead of re-deriving it.
+                #
+                # The `dependencies` kwarg takes precedence over `before`: one
+                # call may legitimately rewire the array and relay that change
+                # in the same write, and the invariant is about the array the
+                # write LEAVES BEHIND, so judging the prose against the
+                # pre-write row would reject that correct write. `before` is
+                # reused rather than re-read (see the comment block above).
+                if err := stale_gate_citation_error(
+                    kwargs.get('details'),
+                    agent_id,
+                    live_dependencies=(
+                        kwargs['dependencies'] if 'dependencies' in kwargs
+                        else (before or {}).get('dependencies')
+                    ),
+                ):
+                    return err
 
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
