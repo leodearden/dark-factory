@@ -127,7 +127,12 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    the change is no longer low-risk: **ABORT**. Do not commit `.task/`.
 
 4. **Rebase onto main.** `git -C <worktree> rebase main` (main may have moved). On **any conflict** →
+   run [Rebase recovery preflight](#rebase-recovery-preflight) to leave the worktree clean, then
    **ABORT** (a conflict means the change is no longer self-contained).
+
+   The cleanup is not optional politeness. Aborting the skill while the worktree is still
+   mid-rebase leaves precondition 5 refusing the *next* run for that exact reason, so the task
+   deadlocks: nothing can retry it and nothing cleans it up.
 
 5. **Verify.** Run the project's full verify suite from `orchestrator/config.yaml` in the worktree —
    `test_command`, then `lint_command`, then `type_check_command` (read them from the file; do not
@@ -316,6 +321,41 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
        calling `merge_cancel` — this section scopes that call to genuine not-landed outcomes.
 
+### Rebase recovery preflight
+
+`git rebase --abort` is the way out of a conflicted rebase, and it has two measured failure modes
+that leave the worktree wedged with no obvious way forward. Run the preflight first — from the
+**primary dark-factory checkout** (where `.venv/` and `orchestrator/` live — NOT the worktree,
+which has no `.venv`), exactly as precondition 6 invokes `b3_gate`:
+
+```
+.venv/bin/python -m orchestrator.rebase_recovery preflight --worktree <worktree>
+```
+
+Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
+
+- `clean` or `repaired` → run the abort itself, **with the guard**:
+  `git -C <worktree> -c rerere.enabled=false rebase --abort`. Use that spelling every time, not
+  the bare `git rebase --abort`: with rerere disabled git never opens `MERGE_RR`, which is what
+  makes the abort survive both failure modes.
+- `blocked` → **ABORT** the skill without running the abort, copying the payload's `unrepaired`
+  entries verbatim into your `reason`. `blocked` means something the preflight declined to touch —
+  typically a lock file a live process still holds open — and deciding what that process is, is a
+  human's call, not this skill's.
+
+Add `--report-only` to inspect without changing anything; it detects and reports, moves nothing,
+and returns `blocked` rather than `clean` when it finds damage it deliberately left in place.
+
+**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to a
+`MERGE_RR.quarantined-<timestamp>` sibling — **moved, never deleted**, because a *successful*
+abort deletes that file and it is the only record of which conflict ids the worktree was carrying.
+It also removes `*.lock` files that are both older than an hour **and** held open by no running
+process; a lock with a live holder is retained at any age.
+
+The state it detects is an id present in `MERGE_RR` with no backing `rr-cache/<id>` directory. How
+those directories come to be missing is **not established** — do not repeat any explanation of the
+cause, including in a report; describe only what was observed.
+
 ### Deriving the landed sha
 
 The derivation ladder itself — exact-subject marker search, the ref-existence gate, containment,
@@ -428,6 +468,9 @@ On any ABORT:
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
   return, exactly as the normal `task_failure`/`review_issues` path does.
 - Leave the worktree intact (do not remove it) so the human can inspect your partial work.
+  That includes any `MERGE_RR.quarantined-*` file the rebase-recovery preflight left behind: it is
+  preserved evidence of what the worktree was carrying when it wedged, and the human inspecting
+  your partial work is the reader it was preserved for. Do not tidy it away.
 - Return a structured result so the watcher can log it to the digest.
 
 ## Return value (your final message IS the data)

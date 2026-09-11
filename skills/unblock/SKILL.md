@@ -156,6 +156,17 @@ In the worktree:
 - `git log --oneline -10` — recent commits on the task branch
 - `git diff $(git merge-base main HEAD)..HEAD --stat` (equivalently `git diff main...HEAD --stat`) — scope of changes; use the merge-base/three-dot form, not two-dot `main..HEAD`, which charges everything that landed on main since the branch base to the task branch
 - Whether the branch can cleanly rebase on current main
+- Whether the worktree is safe to abort out of. From the **primary dark-factory checkout** (where
+  `.venv/` lives — not the worktree), run:
+
+  ```
+  .venv/bin/python -m orchestrator.rebase_recovery preflight --worktree <worktree> --report-only
+  ```
+
+  Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`. `--report-only` changes
+  nothing, so this is safe to run during analysis. A `blocked` verdict, or a non-empty `dangling`
+  list, means a plain `git rebase --abort` here is not safe — see
+  [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge) before you run one.
 
 ---
 
@@ -546,7 +557,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
 *Immediate-response failures (from `merge_request`):*
 
-- `status: "conflict"` or `status: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit).
+- `status: "conflict"` or `status: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit). If backing out of that rebase is the right call, do it via [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge) — not a bare `git rebase --abort`.
 - `status: "unknown_branch"` → the branch was not found by the merge queue. Verify the branch exists in this repo (`git branch`) and you are targeting the correct escalation MCP endpoint. Push the branch if needed, then loop back to step 7.
 - `status: "failed"` → read `result["reason"]` and address accordingly, then loop back to step 7.
 - `{"error": "Merge queue not available — orchestrator not running"}` → orchestrator is down; fall back to a direct merge (**this is the ONLY situation where a direct merge is appropriate — NEVER use it in response to `state: "unknown"`**):
@@ -554,11 +565,15 @@ The merge procedure is iterative — don't assume one pass will be enough:
   git merge --no-ff task/<TASK_ID>   # run from the main branch checkout
   git push origin main               # advance the remote ref so downstream dispatch sees it
   ```
+  If that `git merge --no-ff` conflicts, you are mid-merge **in the main checkout**, which is
+  machine-operated — the merge worker and the startup reconciler act on it directly. Back out via
+  [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge) rather than a bare
+  `git merge --abort`, and do not leave it mid-merge while you decide.
   **No downstream gate checks this path** — unlike the merge-queue path in step 7, nothing re-verifies after `git merge --no-ff` lands. Before running it, confirm you are on the current main tip and that a full verify passed against exactly that rebased tip, this iteration. If your last verify predates any main landing since — including because step 6's D1 empty-intersection terminator let you skip a re-verify loop — rebase onto the current tip and re-run the full suite first (see step 6's D1 carve-out above). Then proceed to step 8 with the resulting commit SHA.
 
 *Polled terminal failures (from `merge_status`):*
 
-- `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7. (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
+- `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7 (backing out of that rebase goes through [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge)). (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
 - `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → `merge_status` now self-resolves a landed merge via its git-authority tier and returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` when the branch is provably on main. **`unknown` does not mean "not landed"** — the tier is deliberately silent whenever it cannot *attribute* a landing, which now includes a branch that never advanced past its creation point and a landing that no commit on main cites. If `merge_status` still returns `unknown`, confirm deterministically:
   ```bash
   git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
@@ -791,6 +806,38 @@ Exit plan mode and execute. **Keep the task in its current status during the wor
 - Brief summary: what was accomplished, what was deferred (with task numbers)
 
 This is the last step. Do not consider the unblock workflow complete until reflect has run.
+
+### Recovering a wedged rebase or merge
+
+Anywhere this skill says "fix the conflict in the worktree, rebase on main" — and anywhere you
+decide to back out of a rebase or merge instead — do **not** reach for a bare `git rebase --abort`
+or `git merge --abort`. Both have measured failure modes that leave the worktree wedged: an abort can
+die outright, or fail with git's "Another git process seems to be running" advice, which names no
+remedy you can act on.
+
+Run the preflight first, from the **primary dark-factory checkout**:
+
+```
+.venv/bin/python -m orchestrator.rebase_recovery preflight --worktree <worktree>
+```
+
+Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
+
+- `clean` or `repaired` → abort **with the guard**, and use this spelling every time:
+  `git -C <worktree> -c rerere.enabled=false rebase --abort` (or `... merge --abort`). With rerere
+  disabled git never opens `MERGE_RR`, which is what makes the abort survive both failure modes.
+- `blocked` → do not abort. Report the payload's `unrepaired` entries to the human verbatim.
+  It means something the preflight declined to touch, typically a lock a live process still holds
+  open, and deciding what that process is, is a human's call.
+
+The preflight moves a suspect `MERGE_RR` aside to a `MERGE_RR.quarantined-<timestamp>` sibling —
+**moved, never deleted**. A *successful* abort deletes that file, and it is the only record of
+which conflict ids the worktree was carrying, so leave any quarantined copy where it is.
+
+The state it detects is an id present in `MERGE_RR` with no backing `rr-cache/<id>` directory. How
+those directories come to be missing is **not established** — report only what was observed, never
+an explanation of the cause.
+
 
 ---
 
