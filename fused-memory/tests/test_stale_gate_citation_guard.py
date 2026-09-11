@@ -508,3 +508,50 @@ class TestUpdateTaskBoundary:
 
         assert result.get('error_type') == 'ReconTerminalWriteRejected'
         taskmaster.update_task.assert_not_awaited()
+
+
+class TestGateCitationPromptSection:
+    """The generative half. The guard alone makes a bad relay unlandable only
+    after Stage 2 has spent the turn composing it; the prompt alone is
+    advisory and demonstrably insufficient — this incident IS an agent
+    re-reading live task state and still copy-forwarding the prose. Both
+    ship, sharing ERROR_TYPE and the marker tuple so they cannot drift.
+
+    Assertions stay at the level of "the mandate is present and
+    machine-linkable" — never sentence wording, which would make this a prose
+    pin rather than a behaviour test.
+    """
+
+    def test_section_is_rendered(self):
+        section = stale_gate_citation_guard.render_gate_citation_section()
+        assert isinstance(section, str)
+        assert section
+
+    def test_section_names_the_error_type_the_guard_returns(self):
+        # Single source of truth: renaming ERROR_TYPE cannot silently orphan
+        # the prompt's description of the rejection.
+        assert (
+            stale_gate_citation_guard.ERROR_TYPE
+            in stale_gate_citation_guard.render_gate_citation_section()
+        )
+
+    def test_section_names_the_field_to_re_read(self):
+        assert 'dependencies' in stale_gate_citation_guard.render_gate_citation_section()
+
+    def test_section_lists_every_policed_marker_phrase(self):
+        # An agent reading the prompt must be able to tell which phrasings are
+        # policed, so the prompt cannot describe a narrower rule than the regex
+        # enforces.
+        section = stale_gate_citation_guard.render_gate_citation_section()
+        for phrase in stale_gate_citation_guard.GATE_CITATION_MARKER_PHRASES:
+            assert phrase in section
+
+    def test_section_is_embedded_in_the_stage2_prompt_exactly_once(self):
+        from fused_memory.reconciliation.prompts.stage2 import (
+            STAGE2_SYSTEM_PROMPT,
+            build_stage2_system_prompt,
+        )
+
+        section = stale_gate_citation_guard.render_gate_citation_section()
+        assert STAGE2_SYSTEM_PROMPT.count(section) == 1
+        assert build_stage2_system_prompt('dark_factory').count(section) == 1
