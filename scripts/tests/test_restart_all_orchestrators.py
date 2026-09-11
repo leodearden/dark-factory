@@ -31,10 +31,12 @@ import pytest
 # test module would bind a module-scoped copy that shadows the conftest's.
 from df_pytest_isolation import (
     PIPE_CLOSING_LEAKER_SRC,
+    WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
     assert_synthetic_units,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
     fleet_dir_redirect_violation_reason,
+    load_scaled_grace,
     read_leaked_pid,
     run_in_new_session,
     synthetic_unit,
@@ -313,8 +315,13 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     reason = fleet_dir_redirect_violation_reason(value, tmp_path_factory.getbasetemp())
     assert reason is None, reason
 
-    # The genuinely per-root half: this proves THIS rootdir's conftest bound the
-    # fixture that set the variable checked above.
+    # The genuinely per-root half: this proves THIS rootdir's conftest bound a
+    # LIVE instance of the fixture -- which then either ESTABLISHED the value
+    # checked above or ADOPTED one another root's instance had already
+    # established (df_pytest_isolation.fleet_dir_redirect_target, task 4890).
+    # The two are indistinguishable from here, deliberately: what this pins is
+    # that the yielded path and the env var AGREE, which is exactly what
+    # stopped holding in a two-root session before adoption existed.
     assert Path(_df_fleet_dir_redirect).resolve() == Path(value or "").resolve()
 
 
@@ -487,7 +494,30 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     # the grace must outlast the timeout (or the script force-fires mid-test and
     # the assertion below fails), and must stay small enough that a poller which
     # escapes the kill self-terminates in seconds rather than 27.8h (task 3798).
-    spawn_timeout = 3
+    # That design is what makes the load-scaling below a ONE-line change:
+    # wait_proof_grace_secs derives from this same (now scaled) binding, so the
+    # grace-outlasts-timeout invariant holds automatically at every load -- at
+    # base 3 the grace is the 30s floor, at the 22 cap it is 88, always >= 4x.
+    #
+    # BASE 3 IS PRESERVED DELIBERATELY, not widened (task 4890): load_scaled_grace
+    # floors at its base, so an unloaded run is byte-identical and this test still
+    # takes ~3s there. The cap is WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS because the
+    # grace DERIVED from this binding must stay inside
+    # LEAK_SELF_TERMINATION_CEILING_SECS -- see that constant's derivation.
+    #
+    # THE MEASURED MECHANISM (task 4218): a flat 3s had to cover bash start +
+    # script parse + the fake systemctl's python3 (list-units) + drain_check.py's
+    # own python3 before the defer `echo` in restart-all-orchestrators.sh is even
+    # reached. The one observed failure's stdout ended exactly at the preceding
+    # "Restarting 1 orchestrator unit(s)" line, which is the signature of the
+    # budget expiring before that echo. The MIRROR test in
+    # tests/scripts/test_orchestrator_watchdog.py::
+    # test_boundary4_defers_busy_unit_while_others_proceed carries a comment
+    # recording that 8s was already measured as insufficient for the same defer
+    # line under load and was raised to 20 -- this site's 3s was 2.7x tighter
+    # still. Freshness is NOT the mechanism: `classify` needs now - ts_epoch > 120
+    # for stale, unreachable inside a 3s budget.
+    spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
@@ -507,7 +537,21 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     # here is how the task-3799 rename would silently half-land -- the defer
     # assertion would just stop matching the name the fixture actually used.
     assert f"deferring restart of {UNIT_R}: mid-merge" in stdout, (
-        f"expected a stable defer-prefix line; got stdout={stdout!r}"
+        f"expected a stable defer-prefix line; got stdout={stdout!r} "
+        f"stderr={_decode(exc_info.value.stderr)!r} "
+        f"(spawn_timeout={spawn_timeout}s, load-scaled from base 3). "
+        f"TWO mechanisms produce this, and their stdout is byte-identical, so "
+        f"check both before touching a number: (1) the budget expired before "
+        f"the defer `echo` was reached -- stdout ending at the preceding "
+        f"'Restarting N orchestrator unit(s)' line is the tell, and the "
+        f"remedy is the load scaling already applied here, so log the RESOLVED "
+        f"budget above and check whether it hit the cap rather than widening "
+        f"the base; (2) restart-all-orchestrators.sh coerces ANY non-zero exit "
+        f"of drain_check.py to raw=\"absent\", after which drain_await_fresh "
+        f"polls SILENTLY for up to ORCH_DRAIN_UNKNOWN_GRACE_SECS (default 120, "
+        f"deliberately left unset by this test) and prints nothing at all. "
+        f"Do NOT pin that grace to disambiguate -- it trades a silent stall "
+        f"for an equally confusing spurious restart."
     )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
@@ -706,7 +750,17 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     # ONE binding feeding BOTH the grace and the timeout -- see
     # test_defer_withholds_restart_while_busy above. This is the test named in
     # every sampled orphan's PYTEST_CURRENT_TEST (task 3798).
-    spawn_timeout = 3
+    #
+    # Load-scaled for the same measured reason as that sibling, and it matters
+    # MORE here (task 4890 amendment). This test's only behavioural assertion
+    # is NEGATIVE, so a flat 3s budget that expires before the script even
+    # reaches the drain gate makes it pass VACUOUSLY -- proving nothing about
+    # the bounded wait it is named for, and proving nothing SILENTLY, which is
+    # a worse outcome than the flake fixed next door. Base 3 is preserved, not
+    # widened, so an unloaded run stays byte-identical; the cap is
+    # WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS because the grace derived from this
+    # same binding must stay inside LEAK_SELF_TERMINATION_CEILING_SECS.
+    spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
@@ -722,6 +776,26 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
         )
 
     stdout = _decode(exc_info.value.stdout)
+    # NON-VACUITY, without which the negative assertion below is satisfied just
+    # as well by a subprocess killed before it ever entered the wait (task 4890
+    # amendment). There is no drain line to assert on and that is by contract,
+    # not oversight: restart-all-orchestrators.sh's `drain_await_fresh` "prints
+    # nothing to stdout" while it polls, and the one line the absent path ever
+    # emits -- "proceeding with restart of <unit>: heartbeat absent after Ns
+    # grace" -- is printed when the grace ELAPSES, which must never happen
+    # here. So the strongest available witness is the last line before the
+    # gate: it is echoed immediately ahead of the per-unit loop that calls
+    # `drain_gate`, so reaching it proves the subprocess cleared bash start,
+    # script parse and the fake systemctl's `list-units`, i.e. that the kill
+    # landed INSIDE the bounded wait rather than short of it.
+    assert f"Restarting 1 orchestrator unit(s): {UNIT_R}" in stdout, (
+        f"the script was killed before it reached the per-unit drain gate, so "
+        f"the no-restart assertion below would hold VACUOUSLY. Raise nothing "
+        f"by hand: spawn_timeout={spawn_timeout}s is already load-scaled from "
+        f"base 3, so check whether it hit the "
+        f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS cap before touching a number. "
+        f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
+    )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
         f"restart must NOT have been recorded yet; got calls={state['calls']!r} "
@@ -784,10 +858,26 @@ def _heartbeat_timeline(fleet_dir, unit, timeline):
     (missing_ok=True), driving the verdict to "absent".
 
     Yields a `fired` list that each transition appends its label to on
-    success -- callers' non-vacuity handle in BOTH directions: a transition a
-    test depends on asserts its label IS in `fired`; a counterfactual "trap"
-    transition the correct code must never reach asserts its label is NOT in
-    `fired`.
+    success. READ THAT LIST FOR WHAT IT IS: a wall-clock observation of THIS
+    process, never a record of what the spawned script reached. Every timer is
+    armed here at context entry and cancelled only once the with-BODY returns,
+    so a label lands in `fired` iff the script's TOTAL wall clock outran that
+    label's delay -- whatever the script did or did not observe.
+
+    So only POSITIVE `<label> in fired` checks are legitimate, and what they
+    assert is non-vacuity: "the rewrite this test depends on did happen before
+    the script exited". A NEGATIVE `<label> not in fired` is FORBIDDEN in any
+    form (task 4890). It reads as "the correct code never reached that state"
+    and is in fact "this host was fast enough", so it fails on correct code
+    under load: one stood in
+    test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor and
+    failed 2/10 isolated reruns at loadavg 90 on 32 cores, where the same run's
+    wall clock was measured varying 11.3s-39.7s. Observe a counterfactual
+    "trap" transition through the SUBPROCESS'S STDOUT instead -- that records
+    what the script actually reached, and no amount of host load can perturb
+    it. `test_fired_records_elapsed_wall_clock_not_script_reachability` pins
+    this premise directly, and is the test to read before adding a timeline
+    test that wants to assert a negative.
 
     Cancels and joins every timer on the way out, and asserts that no
     transition raised -- collected into a list rather than left to escape
@@ -846,6 +936,62 @@ def _heartbeat_timeline(fleet_dir, unit, timeline):
                 raise AssertionError(
                     f"heartbeat timeline transition(s) raised: {errors!r}"
                 )
+
+
+def test_fired_records_elapsed_wall_clock_not_script_reachability(tmp_path):
+    """`fired` is a WALL-CLOCK observation of the TEST process -- not a record
+    of what the spawned script actually reached.
+
+    `_heartbeat_timeline` arms one `threading.Timer` per transition IN THIS
+    process and cancels them only once the with-block exits, so a label
+    lands in `fired` iff the BODY was still inside the block when that
+    timer's delay elapsed -- whether or not anything ever read the heartbeat
+    the transition wrote. The body below proves the decoupling: it finishes
+    everything it cares about in its first statement (reading the
+    pre-transition heartbeat), then merely LINGERS past the transition's
+    delay, standing in for a subprocess still running under host load. The
+    label lands anyway.
+
+    That is why a NEGATIVE `assert <label> not in fired` cannot be a
+    behavioural assertion: it asserts only "the with-body returned in under
+    <delay> seconds", which on a contended host is a property of the LOAD,
+    not of the code under test (task 4890). The POSITIVE `<label> in fired`
+    non-vacuity checks elsewhere in this file are a different claim and are
+    unaffected -- they assert a transition a test depends on did land.
+
+    Load-independent in the direction that matters: it asserts a label IS
+    present after lingering PAST the delay, so extra host load can only make
+    it more true, never flaky. In-process and sub-second; spawns no
+    subprocess and shims no PATH.
+    """
+    fleet_dir = tmp_path / "fleet"
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+    trap_delay_secs = 0.2
+
+    with _heartbeat_timeline(
+        fleet_dir, UNIT_R, [("trap", trap_delay_secs, _HB_IDLE)],
+    ) as fired:
+        # The body's OWN business, complete in one statement: it reads the
+        # heartbeat and gets the pre-transition value. Nothing below ever
+        # looks at the file again, so nothing here observes the trap.
+        observed = json.loads((fleet_dir / f"{UNIT_R}.json").read_text())
+        # From here the body only LINGERS -- the stand-in for `_run_script`
+        # still blocking on a child that host load has slowed down.
+        time.sleep(trap_delay_secs * 2)
+        # Bounded top-up wait: under heavy load the timer THREAD may not have
+        # been scheduled by the time that sleep returns. Waiting on the
+        # CONDITION rather than trusting one fixed sleep is what keeps this
+        # test's own assertion load-independent -- extra load makes it wait
+        # longer, never fail. The bound only caps a genuine hang.
+        deadline = time.monotonic() + 30
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    assert "trap" in fired, (
+        f"the trap label must land purely because the BODY lingered past "
+        f"{trap_delay_secs}s, with nothing having read the heartbeat it "
+        f"wrote; got fired={fired!r} body_observed={observed!r}"
+    )
 
 
 def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
@@ -1161,31 +1307,57 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
         of the UNRESET deadline (start~0 + FORCE_FIRE(10) = ~10). The outer
         loop force-fires the first time elapsed reaches 10 -- around
         t~10-11 -- and never reads the heartbeat again, so the t=15 trap is
-        unreachable: `fired` stays ["stale", "busy"].
+        unreachable BY THE SCRIPT: it prints the force line and no resume
+        line. (The trap's timer may still FIRE in this process afterwards
+        if the run is slow -- see below; that says nothing about the
+        anchor.)
       - Anchor RESET (the regression): start_secs restarts at t~8-9, so the
         new deadline is ~8-9 + FORCE_FIRE(10) = ~18-19 -- AFTER the trap.
         The loop keeps polling past t=15, its own (unguarded-by-FORCE_FIRE)
         idle check reads the trap's heartbeat, and it prints "resuming
         restart of <unit>: drained" with NO force line (the reset deadline
         would not have been reached until t~18-19).
-    The two counterfactuals differ in OUTPUT, not merely in duration, so the
-    assertions below are text-level: exactly two defer lines (the initial
-    one plus the re-defer after the stale interlude -- itself independent
-    corroboration that the oscillation happened), a force line present, a
-    resume line absent, and "idle-trap" absent from `fired`.
+    The two counterfactuals differ in OUTPUT, not merely in duration, so
+    every assertion below is text-level, read off the subprocess's STDOUT:
+    exactly two defer lines (the initial one plus the re-defer after the
+    stale interlude -- itself independent corroboration that the
+    oscillation happened), a force line PRESENT, and a resume line ABSENT.
+    That pair discriminates both counterfactuals completely, and stdout is
+    a record of what the script actually reached, which no amount of host
+    load can perturb.
+
+    The trap is therefore observed through stdout and NEVER through this
+    process's timer. A negative `assert "idle-trap" not in fired` used to
+    stand here and was deleted (task 4890): `fired` is appended by a
+    `threading.Timer` armed in the TEST process and cancelled only when
+    `_run_script` returns, so it reports "the script's total wall clock
+    exceeded 15s" -- a quantity measured varying 11.3s-39.7s across five
+    runs at loadavg 90 on 32 cores, i.e. a property of the host, not of
+    the anchor. It failed 2/10 isolated reruns while the code was correct.
+    `test_fired_records_elapsed_wall_clock_not_script_reachability` (above)
+    pins that premise directly.
+
+    DO NOT, on a recurrence here: widen the trap delay, raise FORCE_FIRE,
+    or re-add a negative `fired` assertion in any form. The trap ENTRY at
+    t=15 stays -- it is load-bearing, being what makes the reset path print
+    a resume line instead of merely force-firing later -- but its only
+    legitimate observation is the stdout pair above.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is a must-never-elapse bound here (the
-    # unit resumes busy on its own at t=8, well inside it). Capped at 22
-    # (rather than pushed higher for even more trap margin) because
-    # wait_proof_grace_secs(22)=88 is the largest multiple of this spawn
-    # timeout that still stays inside LEAK_SELF_TERMINATION_CEILING_SECS
-    # (90s, df_pytest_isolation.py). That ceiling is load-bearing: a poll
-    # loop that escapes its kill must expire while pytest's tmpdir -- and so
-    # the fake `systemctl` on its PATH -- still exists, or its expiry falls
-    # through to /usr/bin/systemctl and restarts REAL units.
-    spawn_timeout = 22
+    # unit resumes busy on its own at t=8, well inside it), so this site wants
+    # the LARGEST spawn timeout a wait-proving test may legally take -- which
+    # is precisely what WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS is defined to be.
+    # The 22 -> wait_proof_grace_secs(22)=88 <= 90 derivation, and why that
+    # ceiling is load-bearing, live ONCE at that constant in
+    # df_pytest_isolation and are deliberately not re-spelled here (task 4890
+    # amendment): a bare literal would survive a move of
+    # WAIT_PROOF_GRACE_MULTIPLIER or LEAK_SELF_TERMINATION_CEILING_SECS with a
+    # silently-wrong comment, out of reach of
+    # test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits, which
+    # pins the constant but cannot see a copy of its arithmetic.
+    spawn_timeout = WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS
 
-    result, state, fired = _busy_unit_drain_run(
+    result, state, _ = _busy_unit_drain_run(
         tmp_path,
         [
             ("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE),
@@ -1214,10 +1386,6 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     assert f"resuming restart of {UNIT_R}: drained" not in result.stdout, (
         f"expected NO resume line -- one here means start_secs was reset "
         f"on the busy-resumption arm; got stdout={result.stdout!r}"
-    )
-    assert "idle-trap" not in fired, (
-        f"the idle-trap transition fired, meaning the script was still "
-        f"running at t=15 -- the anchor must have been reset: fired={fired!r}"
     )
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"

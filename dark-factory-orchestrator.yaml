@@ -369,6 +369,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #       skills/spawn/spawn-claude.sh to cross-check a bash/Python encoder mirror.
 #   tests/scripts/test_find_escalation_port.py    — LOADS AND EXECUTES the real
 #       skills/factory-init/scripts/find_escalation_port.py (task 3705).
+#   tests/scripts/test_unblock_skill_done_provenance_templates.py — reads
+#       skills/unblock/SKILL.md to validate its done_provenance payload
+#       literals against the live DoneProvenance model (task 4095).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
@@ -798,6 +801,34 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 verify_command_timeout_secs: 3600
 verify_cold_command_timeout_secs: 5400
 
+# Pre-turn-1 startup grace (Leo, 2026-09-07; esc-4444-3 cluster).
+# RAISED 120 -> 450, matching reify's already-ruled value.
+#
+# WHY. Six of the seven members of the 2026-09-03 dispatch-failure cluster were
+# NOT an upstream 529 — they were pre-turn-1 kills landing at 120600-120835ms,
+# i.e. within ~250ms of this fixed 120s wall clock. Failures clustered that
+# tightly around a fixed budget are watchdog behaviour, not variable-API
+# behaviour. The agent never produced a turn, so it never read its task, and the
+# kill destroys the evidence that would distinguish a genuine hang from CPU
+# starvation. This host runs at CPU PSI ~52% (some avg10) with runqueue >100 on
+# 32 cores, so 120s of wall clock is routinely not 120s of scheduled CPU.
+#
+# COST OF BEING WRONG is bounded and small, per reify's identical ruling: a
+# genuine from-source-build / uv / MCP-startup wedge now burns 450s instead of
+# 120s before the kill. That is cheap against the alternative measured here — a
+# terminal BLOCKED task plus an L2 escalation plus a human unblock session,
+# because the planning path has no retry for this shape.
+#
+# NOT the whole fix. This widens a fixed budget; it does not make the budget
+# load-aware, and it does not fix the stderr naming the wrong bound. Task 3326
+# ("Watchdog two-regime startup grace") owns both halves and remains pending.
+#
+# Green-tier: timeouts.startup_grace_secs is in RELOADABLE_FIELDS via
+# _submodel_leaf_paths('timeouts', TimeoutsConfig). Applies via the escalation
+# MCP's reload_config, no restart.
+timeouts:
+  startup_grace_secs: 450
+
 # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3). On a COLD verify
 # worktree the shared workspace .venv is populated only as a SIDE EFFECT of the
 # TEST leg running `uv run pytest` in each member. The full-repo-scope root LINT
@@ -934,7 +965,41 @@ verify_admission_pytest_n: "8"
 # next run, put this back to 1 rather than raising it further — the box is CPU
 # constrained (verify was ~72% of a 99.3%-busy 32-core host on 2026-08-28) and
 # more verify concurrency is not free.
-verify_admission_task_slots: 3
+#
+# PUT BACK TO 1 (operator decision, Leo 2026-09-08, load-tuning session). The
+# "REVERSIBLE AND UNDER OBSERVATION" clause above fired: median task duration
+# did not fall, it rose. Measured from the same event store, orchestrator-module
+# TASK-LEG verify only:
+#   1 slot  (30 legs before 2026-09-03 15:58Z): median 2300s, 10% hit the 3600s wall
+#   3 slots (49 legs after):                    median censored at 3600s, 80% hit it
+# Merge verify median moved 2572s -> 3199s across the same step, and journal
+# timeouts/day went 2,1,3,7,13,9,7 (08-28..09-07). Dose-response against the
+# number of OTHER concurrent orchestrator-suite fan-outs: 0-0.5 others -> 1978s
+# median, 0/12 timeouts; >=0.5 others -> 3600s censored, 29/52 timeouts. So 2
+# slots is not a middle ground either. Slot time is not the constraint: the whole
+# task-lane leg volume (~240 legs/14d) sums to ~5.5h/day, i.e. ~23% of ONE slot.
+# The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
+# 49-72 and non-discriminating at this load, per task 3590).
+# The main-tip sweep (background role) shares this slot and was already live in
+# the 1-slot regime the 2300s figure comes from.
+verify_admission_task_slots: 1
+
+# Pin `-n auto` for every verify subprocess (task 3589's residual, operator
+# decision Leo 2026-09-08). pytest-xdist resolves `-n auto` via psutil physical
+# cores (16) when psutil is importable and via sched_getaffinity (32) when it is
+# not; psutil is only a `sampler` dependency, so it lands in a cold worktree's
+# .venv only through `uv sync --all-packages`. The MERGE test leg carries no `-n`
+# (it is deliberately exempt from verify_admission_pytest_n, see above) and so
+# ran 16 or 32 workers depending on that accident. This pins it at 16, the
+# physical-core count and the wall-clock optimum of 3589's loaded-host ladder;
+# it is NOT a merge throttle. Task/background legs are untouched: their explicit
+# `-n 8` beats this (the env var only feeds `-n auto`). This overlays LAST in
+# verify.py::_resolve_verify_env, so it also wins over the unit-level
+# PYTEST_XDIST_AUTO_NUM_WORKERS=8 that caps the offline lane and agent shells.
+# Green-tier (verify_env is in RELOADABLE_FIELDS).
+verify_env:
+  # A/B arm: PYTEST_XDIST_AUTO_NUM_WORKERS set to "8" at 2026-09-10T12:42:14Z by scripts/merge-pytest-n-ab-switch.sh
+  PYTEST_XDIST_AUTO_NUM_WORKERS: "8"
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
@@ -981,9 +1046,25 @@ escalation:
 # turn cap, not the dollar cap, is the binding margin on large scope.
 # 180 = ~1.9x p99, matches reify's architect cap (raised 2026-08-19). The
 # dollar ceiling (15.0) still bounds true runaways independently.
+# implementer 80 -> 160, debugger 50 -> 100, merger 50 -> 100, simple_task
+# 50 -> 100 (2026-09-10, Leo ruling D4 of the agent-capacity study,
+# plans/agent-capacity-study-2026-09-09.md section 10). Same doctrine as the two
+# raises above: a cap is a runaway guard at ~2x the p99 of healthy runs, not a
+# throttle. Measured 2026-08-10..09-10 (invocation_end, appendix S5 section 1.1
+# and E-sweep 2a): implementer/sonnet at the 80 cap: p90=67 p95=77 max-successful
+# 99, cap-hit 14.8%, 17.3% of all implementer spend cap-killed all-time;
+# merger p50=48 p95=52 vs cap 50, cap-hit 29.4%; simple_task p95=42 max 51 vs 50,
+# cap-hit 6.3%; debugger/sonnet max successful 59 vs cap 50. The p99s are
+# censored BY these caps, so 160/100 are provisional; re-baseline after two
+# weeks once the uncensored p99 is visible (E-sweep 2a query). Dollar
+# ceilings below still bound true runaways.
 max_turns:
   architect: 180
   reviewer: 60
+  implementer: 160
+  debugger: 100
+  merger: 100
+  simple_task: 100
 
 # Per-role per-invocation dollar ceilings. reviewer 5.0 -> 12.0, same
 # investigation and same rationale as the max_turns.reviewer raise above.
@@ -999,8 +1080,35 @@ max_turns:
 # cap masks the other.
 # EXPECTED TO REDUCE net spend: a cap-killed run burns the FULL ceiling, yields
 # nothing, and is then retried up to 4 more times.
+# implementer 10.0 -> 20.0, merger 5.0 -> 8.0 (2026-09-10, same ruling D4).
+# implementer/opus cost p95=$9.67, max=$10.00 (= the ceiling, so censored); 31
+# budget-cap kills in 30 days and 27 zero-output deaths worth $273 on reify at
+# the same $10 wall; the large-plan routing rules raise turns to 120 but never
+# raised the dollar ceiling, so exactly the runs judged to need more turns
+# were the ones dying on dollars. merger: cost p95=$3.01 but 29.4% turn-cap
+# kills at 50 turns -> 8.0 keeps the dollar cap above a 100-turn run.
 budgets:
   reviewer: 12.0
+  implementer: 20.0
+  merger: 8.0
+
+# Per-role model overrides (project-level; defaults.yaml is the fleet default).
+# implementer/debugger sonnet -> opus on dark-factory ONLY, for a two-week
+# canary from 2026-09-10 (Leo ruling D4). Basis: on the same task population
+# implementer/sonnet hit its turn cap 14.6% of the time vs 0.08% for
+# implementer/opus (178x), with p50 turns 42 vs 55 -- sonnet was not doing more
+# work per turn, it was failing to converge; and 73% of implementer/debugger
+# dispatches were ALREADY routed to opus by the large-plan-steps /
+# large-plan-modules rules (which at lock_depth 12 read "touches >= 3 files").
+# This makes those two rules no-ops here; they are left in defaults.yaml for
+# the fleet. Expected net cost ~ +$25/day (+4%) after subtracting cap-kill
+# retries. CANARY / REVERT RULE: revert to sonnet if opus cap-kill on the
+# ex-sonnet population exceeds 2% after ~500 invocations, or if opus
+# account cap_hit events (account_events) rise materially above the
+# 30-day baseline of ~13/day. Hot-reloadable (green tier).
+models:
+  implementer: opus
+  debugger: opus
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
@@ -1103,6 +1211,18 @@ orchestrator_restart_watch_prefixes:
   - "orchestrator/pyproject.toml"
   - "orchestrator/uv.lock"
   - "escalation/pyproject.toml"
+
+# Starvation watchdog idle-only backstop, effectively OFF until task 3821 deploys
+# (Leo, 2026-09-11, L2 docket option A). Its eligibility clock is in-memory, so
+# every restart re-anchors the whole pending pool, and idle_only_secs (72h in
+# defaults.yaml) later the entire cohort fires at once: 489 records on 09-07
+# (esc-4851-3) and 368 on 09-10 (esc-4507-5). With deploys paused, processes now
+# routinely outlive 72h. 30 days satisfies the idle_only_secs >= idle_secs
+# validator and leaves the dual gate (skip_threshold AND idle_secs) armed.
+# Green tier: applied by hot reload. REVERT by deleting this block once 3821's
+# restart-safe clock is deployed, or when deploys resume (task 5020).
+starvation_watchdog:
+  idle_only_secs: 2592000.0
 
 # Verify-scope inversion — σ capstone (plans/verify-scope-inversion-prd.md).
 # Flips the broad merge-role verify gate on and enables merge-train formation

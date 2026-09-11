@@ -1517,6 +1517,12 @@ class TestStampOne:
         assert kwargs['metadata_patch'] == {'topic': 'topic-one'}
         assert kwargs['metadata_mode'] == 'merge'
         assert kwargs['_source'] == 'retro_stamp_topics'
+        assert kwargs['agent_id'] == 'retro_stamp_topics', (
+            'a metadata_patch write routes through '
+            '_apply_memory_metadata_validation, whose census/storm keying '
+            'reads agent_id (not _source) -- an unset agent_id keys every '
+            'row from this sweep to a null agent'
+        )
         assert 'content' not in kwargs, (
             f'a content argument would re-embed the record: {kwargs}'
         )

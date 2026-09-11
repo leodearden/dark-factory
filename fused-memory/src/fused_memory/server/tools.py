@@ -491,8 +491,8 @@ Conventions:
   consolidate/update the existing entries or add context to the human gate task named in the hint;
   and (2) a cosine guard, scoped to procedural_knowledge only, that soft-blocks a write matching an
   existing entry at high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
-  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
-  agents are exempt from both. Both guards apply only while write_triage.enabled is false (the
+  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct. No agent
+  class is exempt. Both guards apply only while write_triage.enabled is false (the
   shipped default); with it on, an explicit Mem0-primary write is REDIRECTED instead of rejected —
   nothing is soft-blocked, the ack carries routed (stored | restated | amended | contested) plus
   canonical_id on an attach, and a restated write becomes a sighting CHILD of the memory it
@@ -3218,11 +3218,12 @@ def create_mcp_server(
         remains scoped to an explicit category='procedural_knowledge' write
         only (a category=None write that auto-classifies to
         procedural_knowledge is covered by neither). Both guards share the
-        procedural_knowledge_near_dup_guard_enabled kill-switch, and exempt
-        recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
-        entry that is expected to closely resemble the duplicates it
-        replaces, with no ordering guarantee that those duplicates are
-        deleted first).
+        procedural_knowledge_near_dup_guard_enabled kill-switch. NO agent
+        class is exempt (task 3134): Stage-1 consolidation now folds a
+        cluster with `consolidate_memories`, whose canonical write goes
+        through `memory_service.add_memory` and so never meets these
+        tool-layer guards, and which writes that canonical BEFORE any
+        delete.
 
         BOTH GUARDS ABOVE APPLY ONLY WHILE ``write_triage.enabled`` IS FALSE
         (its shipped default). With write triage ON, an explicit Mem0-primary
@@ -3258,9 +3259,9 @@ def create_mcp_server(
         With triage on, ``metadata={'allow_near_duplicate': True}`` is
         reinterpreted rather than retired: it now means FORCE-STORE — store
         this standalone, do not reroute it — for the same reason it meant
-        "do not reject me" before. recon-stage-* agents are likewise
-        force-stored, as is any write whose own metadata already sets
-        ``parent_id`` or ``kind`` — the two keys an attach would overwrite.
+        "do not reject me" before, as is any write whose own metadata already
+        sets ``parent_id`` or ``kind`` — the two keys an attach would
+        overwrite. No agent class is force-stored (task 3134).
         Your own classification of a record is not triage's to replace.
 
         Content carrying a raw MCP envelope fragment is REJECTED outright
@@ -3416,7 +3417,6 @@ def create_mcp_server(
         # for why ANY `kind` counts (not just the child kinds) and what that
         # costs in coverage.
         caller_owns_attach_keys = declares_attach_keys(metadata)
-        is_recon_stage_agent = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3454,7 +3454,6 @@ def create_mcp_server(
                 # second place for the two to disagree about who is exempt.
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
-                is_recon_stage_agent=is_recon_stage_agent,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
@@ -3480,9 +3479,20 @@ def create_mcp_server(
         # `routed == stored` for a topic match, and a real judge may answer
         # otherwise. That assertion is EXPECTED to change with this arm — it
         # pins the retirement of the soft-block, not the outcome `stored`.
+        # (task 3134, PRD leaf iota) NO recon-stage exemption. It rested on
+        # Stage-1 consolidation writing a merged canonical through THIS tool
+        # with no ordering guarantee that the duplicates it resembles were
+        # deleted first. Stage 1 now folds a cluster with
+        # `consolidate_memories`, which writes its canonical through
+        # `memory_service.add_memory` — the SERVICE method, below this tool —
+        # so the sanctioned path never meets this guard at all, and that op
+        # writes the canonical BEFORE any delete, supplying the very ordering
+        # guarantee whose absence the exemption cited. A recon-stage write
+        # arriving HERE is an ordinary duplicate and is treated as one.
+        #
         # Shared exemptions for both dup-guard blocks below (task 3430 review,
         # reviewer_comprehensive #1 duplication): hoisted to a single source
-        # of truth so a future new exemption (another agent-id carve-out, a
+        # of truth so a future new exemption (an agent-id carve-out, a
         # triage-mode tweak) is a one-place edit instead of two conjunct
         # chains that can silently drift apart. Deliberately EXCLUDES the
         # category predicate and the resolve_near_dup_guard_enabled() call:
@@ -3493,9 +3503,7 @@ def create_mcp_server(
         # cosine block's behaviour for procedural_knowledge stays provably
         # unchanged (same truth table, same call count, order of the pure
         # boolean reads is immaterial since none of them has a side effect).
-        dup_guard_base_exempt = (
-            not triage_enabled and not allow_near_duplicate and not is_recon_stage_agent
-        )
+        dup_guard_base_exempt = not triage_enabled and not allow_near_duplicate
         if (
             dup_guard_base_exempt
             and category in _TOPIC_GUARD_GATED_CATEGORIES
@@ -3509,8 +3517,8 @@ def create_mcp_server(
             # match (or an empty/unconfigured clusters list) fall through — to
             # the cosine path below for procedural_knowledge, or straight
             # through to the write for any other _TOPIC_GUARD_GATED_CATEGORIES
-            # member. Shares the allow_near_duplicate / recon-stage exemptions
-            # and the enabled kill-switch with the cosine guard below.
+            # member. Shares the allow_near_duplicate exemption and the
+            # enabled kill-switch with the cosine guard below.
             #
             # TOPIC-keyed rather than category-keyed: unlike the cosine guard
             # below, this check is not scoped to a single category — it covers

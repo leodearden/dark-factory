@@ -33,6 +33,11 @@ from reconciliation.plural_enum_shapes import (
     SUBJECT_POSITIVE_SHAPES,
 )
 
+# The SHIPPED pagination engine, imported for the same reason the guard below
+# is: the probe delegates to it, and identity checks against the real objects
+# are the only way to catch the probe quietly growing a private copy back.
+from fused_memory.backends import graphiti_client
+
 # The PRODUCTION guard object, imported the same way the sweep suite imports
 # it. Held here only so the baseline test can assert the probe's 'shipped'
 # candidate IS this object rather than a drifted copy — an identity check that
@@ -81,6 +86,7 @@ scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
 simulate_candidate = _mod.simulate_candidate
 extract_plural_ids = _mod.extract_plural_ids
+EnumerationOutcome = _mod.EnumerationOutcome
 _CANDIDATE_GUARDS = _mod._CANDIDATE_GUARDS
 
 
@@ -205,6 +211,66 @@ def test_scan_corpus_rejections_are_triageable_records():
     by_fact = {r.fact: r.match_start for r in result.rejections}
     assert by_fact[_COMPLEMENT_REJECTION] == _COMPLEMENT_REJECTION.index('tasks 1020')
     assert by_fact[_PREAMBLE_REJECTION] == _PREAMBLE_REJECTION.index('tasks 1020')
+
+
+# Every pinned fact in the shared corpora, positives included (whose entries
+# are (fact, expected_ids) pairs). The near-miss subtraction below is only
+# safe while the lexical precondition is a SUPERSET of the full regex, so the
+# guard on that identity has to quantify over every shape the sweep suite
+# pins, not just the guarded ones.
+_ALL_PINNED_FACTS = _ALL_GUARDED_SHAPES + [fact for fact, _ids in _POSITIVE_SHAPES]
+
+
+@pytest.mark.parametrize('fact', _ALL_PINNED_FACTS)
+def test_the_lexical_precondition_is_a_superset_of_the_full_regex(fact):
+    """Anything the shipped regex matches must match the precondition too.
+
+    This is the identity that makes ``near_miss = lexical_precondition -
+    regex_matched`` a partition rather than a subtraction of two unrelated
+    counters: PLURAL_ENUM_SNAPSHOT_RE's pattern literally begins
+    ``\\btasks\\b\\s*#?\\s*(?P<ids>\\d++``, of which the probe's
+    ``_LEXICAL_PRECONDITION_RE`` (``\\btasks\\b\\s*#?\\s*\\d``) is a
+    literal prefix. A prefix cannot fail where the whole pattern succeeded.
+
+    Pinned mechanically rather than asserted in prose because both patterns
+    are editable: were either to drift so that a full match no longer carried
+    the precondition, ``near_miss`` could go NEGATIVE and the report would
+    render a nonsense column with nothing failing. Parametrizing over the
+    shared corpora keeps the gate automatic — a shape appended in
+    reconciliation/plural_enum_shapes.py re-validates the identity with no
+    second copy to go stale.
+    """
+    if _mod.PLURAL_ENUM_SNAPSHOT_RE.search(fact):
+        assert _mod._LEXICAL_PRECONDITION_RE.search(fact), fact
+
+
+def test_the_superset_corpus_actually_exercises_both_sides():
+    """The parametrization above must not be vacuous in either direction.
+
+    Its body is a conditional, so a corpus in which NOTHING matched the full
+    regex would leave every case green while checking nothing. Both sides
+    have to be populated for the identity to have been tested at all.
+
+    NON-VACUITY IS THE WHOLE CLAIM, so no magnitude is pinned. Earlier this
+    asserted 61 / 48 / 61 exactly, which contradicted the design the docstring
+    above states and the artifact repeats — that appending a shape to
+    reconciliation/plural_enum_shapes.py re-validates both candidates
+    automatically. A single appended shape failed this test with a
+    magic-number mismatch that said nothing about the property under test and
+    sent its reader to the wrong file. The three assertions below carry the
+    entire guarantee the docstring claims and need no re-tuning as the shared
+    corpus grows.
+    """
+    matched = [f for f in _ALL_PINNED_FACTS if _mod.PLURAL_ENUM_SNAPSHOT_RE.search(f)]
+    precondition = [
+        f for f in _ALL_PINNED_FACTS if _mod._LEXICAL_PRECONDITION_RE.search(f)
+    ]
+    assert matched, 'the full-regex side emptied or drifted'
+    assert precondition, 'the precondition side emptied or drifted'
+    assert len(matched) < len(precondition), (
+        'a corpus where the two counts coincide cannot show near_miss is not '
+        'just a second name for lexical_precondition'
+    )
 
 
 def _first_enumeration_start(fact: str) -> int:
@@ -368,6 +434,15 @@ def test_the_shipped_baseline_is_a_precondition_not_a_measurement():
        reassuring pair of zeroes.
     3. The no-op baseline itself, stated as what it is: a CONSEQUENCE of
        (1) and (2), not an independent measurement.
+
+    The baseline is stated in the simulation's own unit, the rejected MATCH:
+    every match this corpus carries is rejected by the shipped guard
+    (``already_selected == 0``) and the shipped guard compared against itself
+    leaves every one of them unchanged. Note the corpus holds more SHAPES
+    than matches — the suppression shapes carry no plural enumeration for the
+    regex to find at all — so ``facts_simulated`` and ``matches_scanned`` are
+    genuinely different numbers here, which is exactly why the band carries
+    both rather than letting a reader assume one from the other.
     """
     assert _CANDIDATE_GUARDS['shipped'] is _enumeration_is_prepositional_complement
 
@@ -379,7 +454,10 @@ def test_the_shipped_baseline_is_a_precondition_not_a_measurement():
 
     assert result.over_selected == []
     assert result.recovered == []
-    assert result.unchanged == _ALL_GUARDED_SHAPES
+    assert result.already_selected == 0, 'every match here reaches the guard'
+    assert len(result.unchanged) == result.matches_scanned
+    assert result.facts_simulated == len(_ALL_GUARDED_SHAPES)
+    assert set(m.fact for m in result.unchanged) <= set(_ALL_GUARDED_SHAPES)
 
 
 def test_candidate_a_re_opens_nothing_but_misses_the_motivating_shape():
@@ -392,10 +470,11 @@ def test_candidate_a_re_opens_nothing_but_misses_the_motivating_shape():
     motivated it buys very little.
     """
     result = simulate_candidate('a', _ALL_GUARDED_SHAPES)
+    recovered_facts = [m.fact for m in result.recovered]
 
     assert result.over_selected == []
-    assert _DATE_STAMP_PREAMBLE not in result.recovered
-    assert set(result.recovered) == set(_PREAMBLE_SHAPES) - {_DATE_STAMP_PREAMBLE}
+    assert _DATE_STAMP_PREAMBLE not in recovered_facts
+    assert set(recovered_facts) == set(_PREAMBLE_SHAPES) - {_DATE_STAMP_PREAMBLE}
 
 
 def test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection():
@@ -410,8 +489,8 @@ def test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection():
     """
     result = simulate_candidate('b', _ALL_GUARDED_SHAPES)
 
-    assert result.recovered == _PREAMBLE_SHAPES
-    assert result.over_selected == [_INTRA_CLAUSE_COMMA]
+    assert [m.fact for m in result.recovered] == _PREAMBLE_SHAPES
+    assert [m.fact for m in result.over_selected] == [_INTRA_CLAUSE_COMMA]
 
 
 @pytest.mark.parametrize('candidate', ['shipped', 'a', 'b'])
@@ -439,7 +518,80 @@ def test_subject_position_positives_extract_unchanged_under_both_candidates(
 # Edge enumeration must survive FalkorDB's server-wide result-set cap
 # ---------------------------------------------------------------------------
 
+def test_the_enumerator_delegates_to_the_shipped_paginator():
+    """The probe must not own a second copy of the pagination machinery.
+
+    It used to: its own census helper, its own page loop, its own structural
+    guard, and its own spellings of 5000 / 10000 / 1000. Two copies of a
+    fail-closed page loop is two places to fix a paging defect and one place
+    to forget, and duplicated CONSTANTS are worse still — the probe's
+    RESULTSET_SIZE is an assumption about server configuration, so a
+    re-measurement that corrected graphiti_client's copy would leave the
+    probe reasoning from the old number while still reporting `complete`.
+
+    Asserted by IDENTITY against the real objects rather than by equal
+    values, because equal values are exactly what a re-spelled copy has.
+    """
+    assert _mod._paged_ro_query is graphiti_client._paged_ro_query
+    assert _mod.DEFAULT_PAGE_SIZE is graphiti_client._DEFAULT_READ_PAGE_SIZE
+    assert _mod.RESULTSET_SIZE is graphiti_client._RESULTSET_SIZE
+    assert _mod.MAX_ENUM_PAGES is graphiti_client._MAX_READ_PAGES
+
+    # The public names are RETAINED — argparse help strings and these tests
+    # use them — so this is a rebinding, not a rename.
+    assert _mod.DEFAULT_PAGE_SIZE == 5000
+    assert _mod.RESULTSET_SIZE == 10000
+    assert _mod.MAX_ENUM_PAGES == 1000
+
+    # ...and the probe's own duplicate is GONE rather than merely unused.
+    assert not hasattr(_mod, '_census_count'), (
+        'the probe still defines its own census helper'
+    )
+
+
+def test_the_probe_and_production_read_the_same_population():
+    """A drifting MATCH/WHERE must fail HERE, not become a silent zero.
+
+    The probe and ``enumerate_all_valid_edges`` are supposed to measure the
+    same corpus. Nothing enforced that: two independently-spelled Cypher
+    strings could drift apart — production narrowing its WHERE, say — and the
+    probe would keep measuring the OLD population while reporting
+    `complete: true` over it. That is the same argument the script's import
+    block already makes about the regex and the guard, applied to the
+    population definition, so it gets the same treatment: share the object,
+    and check the identity mechanically.
+
+    What is deliberately NOT shared is the PROJECTION. The probe returns
+    ``DISTINCT e.uuid, e.fact`` — half the rows of production's four-column
+    per-endpoint projection, and directly comparable to the post-dedup
+    ``len(facts)`` its completeness rule is stated in.
+    """
+    match = graphiti_client._ALL_VALID_EDGES_MATCH
+    assert _mod._EDGE_PAGE_CYPHER.startswith(match), _mod._EDGE_PAGE_CYPHER
+    assert _mod._EDGE_COUNT_CYPHER.startswith(match), _mod._EDGE_COUNT_CYPHER
+
+    # The placeholders _render_page_bounds requires, left literal.
+    assert '{skip}' in _mod._EDGE_PAGE_CYPHER
+    assert '{limit}' in _mod._EDGE_PAGE_CYPHER
+
+    # The probe's own projection and its own single-row census, retained.
+    assert 'RETURN DISTINCT e.uuid, e.fact' in _mod._EDGE_PAGE_CYPHER
+    assert 'ORDER BY e.uuid' in _mod._EDGE_PAGE_CYPHER
+    assert _mod._EDGE_PAGE_CYPHER.index('ORDER BY') < _mod._EDGE_PAGE_CYPHER.index(
+        'SKIP'
+    )
+    assert 'count(DISTINCT e.uuid)' in _mod._EDGE_COUNT_CYPHER
+    assert 'SKIP' not in _mod._EDGE_COUNT_CYPHER
+    assert _mod._EDGE_PAGE_CYPHER != graphiti_client._ALL_VALID_EDGES_PAGE_TEMPLATE, (
+        "the probe keeps its own projection; adopting production's four-column "
+        'one would double the rows and break the len(facts) comparison'
+    )
+
+
 _PAGE_SIZE = 4
+# Small enough that a 50-edge corpus cannot be read inside it, so the cap is
+# reached with the last page still full — the structural shortfall condition.
+_DELTA_PAGE_CAP = 3
 
 # Sentinel: derive the census count from the fake's own rows. A plain None
 # default would be indistinguishable from 'the probe answered None', which
@@ -528,11 +680,11 @@ async def test_edge_enumeration_paginates_past_the_resultset_cap():
     rows, distinct = _fake_corpus()
     query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is True
+    assert outcome.complete is True
     assert len(facts) == distinct
     assert set(facts) == {f'edge-{i:02d}' for i in range(10)}
     # fact text is preserved verbatim...
@@ -571,12 +723,12 @@ async def test_edge_enumeration_of_empty_graph_is_complete_and_empty():
     """Zero edges is a valid, COMPLETE result — knowlive held exactly that."""
     query_fn = _FakeCappedEdgeQuery([], cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
     assert facts == {}
-    assert complete is True
+    assert outcome.complete is True
 
 
 # ---------------------------------------------------------------------------
@@ -619,11 +771,11 @@ async def test_enumeration_fails_closed_when_page_size_exceeds_the_server_cap():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=20, resultset_size=10,
     )
 
-    assert complete is False, (
+    assert outcome.complete is False, (
         'a page_size at or above the server cap cannot yield a provably '
         'complete enumeration'
     )
@@ -650,12 +802,12 @@ async def test_enumeration_fails_closed_at_the_module_default_cap():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_mod.RESULTSET_SIZE,
     )
 
     assert _mod.RESULTSET_SIZE == 10000, "FalkorDB's server-wide default"
-    assert complete is False
+    assert outcome.complete is False
     assert facts == {}
     assert query_fn.cyphers == []
 
@@ -672,13 +824,13 @@ async def test_enumeration_fails_closed_when_the_page_cap_is_exhausted():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE, max_pages=3,
     )
 
     page_cyphers = [c for c in query_fn.cyphers if 'SKIP' in c]
     assert len(page_cyphers) == 3, 'the loop must TERMINATE at the cap'
-    assert complete is False, (
+    assert outcome.complete is False, (
         'hitting the page cap on a still-full page is a suspected shortfall, '
         'not a successful enumeration'
     )
@@ -695,11 +847,11 @@ async def test_benign_pagination_is_still_complete():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is True
+    assert outcome.complete is True
     assert len(facts) == 50
 
 
@@ -774,9 +926,9 @@ async def test_enumeration_fails_closed_when_the_server_caps_below_the_assumed_c
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
-    facts, complete = await enumerate_valid_edge_facts(query_fn, page_size=20)
+    facts, outcome = await enumerate_valid_edge_facts(query_fn, page_size=20)
 
-    assert complete is False, (
+    assert outcome.complete is False, (
         'enumerated 10 against a census-reported 50 — a count mismatch is a '
         'shortfall however it was caused'
     )
@@ -794,11 +946,11 @@ async def test_enumeration_is_complete_when_the_enumerated_count_matches_the_cen
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is True
+    assert outcome.complete is True
     assert len(facts) == 50
 
 
@@ -868,36 +1020,128 @@ class _FakeMovingCorpusQuery(_FakeCappedEdgeQuery):
 
 
 @pytest.mark.asyncio
-async def test_a_corpus_that_moves_mid_enumeration_is_reported_as_a_race(caplog):
-    """A concurrent write must not be diagnosed as a server misconfiguration.
+async def test_a_corpus_that_only_grew_is_still_a_complete_enumeration(caplog):
+    """Growth is not a shortfall, and must not fail a 43-graph run.
 
-    With one census probe, ANY write landing during the run makes
-    ``len(facts) != expected`` and the operator is told the most likely cause
-    is 'a server result-set cap below the assumed 10000'. On a busy graph that
-    is the LEAST likely cause, and it sends them to configuration they do not
-    need to change — while the actual remedy is simply to re-run.
+    The rule this replaces was ``post_expected != expected`` — ANY census
+    delta, in either direction, by any magnitude, forced INCOMPLETE. On the
+    graphs this probe measures that is a hair trigger rather than a check:
+    they are the orchestrator's and the reconciler's live working memory,
+    written continuously, and a full run pages tens of thousands of edges
+    across dozens of queries. One edge added by an unrelated cycle anywhere
+    in that window flipped the whole run to INCOMPLETE and exit 1.
 
-    Fail-closed either way (an enumeration that raced a write is not a proven
-    one); what this pins is that the two are reported as DIFFERENT things.
+    The band is DERIVED from set semantics rather than guessed. The edges
+    present for the WHOLE run are a subset of both censuses, so their count
+    is at most ``min(before, after)``; reading at least that many means
+    nothing continuously present went unread. Here 50 edges were enumerated
+    against censuses of 50 and 51 — everything that existed when the run
+    started was read, and the 51st arrived after the count that would have
+    included it. That is a COMPLETE enumeration of a corpus that grew, and
+    the growth is DISCLOSED (both readings are carried out of the function
+    and land in the artifact) rather than used to fail the run.
     """
     query_fn = _FakeMovingCorpusQuery(
         _fake_rows(50), cap=_PAGE_SIZE, counts=[50, 51],
     )
 
-    with caplog.at_level('WARNING'):
-        facts, complete = await enumerate_valid_edge_facts(
+    with caplog.at_level('INFO'):
+        facts, outcome = await enumerate_valid_edge_facts(
             query_fn, page_size=_PAGE_SIZE,
         )
 
-    # The enumeration itself was fine — 50 fetched against a pre-count of 50.
     assert len(facts) == 50
-    assert complete is False, 'a raced enumeration is not a proven one'
+    assert outcome.complete is True, (
+        'every edge that existed for the whole run was read; a corpus that '
+        'GREW under the enumeration is not a truncated one'
+    )
 
-    warnings = '\n'.join(r.getMessage() for r in caplog.records)
-    assert 'CHANGED MID-ENUMERATION' in warnings
-    assert 're-run' in warnings.lower()
-    assert 'result-set cap' not in warnings, (
-        'a concurrent write must not be reported as a suspected truncation'
+    # Both readings leave the function — an artifact reporting a census-derived
+    # verdict without the two numbers behind it cannot be audited.
+    assert outcome.census_before == 50
+    assert outcome.census_after == 51
+
+    # Disclosed at INFO, not failed at WARNING.
+    assert [r for r in caplog.records if r.levelname == 'WARNING'] == [], (
+        'a growing corpus is the ordinary case on these graphs, not a defect'
+    )
+    messages = '\n'.join(r.getMessage() for r in caplog.records)
+    assert '50' in messages and '51' in messages, messages
+    assert 'CHANGED MID-ENUMERATION' not in messages, (
+        'the old text told the operator to re-run a run that was already good'
+    )
+    assert 'INCOMPLETE' not in messages
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_that_shrank_is_tolerated_only_down_to_the_post_census(caplog):
+    """Shrinkage is tolerated EXACTLY as far as the post-census, and no further.
+
+    ``min(before, after)`` is not a symmetric fudge factor — it is the largest
+    number of edges that can have been continuously present. With a census of
+    51 before and 50 after, at most 50 edges existed for the whole run, so
+    reading 50 leaves nothing continuously present unread. Reading 49 would.
+
+    This is also the case where the shipped layer and this probe legitimately
+    disagree out loud: ``_paged_ro_query`` compares rows fetched against the
+    PRE-census only, so it reports a short read and warns about a suspected
+    result-set cap. That warning is about a different quantity, and the probe
+    says so at INFO rather than leaving a reader to take a WARNING from the
+    layer below as this probe's verdict.
+    """
+    query_fn = _FakeMovingCorpusQuery(
+        _fake_rows(50), cap=_PAGE_SIZE, counts=[51, 50],
+    )
+
+    with caplog.at_level('INFO'):
+        facts, outcome = await enumerate_valid_edge_facts(
+            query_fn, page_size=_PAGE_SIZE,
+        )
+
+    assert len(facts) == 50
+    assert outcome.complete is True, '50 >= min(51, 50) — nothing continuously present was missed'
+    assert outcome.census_before == 51
+    assert outcome.census_after == 50
+
+    infos = '\n'.join(
+        r.getMessage() for r in caplog.records if r.levelname == 'INFO'
+    )
+    assert 'different units' in infos, (
+        "the layer below warned about a short read; the probe must say that "
+        "warning is not its own verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_enumeration_short_of_both_censuses_is_still_a_shortfall(caplog):
+    """The tolerance must not become the answer to every mismatch.
+
+    A corpus that moved does NOT excuse a read that came up short of the
+    SMALLER of the two counts: 40 edges against censuses of 50 and 51 means
+    at least ten edges that were present for the entire run were never read,
+    and no amount of concurrent writing explains that. Fail closed, and name
+    both readings so the operator can see the band the verdict was made
+    against rather than a single number.
+    """
+    query_fn = _FakeMovingCorpusQuery(
+        _fake_rows(40), cap=_PAGE_SIZE, counts=[50, 51],
+    )
+
+    with caplog.at_level('WARNING'):
+        facts, outcome = await enumerate_valid_edge_facts(
+            query_fn, page_size=_PAGE_SIZE,
+        )
+
+    assert len(facts) == 40
+    assert outcome.complete is False, '40 < min(50, 51) — ten edges present throughout went unread'
+    assert outcome.census_before == 50
+    assert outcome.census_after == 51
+
+    warnings = '\n'.join(
+        r.getMessage() for r in caplog.records if r.levelname == 'WARNING'
+    )
+    assert '50' in warnings and '51' in warnings, (
+        'both census readings must be named, not just the one that was compared'
     )
 
 
@@ -912,11 +1156,11 @@ async def test_a_stable_count_that_disagrees_is_still_a_suspected_shortfall(capl
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
     with caplog.at_level('WARNING'):
-        facts, complete = await enumerate_valid_edge_facts(
+        facts, outcome = await enumerate_valid_edge_facts(
             query_fn, page_size=20,
         )
 
-    assert complete is False
+    assert outcome.complete is False
     assert len(facts) < 50
 
     warnings = '\n'.join(r.getMessage() for r in caplog.records)
@@ -956,11 +1200,11 @@ async def test_enumeration_fails_closed_when_the_count_probe_returns_nothing(
         _fake_rows(50), cap=_PAGE_SIZE, count_rows=count_rows,
     )
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is False
+    assert outcome.complete is False
     assert len(facts) == 50, 'the paging worked; only the proof was unavailable'
 
 
@@ -985,12 +1229,12 @@ async def test_a_census_that_answers_then_stops_answering_fails_closed(caplog):
     )
 
     with caplog.at_level('WARNING'):
-        facts, complete = await enumerate_valid_edge_facts(
+        facts, outcome = await enumerate_valid_edge_facts(
             query_fn, page_size=_PAGE_SIZE,
         )
 
     assert len(facts) == 50, 'the paging itself was fine'
-    assert complete is False, 'an unavailable proof is not a passing one'
+    assert outcome.complete is False, 'an unavailable proof is not a passing one'
 
     warnings = '\n'.join(r.getMessage() for r in caplog.records)
     assert 'no usable count' in warnings
@@ -1015,13 +1259,13 @@ async def test_a_row_with_a_null_uuid_is_skipped_not_counted():
     rows[2] = [None, 'Tasks 1020 and 1030 are pending.']
     query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE, count_rows=[[3]])
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
     assert len(facts) == 3, 'the null-uuid row is not an enumerated edge'
     assert None not in facts
-    assert complete is True, 'and the census agrees 3 is the whole corpus'
+    assert outcome.complete is True, 'and the census agrees 3 is the whole corpus'
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1281,10 @@ class _FakeEdgeSource:
     call log rather than by a mysteriously large number.
     """
 
-    def __init__(self, corpora: dict[str, tuple[list[str], bool]]) -> None:
+    def __init__(
+        self,
+        corpora: dict[str, tuple[list[str], bool | EnumerationOutcome]],
+    ) -> None:
         self.corpora = corpora
         self.asked: list[str] = []
         # RECORDED, not just accepted. An earlier version discarded
@@ -1051,8 +1298,37 @@ class _FakeEdgeSource:
     async def __call__(self, project_id: str, *, page_size: int):
         self.asked.append(project_id)
         self.page_sizes.append(page_size)
-        facts, complete = self.corpora[project_id]
-        return {f'{project_id}-edge-{i}': f for i, f in enumerate(facts)}, complete
+        facts, outcome = self.corpora[project_id]
+        return (
+            {f'{project_id}-edge-{i}': f for i, f in enumerate(facts)},
+            _as_outcome(outcome),
+        )
+
+
+def _as_outcome(value: bool | EnumerationOutcome) -> EnumerationOutcome:
+    """Let a corpus declare `True`/`False` where the seam wants an outcome.
+
+    ``enumerate_valid_edge_facts`` returns an ``EnumerationOutcome`` and
+    ``run`` consumes one, but the ~20 corpus declarations in this file care
+    about exactly one bit of it. Widening every one of them to a constructor
+    call would bury the fact each is actually testing under boilerplate, so
+    the bool is coerced here and only the tests that care about the DIAGNOSIS
+    spell an outcome out.
+
+    A False coerces to the shape the invariant demands — an incomplete
+    outcome must carry a reason and a kind — using the shipped
+    ``INCOMPLETE_SHORT_READ``, which is what a bare 'this graph came back
+    short' means. A test asserting on a SPECIFIC kind passes its own outcome.
+    """
+    if not isinstance(value, bool):
+        return value
+    if value:
+        return EnumerationOutcome(complete=True)
+    return EnumerationOutcome(
+        complete=False,
+        reason='fake edge source: declared incomplete by the test corpus',
+        kind=graphiti_client.INCOMPLETE_SHORT_READ,
+    )
 
 
 _ALPHA_FACTS = [
@@ -1064,6 +1340,37 @@ _BETA_FACTS = [
     'As of 2026-08-09, tasks 1020 and 1030 are pending.',  # guard-rejected
     'Tasks 1752 and 1753 are related to the uptime feed.',  # lexical near-miss
 ]
+
+
+def test_near_miss_excludes_the_facts_that_fully_matched():
+    """`near_miss` is the precondition MINUS the full matches, not the raw count.
+
+    ``lexical_precondition`` counts every fact carrying the ``tasks <n>``
+    shape — INCLUDING the ones the shipped regex went on to match in full.
+    The markdown column labelled "`tasks <n>` near-misses" rendered that raw
+    number, so a corpus where every shape matched in full was reported as
+    having that many near-misses, and a reader was invited to subtract a
+    column from a column it contains.
+
+    A near-miss is a fact that carried the shape and did NOT match: the two
+    are disjoint and sum to the precondition, which is what makes the column
+    interpretable.
+    """
+    alpha = scan_corpus(_ALPHA_FACTS)
+    # Both plural-task facts matched the full regex; nothing NEARLY matched.
+    assert alpha.lexical_precondition == 2
+    assert alpha.regex_matched == 2
+    assert alpha.near_miss == 0
+
+    beta = scan_corpus(_BETA_FACTS)
+    # 'Tasks 1752 and 1753 are related to ...' carries the shape and no
+    # status marker, so it is the only near-miss here.
+    assert beta.lexical_precondition == 2
+    assert beta.regex_matched == 1
+    assert beta.near_miss == 1
+
+    for scan in (alpha, beta):
+        assert scan.near_miss == scan.lexical_precondition - scan.regex_matched
 
 
 def _args(**overrides):
@@ -1227,6 +1534,90 @@ _TWO_REJECTIONS_IN_ONE_FACT = (
 )
 
 
+# The four outcome classes the candidate simulation can produce, one fact
+# each, so the arithmetic invariant below is exercised on a corpus where every
+# term is nonzero for at least one candidate.
+_UNIT_CORPUS = [
+    _TWO_REJECTIONS_IN_ONE_FACT,  # two rejected matches, both preambles
+    _SUBJECT_POSITIVE,            # one match the SHIPPED guard already selects
+    _INTRA_CLAUSE_COMMA,          # candidate 'b' admits it -> over-selection
+    _COMPLEMENT_REJECTION,        # both shipped and candidate reject it
+]
+
+
+@pytest.mark.parametrize('candidate', ['shipped', 'a', 'b'])
+def test_candidate_result_accounts_in_one_unit_per_match(candidate):
+    """Every CandidateResult term is a per-MATCH count, and they sum.
+
+    The committed artifact used to mix three units in one band: over_selected
+    and recovered were appended once per newly-admitted MATCH while unchanged
+    was appended once per FACT, and a fact the shipped guard already selected
+    landed in unchanged alongside a rejection both guards agreed on. Nothing
+    could be added or subtracted across those columns, and the renderers put
+    them in one table anyway.
+
+    One unit — the rejected MATCH — makes the band arithmetic. A match the
+    shipped guard already selects is out of scope for a simulation that only
+    asks what a candidate does with the shipped guard's REJECTIONS, so it is
+    counted in ``already_selected`` rather than smuggled into ``unchanged``.
+    """
+    result = simulate_candidate(candidate, _UNIT_CORPUS)
+
+    # Per-MATCH records, not bare strings: a fact carrying two rejected
+    # enumerations must be distinguishable at the offset that was scored.
+    for bucket in (result.recovered, result.over_selected, result.unchanged):
+        for entry in bucket:
+            assert not isinstance(entry, str), (
+                'per-match records, not fact text'
+            )
+            assert isinstance(entry.fact, str)
+            assert isinstance(entry.match_start, int)
+
+    # The denominator is carried, not implied: five matches over four
+    # distinct shapes, one of which the shipped guard already selects.
+    assert result.matches_scanned == 5
+    assert result.already_selected == 1
+    assert result.facts_simulated == 4
+
+    assert result.matches_scanned == (
+        result.already_selected
+        + len(result.recovered)
+        + len(result.over_selected)
+        + len(result.unchanged)
+    )
+
+
+def test_the_per_match_unit_is_visible_where_the_per_fact_one_hid_it():
+    """The unit change is observable, not just a renaming.
+
+    Candidate 'b' recovers both of the two-rejection fact's matches and
+    re-opens the intra-clause-comma over-selection, leaving exactly ONE
+    rejected match ('Reviews of tasks ...') that both guards agree on. The
+    old per-FACT spelling answered 2 here, because it also counted the
+    subject-position fact the shipped guard had already selected — a fact
+    the simulation never had anything to say about.
+    """
+    by_name = {
+        name: simulate_candidate(name, _UNIT_CORPUS)
+        for name in _mod.CANDIDATE_NAMES
+    }
+
+    assert len(by_name['b'].recovered) == 2
+    assert len(by_name['b'].over_selected) == 1
+    assert len(by_name['b'].unchanged) == 1
+
+    # The shipped guard compared against itself changes nothing, so every
+    # rejected match — all four of them — is unchanged.
+    assert by_name['shipped'].recovered == []
+    assert by_name['shipped'].over_selected == []
+    assert len(by_name['shipped'].unchanged) == 4
+
+    # Candidate 'a' recovers only the second enumeration of the two-rejection
+    # fact; the 'As of <date>' shape it was never able to reach stays put.
+    assert len(by_name['a'].recovered) == 1
+    assert len(by_name['a'].unchanged) == 3
+
+
 @pytest.mark.asyncio
 async def test_candidate_simulation_scores_each_match_once_per_fact():
     """A multi-rejection fact must not be simulated once per rejection.
@@ -1240,6 +1631,15 @@ async def test_candidate_simulation_scores_each_match_once_per_fact():
 
     The live corpus currently has zero matches, which masks this entirely; it
     would first surface on precisely the re-run this script exists to enable.
+
+    Two different things meet in this test and are deliberately kept apart.
+    The DEDUP it guards is per distinct fact SHAPE — ``run()`` feeds each
+    shape to the simulation once, so a fact with N rejections is not scored N
+    times over. The UNIT the simulation counts in is the rejected MATCH — so
+    this one fact's two enumerations contribute 2, not 1, to whichever bucket
+    each lands in. Deduping shapes and counting matches are compatible, and
+    conflating them is what produced a per-FACT ``unchanged`` beside a
+    per-MATCH ``recovered`` in the same rendered table.
     """
     source = _FakeEdgeSource({'alpha': ([_TWO_REJECTIONS_IN_ONE_FACT], True)})
 
@@ -1254,12 +1654,20 @@ async def test_candidate_simulation_scores_each_match_once_per_fact():
     assert len(by_name['b'].recovered) == 2
     # Candidate 'a' admits only the 'As of ...' shape: 1, not 2.
     assert len(by_name['a'].recovered) == 1
-    # Neither re-opens an over-selection, and the shipped baseline changes
-    # nothing — one unchanged FACT, not one per rejection.
+    # Neither re-opens an over-selection. `unchanged` is counted per rejected
+    # MATCH, so the shipped baseline — which agrees with itself about both of
+    # this fact's rejections — reports 2, and the invariant holds for all three.
     for name, candidate in by_name.items():
         assert candidate.over_selected == [], name
-        assert len(candidate.unchanged) <= 1, name
-    assert len(by_name['shipped'].unchanged) == 1
+        assert len(candidate.unchanged) <= 2, name
+        assert candidate.matches_scanned == (
+            candidate.already_selected
+            + len(candidate.recovered)
+            + len(candidate.over_selected)
+            + len(candidate.unchanged)
+        ), name
+        assert candidate.facts_simulated == 1, name
+    assert len(by_name['shipped'].unchanged) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1334,6 +1742,163 @@ async def test_rendered_json_carries_the_measurement_and_the_verdict():
 
     assert [c['name'] for c in payload['candidates']] == list(_mod.CANDIDATE_NAMES)
     assert payload['revalidation_test'] == _mod.REVALIDATION_TEST
+
+    # The candidate band's own keys, in the unit the band counts in. Two
+    # rejected matches over two distinct shapes reached the candidates, and
+    # the denominators are identical across the three rows because all three
+    # are simulated over the SAME corpus — the rows differ only in what they
+    # do with those matches.
+    for candidate in payload['candidates']:
+        assert candidate['facts_simulated'] == 2
+        assert candidate['matches_scanned'] == 2
+        assert candidate['already_selected'] == 0
+        assert candidate['over_selected'] == []
+        assert 'unchanged_count' not in candidate
+
+    candidates = {c['name']: c for c in payload['candidates']}
+    # 'b' restarts its scan after the date stamp's comma and so recovers the
+    # preamble shape; 'shipped' and 'a' both leave every rejection standing.
+    assert candidates['b']['recovered'] == [
+        {'fact': _PREAMBLE_REJECTION, 'match_start': 18},
+    ]
+    assert len(candidates['b']['unchanged']) == 1
+    for name in ('shipped', 'a'):
+        assert candidates[name]['recovered'] == [], name
+        assert len(candidates[name]['unchanged']) == 2, name
+
+
+async def _candidate_active_report():
+    """A report whose candidate band is NONZERO in three of its four terms.
+
+    ``_fixed_report()``'s corpus recovers nothing, so it cannot tell a
+    correctly-rendered candidate band from one that renders empty lists
+    correctly. This corpus does: two rejected matches in one fact that
+    candidate 'b' recovers, plus an intra-clause-comma shape it re-opens.
+    """
+    source = _FakeEdgeSource({
+        'alpha': ([_TWO_REJECTIONS_IN_ONE_FACT, _INTRA_CLAUSE_COMMA], True),
+    })
+    return await run(
+        _args(project_id=['alpha'], measured_at=_FIXED_TIMESTAMP),
+        edge_source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_candidate_band_declares_its_unit_and_denominator():
+    """Both artifacts must render the candidate band in ONE stated unit.
+
+    The committed artifact used to render three units side by side with none
+    of them labelled: ``over_selected``/``recovered`` as lists of fact
+    strings (per MATCH, with the text repeated for a multi-enumeration
+    fact), ``unchanged`` as a bare COUNT under the name ``unchanged_count``
+    (per FACT), in a markdown table sitting directly below a per-FACT table
+    of edges. A reader could not say what any column counted, and could
+    subtract one table from the other and get a number that means nothing.
+
+    So: one record shape for every per-match list, the scalar
+    ``unchanged_count`` gone (it could not say WHICH matches were
+    unchanged), and the denominator STATED next to the table rather than
+    left to be inferred from the rows above it.
+    """
+    report = await _candidate_active_report()
+    payload = json.loads(render_json(report))
+
+    by_name = {c['name']: c for c in payload['candidates']}
+    assert set(by_name) == set(_mod.CANDIDATE_NAMES)
+
+    for name, candidate in by_name.items():
+        for key in ('over_selected', 'recovered', 'unchanged'):
+            entries = candidate[key]
+            assert isinstance(entries, list), f'{name}.{key}'
+            for entry in entries:
+                assert set(entry) == {'fact', 'match_start'}, f'{name}.{key}'
+                assert isinstance(entry['fact'], str)
+                assert isinstance(entry['match_start'], int)
+            # The same explicit-sort guarantee the rejection lists carry.
+            assert entries == sorted(
+                entries, key=lambda e: (e['fact'], e['match_start']),
+            ), f'{name}.{key} is not explicitly sorted'
+
+        assert isinstance(candidate['matches_scanned'], int), name
+        assert isinstance(candidate['already_selected'], int), name
+        assert isinstance(candidate['facts_simulated'], int), name
+        assert candidate['matches_scanned'] == (
+            candidate['already_selected']
+            + len(candidate['recovered'])
+            + len(candidate['over_selected'])
+            + len(candidate['unchanged'])
+        ), name
+
+        # The per-FACT scalar is GONE, so nothing downstream can keep reading
+        # a per-fact number under a per-match heading.
+        assert 'unchanged_count' not in candidate, name
+
+    # The corpus really does exercise every term, so the assertions above are
+    # not passing over three empty lists.
+    assert len(by_name['b']['recovered']) == 2
+    assert len(by_name['b']['over_selected']) == 1
+    assert len(by_name['shipped']['unchanged']) == 3
+    assert by_name['shipped']['facts_simulated'] == 2
+    assert by_name['shipped']['matches_scanned'] == 3
+
+    markdown = render_markdown(report)
+    section = markdown[markdown.index('## Candidate tightenings'):]
+
+    # The column headers name the UNIT.
+    header = next(
+        line for line in section.splitlines() if line.startswith('| candidate |')
+    )
+    assert 'matches' in header, header
+    assert 'shapes recovered' not in header, (
+        'the recovered column counts matches, not shapes'
+    )
+
+    # ...and the denominator is stated, not left to be inferred from the
+    # per-FACT table above.
+    assert '2 distinct fact shape' in section
+    assert '3 regex match' in section
+    assert 'per rejected MATCH' in section
+
+
+@pytest.mark.asyncio
+async def test_the_artifacts_report_near_misses_not_the_raw_precondition_count():
+    """The near-miss LABEL must sit over the near-miss NUMBER.
+
+    `alpha` holds two facts carrying the shape and both match the regex in
+    full, so it has zero near-misses; the old column rendered 2. `zeta` holds
+    two carrying the shape of which one matches, so it has exactly one. The
+    JSON keeps the raw ``lexical_precondition`` under its own accurate name
+    alongside the derived ``near_miss``, so nothing is lost — only correctly
+    labelled.
+    """
+    report = await _fixed_report()
+    payload = json.loads(render_json(report))
+
+    by_id = {p['project_id']: p for p in payload['projects']}
+    assert by_id['alpha']['scan']['lexical_precondition'] == 2
+    assert by_id['alpha']['scan']['regex_matched'] == 2
+    assert by_id['alpha']['scan']['near_miss'] == 0
+    assert by_id['zeta']['scan']['near_miss'] == 1
+    assert payload['totals']['lexical_precondition'] == 4
+    assert payload['totals']['regex_matched'] == 3
+    assert payload['totals']['near_miss'] == 1
+
+    markdown = render_markdown(report)
+    rows = {
+        line.split('|')[1].strip(): line
+        for line in markdown.splitlines()
+        if line.startswith('| `')
+    }
+    # column order: project | valid edges | near-misses | regex matches | ...
+    assert rows['`alpha`'].split('|')[3].strip() == '0', rows['`alpha`']
+    assert rows['`zeta`'].split('|')[3].strip() == '1', rows['`zeta`']
+    assert '| **(all)** | **5** | **1** | **3** |' in markdown
+
+    # The partition is stated, so a reader is told the two columns are
+    # disjoint rather than left to discover they are not.
+    assert 'near-miss' in markdown
+    assert 'disjoint' in markdown
 
 
 @pytest.mark.asyncio
@@ -1597,6 +2162,282 @@ async def test_one_graphs_failure_is_a_shortfall_not_a_lost_run(caplog):
     ]
     assert '| `beta` | 0 |' in render_markdown(report)
 
+    # ...and the evidence has to say WHY. A `complete: false` row carrying no
+    # reason is indistinguishable in the artifact from a graph that enumerated
+    # cleanly and came back short, and the two call for opposite responses:
+    # the first is 'the graph went away, re-run', the second is 'the read was
+    # truncated, raise --page-size'. The reason lived only in the operator's
+    # terminal, which contradicts exit_code's own rule that the evidence of
+    # the shortfall is IN the artifact.
+    assert by_id['beta'].error_kind == _mod.ENUMERATION_FAILED, (
+        'the probe mints its own kind for a graph that never enumerated — no '
+        'graphiti_client INCOMPLETE_* kind describes a query that was never '
+        'issued through the paginator at all'
+    )
+    assert by_id['beta'].error is not None
+    assert 'KeyError' in by_id['beta'].error, (
+        'the exception TYPE is what separates a vanished graph from a '
+        'timeout or a refused connection'
+    )
+    assert 'beta' in by_id['beta'].error, 'and the message that named it'
+    assert 'Traceback' not in by_id['beta'].error, (
+        'the traceback belongs in the log, which already has it via '
+        'logger.exception — the artifact carries the identification'
+    )
+    assert by_id['alpha'].error is None and by_id['alpha'].error_kind is None
+
+    beta_block = next(p for p in payload['projects'] if p['project_id'] == 'beta')
+    assert beta_block['error_kind'] == _mod.ENUMERATION_FAILED
+    assert 'KeyError' in beta_block['error']
+
+
+@pytest.mark.asyncio
+async def test_every_incomplete_project_names_why_in_the_artifact():
+    """`complete: false` must never appear without the reason beside it.
+
+    THE INVARIANT, asserted here over a MIXED report rather than over one
+    failure mode at a time: ``(error is None) == (complete is True)``, for
+    every project. It rules out both defects at once — an unexplained
+    incomplete row, and a stray error string on a healthy one — which is what
+    makes the field trustworthy enough to read without cross-checking a log.
+
+    The four graphs are the four shapes a reader has to be able to tell
+    apart in a committed artifact months later, and today cannot:
+
+    - ``alpha`` enumerated cleanly;
+    - ``beta`` NEVER enumerated (its graph vanished mid-run — the KeyError
+      path), so no query reached the paginator at all;
+    - ``gamma`` enumerated and came back SHORT of a census that bracketed it;
+    - ``delta`` exhausted the PAGE CAP with the last page still full — a
+      structural shortfall, and the second of the two paths where the
+      paginator, not this probe, is the layer that reached the verdict.
+
+    ``beta`` and ``gamma`` are recorded identically today: ``valid_edges: 0``
+    versus a partial count, both ``complete: false``, neither saying why. The
+    responses they call for are opposite — re-run for the first, raise
+    ``--page-size`` for the second.
+
+    ONE TAXONOMY, not two. ``gamma``'s and ``delta``'s kinds are
+    graphiti_client's own ``INCOMPLETE_*`` values and their reasons are the
+    paginator's own prose, verbatim, so the artifact and the backend's logs
+    name the same failure with the same string and nobody has to build a
+    mapping between them. BOTH paginator-judged paths are pinned, not just
+    the short read: an arm that kept the shipped KIND while minting fresh
+    PROSE would commit a row whose two halves came from different layers, and
+    pinning only one path left the other free to do exactly that. Only
+    ``beta`` needs a probe-level kind, because no shipped kind describes a
+    read that was never attempted.
+
+    Both graphs are driven through the REAL enumerator over fake queries
+    rather than through canned outcomes: a hand-written outcome would assert
+    that this test knows the taxonomy, not that the two layers share one.
+    """
+    complete_query = _FakeCappedEdgeQuery(
+        [[f'alpha-edge-{i}', fact] for i, fact in enumerate(_ALPHA_FACTS)],
+        cap=_PAGE_SIZE,
+    )
+    # 40 rows read against a census that bracketed the run at 50 then 51 —
+    # ten edges present for the WHOLE run went unread, which the growth
+    # tolerance deliberately does not excuse.
+    short_query = _FakeMovingCorpusQuery(
+        _fake_rows(40), cap=_PAGE_SIZE, counts=[50, 51],
+    )
+    # 50 edges behind a 3-page cap at page_size=4: the loop stops with the
+    # last page still full, which is a STRUCTURAL shortfall the paginator
+    # itself diagnoses and words.
+    page_cap_query = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
+    queries = {
+        'alpha': complete_query, 'gamma': short_query, 'delta': page_cap_query,
+    }
+
+    # What the SHIPPED paginator says about that same read, read off a twin
+    # fake so the expectation is the layer's own wording rather than a copy
+    # of it pasted into this file, which would keep passing after a rewording
+    # that had stopped reaching the artifact.
+    short_query_reason = (await _mod._paged_ro_query(
+        _mod._QueryFnGraph(
+            _FakeMovingCorpusQuery(_fake_rows(40), cap=_PAGE_SIZE, counts=[50, 51]),
+        ),
+        _mod._EDGE_PAGE_CYPHER,
+        _mod._EDGE_COUNT_CYPHER,
+        page_size=_PAGE_SIZE,
+    )).reason
+    assert short_query_reason, 'the paginator must have something to say'
+
+    page_cap_reason = (await _mod._paged_ro_query(
+        _mod._QueryFnGraph(_FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)),
+        _mod._EDGE_PAGE_CYPHER,
+        _mod._EDGE_COUNT_CYPHER,
+        page_size=_PAGE_SIZE,
+        max_pages=_DELTA_PAGE_CAP,
+    )).reason
+    assert page_cap_reason, 'the paginator must have something to say'
+    assert page_cap_reason != short_query_reason, (
+        'the two shortfalls must be distinguishable, or this test cannot tell '
+        'a carried-through reason from a coincidence'
+    )
+
+    async def edge_source(project_id: str, *, page_size: int):
+        # 'beta' is absent — the vanished-graph case, raised from the same
+        # place a live backend would raise it.
+        if project_id == 'delta':
+            return await enumerate_valid_edge_facts(
+                queries[project_id],
+                page_size=page_size,
+                max_pages=_DELTA_PAGE_CAP,
+            )
+        return await enumerate_valid_edge_facts(
+            queries[project_id], page_size=page_size,
+        )
+
+    report = await run(
+        _args(project_id=None, page_size=_PAGE_SIZE),
+        edge_source=edge_source,
+        graph_lister=_lister('alpha', 'beta', 'gamma', 'delta'),
+    )
+
+    by_id = {p.project_id: p for p in report.projects}
+    for project in report.projects:
+        assert (project.error is None) == project.complete, (
+            f'{project.project_id}: error and complete must agree — '
+            f'complete={project.complete} error={project.error!r}'
+        )
+        assert (project.error_kind is None) == project.complete, (
+            f'{project.project_id}: kind must follow the same biconditional'
+        )
+
+    assert by_id['alpha'].complete is True
+    assert by_id['alpha'].census_before == len(_ALPHA_FACTS)
+    assert by_id['alpha'].census_after == len(_ALPHA_FACTS)
+
+    assert by_id['beta'].complete is False
+    assert by_id['beta'].error_kind == _mod.ENUMERATION_FAILED
+    assert 'KeyError' in by_id['beta'].error
+    assert by_id['beta'].census_before is None, (
+        'no census was taken — a zero here would read as a proven-empty graph'
+    )
+    assert by_id['beta'].census_after is None
+
+    assert by_id['gamma'].complete is False
+    assert by_id['gamma'].valid_edges == 40
+    assert by_id['gamma'].error_kind in {
+        graphiti_client.INCOMPLETE_STRUCTURAL_REFUSAL,
+        graphiti_client.INCOMPLETE_PAGE_CAP,
+        graphiti_client.INCOMPLETE_CENSUS_UNAVAILABLE,
+        graphiti_client.INCOMPLETE_SHORT_READ,
+    }, (
+        'the shortfall kinds are REUSED from the layer that produced them, '
+        'not minted in parallel here'
+    )
+    assert by_id['gamma'].error_kind == graphiti_client.INCOMPLETE_SHORT_READ
+    assert by_id['gamma'].error == short_query_reason, (
+        "the paginator's own prose, verbatim — so the artifact and the "
+        'backend log name one failure with one string'
+    )
+    assert by_id['gamma'].census_before == 50
+    assert by_id['gamma'].census_after == 51
+
+    assert by_id['delta'].complete is False
+    assert by_id['delta'].error_kind == graphiti_client.INCOMPLETE_PAGE_CAP
+    assert by_id['delta'].error == page_cap_reason, (
+        "the page cap is the paginator's own verdict too, so its prose is "
+        'carried through verbatim exactly as the short read is — an arm that '
+        'kept the shipped kind but minted its own message would put the two '
+        'halves of one committed row in two different vocabularies'
+    )
+    assert by_id['delta'].valid_edges == _DELTA_PAGE_CAP * _PAGE_SIZE, (
+        'the cap must have truncated the read, or this row proves nothing'
+    )
+
+    payload = json.loads(render_json(report))
+    assert payload['schema_version'] == 3, (
+        'the fields below are new; a schema-2 artifact beside this renderer '
+        'would misdescribe the script that claims to generate it'
+    )
+    assert _mod.SCHEMA_VERSION == 3
+    blocks = {p['project_id']: p for p in payload['projects']}
+    for project_id, project in by_id.items():
+        block = blocks[project_id]
+        assert block['error'] == project.error
+        assert block['error_kind'] == project.error_kind
+        assert block['census_before'] == project.census_before
+        assert block['census_after'] == project.census_after
+
+    markdown = render_markdown(report)
+    # The table's own `**NO**` cells are annotated, and the prose beneath
+    # carries the diagnostic reason. A bare `**NO**` is the defect.
+    assert _mod.ENUMERATION_FAILED in markdown
+    assert graphiti_client.INCOMPLETE_SHORT_READ in markdown
+    assert graphiti_client.INCOMPLETE_PAGE_CAP in markdown
+    assert by_id['beta'].error in markdown
+    assert by_id['gamma'].error in markdown
+    assert by_id['delta'].error in markdown
+    for line in markdown.splitlines():
+        if line.startswith('| `') and '**NO**' in line:
+            assert line.count('`') > 2, (
+                f'an incomplete row must name its kind, not just fail: {line}'
+            )
+
+
+# The four ways a verdict can disagree with its own explanation, one per
+# `raise ValueError` path across the two dataclasses. Each case names the
+# field whose check must be the one that fires, so a validator deleted or
+# inverted in a refactor fails HERE rather than shipping an artifact nobody
+# can read. Both dataclasses word their message as `... but <field>=<repr>`,
+# which is what makes one `match` expression serve both.
+_DISAGREEING_VERDICTS = [
+    # An incomplete verdict that cannot say why — the defect these types
+    # exist to make unrepresentable.
+    ({'complete': False}, 'reason'),
+    # Explained, but with no branchable discriminator beside the prose: a
+    # consumer would have to parse an interface that is deliberately not one.
+    ({'complete': False, 'reason': 'came back short'}, 'kind'),
+    # The reverse direction, which is just as corrosive: an explanation
+    # stapled to a healthy row makes every explanation in the artifact
+    # suspect.
+    ({'complete': True, 'reason': 'came back short', 'kind': 'short_read'}, 'reason'),
+    ({'complete': True, 'kind': 'short_read'}, 'kind'),
+]
+
+
+@pytest.mark.parametrize('kwargs, offending', _DISAGREEING_VERDICTS)
+def test_an_enumeration_outcome_cannot_disagree_with_itself(kwargs, offending):
+    """The biconditional is ENFORCED, not merely satisfied by today's callers.
+
+    ``test_every_incomplete_project_names_why_in_the_artifact`` asserts the
+    invariant HOLDS over a mixed report — and it passes identically whether
+    these validators exist or were deleted, because every report it builds is
+    well-formed by construction. The mechanism doing the work had no direct
+    coverage at all, which is the wrong thing to leave untested in a change
+    whose stated purpose is to make an unexplained `complete: false`
+    unrepresentable.
+    """
+    with pytest.raises(ValueError, match=rf'but {offending}='):
+        EnumerationOutcome(**kwargs)
+
+
+@pytest.mark.parametrize('kwargs, offending', [
+    (kwargs, offending.replace('reason', 'error').replace('kind', 'error_kind'))
+    for kwargs, offending in _DISAGREEING_VERDICTS
+])
+def test_a_project_report_cannot_disagree_with_itself(kwargs, offending):
+    """The same guarantee at the layer that gets COMMITTED.
+
+    ``ProjectReport`` re-asserts the invariant it inherits from
+    ``EnumerationOutcome`` rather than trusting it, because ``run``'s
+    exception handler builds one WITHOUT an outcome — the graph that never
+    enumerated. That path is exactly where an unexplained row would come
+    from, so the check has to live here too and has to be tested here too.
+    """
+    kwargs = {
+        k.replace('reason', 'error').replace('kind', 'error_kind'): v
+        for k, v in kwargs.items()
+    }
+    with pytest.raises(ValueError, match=rf'but {offending}='):
+        _mod.ProjectReport(
+            project_id='alpha', valid_edges=0, scan=_mod.ScanResult(), **kwargs,
+        )
+
 
 @pytest.mark.asyncio
 async def test_without_a_lister_the_report_says_its_graph_set_was_unchecked():
@@ -1855,3 +2696,191 @@ def test_scan_corpus_of_empty_corpus_is_all_zeroes():
     assert result.guard_rejected == 0
     assert result.selected == 0
     assert result.rejections == []
+
+
+# ---------------------------------------------------------------------------
+# An INCOMPLETE run must not destroy a COMPLETE committed measurement
+# ---------------------------------------------------------------------------
+#
+# The artifacts are the deliverable — the whole reason this is a committed
+# script and not a transcript is that 'zero matches today' is only as good as
+# its re-checkability. `exit_code` already encodes the fail-closed instinct
+# for the STATUS: the evidence lands, and the exit code refuses to call an
+# under-enumerated measurement a success. It was never applied to the FILE.
+#
+# So a single benign raced run — one edge written by an unrelated cycle while
+# 43 graphs paged — overwrote a good committed measurement with a truncated
+# one, and the recovery was `git checkout`, if anyone noticed. The growth
+# tolerance above makes that race far rarer; it does not make the clobber
+# safe, and the two fixes are independent.
+
+
+async def _report_with(complete: bool):
+    """A real report, complete or not, built through ``run`` rather than by hand.
+
+    Hand-built dataclasses would let this test pass against a `_write_artifacts`
+    that reads a field the real renderer never emits.
+    """
+    corpora = {'alpha': (_ALPHA_FACTS, complete)}
+    return await run(_args(project_id=['alpha'], measured_at=_FIXED_TIMESTAMP),
+                     edge_source=_FakeEdgeSource(corpora))
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_run_does_not_overwrite_a_complete_artifact(
+    tmp_path, caplog,
+):
+    """A raced run must not be able to destroy a good committed measurement."""
+    json_out = tmp_path / 'recall.json'
+    md_out = tmp_path / 'recall.md'
+
+    good = await _report_with(complete=True)
+    _mod._write_artifacts(good, str(json_out), str(md_out))
+    good_json = json_out.read_text()
+    good_md = md_out.read_text()
+
+    bad = await _report_with(complete=False)
+    with caplog.at_level('WARNING'):
+        _mod._write_artifacts(bad, str(json_out), str(md_out))
+
+    assert json_out.read_text() == good_json, 'the committed measurement was clobbered'
+    assert md_out.read_text() == good_md, 'the committed measurement was clobbered'
+
+    # The evidence is still recorded — refusing to write it at all would be
+    # the opposite failure.
+    sidecar_json = tmp_path / 'recall.json.incomplete'
+    sidecar_md = tmp_path / 'recall.md.incomplete'
+    assert json.loads(sidecar_json.read_text())['complete'] is False
+    assert sidecar_md.read_text()
+
+    # ...and the operator is TOLD, because a run that silently wrote somewhere
+    # else is worse than one that clobbered: the reader of the committed file
+    # would have no way to know a newer, worse measurement exists.
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert str(sidecar_json) in warnings
+    assert str(sidecar_md) in warnings
+    assert str(json_out) in warnings
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_run_writes_in_place_when_there_is_nothing_to_protect(
+    tmp_path,
+):
+    """The guard protects a KNOWN-GOOD artifact; it does not refuse evidence.
+
+    Diverting to a sidecar when the primary path holds nothing worth keeping
+    would leave the deliverable permanently empty and make every subsequent
+    run's sidecar the real report — the reverse of the intent.
+    """
+    # (a) nothing there at all
+    first_json = tmp_path / 'a.json'
+    first_md = tmp_path / 'a.md'
+    bad = await _report_with(complete=False)
+    _mod._write_artifacts(bad, str(first_json), str(first_md))
+    assert json.loads(first_json.read_text())['complete'] is False
+    assert not (tmp_path / 'a.json.incomplete').exists()
+
+    # (b) what IS there is already incomplete — nothing to protect
+    _mod._write_artifacts(bad, str(first_json), str(first_md))
+    assert json.loads(first_json.read_text())['complete'] is False
+    assert not (tmp_path / 'a.json.incomplete').exists()
+
+    # (c) unreadable/malformed JSON is 'nothing to protect', not a crash and
+    #     not an excuse to divert: a file that cannot be parsed cannot be
+    #     shown to be a good measurement.
+    broken_json = tmp_path / 'b.json'
+    broken_md = tmp_path / 'b.md'
+    broken_json.write_text('{not json at all')
+    broken_md.write_text('stale')
+    _mod._write_artifacts(bad, str(broken_json), str(broken_md))
+    assert json.loads(broken_json.read_text())['complete'] is False
+    assert not (tmp_path / 'b.json.incomplete').exists()
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_sidecar_does_not_outlive_the_report_beside_it(
+    tmp_path, caplog,
+):
+    """A diverted run's sidecar must not survive the next write to the primary.
+
+    The diversion above protects a good artifact; nothing removed what it
+    left behind. Run A is incomplete and diverts to
+    `plural-enum-guard-recall-report.json.incomplete`; run B is complete and
+    writes in place. Without a cleanup, A's sidecar sits in a COMMITTED
+    directory next to a newer and better report, with nothing in either
+    filename saying which is which — an operator (or a `git status`) has to
+    open both and compare `measured_at`. That is exactly the 'a reader cannot
+    tell what happened' failure the per-graph `error`/`error_kind` fields
+    exist to close, moved up to the directory listing.
+
+    ``test_a_complete_run_always_writes_in_place`` looks like it covers this
+    and does not: in its flow the incomplete write went IN PLACE (there was
+    nothing to protect), so no sidecar was ever created and its
+    ``not ...exists()`` assertion passes vacuously. This test creates one
+    first.
+    """
+    json_out = tmp_path / 'recall.json'
+    md_out = tmp_path / 'recall.md'
+    sidecar_json = tmp_path / 'recall.json.incomplete'
+    sidecar_md = tmp_path / 'recall.md.incomplete'
+
+    good = await _report_with(complete=True)
+    bad = await _report_with(complete=False)
+
+    _mod._write_artifacts(good, str(json_out), str(md_out))
+    _mod._write_artifacts(bad, str(json_out), str(md_out))
+    assert sidecar_json.exists() and sidecar_md.exists(), (
+        'precondition: the diversion must actually have produced a sidecar, '
+        'or this test proves nothing'
+    )
+
+    with caplog.at_level('INFO'):
+        written = _mod._write_artifacts(good, str(json_out), str(md_out))
+
+    assert json.loads(json_out.read_text())['complete'] is True
+    assert not sidecar_json.exists(), 'the superseded sidecar outlived its replacement'
+    assert not sidecar_md.exists(), 'the superseded sidecar outlived its replacement'
+    assert str(json_out) in written
+
+    # Removing a file the operator was previously TOLD to go read is itself
+    # something to say out loud.
+    logs = '\n'.join(r.getMessage() for r in caplog.records)
+    assert str(sidecar_json) in logs
+    assert str(sidecar_md) in logs
+
+    # The rule is 'a write that reached the primary paths supersedes the
+    # sidecar', not 'a COMPLETE write does'. The residual case — a primary
+    # artifact that is itself incomplete, reachable only if one was replaced
+    # by hand — is cleared on the same terms, so a sidecar never outlives a
+    # report written after it regardless of how the primary got there.
+    _mod._write_artifacts(bad, str(json_out), str(md_out))  # diverts again
+    assert sidecar_json.exists()
+    json_out.write_text(sidecar_json.read_text())  # by hand: primary now incomplete
+    _mod._write_artifacts(bad, str(json_out), str(md_out))  # ...so this lands in place
+    assert json.loads(json_out.read_text())['complete'] is False
+    assert not sidecar_json.exists()
+    assert not sidecar_md.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_complete_run_always_writes_in_place(tmp_path):
+    """The regression guard: the protection must not degenerate to 'never write'.
+
+    A complete measurement is exactly what the committed artifact is FOR, so
+    it overwrites whatever is there — including a previous complete one.
+    """
+    json_out = tmp_path / 'c.json'
+    md_out = tmp_path / 'c.md'
+
+    bad = await _report_with(complete=False)
+    _mod._write_artifacts(bad, str(json_out), str(md_out))
+    assert json.loads(json_out.read_text())['complete'] is False
+
+    good = await _report_with(complete=True)
+    _mod._write_artifacts(good, str(json_out), str(md_out))
+    assert json.loads(json_out.read_text())['complete'] is True
+
+    again = await _report_with(complete=True)
+    _mod._write_artifacts(again, str(json_out), str(md_out))
+    assert json.loads(json_out.read_text())['complete'] is True
+    assert not (tmp_path / 'c.json.incomplete').exists()

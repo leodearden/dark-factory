@@ -4973,3 +4973,178 @@ class TestStyleOnlyAuthorshipFlagWiring:
         assert report.stats.get('style_only_authorship_flags_dropped') == 0, (
             f'expected the stat present and 0; got stats={report.stats!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# ---- task 3476 step-11 ----
+# RED: MemoryConsolidator.run() must apply filter_accounted_cluster_growth_flags.
+# ---------------------------------------------------------------------------
+
+
+class TestAccountedClusterGrowthWiring:
+    """MemoryConsolidator.run() must apply filter_accounted_cluster_growth_flags
+    to items_flagged (task 3476), dropping a duplicate-cluster-growth finding
+    whose cited memory UUID is already written into the referenced gate task's
+    description body, and surfacing
+    report.stats['accounted_cluster_growth_flags_dropped'].
+
+    Hardens against the run-df364849-21e9-4f54-b802-a126a49eba97 /
+    finding-96a14765 incident, in which 2 of 3 such flags were FALSE POSITIVES:
+    Stage 1 diffed the candidate UUID against a title-derived COUNT rather than
+    the task's current body, and task 3417's title still reads "(3 primary + 3
+    secondary entries)" while its body already lists the "new" UUID verbatim.
+
+    RED until step-12 wires the filter into run() and sets the stat.
+    """
+
+    _UUID = '03b783d5-dc00-441a-af9d-05b0e636b668'
+
+    def _make_growth_flag(self, memory_id: str | None = None) -> dict:
+        mid = memory_id or self._UUID
+        return {
+            'task_id': '3417',
+            'category': 'memory_duplicate',
+            'flag_type': 'procedural_knowledge_cluster_growth',
+            'description': (
+                'Cluster has grown beyond the 3 primary + 3 secondary entries '
+                f'tracked by gate task 3417: mem0 {mid} is unaccounted.'
+            ),
+            'cited_memories': [{'memory_id': mid, 'store': 'mem0'}],
+        }
+
+    def _make_gate_task(self) -> dict:
+        return {
+            'id': 3417,
+            'title': (
+                'Human gate: consolidate npx-pyright EACCES procedural_knowledge '
+                'cluster (3 primary + 3 secondary entries)'
+            ),
+            'description': (
+                'Primary entries:\n'
+                '  1. mem0 aaaaaaaa-0000-4c01-baa0-b7851d2376cb\n'
+                '  2. mem0 bbbbbbbb-0000-4c01-baa0-b7851d2376cb\n'
+                f'  3. mem0 {self._UUID} (2026-08-01T00:20)\n'
+            ),
+            'details': '',
+        }
+
+    async def _run(self, stage, flags: list[dict], run_id: str):
+        """Run the stage over *flags* with dedup_flags neutralised."""
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(flags),
+            stats={},
+        )
+        # dedup_flags passes all flags through unchanged so the new filter's
+        # effect is observable in isolation.
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+        return report, dedup_mock
+
+    @pytest.mark.asyncio
+    async def test_accounted_growth_flag_dropped_and_benign_survives(self):
+        """The 3417 false positive is dropped; a benign finding survives."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
+        stage.taskmaster.get_task = AsyncMock(return_value=self._make_gate_task())
+
+        growth_flag = self._make_growth_flag()
+        benign_flag = {
+            'task_id': '100',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 100 has no deliverable',
+        }
+
+        report, _ = await self._run(
+            stage, [growth_flag, benign_flag], 'run-3476-step11',
+        )
+
+        assert growth_flag not in report.items_flagged, (
+            'the cluster-growth finding must be DROPPED when gate task 3417\'s '
+            'description body already lists the cited UUID; got '
+            f'items_flagged={report.items_flagged!r}. '
+            'RED: filter_accounted_cluster_growth_flags is not yet wired into run().'
+        )
+        assert benign_flag in report.items_flagged, (
+            f'Benign missing_deliverable flag must survive; got {report.items_flagged!r}'
+        )
+        assert report.stats.get('accounted_cluster_growth_flags_dropped') == 1, (
+            "run() must set report.stats['accounted_cluster_growth_flags_dropped'] "
+            f'= 1 when one accounted finding is dropped; got stats={report.stats!r}. '
+            'RED: stat not yet surfaced.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stat_is_present_and_zero_when_growth_is_genuine(self):
+        """The stat must never be conditionally absent (always-present convention)."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        assert stage.taskmaster is not None
+        stage.taskmaster.get_task = AsyncMock(return_value=self._make_gate_task())
+
+        # A genuine growth flag: the cited UUID is NOT in the gate task's body.
+        genuine_flag = self._make_growth_flag(
+            memory_id='deadbeef-9999-4c01-baa0-b7851d2376cb',
+        )
+
+        report, _ = await self._run(stage, [genuine_flag], 'run-3476-step11-zero')
+
+        assert genuine_flag in report.items_flagged, (
+            'a genuine growth finding (cited UUID absent from the body) must '
+            f'SURVIVE; got items_flagged={report.items_flagged!r}'
+        )
+        assert 'accounted_cluster_growth_flags_dropped' in report.stats, (
+            'the stat must be present on EVERY run, not only when something is '
+            f'dropped; got stats={report.stats!r}'
+        )
+        assert report.stats['accounted_cluster_growth_flags_dropped'] == 0, (
+            f'nothing was dropped, so the stat must be 0; got {report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_filter_runs_before_dedup_flags(self):
+        """Position is load-bearing: a dropped flag must never reach dedup_flags.
+
+        dedup_flags internally writes a stage1_flag_marker per surviving flag,
+        so a flag dropped AFTER it would leave marker churn behind.
+        """
+        stage = make_consolidator(project_root='/tmp/reify')
+        assert stage.taskmaster is not None
+        stage.taskmaster.get_task = AsyncMock(return_value=self._make_gate_task())
+
+        growth_flag = self._make_growth_flag()
+        benign_flag = {
+            'task_id': '100',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 100 has no deliverable',
+        }
+
+        _, dedup_mock = await self._run(
+            stage, [growth_flag, benign_flag], 'run-3476-step11-order',
+        )
+
+        dedup_mock.assert_awaited_once()
+        assert dedup_mock.await_args is not None
+        passed_flags = dedup_mock.await_args.kwargs['flags']
+        assert growth_flag not in passed_flags, (
+            'the dropped flag must never reach dedup_flags — dropping it after '
+            'dedup would leave a stage1_flag_marker behind; got '
+            f'flags={passed_flags!r}'
+        )
+        assert benign_flag in passed_flags, (
+            f'the benign flag must reach dedup_flags; got flags={passed_flags!r}'
+        )

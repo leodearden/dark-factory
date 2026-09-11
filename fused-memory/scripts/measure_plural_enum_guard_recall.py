@@ -40,6 +40,23 @@ shapes at all' (nothing to measure) from 'the corpus contains them and the
 guard is eating them' (a real recall cost). Without it a headline zero is
 uninterpretable.
 
+``near_miss`` is the REPORTABLE number derived from it:
+``lexical_precondition - regex_matched``, i.e. facts that carried the shape
+and did NOT match in full. That is what the artifacts label 'near-miss',
+because the raw precondition count CONTAINS the full matches and labelling
+it so invites a reader to subtract two columns of which one is a subset of
+the other. The subtraction is exact rather than approximate:
+PLURAL_ENUM_SNAPSHOT_RE's pattern literally begins
+``\\btasks\\b\\s*#?\\s*(?P<ids>\\d++``, so ``_LEXICAL_PRECONDITION_RE`` is a
+literal PREFIX of it and ``regex_matched <= lexical_precondition`` is an
+identity, not an observed coincidence — a prefix cannot fail where the whole
+pattern succeeded. Both patterns are editable, so the identity is pinned
+mechanically over the shared pinned corpora by
+``tests/test_measure_plural_enum_guard_recall.py::
+test_the_lexical_precondition_is_a_superset_of_the_full_regex``; without
+that gate a drifting pattern could drive ``near_miss`` negative and the
+report would render a nonsense column with nothing failing.
+
 Regenerate:
 
     cd fused-memory && uv run python scripts/measure_plural_enum_guard_recall.py
@@ -55,18 +72,47 @@ import sys
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-# The probe IMPORTS the shipped regex and guard rather than re-spelling
-# them. This is load-bearing, not stylistic: a copied pattern measures a
-# stale spelling of the thing it claims to measure, and would keep
-# reporting a reassuring zero after the guard it audits had changed
-# underneath it. Any drift now surfaces as an ImportError, not as a wrong
-# number.
+# The probe IMPORTS what it measures rather than re-spelling it. This is
+# load-bearing, not stylistic, and it applies to all three imported things —
+# the regex, the guard, and the pagination engine below. A copied pattern
+# measures a stale spelling of the thing it claims to measure, and would keep
+# reporting a reassuring zero after the code it audits had changed underneath
+# it. Any drift now surfaces as an ImportError, not as a wrong number.
 _SRC = Path(__file__).resolve().parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# The SHIPPED pagination engine and the SHIPPED population definition. The
+# probe DELEGATES to them rather than owning a second copy: two copies of a
+# fail-closed page loop is two places to fix a paging defect and one place to
+# forget, and a duplicated `_ALL_VALID_EDGES_MATCH` is worse still — the probe
+# would go on measuring the OLD population while reporting `complete: true`
+# over it, with nothing failing.
+#
+# `_census_count` is imported ALIASED, deliberately: the bare name is kept FREE
+# in this module's namespace as a tripwire, because the delegation test asserts
+# the probe defines no attribute by that name. That is how a future author
+# re-growing a private census helper gets caught. The alias also makes it
+# unambiguous at the call site that the SHIPPED helper is the one running.
+from fused_memory.backends.graphiti_client import (  # noqa: E402
+    _ALL_VALID_EDGES_MATCH,
+    _DEFAULT_READ_PAGE_SIZE,
+    _MAX_READ_PAGES,
+    _RESULTSET_SIZE,
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+    INCOMPLETE_STRUCTURAL_REFUSAL,
+    _paged_ro_query,
+)
+from fused_memory.backends.graphiti_client import (  # noqa: E402
+    _census_count as _shipped_census_count,
+)
+
+# The shipped regex and the guard whose recall this probe measures.
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
     _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
@@ -116,6 +162,27 @@ class ScanResult:
     guard_rejected: int = 0
     selected: int = 0
     rejections: list[Rejection] = field(default_factory=list)
+
+    @property
+    def near_miss(self) -> int:
+        """Facts carrying the shape that did NOT match the full regex.
+
+        DERIVED, deliberately: not a counted field and not a ``_sum_scans``
+        term. A separately-accumulated counter can drift from the two numbers
+        it is supposed to be the difference of, while this one cannot — and
+        because ``_sum_scans`` already sums both inputs, the totals row's
+        near-miss count is automatically consistent with every project row's
+        without a third accumulation to keep in step.
+
+        Non-negative by an identity, not by luck:
+        ``_LEXICAL_PRECONDITION_RE`` is a literal prefix of
+        PLURAL_ENUM_SNAPSHOT_RE, so every fact counted in ``regex_matched``
+        was already counted in ``lexical_precondition``. The mechanical guard
+        on that claim is
+        ``test_the_lexical_precondition_is_a_superset_of_the_full_regex``,
+        parametrized over the shared pinned corpora.
+        """
+        return self.lexical_precondition - self.regex_matched
 
 
 def scan_corpus(facts: Iterable[str]) -> ScanResult:
@@ -352,19 +419,64 @@ def extract_plural_ids(fact: str, *, candidate: str = 'shipped') -> set[int]:
 
 
 @dataclass(frozen=True)
+class CandidateMatch:
+    """One simulated match, carried into the report at the offset scored.
+
+    Deliberately the SAME two fields as ``Rejection``, so the report has one
+    record shape and one ``(fact, match_start)`` sort convention for every
+    per-match list it renders. A bare fact string cannot say WHICH of a
+    multi-enumeration fact's matches was scored, which is the distinction the
+    whole per-MATCH unit exists to preserve.
+    """
+
+    fact: str
+    match_start: int
+
+
+@dataclass(frozen=True)
 class CandidateResult:
     """What one candidate tightening would change against a shape corpus.
+
+    EVERY FIELD BELOW IS COUNTED IN ONE UNIT: the regex MATCH. A fact
+    carrying two enumerations contributes 2, not 1, and contributes to two
+    different buckets if its two matches are scored differently.
 
     ``over_selected`` is disqualifying and ``recovered`` is the benefit; the
     two are separated by ``triage_rejection``, so the same newly-admitted
     match is scored as a regression or a recovery on its own linguistic
-    merits rather than on which list the caller passed it in.
+    merits rather than on which list the caller passed it in. ``unchanged``
+    holds the rejected matches the candidate rejects too, and ONLY those —
+    a match the shipped guard already selects is out of the simulation's
+    scope and is counted in ``already_selected`` instead.
+
+    That split is what makes the band arithmetic::
+
+        matches_scanned
+            == already_selected + len(recovered) + len(over_selected)
+               + len(unchanged)
+
+    An earlier spelling mixed three units in these four fields —
+    ``over_selected``/``recovered`` appended per MATCH, ``unchanged``
+    appended per FACT (and including facts that never reached the guard) —
+    so the columns could not be added, subtracted or compared even though
+    the renderers put them in one table.
+
+    ``facts_simulated`` carries the OTHER denominator: how many distinct
+    fact SHAPES were fed in. The dedup that produces those shapes happens in
+    ``run()`` (see ``live_facts``) and is a separate concern from the unit
+    counted here — deduping shapes stops an N-rejection fact being scored N
+    times over, while the per-MATCH unit is what makes its N enumerations
+    individually visible. Both are needed; conflating them is the defect
+    above.
     """
 
     name: str
-    over_selected: list[str] = field(default_factory=list)
-    recovered: list[str] = field(default_factory=list)
-    unchanged: list[str] = field(default_factory=list)
+    over_selected: list[CandidateMatch] = field(default_factory=list)
+    recovered: list[CandidateMatch] = field(default_factory=list)
+    unchanged: list[CandidateMatch] = field(default_factory=list)
+    matches_scanned: int = 0
+    already_selected: int = 0
+    facts_simulated: int = 0
 
 
 def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
@@ -380,33 +492,57 @@ def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
     is strictly weaker on some prefix; a candidate that instead rejects
     something the shipped guard admits shows up as a changed id set in
     ``extract_plural_ids``, which the subject-position positives pin.
+
+    THE UNIT IS THE MATCH, everywhere, and *facts* is expected to be a
+    deduplicated set of distinct fact SHAPES (``run()`` does that dedup; see
+    its ``live_facts``). Every match of every shape is counted exactly once,
+    into exactly one of four places, so::
+
+        matches_scanned
+            == already_selected + len(recovered) + len(over_selected)
+               + len(unchanged)
+
+    holds by construction. ``already_selected`` is the branch the simulation
+    has nothing to say about: the shipped guard admits that match, so no
+    candidate that is merely WEAKER can change it, and folding it into
+    ``unchanged`` would put a fact that never reached the guard beside the
+    rejections the guard actually produced.
     """
-    over_selected: list[str] = []
-    recovered: list[str] = []
-    unchanged: list[str] = []
+    over_selected: list[CandidateMatch] = []
+    recovered: list[CandidateMatch] = []
+    unchanged: list[CandidateMatch] = []
+    matches_scanned = 0
+    already_selected = 0
+    facts_simulated = 0
 
     guard = _CANDIDATE_GUARDS[name]
     for fact in facts:
-        changed = False
+        facts_simulated += 1
         for match in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
+            matches_scanned += 1
             prefix = fact[: match.start()]
+            entry = CandidateMatch(fact=fact, match_start=match.start())
             if not _enumeration_is_prepositional_complement(prefix):
-                continue  # shipped already selects it; nothing to recover
+                # Shipped already selects it; nothing to recover, and out of
+                # this simulation's scope rather than 'unchanged'.
+                already_selected += 1
+                continue
             if guard(prefix):
-                continue  # candidate agrees with the shipped rejection
-            changed = True
+                unchanged.append(entry)  # candidate agrees with the rejection
+                continue
             if triage_rejection(fact, match.start()) == ADVERBIAL_PREAMBLE:
-                recovered.append(fact)
+                recovered.append(entry)
             else:
-                over_selected.append(fact)
-        if not changed:
-            unchanged.append(fact)
+                over_selected.append(entry)
 
     return CandidateResult(
         name=name,
         over_selected=over_selected,
         recovered=recovered,
         unchanged=unchanged,
+        matches_scanned=matches_scanned,
+        already_selected=already_selected,
+        facts_simulated=facts_simulated,
     )
 
 
@@ -414,55 +550,42 @@ def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
 # Edge enumeration
 # ---------------------------------------------------------------------------
 
-# FalkorDB's server-wide RESULTSET_SIZE is 10000 and nothing in this repo
-# overrides it, so ANY single query returning more rows than that is
-# SILENTLY truncated — no error, no warning, no partial-result flag.
+# The three paging constants are REBOUND from graphiti_client, not re-spelled
+# here. The public names are retained — argparse help strings and the tests
+# use them — but the values are now the shipped objects, so there is exactly
+# one place a re-measurement has to correct.
 #
-# Measured on the live dark_factory graph (task 3949 planning):
-#   get_all_valid_edges' exact query      -> 24902 rows, 10000 returned
-#   distinct valid edges actually exposed -> 6376 of 12488 (51%)
+# Why that matters more than tidiness: RESULTSET_SIZE is an ASSUMPTION about
+# server configuration, not something this repo sets. A second copy of an
+# assumption is a copy that can go stale silently — the probe would keep
+# reasoning from the old number and keep reporting `complete` while the layer
+# it audits reasoned from the new one.
 #
-# Default page size is therefore well under the cap, so a page that comes
-# back short really is the end of the data rather than the server's ceiling.
-DEFAULT_PAGE_SIZE = 5000
+# The measured figures behind these values (FalkorDB's server-wide cap of
+# 10000, and what an unpaginated whole-graph read cost on the live corpus)
+# live in the RESULT-SET CAP AUDIT block of backends/graphiti_client.py,
+# which is the one place they are recorded.
+DEFAULT_PAGE_SIZE = _DEFAULT_READ_PAGE_SIZE
+RESULTSET_SIZE = _RESULTSET_SIZE
+MAX_ENUM_PAGES = _MAX_READ_PAGES
 
-# FalkorDB's server-wide result-set ceiling.
+# The population definition is SHARED with production, by construction rather
+# than by coincidence of spelling: both Cypher strings below are composed from
+# graphiti_client's own `_ALL_VALID_EDGES_MATCH`, the same constant
+# `enumerate_all_valid_edges` pages over.
 #
-# THIS IS AN ASSUMPTION ABOUT SERVER CONFIGURATION, not something this repo
-# sets — which is exactly why the census cross-check below does not trust it.
-# The value only has to be RIGHT for the structural check to be useful; the
-# empirical check is what stays correct when it is wrong.
-RESULTSET_SIZE = 10000
-
-# Hard safety cap on the number of SKIP/LIMIT pages a single graph's
-# enumeration will fetch, bounding worst-case pagination against a
-# pathological corpus. Normal use never approaches it: at the default page
-# size this is 5,000,000 edges against a live maximum near 16,000. Copied
-# from census_foreign_nodes' MAX_CENSUS_PAGES precedent
-# (scripts/migrate_cross_graph_leak.py:161), including its rule that hitting
-# the cap on a still-full page is reported, never swallowed.
-MAX_ENUM_PAGES = 1000
-
-# The same MATCH pattern GraphitiBackend.get_all_valid_edges uses, so this
-# measures the corpus the production sweep is aimed at — but issued with
-# SKIP/LIMIT and page-audited here. This is DELIBERATELY not a call to
-# get_all_valid_edges.
+# This is the same load-bearing argument the import block at the top of this
+# module makes about the regex and the guard, applied to the population. Two
+# independently-spelled MATCH/WHERE clauses can drift — production narrowing
+# its WHERE, say — and the probe would go on measuring the OLD population
+# while reporting `complete: true` over it. A shared constant cannot drift,
+# and `test_the_probe_and_production_read_the_same_population` fails if this
+# composition is ever unpicked.
 #
-# TENSE MATTERS HERE, and an earlier draft of this comment got it wrong (the
-# error reached the committed artifact, which is the deliverable): at this
-# task's PLANNING TIME get_all_valid_edges was a single unpaginated query and
-# was silently truncated by FalkorDB's server-wide RESULTSET_SIZE of 10000,
-# hiding about half the corpus. It is PAGINATED AS OF TASK 4340 and that
-# truncation is GONE — get_all_valid_edges' own docstring says so, and the
-# measured counts are recorded in the RESULT-SET CAP AUDIT block of
-# backends/graphiti_client.py. There is NO outstanding truncation bug in
-# graphiti_client.py to file or fix on this account.
-#
-# The probe keeps its own paging anyway, for independence rather than for
-# workaround: the coverage claim then rests on the page accounting audited
-# below, not on whatever a shared enumerator does next. (Separately, the
-# task-2613 miss RATE still carries the old truncated denominator; that
-# re-measurement is ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8.)
+# What is deliberately NOT shared is the PROJECTION. Production returns four
+# columns, one row per (edge, endpoint); this probe returns
+# `DISTINCT e.uuid, e.fact` — half the rows, and directly comparable to the
+# post-dedup `len(facts)` its completeness rule is stated in.
 #
 # ORDER BY is load-bearing, not cosmetic. Every page is a SEPARATE query, and
 # DISTINCT + SKIP/LIMIT with no total order gives the store no obligation to
@@ -470,48 +593,115 @@ MAX_ENUM_PAGES = 1000
 # page 1 never returned (silently dropped, permanently) or re-return rows it
 # did (harmlessly deduped here, which is what makes the drop so easy to miss).
 _EDGE_PAGE_CYPHER = (
-    'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
-    'RETURN DISTINCT e.uuid, e.fact '
+    _ALL_VALID_EDGES_MATCH
+    + 'RETURN DISTINCT e.uuid, e.fact '
     'ORDER BY e.uuid '
     'SKIP {skip} LIMIT {limit}'
 )
 
-# The empirical completeness proof. Deliberately the SAME MATCH and WHERE as
-# the page query, so the two numbers describe the same population and are
+# The empirical completeness proof. Same MATCH and WHERE as the page query by
+# construction, so the two numbers describe the same population and are
 # therefore comparable; DISTINCT on e.uuid so the undirected match's
 # double-attribution collapses exactly as the paged dict-dedup collapses it.
+# (Production's own census returns `count(*)` — the count of ROWS, matching
+# its per-endpoint projection. Reusing it here would manufacture a mismatch
+# on every run, which is why the census is composed rather than imported.)
 #
 # It returns exactly ONE row, which is the whole point: a single-row result
 # can never be truncated by the row cap it is being used to detect. That is
-# what makes `len(facts) == expected` a proof rather than one more heuristic.
-_EDGE_COUNT_CYPHER = (
-    'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
-    'RETURN count(DISTINCT e.uuid)'
-)
+# what makes the count check a proof rather than one more heuristic.
+_EDGE_COUNT_CYPHER = _ALL_VALID_EDGES_MATCH + 'RETURN count(DISTINCT e.uuid)'
 
 
-async def _census_count(
-    query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
-) -> int | None:
-    """Distinct valid edges the store reports, or None if it did not say.
+class _QueryFnGraph:
+    """Adapt this module's ``query_fn(cypher)`` seam to a FalkorDB handle.
 
-    Every 'it did not say' shape collapses to None — no rows, a null result
-    set, a NULL count, a row with no columns, a non-integer — because the
-    caller treats None as fail-closed and there is nothing to gain by
-    distinguishing between flavours of missing evidence.
+    ``_paged_ro_query`` touches its ``graph`` argument in exactly one way —
+    ``await graph.ro_query(cypher, params)``, then reads ``.result_set`` — so
+    eight lines are enough to keep the ``query_fn`` seam every enumeration
+    test drives, while the paging LOGIC comes from the shipped engine.
+
+    Keeping the seam is not incidental. It is what lets the whole enumeration
+    band be exercised — page caps, server truncation, a census that stops
+    answering — with no FalkorDB anywhere near the test run.
     """
-    rows = list(await query_fn(_EDGE_COUNT_CYPHER) or [])
-    if not rows:
-        return None
-    row = rows[0]
-    if row is None or len(row) == 0 or row[0] is None:
-        return None
-    try:
-        return int(row[0])
-    except (TypeError, ValueError):
-        return None
+
+    __slots__ = ('_query_fn',)
+
+    def __init__(
+        self, query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
+    ) -> None:
+        self._query_fn = query_fn
+
+    async def ro_query(self, cypher: str, params: dict | None = None) -> Any:
+        # ``params`` is accepted and ignored: this module binds nothing, and
+        # the seam predates parameter support. Rows are normalised to a list
+        # so a fake returning None reads as an empty result set rather than
+        # as a missing attribute.
+        rows = list(await self._query_fn(cypher) or [])
+        return SimpleNamespace(result_set=rows)
+
+
+# The probe's OWN incompleteness kind, and the only one it mints. Every
+# other kind this module reports is graphiti_client's, reused verbatim.
+#
+# It exists because no shipped kind describes what it names: the four
+# ``INCOMPLETE_*`` values all classify a read that REACHED the paginator and
+# came back deficient, whereas this one marks a graph where the enumeration
+# raised before producing anything — a graph key that vanished between the
+# listing and the query is the cheap, routine way in (``list_graphs()``
+# returns dozens of ephemeral pytest graphs). Borrowing a shipped kind for it
+# would put a value in the artifact that the layer it came from never emits.
+ENUMERATION_FAILED = 'enumeration_failed'
+
+
+@dataclass(frozen=True)
+class EnumerationOutcome:
+    """Whether an enumeration is all of it, and — when it is not — why.
+
+    Modelled directly on ``PagedRead``, including the field SPLIT, which that
+    docstring already argues for this exact situation: ``reason`` is
+    diagnostic prose aimed at an operator reading a log and is deliberately
+    NOT a stable interface, while ``kind`` is the discriminator a consumer can
+    branch on without parsing prose. This module does not get to invent a
+    second convention for the same problem one layer up.
+
+    ``kind`` is one of graphiti_client's four ``INCOMPLETE_*`` values —
+    reused, not paralleled, so the committed artifact and the backend's own
+    logs name one failure with one string and a reader correlating them needs
+    no mapping — or this module's ``ENUMERATION_FAILED``.
+
+    INVARIANT: ``reason is None``, ``kind is None`` and ``complete is True``
+    all hold together or none does. An incomplete outcome that cannot say why
+    is the defect this type exists to make unrepresentable; an explained
+    'complete' would be just as untrustworthy in the other direction.
+
+    ``census_before``/``census_after`` are the bracket the verdict was DERIVED
+    from, and they travel with it because a `complete: false` without them
+    cannot be audited: a reader cannot tell a corpus that grew from one that
+    was truncated, which is the entire distinction the tolerance band draws.
+    Both are None when no census was taken at all.
+    """
+
+    complete: bool
+    reason: str | None = None
+    kind: str | None = None
+    census_before: int | None = None
+    census_after: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.reason is None) != self.complete:
+            raise ValueError(
+                f'EnumerationOutcome: complete={self.complete} but '
+                f'reason={self.reason!r} — an incomplete enumeration must say '
+                'why, and a complete one has nothing to explain'
+            )
+        if (self.kind is None) != self.complete:
+            raise ValueError(
+                f'EnumerationOutcome: complete={self.complete} but '
+                f'kind={self.kind!r} — the discriminator follows the same '
+                'biconditional as the prose'
+            )
 
 
 async def enumerate_valid_edge_facts(
@@ -520,18 +710,30 @@ async def enumerate_valid_edge_facts(
     page_size: int = DEFAULT_PAGE_SIZE,
     resultset_size: int = RESULTSET_SIZE,
     max_pages: int = MAX_ENUM_PAGES,
-) -> tuple[dict[str, str], bool]:
+) -> tuple[dict[str, str], EnumerationOutcome]:
     """Enumerate every valid RELATES_TO edge's fact text, keyed on edge uuid.
 
-    Pages with SKIP/LIMIT until a page comes back short or empty. Dedupes on
-    edge uuid: the undirected MATCH attributes each directed edge to BOTH of
-    its endpoints, so the same edge uuid legitimately arrives more than once
-    (documented on get_all_valid_edges). A NULL fact is coerced to ''.
+    The paging itself is DELEGATED to graphiti_client's ``_paged_ro_query``
+    — the same audited engine ``enumerate_all_valid_edges`` uses — rather
+    than re-derived here. This module used to own a second copy: its own
+    census helper, its own page loop, its own structural guard, and its own
+    spellings of 5000 / 10000 / 1000. Two copies of a fail-closed page loop
+    is two places to fix a paging defect and one place to forget.
 
-    Returns ``(facts_by_uuid, complete)``. The flag is the fail-closed hook:
-    an under-enumerated corpus must be reported as a FAILURE rather than as a
-    smaller report, because the headline result is a zero and a truncated
-    zero is worthless.
+    What this function still owns, because it is what makes the measurement
+    comparable, is the UNIT: it dedupes on edge uuid, and its completeness
+    rule is stated in DISTINCT EDGES, not in rows. The undirected MATCH
+    attributes each directed edge to BOTH of its endpoints, so the same edge
+    uuid legitimately arrives more than once (documented on
+    get_all_valid_edges). A NULL fact is coerced to ''.
+
+    Returns ``(facts_by_uuid, EnumerationOutcome)``. The outcome is the
+    fail-closed hook: an under-enumerated corpus must be reported as a FAILURE
+    rather than as a smaller report, because the headline result is a zero and
+    a truncated zero is worthless. It carries the two census readings the
+    verdict was derived from, and — whenever the verdict is a failure — the
+    KIND and the REASON, so the shortfall reaches the committed artifact
+    instead of stopping at the operator's terminal.
 
     ``complete`` is FALSE — and every one of these paths logs a WARNING
     naming the numbers, so a shortfall is never silent — when:
@@ -541,150 +743,267 @@ async def enumerate_valid_edge_facts(
        the server cannot be what shortened it. At or above the cap the two
        causes are indistinguishable, so no enumeration is attempted at all
        and an EMPTY dict is returned: a partial dict invites a caller to use
-       it anyway.
+       it anyway. (``INCOMPLETE_STRUCTURAL_REFUSAL``, and the only path that
+       returns before the post-census, since zero queries were issued.)
     2. The ``max_pages`` bound is reached while the last page was still full
        — a suspected shortfall, reported rather than swallowed.
+       (``INCOMPLETE_PAGE_CAP``.)
     3. Either census probe did not answer with a usable count. An unavailable
-       proof is not a passing proof.
-    4. The corpus MOVED during enumeration — the census answers a different
-       number before and after paging.
-    5. A STABLE census count and the number enumerated disagree.
+       proof is not a passing proof, and a band needs both ends.
+    4. Fewer distinct edges were enumerated than ``min(census_before,
+       census_after)``.
 
-    (1) and (2) are STRUCTURAL; (3), (4) and (5) are EMPIRICAL, and the two
-    kinds are deliberately independent rather than redundant.
+    (1) and (2) are STRUCTURAL — ``INCOMPLETE_STRUCTURAL_KINDS``, which this
+    function treats as never tolerable; (3) and (4) are EMPIRICAL, and the two
+    kinds are deliberately independent rather than redundant. The shipped
+    engine names the same split for the same reason.
+
+    WHERE THE KIND AND REASON COME FROM. Whenever ``_paged_ro_query`` already
+    judged the read incomplete, ITS kind and ITS prose are carried through
+    verbatim — the layer that made the observation is the one that gets to
+    word it, and passing it along unaltered is what keeps the artifact and the
+    backend's logs naming one failure with one string. Only where this
+    function reaches a verdict the paginator did not are they minted here:
+    the post-census that stopped answering, and the dedup that fell below the
+    band on rows the paginator was content with. Those still use the SHIPPED
+    kind vocabulary, because the failures they name are the same failures.
 
     THE CORPUS IS LIVE AND IS BEING WRITTEN WHILE THIS RUNS. The graphs
     measured here are the orchestrator's and the reconciler's working memory,
-    so an add or an invalidate can land between the census probe and the last
-    page. That makes ``len(facts) != expected`` a genuinely ambiguous
-    observation, which is why the census is probed TWICE — once before paging
-    and once after. A shortfall against a count that MOVED is a benign,
-    retryable race; a shortfall against a count that held still is evidence of
-    truncation or of dropped rows. Both fail closed, but they are reported as
-    different things, because handing an operator 'suspected server cap' for
-    what is actually a concurrent write sends them to configuration they do
-    not need to change.
+    so adds and invalidates land between the census probe and the last page —
+    on a full run paging tens of thousands of edges across dozens of queries,
+    a census that moves is the ORDINARY case, not the exotic one.
 
-    The structural check is ``>=`` and not ``>``: equality is arithmetically
-    safe on a server configured at exactly ``RESULTSET_SIZE``, but that
-    constant is an ASSUMPTION about server configuration, so equality leaves
-    zero margin — a server configured one row lower silently re-opens the
-    truncation. One page of throughput buys that margin.
+    THE TOLERANCE BAND, and why it is derived rather than tuned. An earlier
+    rule failed the run whenever the two census readings disagreed at all. On
+    these graphs that is a hair trigger rather than a check: one edge written
+    by an unrelated cycle anywhere in the window flipped a 43-graph run to
+    INCOMPLETE and exit 1, and told the operator to re-run something that was
+    already right.
 
-    The census check exists because that reasoning bottoms out on a guess,
-    and the defect class ('a short page was mistaken for end-of-data') does
-    not. If the live server is configured BELOW the assumed constant, then
-    ``page_size < resultset_size`` passes the structural check and the
-    short-page break lies exactly as it would have before — the identical
-    silent truncation, undetected. Comparing what was enumerated against a
-    single-row count that the cap cannot truncate catches that, and catches
-    causes not enumerated here: unstable DISTINCT+SKIP/LIMIT page
-    boundaries, a dropped page.
+    The replacement comes from set semantics. The edges present for the WHOLE
+    run are a subset of the corpus at the first census AND of the corpus at
+    the second, so there are at most ``min(before, after)`` of them. Reading
+    at least that many therefore means nothing continuously present went
+    unread — which is precisely the claim `complete` is making. Growth is
+    tolerated; shrinkage is tolerated exactly down to the post-census and no
+    further; a STABLE census that disagrees is still a shortfall, which is
+    what stops the tolerance becoming the answer to every mismatch.
 
-    Both are kept because they fail differently and usefully. The structural
-    check fails FAST, before any work, with a specific operator-actionable
-    reason ('re-run with a smaller --page-size'); the census check catches
-    everything else, at the cost of only being able to report a bare count
-    mismatch.
+    There is deliberately NO magnitude threshold — no '1% drift is fine'. A
+    percentage would be a tuned constant with no achievability basis, it
+    would need re-tuning as the corpus grows, and it would silently excuse a
+    shortfall of exactly the size someone once guessed was benign. This band
+    is derived from what the numbers mean and needs no tuning at all. Movement
+    is not swallowed either: it is DISCLOSED, logged at INFO and recorded in
+    the artifact as the census pair, so a reader sees it rather than inferring
+    it from a verdict.
+
+    This aligns with the shipped precedent rather than inventing a policy:
+    ``_paged_ro_query`` judges its own reads on ``rows_seen >= expected_rows``
+    for the same reason, and its docstring says so — 'a corpus that grew
+    between the census probe and the last page is not a truncation'. The band
+    here is the two-ended form of that rule, which this function can afford
+    because it takes the second reading the shipped engine does not.
+
+    WHY COMPLETENESS IS RE-DERIVED HERE rather than read off ``paged.complete``.
+    The two flags are stated in DIFFERENT UNITS and are not interchangeable:
+    ``paged.rows_seen`` counts ROWS as fetched, while this function's census
+    counts DISTINCT EDGE UUIDS and ``len(facts)`` is the post-dedup number.
+    Deferring to ``paged.complete`` would compare a row count against an edge
+    count and manufacture a verdict from two populations. The shipped engine's
+    structural verdict IS honoured verbatim, because that one is about the
+    read itself and is unit-free.
     """
-    if page_size >= resultset_size:
-        logger.warning(
-            'enumerate_valid_edge_facts: page_size=%d is at or above the '
-            "server's result-set cap (resultset_size=%d), so a short page "
-            'cannot be distinguished from a server-truncated one and '
-            'completeness is unprovable. Refusing to enumerate — re-run '
-            'with --page-size well below %d.',
-            page_size, resultset_size, resultset_size,
-        )
-        return {}, False
+    graph = _QueryFnGraph(query_fn)
+    paged = await _paged_ro_query(
+        graph,
+        _EDGE_PAGE_CYPHER,
+        _EDGE_COUNT_CYPHER,
+        page_size=page_size,
+        resultset_size=resultset_size,
+        max_pages=max_pages,
+    )
 
-    # Taken BEFORE paging so the target is fixed up front rather than
-    # inferred from the same pages whose completeness is in question.
-    expected = await _census_count(query_fn)
-    if expected is None:
-        logger.warning(
-            'enumerate_valid_edge_facts: the census probe returned no usable '
-            'count, so completeness cannot be proven. Reporting INCOMPLETE — '
-            'an unavailable proof is not a passing one.',
+    if paged.incomplete_kind == INCOMPLETE_STRUCTURAL_REFUSAL:
+        # Guard 1 refused before issuing a single query, and returned no rows
+        # for the reason its own comment gives: a partial dict invites the
+        # caller to use it anyway. Return here rather than fall through, so
+        # the post-census does not turn 'zero queries issued' into one.
+        return {}, EnumerationOutcome(
+            complete=False,
+            reason=paged.reason,
+            kind=INCOMPLETE_STRUCTURAL_REFUSAL,
         )
 
     facts: dict[str, str] = {}
-    skip = 0
-    paged_to_the_end = False
-    for _page in range(max_pages):
-        page = await query_fn(
-            _EDGE_PAGE_CYPHER.format(skip=skip, limit=page_size),
-        )
-        rows = list(page or [])
-        for row in rows:
-            edge_uuid = row[0]
-            if edge_uuid is None or edge_uuid in facts:
-                continue
-            facts[edge_uuid] = row[1] or ''
-        if len(rows) < page_size:
-            # Short (or empty) page, and page_size < resultset_size was
-            # checked above — so the server cannot be what shortened it and
-            # the data really is exhausted. A FULL page can never prove that,
-            # which is exactly why the loop continues. Note this is only the
-            # STRUCTURAL half of the argument; the census check below is what
-            # holds when the assumption behind it does not.
-            paged_to_the_end = True
-            break
-        skip += len(rows)
+    for row in paged.rows:
+        edge_uuid = row[0]
+        if edge_uuid is None or edge_uuid in facts:
+            continue
+        facts[edge_uuid] = row[1] or ''
 
-    # Re-probed AFTER paging. The pre-count alone cannot tell a truncated
-    # enumeration from one that raced a concurrent write, and those two want
-    # opposite responses from the operator (fix the config vs just re-run).
-    post_expected = None if expected is None else await _census_count(query_fn)
-    corpus_moved = (
-        expected is not None
-        and post_expected is not None
-        and post_expected != expected
+    census_before = paged.expected_rows
+    # Re-probed AFTER paging, through the SHIPPED census helper. One reading
+    # cannot bound what was continuously present on a graph being written to,
+    # and the two readings are what the tolerance band below is derived from.
+    # Skipped when the pre-count was unavailable: a band needs both ends.
+    census_after = (
+        None
+        if census_before is None
+        else await _shipped_census_count(graph, _EDGE_COUNT_CYPHER)
     )
 
-    if not paged_to_the_end:
-        logger.warning(
-            'enumerate_valid_edge_facts: hit the %d-page cap (page_size=%d, '
-            'enumerated=%d) while the last page was still full — enumeration '
-            'is incomplete. Re-run with a larger --page-size.',
-            max_pages, page_size, len(facts),
-        )
-    elif expected is not None and post_expected is None:
-        logger.warning(
-            'enumerate_valid_edge_facts: the post-enumeration census probe '
-            'returned no usable count, so a shortfall could not be told apart '
-            'from a concurrent write. Reporting INCOMPLETE — an unavailable '
-            'proof is not a passing one.',
-        )
-    elif corpus_moved:
-        logger.warning(
-            'enumerate_valid_edge_facts: the corpus CHANGED MID-ENUMERATION — '
-            'the census reported %d distinct edges before paging and %d after '
-            '(enumerated=%d, page_size=%d). These graphs are written live by '
-            'the orchestrator and the reconciler, so this is an ordinary '
-            'race, NOT a truncation: nothing is misconfigured. Reporting '
-            'INCOMPLETE — re-run.',
-            expected, post_expected, len(facts), page_size,
-        )
-    elif expected is not None and len(facts) != expected:
-        logger.warning(
-            'enumerate_valid_edge_facts: enumerated %d distinct edges but the '
-            'census reports %d, stable across the whole run (page_size=%d) — '
-            'the enumeration is SHORT and the corpus did not move under it. '
-            'The most likely cause is a server result-set cap below the '
-            'assumed %d; unstable page boundaries would do it too. Reporting '
-            'INCOMPLETE.',
-            len(facts), expected, page_size, resultset_size,
-        )
+    structurally_incomplete = paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS
+    # The largest number of edges that can have been present for the WHOLE
+    # run. See the docstring: this is set semantics, not a tuned threshold.
+    floor = (
+        None
+        if census_before is None or census_after is None
+        else min(census_before, census_after)
+    )
+    corpus_moved = (
+        census_before is not None
+        and census_after is not None
+        and census_before != census_after
+    )
 
     complete = (
-        paged_to_the_end
-        and expected is not None
-        and post_expected is not None
-        and not corpus_moved
-        and len(facts) == expected
+        not structurally_incomplete
+        and floor is not None
+        and len(facts) >= floor
     )
-    return facts, complete
+
+    # The diagnosis, built ONCE and used twice: logged for the operator
+    # watching the run, and returned so it reaches the committed artifact.
+    # Two spellings of the same finding would be two things to keep in step,
+    # and the artifact's copy is the one nobody is watching when it goes
+    # wrong. `reason` stays None on the complete path, which is half the
+    # EnumerationOutcome invariant.
+    reason: str | None = None
+    kind: str | None = None
+
+    if structurally_incomplete:
+        message = (
+            f'enumerate_valid_edge_facts: hit the {max_pages}-page cap '
+            f'(page_size={page_size}, enumerated={len(facts)}) while the last '
+            f'page was still full — enumeration is incomplete. Re-run with a '
+            f'larger --page-size.'
+        )
+        logger.warning('%s', message)
+        # The carry-through rule this function's docstring states, applied
+        # here too — it used to be the one arm that broke it. The paginator
+        # observed this page cap and worded it, so ITS prose is what reaches
+        # the artifact; keeping its KIND while minting fresh PROSE produced a
+        # committed row whose `error` and `error_kind` came from different
+        # layers, which is the artifact/backend-log mismatch the rule exists
+        # to prevent. The message just logged is this function's separate
+        # account — stated in distinct edges, and carrying the remedy — and it
+        # is recorded only where the paginator reached a structural verdict
+        # with nothing to say.
+        reason = paged.reason or message
+        kind = paged.incomplete_kind
+    elif census_before is None:
+        reason = (
+            'enumerate_valid_edge_facts: the census probe returned no usable '
+            'count, so completeness cannot be proven. Reporting INCOMPLETE — '
+            'an unavailable proof is not a passing one.'
+        )
+        kind = INCOMPLETE_CENSUS_UNAVAILABLE
+        logger.warning('%s', reason)
+    elif census_after is None:
+        reason = (
+            'enumerate_valid_edge_facts: the post-enumeration census probe '
+            'returned no usable count, so the tolerance band has only one '
+            'end and completeness cannot be proven. Reporting INCOMPLETE — '
+            'an unavailable proof is not a passing one.'
+        )
+        kind = INCOMPLETE_CENSUS_UNAVAILABLE
+        logger.warning('%s', reason)
+    # `floor is not None` is RE-STATED rather than inherited from the two
+    # arms above. This arm compares against it and its body subtracts from it,
+    # and a chain whose None-safety rests on the ORDER of its neighbours
+    # becomes a TypeError the moment an arm is inserted or moved — inside the
+    # function whose entire job is to fail closed. Stated here, the narrowing
+    # is checked by pyright rather than by a reader tracing the chain. It
+    # cannot change which arm fires: `floor` is None exactly when one of the
+    # two census arms above has already fired.
+    elif floor is not None and len(facts) < floor:
+        if corpus_moved:
+            message = (
+                f'enumerate_valid_edge_facts: enumerated {len(facts)} distinct '
+                f'edges, short of {floor} — the smaller of a census that read '
+                f'{census_before} before paging and {census_after} after '
+                f'(page_size={page_size}). At least {floor - len(facts)} edges '
+                f'were present for the WHOLE run and went unread, which '
+                f'concurrent writing does not explain. Reporting INCOMPLETE.'
+            )
+        else:
+            message = (
+                f'enumerate_valid_edge_facts: enumerated {len(facts)} distinct '
+                f'edges but the census reports {census_before}, stable across '
+                f'the whole run (page_size={page_size}) — the enumeration is '
+                f'SHORT and the corpus did not move under it. The most likely '
+                f'cause is a server result-set cap below the assumed '
+                f'{resultset_size}; unstable page boundaries would do it too. '
+                f'Reporting INCOMPLETE.'
+            )
+        logger.warning('%s', message)
+        # WHOSE WORDS GO IN THE ARTIFACT. When the paginator already judged
+        # this read deficient, its prose and its kind are carried through
+        # VERBATIM rather than replaced by the message just logged: the layer
+        # that made the observation is the one that gets to word it, and a
+        # reader correlating the artifact against the backend's own logs then
+        # finds one failure named one way. The message above is this
+        # function's separate account of the same shortfall — stated in
+        # distinct edges against the band rather than in rows against the
+        # pre-census — and it is what gets recorded only where the paginator
+        # was content and this dedup was not.
+        reason = paged.reason or message
+        kind = paged.incomplete_kind or INCOMPLETE_SHORT_READ
+    elif corpus_moved:
+        # DISCLOSED, not failed. These graphs are the orchestrator's and the
+        # reconciler's working memory, so a census that moves under a run
+        # paging tens of thousands of edges is the ordinary case. Everything
+        # present throughout was read; both readings go into the artifact so
+        # a reader can see the movement rather than infer it from a verdict.
+        logger.info(
+            'enumerate_valid_edge_facts: the corpus MOVED under the '
+            'enumeration — the census read %d distinct edges before paging '
+            'and %d after, and %d were enumerated (page_size=%d). Everything '
+            'present for the whole run was read, so this is a COMPLETE '
+            'enumeration of a moving corpus, not a shortfall. Both readings '
+            'are recorded in the report.',
+            census_before, census_after, len(facts), page_size,
+        )
+
+    if paged.incomplete_kind == INCOMPLETE_SHORT_READ and complete:
+        # The shipped layer already logged a WARNING naming a suspected
+        # result-set cap, and this function has just concluded there was no
+        # shortfall. Both can be true at once — they count different things
+        # (rows fetched against the PRE-census only, vs distinct edges against
+        # the band) — so say so explicitly. Left unstated, an operator reading
+        # the log would take a WARNING from the layer below as this probe's
+        # verdict, which is the reverse of what the artifact reports.
+        logger.info(
+            'enumerate_valid_edge_facts: _paged_ro_query reported a short '
+            'read (rows_seen=%s, expected_rows=%s) but this probe enumerated '
+            '%d distinct edges, at or above the %s-edge floor of a census '
+            'that read %s then %s. The two are counted in different units — '
+            'rows fetched against the pre-census, vs distinct edge uuids '
+            'against the band — so the WARNING above is NOT this probe\'s '
+            'verdict. Reason given below: %s',
+            paged.rows_seen, paged.expected_rows, len(facts), floor,
+            census_before, census_after, paged.reason,
+        )
+
+    return facts, EnumerationOutcome(
+        complete=complete,
+        reason=reason,
+        kind=kind,
+        census_before=census_before,
+        census_after=census_after,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +1013,15 @@ async def enumerate_valid_edge_facts(
 # 2: the report gained `project_ids_source`, `unmeasured_graphs` and
 #    `max_samples`, when the measured GRAPH SET stopped being assumed and
 #    started being discovered and cross-checked (see DEFAULT_PROJECT_IDS).
-SCHEMA_VERSION = 2
+# 3: the report started saying, per graph, WHY a measurement is deficient and
+#    WHAT it was judged against — `error`/`error_kind` and the
+#    `census_before`/`census_after` bracket — so a `complete: false` row can
+#    be diagnosed from the artifact rather than from an operator's terminal.
+#    Alongside: `near_miss` under the near-miss label (the raw
+#    `lexical_precondition` CONTAINS the regex matches and cannot be
+#    subtracted from them), and a candidate band restated per rejected MATCH
+#    end to end, with its denominators named so the arithmetic closes.
+SCHEMA_VERSION = 3
 
 # FALLBACK ONLY — not the normal project set. The measured graphs are
 # DISCOVERED from the store via ``GraphitiBackend.list_graphs()``, because a
@@ -798,13 +1125,45 @@ def _verdict_for(totals: ScanResult, triage_totals: dict[str, int]) -> str:
 
 @dataclass(frozen=True)
 class ProjectReport:
-    """One project graph's measurement."""
+    """One project graph's measurement.
+
+    INVARIANT: ``(error is None) == complete``, and ``error_kind`` follows the
+    same biconditional — inherited from ``EnumerationOutcome``, and asserted
+    here too because this is the shape that gets COMMITTED. A `complete:
+    false` row with nothing beside it is indistinguishable in the artifact
+    from any other, and the responses diverge: a graph that vanished mid-run
+    calls for a re-run, a graph whose read was truncated calls for a larger
+    ``--page-size``. The reverse defect is just as corrosive — an explanation
+    attached to a healthy row would make every explanation suspect.
+
+    ``census_before``/``census_after`` are the bracket ``complete`` was judged
+    against, carried so a reader can tell a corpus that grew from one that was
+    truncated. Both are None when no census was taken at all, which is the
+    honest reading for a graph that never enumerated: a zero there would claim
+    the graph was PROVEN empty.
+    """
 
     project_id: str
     valid_edges: int
     complete: bool
     scan: ScanResult
     triage: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
+    error_kind: str | None = None
+    census_before: int | None = None
+    census_after: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.error is None) != self.complete:
+            raise ValueError(
+                f'ProjectReport({self.project_id!r}): complete='
+                f'{self.complete} but error={self.error!r}'
+            )
+        if (self.error_kind is None) != self.complete:
+            raise ValueError(
+                f'ProjectReport({self.project_id!r}): complete='
+                f'{self.complete} but error_kind={self.error_kind!r}'
+            )
 
 
 @dataclass(frozen=True)
@@ -870,10 +1229,15 @@ async def run(
 ) -> Report:
     """Measure every requested project through the injected *edge_source*.
 
-    ``edge_source(project_id, *, page_size) -> (facts_by_uuid, complete)`` is
-    the only corpus access, mirroring cleanup_count_snapshots.run(args, *,
-    memory): every test drives a fake through it, so the whole aggregation
-    band is checkable with no live backend.
+    ``edge_source(project_id, *, page_size) -> (facts_by_uuid,
+    EnumerationOutcome)`` is the only corpus access, mirroring
+    cleanup_count_snapshots.run(args, *, memory): every test drives a fake
+    through it, so the whole aggregation band is checkable with no live
+    backend. The outcome — not a bare bool — is what lets a deficient graph
+    reach the artifact carrying its own diagnosis; a source that raises
+    instead gets ``ENUMERATION_FAILED`` and the exception's type and message,
+    which is the one failure no shipped ``INCOMPLETE_*`` kind describes
+    because no query ever reached the paginator.
 
     ``graph_lister() -> list[str]`` is the second seam, and it decides WHICH
     graphs get measured. The enumerator can prove it read every row of a
@@ -956,10 +1320,10 @@ async def run(
     for project_id in project_ids:
         logger.info('enumerating project=%s', project_id)
         try:
-            facts_by_uuid, complete = await edge_source(
+            facts_by_uuid, outcome = await edge_source(
                 project_id, page_size=args.page_size,
             )
-        except Exception:
+        except Exception as exc:
             # One graph's failure is a coverage shortfall, NOT a lost run.
             # Letting this propagate aborted the whole measurement and wrote
             # no artifact at all, contradicting exit_code's own stated rule
@@ -985,20 +1349,36 @@ async def run(
                 complete=False,
                 scan=ScanResult(),
                 triage={},
+                # TYPE AND MESSAGE, no traceback: logger.exception above
+                # already has the traceback, and the artifact's job is
+                # IDENTIFICATION — telling a vanished graph from a refused
+                # connection from a timeout months later, in a file a reader
+                # has without the log. A traceback pasted into a committed
+                # JSON would also be diff churn on every re-measurement.
+                error=f'{type(exc).__name__}: {exc}',
+                error_kind=ENUMERATION_FAILED,
+                # Left None rather than zeroed: no census was ever taken, and
+                # a 0 here would read as a graph PROVEN empty.
+                census_before=None,
+                census_after=None,
             ))
             continue
         scan = scan_corpus(facts_by_uuid.values())
         projects.append(ProjectReport(
             project_id=project_id,
             valid_edges=len(facts_by_uuid),
-            complete=complete,
+            complete=outcome.complete,
             scan=scan,
             triage=_triage_counts(scan),
+            error=outcome.reason,
+            error_kind=outcome.kind,
+            census_before=outcome.census_before,
+            census_after=outcome.census_after,
         ))
         logger.info(
             'project=%s edges=%d matched=%d rejected=%d selected=%d complete=%s',
             project_id, len(facts_by_uuid), scan.regex_matched,
-            scan.guard_rejected, scan.selected, complete,
+            scan.guard_rejected, scan.selected, outcome.complete,
         )
 
     totals = _sum_scans(p.scan for p in projects)
@@ -1129,7 +1509,10 @@ def _sorted_projects(report: Report) -> list[ProjectReport]:
 def _scan_payload(scan: ScanResult) -> dict[str, Any]:
     return {
         'facts_scanned': scan.facts_scanned,
+        # Both, and both named accurately: the raw counter under its own
+        # name, and the derived number the near-miss column reports.
         'lexical_precondition': scan.lexical_precondition,
+        'near_miss': scan.near_miss,
         'regex_matched': scan.regex_matched,
         'guard_rejected': scan.guard_rejected,
         'selected': scan.selected,
@@ -1145,6 +1528,23 @@ def _rejection_payload(rejections: list[Rejection]) -> list[dict[str, Any]]:
             'triage': triage_rejection(r.fact, r.match_start),
         }
         for r in sorted(rejections, key=lambda r: (r.fact, r.match_start))
+    ]
+
+
+def _candidate_match_payload(
+    matches: list[CandidateMatch],
+) -> list[dict[str, Any]]:
+    """Simulated matches, sorted by (fact, offset) so the list never reorders.
+
+    Deliberately the same ordering rule and the same record shape as
+    ``_rejection_payload``: the artifact then has ONE convention for every
+    per-match list it carries, and the renderer band's stated guarantee —
+    every ordering is an explicit sort, so two identical runs diff cleanly —
+    holds for these lists without a second rule to remember.
+    """
+    return [
+        {'fact': m.fact, 'match_start': m.match_start}
+        for m in sorted(matches, key=lambda m: (m.fact, m.match_start))
     ]
 
 
@@ -1172,6 +1572,22 @@ def render_json(report: Report) -> str:
                 'project_id': project.project_id,
                 'valid_edges': project.valid_edges,
                 'complete': project.complete,
+                # Next to `complete`, not in an appendix: the flag and the
+                # reason for it are one fact, and a reader who has to look
+                # elsewhere for the second half is a reader who will publish
+                # the first half alone. `error_kind` is the branchable
+                # discriminator, `error` the prose — the same split PagedRead
+                # makes, with the same kind VALUES, so this artifact and the
+                # backend's logs name one failure with one string.
+                'error': project.error,
+                'error_kind': project.error_kind,
+                # The bracket the verdict was made against. Without it a
+                # `complete: false` cannot be told from a corpus that merely
+                # grew, which is the whole distinction the tolerance band
+                # draws — and a `complete: true` cannot be seen to have been
+                # made over a corpus that moved by a thousand edges.
+                'census_before': project.census_before,
+                'census_after': project.census_after,
                 'scan': _scan_payload(project.scan),
                 'triage': dict(sorted(project.triage.items())),
                 'rejections': _rejection_payload(project.scan.rejections),
@@ -1181,9 +1597,20 @@ def render_json(report: Report) -> str:
         'candidates': [
             {
                 'name': candidate.name,
-                'over_selected': sorted(candidate.over_selected),
-                'recovered': sorted(candidate.recovered),
-                'unchanged_count': len(candidate.unchanged),
+                # All three lists in ONE unit and ONE record shape. The old
+                # payload emitted the first two as bare fact strings and the
+                # third as a scalar `unchanged_count`, which could not say
+                # WHICH matches were unchanged and counted facts while its
+                # neighbours counted matches.
+                'over_selected': _candidate_match_payload(candidate.over_selected),
+                'recovered': _candidate_match_payload(candidate.recovered),
+                'unchanged': _candidate_match_payload(candidate.unchanged),
+                # The denominators, carried so the band is checkable from the
+                # artifact alone: matches_scanned == already_selected +
+                # recovered + over_selected + unchanged.
+                'matches_scanned': candidate.matches_scanned,
+                'already_selected': candidate.already_selected,
+                'facts_simulated': candidate.facts_simulated,
             }
             for candidate in report.candidates
         ],
@@ -1236,14 +1663,24 @@ def render_markdown(report: Report) -> str:
         scan = project.scan
         lines.append(
             f'| `{project.project_id}` | {project.valid_edges:,} | '
-            f'{scan.lexical_precondition:,} | {scan.regex_matched:,} | '
+            f'{scan.near_miss:,} | {scan.regex_matched:,} | '
             f'{scan.guard_rejected:,} | {scan.selected:,} | '
-            f'{"yes" if project.complete else "**NO**"} |'
+            + (
+                'yes'
+                if project.complete
+                # The KIND rides in the cell itself, so the table alone
+                # already separates 'the graph went away' from 'the read was
+                # truncated' — the two call for opposite responses, and a bare
+                # **NO** sends a reader hunting for a log they may not have.
+                # The prose lands below, where a column cannot hold it.
+                else f'**NO** (`{project.error_kind}`)'
+            )
+            + ' |'
         )
     totals = report.totals
     lines += [
         f'| **(all)** | **{report.total_valid_edges:,}** | '
-        f'**{totals.lexical_precondition:,}** | **{totals.regex_matched:,}** | '
+        f'**{totals.near_miss:,}** | **{totals.regex_matched:,}** | '
         f'**{totals.guard_rejected:,}** | **{totals.selected:,}** | '
         f'**{"yes" if report.complete else "NO"}** |',
         '',
@@ -1258,10 +1695,46 @@ def render_markdown(report: Report) -> str:
             + '.',
             '',
         ]
+    # WHY each **NO** is a **NO**. Without this the artifact records that a
+    # graph fell short and destroys the only account of how, leaving a reader
+    # months later to guess between a graph that vanished mid-run (re-run) and
+    # a read the store truncated (raise --page-size). The kinds are shared
+    # with `graphiti_client`, so a reader can grep this string in the
+    # backend's own logs and land on the same event.
+    incomplete_projects = [p for p in _sorted_projects(report) if not p.complete]
+    if incomplete_projects:
+        lines += [
+            'Why each `**NO**` above is a **NO** — the kind is the '
+            'discriminator (shared with `graphiti_client`, so it names the '
+            'same failure the backend logs name), the reason is that layer\'s '
+            'own account of it:',
+            '',
+            '| project | kind | reason |',
+            '| --- | --- | --- |',
+        ]
+        for project in incomplete_projects:
+            # Pipes would break the row, newlines the table; neither appears
+            # in any reason produced today, and escaping them here costs
+            # nothing against the day one does.
+            reason = (project.error or '').replace('|', '\\|').replace('\n', ' ')
+            lines.append(
+                f'| `{project.project_id}` | `{project.error_kind}` | {reason} |'
+            )
+        lines.append('')
     lines += [
         'The near-miss column is what makes a zero interpretable: it separates '
         '"the corpus holds no plural-task shapes at all" from "it holds them '
         'and the guard is eating them".',
+        '',
+        f'It is a PARTITION, not an overlapping count. The '
+        f'{totals.lexical_precondition:,} fact(s) carrying the `tasks <n>` '
+        f'shape split into the {totals.regex_matched:,} that also matched the '
+        f'full regex (the `regex matches` column) and the '
+        f'{totals.near_miss:,} that did not (the near-miss column). The two '
+        f'are disjoint and sum to the shape count, so the columns can be '
+        f'added; the near-miss column deliberately does NOT report the raw '
+        f'shape count, which contains the regex matches and cannot be '
+        f'subtracted from them.',
         '',
         '## Rejection triage',
         '',
@@ -1330,6 +1803,19 @@ def render_markdown(report: Report) -> str:
     if not sampled_any:
         lines += ['_None._', '']
 
+    # UNIT AND DENOMINATOR, called out for the second time in this renderer
+    # and for a stronger reason than the triage table needed. That table
+    # changed the unit against the table above it (per-MATCH, not per-FACT);
+    # this one changes BOTH the unit and the population: its counts are per
+    # rejected MATCH over the DEDUPLICATED distinct fact SHAPES that reached
+    # the guard, not over edges. So it shares a denominator with neither
+    # table above it, and a reader who subtracts gets a number that means
+    # nothing. The denominator is therefore stated in the prose rather than
+    # left to be inferred from the rows.
+    #
+    # `_denominator` is derived here from the first candidate because every
+    # candidate is simulated over the same corpus — the three rows differ in
+    # what they DO with those matches, never in how many they saw.
     lines += [
         '## Candidate tightenings',
         '',
@@ -1338,13 +1824,33 @@ def render_markdown(report: Report) -> str:
         'guard in this run. `over_selected` is disqualifying (the '
         'unrecoverable direction); `recovered` is the benefit.',
         '',
-        '| candidate | over-selections re-opened | preamble shapes recovered |',
-        '| --- | ---: | ---: |',
+    ]
+    if report.candidates:
+        sample = report.candidates[0]
+        rejected_matches = sample.matches_scanned - sample.already_selected
+        lines += [
+            f'**Denominator.** {sample.facts_simulated:,} distinct fact '
+            f'shape(s) were simulated, carrying {sample.matches_scanned:,} '
+            f'regex match(es), of which {sample.already_selected:,} were '
+            f'already selected by the shipped guard and '
+            f'{rejected_matches:,} reached the candidates. Every count below '
+            'is per rejected MATCH over those deduplicated shapes, so it '
+            'shares a denominator with NEITHER table above — not the '
+            'per-FACT edge counts, not the per-MATCH triage over every '
+            'rejection including duplicate shapes. Each row sums: '
+            '`already_selected + recovered + over-selected + unchanged = '
+            'matches scanned`.',
+            '',
+        ]
+    lines += [
+        '| candidate | over-selections re-opened (matches) | '
+        'preamble matches recovered | rejections left unchanged (matches) |',
+        '| --- | ---: | ---: | ---: |',
     ]
     for candidate in report.candidates:
         lines.append(
             f'| `{candidate.name}` | {len(candidate.over_selected):,} | '
-            f'{len(candidate.recovered):,} |'
+            f'{len(candidate.recovered):,} | {len(candidate.unchanged):,} |'
         )
     lines += [
         '',
@@ -1387,27 +1893,42 @@ def render_markdown(report: Report) -> str:
             '',
         ]
     lines += [
-        'This probe pages with `SKIP`/`LIMIT` instead of calling '
-        '`GraphitiBackend.get_all_valid_edges`. That is deliberate, and the '
-        'reason has a history worth stating in the right tense. FalkorDB\'s '
-        'server-wide `RESULTSET_SIZE` is 10000 and nothing in this repo '
-        'overrides it, so any UNPAGINATED whole-graph read is silently '
-        'truncated with no error and no marker. At this task\'s planning time '
-        '`get_all_valid_edges` was exactly such a read: measured on the live '
-        '`dark_factory` graph, its query returned 10000 of 24902 rows, '
-        'exposing 6376 of 12488 distinct valid edges (51%). Measuring recall '
-        'through a truncated enumerator would have produced a zero that means '
-        'nothing — hence this probe\'s own paging.',
+        'This probe reads its corpus in `SKIP`/`LIMIT` pages rather than in '
+        'one whole-graph query. That is deliberate, and the reason has a '
+        'history worth stating in the right tense. FalkorDB\'s server-wide '
+        '`RESULTSET_SIZE` is 10000 and nothing in this repo overrides it, so '
+        'any UNPAGINATED whole-graph read is silently truncated with no error '
+        'and no marker. At this task\'s planning time '
+        '`GraphitiBackend.get_all_valid_edges` was exactly such a read: '
+        'measured on the live `dark_factory` graph, its query returned 10000 '
+        'of 24902 rows, exposing 6376 of 12488 distinct valid edges (51%). '
+        'Measuring recall through a truncated enumerator would have produced '
+        'a zero that means nothing.',
         '',
         '`get_all_valid_edges` is **PAGINATED as of task 4340** and that '
         'truncation is GONE. The measured counts behind both statements live '
         'in the `RESULT-SET CAP AUDIT` block of '
         '`fused-memory/src/fused_memory/backends/graphiti_client.py`, which is '
-        'the one place they are recorded. This probe nonetheless keeps its own '
-        '`SKIP`/`LIMIT` paging, so the coverage claim below rests on the '
-        'page-accounting audited here rather than on whatever a shared '
-        'enumerator does next — but it is NOT working around a live bug, and '
-        'nothing in `graphiti_client.py` is owed a fix on this account.',
+        'the one place they are recorded. It is NOT working around a live bug, '
+        'and nothing in `graphiti_client.py` is owed a fix on this account.',
+        '',
+        'The paging is not this probe\'s own. It goes through '
+        '`graphiti_client._paged_ro_query` — the same audited engine the '
+        'production enumerator uses — and both of this probe\'s Cypher '
+        'strings are COMPOSED from that module\'s `_ALL_VALID_EDGES_MATCH`, '
+        'so the population measured here cannot drift from the population '
+        'production reads. An earlier draft kept a second private copy of the '
+        'page loop and the constants for independence; that traded one risk '
+        'for a worse one, because a probe measuring a stale `MATCH`/`WHERE` '
+        'reports `complete: true` over the wrong corpus and nothing fails.',
+        '',
+        'What the probe does retain is its own PROJECTION and its own census '
+        'bracket, and that is what the coverage claim below actually rests '
+        'on. It returns `DISTINCT e.uuid, e.fact` — half the rows of '
+        'production\'s per-endpoint projection — and brackets the paging with '
+        'two `count(DISTINCT e.uuid)` probes, so completeness is decided in '
+        'DISTINCT EDGES against a single-row count the row cap cannot '
+        'truncate, not in rows fetched.',
         '',
         'What has NOT been recomputed is the separate task-2613 stale-status '
         'MISS RATE, which was calculated against the old truncated '
@@ -1567,7 +2088,9 @@ def _build_live_edge_source(config: Any) -> Any:
             await backend.initialize(skip_maintenance=True)
             initialized = True
 
-    async def edge_source(project_id: str, *, page_size: int):
+    async def edge_source(
+        project_id: str, *, page_size: int,
+    ) -> tuple[dict[str, str], EnumerationOutcome]:
         await _ensure_initialized()
         graph = backend._graph_for(project_id)  # noqa: SLF001
 
@@ -1593,13 +2116,138 @@ def _build_live_edge_source(config: Any) -> Any:
     return edge_source
 
 
-def _write_artifacts(report: Report, json_out: str, md_out: str) -> None:
+# Suffix for the pair an incomplete run writes when a COMPLETE measurement is
+# already committed at the target paths. A sibling of the real artifact on
+# purpose: an operator who has been told a shortfall happened finds the
+# evidence next to the thing it failed to replace, not in a temp directory.
+_INCOMPLETE_SUFFIX = '.incomplete'
+
+
+def _existing_artifact_is_complete(json_path: Path) -> bool:
+    """Does *json_path* hold a measurement that claims to be COMPLETE?
+
+    Every 'cannot tell' shape answers False — no file, unreadable, malformed
+    JSON, a payload that is not an object, a missing or non-``True``
+    ``complete`` key. That direction is deliberate and is NOT the fail-closed
+    one: a file that cannot be shown to be a good measurement is not one worth
+    protecting, and treating it as protected would divert every future run to
+    a sidecar and leave the deliverable permanently stale.
+    """
+    try:
+        payload = json.loads(json_path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get('complete') is True
+
+
+def _clear_superseded_sidecars(json_out: str, md_out: str) -> None:
+    """Remove any sidecar the write just made to the primary paths outdates.
+
+    A sidecar exists only because some EARLIER run was not allowed to replace
+    the primary artifact. Once a later run has written those primary paths,
+    that sidecar is older than what now sits beside it and describes a run
+    nobody should act on — but nothing about the two filenames says which is
+    newer, so an operator (or a `git status` in the committed `plans/`
+    directory) sees an `.incomplete` report next to the real one and has to
+    open both and compare `measured_at` to find out. That is the same 'a
+    reader cannot tell what happened' failure the per-graph `error` /
+    `error_kind` fields exist to close, one level up in the directory listing.
+
+    Keyed on 'a write reached the primary paths', NOT on 'the report was
+    complete': the invariant worth holding is that a sidecar never outlives a
+    report written after it, and the narrower rule would leave a leftover
+    behind in the one case — a primary artifact replaced by hand — where a
+    reader has the least context to sort it out.
+
+    Best-effort. A sidecar that cannot be removed is WARNED about and the
+    write still stands: failing a good measurement over a leftover file would
+    trade a confusing directory for a lost report.
+    """
+    for stale in (
+        Path(f'{json_out}{_INCOMPLETE_SUFFIX}'),
+        Path(f'{md_out}{_INCOMPLETE_SUFFIX}'),
+    ):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning(
+                'could not remove the superseded sidecar %s (%s). It is now '
+                'OLDER than the report just written beside it and should be '
+                'deleted by hand — left in place it reads as a second, '
+                'competing measurement.',
+                stale, exc,
+            )
+            continue
+        logger.info(
+            'removed the superseded sidecar %s — the report just written to '
+            'the primary path replaces it.', stale,
+        )
+
+
+def _write_artifacts(report: Report, json_out: str, md_out: str) -> str:
+    """Write the report, without letting a bad run destroy a good one.
+
+    The artifacts ARE the deliverable — the whole reason this is a committed
+    script and not a transcript is that 'zero matches today' is only as good
+    as its re-checkability. ``exit_code`` already encodes the fail-closed
+    instinct for the STATUS: the evidence lands, and the exit code refuses to
+    call an under-enumerated measurement a success. This applies the same
+    instinct to the FILE.
+
+    An INCOMPLETE report aimed at paths that already hold a COMPLETE one is
+    written to ``<path>.incomplete`` sidecars instead, and the committed
+    measurement is left byte-intact. Without this, one benign raced run — a
+    single edge written by an unrelated cycle while 43 graphs paged — replaced
+    a good measurement with a truncated one, and the recovery was
+    ``git checkout``, if anyone noticed.
+
+    The guard protects a KNOWN-GOOD artifact; it does not refuse to record
+    evidence. When there is nothing to protect (no file, an existing report
+    that is itself incomplete, an unparseable one) the incomplete report
+    writes straight to the primary paths, because diverting there would leave
+    the deliverable permanently empty and make every later sidecar the real
+    report. A COMPLETE report always writes in place — that is what the
+    committed artifact is for.
+
+    The reverse also holds: a write that DOES reach the primary paths clears
+    any sidecar left by an earlier diverted run, because that sidecar is now
+    the older of two reports sitting side by side with nothing in either
+    filename to say so. See ``_clear_superseded_sidecars``.
+
+    Returns the paths actually written, as a display string, so the caller can
+    tell the operator where the report went. A run that silently wrote
+    somewhere else is worse than one that clobbered: the reader of the
+    committed file would have no way to know a newer, worse measurement
+    exists. The EXIT CODE is unaffected — a sidecar write is still a shortfall
+    and still exits 1.
+    """
     json_path = Path(json_out)
     md_path = Path(md_out)
+    diverted = not report.complete and _existing_artifact_is_complete(json_path)
+
+    if diverted:
+        protected_json, protected_md = json_path, md_path
+        json_path = Path(f'{json_out}{_INCOMPLETE_SUFFIX}')
+        md_path = Path(f'{md_out}{_INCOMPLETE_SUFFIX}')
+        logger.warning(
+            'this measurement is INCOMPLETE and %s already holds a COMPLETE '
+            'one, so the committed measurement was left intact and this run '
+            'was written to %s and %s instead. Read the shortfall out of the '
+            'sidecar; do NOT promote it over %s without re-running.',
+            protected_json, json_path, md_path, protected_md,
+        )
+
     json_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(render_json(report))
     md_path.write_text(render_markdown(report))
+
+    if not diverted:
+        _clear_superseded_sidecars(json_out, md_out)
+
+    return f'{json_path} {md_path}'
 
 
 async def _main(argv: list[str] | None = None) -> int:
@@ -1625,14 +2273,19 @@ async def _main(argv: list[str] | None = None) -> int:
         report = await run(
             args, edge_source=edge_source, graph_lister=edge_source.list_graphs,
         )
-        _write_artifacts(report, args.json_out, args.md_out)
+        # The paths ACTUALLY written, which are not always the ones asked
+        # for: an incomplete run that would have clobbered a complete
+        # artifact is diverted to sidecars. Logging the request rather than
+        # the outcome would leave the operator looking at a file this run
+        # never touched.
+        written = _write_artifacts(report, args.json_out, args.md_out)
         logger.info(
             'measured graphs=%d (%s) edges=%d matched=%d rejected=%d '
-            'complete=%s json=%s md=%s',
+            'complete=%s written=%s',
             len(report.projects), report.project_ids_source,
             report.total_valid_edges, report.totals.regex_matched,
             report.totals.guard_rejected, report.complete,
-            args.json_out, args.md_out,
+            written,
         )
         if not report.complete:
             if not report.projects:

@@ -67,7 +67,12 @@ import toolcall_markup_corpus_extract as extract
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    _ATTRIBUTION_AXIS_MAXLEN,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+    _bounded_axis,
+)
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect
 
 # ---------------------------------------------------------------------------
@@ -2585,7 +2590,16 @@ class TestB10StormEscape:
             )
         return excinfo
 
-    async def _unrepairable(self, h, project='/srv/alpha'):
+    @staticmethod
+    async def _unrepairable(h, project='/srv/alpha'):
+        """One unrepairable refusal attributed to *project*, by *agent_id*.
+
+        STATIC, like ``_storms`` below and for the same reason: it touches no
+        instance state, and the sibling class beside this one drives the
+        IDENTITY axis through it — ``add_memory`` is the toy that declares
+        ``agent_id``, so a bound-method-only helper would have to be copied to
+        be reused.
+        """
         with pytest.raises(ToolError):
             await h.call(
                 'add_memory',
@@ -2874,6 +2888,336 @@ class TestB10StormEscape:
 
         assert self._storms(first) == []
         assert self._storms(second) == []
+
+
+# ---------------------------------------------------------------------------
+# The storm record names its own caller (task 4805).
+# ---------------------------------------------------------------------------
+
+
+class TestTheStormNamesItsCrossingCaller:
+    """A burst record that cannot say WHO leaked is an alarm with no address.
+
+    Measured on four real ``esc-plan-tools-markup-storm-*`` records: the storm
+    escalation's only route to the caller was its own ``suggested_action``, a
+    grep of the guard's log lines — and those records were read 6-7 days old,
+    well past this host's ~72h ``journald --user`` retention, on a server whose
+    stderr never reaches journald at all. The instruction was undischargeable
+    by construction, so the record had to carry the answer itself.
+
+    The two attribution axes are BOTH driven here, deliberately. ``_identity``
+    (``agent_id``) comes back empty on exactly the servers whose surfaces carry
+    the answer — the real escalation signature, mirrored verbatim by the
+    ``escalate_info_typed`` toy, declares ``task_id``/``agent_role`` and none
+    of ``agent_id``/``project_root``/``project_id`` — so an ``agent_id``-only
+    fix would be structurally inert on the boundary that most needs it.
+    """
+
+    #: The real escalation signature's four required parameters, as
+    #: ``TestB3ExtendedListTypedRecovery`` already spells them — but with the
+    #: subject axis set to values no other row uses, so a leak of these
+    #: assertions into another test would be visible.
+    SUBJECT = {'task_id': '4805', 'agent_role': 'implementer-4805'}
+    OTHER_SUBJECT = {'task_id': '4744', 'agent_role': 'architect-4744'}
+
+    def _harness(self, policy, clock, **kwargs):
+        return build_harness(
+            policy, time_provider=clock, storm_threshold=3, storm_window_seconds=3600.0, **kwargs
+        )
+
+    @staticmethod
+    def _storms(h) -> list[dict[str, Any]]:
+        """The same projection ``TestB10StormEscape`` uses."""
+        return TestB10StormEscape._storms(h)
+
+    async def _typed_repair(self, h, **subject):
+        """One FORWARD_REPAIR repair on the REAL escalation signature.
+
+        ``escalate_info_typed`` declares no project axis, so every call here
+        lands in the ``(None, 'repaired')`` counter — one burst, whatever the
+        subject.
+        """
+        return await h.call(
+            'escalate_info_typed',
+            {
+                **(subject or self.SUBJECT),
+                'category': 'risk_identified',
+                'summary': 'It stranded',
+                'detail': TestB3StrandRiskTierForwards.DETAIL,
+            },
+        )
+
+    async def _anonymous_repair(self, h):
+        """One repair whose caller declared NOTHING resolvable.
+
+        The legacy ``escalate_info`` toy declares neither ``agent_id`` nor
+        ``task_id``/``agent_role``, and ``project_root`` is left off.
+        """
+        return await h.call(
+            'escalate_info',
+            {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+        )
+
+    # -- (a) the subject axis, on the boundary where it is the only one -----
+
+    async def test_the_storm_names_the_crossing_call_subject(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._typed_repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+
+    # -- (b) the identity axis, and the old keys are UNCHANGED --------------
+
+    async def test_the_storm_names_the_crossing_call_agent_id(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await TestB10StormEscape._unrepairable(h)
+            clock.advance(60)
+
+        assert self._storms(h)[0]['crossing_agent_id'] == 'claude-caller'
+
+    async def test_the_pre_existing_keys_are_untouched(self):
+        """ADDITIVE, not a re-shaping.
+
+        Three sinks read this dict and one of them (the escalation server's
+        ``_file_markup_storm``) renders ``sorted(record)`` wholesale, so a
+        changed VALUE on an existing key would silently rewrite records this
+        task never meant to touch.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await TestB10StormEscape._unrepairable(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['count'] == 3
+        assert storm['threshold'] == 3
+        assert storm['window_seconds'] == 3600.0
+        assert storm['outcome'] == 'unrepairable'
+        assert storm['project'] == '/srv/alpha'
+
+    # -- (c) complete even when null ---------------------------------------
+
+    async def test_every_crossing_key_is_present_even_when_nothing_resolved(self):
+        """The contract ``_emit_fact``'s docstring already states for ``misclose``.
+
+        A consumer must never have to tell "no caller declared" apart from
+        "that emitter forgot the key" — the first is a fact about the leak,
+        the second is a bug in this layer, and an absent key reads as both.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._anonymous_repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        for key in ('crossing_agent_id', 'crossing_subject_task_id',
+                    'crossing_subject_agent_role'):
+            assert key in storm, f'{key} is absent, not null'
+            assert storm[key] is None
+
+    # -- the window-wide axis: EVERY caller, not only the crossing one ------
+
+    async def test_the_storm_names_every_caller_in_the_window(self):
+        """The crossing call is one event of many.
+
+        On a shared, long-lived server (the escalation server, fused-memory)
+        a burst can be several agents at once, and naming only whoever
+        happened to trip the wire is exactly the confident misattribution
+        ``_identity``'s docstring rules against. All three calls land in ONE
+        counter — ``escalate_info_typed`` declares no project axis, so
+        ``project`` is ``None`` for every one and the outcome is identical —
+        so one storm fires over two distinct callers.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        callers = self._storms(h)[0]['callers']
+        assert len(callers) == 2, callers
+        assert callers == sorted(callers)
+        assert any('4805' in c and 'implementer-4805' in c for c in callers)
+        assert any('4744' in c and 'architect-4744' in c for c in callers)
+
+    async def test_the_crossing_call_still_names_only_itself(self):
+        """The two axes answer DIFFERENT questions and must not be conflated.
+
+        ``callers`` is "who was in this window"; ``crossing_*`` is "who tripped
+        it". Folding either into the other loses the one an operator needs.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+
+    async def test_an_unattributable_burst_names_nobody_but_still_counts(self):
+        """``StormCounter``'s own rule, made visible on the record.
+
+        An unlabelled event still counts toward the burst; there is simply
+        nothing to name it against. ``callers`` is therefore PRESENT and
+        EMPTY — never absent, and never holding a placeholder string — so
+        ``count`` and ``len(callers)`` can never be read as the same number.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._anonymous_repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['count'] == 3
+        assert storm['callers'] == []
+
+    async def test_the_caller_set_is_not_degenerate(self):
+        """NON-CIRCULAR pin on the defect itself.
+
+        Before this fix the label handed to ``StormCounter.record`` was
+        ``f'{project}\\x1f{outcome}'`` — the very string the counter is keyed
+        by — so the distinct-label set was degenerate BY CONSTRUCTION and
+        could never hold two entries however many callers leaked. A
+        one-element ``callers`` on the two-caller burst above is that bug,
+        not a smaller-than-expected list.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        callers = self._storms(h)[0]['callers']
+        assert len(callers) != 1, callers
+        # Spelled ``chr(0x1f)`` and not as an escape, so this reads as the
+        # counter's real separator byte rather than a four-character literal.
+        assert not any(chr(0x1f) in c for c in callers), callers
+
+    # -- (d) one dict, so the caller-facing shapes cannot drift -------------
+
+    async def test_the_rejected_payload_storm_carries_the_attribution(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.REJECT_WITH_REPAIR, clock)
+
+        for _ in range(2):
+            with pytest.raises(ToolError):
+                await self._typed_repair(h)
+            clock.advance(60)
+        with pytest.raises(ToolError) as excinfo:
+            await self._typed_repair(h)
+
+        storm = _reject_payload(excinfo)['storm']
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+        assert storm['crossing_agent_id'] is None
+
+    async def test_the_forwarded_meta_storm_carries_the_attribution(self):
+        """The two record shapes are ONE dict — pinned here so they cannot part.
+
+        ``_with_storm`` folds the same object into the refusal payload and the
+        FORWARD_REPAIR ``meta``; splitting a record-only channel out of it is
+        exactly the lock-step duplication this PRD exists to end (INV-5).
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(2):
+            await self._typed_repair(h)
+            clock.advance(60)
+        result = await self._typed_repair(h)
+
+        storm = meta_of(result)['markup_repair']['storm']
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+        assert storm['crossing_agent_id'] is None
+
+    # -- (e) the axes are argument values, so they are BOUNDED --------------
+
+    def test_the_bound_leaves_a_real_identifier_alone(self):
+        """The bound must be invisible on every value this fleet actually mints.
+
+        The longest ids here are ~30 characters, so a bound that altered one
+        would be trading a rare pathological record for a wrong ordinary one.
+        ``None`` passes through as ``None``: absent is not empty, and the
+        record's present-and-null contract rests on that.
+        """
+        assert _bounded_axis('claude-task-4805-implementer') == (
+            'claude-task-4805-implementer'
+        )
+        assert _bounded_axis(None) is None
+        assert _bounded_axis('') == ''
+        # Exactly at the bound is NOT truncated — an off-by-one here would
+        # silently mark untruncated values as prefixes.
+        edge = 'x' * _ATTRIBUTION_AXIS_MAXLEN
+        assert _bounded_axis(edge) == edge
+
+    def test_the_bound_marks_what_it_shortened(self):
+        """Silent truncation is worse than none.
+
+        A shortened id is otherwise indistinguishable from a real one, so a
+        triager could compare it against the true id, find they differ, and
+        conclude the record names a caller that does not exist. The marker is
+        ASCII because this value is ``json.dumps``-ed into the caller-facing
+        payload, which escapes non-ASCII — a ``…`` would arrive as a
+        ``\u2026`` that reads as corruption rather than as truncation.
+        """
+        bounded = _bounded_axis('y' * (_ATTRIBUTION_AXIS_MAXLEN + 500))
+
+        # A str in, a str out — never widened to None on the truncating path,
+        # which would turn a too-long id into "nobody declared one".
+        assert isinstance(bounded, str)
+        assert bounded.startswith('y' * _ATTRIBUTION_AXIS_MAXLEN)
+        assert bounded.endswith('...')
+        assert len(bounded) == _ATTRIBUTION_AXIS_MAXLEN + 3
+        assert bounded.isascii()
+
+    async def test_a_blob_in_an_axis_does_not_ride_into_the_record(self):
+        """The pathological case is not hypothetical, and that is the point.
+
+        These axes are argument VALUES — the exact things this guard fires on
+        — so the axis a serialization leak lands in can itself BE the leaked
+        blob. Unbounded, it would ride whole into an operator-facing escalation
+        body, into every bounce payload for the rest of the window, and into
+        the ``StormCounter``'s retained event list once per event.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+        blob = 'B' * 4000
+
+        for _ in range(3):
+            await self._typed_repair(h, task_id=blob, agent_role='implementer-4805')
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        crossing = storm['crossing_subject_task_id']
+        assert crossing is not None
+        assert len(crossing) == _ATTRIBUTION_AXIS_MAXLEN + 3, len(crossing)
+        assert blob not in crossing
+        # The window-wide axis is bounded by the same helper, so neither name
+        # for the caller can be the one that carries the blob.
+        assert storm['callers'] and all(blob not in c for c in storm['callers'])
+        # The unbounded value reaches NOTHING on the record.
+        assert blob not in repr(storm)
 
 
 # ---------------------------------------------------------------------------

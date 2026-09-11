@@ -1641,6 +1641,78 @@ class ReconcileStats:
 #: outright: it "folds in", and is "not a distinct leaf".
 REFERENT_CHECKS: tuple[str, ...] = ('set-membership', 'per-edge-pairing')
 
+#: THE closed vocabulary of finding AXES — the counter buckets that are not
+#: check names (task 3671, PRD leaf zeta). Registered here for the reason
+#: :data:`REFERENT_CHECKS` and :data:`REFERENT_REPAIR_OUTCOMES` are: leaf iota
+#: keys a rate off these names, so a bucket must be REGISTERED rather than
+#: spelled as a bare string at the construction site and again at every reader.
+#:
+#: An AXIS answers an independent question ABOUT a finding; a CHECK names which
+#: rule produced it. Axes increment ALONGSIDE whichever check fired, so
+#: :meth:`MemoryService.referent_finding_counts` deliberately does not sum to
+#: the finding total. The two:
+#:
+#: * ``'unresolvable'`` — no correct target could be determined, so the finding
+#:   is recorded and LEFT ALONE. A numerator over the checks, not a third check.
+#: * ``'corroborated'`` — the edge's own fact names the node it is already
+#:   attached to, so :func:`_candidate_pool`'s corroboration veto emptied the
+#:   pool. A NO-OBSERVABLE-DEFECT row: real and recorded, but not evidence of a
+#:   scanner regression, and the dominant legitimate ``source='metadata'`` write
+#:   shape produces it routinely. Registered as its own axis, and NOT folded out
+#:   of the check bucket, so leaf iota can SUBTRACT it from the membership rate
+#:   — which needs the denominator still there. Conflating it into the check
+#:   would let ordinary ambient-task writes read as a scanner regression, the
+#:   same argument ``'failed'`` makes one register down.
+#:
+#: DELIBERATELY NARROWER THAN "structurally unactionable". `_candidate_pool`'s
+#: other two vetoes (an ambiguous endpoint, a ``source='metadata'`` fallback)
+#: also produce unactionable rows, but neither is derivable from anything the
+#: finding record carries — widening this axis to cover them would require a
+#: stored flag, i.e. a second site that must agree with the guard in lockstep,
+#: which is the drift this whole subsystem is built to avoid. Their volume is
+#: bounded by `_REFERENT_FINDING_WARN_CAP` instead.
+REFERENT_FINDING_AXES: tuple[str, ...] = ('unresolvable', 'corroborated')
+
+#: Per-EPISODE ceiling on INDIVIDUALLY logged verification findings, after which
+#: the operator log emits one aggregate line instead (task 3671, PRD leaf zeta).
+#:
+#: TEN, taken from the sibling :data:`_REFERENT_REPAIR_STREAK_THRESHOLD` in this
+#: same subsystem rather than invented: both answer the same operator question
+#: ("how many of these do I need to see before I have the picture?"), and two
+#: unrelated magic numbers in one subsystem is a tuning surface nobody can hold
+#: in their head.
+#:
+#: A LOG-VOLUME POLICY NUMBER, NOT AN ACCURACY THRESHOLD. Nothing downstream
+#: keys off it — the counters and :attr:`ReferentStats.findings` are outside the
+#: cap entirely — so retuning it cannot change a verdict, a rate, or a repair.
+#: Every test computes its expectations FROM this constant for that reason, so a
+#: retune can never red the suite.
+#:
+#: A LOWER value costs diagnostic detail: the individually-logged findings are
+#: where an operator reads WHICH edges are wrong, and ten distinct payloads is
+#: about the smallest sample that shows whether a storm is one repeated shape or
+#: many. A HIGHER one buys nothing once the aggregate line exists — past a dozen
+#: near-identical payloads the marginal line adds no diagnosis, and the storm's
+#: SIZE, which is what the aggregate reports, is the thing that matters.
+#:
+#: IT BOUNDS THE WARN-LEVEL HALF ONLY, and the INFO half is uncapped ON PURPOSE.
+#: A corroborated finding is demoted below WARNING *before* this budget is
+#: applied (see the finding loop in
+#: :meth:`MemoryService._verify_episode_referents`), so it never consumes it and
+#: is never suppressed by it. What this constant protects is the ALERT channel —
+#: the level an operator is expected to read every line of — from being buried
+#: by the dominant legitimate ``source='metadata'`` shape. INFO is the OPT-IN
+#: diagnostic channel: capping it would withhold exactly the per-finding detail
+#: somebody switched it on to read, and it is switched on per module and
+#: switched off again the same way. Uncapped is not unbounded WORK either — the
+#: emission is guarded by ``logger.isEnabledFor``, so on a process that has not
+#: enabled INFO for this module the demoted half costs neither a payload dict
+#: nor a record. Nor can it lose the storm signal INV-4 requires: the
+#: ``'corroborated'`` counter axis moves once per finding at every level, and
+#: the aggregate line's per-check totals are computed over ALL of
+#: :attr:`ReferentStats.findings` rather than over what was logged.
+_REFERENT_FINDING_WARN_CAP: int = 10
+
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
 #: the ``entity_mint.lock_timeout_seconds`` config hop is missing, None or the
 #: wrong type. Matches the schema default; the LIVE config value is what
@@ -1673,8 +1745,11 @@ class ReferentFinding:
     ``finding.referent_set.append(...)`` open, letting a consumer quietly widen
     the set that justified the repair it is about to perform.
 
-    Keyword-only because eleven fields, seven of them strings, is exactly the
-    shape where a positional argument silently lands in the wrong slot.
+    Keyword-only because a record this wide, most of it strings, is exactly the
+    shape where a positional argument silently lands in the wrong slot. (The
+    count is deliberately not stated: it has grown twice already, and a docstring
+    that has to be recounted on every field addition is a docstring that goes
+    stale on the first one that forgets.)
 
     ``new_endpoint_uuid is None`` means "the node does not exist yet, or its
     name keys a duplicate-name group" — leaf eta resolves-or-mints via
@@ -1691,7 +1766,23 @@ class ReferentFinding:
     which_end: str
     #: Which check fired; one of :data:`REFERENT_CHECKS`.
     check: str
-    #: The node the edge is attached to today.
+    #: The node the edge is attached to today — as THIS EPISODE'S in-memory
+    #: result reported it, PRE-NORMALIZATION. Recorded for the operator log,
+    #: with the same caveat :attr:`old_endpoint_name` carries one field down and
+    #: for the same reason: this pass is the EIGHTH sub-pass of
+    #: ``_reconcile_episode_identity``, running after
+    #: ``_normalize_task_node_names`` and ``_dedup_episode_nodes``, both of which
+    #: call ``graphiti.merge_entities``. A node that LOST such a merge no longer
+    #: exists in the graph, so an operator following this uuid out of a warning
+    #: payload can query one that resolves to nothing — just as a spelling can
+    #: have been normalized out from under the name beside it.
+    #:
+    #: Leaf eta is unaffected: ``reassign_edge`` keys on the EDGE uuid
+    #: (:attr:`edge_uuid`) and never on this one, so a dead value is recorded
+    #: but never acted on. The cost is operator-facing only, which is why this
+    #: is DOCUMENTED rather than re-resolved live — re-resolving would add a
+    #: backend round-trip per finding inside the identity-lock critical section,
+    #: to refresh a field nothing reads.
     old_endpoint_uuid: str
     #: That node's name as this episode's result reported it. Recorded for the
     #: operator log; the VERDICT is keyed off :attr:`endpoint_referent`, since a
@@ -1699,20 +1790,113 @@ class ReferentFinding:
     old_endpoint_name: str
     #: The parsed referent that name denotes — the thing actually compared.
     endpoint_referent: Referent
-    #: The declared referent set, as canonical node names, that the endpoint
-    #: was tested against.
+    #: The referent set the write DECLARED itself to be about, as canonical
+    #: node names. The SET-MEMBERSHIP arm is what tests the endpoint against
+    #: THIS; the pairing arm tests it against :attr:`cited`. Read the two
+    #: together — recording only this one is what left the pairing arm's
+    #: deciding input off the record (esc-3671-3).
     referent_set: tuple[str, ...]
+    #: The referents THIS EDGE'S OWN FACT names, as canonical node names.
+    #: The evidence that decided the PER-EDGE PAIRING arm, which fires
+    #: precisely on ``cited_declared and endpoint_referent not in cited``, and
+    #: — read together with :attr:`endpoint_referent` — the evidence behind
+    #: :func:`_candidate_pool`'s corroboration veto: an endpoint that appears
+    #: here is one the fact says the edge already belongs on.
+    #:
+    #: Recorded on BOTH arms, not just the one that reads it, so a consumer
+    #: never has to know which arm carries which evidence. SORTED, for the
+    #: reason :func:`_candidate_targets` sorts its survivors: the underlying
+    #: value is a frozenset, whose iteration order is not stable across
+    #: processes under hash randomization, and a finding must be stable across
+    #: runs and diffable in eta's audit. Empty is a real answer rather than an
+    #: absence — a fact naming no task is UNINFORMATIVE about where its edge
+    #: belongs, which is exactly why the pairing guard refuses to fire on it.
+    cited: tuple[str, ...] = ()
     #: The referent the edge SHOULD hang off, when exactly one candidate
     #: survives. ``None`` whenever :attr:`resolvable` is False.
     intended_referent: Referent | None = None
     #: The uuid of :attr:`intended_referent`'s node, when it resolves to
     #: exactly one live node. See the class docstring for what ``None`` means.
     new_endpoint_uuid: str | None = None
+    #: Whether the :attr:`new_endpoint_uuid` lookup was DEGRADED — the backend
+    #: would not answer — as opposed to answering "no such node" or "that name
+    #: keys a duplicate group". All three yield ``new_endpoint_uuid=None``, and
+    #: the last two are a DELIBERATE collapse (leaf eta's ``ensure_entity_node``
+    #: resolves-or-mints and handles them identically); this flag is what stops
+    #: the first from being folded in with them.
+    #:
+    #: THE CONCRETE STAKE. Task 3672's landed repair path reads
+    #: :attr:`new_endpoint_uuid` at exactly ONE site —
+    #: ``minted=finding.new_endpoint_uuid is None`` in
+    #: :meth:`_repair_episode_referents` — so today a transient FalkorDB error
+    #: books as ``minted=True`` telemetry: a node reported as newly created
+    #: where in fact nobody could look. This flag is the discriminator that
+    #: makes that a one-line fix in eta; zeta produces it and does not act on it
+    #: (that consequence is filed as its own follow-up).
+    #:
+    #: Fail-closed like :attr:`resolvable`: a finding whose lookup never ran —
+    #: one with no ``intended_referent`` — is not a finding whose lookup was
+    #: degraded, so the default is ``False``.
+    uuid_lookup_degraded: bool = False
     #: Whether a correct target was determined. Defaults False — fail-closed.
     resolvable: bool = False
     #: Why not, when :attr:`resolvable` is False. Empty on a resolvable
     #: finding.
     reason: str = ''
+
+    @property
+    def corroborated(self) -> bool:
+        """Does this edge's OWN FACT name the node it is already attached to?
+
+        The READ side of the corroboration veto whose single normative site is
+        :func:`_candidate_pool`'s ``if endpoint in cited: return frozenset()``.
+        True means the fact asserts the attachment is CORRECT, so the finding is
+        a no-observable-defect row: real, recorded, and not actionable. The
+        dominant legitimate write shape produces it — ``resolve_referents``
+        derives ``source='metadata'`` from an agent's ambient ``task_id``, and
+        "an agent working on task 3668 legitimately writes memories about Task
+        2500" is that function's own example.
+
+        A ``@property`` OVER THE RECORDED EVIDENCE, deliberately not a stored
+        boolean set where the finding is built. A stored flag is a second site
+        that must agree byte-for-byte with that guard, which is exactly the
+        INV-5 lockstep duplication ``utils/canonical_labels.py`` exists to
+        prevent — and exactly the failure mode that produced esc-3671-3's
+        blocking bug, where the guard had drifted out of the position its own
+        rationale assumed. Derived, the two cannot disagree. It is the same
+        property-not-field discipline :class:`ReferentStats` documents for its
+        counts and :attr:`Referent.node_name` follows for its rendering.
+
+        Deliberately NOT a :meth:`to_dict` key: that payload's key set is
+        contractually the dataclass FIELD names, and nothing is lost, because it
+        already carries both inputs — an operator reads the corroboration off
+        :attr:`cited` and :attr:`endpoint_referent` on the log line.
+
+        Its two consumers are the ``'corroborated'`` counter bucket (so leaf
+        iota can subtract these rows from the membership rate rather than read
+        them as scanner defects) and the operator log's level (INFO rather than
+        WARNING, for the alert-fatigue reason the pairing arm's
+        ``cited_declared`` narrowing already refused to create).
+
+        PRECONDITION — ``node_name`` IS INJECTIVE OVER THE REGISTERED KINDS.
+        The veto it derives from compares :class:`Referent` OBJECTS (equality on
+        the ``(kind, project_id, number)`` triple); this compares their
+        RENDERINGS, because that is what :attr:`cited` carries, and the two
+        agree only while distinct referents cannot render alike.
+        :attr:`Referent.node_name` drops ``kind`` entirely for a FOREIGN
+        referent (``f'{project_id}:{number}'``), so the rendering is injective
+        purely because ``canonical_labels._KIND_LABELS`` holds exactly one kind
+        today. Register a second, and a foreign citation of the new kind
+        corroborates a foreign ``'task'`` endpoint of the same number — a genuine
+        misattachment silently demoted to INFO and booked as corroborated, i.e.
+        exactly the divergence deriving the property was chosen to make
+        unrepresentable. That precondition is PINNED rather than merely noted:
+        ``tests/test_referent_verification.py::
+        TestCorroboratedIsDerivedFromTheRecordedEvidence::
+        test_node_name_is_injective_over_the_registered_kinds`` reds the moment
+        a kind is added, and carries the two admissible repairs.
+        """
+        return self.endpoint_referent.node_name in self.cited
 
     def __post_init__(self) -> None:
         if self.check not in REFERENT_CHECKS:
@@ -1739,12 +1923,14 @@ class ReferentFinding:
             'old_endpoint_name': self.old_endpoint_name,
             'endpoint_referent': self.endpoint_referent.node_name,
             'referent_set': list(self.referent_set),
+            'cited': list(self.cited),
             'intended_referent': (
                 self.intended_referent.node_name
                 if self.intended_referent is not None
                 else None
             ),
             'new_endpoint_uuid': self.new_endpoint_uuid,
+            'uuid_lookup_degraded': self.uuid_lookup_degraded,
             'resolvable': self.resolvable,
             'reason': self.reason,
         }
@@ -1770,6 +1956,31 @@ def _endpoint_referent(endpoint_name: str, *, group_id: str) -> Referent | None:
     if referent is None:
         return None
     return local_referent(referent, group_id=group_id)
+
+
+def _referent_sort_key(referent: Referent) -> tuple[str, str, str]:
+    """The total order every rendered or returned referent SEQUENCE is sorted by.
+
+    THE single site for that rule (INV-5), because its callers must agree and
+    their correctness is one argument, not two: referents reach both as
+    FROZENSETS, whose iteration order is not stable across processes under hash
+    randomization, so an unsorted sequence would make :func:`_candidate_targets`'
+    output and a finding's ``cited`` payload differ run to run for byte-identical
+    inputs — undiffable in leaf eta's audit and unassertable without re-sorting
+    at every call site that reads them.
+
+    Keys on the IDENTITY TRIPLE ``(kind, project_id, number)`` — what a
+    :class:`~fused_memory.utils.canonical_labels.Referent` IS, and the same
+    triple its equality and hash are defined on — rather than on the rendered
+    :attr:`~fused_memory.utils.canonical_labels.Referent.node_name`, which drops
+    ``kind`` for a foreign referent and would therefore stop being a total order
+    the moment a second kind is registered.
+
+    ``number`` sorts as a STRING, matching how it is stored, so ``'10'`` precedes
+    ``'9'``. Nothing keys off numeric rank; the property required here is
+    STABILITY, not arithmetic order.
+    """
+    return (referent.kind, referent.project_id, referent.number)
 
 
 def _candidate_pool(
@@ -2002,11 +2213,14 @@ def _candidate_targets(
             verbatim to :func:`_candidate_pool` (veto 2).
 
     Returns:
-        The surviving candidates, sorted by ``(kind, project_id, number)``.
+        The surviving candidates, sorted by :func:`_referent_sort_key`.
         Sorted rather than kept in the caller's first-seen order because the
         inputs are FROZENSETS, whose iteration order is not stable across
         processes under hash randomization — and a finding must be stable across
-        runs and diffable in eta's audit.
+        runs and diffable in eta's audit. Through the shared key rather than an
+        inline ``lambda`` because the ``cited`` rendering in
+        :meth:`MemoryService._verify_episode_referents` sorts for this exact
+        reason and must not drift from it.
     """
     # `other_endpoint` may be None; None is simply not a member of a
     # frozenset[Referent], and typeshed types `frozenset.__sub__` as accepting
@@ -2015,7 +2229,7 @@ def _candidate_targets(
         referents=referents, cited=cited, endpoint=endpoint,
         ambiguous=ambiguous, source=source,
     ) - {endpoint, other_endpoint}
-    return tuple(sorted(pool, key=lambda r: (r.kind, r.project_id, r.number)))
+    return tuple(sorted(pool, key=_referent_sort_key))
 
 def _unresolvable_reason(
     candidates: tuple[Referent, ...],
@@ -2501,13 +2715,14 @@ class MemoryService:
         # vocabulary, so unlike the per-agent storm counters above it needs no
         # pruning.
         #
-        # Keyed off REFERENT_CHECKS so the check vocabulary lives at ONE site
-        # and a third check cannot escape the counter. The extra 'unresolvable'
-        # bucket is a SECOND, ORTHOGONAL axis (whether a finding can be acted on)
-        # rather than a third check, so the buckets deliberately do not sum to
-        # the finding total.
+        # Keyed off REFERENT_CHECKS and REFERENT_FINDING_AXES so BOTH
+        # vocabularies live at ONE site each and neither a third check nor a
+        # third axis can escape the counter. The axes are ORTHOGONAL questions
+        # about a finding (can it be acted on; does its own fact corroborate the
+        # attachment) rather than further checks, so the buckets deliberately do
+        # not sum to the finding total.
         self._referent_finding_counts: dict[str, int] = dict.fromkeys(
-            (*REFERENT_CHECKS, 'unresolvable'), 0,
+            (*REFERENT_CHECKS, *REFERENT_FINDING_AXES), 0,
         )
         # INV-4 storm escape for the REPAIR sub-pass (task 3672, PRD leaf eta):
         # the counter half of the alarm whose fire half is
@@ -3718,31 +3933,6 @@ class MemoryService:
         for edge in edges:
             stats.edges_scanned += 1
             edge_uuid = getattr(edge, 'uuid', '') or ''
-            # Scanned ONCE per edge, not once per endpoint. The FACT is what
-            # pairing reads — not the episode content — because the fact is the
-            # per-edge assertion whose subject must match the endpoint it landed
-            # on; the episode body is about the write as a whole and cannot
-            # discriminate between two edges of the same episode.
-            #
-            # PERMISSIVE mode (no `known_project_ids`), matching the choice
-            # gamma made and documented in `resolve_referents`. Threading
-            # `self._known_projects` here would fork that decision mid-PRD, and
-            # would DROP a foreign reference the fact genuinely makes — turning
-            # a true negative into a false pairing finding.
-            #
-            # `scan.refs` already excludes `scan.ambiguous`, so nothing further
-            # is filtered out here: an ambiguous reference is deliberately
-            # invisible to this check rather than evidence for it.
-            cited = frozenset(
-                scan_content(
-                    getattr(edge, 'fact', '') or '', group_id=group_id,
-                ).refs
-            )
-            # The referents this edge's fact names that the write also DECLARED
-            # itself to be about — i.e. the concrete alternatives this edge
-            # could actually belong on. Computed once per edge, beside `cited`,
-            # because both endpoints test against it.
-            cited_declared = cited & referent_set
             # BOTH ends are resolved before EITHER is checked: the candidate
             # rule needs the OTHER end's referent (a target equal to it would be
             # the self-loop `reassign_edge` refuses), which is only knowable once
@@ -3778,6 +3968,71 @@ class MemoryService:
                     endpoint_name,
                     _endpoint_referent(endpoint_name, group_id=group_id),
                 ))
+
+            if all(end[3] is None for end in ends):
+                # Neither end is a canonical task label, so neither citation
+                # rule below is reachable and the scan would produce a value
+                # nothing reads. This is the ~99% shape, and skipping it here is
+                # the whole point of computing the scan AFTER the ends rather
+                # than before them: the pass runs SERIALIZED inside the
+                # per-group `_identity_lock_for` critical section that every
+                # other same-group write queues behind, so a regex pass per edge
+                # is charged to that queue. `endpoints_unresolved` has already
+                # been counted above; the loop below would `continue` on every
+                # end anyway, so this is an efficiency short-circuit and not a
+                # coverage one.
+                continue
+
+            # Scanned AT MOST ONCE PER EDGE, and only once an endpoint is a task
+            # label — never once per endpoint. The FACT is what pairing reads —
+            # not the episode content — because the fact is the per-edge
+            # assertion whose subject must match the endpoint it landed on; the
+            # episode body is about the write as a whole and cannot discriminate
+            # between two edges of the same episode.
+            #
+            # Computed HERE, after both ends are parsed and before either is
+            # checked, so the single scan still serves both endpoints: hoisting
+            # it into the endpoint loop below would scan a two-task-endpoint
+            # edge twice, which is the property the original eager placement
+            # bought and this deferral must not give back.
+            #
+            # PERMISSIVE mode (no `known_project_ids`), matching the choice
+            # gamma made and documented in `resolve_referents`. Threading
+            # `self._known_projects` here would fork that decision mid-PRD, and
+            # would DROP a foreign reference the fact genuinely makes — turning
+            # a true negative into a false pairing finding.
+            #
+            # `scan.refs` already excludes `scan.ambiguous`, so nothing further
+            # is filtered out here: an ambiguous reference is deliberately
+            # invisible to this check rather than evidence for it.
+            cited = frozenset(
+                scan_content(
+                    getattr(edge, 'fact', '') or '', group_id=group_id,
+                ).refs
+            )
+            # The referents this edge's fact names that the write also DECLARED
+            # itself to be about — i.e. the concrete alternatives this edge
+            # could actually belong on. Computed once per edge, beside `cited`,
+            # because both endpoints test against it.
+            cited_declared = cited & referent_set
+            # The same citations rendered for the RECORD, so a finding carries
+            # the evidence that decided it and not merely the declared set it
+            # was compared against. Sorted through `_referent_sort_key`, the
+            # single site for that rule, and for the reason it documents:
+            # `cited` is a frozenset, whose iteration order is not stable across
+            # processes under hash randomization.
+            #
+            # LAZY and memoized per EDGE, for the same reason the scan above is
+            # deferred and in the same critical section. Its only reader is the
+            # `ReferentFinding(...)` site below — the ~0.2% path — so paying a
+            # sort plus a rendering on every task-labelled edge that produces no
+            # finding is the identical waste deferring the scan just removed,
+            # charged to the same serialized per-group `_identity_lock_for`
+            # queue. `None` is the sentinel rather than a falsy default because
+            # `()` is a LEGITIMATE computed value (a fact citing nothing), and
+            # per-edge rather than per-endpoint so both ends of one edge still
+            # share ONE rendering.
+            cited_names: tuple[str, ...] | None = None
 
             for index, end in enumerate(ends):
                 which_end, endpoint_uuid, endpoint_name, endpoint_referent = end
@@ -3856,6 +4111,11 @@ class MemoryService:
                     source=referent_source,
                 )
                 resolvable = len(candidates) == 1
+                if cited_names is None:
+                    cited_names = tuple(
+                        r.node_name
+                        for r in sorted(cited, key=_referent_sort_key)
+                    )
                 stats.findings.append(ReferentFinding(
                     edge_uuid=edge_uuid,
                     which_end=which_end,
@@ -3864,6 +4124,7 @@ class MemoryService:
                     old_endpoint_name=endpoint_name,
                     endpoint_referent=endpoint_referent,
                     referent_set=referent_names,
+                    cited=cited_names,
                     intended_referent=candidates[0] if resolvable else None,
                     resolvable=resolvable,
                     reason='' if resolvable else _unresolvable_reason(
@@ -3885,21 +4146,35 @@ class MemoryService:
         # findings alone so the ~99.8% clean path issues ZERO extra queries
         # inside the per-group identity lock. One query per DISTINCT intended
         # referent, cached for this call.
-        uuid_by_name: dict[str, str | None] = {}
+        lookup_by_name: dict[str, tuple[str | None, bool]] = {}
         for index, finding in enumerate(stats.findings):
             if finding.intended_referent is None:
                 continue
             name = finding.intended_referent.node_name
-            if name not in uuid_by_name:
-                uuid_by_name[name] = await self._intended_endpoint_uuid(
+            if name not in lookup_by_name:
+                lookup_by_name[name] = await self._intended_endpoint_uuid(
                     name, group_id=group_id,
                 )
+            # The DEGRADATION is cached with the uuid, not re-derived: two
+            # findings pointing at the same intended referent share one lookup,
+            # so they must share its verdict too — a second finding reading
+            # `degraded=False` off a lookup that never re-ran would be exactly
+            # the drift caching exists to avoid.
+            endpoint_uuid, degraded = lookup_by_name[name]
             # `dataclasses.replace`, never mutation: the record is frozen
             # because it is evidence for destructive edge surgery.
             stats.findings[index] = dataclasses.replace(
-                finding, new_endpoint_uuid=uuid_by_name[name],
+                finding,
+                new_endpoint_uuid=endpoint_uuid,
+                uuid_lookup_degraded=degraded,
             )
 
+        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below and
+        # `stats.findings` stay outside it entirely, so suppression costs leaf
+        # iota no rate signal and leaf eta no finding — see
+        # `_REFERENT_FINDING_WARN_CAP`.
+        warned = 0
+        suppressed = 0
         for finding in stats.findings:
             # The two INV-2 surfaces no consumer has to parse a log for: the
             # process-lifetime counter leaf iota reads, and the return value
@@ -3907,20 +4182,111 @@ class MemoryService:
             self._referent_finding_counts[finding.check] += 1
             if not finding.resolvable:
                 self._referent_finding_counts['unresolvable'] += 1
-            # WARNING, not DEBUG. The task calls out today's `logger.debug`-only
-            # ReconcileStats shape as unacceptable here, and a misattached edge
-            # is a correctness defect an operator should see. This line is the
-            # OPERATOR surface ONLY — it carries the structured payload for
-            # legibility, but nothing parses it.
+            if finding.corroborated:
+                # ALONGSIDE the check bucket, never instead of it: leaf iota
+                # SUBTRACTS this axis from the membership rate, which needs the
+                # denominator to still be there. See REFERENT_FINDING_AXES.
+                self._referent_finding_counts['corroborated'] += 1
+            # WARNING, not DEBUG — but NOT WARNING for every finding.
+            #
+            # WARNING is right for the shape this pass exists to catch. The task
+            # calls out today's `logger.debug`-only ReconcileStats shape as
+            # unacceptable here, and a misattached edge is a correctness defect
+            # an operator should see.
+            #
+            # INFO is right for a CORROBORATED finding, and that is the other
+            # half of the same rule. A fact that names the very node its edge
+            # landed on is evidence the attachment is CORRECT:
+            # `_candidate_pool`'s veto has already emptied its pool, so there is
+            # nothing to act on, and the dominant legitimate write shape
+            # produces it routinely (`resolve_referents` derives
+            # `source='metadata'` from an agent's ambient task_id — "an agent
+            # working on task 3668 legitimately writes memories about Task
+            # 2500"). Warning about it is exactly the alert fatigue the pairing
+            # arm's `cited_declared` narrowing already refused to create; this
+            # is the membership arm keeping the same discipline the only way
+            # open to it, since the PRD requires the finding be RECORDED.
+            #
+            # DEMOTED, NOT DROPPED. Discarding the line would be a fail-soft
+            # path with nothing to hear it (INV-4); one level down, the evidence
+            # is still there for anyone who goes looking.
+            #
+            # PER FINDING, never per episode: one episode routinely carries both
+            # shapes, and an episode-level rule would swallow the defect.
+            #
+            # This line is the OPERATOR surface ONLY — it carries the structured
+            # payload for legibility, but nothing parses it. The machine
+            # surfaces are the counters above and `stats.findings`, and NEITHER
+            # is affected by this level: a corroborated finding is counted and
+            # returned in full regardless.
+            #
+            # CAPPED, and only on the warn-level half. One episode can carry
+            # hundreds of edges, and `replay_from_store` re-writing a backlog
+            # multiplies that across every episode in the queue — an unbounded
+            # per-finding warning turns the surface that exists to make a defect
+            # VISIBLE into the surface that buries every other line an operator
+            # needs. Corroborated findings are demoted before the cap is
+            # applied, so the budget is spent on findings that indicate a defect
+            # rather than on the dominant legitimate ambient-task shape.
+            if finding.corroborated:
+                level = logging.INFO
+            elif warned < _REFERENT_FINDING_WARN_CAP:
+                level = logging.WARNING
+                warned += 1
+            else:
+                suppressed += 1
+                continue
+            # THE PAYLOAD IS BUILT INSIDE THE LEVEL GUARD. `%s`-style lazy
+            # formatting defers the STRING rendering, never the `to_dict()`
+            # call that produces the argument — so an unguarded emission
+            # allocates a dict per finding even on a process where the level is
+            # off. `isEnabledFor` is what makes the uncapped INFO half above
+            # genuinely free when nobody asked for it (precedent:
+            # `orchestrator/src/orchestrator/scheduler.py::
+            # Scheduler._phase_select_scored`), which matters here because that
+            # half is the DOMINANT shape and this loop runs serialized inside
+            # the per-group identity lock.
+            #
+            # THE BUDGET IS DELIBERATELY OUTSIDE THE GUARD. `warned` and
+            # `suppressed` are a per-episode log-VOLUME policy, not a record of
+            # what a particular handler happened to keep; deciding them on
+            # handler configuration would make the aggregate line below count
+            # differently on two processes reading the same episode, and would
+            # silently uncap the log the moment a handler was reconfigured.
+            if logger.isEnabledFor(level):
+                logger.log(
+                    level, 'Referent verification finding: %s',
+                    finding.to_dict(),
+                )
+
+        if suppressed:
+            # THE TRUNCATION ANNOUNCES ITSELF rather than the log simply
+            # stopping. A silently shortened log is a fail-soft path with
+            # nothing to hear it, which is exactly what INV-4 forbids: the
+            # counter is the MACHINE half of that escape and this line is the
+            # OPERATOR half, and a storm is precisely the condition in which the
+            # operator half matters most. It carries the size of the storm and
+            # its per-check shape, so what the suppressed lines would have shown
+            # in aggregate is still legible.
             logger.warning(
-                'Referent verification finding: %s', finding.to_dict(),
+                'Referent verification finding storm: %d further finding(s) '
+                'suppressed from this episode after the first %d were logged '
+                'individually; per-check totals for the episode: %s. Every '
+                'finding is on the return value and in the counters — only the '
+                'log is capped.',
+                suppressed,
+                _REFERENT_FINDING_WARN_CAP,
+                {
+                    check: sum(1 for f in stats.findings if f.check == check)
+                    for check in REFERENT_CHECKS
+                },
             )
 
         return stats
 
     async def _intended_endpoint_uuid(
         self, name: str, *, group_id: str
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """The uuid of the node *name* denotes, or ``None`` — never a write.
 
         ``get_nodes_by_exact_name`` SPECIFICALLY, because it is documented
@@ -3942,6 +4308,20 @@ class MemoryService:
         backend error degrades the uuid to ``None`` rather than losing the
         finding. Detection is the primary result and the uuid is an audit
         convenience, so a lookup failure must not cost the evidence.
+
+        THE THIRD OUTCOME IS REPORTED, NOT COLLAPSED. The two paragraphs above
+        describe DELIBERATE collapses — absent and duplicate-name-group are one
+        answer because eta treats them as one. A backend that would not answer
+        at all is a different thing entirely, and returning a bare ``None`` for
+        it made "could not look" indistinguishable from "not there" at the one
+        site eta reads (``minted=finding.new_endpoint_uuid is None``). Hence the
+        pair: the uuid, and whether the lookup was DEGRADED. See
+        :attr:`ReferentFinding.uuid_lookup_degraded`.
+
+        Returns:
+            ``(uuid_or_None, degraded)``. ``degraded`` is ``True`` only for the
+            exception path — a clean lookup returning zero or many rows is an
+            ANSWER, and reports ``False``.
         """
         try:
             rows = await self.graphiti.get_nodes_by_exact_name(
@@ -3955,8 +4335,8 @@ class MemoryService:
                 'referent verification; recording the finding without one',
                 name, exc_info=True,
             )
-            return None
-        return rows[0]['uuid'] if len(rows) == 1 else None
+            return None, True
+        return (rows[0]['uuid'] if len(rows) == 1 else None), False
 
     async def _repair_episode_referents(
         self, stats: ReferentStats, *, group_id: str, episode_uuid: str = ''
@@ -5008,15 +5388,25 @@ class MemoryService:
         mirrors :meth:`referent_source_counts` rather than inventing a second
         idiom in this file.
 
-        THE BUCKETS ARE TWO ORTHOGONAL AXES, NOT A PARTITION.
+        THE BUCKETS ARE THREE ORTHOGONAL AXES, NOT A PARTITION.
         ``'set-membership'`` and ``'per-edge-pairing'`` answer "which check
         fired" and do partition the findings between them (they are ordered, so
-        an endpoint failing both is counted once, under membership).
-        ``'unresolvable'`` answers the independent question "could a correct
-        target be determined at all", and increments ALONGSIDE whichever check
-        fired. So the three counts intentionally do not sum to the finding
-        total, and ``unresolvable`` is a numerator over the other two, not a
-        third category.
+        an endpoint failing both is counted once, under membership). The other
+        two — :data:`REFERENT_FINDING_AXES` — each answer an independent
+        question and increment ALONGSIDE whichever check fired, so the counts
+        intentionally do not sum to the finding total and are numerators over
+        the checks rather than further categories:
+
+        * ``'unresolvable'`` — could a correct target be determined at all?
+        * ``'corroborated'`` — does the edge's OWN FACT name the node it is
+          already attached to? SUBTRACT this from the membership rate. Such a
+          finding is real and is recorded, but it has no observable defect:
+          ``_candidate_pool``'s corroboration veto already emptied its pool, and
+          the dominant legitimate write shape produces it routinely (an agent
+          dispatched on task 3668 writing about Task 2500). Counting it as a
+          membership hit would let ordinary ambient-task writes read as a
+          scanner regression — the same argument ``'failed'`` makes in
+          :data:`REFERENT_REPAIR_OUTCOMES`.
 
         Every bucket exists from construction, so a reader never has to
         distinguish "zero" from "absent". Returns a COPY, so a caller cannot

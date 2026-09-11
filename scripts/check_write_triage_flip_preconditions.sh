@@ -150,6 +150,17 @@ note() { report="${report}$1"$'\n'; }
 # shell, never from inside a `$(...)` — see the note above read_ref_file.
 record_fail() { fail=1; failed_items="${failed_items}${1} "; }
 
+# Did item $1 record a failure? Derived from failed_items -- the SAME string
+# the authoritative `FAILING ITEMS:` line below is built from -- so the
+# RESULT block's ownership prose can never disagree with it again. A `case`
+# glob, deliberately: no pipe (see item 1's SIGPIPE note above) and no
+# `$(...)` subshell (see the note above read_ref_file). Tolerates the
+# multi-word `record_fail '2 4'` on the unreadable-EVAL branch below: the
+# comparison is " $failed_items" against "*\" $1 \"*", and failed_items
+# already carries a TRAILING space per entry, so " 2 4 " matches both
+# *" 2 "* and *" 4 "*.
+item_failed() { case " $failed_items" in *" $1 "*) return 0 ;; esac; return 1; }
+
 # item 1 extracts the ref's package tree to a temp dir. `git archive` is
 # read-only and touches no .git state, unlike `git worktree add` -- which
 # matters in this repo, where refs are shared across every worktree.
@@ -296,6 +307,11 @@ if read_ref_file "$EVAL"; then
   # Here-string, not a pipe -- same pipefail/SIGPIPE race as item 1 above, and
   # here it fails the OTHER way: a spurious non-zero takes the else branch and
   # prints `PASS item 2` for an eval script that still iterates the frozenset.
+  # Measured: a 960 KB $eval_src with the pattern first gives PIPESTATUS=(141 0)
+  # piped -- grep matched, printf SIGPIPE-killed -- 200/200 spurious PASS piped
+  # vs 0/200 here-string. Pinned by
+  # scripts/tests/test_check_write_triage_flip_preconditions.py::TestItemsTwoAndFourReadingIsNotRaceProne
+  # so the two cannot drift apart silently. Do not "tidy" this back into a pipe.
   if grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)' <<<"$eval_src"; then
     note "FAIL  item 2  $EVAL still iterates the TRIAGE_OUTCOMES frozenset directly"
     note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
@@ -315,7 +331,9 @@ if read_ref_file "$EVAL"; then
   fi
 
   # --- item 4: --report-path must not destroy its own JSON --------------------
-  # Here-string, not a pipe -- see item 2. A flake here spuriously PASSES too.
+  # Here-string, not a pipe -- see item 2's comment above for the measurement.
+  # A flake here spuriously PASSES too. Pinned by the same
+  # scripts/tests/test_check_write_triage_flip_preconditions.py::TestItemsTwoAndFourReadingIsNotRaceProne.
   if grep -q "report_path\.with_suffix('\.md')" <<<"$eval_src"; then
     note "FAIL  item 4  $EVAL still derives the markdown sibling via with_suffix('.md')"
     note "              '--report-path foo.md' writes the JSON and then OVERWRITES it"
@@ -361,11 +379,40 @@ note ""
 if [ "$fail" -eq 0 ]; then
   note "RESULT: all preconditions satisfied — the flip may proceed."
 else
-  note "RESULT: preconditions NOT satisfied. Items 2 and 4 are task 4762's (priority"
-  note "        high); see its description and details for the verbatim findings."
-  note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
-  note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
-  note "        satisfies it. See its report above for what was measured."
+  # BOTH ownership clauses below are gated on their OWN item(s)' pass/fail
+  # state via item_failed(), not just the items-2/4 one. This whole arm runs
+  # on ANY failure, so an ungated clause names an item the report declared
+  # PASS a few lines above, contradicting the authoritative `FAILING ITEMS:`
+  # line -- measured both directions: items 2/4 blamed while passing on
+  # judge='flat'/eval_src='fixed', and item 1 blamed while passing on
+  # judge='by_id'/eval_src='failing'. Pinned by
+  # scripts/tests/test_check_write_triage_flip_preconditions.py::TestResultBlockBlamesOnlyFailingItems.
+  note "RESULT: preconditions NOT satisfied."
+  clause_printed=''
+  triage_subject=''
+  if item_failed 2 && item_failed 4; then triage_subject='Items 2 and 4 are'
+  elif item_failed 2; then triage_subject='Item 2 is'
+  elif item_failed 4; then triage_subject='Item 4 is'
+  fi
+  if [ -n "$triage_subject" ]; then
+    note "        $triage_subject task 4762's (priority high); see its description"
+    note "        and details for the verbatim findings."
+    clause_printed=1
+  fi
+  if item_failed 1; then
+    note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
+    note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
+    note "        satisfies it. See its report above for what was measured."
+    clause_printed=1
+  fi
+  # Fallback so this block can never go guidance-free: unreachable today
+  # (every record_fail call site passes 1, 2, 4, or '2 4', so one of the two
+  # clauses above always fires when fail -ne 0), but a future item added
+  # without a matching clause here would otherwise degrade silently to a
+  # bare RESULT line with no ownership guidance.
+  if [ -z "$clause_printed" ]; then
+    note "        See the FAILING ITEMS line below and each item's report above."
+  fi
 fi
 
 # LAST, deliberately. DeterministicRunner._default_run_script returns only the

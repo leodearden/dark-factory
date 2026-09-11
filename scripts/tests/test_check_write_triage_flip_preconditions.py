@@ -1565,7 +1565,8 @@ def _make_gate_repo(
     tmp_path: Path,
     *,
     judge: str = 'flat',
-    eval_src: str = 'failing',
+    eval_src: str | None = None,
+    eval_text: str | None = None,
     repo_name: str = 'gate-repo',
 ) -> Path:
     """A throwaway git repo the gate script can be run from.
@@ -1574,7 +1575,16 @@ def _make_gate_repo(
     so BOTH scripts are copied into ``<repo>/scripts/`` — that is what makes
     the fixture repo, rather than the real checkout, the thing item 1's
     ``git archive`` reads.
+
+    ``eval_text`` and ``eval_src`` are mutually exclusive: pass at most one.
+    When ``eval_text`` is given, it is written VERBATIM as the fixture's
+    ``eval_write_triage_judge.py`` instead of the ``_EVAL_FIXED``/
+    ``_EVAL_FAILING`` constants ``eval_src`` selects between (default
+    ``'failing'`` when neither is given, matching the historical default).
     """
+    assert eval_text is None or eval_src is None, (
+        'eval_text and eval_src are mutually exclusive'
+    )
     repo = tmp_path / repo_name
     (repo / 'scripts').mkdir(parents=True)
     for script in (_GATE_SCRIPT, _PROBE):
@@ -1584,8 +1594,12 @@ def _make_gate_repo(
 
     _write_fake_judge(repo / 'fused-memory' / 'src', variant=judge)
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True)
+    if eval_text is not None:
+        eval_source = eval_text
+    else:
+        eval_source = _EVAL_FIXED if eval_src == 'fixed' else _EVAL_FAILING
     (repo / 'fused-memory' / 'scripts' / 'eval_write_triage_judge.py').write_text(
-        _EVAL_FIXED if eval_src == 'fixed' else _EVAL_FAILING,
+        eval_source,
     )
     (repo / 'fused-memory' / 'config').mkdir(parents=True)
     (repo / 'fused-memory' / 'config' / 'config.yaml').write_text(_CONFIG_YAML)
@@ -1934,6 +1948,185 @@ class TestReportSurvivesTruncation:
         assert 'FAILING ITEMS: none' in tail, tail
 
 
+def _result_block(stdout: str) -> str:
+    """The RESULT prose only, sliced from ``RESULT:`` to ``FAILING ITEMS:``.
+
+    Assertions against this slice cannot be satisfied or defeated by text
+    elsewhere in the ~9 KB report -- the item-2/4 and item-1 guidance blocks
+    higher up discuss the same findings in their own words.
+    """
+    start = stdout.find('RESULT:')
+    end = stdout.find('FAILING ITEMS:')
+    if start == -1 or end == -1:
+        raise AssertionError(
+            f"expected both 'RESULT:' and 'FAILING ITEMS:' markers in stdout:\n{stdout}"
+        )
+    return stdout[start:end]
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse every run of whitespace -- including the report's own line
+    wraps -- to a single space.
+
+    The report wraps prose across several ``note`` calls purely for terminal
+    width (e.g. today's unfixed else-arm splits ``"...task 4762's (priority"``
+    and ``"high); ..."`` across two lines). A clause marker must not care
+    WHERE the report happens to wrap it, only whether the words are there --
+    otherwise a marker check can silently stop testing anything the moment a
+    wrap point shifts, in either direction.
+    """
+    return ' '.join(text.split())
+
+
+# The items-2/4 ownership clause's marker. NOT bare 'task 4762': the item-1
+# clause also contains that substring ("option (b) is task 4762"), so it
+# would not discriminate between the two clauses. The possessive "'s" alone
+# already discriminates (the item-1 clause reads "is task 4762 --", never
+# "task 4762's") -- deliberately NOT extended with "(priority high)", which
+# is incidental wording (a mutable task-tracker attribute) rather than the
+# ownership behaviour under test.
+_TRIAGE_CLAUSE = "task 4762's"
+#: The item-1 ownership clause's marker.
+_ITEM1_CLAUSE = 'Item 1 is closed by EITHER'
+
+# Item 2's defect pattern, with item 4 already FIXED -- isolates a report
+# where exactly item 2 fails. Items 2 and 4 are independent greps over the
+# same file, so a partial landing (one fixed, one not) is reachable.
+_EVAL_ITEM2_ONLY_FAILING = '''\
+"""Fixture stand-in: item 2 fails, item 4 fixed."""
+CONFUSION_COLUMNS = list(TRIAGE_OUTCOMES)
+
+
+def publish(report_path):
+    sibling = report_path.parent / (report_path.stem + '.md')
+    assert sibling != report_path
+    return sibling
+'''
+
+# The mirror image: item 4 fails, item 2 already fixed.
+_EVAL_ITEM4_ONLY_FAILING = '''\
+"""Fixture stand-in: item 4 fails, item 2 fixed."""
+EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))
+CONFUSION_COLUMNS = EVAL_OUTCOMES
+
+
+def publish(report_path):
+    return report_path.with_suffix('.md')
+'''
+
+
+class TestResultBlockBlamesOnlyFailingItems:
+    """DEFECT B (fixed here): the RESULT block's ownership prose must never
+    name a PASSING item -- reproduced from esc-4810-12, which misread this
+    fixture's output as main's. The else-arm (``fail -ne 0``) used to print
+    its ownership clauses UNCONDITIONALLY, so the report could say ``PASS
+    item 2`` / ``PASS item 4`` and then blame items 2 and 4 a few lines later
+    for a failure another item caused. Both clauses are now gated on
+    ``item_failed()`` (see ``check_write_triage_flip_preconditions.sh``).
+    Items 2 and 4 are independent greps over the same file, so exactly
+    one can fail on a partial landing -- the clause names the actually
+    -failing SUBSET, not a binary "Items 2 and 4 are ...". The symmetric
+    item-1 half of this same defect is tested directly in this class below.
+    """
+
+    def test_items_2_and_4_passing_are_not_blamed(self, tmp_path):
+        """PRIMARY: the exact fixture the task description names (esc-4810-12)."""
+        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        # Non-vacuity: prove the fixture really has items 2/4 passing and only
+        # item 1 failing -- otherwise the clause-absence assertion below would
+        # also pass on a report where items 2/4 legitimately failed.
+        assert 'PASS  item 2' in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE not in block, proc.stdout
+        # Mirrors test_item_1_passing_is_not_blamed's positive assertion: a
+        # mis-gating of the item-1 clause (e.g. `if item_failed 3`) would drop
+        # this guidance silently, and only the all-fail/unreadable-ref guards
+        # would catch it -- neither of which isolates item 1 failing alone.
+        assert _ITEM1_CLAUSE in block, proc.stdout
+
+    def test_item_2_alone_failing_names_only_item_2(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=_EVAL_ITEM2_ONLY_FAILING)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 2' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert 'Item 2 is' in block, proc.stdout
+        assert 'Items 2 and 4' not in block, proc.stdout
+
+    def test_item_4_alone_failing_names_only_item_4(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=_EVAL_ITEM4_ONLY_FAILING)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert 'Item 4 is' in block, proc.stdout
+        assert 'Items 2 and 4' not in block, proc.stdout
+
+    def test_item_1_passing_is_not_blamed(self, tmp_path):
+        """The SYMMETRIC half: item 1 passes, items 2 and 4 fail -- the
+        mirror image of ``test_items_2_and_4_passing_are_not_blamed`` above.
+        The item-1 clause used to print unconditionally; it is now gated on
+        ``item_failed 1``, the mirror image of the items-2/4 gating.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='failing')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        # Non-vacuity: prove item 1 really passed and items 2/4 really failed.
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 2 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _ITEM1_CLAUSE not in block, proc.stdout
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+
+    def test_all_items_failing_keeps_both_clauses(self, tmp_path):
+        """GUARD: the all-fail run -- the one the gate actually produces
+        against today's main -- must keep BOTH ownership clauses. Exists so
+        gating either clause on its item's pass/fail state cannot "pass" the
+        RED tests here by simply deleting the guidance an operator needs on
+        the run that matters most: the one where every item still fails.
+        """
+        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='failing')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1 2 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert _ITEM1_CLAUSE in block, proc.stdout
+        assert 'Items 2 and 4 are' in block, proc.stdout
+
+    def test_unreadable_ref_names_every_failing_item(self):
+        """GUARD: the multi-word ``record_fail '2 4'`` path.
+
+        ``ref='no-such-ref'`` is the ONLY caller that reaches a multi-word
+        ``record_fail`` argument (the unreadable-EVAL branch), so it is the
+        one case where ``item_failed()``'s ``case``-glob membership test
+        could silently mis-parse ``failed_items``. Reuses the negative
+        -control shape of ``test_unreadable_ref_fails_closed``: read-only
+        against the REAL checkout. Measured output today: ``FAIL  items 2+4
+        UNVERIFIABLE`` with ``FAILING ITEMS: 1 2 4``. Do not "simplify" this
+        into a duplicate of the fixture-based tests above -- it is the only
+        path that reaches this code shape.
+        """
+        proc = _run_gate(_GATE_SCRIPT, ref='no-such-ref')
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1 2 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert _ITEM1_CLAUSE in block, proc.stdout
+
+
 def _gate_marker(name: str) -> str:
     """The gate's own literal value for a marker variable.
 
@@ -2061,3 +2254,57 @@ class TestVerdictReadingIsNotRaceProne:
             f'the gate did not agree with itself across 30 identical runs: '
             f'{sorted(set(verdicts))}'
         )
+
+
+def _defect_first_eval_source(pattern_line: str) -> str:
+    """A synthetic ``eval_write_triage_judge.py`` source, defect pattern FIRST.
+
+    Mirrors ``_write_marker_first_probe_stub``'s shape one layer over: put the
+    matched pattern FIRST, then ``_PROBE_FILLER_BYTES`` of inert filler, so a
+    writer feeding this through ``grep -q PATTERN`` over a PIPE is certain to
+    be killed by SIGPIPE before it finishes -- grep exits at the match, and
+    ~1 MB still has to go down the pipe behind it. The ORDER is the mechanism
+    under test: a pattern at the END would let the writer finish before grep
+    can exit, so it would never expose the race no matter how large the
+    filler is. The filler line itself contains neither item 2's nor item 4's
+    pattern.
+    """
+    filler_line = 'filler line, module body continues\n'
+    repeats = _PROBE_FILLER_BYTES // len(filler_line) + 1
+    return pattern_line + '\n' + (filler_line * repeats)
+
+
+class TestItemsTwoAndFourReadingIsNotRaceProne:
+    """DEFECT-A regression lock for items 2 and 4 -- the other half of
+    ``TestVerdictReadingIsNotRaceProne``'s defect, over a different stream.
+
+    Item 1's verdict is read from the probe's stdout (``$probe_out``); items 2
+    and 4 read the ref's eval source (``$eval_src``) via the identical
+    ``printf | grep -q`` shape task 4810 also fixed in this file (commit
+    a671556834), over a here-string instead. Nothing pinned that fix until
+    now: ``test_items_2_and_4_still_fail_on_their_patterns`` uses a ~150-byte
+    fixture, far under the 64 KB pipe buffer, so a re-introduced pipe never
+    SIGPIPEs there and that test would stay green regardless. These tests
+    reuse the marker-first + large-filler technique above, applied to
+    ``$eval_src`` instead of ``$probe_out``, to make a reintroduced pipe
+    deterministically wrong rather than a rare flake.
+
+    ``judge='by_id'`` throughout so item 1 passes and a failure is
+    unambiguously attributable to the item under test.
+    """
+
+    def test_a_defect_pattern_ahead_of_a_large_eval_source_fails_item_2(self, tmp_path):
+        eval_text = _defect_first_eval_source('CONFUSION_COLUMNS = list(TRIAGE_OUTCOMES)')
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=eval_text)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'FAIL  item 2' in proc.stdout, proc.stdout[:4000]
+        assert 'PASS  item 2' not in proc.stdout, proc.stdout[:4000]
+
+    def test_a_defect_pattern_ahead_of_a_large_eval_source_fails_item_4(self, tmp_path):
+        eval_text = _defect_first_eval_source(
+            "def publish(report_path):\n    return report_path.with_suffix('.md')",
+        )
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=eval_text)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'FAIL  item 4' in proc.stdout, proc.stdout[:4000]
+        assert 'PASS  item 4' not in proc.stdout, proc.stdout[:4000]

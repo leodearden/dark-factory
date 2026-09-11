@@ -1712,6 +1712,20 @@ class TestServerWiringContract:
 # via the ``reopen_reason.startswith('parent_cancelled:')`` check.
 
 
+def _backlog_rejection() -> dict:
+    """A fresh ``BacklogVerdict.to_error_dict()``-shaped gate rejection.
+
+    Carries ``error``/``error_type`` and **no** ``success`` key, and does not
+    raise -- the shape a bare ``try/except`` around an interceptor write is
+    blind to.  A factory rather than a constant so no test can mutate a
+    payload another test reads.
+    """
+    return {
+        'error': 'ReconciliationBacklogExceeded: backlog depth 512 exceeds limit',
+        'error_type': 'ReconciliationBacklogExceeded',
+    }
+
+
 class TestSweepCancelledDescendants:
     """Auto-sweep dep-tree on task cancellation."""
 
@@ -2316,6 +2330,412 @@ class TestSweepCancelledDescendants:
         assert not warns, (
             f"well-formed {{tasks:[]}} must emit no WARNINGs; got {warns!r}"
         )
+
+    # ── Task 4977: the sweep's own interceptor writes must be classified ───
+    # The sweep helpers wrapped their writes in a bare ``try/except``, which
+    # sees none of the non-raising gate rejections enumerated in
+    # task_interceptor.py::interceptor_write_succeeded.  These mirror the
+    # task-4903 templates for the structurally identical split in
+    # targeted.py::_unblock_dependent.
+
+    @staticmethod
+    def _block_branch_tasks() -> dict:
+        """B is ambiguous (spawned_from=A, no escalation_id) → block branch."""
+        return {'tasks': [{
+            'id': 'B', 'status': 'pending', 'title': 'ambiguous',
+            'metadata': {'spawned_from': 'A'},
+            'dependencies': [],
+            'subtasks': [],
+        }]}
+
+    @staticmethod
+    def _cancel_branch_tasks() -> dict:
+        """B is a deterministic orphan (spawned_from + escalation_id, no
+        surviving declared files) → cancel branch."""
+        return {'tasks': [{
+            'id': 'B', 'status': 'pending', 'title': 'review-followup',
+            'metadata': {'spawned_from': 'A', 'escalation_id': 'esc-A-1'},
+            'dependencies': [],
+            'subtasks': [],
+        }]}
+
+    @staticmethod
+    async def _sweep_cancelled_parent(wired_reconciler, project_root) -> dict:
+        return await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=str(project_root),
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+    @staticmethod
+    def _descendant_actions(result: dict, action_type: str) -> list[dict]:
+        return [
+            a for a in result.get('actions', [])
+            if a.get('type') == action_type and a.get('task_id') == 'B'
+        ]
+
+    @staticmethod
+    async def _taskmaster_rows(journal, action_type: str, operation: str) -> list[dict]:
+        """Real journal rows for one (action_type, operation) pair.
+
+        ``limit`` is deliberately above 1 so the cardinality assertion below
+        can actually fail: under ``limit=1`` it could only ever catch zero
+        runs, silently narrowing every per-row count to whichever run came
+        back.  One reconcile_task call is one run.
+        """
+        runs = await journal.get_recent_runs('test-project', limit=5)
+        assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+        rows = await journal.get_run_actions(runs[0].id)
+        return [
+            r for r in rows
+            if r['action_type'] == action_type and r['target'] == 'taskmaster'
+            and r['operation'] == operation
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('make_response,expected_error', [
+        pytest.param(_backlog_rejection, 'ReconciliationBacklogExceeded', id='backlog-verdict'),
+        pytest.param(lambda: None, 'unknown', id='non-dict-none'),
+    ])
+    async def test_block_metadata_stamp_rejection_is_classified(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog, make_response, expected_error,
+    ):
+        """A rejected parent_cancelled stamp must not be reported as landed.
+
+        The status flip itself genuinely landed, so the action must stay
+        ``descendant_blocked`` -- a stamp failure must not downgrade it -- but
+        it must additionally carry ``metadata_stamp='rejected'`` and leave a
+        durable ``skip`` row, because ``_unblock_veto_reason`` reads exactly
+        the keys this dropped write stamps.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+        mock_interceptor.update_task = AsyncMock(return_value=make_response())
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert len(blocks) == 1, (
+            f'The status flip landed, so exactly one descendant_blocked action '
+            f'must survive a stamp rejection; got: {blocks}'
+        )
+        assert blocks[0].get('metadata_stamp') == 'rejected', (
+            f'Expected metadata_stamp="rejected" so the audit does not claim '
+            f'the parent_cancelled stamp landed, got: {blocks[0]!r}'
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the rejected metadata stamp'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        assert len(skips) == 1, f'Expected exactly one skip/update_task row, got: {skips}'
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert detail.get('parent_id') == 'A', f'Expected parent_id="A", got: {detail!r}'
+        assert detail.get('error') == expected_error, (
+            f'Expected the stable error_type code (preferred over the rendered '
+            f'error message), falling back to "unknown" for a non-dict '
+            f'response, got: {detail!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_block_metadata_stamp_exception_marks_action_failed(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog,
+    ):
+        """An unexpected raise must stay distinguishable from a gate refusal.
+
+        A rejection succeeds on retry; a raise needs investigation.  Operators
+        remediate them differently, so the two must never collapse onto one
+        marker.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+        mock_interceptor.update_task = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert len(blocks) == 1, (
+            f'The status flip landed, so a raising stamp must not downgrade the '
+            f'descendant_blocked action; got: {blocks}'
+        )
+        assert blocks[0].get('metadata_stamp') == 'failed', (
+            f'Expected metadata_stamp="failed" for an unexpected raise, got: {blocks[0]!r}'
+        )
+        assert blocks[0].get('metadata_stamp') != 'rejected', (
+            'A raise and a gate refusal need different operator remediation and '
+            'must not share a marker'
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the raising metadata stamp'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        assert len(skips) == 1, f'Expected exactly one skip/update_task row, got: {skips}'
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert 'boom' in (detail.get('error') or ''), (
+            f'Expected the exception text in the journal row, got: {detail!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_block_status_rejection_reports_nothing_and_skips_the_stamp(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog,
+    ):
+        """A refused block must not be reported, and must not stamp metadata.
+
+        This is the inverse of the dropped-stamp defect and the more damaging
+        direction: targeted.py::_unblock_veto_reason vetoes an unblock on
+        ``parent_cancelled`` / ``needs_recheck_against_main``, so stamping
+        them onto a task that was never blocked silently parks a live task
+        that nothing subsequently unparks.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+        mock_interceptor.set_task_status = AsyncMock(return_value=_backlog_rejection())
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert not blocks, (
+            f'Nothing landed, so the sweep must report no block -- matching its '
+            f'own exception path; got: {blocks}'
+        )
+
+        mock_interceptor.update_task.assert_not_called()
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the rejected block'
+
+        status_skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert len(status_skips) == 1, (
+            f'Expected exactly one skip/set_task_status row, got: {status_skips}'
+        )
+        detail = status_skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert detail.get('parent_id') == 'A', f'Expected parent_id="A", got: {detail!r}'
+        assert detail.get('type') == 'descendant_blocked', f'got: {detail!r}'
+        assert detail.get('error') == 'ReconciliationBacklogExceeded', (
+            f'Expected the stable error_type code, got: {detail!r}'
+        )
+
+        stamp_skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        assert not stamp_skips, (
+            f'The metadata write was never attempted, so it must leave no row; '
+            f'got: {stamp_skips}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_block_success_writes_symmetric_journal_rows(
+        self, wired_reconciler, mock_taskmaster, journal, tmp_path,
+    ):
+        """Both landed writes get their own 'write' row.
+
+        Without the positive rows an operator filtering ``action_type='skip'``
+        has no denominator, so a rejection rate cannot be computed. Absence of
+        ``metadata_stamp`` is the success signal, mirroring ``hints_attached``
+        in targeted.py::_on_task_blocked.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert len(blocks) == 1, f'Expected exactly one descendant_blocked, got: {blocks}'
+        assert 'metadata_stamp' not in blocks[0], (
+            f'metadata_stamp must be absent when the stamp landed, got: {blocks[0]!r}'
+        )
+
+        status_writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert len(status_writes) == 1, (
+            f'Expected exactly one write/set_task_status row, got: {status_writes}'
+        )
+        assert status_writes[0]['detail'].get('type') == 'descendant_blocked', (
+            f'got: {status_writes[0]["detail"]!r}'
+        )
+        assert status_writes[0]['detail'].get('task_id') == 'B', (
+            f'got: {status_writes[0]["detail"]!r}'
+        )
+
+        stamp_writes = await self._taskmaster_rows(journal, 'write', 'update_task')
+        assert len(stamp_writes) == 1, (
+            f'Expected exactly one write/update_task row, got: {stamp_writes}'
+        )
+        assert stamp_writes[0]['detail'].get('type') == 'block_metadata_stamp', (
+            f'got: {stamp_writes[0]["detail"]!r}'
+        )
+
+        for operation in ('set_task_status', 'update_task'):
+            skips = await self._taskmaster_rows(journal, 'skip', operation)
+            assert not skips, f'Expected no skip/{operation} rows, got: {skips}'
+
+    @pytest.mark.asyncio
+    async def test_cancel_status_rejection_reports_nothing(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog,
+    ):
+        """The adjacent cancel branch had the identical unclassified shape.
+
+        `_sweep_cancel_orphan` returned `descendant_cancelled` whether or not
+        the flip landed, so a refused cancel read as a completed one.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._cancel_branch_tasks())
+        mock_interceptor.set_task_status = AsyncMock(return_value=_backlog_rejection())
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        cancels = self._descendant_actions(result, 'descendant_cancelled')
+        assert not cancels, (
+            f'Nothing landed, so the sweep must report no cancel; got: {cancels}'
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the rejected cancel'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert len(skips) == 1, (
+            f'Expected exactly one skip/set_task_status row, got: {skips}'
+        )
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert detail.get('type') == 'descendant_cancelled', (
+            f'Expected the cancel-branch discriminator, got: {detail!r}'
+        )
+        assert detail.get('error') == 'ReconciliationBacklogExceeded', (
+            f'Expected the stable error_type code, got: {detail!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_success_writes_journal_row(
+        self, wired_reconciler, mock_taskmaster, journal, tmp_path,
+    ):
+        """The cancel branch's positive counterpart to step-10's skip row."""
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._cancel_branch_tasks())
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        cancels = self._descendant_actions(result, 'descendant_cancelled')
+        assert len(cancels) == 1, f'Expected exactly one descendant_cancelled, got: {cancels}'
+
+        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert len(writes) == 1, (
+            f'Expected exactly one write/set_task_status row, got: {writes}'
+        )
+        detail = writes[0]['detail']
+        assert detail.get('type') == 'descendant_cancelled', f'got: {detail!r}'
+        assert detail.get('task_id') == 'B', f'got: {detail!r}'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert not skips, f'Expected no skip/set_task_status rows, got: {skips}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('tasks_key,action_type', [
+        pytest.param('_block_branch_tasks', 'descendant_blocked', id='block-branch'),
+        pytest.param('_cancel_branch_tasks', 'descendant_cancelled', id='cancel-branch'),
+    ])
+    async def test_status_write_exception_leaves_skip_row(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog, tasks_key, action_type,
+    ):
+        """A RAISING status write is journalled like a refused one.
+
+        Gate rejections and raises are two arms of the same decision, and the
+        raising arm (db locked, interceptor timeout) is the one an operator
+        most needs to see.  Journalling only the rejection arm would leave
+        `WHERE action_type='skip'` under-counting precisely there.  Both
+        branches also assert the success row is absent, pinning that the row
+        is emitted only for a landed write.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=getattr(self, tasks_key)())
+        mock_interceptor.set_task_status = AsyncMock(side_effect=RuntimeError('db locked'))
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        acted = self._descendant_actions(result, action_type)
+        assert not acted, f'A raising write must report no {action_type}; got: {acted}'
+        mock_interceptor.update_task.assert_not_called()
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the raising status write'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert len(skips) == 1, (
+            f'Expected exactly one skip/set_task_status row, got: {skips}'
+        )
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'got: {detail!r}'
+        assert detail.get('type') == action_type, (
+            f'Expected the journal type to match the action vocabulary, got: {detail!r}'
+        )
+        assert 'db locked' in str(detail.get('error')), (
+            f'Expected the raised message recorded, got: {detail!r}'
+        )
+
+        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert not writes, f'Nothing landed, so expected no write row; got: {writes}'
+
+    @pytest.mark.asyncio
+    async def test_cancel_no_op_response_counts_as_landed(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal, tmp_path,
+    ):
+        """The co-cancellation race the call site calls 'safely idempotent'.
+
+        targeted.py::_sweep_cancelled_descendants justifies having no
+        co-cancellation guard on this branch by the TaskInterceptor
+        same-status guard returning a no-op response.  That claim now depends
+        on interceptor_write_succeeded classifying that exact shape as
+        success -- were it ever read as a rejection, benign idempotent
+        re-cancels would start being dropped and only the comment would
+        disagree.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._cancel_branch_tasks())
+        mock_interceptor.set_task_status = AsyncMock(
+            return_value={'success': True, 'no_op': True, 'task_id': 'B'},
+        )
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        cancels = self._descendant_actions(result, 'descendant_cancelled')
+        assert len(cancels) == 1, (
+            f'A no-op re-cancel must still report the cancel, got: {result.get("actions")}'
+        )
+
+        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        assert len(writes) == 1, (
+            f'Expected exactly one write/set_task_status row, got: {writes}'
+        )
+        assert writes[0]['detail'].get('task_id') == 'B', f'got: {writes[0]!r}'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert not skips, f'A no-op is a landed write, not a skip; got: {skips}'
 
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────

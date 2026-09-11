@@ -1145,10 +1145,18 @@ def merge_plans(*plan_lists: list[ClusterPlan]) -> tuple[list[StampTarget], list
 # The single I/O boundary
 # ---------------------------------------------------------------------------
 
-#: Written to every ``update_memory`` so the write journal attributes each
-#: stamp to this sweep rather than to a generic ``mcp_tool``.  The amendment
-#: storm alarm reads this field; a bulk run under the default source would
-#: look exactly like the runaway rewrite that alarm exists to catch.
+#: Passed as BOTH ``_source`` and ``agent_id`` to every ``update_memory``
+#: call below, because the two kwargs feed different consumers and neither
+#: substitutes for the other. ``_source`` becomes the write journal's
+#: ``source`` column, attributing each stamp to this sweep rather than to a
+#: generic ``mcp_tool``. ``agent_id`` is what
+#: ``_apply_memory_metadata_validation`` forwards to ``emit_schema_warnings``,
+#: ``UnknownKeyStormDetector.record``, and ``file_unknown_key_storm_escalation``
+#: — and it is also what the write journal records in its own ``agent_id``
+#: column alongside ``source``. Leaving ``agent_id`` unset would attribute
+#: every census line and unknown-key storm bucket from this sweep to a null
+#: agent even though the journal correctly names it, so both kwargs are set
+#: to the same value to keep every view in agreement.
 WRITE_SOURCE = 'retro_stamp_topics'
 
 #: Recorded on the write journal row beside the patch.
@@ -1337,6 +1345,7 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
             metadata_patch=dict(decision.patch),
             metadata_mode='merge',
             reason=WRITE_REASON,
+            agent_id=WRITE_SOURCE,
             _source=WRITE_SOURCE,
         )
     except Exception as exc:

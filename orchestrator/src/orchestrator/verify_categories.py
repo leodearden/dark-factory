@@ -458,9 +458,15 @@ INFRA_TRANSIENT_CATEGORIES: frozenset[FailureCategory] = frozenset(
 # PYTEST_INTERNALERROR fail (2) — a hang and a collection-time INTERNALERROR
 # are both non-completions a diff can genuinely CAUSE; DISK_FULL likewise
 # fails (2) — a diff can generate the artifacts that fill the disk;
-# SEMAPHORE_TIMEOUT and ENV_TRANSIENT fail (3) on the residuals
-# verify_classify's own docstrings document (:438-453 and :498-508). Fail
-# CLOSED in every one of those cases.
+# SEMAPHORE_TIMEOUT and ENV_TRANSIENT fail (3), but on residuals documented
+# where each is actually adjudicated, not here: SEMAPHORE_TIMEOUT's on this
+# table's own FailureCategory.SEMAPHORE_TIMEOUT row comment (a real,
+# column-0 emitter line landing outside run_all's framing — the historical
+# gap verify_classify.py::_classify_environmental's docstring describes is
+# CLOSED, and is no longer this row's residual); ENV_TRANSIENT's on this
+# table's own FailureCategory.ENV_TRANSIENT row comment, which points at
+# verify_classify.py::_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE's shape-1
+# matcher. Fail CLOSED in every one of those cases.
 #
 # Deliberately NOT spelled as a subtraction from INFRA_TRANSIENT_CATEGORIES.
 # The two sets answer different questions ("is retrying worthwhile" vs "may

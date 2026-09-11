@@ -12034,3 +12034,1143 @@ class TestFilterStyleOnlyAuthorshipFlags:
         assert flags == [benign1, dropped, benign2, survivor, benign3], (
             'the input list itself must never be mutated'
         )
+
+
+# ---------------------------------------------------------------------------
+# ---- task 3476 step-1 ----
+# RED: the cluster-growth flag_type predicate must exist and be total.
+# ---------------------------------------------------------------------------
+
+
+class TestIsClusterGrowthFlagType:
+    """`_is_cluster_growth_flag_type` recognises the duplicate-cluster-growth
+    family across LLM spelling drift (task 3476).
+
+    Stage 1 emits these findings with an LLM-authored, un-enumerated
+    ``flag_type``; the two spellings named in the run-df364849 /
+    finding-96a14765 incident (``procedural_knowledge_cluster_growth`` and
+    ``duplicate_procedural_knowledge_cluster_growth``) are observed samples,
+    not a closed set.  The predicate therefore matches on
+    :func:`canonical_flag_type_family` membership OR on the token pair
+    ``{'cluster', 'growth'}``.
+
+    RED until step-2 adds the predicate.
+    """
+
+    @pytest.mark.parametrize('flag_type', [
+        'procedural_knowledge_cluster_growth',
+        'duplicate_procedural_knowledge_cluster_growth',
+    ])
+    def test_known_canonical_spellings_match(self, flag_type):
+        """Both spellings named in the incident are recognised."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is True, (
+            f'{flag_type!r} is a canonical incident spelling and must match. '
+            'RED: _is_cluster_growth_flag_type does not exist yet.'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'Procedural-Knowledge Cluster Growth',
+        'PROCEDURAL_KNOWLEDGE_CLUSTER_GROWTH',
+        'cluster_growth_procedural_knowledge',
+        'Duplicate Procedural Knowledge  Cluster-Growth',
+        'growth_cluster_knowledge_procedural_duplicate',
+    ])
+    def test_case_separator_and_word_order_variants_match(self, flag_type):
+        """canonical_flag_type_family normalization collapses these onto a known family."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is True, (
+            f'{flag_type!r} is a case/separator/word-order variant of a known '
+            'spelling and must match via canonical_flag_type_family'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'mem0_duplicate_cluster_growth',
+        'memory_cluster_growth_detected',
+        'unaccounted-cluster-growth',
+    ])
+    def test_token_drift_spellings_carrying_both_tokens_match(self, flag_type):
+        """An unknown spelling still matches when it carries BOTH 'cluster' and 'growth'.
+
+        Deliberately broader than the sibling filters' exact-family matching:
+        this filter only ever DROPS on positively-confirmed UUID presence, so
+        over-matching can only reclassify an already-accounted-for finding.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is True, (
+            f'{flag_type!r} carries both the cluster and growth tokens and must '
+            'match via the token-pair arm'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'cluster_consolidation',
+        'duplicate_procedural_knowledge_cluster_expansion',
+        'entity_growth',
+        'memory_growth_detected',
+    ])
+    def test_single_token_flag_types_do_not_match(self, flag_type):
+        """Only ONE of the two tokens is not enough — the pair is required."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is False, (
+            f'{flag_type!r} carries only one of the cluster/growth tokens and '
+            'must NOT match'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'stale_metadata',
+        'missing_deliverable',
+        'systemic_pattern',
+        '',
+        '   ',
+    ])
+    def test_unrelated_flag_types_do_not_match(self, flag_type):
+        """Unrelated / empty flag types never match."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is False, (
+            f'{flag_type!r} is unrelated to cluster growth and must NOT match'
+        )
+
+    @pytest.mark.parametrize('flag_type', [None, 123, 4.2, [], {}, object()])
+    def test_non_string_input_is_false_not_raising(self, flag_type):
+        """The predicate must be TOTAL over malformed LLM-authored input."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is False, (
+            f'{flag_type!r} is not a str; the predicate must return False rather '
+            'than raise (flag dicts are LLM-authored and unvalidated)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# ---- task 3476 step-3 ----
+# RED: the two pure extractors that feed the accounted-cluster-growth filter.
+# ---------------------------------------------------------------------------
+
+
+class TestClusterGrowthExtractionHelpers:
+    """`_cluster_growth_cited_memory_ids` / `_cluster_growth_candidate_task_ids`
+    read the flag's STRUCTURED citation channels only (task 3476).
+
+    Both are pure/sync/no-I/O and must be TOTAL over malformed LLM-authored
+    flag dicts -- a raised TypeError here would crash the whole Stage-1 filter
+    chain on one bad finding.
+
+    RED until step-4 adds the helpers.
+    """
+
+    _UUID_A = '03b783d5-dc00-441a-af9d-05b0e636b668'
+    _UUID_B = '01499374-8029-4c01-baa0-b7851d2376cb'
+    _UUID_C = '4a4daa2d-1111-4c01-baa0-b7851d2376cb'
+
+    # -- (a) _cluster_growth_cited_memory_ids ------------------------------
+
+    def test_cited_memory_ids_returns_ids_in_order(self):
+        """Every cited memory_id, in citation order."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        flag = {'cited_memories': [
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+            {'memory_id': self._UUID_B, 'store': 'mem0'},
+        ]}
+        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
+            'cited memory ids must be returned in citation order. '
+            'RED: _cluster_growth_cited_memory_ids does not exist yet.'
+        )
+
+    def test_cited_memory_ids_are_deduped_preserving_first_position(self):
+        """A repeated citation contributes one id, at its first position."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        flag = {'cited_memories': [
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+            {'memory_id': self._UUID_B, 'store': 'mem0'},
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+        ]}
+        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B]
+
+    def test_cited_memory_ids_includes_graphiti_store_entries(self):
+        """A non-mem0 citation is INCLUDED -- conservative by design.
+
+        An unmatched graph-edge uuid can only fail the all-present test and
+        thereby force a KEEP, which is the fail-safe direction.  Excluding it
+        could let a partially-accounted finding be dropped.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        flag = {'cited_memories': [
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+            {'memory_id': self._UUID_B, 'store': 'graphiti'},
+        ]}
+        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
+            'a graphiti citation must be INCLUDED: an unmatched id can only force '
+            'a KEEP, which is the fail-safe direction'
+        )
+
+    @pytest.mark.parametrize('entries', [
+        [{'store': 'mem0'}],                                   # missing memory_id
+        [{'memory_id': None, 'store': 'mem0'}],                # None memory_id
+        [{'memory_id': '', 'store': 'mem0'}],                  # blank memory_id
+        [{'memory_id': '   ', 'store': 'mem0'}],               # whitespace-only
+        [{'memory_id': 123, 'store': 'mem0'}],                 # non-str memory_id
+        ['not-a-dict'],                                        # non-dict entry
+        [None],                                                # None entry
+    ])
+    def test_cited_memory_ids_skips_malformed_entries(self, entries):
+        """Malformed citation entries are skipped, never raised on."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        assert _cluster_growth_cited_memory_ids({'cited_memories': entries}) == [], (
+            f'malformed cited_memories entry {entries!r} must be skipped'
+        )
+
+    @pytest.mark.parametrize('cited', [None, 'oops', 123, {}, []])
+    def test_cited_memory_ids_returns_empty_for_missing_or_non_list(self, cited):
+        """A missing / None / non-list cited_memories yields []."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        assert _cluster_growth_cited_memory_ids({'cited_memories': cited}) == []
+        assert _cluster_growth_cited_memory_ids({}) == []
+
+    # -- (b) _cluster_growth_candidate_task_ids ----------------------------
+
+    def test_candidate_task_ids_yields_top_level_task_id(self):
+        """The flag's own task_id is a candidate."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids({'task_id': '3417'}) == ['3417'], (
+            'the flag\'s own task_id must be a candidate. '
+            'RED: _cluster_growth_candidate_task_ids does not exist yet.'
+        )
+
+    def test_candidate_task_ids_splits_the_comma_joined_shape(self):
+        """A comma-joined task_id decomposes, each component stripped."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids(
+            {'task_id': '3417, 3468 ,3500'},
+        ) == ['3417', '3468', '3500']
+
+    def test_candidate_task_ids_tolerates_an_int_task_id(self):
+        """An int task_id is coerced to str."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids({'task_id': 3417}) == ['3417']
+
+    def test_candidate_task_ids_includes_cited_task_ids(self):
+        """Every cited_tasks[].task_id is also a candidate."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        flag = {
+            'task_id': None,
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '3468', 'title': 'Human gate'},
+                {'project_id': 'reify', 'task_id': 42, 'title': 'Other'},
+            ],
+        }
+        assert _cluster_growth_candidate_task_ids(flag) == ['3468', '42']
+
+    def test_candidate_task_ids_dedupes_across_both_channels_preserving_order(self):
+        """Top-level ids come first; a repeat from cited_tasks is deduped."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        flag = {
+            'task_id': '3417,3468',
+            'cited_tasks': [
+                {'task_id': '3468'},   # duplicate of a top-level id
+                {'task_id': '3500'},
+            ],
+        }
+        assert _cluster_growth_candidate_task_ids(flag) == ['3417', '3468', '3500']
+
+    @pytest.mark.parametrize('entries', [
+        [{'project_id': 'dark_factory'}],       # missing task_id
+        [{'task_id': None}],                    # None task_id
+        [{'task_id': ''}],                      # blank
+        [{'task_id': '   '}],                   # whitespace-only
+        ['not-a-dict'],                         # non-dict entry
+        [None],
+    ])
+    def test_candidate_task_ids_skips_malformed_cited_task_entries(self, entries):
+        """Malformed cited_tasks entries are skipped, never raised on."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids(
+            {'task_id': None, 'cited_tasks': entries},
+        ) == [], f'malformed cited_tasks entry {entries!r} must be skipped'
+
+    @pytest.mark.parametrize('flag', [
+        {},
+        {'task_id': None},
+        {'task_id': ''},
+        {'task_id': '   '},
+        {'task_id': ','},
+        {'task_id': None, 'cited_tasks': []},
+        {'task_id': None, 'cited_tasks': None},
+        {'task_id': None, 'cited_tasks': 'oops'},
+    ])
+    def test_candidate_task_ids_returns_empty_when_nothing_resolvable(self, flag):
+        """No resolvable task id yields [] -- the caller then KEEPs the flag."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids(flag) == []
+
+
+# ---------------------------------------------------------------------------
+# ---- task 3476 step-5 ----
+# RED: the core drop path — reproduces the run-df364849 false positives.
+# ---------------------------------------------------------------------------
+
+
+class TestFilterAccountedClusterGrowthFlags:
+    """`filter_accounted_cluster_growth_flags` drops a cluster-growth finding
+    whose cited memory UUIDs are ALREADY written into the referenced task's
+    current description body (task 3476).
+
+    Closes the run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765
+    incident, in which 2 of 3 duplicate-cluster-growth flags were FALSE
+    POSITIVES.  The Stage-1 check diffed the candidate UUID against a
+    title-derived / remembered COUNT rather than against the task's current
+    body -- and task 3417's title still reads "(3 primary + 3 secondary
+    entries)" while its body already lists the "new" UUID verbatim as primary
+    entry #3 of 3.  Same shape for task 3468's "Cluster UUIDs (mem0)" list.
+
+    RED until step-6 adds the filter.
+    """
+
+    _UUID_3417 = '03b783d5-dc00-441a-af9d-05b0e636b668'
+    _UUID_3468 = '01499374-8029-4c01-baa0-b7851d2376cb'
+
+    def _make_growth_flag(
+        self,
+        *,
+        task_id: Any = '3417',
+        flag_type: str = 'procedural_knowledge_cluster_growth',
+        memory_ids: list[str] | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """A Stage-1 duplicate-cluster-growth finding, incident-shaped."""
+        ids = [self._UUID_3417] if memory_ids is None else memory_ids
+        flag: dict[str, Any] = {
+            'task_id': task_id,
+            'category': 'memory_duplicate',
+            'flag_type': flag_type,
+            'description': (
+                'Cluster has grown beyond the 3 primary + 3 secondary entries '
+                f'tracked by gate task {task_id}: mem0 {ids[0]} is unaccounted.'
+            ),
+            'cited_memories': [{'memory_id': m, 'store': 'mem0'} for m in ids],
+        }
+        flag.update(extra)
+        return flag
+
+    def _make_task_record(
+        self,
+        *,
+        task_id: Any = 3417,
+        title: str = (
+            'Human gate: consolidate npx-pyright EACCES procedural_knowledge '
+            'cluster (3 primary + 3 secondary entries)'
+        ),
+        description: str = '',
+        details: str = '',
+    ) -> dict[str, Any]:
+        return {
+            'id': task_id,
+            'title': title,
+            'description': description,
+            'details': details,
+        }
+
+    @pytest.mark.asyncio
+    async def test_task_3417_false_positive_is_dropped(self):
+        """The exact live 3417 false positive: title says 3+3, body lists the UUID."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=(
+                'Primary entries:\n'
+                '  1. mem0 aaaaaaaa-0000-4c01-baa0-b7851d2376cb (2026-07-30T11:02)\n'
+                '  2. mem0 bbbbbbbb-0000-4c01-baa0-b7851d2376cb (2026-07-31T09:14)\n'
+                f'  3. mem0 {self._UUID_3417} (2026-08-01T00:20) — sudo chown ...\n'
+            ),
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'the cited UUID is already spelled out in task 3417\'s description '
+            f'body, so the growth flag must be DROPPED; got {result!r}. '
+            'RED: filter_accounted_cluster_growth_flags does not exist yet.'
+        )
+        taskmaster.get_task.assert_awaited_once_with('3417', '/df')
+
+    @pytest.mark.asyncio
+    async def test_task_3468_false_positive_with_duplicate_spelling_is_dropped(self):
+        """The 3468 shape, under the `duplicate_...` flag_type spelling."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id='3468',
+            flag_type='duplicate_procedural_knowledge_cluster_growth',
+            memory_ids=[self._UUID_3468],
+        )
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            task_id=3468,
+            title='Human gate: consolidate the verify-lane cluster (4 entries)',
+            description=(
+                'Cluster UUIDs (mem0):\n'
+                '  - cccccccc-0000-4c01-baa0-b7851d2376cb\n'
+                f'  - {self._UUID_3468}\n'
+            ),
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'task 3468 already lists the cited UUID in its "Cluster UUIDs (mem0)" '
+            f'block, so the flag must be DROPPED; got {result!r}'
+        )
+        taskmaster.get_task.assert_awaited_once_with('3468', '/df')
+
+    @pytest.mark.asyncio
+    async def test_all_three_cited_uuids_present_drops(self):
+        """ALL-must-be-present, in its satisfied direction."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        uuids = [
+            self._UUID_3417,
+            self._UUID_3468,
+            '4a4daa2d-1111-4c01-baa0-b7851d2376cb',
+        ]
+        flag = self._make_growth_flag(memory_ids=uuids)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description='Tracked: ' + '\n'.join(f'  - mem0 {u}' for u in uuids),
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'every one of the three cited UUIDs appears in the body, so the flag '
+            f'must be DROPPED; got {result!r}'
+        )
+
+    # -- task 3476 step-7: the fail-safe / scope matrix --------------------
+    # Every case below must KEEP the flag. This filter drops ONLY on positive
+    # confirmation, so a genuine growth signal is never silenced.
+
+    @pytest.mark.asyncio
+    async def test_partial_presence_keeps_the_flag(self):
+        """(a) Genuine growth: one of two cited UUIDs is absent -> KEEP."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(memory_ids=[self._UUID_3417, self._UUID_3468])
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'Primary entries:\n  1. mem0 {self._UUID_3417}\n',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'only ONE of the two cited UUIDs is in the body — this is GENUINE '
+            f'growth and must be KEPT; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_task_raising_keeps_the_flag(self):
+        """(b) A lookup error is a degraded outcome -> KEEP."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=Exception('boom'))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'a raised get_task must fail SAFE to KEEP (never crash the stage, '
+            f'never drop on an unknown body); got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_not_found_error_keeps_the_flag(self):
+        """(c) SqliteTaskBackend RAISES for a missing id — it does not return a dict."""
+        from fused_memory.backends.task_backend_errors import TaskNotFoundError
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=TaskNotFoundError('3417'))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'a not-found TaskmasterError must KEEP the flag; '
+            f'got {result!r}'
+        )
+
+    @pytest.mark.parametrize('bad_result', [
+        None,
+        'oops',
+        123,
+        [],
+        {},                                       # dict with no body fields
+        {'id': 3417, 'title': 't'},               # no description/details
+        {'description': None, 'details': None},   # explicit None bodies
+    ])
+    @pytest.mark.asyncio
+    async def test_non_dict_or_bodyless_result_keeps_the_flag(self, bad_result):
+        """(d) A non-dict / body-less result is "no body" and can never confirm."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=bad_result)
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f'get_task returning {bad_result!r} yields no body to confirm against, '
+            f'so the flag must be KEPT; got {result!r}'
+        )
+
+    @pytest.mark.parametrize('cited', [None, [], 'oops'])
+    @pytest.mark.asyncio
+    async def test_no_cited_memories_keeps_the_flag_without_io(self, cited):
+        """(e) Nothing to confirm -> KEEP, and no lookup is attempted."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        flag['cited_memories'] = cited
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record())
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], f'no citations to confirm -> KEEP; got {result!r}'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_resolvable_task_id_keeps_the_flag_without_io(self):
+        """(f) No task to diff against -> KEEP, and no lookup is attempted."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(task_id=None)
+        flag.pop('cited_tasks', None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record())
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], f'no resolvable task id -> KEEP; got {result!r}'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_cluster_growth_flag_type_is_out_of_scope(self):
+        """(g) Scope guard: a stale_metadata flag is never touched, even if accounted."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(flag_type='stale_metadata')
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'body mentions mem0 {self._UUID_3417} explicitly',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'a non-cluster-growth flag_type is out of this filter\'s scope and '
+            f'must pass through untouched; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.parametrize(('taskmaster', 'project_root'), [
+        (None, '/df'),
+        (AsyncMock(), ''),
+        (None, ''),
+    ])
+    @pytest.mark.asyncio
+    async def test_falsy_dependencies_degrade_to_a_no_op(self, taskmaster, project_root):
+        """(h) Falsy taskmaster / project_root -> unchanged pass-through, no I/O."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flags = [self._make_growth_flag()]
+        result = await filter_accounted_cluster_growth_flags(
+            taskmaster, project_root, flags,
+        )
+
+        assert result == flags, (
+            'a falsy dependency must degrade to a no-op pass-through; '
+            f'got {result!r}'
+        )
+        if taskmaster is not None:
+            taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_batch_of_only_non_candidates_does_zero_io(self):
+        """(i) A normal cycle (this family is rare) must do zero lookups."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flags = [
+            {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'},
+            {'task_id': '2', 'flag_type': 'missing_deliverable', 'description': 'b'},
+        ]
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record())
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', flags)
+
+        assert result == flags
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.parametrize(('cited_case', 'body_case'), [
+        ('upper', 'lower'),
+        ('lower', 'upper'),
+        ('mixed', 'lower'),
+    ])
+    @pytest.mark.asyncio
+    async def test_uuid_matching_is_case_insensitive(self, cited_case, body_case):
+        """(j) Case-insensitive matching: a case-variant UUID still DROPS."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        def _cased(value: str, how: str) -> str:
+            if how == 'upper':
+                return value.upper()
+            if how == 'mixed':
+                return ''.join(
+                    c.upper() if n % 2 else c for n, c in enumerate(value)
+                )
+            return value.lower()
+
+        flag = self._make_growth_flag(
+            memory_ids=[_cased(self._UUID_3417, cited_case)],
+        )
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'  3. mem0 {_cased(self._UUID_3417, body_case)} (2026-08-01)',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            f'a {cited_case}-cased citation vs a {body_case}-cased body is the '
+            f'same UUID and must DROP; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_survivors_preserve_input_order(self):
+        """(k) Order preservation across a mixed batch."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        benign = {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'}
+        accounted = self._make_growth_flag(task_id='3417')
+        benign2 = {'task_id': '2', 'flag_type': 'missing_deliverable', 'description': 'b'}
+        genuine = self._make_growth_flag(task_id='3468', memory_ids=[self._UUID_3468])
+
+        bodies = {
+            '3417': self._make_task_record(
+                description=f'tracked: mem0 {self._UUID_3417}',
+            ),
+            '3468': self._make_task_record(
+                task_id=3468, description='tracked: nothing relevant',
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=lambda tid, _root: bodies[tid])
+
+        flags = [benign, accounted, benign2, genuine]
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', flags)
+
+        assert result == [benign, benign2, genuine], (
+            f'survivors must keep their original relative order; got {result!r}'
+        )
+        assert flags == [benign, accounted, benign2, genuine], (
+            'the input list itself must never be mutated'
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_distinct_task_id_is_resolved_exactly_once(self):
+        """(l) Two flags citing the same task cost ONE get_task."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag_a = self._make_growth_flag(task_id='3417')
+        flag_b = self._make_growth_flag(
+            task_id='3417',
+            flag_type='duplicate_procedural_knowledge_cluster_growth',
+            memory_ids=[self._UUID_3468],
+        )
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'tracked: {self._UUID_3417} and {self._UUID_3468}',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(
+            taskmaster, '/df', [flag_a, flag_b],
+        )
+
+        assert result == []
+        assert taskmaster.get_task.await_count == 1, (
+            'each DISTINCT task id must be resolved exactly once per call; '
+            f'got {taskmaster.get_task.await_count} awaits'
+        )
+
+    @pytest.mark.asyncio
+    async def test_lookup_error_emits_a_warning_naming_the_task_id(self, caplog):
+        """(m) The degraded-outcome log required by the silent-fallthrough gate.
+
+        WARNING, not debug: a swallowed lookup error means the filter cannot
+        tell whether the flag is accounted for, and a broad handler returning
+        an empty value with no WARN+ log trips
+        shared/tests/test_silent_fallthrough_gate.py.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=Exception('boom'))
+
+        with caplog.at_level(logging.WARNING):
+            result = await filter_accounted_cluster_growth_flags(
+                taskmaster, '/df', [flag],
+            )
+
+        assert result == [flag]
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, (
+            'a swallowed get_task error must emit a WARNING (not debug) — the '
+            'silent-fallthrough gate requires a WARN+ log on a broad handler '
+            'that returns an empty value'
+        )
+        joined = ' '.join(r.getMessage() for r in warnings)
+        assert '3417' in joined, (
+            f'the WARNING must name the task id that failed to resolve; got {joined!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_is_logged_for_a_cluster_only_flag_type(self, caplog):
+        """(n) A 'cluster'-but-not-'growth' flag_type is KEPT and logged as drift."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            flag_type='duplicate_procedural_knowledge_cluster_expansion',
+        )
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'tracked: mem0 {self._UUID_3417}',
+        ))
+
+        with caplog.at_level(logging.INFO):
+            result = await filter_accounted_cluster_growth_flags(
+                taskmaster, '/df', [flag],
+            )
+
+        assert result == [flag], (
+            'an unmatched flag_type is out of scope and must be KEPT; '
+            f'got {result!r}'
+        )
+        drift = [
+            r.getMessage() for r in caplog.records
+            if 'accounted_cluster_growth_filter_possible_drift' in r.getMessage()
+        ]
+        assert drift, (
+            'a flag_type containing "cluster" that the predicate does not match '
+            'must emit a possible-drift log so the silent no-op is observable; '
+            f'got records={[r.getMessage() for r in caplog.records]!r}'
+        )
+        assert 'duplicate_procedural_knowledge_cluster_expansion' in drift[0], (
+            f'the drift log must name the unmatched flag_type; got {drift[0]!r}'
+        )
+        assert 'procedural_knowledge_cluster_growth' in drift[0], (
+            'the drift log must name CLUSTER_GROWTH_FLAG_TYPES as its reference '
+            f'point; got {drift[0]!r}'
+        )
+
+    # -- task 3476 step-9: multi-task resolution ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_task_id_resolved_from_cited_tasks_only(self):
+        """(a) The gate task appears ONLY in cited_tasks -> still resolved and DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id=None,
+            memory_ids=[self._UUID_3468],
+            cited_tasks=[{
+                'project_id': 'dark_factory',
+                'task_id': '3468',
+                'title': 'Human gate: consolidate the verify-lane cluster',
+            }],
+        )
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            task_id=3468,
+            description=f'Cluster UUIDs (mem0):\n  - {self._UUID_3468}\n',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'a task id present only in cited_tasks must still be resolved and '
+            f'the flag DROPPED; got {result!r}'
+        )
+        taskmaster.get_task.assert_awaited_once_with('3468', '/df')
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_task_id_drops_when_the_second_task_accounts(self):
+        """(b) Some-task-accounts-for-all: '3417,3468' where only 3468 lists it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id='3417,3468', memory_ids=[self._UUID_3468],
+        )
+        bodies = {
+            '3417': self._make_task_record(description='nothing relevant here'),
+            '3468': self._make_task_record(
+                task_id=3468,
+                description=f'Cluster UUIDs (mem0):\n  - {self._UUID_3468}\n',
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=lambda tid, _root: bodies[tid])
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'SOME candidate task accounting for every cited UUID is sufficient; '
+            f'got {result!r}'
+        )
+        assert taskmaster.get_task.await_count == 2, (
+            'both components of the comma-joined task_id must be resolved; '
+            f'got {taskmaster.get_task.await_count} awaits'
+        )
+
+    @pytest.mark.asyncio
+    async def test_bodies_are_never_unioned_across_candidate_tasks(self):
+        """(c) 3417 has uuid-A, 3468 has uuid-B, flag cites both -> KEPT.
+
+        The all-present test must be satisfied by a SINGLE task's body.
+        "uuid-A is in 3417 and uuid-B is in 3468" does not establish that the
+        cluster this finding is about is fully tracked anywhere.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id='3417,3468',
+            memory_ids=[self._UUID_3417, self._UUID_3468],
+        )
+        bodies = {
+            '3417': self._make_task_record(
+                description=f'tracked: {self._UUID_3417}',
+            ),
+            '3468': self._make_task_record(
+                task_id=3468, description=f'tracked: {self._UUID_3468}',
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=lambda tid, _root: bodies[tid])
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'neither task lists BOTH cited UUIDs; unioning bodies across tasks '
+            f'would be a false DROP, so the flag must be KEPT; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_uuid_present_only_in_details_drops(self):
+        """(d) The body under test is description + details.
+
+        Mirrors the live 3417 record, whose `details` genuinely carries UUIDs
+        (e.g. 4a4daa2d, 190731b1) that the description does not.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description='',
+            details=f'Secondary entries:\n  - mem0 {self._UUID_3417}\n',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'a UUID present only in `details` still accounts for the growth — '
+            f'the body is description+details; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_positive_confirmation_survives_a_sibling_lookup_error(self):
+        """(e) An error on one candidate id must not veto another's confirmation."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(task_id='3417,3468')
+
+        def _get(tid, _root):
+            if tid == '3417':
+                raise Exception('backend hiccup')
+            return self._make_task_record(
+                task_id=3468, description=f'tracked: {self._UUID_3417}',
+            )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get)
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'one positive confirmation is sufficient; an erroring sibling id '
+            f'contributes no body and must not veto it; got {result!r}'
+        )
+
+    # -- task 3476 amendment pass: only a DISCRIMINATING cited id confirms --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('memory_ids, description', [
+        pytest.param(
+            ['mem0', '3'],
+            'Cluster gate for the mem0 npx-pyright cluster; 3 primary entries',
+            id='degenerate-tokens-any-prose-contains',
+        ),
+        pytest.param(
+            ['03b783d5'],
+            f'  3. mem0 {_UUID_3417} (2026-08-01)',
+            id='truncated-uuid-prefix',
+        ),
+        pytest.param(
+            ['0123456789abcde'],
+            'tracked: mem0 0123456789abcde',
+            id='fifteen-chars-is-one-short-of-the-threshold',
+        ),
+    ])
+    async def test_a_non_discriminating_cited_id_keeps_the_flag(
+        self, memory_ids, description,
+    ):
+        """A cited id short enough to occur in prose by chance cannot confirm.
+
+        The all-present test is a case-insensitive SUBSTRING scan over the task
+        body, and ``cited_memories[].memory_id`` reaches this filter with no
+        shape validation: ``verify_cited_memories`` never resolves a
+        ``store != 'mem0'`` entry -- which this filter deliberately INCLUDES --
+        and KEEPS a citation whose lookup ERRORS, so during a Qdrant outage
+        unverified ids arrive here too.  A degenerate id therefore satisfies
+        "already written into the body" trivially, which is exactly the false
+        DROP the drops-only-on-positive-confirmation invariant exists to
+        exclude.  Fail-safe direction is KEEP.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(memory_ids=memory_ids)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value=self._make_task_record(description=description),
+        )
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'a cited id that is not discriminating cannot positively confirm '
+            'that the cluster is accounted for, however literally it appears '
+            f'in the body; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_long_non_uuid_cited_id_still_confirms(self):
+        """The length arm is inclusive, so a non-UUID store id still confirms.
+
+        Guards the opposite failure: hardening the confirmation must not narrow
+        it to UUID-shaped ids only and silently disable the guard for any store
+        whose ids are merely long.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        long_id = 'mem0point0123456'  # 16 chars: the threshold, inclusive
+        flag = self._make_growth_flag(memory_ids=[long_id])
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value=self._make_task_record(description=f'tracked: {long_id}'),
+        )
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'an id long enough not to collide with prose by chance is '
+            f'discriminating and must still confirm a drop; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('flag_kwargs, expected_tokens', [
+        pytest.param(
+            {'cited_memories': []},
+            ['no_cited_memory_ids', 'procedural_knowledge_cluster_growth', '3417'],
+            id='cites-no-memory-ids',
+        ),
+        pytest.param(
+            {'memory_ids': ['mem0']},
+            [
+                'non_discriminating_memory_id',
+                'procedural_knowledge_cluster_growth',
+                '3417',
+            ],
+            id='cites-only-a-degenerate-id',
+        ),
+        pytest.param(
+            {'task_id': None},
+            ['no_resolvable_task_id', 'procedural_knowledge_cluster_growth'],
+            id='resolves-no-task-id',
+        ),
+    ])
+    async def test_an_unconfirmable_candidate_is_logged(
+        self, caplog, flag_kwargs, expected_tokens,
+    ):
+        """A flag_type-matched flag the guard cannot act on must say so.
+
+        The drift log covers only ONE of the ways this guard silently becomes a
+        no-op -- an unrecognised flag_type.  If findings in this family put the
+        UUID only in prose (which this module deliberately refuses to parse),
+        omit ``cited_memories``, cite nothing discriminating, or carry no
+        resolvable task id, the guard is permanently ineffective while the
+        drift log stays quiet because the flag_type matched fine.  That is the
+        same failure mode the drift log exists to make observable.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(**flag_kwargs)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'tracked: mem0 {self._UUID_3417}',
+        ))
+
+        with caplog.at_level(logging.INFO):
+            result = await filter_accounted_cluster_growth_flags(
+                taskmaster, '/df', [flag],
+            )
+
+        assert result == [flag], (
+            f'an unconfirmable candidate must be KEPT; got {result!r}'
+        )
+        logged = [
+            r.getMessage() for r in caplog.records
+            if 'accounted_cluster_growth_filter_unconfirmable_candidates'
+            in r.getMessage()
+        ]
+        assert logged, (
+            'a flag_type-matched flag skipped for want of something to confirm '
+            'against must be logged, or the guard is a silent no-op; got '
+            f'records={[r.getMessage() for r in caplog.records]!r}'
+        )
+        for token in expected_tokens:
+            assert token in logged[0], (
+                f'the log must name {token!r} (the reason, the flag_type and '
+                f'the task_id); got {logged[0]!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_confirmable_batch_logs_no_unconfirmable_candidates(self, caplog):
+        """The skip log is scoped to real skips, so it cannot become noise."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=f'tracked: mem0 {self._UUID_3417}',
+        ))
+
+        with caplog.at_level(logging.INFO):
+            result = await filter_accounted_cluster_growth_flags(
+                taskmaster, '/df', [flag],
+            )
+
+        assert result == []
+        noise = [
+            r.getMessage() for r in caplog.records
+            if 'unconfirmable_candidates' in r.getMessage()
+        ]
+        assert not noise, (
+            f'no candidate was skipped, so nothing may be logged; got {noise!r}'
+        )

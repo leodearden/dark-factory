@@ -2602,6 +2602,173 @@ class TestBeforeDoneTargetUnitlessDeploy:
         assert 'Baseline inspect failed' in pending[0].summary
         script_runner.assert_not_called()
 
+    async def test_baseline_inspect_spawn_failure_blocks_without_running_deploy(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector OSError on the PRE-DEPLOY baseline leg must
+        be indistinguishable from a wedged inspect once routed into the
+        sentinel — same BLOCKED, same single infra_issue, same untouched
+        deploy.
+
+        Injected through the documented ``unit_inspector`` seam, so (like the
+        crash-window leg) this is un-GREENable by the source-level guard
+        alone. RED today: the OSError propagates out of
+        ``deterministic_runner.py::DeterministicRunner.run``'s pre-deploy
+        baseline capture, BEFORE the task-2091
+        ``if not baseline.get('ActiveState')`` gate can fire — so the deploy
+        is not attempted, but neither is the escalation filed, and the task is
+        left neither done nor cleanly blocked.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2635', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2635', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        # Reviewer amendment: the sentinel renders identically for EMFILE, a
+        # missing `systemctl` and a hung systemd — three failures needing three
+        # different operator responses — so the detail must NAME the real cause
+        # rather than stranding it in the journal (INV-2
+        # structured-facts-at-failure).
+        detail = pending[0].detail
+        assert 'Cause:' in detail, (
+            f'the escalation must name the underlying inspect failure: {detail!r}'
+        )
+        assert 'Too many open files' in detail, (
+            f'the EMFILE root cause must survive into the escalation the '
+            f'operator reads: {detail!r}'
+        )
+        # before_done_ran_at is already stamped (I1 once-only), so the deploy
+        # must NOT be attempted against a baseline that was never established.
+        script_runner.assert_not_called()
+
+    async def test_verify_inspect_spawn_failure_blames_verify_not_run_fn(
+        self, tmp_path: Path,
+    ):
+        """Task 4157 (reviewer amendment): an inspector OSError on the
+        POST-DEPLOY verify leg must be reported as a verify failure, not as a
+        deploy-script failure.
+
+        The third ``inspect_fn`` call site lives in ``_capturing_inspector``,
+        which ``RestartPlan.execute()`` awaits after a successful deploy.
+        ``run()``'s contract was never at risk there — ``plan.execute()``'s
+        broad ``except Exception`` catches it — but that handler files
+        ``'Deploy run_fn failed (unexpected error)'``, blaming the deploy
+        script for a systemd-inspect failure (INV-2
+        ``block-report-misattribution``). Routing this leg through
+        ``_inspect_unit_guarded`` degrades it to the sentinel, which the verify
+        leg's own ``pid > 0`` check rejects — landing it as VERIFY_FAILED, the
+        SAME disposition the default inspector already produces for this
+        failure (``systemd_inspect`` swallows the OSError into the sentinel
+        before it can ever be raised). With the seam injected, the two paths
+        now agree.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        target_unit = 'orchestrator-reify.service'
+        task = _deploy_task(task_id='2636', target_unit=target_unit)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        # Baseline inspect succeeds; the deploy runs; the VERIFY re-inspect is
+        # the one that fails to spawn.
+        unit_inspector = AsyncMock(side_effect=[
+            _BASELINE_UNIT_STATE,
+            OSError(errno.EMFILE, 'Too many open files'),
+        ])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2636', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue'
+        assert esc.summary == f'Deploy verify failed: {target_unit}', (
+            f'an inspect failure must not be misattributed to the deploy '
+            f'script ("Deploy run_fn failed (unexpected error)"): {esc.summary!r}'
+        )
+        assert 'Cause:' in esc.detail, (
+            f'the escalation must name the underlying inspect failure: {esc.detail!r}'
+        )
+        assert 'Too many open files' in esc.detail, (
+            f'the EMFILE root cause must survive into the escalation the '
+            f'operator reads: {esc.detail!r}'
+        )
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'an unverified deploy must NOT drive to done'
+
+    async def test_verify_inspect_non_oserror_still_reaches_the_catch_all(
+        self, tmp_path: Path,
+    ):
+        """Pins the narrowness of the verify-leg guard.
+
+        Only ``OSError`` degrades to the sentinel; anything else still
+        propagates out of ``_capturing_inspector`` into ``plan.execute()``'s
+        pre-existing broad handler, so the guard cannot quietly become a
+        blanket ``except Exception`` on this leg either. ``run()`` still
+        returns BLOCKED (that handler is fail-closed) — the point is that the
+        exception was NOT swallowed into a sentinel.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        target_unit = 'orchestrator-reify.service'
+        task = _deploy_task(task_id='2637', target_unit=target_unit)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(side_effect=[
+            _BASELINE_UNIT_STATE,
+            RuntimeError('not an OSError — must stay loud'),
+        ])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2637', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert 'not an OSError' in pending[0].detail, (
+            f'a non-OSError must reach the catch-all with its own repr intact, '
+            f'not be degraded to the sentinel: {pending[0].detail!r}'
+        )
+
     async def test_named_target_happy_path_still_double_inspects_and_drives_done(
         self, tmp_path: Path,
     ):
@@ -4370,6 +4537,54 @@ class TestInspectUnitTimeoutHardening:
             'the verify-leg inspect is ever invoked'
         )
 
+    async def test_spawn_failure_baseline_inspect_blocks_without_running_deploy(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector SPAWN failure must fail closed exactly like
+        a wedged inspect — end-to-end through the REAL (non-injected) inspector.
+
+        ``unit_inspector`` is deliberately left unset so
+        ``_default_inspect_unit`` -> ``systemd_inspect.inspect_systemd_unit``
+        executes for real; that is what proves the source-level guard reaches
+        production rather than only the constructor seam that the
+        runner-level tests inject through. RED today: the raw ``OSError``
+        propagates straight out of ``run()``, so the task-2091 ActiveState
+        gate never fires and the operator never sees the infra_issue.
+        """
+        import errno
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4157', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            script_runner=script_runner,
+        )
+
+        with patch(
+            'asyncio.create_subprocess_exec',
+            AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files')),
+        ):
+            # Hang tripwire: fail loudly rather than stalling the suite.
+            outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4157', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        # The deploy must NOT be attempted on an untrusted baseline
+        # (before_done_ran_at is already stamped; I1 once-only).
+        script_runner.assert_not_called()
+
     async def test_baseline_inspect_fail_advances_deploy_state_phase_ran_to_escalated(
         self, tmp_path: Path,
     ):
@@ -4451,8 +4666,27 @@ class TestDefaultInspectUnitDelegatesToModule:
             result = await runner._default_inspect_unit('orchestrator-reify.service')
 
         assert result == {'MainPID': 999, 'ActiveState': 'active'}
+        # Task 4157 (reviewer amendment): the delegate now forwards a THIRD
+        # seam — the optional `degradation_sink` out-dict that lets the caller
+        # recover WHICH degradation produced the (byte-identical) sentinel.
+        # Absent one, it forwards None, so the pre-4157 behaviour is unchanged.
         mock_inspect.assert_awaited_once_with(
             'orchestrator-reify.service', timeout_secs=7.0, reap_grace_secs=3.0,
+            degradation_sink=None,
+        )
+
+        # ...and a supplied sink must reach the module function itself, not be
+        # dropped by the delegate — the whole cause-reporting chain hangs off
+        # this one hop.
+        sink: dict = {}
+        mock_inspect.reset_mock()
+        with patch('orchestrator.deterministic_runner.inspect_systemd_unit', mock_inspect):
+            await runner._default_inspect_unit(
+                'orchestrator-reify.service', degradation_sink=sink,
+            )
+        mock_inspect.assert_awaited_once_with(
+            'orchestrator-reify.service', timeout_secs=7.0, reap_grace_secs=3.0,
+            degradation_sink=sink,
         )
 
 
@@ -5998,6 +6232,113 @@ class TestCrashWindowReverify:
         assert 'MainPID' in detail, (
             f'detail must record the re-inspected live unit state: {detail!r}'
         )
+
+    async def test_reverify_inspect_spawn_failure_escalates_instead_of_raising(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector OSError on the crash-window re-verify leg
+        must route into the crash-window escalation, not escape ``run()``.
+
+        Injected through the DOCUMENTED constructor seam — ``inspect_fn``
+        resolves to ``self._unit_inspector or self._default_inspect_unit``, so
+        the source-level guard in ``systemd_inspect`` (which the injected mock
+        never reaches) cannot discharge ``run()``'s own "always returns
+        BLOCKED, never a raw exception" contract. RED today: the OSError
+        propagates straight out of
+        ``deterministic_runner.py::DeterministicRunner.run``'s crash-window
+        re-verify leg, bypassing the escalation entirely.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='904',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no prior escalation
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('904', status='pending')
+        assert len(pending) == 1, (
+            f'a failed re-verify must still escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'a failed re-verify must NOT drive to done'
+        script_runner.assert_not_awaited()
+        # The failure must route THROUGH the sentinel into
+        # _deterministic_deploy_health_verdict (which returns 'unconfirmed'
+        # for it) rather than skipping the re-verify branch — the enriched
+        # reverify_note is the observable proof it did.
+        detail = pending[0].detail
+        assert 'unconfirmed' in detail, (
+            f'detail must record that the re-verify came back unconfirmed: {detail!r}'
+        )
+        assert 'MainPID' in detail, (
+            f'detail must record the observed (sentinel) unit state: {detail!r}'
+        )
+        # Reviewer amendment: that observed state IS the sentinel, which is
+        # identical for every degradation mode — the real cause must travel
+        # with it instead of being left in the journal (INV-2).
+        assert 'Cause:' in detail, (
+            f'the escalation must name the underlying inspect failure: {detail!r}'
+        )
+        assert 'Too many open files' in detail, (
+            f'the EMFILE root cause must survive into the escalation the '
+            f'operator reads: {detail!r}'
+        )
+
+    async def test_reverify_inspect_non_oserror_still_propagates(self, tmp_path: Path):
+        """Pins the NARROWNESS of the step-4 call-site guard.
+
+        ``run()`` deliberately raises ``ValueError`` (the only entry in its
+        documented ``Raises:`` section) and ``NotImplementedError`` (the "gate
+        resolved but before_done_ran_at is not set" operator guard). A guard
+        widened to a bare ``except Exception`` would swallow those into a
+        silent BLOCKED escalation — inverting this repo's
+        loud-over-silent-degradation norm — so a non-OSError inspector failure
+        must keep propagating.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='905',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=RuntimeError('not an OSError — must stay loud'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        with pytest.raises(RuntimeError, match='must stay loud'):
+            await runner.run(assignment)
 
     async def test_no_baseline_crash_window_does_not_reinspect(self, tmp_path: Path):
         """Pre-ζ shape (no deploy_state at all): the persisted-baseline gate

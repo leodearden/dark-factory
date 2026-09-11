@@ -1403,7 +1403,13 @@ class TestOrchestratorConfigSccache:
         config = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
         assert config.effective_verify_env == config.verify_env
 
-    def test_effective_verify_env_merges_sccache_backend(self):
+    def test_effective_verify_env_merges_sccache_backend(self, monkeypatch, tmp_path):
+        # Isolate from the ambient dark-factory-orchestrator.yaml, which the
+        # autouse _isolate_orch_config fixture pins ORCH_CONFIG_PATH at: its
+        # verify_env block merges into any bare OrchestratorConfig and would
+        # add keys the exact-equality assertion below does not expect.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig(
             verify_env={'RUSTC_WRAPPER': 'sccache'},
             sccache=SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://h:6379'}),
@@ -3145,7 +3151,7 @@ class TestOrchestratorConfigPrices:
     _MODEL_COSTS).
     """
 
-    _SEED_KEYS = {'gpt-5.4', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
+    _SEED_KEYS = {'gpt-5.4', 'gpt-6-astra', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
 
     def test_prices_seeded_with_expected_rates(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -3154,6 +3160,8 @@ class TestOrchestratorConfigPrices:
         assert set(config.prices) == self._SEED_KEYS
         assert config.prices['gpt-5.4'].input_per_1m == 2.50
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
+        assert config.prices['gpt-6-astra'].input_per_1m == 10.00
+        assert config.prices['gpt-6-astra'].output_per_1m == 50.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25

@@ -48,6 +48,16 @@ Nothing enforces this mechanically, by choice — see `CONTRIBUTING.md` §2
 (esc-3815-7).
 <!-- line-pin-policy:end -->
 
+## Code quality
+
+`docs/code-quality.md` is the single normative definition of code quality
+for this repo and for every project the factory operates: quality is the
+cost and risk of the next change, and here the next change is made by an
+agent; fourteen named heuristics with their agreed readings; comments as a
+clarity smell; tests reaching a module's internals as an interface smell.
+Review, refactor and PRD work cite those heuristics by name from that file.
+Do not restate them elsewhere (INV-9). The `CONTRIBUTING.md` §4 gates are
+the floor, not the bar.
 
 ## Prerequisites
 
