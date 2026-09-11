@@ -82,6 +82,42 @@ def task_with_proposal() -> dict:
         },
     }
 
+@pytest.fixture
+def task_with_delivered_checks() -> dict:
+    """Task fixture carrying a two-entry ``metadata.delivered_checks`` list.
+
+    Shared by the unit and integration layers of
+    ``TestDeliveredChecksReachDispatchedRoles`` so the sample descriptor list
+    lives in one place. The grep entry copies the key set the gate's own suites
+    already exercise (``test_delivered_check_gate_e2e.py``,
+    ``test_delivered_check_gate.py``) so the renderer and the runner cannot
+    drift into describing different dicts.
+    """
+    return {
+        'id': '5359',
+        'title': 'Task declaring a capability',
+        'description': 'Deliver the capability its gate names.',
+        'metadata': {
+            'files': ['orchestrator'],
+            'delivered_checks': [
+                {
+                    'name': 'gate-renders-in-briefing',
+                    'kind': 'grep',
+                    'pattern': '_format_delivered_checks',
+                    'expect': 'present',
+                    'paths': ['orchestrator'],
+                },
+                {
+                    'name': 'gate-predicate-runs',
+                    'kind': 'script',
+                    'script': 'scripts/check_gate.py',
+                    'args': ['--strict'],
+                    'timeout_secs': 60,
+                },
+            ],
+        },
+    }
+
 
 class TestFormatTaskMetadataInvariant:
     def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
@@ -341,6 +377,97 @@ class TestFormatDeliveredChecksDegradesSafely:
         out = _format_delivered_checks(checks)
         assert len(self._bullets(out)) == DELIVERED_CHECK_BULLET_LIMIT
         assert '…and' not in out
+
+GATE_HEADING = '## Declared Capability Gate'
+
+
+class TestDeliveredChecksReachDispatchedRoles:
+    """The defect this task exists to fix: ``metadata.delivered_checks`` gates
+    the task's OWN mark-done
+    (``orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks``)
+    yet reached no dispatched role, so the agent was measured against a contract
+    it could not see.
+
+    Two layers, mirroring ``TestFormatTaskIncludeFiles`` (unit) and
+    ``TestAntiAnchorFirstDerivation`` (integration). The integration layer
+    passes ``context=''`` exactly as that class does, so no fused-memory call
+    is attempted. ``pytest.mark.asyncio`` is applied per-method rather than to
+    the class: the plugin's strict mode errors on a sync test carrying the mark,
+    and both layers belong in one class.
+    """
+
+    @staticmethod
+    def _assert_gate_delivered(text: str) -> None:
+        assert GATE_HEADING in text
+        assert 'gate-renders-in-briefing' in text
+        assert 'gate-predicate-runs' in text
+        # Positive-directive form: the anti-gaming prose necessarily contains
+        # the words it warns about, so assert what it tells the agent to DO.
+        assert 'Deliver the BEHAVIOUR' in text
+        assert 'is a defect, not a pass' in text
+
+    def test_format_task_renders_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        self._assert_gate_delivered(briefing._format_task(task_with_delivered_checks))
+
+    def test_task_without_delivered_checks_renders_no_gate(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """The common path is unchanged — no section, no header."""
+        assert GATE_HEADING not in briefing._format_task(anti_anchor_task)
+
+    def test_metadata_explicitly_none_does_not_raise(
+        self, briefing: BriefingAssembler,
+    ):
+        """``metadata: None`` reaches ``_format_task`` from callers that never
+        went through ``Scheduler._normalize_task_metadata`` (the eval runner
+        and the CLI pass a raw ``task_definition``).
+        """
+        out = briefing._format_task({'id': '7', 'title': 'None metadata', 'metadata': None})
+        assert '**ID:** 7' in out
+        assert GATE_HEADING not in out
+
+    def test_include_files_false_keeps_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        """C-A1 suppresses the queue-time ``metadata.files`` GUESS only — never
+        the authored acceptance contract the architect is measured against.
+        """
+        out = briefing._format_task(task_with_delivered_checks, include_files=False)
+        assert '**Files:**' not in out
+        self._assert_gate_delivered(out)
+
+    def test_gate_survives_the_json_fallback(self, briefing: BriefingAssembler):
+        """A task with no recognised top-level field falls through to
+        ``json.dumps``; the gate section must not be lost on that path.
+        """
+        out = briefing._format_task(
+            {'metadata': {'delivered_checks': [
+                {'name': 'lonely-cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+            ]}},
+        )
+        assert GATE_HEADING in out
+        assert 'lonely-cap' in out
+
+    @pytest.mark.asyncio
+    async def test_architect_prompt_carries_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        prompt = await briefing.build_architect_prompt(
+            task_with_delivered_checks, worktree=None, context='',
+        )
+        self._assert_gate_delivered(prompt)
+
+    @pytest.mark.asyncio
+    async def test_simple_task_prompt_carries_the_gate(
+        self, briefing: BriefingAssembler, task_with_delivered_checks: dict,
+    ):
+        """The role with no architect between it and the gate."""
+        prompt = await briefing.build_simple_task_prompt(
+            task_with_delivered_checks, worktree=None, context='',
+        )
+        self._assert_gate_delivered(prompt)
 
 @pytest.mark.asyncio
 class TestBuildPlanTighteningPrompt:

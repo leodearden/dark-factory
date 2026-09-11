@@ -1817,7 +1817,18 @@ A prior block-time investigation concluded the following; verify against the cur
                 ``build_architect_prompt`` to anti-anchor the first plan
                 derivation (C-A1): the architect must derive its own file
                 footprint rather than echoing the queue-time metadata guess.
+
+        Appends the task's own ``metadata.delivered_checks`` as a capability-gate
+        section via :func:`_format_delivered_checks` (task 5359) — the gate
+        ``orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks``
+        applies to THIS task's mark-done, not only to its dependents, so an agent
+        that cannot see it is measured against a contract it was never shown.
+        Deliberately NOT suppressed by ``include_files=False``: C-A1 hides a
+        queue-time GUESS, whereas this is an authored acceptance contract the
+        first derivation must plan against. The descriptor contract itself lives
+        in ``docs/task-authoring.md`` §3.3 — pointed at, never restated (INV-9).
         """
+        metadata = task.get('metadata') or {}
         lines = []
         if task.get('id'):
             lines.append(f'**ID:** {task["id"]}')
@@ -1827,10 +1838,12 @@ A prior block-time investigation concluded the following; verify against the cur
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
-        if include_files and task.get('metadata', {}).get('files'):
-            lines.append(f'**Files:** {", ".join(task["metadata"]["files"])}')
+        if include_files and metadata.get('files'):
+            lines.append(f'**Files:** {", ".join(metadata["files"])}')
         deps = task.get('dependencies', [])
         if deps:
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
-        return '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        body = '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
+        return f'{body}\n\n{checks_block}' if checks_block else body
