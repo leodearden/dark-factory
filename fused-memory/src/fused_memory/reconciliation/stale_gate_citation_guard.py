@@ -105,8 +105,10 @@ from fused_memory.reconciliation.task_filter import TERMINAL_OUTCOME_RE
 __all__ = [
     'ERROR_TYPE',
     'GATE_CITATION_MARKER',
+    'GATE_CITATION_MARKER_PHRASES',
     'GATE_CITATION_RE',
     'find_gate_citation_ids',
+    'render_gate_citation_section',
     'stale_gate_citation_error',
 ]
 
@@ -131,13 +133,32 @@ ERROR_TYPE = 'ReconStaleGateCitationRejected'
 # Widening the vocabulary trades this guard's only real asset — a
 # zero-false-positive record over the live corpus — for recall the incident
 # does not need.
-GATE_CITATION_MARKER = (
-    r'external\s+dep(?:s|endenc(?:y|ies))?'
-    r'|pending\s+external\s+gates?'
-    r'|external\s+gates?'
-    r'|remediation\s+levers?\s+(?:remains?|are|is)'
-    r'|gating\s+dependenc(?:y|ies)'
+#
+# The vocabulary is ONE table with two views: each human-readable spelling (what
+# render_gate_citation_section() shows a Stage 2 author) paired with the regex
+# arm that matches it (what the write boundary enforces). Both
+# GATE_CITATION_MARKER_PHRASES and GATE_CITATION_MARKER are derived from it, so
+# an arm cannot be policed without the prompt naming it, nor named without being
+# policed — the prompt-vs-rule drift this task exists to fix.
+#
+# The arms carry morphology the plain spellings cannot (singular/plural, and the
+# 'remain/remains/are/is' connector), which is why the table pairs them rather
+# than escaping the phrases mechanically. Arm ORDER is significant: 'pending
+# external gates' precedes 'external gates' so the longer spelling wins where
+# both could match.
+_GATE_CITATION_VOCABULARY: tuple[tuple[str, str], ...] = (
+    ('external deps', r'external\s+dep(?:s|endenc(?:y|ies))?'),
+    ('pending external gates', r'pending\s+external\s+gates?'),
+    ('external gates', r'external\s+gates?'),
+    ('remediation levers remain', r'remediation\s+levers?\s+(?:remains?|are|is)'),
+    ('gating dependencies', r'gating\s+dependenc(?:y|ies)'),
 )
+
+GATE_CITATION_MARKER_PHRASES: tuple[str, ...] = tuple(
+    phrase for phrase, _ in _GATE_CITATION_VOCABULARY
+)
+
+GATE_CITATION_MARKER = '|'.join(arm for _, arm in _GATE_CITATION_VOCABULARY)
 
 # Marker-anchored CONTIGUOUS id-list capture: match a marker, then take only
 # the id list IMMEDIATELY following it, stopping at the first non-list token.
@@ -284,3 +305,41 @@ def stale_gate_citation_error(
             f'3658/3659 have landed").'
         ),
     }
+
+
+def render_gate_citation_section() -> str:
+    """Render the gate-citation mandate for the Stage 2 system prompt, following
+    the ``render_*_section()`` style used throughout ``prompts/stage2.py``.
+
+    :data:`ERROR_TYPE` and :data:`GATE_CITATION_MARKER_PHRASES` are interpolated
+    rather than restated, so the rule the prompt states and the rule
+    :func:`stale_gate_citation_error` enforces are one thing.
+    """
+    phrases = ', '.join(f'"{p}"' for p in GATE_CITATION_MARKER_PHRASES)
+    return (
+        '## Pending External Gates Must Be Re-Derived, Never Copied Forward\n'
+        "When you append an evidence relay to a task's `details`, RE-DERIVE any "
+        'list of pending external gates from that task\'s live `dependencies` '
+        'array as read THIS cycle. Never carry a gate list forward from earlier '
+        'relay prose already in the same field — that field is append-only, so '
+        'the text you are reading above your own append may predate several '
+        'dependency changes.\n\n'
+        f'POLICED PHRASINGS: {phrases}. An id list immediately following any of '
+        'these reads as an assertion that those ids are gating the task NOW, and '
+        'every id in it must be an element of the live `dependencies` array.\n\n'
+        f'IF IT IS NOT, the write is rejected at the boundary with '
+        f'`{ERROR_TYPE}` — the write does not land. The rejection carries both '
+        'the stale ids and the full live `dependencies` array, so correct the '
+        'sentence in place and retry in the same turn; you do NOT need another '
+        'read to find out what the live gates are.\n\n'
+        'MENTIONING A SUPERSEDED ID IS STILL FINE, outside a gate assertion. '
+        'State it historically ("3660 was coalesced into 4856") or as a '
+        'completed outcome ("external deps 3658/3659 have landed") rather than '
+        'as a live gate.\n\n'
+        'WHY: task 3708\'s relay named 3660 as its remaining blocker for three '
+        'consecutive cycles after 3660 had been coalesced into 4856, because '
+        'each cycle copied the gate list from the previous relay instead of from '
+        'the dependency array. Re-reading the task is not enough on its own — '
+        'the relay that introduced the error was written by an agent that had '
+        'read the live task in that same cycle (task 4919).'
+    )

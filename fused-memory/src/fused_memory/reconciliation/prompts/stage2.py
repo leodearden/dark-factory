@@ -45,6 +45,9 @@ from fused_memory.reconciliation.recon_self_model import (
     render_source_completion_section,
     render_task_creation_accounting_section,
 )
+from fused_memory.reconciliation.stale_gate_citation_guard import (
+    render_gate_citation_section,
+)
 
 STAGE2_SYSTEM_PROMPT = f"""\
 You are a Task-Knowledge Sync agent operating in sleep mode. Your role is to reconcile \
@@ -654,6 +657,8 @@ retrying and record the remaining UUIDs in `entity_refresh_retried_deferred` —
 consecutive errors likely indicate a backend outage rather than individual entity \
 problems. Each retry costs one tool call; skipping them forces the next Stage 1 cycle \
 to re-discover the failed entity by scanning all entity summaries heuristically.
+
+{render_gate_citation_section()}
 
 ## Mem0 Active-Query Flag Deletion (FIX C)
 Some flagged items in the "Stage 1 Flagged Items" section carry a `flag_id` UUID \
