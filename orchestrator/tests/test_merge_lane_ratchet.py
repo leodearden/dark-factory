@@ -1243,6 +1243,9 @@ def _synthetic_report() -> dict:
         'enumeration': {
             'requested': ['a.py', 'b.py'],
             'resolved': ['a.py', 'b.py'],
+            # The LIVE shape: the test-tree half is two counts, and it is the one
+            # key render_baseline drops on the way to the committed file.
+            'test_tree': {'requested': 9, 'resolved': 2},
             'unreadable': [],
             'complete': True,
         },
@@ -1581,81 +1584,107 @@ class TestTestTreeSweep:
 # parallel gamma branches rebase without conflicting.
 
 
-class TestLaneScopedEnumeration:
-    """The stored `requested` list is lane-scoped, so non-lane churn is inert.
+class TestStoredEnumerationIsChurnFree:
+    """The committed enumeration moves on lane churn ONLY, never on test-tree churn.
 
     esc-5021-7: freezing all 583 orchestrator/tests paths made ANY unrelated
-    test-file addition redden test_baseline_matches_a_fresh_measurement.
+    test-file addition redden test_baseline_matches_a_fresh_measurement, and the
+    message it printed ("Regenerate it in this commit if you lowered a measure")
+    invited a blind regeneration of a baseline that task had never inspected --
+    exactly the silent widening BASELINE_README exists to prevent. Observed live:
+    test_roles_error_remedy_hint.py arriving via rebase (task 4964) produced a
+    one-line baseline diff and a red gate.
+
+    The counts alternative is provably worse, which is why the numbers are not
+    stored either: a shared count line is the shape this PRD's decompose-time
+    constraint already rejected for `totals` ("would conflict on every one of ten
+    rebases"), and a guaranteed one-line conflict beats a probabilistic
+    multi-line one only in the wrong direction.
     """
 
     @staticmethod
-    def _enum(requested: list[str], resolved: list[str], unreadable: list[str]) -> dict:
-        return {
-            'requested': requested,
-            'resolved': resolved,
-            'unreadable': unreadable,
-            'complete': not unreadable,
+    def _report(**enumeration: object) -> dict:
+        report = _synthetic_report()
+        report['enumeration'].update(enumeration)
+        return report
+
+    @staticmethod
+    def _stored(report: dict) -> dict:
+        return json.loads(metrics.render_baseline(report))['enumeration']
+
+    def test_the_stored_key_set_omits_the_test_tree_counts(self) -> None:
+        # No test-tree NUMBER reaches the file, only the cluster half plus
+        # INV-11's two completeness keys.
+        assert set(self._stored(_synthetic_report())) == {
+            'requested',
+            'resolved',
+            'unreadable',
+            'complete',
         }
 
-    def test_a_non_lane_test_file_is_dropped_from_the_stored_list(self) -> None:
-        # THE BUG. A swept-but-never-measured file must not reach the baseline.
-        enum = self._enum(
-            ['orchestrator/tests/test_unrelated.py'], [], []
+    def test_no_test_tree_path_reaches_the_stored_block(self) -> None:
+        # THE BUG, stated over the real measurement rather than a synthetic one:
+        # a swept-but-never-measured file must not reach the baseline, and the
+        # only orchestrator/tests paths left are CLUSTER_PATHS literals.
+        report = self._report(
+            requested=list(metrics.CLUSTER_PATHS),
+            resolved=['orchestrator/tests/conftest.py'],
         )
-        assert metrics._lane_scoped_enumeration(enum)['requested'] == []
-
-    def test_a_lane_importing_test_file_is_kept(self) -> None:
-        # Real lane churn must still move the baseline -- it already moves the
-        # `tests` section, so keeping it adds no new trigger.
-        lane = 'orchestrator/tests/test_merge_queue_x.py'
-        enum = self._enum([lane, 'orchestrator/tests/test_other.py'], [lane], [])
-        assert metrics._lane_scoped_enumeration(enum)['requested'] == [lane]
+        cluster = set(metrics.CLUSTER_PATHS)
+        for key, value in self._stored(report).items():
+            if not isinstance(value, list):
+                continue
+            strays = [
+                entry for entry in value
+                if isinstance(entry, str)
+                and entry.startswith('orchestrator/tests/')
+                and entry not in cluster
+            ]
+            assert strays == [], key
 
     def test_cluster_paths_are_kept_including_the_glob_literals(self) -> None:
         # CLUSTER_PATHS entries are the SPOT record of PRD Appendix A. The glob
-        # LITERALS never appear in `resolved`, so a resolved-only filter would
-        # silently delete them.
+        # LITERALS never appear in `resolved`, so a resolved-only stored list
+        # would silently delete them -- and a glob expanding to zero would stop
+        # being legible in the RESULT.
         globs = [entry for entry in metrics.CLUSTER_PATHS if '*' in entry]
         assert globs, 'expected at least one glob entry in CLUSTER_PATHS'
-        enum = self._enum(list(metrics.CLUSTER_PATHS), [], [])
-        kept = metrics._lane_scoped_enumeration(enum)['requested']
+        report = self._report(requested=list(metrics.CLUSTER_PATHS))
+        kept = self._stored(report)['requested']
         assert kept == list(metrics.CLUSTER_PATHS)
         for glob in globs:
             assert glob in kept
 
     def test_an_unreadable_path_is_kept_so_inv_11_still_reads(self) -> None:
         # INV-11: a partial enumeration must stay distinguishable in the RESULT.
-        # Filtering must never hide the very path that made it partial.
+        # The stored `requested` is the cluster manifest and no longer re-admits
+        # a skipped path, so `unreadable` carries that payload alone -- and it is
+        # a TEST-TREE path here, the half that is otherwise reduced to counts.
         bad = 'orchestrator/tests/test_broken.py'
-        enum = self._enum([bad], [], [bad])
-        narrowed = metrics._lane_scoped_enumeration(enum)
-        assert narrowed['requested'] == [bad]
-        assert narrowed['unreadable'] == [bad]
-        assert narrowed['complete'] is False
+        stored = self._stored(self._report(unreadable=[bad], complete=False))
+        assert stored['unreadable'] == [bad]
+        assert stored['complete'] is False
 
-    def test_filtering_is_idempotent(self) -> None:
+    def test_the_transform_is_idempotent(self) -> None:
         # render_baseline's round-trip contract: regenerating a baseline FROM a
         # baseline must be a no-op, not a second round of deletions.
-        lane = 'orchestrator/tests/test_lane.py'
-        enum = self._enum(
-            [lane, 'orchestrator/tests/test_other.py', *metrics.CLUSTER_PATHS],
-            [lane],
-            [],
-        )
-        once = metrics._lane_scoped_enumeration(enum)
-        assert metrics._lane_scoped_enumeration(once) == once
+        once = self._stored(_synthetic_report())
+        assert metrics._stored_enumeration(once) == once
 
     def test_the_rendered_baseline_is_stable_across_an_unrelated_new_test(
         self,
     ) -> None:
-        # THE REGRESSION, end to end and in the units that bit: adding one
-        # non-lane test file to the sweep must not change a single byte.
+        # THE REGRESSION, end to end and in the units that bit (esc-5021-7):
+        # adding one non-lane test file to the sweep must not change a single
+        # byte. Now STRENGTHENED to both counts, because storing either one would
+        # reintroduce it -- `requested` moves on ANY .py arriving anywhere under
+        # orchestrator/tests, and `resolved` moves whenever a lane-importing one
+        # is added or deleted, which is a shared line every gamma branch rewrites.
         report = _synthetic_report()
         before = metrics.render_baseline(report)
-        report['enumeration']['requested'] = [
-            *report['enumeration']['requested'],
-            'orchestrator/tests/test_roles_error_remedy_hint.py',
-        ]
+        report['enumeration']['test_tree']['requested'] += 1
+        assert metrics.render_baseline(report) == before
+        report['enumeration']['test_tree']['resolved'] += 1
         assert metrics.render_baseline(report) == before
 
 
@@ -1666,6 +1695,11 @@ class TestRenderBaseline:
         report = _synthetic_report()
         loaded = json.loads(metrics.render_baseline(report))
         assert loaded.pop('_README') == metrics.BASELINE_README
+        # The ONE measure deliberately not stored, popped here the same way
+        # _README is: the test-tree denominator is reported by --report, never
+        # ratcheted, so freezing it would churn the file on every unrelated test
+        # file the repo gains. Everything else must survive verbatim.
+        assert report['enumeration'].pop('test_tree') == {'requested': 9, 'resolved': 2}
         assert loaded == report
 
     def test_every_per_path_entry_occupies_exactly_one_line(self) -> None:
@@ -1791,6 +1825,9 @@ def _ratchet_baseline() -> dict:
                 metrics.NEW_FUNCTION_COGNITIVE_CEILING
             ),
         },
+        # REAL-SHAPED means the STORED shape, which has no `test_tree` key: the
+        # test-tree counts are live-only, and this fixture stands in for a
+        # committed baseline that the comparator reads.
         'enumeration': {
             'requested': [_MQ, _GIT_OPS],
             'resolved': [_MQ, _GIT_OPS],
