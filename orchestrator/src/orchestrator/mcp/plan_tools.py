@@ -92,7 +92,11 @@ from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MarkupGuardMiddleware,
+    RepairPolicy,
+    accepts_markup_override,
+)
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator.artifacts import TaskArtifacts
@@ -1751,6 +1755,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     )
 
     @mcp.tool()
+    @accepts_markup_override
     def create_plan(
         task_id: str,
         title: str,
@@ -1776,6 +1781,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _create_plan(artifacts, task_id, title, analysis, files)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_plan_step(
         step_id: str,
         step_type: str,
@@ -1791,6 +1797,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_plan_step(artifacts, step_id, step_type, description)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_prerequisite(
         prereq_id: str,
         description: str,
@@ -1806,6 +1813,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_prerequisite(artifacts, prereq_id, description)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_design_decision(
         decision: str,
         rationale: str,
@@ -1819,6 +1827,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_design_decision(artifacts, decision, rationale)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_reuse_item(
         what: str,
         where: str,
@@ -1834,6 +1843,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_reuse_item(artifacts, what, where, how)
 
     @mcp.tool()
+    @accepts_markup_override
     def mark_step_done(
         step_id: str,
         commit_sha: str,
@@ -1851,6 +1861,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _mark_step_done(artifacts, step_id, commit_sha)
 
     @mcp.tool()
+    @accepts_markup_override
     def mark_step_committed(
         step_id: str,
         sha: str,
@@ -1882,6 +1893,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     # --- Revalidation tools ---
 
     @mcp.tool()
+    @accepts_markup_override
     def update_plan_metadata(
         files: list[str] | str | None = None,
         analysis: str | None = None,
@@ -1903,6 +1915,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _update_plan_metadata(artifacts, files, analysis)
 
     @mcp.tool()
+    @accepts_markup_override
     def remove_plan_step(
         step_id: str,
     ) -> dict[str, Any]:
@@ -1917,6 +1930,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _remove_plan_step(artifacts, step_id)
 
     @mcp.tool()
+    @accepts_markup_override
     def replace_plan_step(
         step_id: str,
         step_type: str,
@@ -1936,6 +1950,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _replace_plan_step(artifacts, step_id, step_type, description)
 
     @mcp.tool()
+    @accepts_markup_override
     def confirm_plan() -> dict[str, Any]:
         """Mark the plan COMPLETE. Call this as your final plan-tools action.
 
@@ -1954,6 +1969,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _confirm_plan(artifacts)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_blocking_dependency(
         depends_on_task_id: str,
         reason: str,
@@ -1988,6 +2004,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         )
 
     @mcp.tool()
+    @accepts_markup_override
     def report_task_already_done(
         commit: str,
         evidence: str,
@@ -2015,6 +2032,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_task_already_done(artifacts, commit, evidence)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_ready_to_merge(
         commit: str,
         evidence: str,
@@ -2058,6 +2076,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_ready_to_merge(artifacts, commit, evidence)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_unactionable_task(
         reason: str,
         evidence: str,
@@ -2084,6 +2103,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_unactionable_task(artifacts, reason, evidence)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_false_premise(
         classification: str,
         premise: str,

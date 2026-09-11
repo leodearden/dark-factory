@@ -101,6 +101,7 @@ the consumers that never touch the middleware.
 from __future__ import annotations
 
 import enum
+import functools
 import inspect
 import json
 import logging
@@ -1613,3 +1614,101 @@ class MarkupGuardMiddleware(Middleware):
             structured_content=result.structured_content,
             meta=meta,
         )
+
+
+# ---------------------------------------------------------------------------
+# The REGISTRATION-side half of the hatch: DECLARING ``metadata`` (task 5283).
+# ---------------------------------------------------------------------------
+
+
+#: The parameter a decorated tool advertises. Keyword-only and defaulted, so it
+#: lands in ``properties`` and never in ``required``; ``dict | None`` so the
+#: schema accepts the flag map or nothing at all.
+_OVERRIDE_PARAMETER = inspect.Parameter(
+    'metadata',
+    inspect.Parameter.KEYWORD_ONLY,
+    default=None,
+    annotation=dict[str, Any] | None,
+)
+
+
+def _swallowing_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """*fn* plus a swallowed ``metadata`` keyword. The sync half of the pair."""
+    @functools.wraps(fn)
+    def wrapper(*args: Any, metadata: Any = None, **kwargs: Any) -> Any:
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _async_swallowing_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """The same for a coroutine function, which must be AWAITED, not returned.
+
+    A sync wrapper here would hand FastMCP an un-awaited coroutine as the
+    tool's result — a silent wrong value rather than a failure.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, metadata: Any = None, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    return wrapper
+
+
+def accepts_markup_override(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Declare ``metadata`` on *fn* so the deliberate-quoting hatch is LEGAL.
+
+    :data:`_OVERRIDE_SENTENCE` tells a bounced caller to resubmit with
+    ``metadata={'`` + :data:`~shared.toolcall_markup.MARKUP_OVERRIDE_KEY` +
+    ``': True}``. A tool that does not DECLARE ``metadata`` advertises
+    ``additionalProperties: false`` over exactly its own parameters, so that
+    remediation is not part of its contract at all — it worked only because
+    ``claude`` CLI 2.1.250 transmits the undeclared argument anyway (measured
+    2026-08-28 on a transparent stdio JSON-RPC tee proxy, task 4817 /
+    esc-4817-1). A stricter client is entitled to refuse to send it, which
+    would leave a caller bounced with a hint it cannot act on. Decorating is
+    how a server makes the hatch a contract instead of a client accident.
+
+    ONE DECLARATION, ONE CONSUMPTION POINT. The parameter is spelled here and
+    only here, rather than edited into each tool's signature — twenty copies of
+    a declaration nobody's body reads is the lock-step duplication INV-5 exists
+    to end, and it would leave twenty places for a future tool to be born
+    without it. The argument is swallowed HERE too, so no tool body can
+    persist it: "the flag is never written" is structural rather than a promise
+    repeated at every registration site.
+
+    SUBSTRATE, MEASURED IN THIS WORKTREE (fastmcp 3.2.2, CPython 3.13.9) — the
+    PRD's section 6 table has been wrong about this library before, so this is
+    recorded the way :meth:`MarkupGuardMiddleware._schema_properties` records
+    its own two facts:
+
+    1. FastMCP builds ``inputSchema`` from ``__signature__``, so appending a
+       parameter there is enough — the function's own parameter list is never
+       re-read. A ``tools/list`` round-trip through an in-process ``Client``
+       advertises ``"metadata": {"anyOf": [{"additionalProperties": true,
+       "type": "object"}, {"type": "null"}], "default": null}``, with the
+       tool's own ``required`` list and its ``additionalProperties: false``
+       both preserved.
+    2. Calls WITH and WITHOUT the argument both succeed, and the wrapped body
+       never sees it.
+    3. An ``async def`` tool is supported: FastMCP awaits the coroutine the
+       async wrapper returns, exactly as it awaits the undecorated tool. The
+       branch matters — a sync wrapper around a coroutine function would hand
+       FastMCP an un-awaited coroutine as the tool's result.
+    """
+    wrapper = (
+        _async_swallowing_wrapper(fn)
+        if inspect.iscoroutinefunction(fn)
+        else _swallowing_wrapper(fn)
+    )
+    signature = inspect.signature(fn)
+    # A NEW annotations dict, never a mutation: ``functools.wraps`` copies the
+    # wrapped function's own ``__annotations__`` BY REFERENCE, so updating it
+    # in place would edit the undecorated function too.
+    wrapper.__annotations__ = {
+        **getattr(fn, '__annotations__', {}),
+        'metadata': _OVERRIDE_PARAMETER.annotation,
+    }
+    wrapper.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[*signature.parameters.values(), _OVERRIDE_PARAMETER],
+    )
+    return wrapper
