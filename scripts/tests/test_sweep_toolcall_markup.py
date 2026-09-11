@@ -416,7 +416,7 @@ def test_symlinked_plan_fixture_is_an_absolute_symlink(sweep_root):
 
 
 # ---------------------------------------------------------------------------
-# step-1 — discovery. The two pinned path sets, and NOTHING else.
+# step-1 — discovery. The three pinned path sets, and NOTHING else.
 # ---------------------------------------------------------------------------
 
 

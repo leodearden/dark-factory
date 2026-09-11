@@ -235,10 +235,11 @@ def _has_dot_component(relative: Path) -> bool:
 def discover_targets(root: Path | str) -> list[Target]:
     """Every sweepable file under *root*, sorted, deterministic.
 
-    Returns the union of the two pinned path sets described in the module
+    Returns the union of the three pinned path sets described in the module
     docstring. An absent lane directory yields nothing rather than raising:
     ``.worktrees-orphaned`` only exists once the reclaim timer has rotated at
-    least one lane, so a fresh checkout legitimately has neither.
+    least one lane and ``.worktrees/.task-meta`` only once a lane has been
+    provisioned, so a fresh checkout legitimately has none of the three.
 
     Dot-prefixed files under ``data/escalations`` are EXCLUDED, explicitly.
     ``data/escalations/.watch-fire.json`` carries a full escalation-record
