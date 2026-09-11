@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -158,3 +159,53 @@ def scan_merge_rr(*, git_dir: Path, common_dir: Path) -> MergeRrScan:
         dangling=dangling,
         unparsable=parsed.unparsable,
     )
+
+
+#: Backup names are ``MERGE_RR.quarantined-<stamp>`` plus a counter when a
+#: same-second repeat would collide.  The stamp orders the evidence for a
+#: reader; the counter is what guarantees nothing is ever overwritten.
+_QUARANTINE_STAMP = '%Y%m%dT%H%M%S'
+
+
+def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
+    """Move a suspect MERGE_RR aside and return the backup path.
+
+    A no-op returning ``None`` unless the scan is suspect: a healthy MERGE_RR
+    is left exactly where git put it, untouched.
+
+    The file is MOVED rather than deleted because it is the only record of
+    which conflict ids the wedged worktree was carrying, and the abort that
+    follows would otherwise destroy it — a successful ``git rebase --abort``
+    deletes MERGE_RR outright.  Backup names never collide, so a worktree that
+    wedges twice keeps both wedges' evidence rather than overwriting the first
+    with the second.
+
+    Logs at WARNING naming the dangling ids and the backup path: a repair that
+    happens silently is indistinguishable from a repair that never ran.
+    """
+    if not scan.suspect:
+        return None
+
+    backup = _free_backup_path(scan.merge_rr_path)
+    scan.merge_rr_path.rename(backup)
+    logger.warning(
+        'Quarantined suspect MERGE_RR to %s — dangling rr-cache refs: [%s]; '
+        'unparsable records: %d. Evidence preserved; the abort that follows '
+        'would have deleted it.',
+        backup,
+        ', '.join(record.conflict_id for record in scan.dangling),
+        len(scan.unparsable),
+    )
+    return backup
+
+
+def _free_backup_path(merge_rr_path: Path) -> Path:
+    """First unused ``MERGE_RR.quarantined-<stamp>[-<n>]`` beside the original."""
+    stamp = datetime.now(UTC).strftime(_QUARANTINE_STAMP)
+    base = merge_rr_path.with_name(f'{merge_rr_path.name}.quarantined-{stamp}')
+    if not base.exists():
+        return base
+    counter = 2
+    while (candidate := Path(f'{base}-{counter}')).exists():
+        counter += 1
+    return candidate
