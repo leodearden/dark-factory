@@ -1827,6 +1827,193 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 5279 W2: a REJECT verdict that resolves to no pending candidate must
+# name itself.
+#
+# Post-4144 `_find_pending_candidate_id` returning None is a NORMAL outcome:
+# when a re-mined title's only same-title candidate is already adjudicated,
+# `codebook.apply_coding_record` deliberately declines to fabricate a pending
+# twin (codebook.py:429-455 -- fabricating one is how rejected
+# cand-20260722-28 came back as pending cand-20260724-2 in the live codebook).
+# The prior verdict standing is CORRECT. The defect is the silence: the
+# `for cluster in rejected:` loop's implicit else discarded a verdict this run
+# PAID a Sonnet call for and said nothing.
+#
+# Seeding an already-adjudicated same-title candidate is sufficient to drive
+# that None through the REAL merge path, so these tests need no hand-built
+# codebook state the merger would never produce.
+# ---------------------------------------------------------------------------
+
+_REJECTED_TITLE = "Spurious pattern"
+"""The title `_happy_invoke_response`'s "novel-rejected" digest proposes, so a
+seeded same-title candidate collides with this run's own mining record."""
+
+
+def _codebook_with_adjudicated_candidate(disposition, *, promoted_to=None, extra_entry=None):
+    """A valid v2 codebook whose only `_REJECTED_TITLE` candidate is ALREADY
+    adjudicated -- the state that makes the merger decline to create a pending
+    twin. `first_seen`/`disposition` are `_CANDIDATE_SCHEMA`-REQUIRED
+    (codebook.py:126), which is why the warning under test can always name
+    them without optional-reading `.get` fallbacks."""
+    cb = _minimal_v2_codebook()
+    if extra_entry is not None:
+        cb["entries"].append(extra_entry)
+    candidate = {
+        "id": "cand-20260701-7",
+        "title": _REJECTED_TITLE,
+        "first_seen": "2026-07-01",
+        "disposition": disposition,
+        "sightings": [],
+    }
+    if promoted_to is not None:
+        candidate["promoted_to"] = promoted_to
+    cb["candidates"].append(candidate)
+    return cb
+
+
+def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
+    """`run_census` kwargs for a single-cluster run the verifier REJECTS.
+    *overrides* win, so a caller can substitute its own `verify_fn`."""
+    defaults = dict(
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-rejected", "a spurious one-off")]],
+        verify_fn=_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=codebook_dict,
+    )
+    return _run_census_kwargs(tmp_path, **{**defaults, **overrides})
+
+
+def _dropped_verdict_warnings(caplog):
+    """Every WARNING naming `_REJECTED_TITLE` as a dropped reject verdict."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and _REJECTED_TITLE in r.getMessage()
+        and "DROPPED" in r.getMessage()
+    ]
+
+
+def test_run_census_dropped_reject_over_a_promoted_candidate_is_a_contradiction(
+    tmp_path, caplog,
+):
+    """The worse case this workstream exists for: a LIVE codebook entry stands
+    while the census's fresh reject verdict is discarded.
+
+    An operator has to know, because only a hand re-open will change it --
+    nothing in the system reconciles a standing promotion against a later
+    verdict that the title is unfounded."""
+    promoted_entry = {
+        "id": "entry-spurious",
+        "title": _REJECTED_TITLE,
+        "severity": "medium",
+        "status": "open",
+        "origin_phase": "review",
+        "manifested_phase": "merge",
+        "sightings": [],
+    }
+    codebook_dict = _codebook_with_adjudicated_candidate(
+        "promoted", promoted_to="entry-spurious", extra_entry=promoted_entry,
+    )
+    kwargs = _rejected_run_kwargs(tmp_path, codebook_dict)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    messages = _dropped_verdict_warnings(caplog)
+    assert len(messages) == 1, (
+        "exactly one WARNING must name the dropped reject verdict; got: "
+        f"{messages}"
+    )
+    message = messages[0]
+    # All four facts an operator needs to find the standing record by hand.
+    assert _REJECTED_TITLE in message
+    assert "cand-20260701-7" in message
+    assert "promoted" in message
+    assert "2026-07-01" in message
+    # The marker that separates this from the agreement case below. A live
+    # ENTRY standing against a fresh reject is the thing to act on.
+    assert "CONTRADICT" in message.upper()
+
+    # Surfacing the drop must not change what is persisted.
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_run_census_dropped_reject_over_a_rejected_candidate_is_agreement(
+    tmp_path, caplog,
+):
+    """The agreement case: the standing verdict already says rejected, so the
+    fresh one is a genuine no-op and only the paid-for Sonnet call was wasted.
+
+    It still gets a line -- a recurring non-zero count is the cue that a title
+    keeps being re-mined and re-verified against a verdict that will never
+    change -- but it must be DISTINGUISHABLE from the contradiction above, or
+    an operator scanning the journal cannot tell "nothing to do" from "a live
+    entry was just judged unfounded"."""
+    codebook_dict = _codebook_with_adjudicated_candidate("rejected")
+    kwargs = _rejected_run_kwargs(tmp_path, codebook_dict)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    messages = _dropped_verdict_warnings(caplog)
+    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
+    message = messages[0]
+    assert _REJECTED_TITLE in message
+    assert "cand-20260701-7" in message
+    assert "rejected" in message
+    assert "2026-07-01" in message
+    # Asserted as an ABSENCE against the marker the promoted case asserts as a
+    # presence, so the two messages cannot converge on one wording later.
+    assert "CONTRADICT" not in message.upper()
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_run_census_dropped_reject_with_no_standing_candidate_says_so_plainly(
+    tmp_path, caplog,
+):
+    """The stranger case: no same-title candidate exists at all, so there is
+    no standing verdict to explain the drop -- the merge and this run's cluster
+    list disagree about the title. Reached here by a verifier that returns a
+    title the merge never saw.
+
+    The message must say that plainly rather than inventing a standing record;
+    an explanation that is fabricated is worse than an admitted gap."""
+    def verify_fn_inventing_a_title(clusters, *, model):
+        return {
+            "verified": [],
+            "rejected": [{"title": "A title the merge never saw", "sightings": []}],
+            "fixed": [],
+        }
+
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _minimal_v2_codebook(), verify_fn=verify_fn_inventing_a_title,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    messages = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "A title the merge never saw" in r.getMessage()
+        and "DROPPED" in r.getMessage()
+    ]
+    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
+    message = messages[0]
+    assert "no same-title candidate" in message.lower()
+    assert "disagree" in message.lower()
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+# ---------------------------------------------------------------------------
 # task 3291: run_census() must never persist a FABRICATED done-count baseline.
 #
 # This is the test that would have caught the 2026-07-24 regression on the day
