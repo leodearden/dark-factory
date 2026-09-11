@@ -927,6 +927,62 @@ class TestCurateFallbacks:
         assert kwargs['pool_sizes'] == known_pool_sizes
 
 
+class TestUnexpectedExceptionArmReports:
+    """Part A: the catch-all arm around the LLM call must REPORT, not just degrade.
+
+    Its two named siblings (``AllAccountsCappedException``,
+    ``CuratorFailureError``) both route through ``report_failure``. This one
+    logged at WARNING and returned ``action='create'`` — a shape
+    indistinguishable downstream from a healthy create, which is how the
+    2026-08-13 to 08-18 curator outage ran for five days on a
+    ``FileNotFoundError`` for the ``claude`` binary.
+
+    The degradation is NOT the defect: fail-open is the designed behaviour and
+    is asserted here to survive. The silence is the defect.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc',
+        [
+            RuntimeError('llm down'),
+            FileNotFoundError(2, 'No such file or directory', 'claude'),
+        ],
+        ids=['runtime-error', 'binary-missing'],
+    )
+    async def test_catch_all_arm_reports_failure(self, exc):
+        config = _make_config()
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        async def boom(*a, **k):
+            raise exc
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch.object(curator, '_call_llm', side_effect=boom):
+            result = await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
+
+        assert result.action == 'create'
+        assert 'llm-failed' in result.justification
+
+        escalator.report_failure.assert_awaited_once()
+        kwargs = escalator.report_failure.await_args.kwargs
+        assert kwargs['project_id'] == 'p'
+        assert kwargs['project_root'] == '/x'
+        assert kwargs['candidate_title'] == 'T'
+
+        exc_name = type(exc).__name__
+        assert 'unexpected-exception' in kwargs['justification']
+        assert exc_name in kwargs['justification']
+        assert exc_name in kwargs['subtype']
+
+
 class TestCallLlmNeutralCwd:
     """Task 1989: the CLI cwd forwarded for the pure prompt-contained classifier
     call is a neutral scratch dir, decoupled from the filing project's
