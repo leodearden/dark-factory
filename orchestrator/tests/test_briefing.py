@@ -187,6 +187,20 @@ class TestBuildPlanTighteningPrompt:
     feedback_test_assert_negative_directives.md — the prompt itself
     contains the token names it forbids, so a bare ``not in`` would
     self-conflict.
+
+    Assertions here name TOOLS and STRUCTURE, never prose. A test that
+    asserts on a substring of a prompt's wording exercises no runtime
+    behaviour; it only pins prose, which pressures the wording toward
+    whatever passes the assertion rather than toward what is clearest to
+    the reader (the rationale test_roles_ancestry_check.py's module
+    docstring already states). A reworded but still correct prompt must
+    not be able to turn this suite red. The invariants that prose once
+    stood in for are pinned where they are load-bearing instead:
+    TestPlanTighteningPromptToolGrants pins that every tool this prompt
+    names is actually granted, and the reason-required /
+    must-be-declared / never-narrow-to-empty rules are enforced in code
+    and pinned by TestDropPlanFile's refusal tests in
+    test_plan_tools_server.py, where they gate real state.
     """
 
     async def test_mentions_all_three_valid_actions(self, briefing: BriefingAssembler):
@@ -208,30 +222,6 @@ class TestBuildPlanTighteningPrompt:
         prompt = await _build_tightening_prompt(briefing)
         assert 'drop_plan_file' in prompt
 
-    async def test_third_action_names_the_correctly_declared_case(
-        self, briefing: BriefingAssembler,
-    ):
-        """The option must be discoverable by the reasoning that currently
-        steers architects to ``confirm_plan()`` — that dropping a correctly-
-        declared entry would falsify the plan. Naming the tool is not enough
-        if the prompt never names the case it serves."""
-        prompt = await _build_tightening_prompt(briefing)
-        assert 'needed no change' in prompt
-
-    async def test_option_a_no_longer_invites_keeping_flagged_entries(
-        self, briefing: BriefingAssembler,
-    ):
-        """Option (a) used to read "You may keep some flagged entries if you
-        judge them genuinely needed" — an invitation whose consequence is
-        DETERMINISTIC: the gate re-checks and the kept entry re-fires it.
-        Pin the replacement statement of that consequence, positively, rather
-        than asserting the removed sentence is absent."""
-        prompt = await _build_tightening_prompt(briefing)
-        assert 'will re-fire' in prompt
-        # The contract the removed sentence carried is load-bearing and must
-        # survive the rewrite as its own statement.
-        assert "the gate's re-check is the source of truth" in prompt
-
     async def test_option_b_is_scoped_to_genuinely_incomplete_work_and_names_the_alternative(
         self, briefing: BriefingAssembler,
     ):
@@ -243,14 +233,6 @@ class TestBuildPlanTighteningPrompt:
         confirm_para = prompt.split('b. **')[1].split('c. **')[0]
         assert 'genuinely incomplete' in confirm_para
         assert 'drop_plan_file' in confirm_para
-
-    async def test_warns_against_narrowing_to_empty(
-        self, briefing: BriefingAssembler,
-    ):
-        """An empty files list is not a narrowed plan, it is an unchecked one:
-        the gate has nothing left to re-check."""
-        prompt = await _build_tightening_prompt(briefing)
-        assert 'never be narrowed to an empty' in prompt
 
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
         prompt = await _build_tightening_prompt(
