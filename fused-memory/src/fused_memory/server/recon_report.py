@@ -1258,6 +1258,16 @@ class ReconReportState:
         ``flagged_items`` carrying a forward pointer to its replacement, so
         the record of what was believed and then retired survives.
 
+        That is also why the TARGET's owning entry may already be COMPLETED,
+        where :meth:`delete_finding` rejects exactly that case: deleting
+        changes ``len(entry.findings)`` and so corrupts the ``flagged_count``
+        :meth:`complete` has already cached, whereas stamping writes one field
+        and changes no count.  Only the guard on the entry being WRITTEN to
+        (above) applies here.  The asymmetry is deliberate and load-bearing:
+        the only real use of supersession is a later stage retiring an
+        earlier — by then completed — stage's finding, so inheriting
+        delete_finding's guard would make the mechanism dead on arrival.
+
         Re-stamping an already-superseded target moves the pointer FORWARD to
         the newest superseder (logged at INFO when overwriting a non-None
         pointer): the most recent assertion about a claim is the one a reader
@@ -1455,6 +1465,15 @@ class ReconReportState:
         add_finding/set_stat/inc_stat post-completion guard, and protects
         complete()'s cached ``flagged_count``/``stats`` from silent
         corruption.  Retraction is intended for in-progress stages.
+
+        To retire an earlier stage's claim after that stage has closed — the
+        common case, and the one this guard refuses — use
+        :meth:`add_finding`'s ``supersedes`` argument instead (task-4653).
+        It deliberately carries no owning-entry guard because it stamps a
+        field rather than removing a row, so the cached ``flagged_count``
+        this guard protects is unaffected; see add_finding's docstring for
+        the full asymmetry.  Deletion remains the right tool only for
+        retracting a finding filed in error by a stage still in progress.
 
         Removes the finding from ``entry.findings`` and every dedup index
         it may be registered under — ``_run_finding_index``, whichever of
