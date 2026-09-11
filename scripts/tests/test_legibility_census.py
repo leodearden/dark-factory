@@ -1245,10 +1245,16 @@ def _coverage_line(report):
     return coverage_lines[0]
 
 
-def _render(**overrides):
-    # Annotated for the same reason as _run_census_kwargs: a heterogeneous
-    # dict whose inferred value union would otherwise be re-reported once per
-    # union member per render_report parameter.
+def _render_kwargs(**overrides) -> dict[str, Any]:
+    """The flagless `render_report` keyword set, with *overrides* applied.
+
+    Split out of `_render` so the same kwargs can drive BOTH `render_report`
+    and `census_report_sections` -- the pure-join identity is only meaningful
+    when the two views are asked the same question.
+
+    Annotated for the same reason as _run_census_kwargs: a heterogeneous
+    dict whose inferred value union would otherwise be re-reported once per
+    union member per render_report parameter."""
     kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
@@ -1260,7 +1266,11 @@ def _render(**overrides):
         cost_note="cost",
     )
     kwargs.update(overrides)
-    return mod.render_report(**kwargs)
+    return kwargs
+
+
+def _render(**overrides):
+    return mod.render_report(**_render_kwargs(**overrides))
 
 
 def test_render_report_capped_run_names_cap_and_partial_coverage():
@@ -1492,6 +1502,138 @@ def test_render_report_without_dry_run_filed_tasks_section_unchanged():
     none_section = none_filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
     assert "_none filed._" in none_section
     assert "dry-run" not in none_section.lower()
+
+
+# ---------------------------------------------------------------------------
+# task 5279 W3: the report's STRUCTURE is the thing to assert on, not the
+# English inside it.
+#
+# The esc-3208-4 convention (memories 53e61951-0704-4436-94bd-bf12ae66c23b and
+# 538183c6-6a83-44b6-8a2f-290b75a545d6), already shipped in
+# fused-memory/scripts/memory_eval_retrieval_probe.py and
+# memory_eval_staleness_sweep.py: module-level SECTION_* keys, a frozen
+# ReportSection(key, lines) with a .text property, a
+# *_report_sections(...) -> tuple[ReportSection, ...] builder, and a pure
+# join. Prose is the part of this module expected to be reworded; a check
+# keyed on prose constrains wording rather than behaviour, while a check keyed
+# on structure keeps the disclosure guarantees falsifiable -- a section that
+# stops being emitted, is emitted on the wrong run, or lands below the thing
+# it qualifies, fails, and a copy edit does not.
+# ---------------------------------------------------------------------------
+
+def _section_text(sections, key):
+    """The text of the section keyed *key*, or a legible AssertionError.
+
+    Replaces `report.split("## Saturation", 1)[1]`, whose IndexError on an
+    absent section is the illegible failure the convention memory explicitly
+    calls out: it names neither what was looked for nor what was there."""
+    matches = [section for section in sections if section.key == key]
+    assert len(matches) == 1, (
+        f"expected exactly one {key!r} section; keys present: "
+        f"{[section.key for section in sections]}"
+    )
+    return matches[0].text
+
+
+def _section_keys(**overrides):
+    return [section.key for section in mod.census_report_sections(**_render_kwargs(**overrides))]
+
+
+# Every flag combination render_report gates a section on, so no branch can
+# render outside the structure.
+_REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
+    "flagless": {},
+    "forced": {"force": True},
+    "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
+    "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, verified=2, cap=2)},
+    "dry_run_filing": {
+        "filed_task_ids": [],
+        "dry_run": mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
+    },
+}
+
+
+def test_census_report_sections_returns_keyed_sections_of_lines():
+    sections = mod.census_report_sections(**_render_kwargs())
+
+    assert isinstance(sections, tuple)
+    assert sections, "a report always carries at least a header"
+    for section in sections:
+        assert isinstance(section, mod.ReportSection)
+        assert isinstance(section.key, str) and section.key
+        assert isinstance(section.lines, tuple)
+        assert all(isinstance(line, str) for line in section.lines)
+        assert section.text == "\n".join(section.lines)
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_render_report_is_the_pure_join_of_its_sections(case):
+    """THE identity that stops the structural view and the operator's text
+    from drifting: the markdown is a plain concatenation of the sections, so a
+    section present in one view is present in the other by construction.
+
+    Asserted across every gated flag combination -- a branch that rendered
+    outside the structure would pass on the flagless case alone."""
+    kwargs = _render_kwargs(**_REPORT_FLAG_CASES[case])
+
+    assert mod.render_report(**kwargs) == mod.join_report_sections(
+        mod.census_report_sections(**kwargs)
+    )
+
+
+def test_census_report_sections_flagless_key_set_and_order():
+    assert _section_keys() == [
+        mod.SECTION_HEADER,
+        mod.SECTION_SATURATION,
+        mod.SECTION_MATRIX,
+        mod.SECTION_SYNTHESIS,
+        mod.SECTION_FILED_TASKS,
+        mod.SECTION_COST,
+    ]
+
+
+def test_census_report_sections_force_marker_is_gated_and_positioned():
+    """Positioned, not merely present: the marker qualifies the header, so it
+    belongs immediately below it."""
+    assert mod.SECTION_FORCE_MARKER not in _section_keys()
+
+    forced = _section_keys(force=True)
+    assert forced.index(mod.SECTION_FORCE_MARKER) == forced.index(mod.SECTION_HEADER) + 1
+
+
+def test_census_report_sections_verification_is_gated_and_positioned():
+    """The verification section reports what the verify cap deferred, so it
+    belongs between the mining report and the matrix built from what survived
+    -- strictly after SATURATION and strictly before MATRIX."""
+    assert mod.SECTION_VERIFICATION not in _section_keys()
+
+    keys = _section_keys(verify_coverage=mod.VerifyCoverage(novel=5, verified=2, cap=2))
+    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_VERIFICATION)
+    assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_MATRIX)
+
+
+def test_section_text_names_the_key_and_the_keys_present_when_absent():
+    """The helper's own failure mode is part of what this workstream buys: an
+    absent section fails naming what was looked for AND what was there,
+    instead of raising a bare IndexError from a string split."""
+    sections = mod.census_report_sections(**_render_kwargs())
+
+    with pytest.raises(AssertionError) as excinfo:
+        _section_text(sections, mod.SECTION_VERIFICATION)
+
+    message = str(excinfo.value)
+    assert mod.SECTION_VERIFICATION in message
+    assert mod.SECTION_SATURATION in message, "the keys actually present must be named"
+
+
+def test_census_report_sections_joined_are_byte_identical_to_the_golden():
+    """The whole-artifact lock, read through the new structure, so the two
+    views cannot drift: whatever
+    test_render_report_flagless_output_is_byte_identical_golden pins for the
+    prose, this pins for the partition."""
+    assert mod.join_report_sections(
+        mod.census_report_sections(**_render_kwargs())
+    ) == _GOLDEN_FLAGLESS_REPORT
 
 
 def test_render_report_flagless_output_is_byte_identical_golden():
