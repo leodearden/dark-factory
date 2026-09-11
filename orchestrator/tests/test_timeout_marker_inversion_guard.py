@@ -100,8 +100,10 @@ _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
 #: of the three is importable from ``_orch_helpers``: two are defined
 #: FILE-LOCALLY in the modules that use them --
 #: ``HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s``
-#: (test_merge_queue_concurrent_verify.py) and ``PYTEST_TIMEOUT = 960`` (in
-#: BOTH test_pytest_marker_deselection.py and test_warm_lane_bash_suite.py).
+#: (test_merge_queue_concurrent_verify.py) and ``PYTEST_TIMEOUT = 960``
+#: (test_warm_lane_bash_suite.py -- test_pytest_marker_deselection.py's
+#: identical line is inside a string FIXTURE, so it is not a binding, which
+#: :class:`TestSanctionedNameMirrors` measures rather than assumes).
 #: This is where the shape departs from its template:
 #: ``_SANCTIONED_CEILING_NAMES`` in test_whole_tree_scan_timeout_guard.py is a
 #: one-element frozenset paired with a single hard-coded
@@ -354,11 +356,12 @@ def _inverts(seconds: float | None) -> bool:
 
 #: Numbers a sanctioned constant's definition may be written in terms of.  All
 #: four real definitions are literal arithmetic over _orch_helpers' own numeric
-#: globals (``5 * PYPROJECT_DEFAULT_TIMEOUT``, ``5 * MERGE_RESULT_TIMEOUT +
-#: 75``), and the two defined in test modules import those names from there --
-#: so one namespace resolves every case without importing a test module, whose
-#: module-scope side effects (test_warm_lane_bash_suite.py:242 asserts at
-#: import time) make importing it for a constant a bad trade.
+#: globals -- ``5 * PYPROJECT_DEFAULT_TIMEOUT`` and ``5 * MERGE_RESULT_TIMEOUT
+#: + 75``, the latter defined in a test module that imports that name from
+#: there -- so ONE namespace resolves every case with no test module imported.
+#: Importing one for a constant would be a bad trade: test modules run code at
+#: import, and test_warm_lane_bash_suite.py asserts at module scope right below
+#: the PYTEST_TIMEOUT this map mirrors.
 #:
 #: STATED LIMIT: a definition written over a FILE-LOCAL name that shadows an
 #: _orch_helpers global of the same spelling would resolve against the wrong
