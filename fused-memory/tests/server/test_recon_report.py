@@ -4068,6 +4068,94 @@ class TestReconReportSupersedes:
         assert stage2_entry.stage == 'task_knowledge_sync'
         assert stage1_finding.superseded_by == stage2_fid
 
+    def test_supersedes_unknown_finding_id_is_rejected(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        self._file(state, flag_type='memory_mechanism_contradiction')
+
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes='11111111-2222-3333-4444-555555555555',
+        )
+        assert result == {'error': 'finding_unknown', 'error_type': 'ReconReportFindingUnknown'}
+
+    def test_supersedes_a_finding_from_another_run_is_rejected(self):
+        """_resolve_finding is run-scoped; supersession must not breach that."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r2', stage='s1', project_id='dark_factory')
+        other_run_fid = self._file(state, run_id='r2', flag_type='memory_mechanism_contradiction')
+
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        self._file(state, flag_type='memory_mechanism_contradiction')
+
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=other_run_fid,
+        )
+        assert result == {'error': 'finding_unknown', 'error_type': 'ReconReportFindingUnknown'}
+
+        # The other run's finding is untouched.
+        _e, other = state._resolve_finding('r2', other_run_fid)
+        assert other.superseded_by is None
+
+    def test_rejected_supersedes_creates_no_finding_and_leaves_no_residue(self):
+        """A rejected supersession must fail the WHOLE call atomically.
+
+        An impl that allocates the finding first and only then discovers the
+        target is unresolvable leaves the new claim live beside the old one
+        with no relation recorded — silently reproducing the original defect —
+        and burns the (task_id, flag_type) signature, so the corrected re-file
+        bounces off a stale duplicate_finding pointer.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        old_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        entry = state._state[('r1', 's1')]
+        before_count = len(entry.findings)
+        before_items = state.get_assembled_report('r1', 's1')['flagged_items']
+
+        rejected = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes='11111111-2222-3333-4444-555555555555',
+        )
+        assert rejected == {'error': 'finding_unknown', 'error_type': 'ReconReportFindingUnknown'}
+        assert len(entry.findings) == before_count
+        assert state.get_assembled_report('r1', 's1')['flagged_items'] == before_items
+
+        # No index residue: the SAME signature re-files cleanly.
+        retry = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=old_fid,
+        )
+        assert 'finding_id' in retry, f'corrected re-file bounced: {retry}'
+        assert len(entry.findings) == before_count + 1
+        _e, old_finding = state._resolve_finding('r1', old_fid)
+        assert old_finding.superseded_by == retry['finding_id']
+
 
 # ---------------------------------------------------------------------------
 # task-2410 step-7: delete_finding registered via FastMCP — RED until
