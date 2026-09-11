@@ -52,7 +52,39 @@ def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str
         )
     return '\n'.join(lines)
 
-def _format_delivered_checks(checks: list[dict] | None) -> str:
+DELIVERED_CHECK_BULLET_LIMIT = 20
+"""Max delivered-check bullets rendered in one briefing section (task 5359).
+
+Bounds the capability-gate section, whose source — a task's author-supplied
+``metadata.delivered_checks`` — carries no length ceiling of its own, and whose
+per-entry cost is unbounded too: a ``grep`` descriptor's ``pattern`` is an
+arbitrary regex. Without a cap the section grows with the author's list in
+EVERY architect/simple_task dispatch of that task. As with
+``COMMIT_BULLET_LIMIT``, the truncation is rendered VISIBLY so the agent knows
+the list is partial and can read the rest from the task record itself.
+"""
+
+_DELIVERED_CHECK_FIELDS_BY_KIND = {
+    'grep': ('pattern', 'expect', 'paths'),
+    'script': ('script', 'args', 'timeout_secs'),
+}
+"""Descriptor fields to render per ``kind``, mirroring
+``shared.capability_manifest.DeliveredCheckMeta``'s mutually exclusive
+grep/script slices. Single source for BOTH the recognised-kind bullet and the
+unrecognised-kind fallback (which renders whichever of the union is present),
+so the two paths cannot drift. ``test_briefing.py`` pins the union against the
+live model's ``model_fields``, so a field added to ``_CheckFieldsBase`` and not
+added here fails there rather than vanishing silently from every prompt.
+"""
+
+_DELIVERED_CHECK_LIST_FIELDS = {'paths': 'whole tree', 'args': 'none'}
+"""List-valued descriptor fields, mapped to what an EMPTY list means to the
+runner — ``paths: []`` greps the whole tree, ``args: []`` passes none. Rendering
+the meaning rather than a bare ``[]`` keeps the bullet readable for an agent.
+"""
+
+
+def _format_delivered_checks(checks: object) -> str:
     """Render a task's ``metadata.delivered_checks`` as an agent-readable block.
 
     Returns '' for a falsy input so ``BriefingAssembler._format_task`` can omit
@@ -62,21 +94,49 @@ def _format_delivered_checks(checks: list[dict] | None) -> str:
     field of :class:`shared.capability_manifest.DeliveredCheckMeta` — a field
     added to that model must not vanish silently from the prompt, which
     ``test_briefing.py::TestFormatDeliveredChecks`` pins against the live
-    schema.
+    schema. Output is capped at ``DELIVERED_CHECK_BULLET_LIMIT`` with a visible
+    "…and N more" line, the never-silent-truncation convention
+    :func:`_format_commit_bullets` documents.
+
+    ``metadata`` is persisted, untyped data and ``_format_task`` runs on every
+    dispatch, so this fails OPEN the way
+    ``BriefingAssembler._format_prior_proposal`` does for ``files_referenced``:
+    a bare dict is accepted as a one-element list (a shape ``parse_metadata``
+    accepts, so a real task can carry one), ``paths``/``args`` elements are
+    ``str()``-coerced, and an entry whose ``kind`` is missing or unrecognised
+    degrades to a VISIBLE partial bullet rather than being dropped — dropping it
+    would reproduce this section's own reason for existing one level down, since
+    an unseen check still blocks mark-done. '' is reserved for "nothing to show".
 
     The block carries its OWN reading directive rather than relying on the six
     consuming prompt bodies to explain it — the same co-location precedent
-    ``BriefingAssembler._format_prior_proposal`` follows with its
-    verify-before-reuse line. The directive is load-bearing: ``docs/task-authoring.md``
-    §3.3 records that a symbol-name grep "is satisfiable by prose — a comment, a
-    docstring, or a variable named after the thing", so handing an agent the
-    literal pattern is a teach-to-the-test hazard unless the same text tells it
-    that matching the pattern without delivering the behaviour is a defect.
+    ``_format_prior_proposal`` follows with its verify-before-reuse line. The
+    directive is load-bearing: ``docs/task-authoring.md`` §3.3 records that a
+    symbol-name grep "is satisfiable by prose — a comment, a docstring, or a
+    variable named after the thing", so handing an agent the literal pattern is
+    a teach-to-the-test hazard unless the same text tells it that matching the
+    pattern without delivering the behaviour is a defect.
     """
     if not checks:
         return ''
+    if isinstance(checks, dict):
+        checks = [checks]
+    if not isinstance(checks, (list, tuple)):
+        return ''
 
-    bullets = '\n'.join(_delivered_check_bullet(check) for check in checks)
+    entries = [check for check in checks if isinstance(check, dict)]
+    if not entries:
+        return ''
+
+    shown = entries[:DELIVERED_CHECK_BULLET_LIMIT]
+    lines = [_delivered_check_bullet(check) for check in shown]
+    hidden = len(entries) - len(shown)
+    if hidden > 0:
+        lines.append(
+            f'- …and {hidden} more declared check(s) (not shown — read the full '
+            f'list from this task\'s `metadata.delivered_checks`)'
+        )
+    bullets = '\n'.join(lines)
 
     return f"""\
 ## Declared Capability Gate (metadata.delivered_checks)
@@ -101,20 +161,42 @@ make the check match. The descriptor contract lives in `docs/task-authoring.md` 
 
 
 def _delivered_check_bullet(check: dict) -> str:
-    """Render one delivered-check descriptor as a single field-labelled bullet."""
+    """Render one delivered-check descriptor as a single field-labelled bullet.
+
+    An unrecognised or missing ``kind`` renders whichever descriptor fields are
+    present, flagged UNRECOGNISED so the malformation is visible to whoever
+    reads the prompt and the agent can ask rather than guess.
+    """
     kind = check.get('kind')
     fields = [f'kind: `{kind}`']
-    if kind == 'grep':
-        fields.append(f'pattern: `{check.get("pattern")}`')
-        fields.append(f'expect: `{check.get("expect")}`')
-        paths = check.get('paths') or []
-        fields.append(f'paths: {", ".join(str(p) for p in paths) if paths else "whole tree"}')
-    elif kind == 'script':
-        fields.append(f'script: `{check.get("script")}`')
-        args = check.get('args') or []
-        fields.append(f'args: {", ".join(str(a) for a in args) if args else "none"}')
-        fields.append(f'timeout_secs: {check.get("timeout_secs")}')
+    if kind in _DELIVERED_CHECK_FIELDS_BY_KIND:
+        fields += [
+            _delivered_check_field(check, name)
+            for name in _DELIVERED_CHECK_FIELDS_BY_KIND[kind]
+        ]
+    else:
+        fields.append('UNRECOGNISED descriptor, shown as-is')
+        fields += [
+            _delivered_check_field(check, name)
+            for group in _DELIVERED_CHECK_FIELDS_BY_KIND.values()
+            for name in group
+            if name in check
+        ]
     return f'- name: `{check.get("name")}` — ' + ', '.join(fields)
+
+
+def _delivered_check_field(check: dict, name: str) -> str:
+    """Render one descriptor field as ``name: value``, coercing defensively."""
+    value = check.get(name)
+    if name not in _DELIVERED_CHECK_LIST_FIELDS:
+        return f'{name}: `{value}`'
+    if value is None:
+        items: list = []
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    return f'{name}: {", ".join(str(v) for v in items) or _DELIVERED_CHECK_LIST_FIELDS[name]}'
 
 
 FOREIGN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')

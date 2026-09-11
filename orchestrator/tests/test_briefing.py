@@ -19,7 +19,11 @@ from unittest.mock import patch
 import pytest
 from shared.capability_manifest import DeliveredCheckMeta
 
-from orchestrator.agents.briefing import BriefingAssembler, _format_delivered_checks
+from orchestrator.agents.briefing import (
+    DELIVERED_CHECK_BULLET_LIMIT,
+    BriefingAssembler,
+    _format_delivered_checks,
+)
 from orchestrator.config import GitConfig, OrchestratorConfig
 
 
@@ -244,6 +248,99 @@ class TestFormatDeliveredChecks:
         )
         missing = [f for f in DeliveredCheckMeta.model_fields if f not in union]
         assert not missing, f'renderer omits live DeliveredCheckMeta fields: {missing}'
+
+class TestFormatDeliveredChecksDegradesSafely:
+    """``_format_delivered_checks`` runs on the hot path of every dispatch over
+    persisted, untyped ``metadata`` — a stray shape must never crash a prompt
+    build, and a descriptor it cannot fully describe must stay VISIBLE rather
+    than be dropped (an invisible check still gates mark-done).
+    """
+
+    VALID = {
+        'name': 'cap-ok',
+        'kind': 'grep',
+        'pattern': 'FooBar',
+        'expect': 'present',
+        'paths': [],
+    }
+
+    @staticmethod
+    def _bullets(out: str) -> list[str]:
+        return [ln for ln in out.splitlines() if ln.startswith('- name:')]
+
+    def test_bare_dict_is_accepted_as_a_one_element_list(self):
+        """A dict supplied where a list belongs validates quietly through
+        ``parse_metadata`` (shared/tests/test_capability_manifest.py), so a real
+        task can carry one — render it as the single bullet the author meant.
+        """
+        out = _format_delivered_checks(
+            {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+        )
+        assert isinstance(out, str)
+        assert len(self._bullets(out)) == 1
+        assert 'cap' in out
+
+    def test_string_value_renders_nothing(self):
+        """Never render a string per-character."""
+        assert _format_delivered_checks('cap-one') == ''
+
+    def test_int_value_renders_nothing(self):
+        assert _format_delivered_checks(7) == ''
+
+    def test_non_dict_element_does_not_lose_the_valid_entry(self):
+        out = _format_delivered_checks(['nope', self.VALID])
+        assert isinstance(out, str)
+        assert 'cap-ok' in out
+        assert len(self._bullets(out)) == 1
+
+    def test_entry_missing_name_and_kind_still_renders_what_is_known(self):
+        out = _format_delivered_checks([{'pattern': 'OnlyAPattern', 'expect': 'present'}])
+        assert len(self._bullets(out)) == 1
+        assert 'OnlyAPattern' in out
+        assert 'present' in out
+
+    def test_unrecognised_kind_renders_a_visible_partial_bullet(self):
+        out = _format_delivered_checks(
+            [{'name': 'cap-weird', 'kind': 'telepathy', 'pattern': 'Z'}],
+        )
+        assert len(self._bullets(out)) == 1
+        assert 'cap-weird' in out
+        assert 'telepathy' in out
+        assert 'Z' in out
+        assert 'UNRECOGNISED' in out
+
+    def test_unrecognised_kind_does_not_suppress_a_sibling_entry(self):
+        out = _format_delivered_checks([{'kind': 'telepathy'}, self.VALID])
+        assert len(self._bullets(out)) == 2
+        assert 'cap-ok' in out
+
+    def test_non_string_paths_element_is_coerced(self):
+        out = _format_delivered_checks(
+            [{'name': 'c', 'kind': 'grep', 'pattern': 'X', 'expect': 'present',
+              'paths': ['orchestrator', 7]}],
+        )
+        assert 'orchestrator' in out
+        assert '7' in out
+
+    def test_non_string_args_element_is_coerced(self):
+        out = _format_delivered_checks(
+            [{'name': 'c', 'kind': 'script', 'script': 's.py', 'args': ['--a', 3],
+              'timeout_secs': 5}],
+        )
+        assert '--a' in out
+        assert '3' in out
+
+    def test_over_the_limit_truncates_visibly(self):
+        checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT + 3)]
+        out = _format_delivered_checks(checks)
+        assert len(self._bullets(out)) == DELIVERED_CHECK_BULLET_LIMIT
+        assert '…and 3 more' in out
+
+    def test_exactly_at_the_limit_renders_no_truncation_line(self):
+        checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT)]
+        out = _format_delivered_checks(checks)
+        assert len(self._bullets(out)) == DELIVERED_CHECK_BULLET_LIMIT
+        assert '…and' not in out
 
 @pytest.mark.asyncio
 class TestBuildPlanTighteningPrompt:
