@@ -213,3 +213,128 @@ class TestParseMergeRr:
         """A truncated final record is evidence of damage, not something to skip."""
         parsed = rebase_recovery.parse_merge_rr(b'a' * 40 + b'\tsrc/one.py')
         assert [r.conflict_id for r in parsed.records] == ['a' * 40]
+
+
+# ---------------------------------------------------------------------------
+# Dangling-vs-intact classification
+# ---------------------------------------------------------------------------
+
+_HEX = 'd932b0e1e48d84453c25373f569e77581b8cc648'
+
+
+def _plant_merge_rr(git_dir: Path, *records: bytes) -> None:
+    git_dir.mkdir(parents=True, exist_ok=True)
+    (git_dir / 'MERGE_RR').write_bytes(b''.join(r + b'\x00' for r in records))
+
+
+def _record(conflict_id: str, path: str = 'src/one.py') -> bytes:
+    return f'{conflict_id}\t{path}'.encode()
+
+
+class TestScanMergeRr:
+    """Classify each MERGE_RR record against its backing rr-cache directory.
+
+    The scan is filesystem-only and takes ``git_dir`` and ``common_dir`` as
+    explicit arguments, so these cases need plain directories rather than real
+    repositories.  That separation is deliberate: it keeps the classifier
+    testable without a repo, and it makes the common-dir resolution an
+    assertable property rather than an implementation detail.
+    """
+
+    def test_variant_suffix_dangling_while_bare_id_exists(self, tmp_path: Path) -> None:
+        """THE load-bearing case — the measured live state of worktree 29171.
+
+        MERGE_RR cites ``<hex>.1``; ``rr-cache/<hex>`` EXISTS and
+        ``rr-cache/<hex>.1`` does NOT.  Verdict must be DANGLING.  A checker
+        that strips or splits the suffix resolves the bare directory, reports
+        intact, and lets exactly the crash this module guards against through.
+        """
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(f'{_HEX}.1'))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert [r.conflict_id for r in scan.dangling] == [f'{_HEX}.1']
+
+    def test_present_directory_classifies_intact(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.dangling == ()
+        assert [r.conflict_id for r in scan.records] == [_HEX]
+
+    def test_absent_directory_classifies_dangling(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache').mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert [r.conflict_id for r in scan.dangling] == [_HEX]
+
+    def test_rr_cache_entry_that_is_a_file_classifies_dangling(
+        self, tmp_path: Path,
+    ) -> None:
+        """git wants a DIRECTORY holding preimage/postimage; a file is not one."""
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache').mkdir(parents=True)
+        (git_dir / 'rr-cache' / _HEX).write_text('not a directory')
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert [r.conflict_id for r in scan.dangling] == [_HEX]
+
+    def test_rr_cache_resolves_under_the_common_dir_not_the_worktree_git_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        """A linked worktree's MERGE_RR is per-worktree; its rr-cache is shared.
+
+        Resolving rr-cache under the per-worktree git dir would find nothing
+        for EVERY record in a linked worktree — reporting the whole file
+        dangling and quarantining healthy state on every run.
+        """
+        git_dir = tmp_path / 'worktrees' / '4797'
+        common_dir = tmp_path / 'common'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (common_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+        (git_dir / 'rr-cache').mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=common_dir)
+
+        assert scan.dangling == ()
+
+    def test_unparsable_record_is_reported_as_suspect(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, b'deadbeef\tsrc/short.py', _record(_HEX))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.dangling == ()
+        assert scan.unparsable == (b'deadbeef\tsrc/short.py',)
+        assert scan.suspect is True
+
+    def test_missing_merge_rr_is_the_healthy_case(self, tmp_path: Path) -> None:
+        """Absence is normal, not an error: most worktrees have no MERGE_RR."""
+        git_dir = tmp_path / 'gitdir'
+        git_dir.mkdir()
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.records == ()
+        assert scan.dangling == ()
+        assert scan.unparsable == ()
+        assert scan.suspect is False
+
+    def test_dangling_records_make_the_scan_suspect(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+
+        assert scan.suspect is True
