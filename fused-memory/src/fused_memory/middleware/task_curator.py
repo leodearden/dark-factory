@@ -30,6 +30,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid as uuid_mod
 from collections.abc import Callable, Mapping
@@ -41,8 +42,10 @@ from typing import TYPE_CHECKING, Any, Literal
 from shared.cli_invoke import (
     AgentResult,
     AllAccountsCappedException,
+    claude_binary_spec,
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    resolve_claude_binary,
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
@@ -1403,6 +1406,50 @@ class TaskCurator:
             entry.name, candidate.title,
         )
         return decision
+
+    # ------------------------------------------------------------------
+    # Backend-binary startup self-check (task 4448)
+    # ------------------------------------------------------------------
+
+    async def startup_self_check(self, project_id: str, project_root: str) -> bool:
+        """Report whether the curator's backend CLI binary resolves. Never raises.
+
+        The 2026-08-13 outage was diagnosable from its first curation — the
+        binary was not there — and what was missing was anyone asking. Asking
+        once, at wiring time, converts five days of silent degradation into one
+        escalation before the first candidate is filed.
+
+        Returns a verdict rather than raising, and the caller treats it as
+        information rather than a precondition: a curator whose binary is
+        missing still degrades to ``action='create'``, which is strictly better
+        than a curator that refuses to construct. The interceptor wraps
+        construction in ``except Exception -> return None``, so raising here
+        would silently disable dedupe outright.
+        """
+        spec = claude_binary_spec()
+        resolved = resolve_claude_binary()
+        if resolved is not None:
+            logger.info(
+                'task_curator: backend binary %r resolves to %s', spec, resolved,
+            )
+            return True
+
+        search_path = os.environ.get('PATH')
+        logger.error(
+            'task_curator: backend binary %r does not resolve (PATH=%s) — every '
+            'curation for project %s will degrade to action=create WITHOUT '
+            'dedupe until this is fixed. Set CLAUDE_BINARY to an absolute path, '
+            'or pin Environment=PATH= in the fused-memory systemd unit.',
+            spec, search_path, project_id,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_backend_binary_unresolvable(
+                project_root=project_root,
+                project_id=project_id,
+                binary_spec=spec,
+                search_path=search_path,
+            )
+        return False
 
     # ------------------------------------------------------------------
     # Class-agnostic degraded-streak alarm (task 4448)

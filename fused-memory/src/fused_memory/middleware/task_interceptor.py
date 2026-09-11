@@ -1651,6 +1651,21 @@ class TaskInterceptor:
                 )
                 self._background_tasks.add(bg)
                 bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                # Ask once whether the curator's backend binary resolves at all
+                # (task 4448). Backgrounded for the same reason as the backfill
+                # check: a PATH lookup must not delay task creation. The check
+                # reports and returns a verdict rather than raising — a curator
+                # with a missing binary still degrades to action='create', which
+                # is strictly better than the `except Exception` below turning a
+                # refusal into a silently absent curator.
+                check = asyncio.create_task(
+                    self._curator.startup_self_check(
+                        resolve_project_id(project_root), project_root,
+                    ),
+                    name='curator-startup-self-check',
+                )
+                self._background_tasks.add(check)
+                check.add_done_callback(lambda t: self._background_tasks.discard(t))
             return self._curator
         except Exception:
             logger.warning('Failed to create TaskCurator', exc_info=True)
