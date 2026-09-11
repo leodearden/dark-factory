@@ -13501,10 +13501,13 @@ async def test_maybe_remediate_drops_a_superseded_actionable_finding(
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2], items_flagged=[_make_superseded_finding()])
 
-    phantom_calls: list = []
-    placeholder_calls: list = []
-    harness._record_phantom_citation_finding_drop = lambda p: phantom_calls.append(p)
-    harness._record_placeholder_finding_drop = lambda p: placeholder_calls.append(p)
+    # MagicMock rather than a lambda so the spy is assignable over the bound
+    # method and reads with the same assert_not_called idiom as the rest of the
+    # file's harness-method spies.
+    record_phantom = MagicMock(return_value=None)
+    record_placeholder = MagicMock(return_value=None)
+    harness._record_phantom_citation_finding_drop = record_phantom
+    harness._record_placeholder_finding_drop = record_placeholder
 
     with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
         run = await harness.run_full_cycle('test-project', 'buffer_size:1')
@@ -13528,8 +13531,8 @@ async def test_maybe_remediate_drops_a_superseded_actionable_finding(
     # task-4781 non-contamination: neither drop cause, neither storm counter.
     assert _drop_records(caplog, 'reconciliation.remediation_dropped_phantom_cited_finding') == []
     assert _drop_records(caplog, 'reconciliation.remediation_dropped_placeholder_finding') == []
-    assert phantom_calls == [], 'a superseded finding is not a phantom-cited drop'
-    assert placeholder_calls == [], 'a superseded finding is not a placeholder drop'
+    record_phantom.assert_not_called()  # not a phantom-cited drop
+    record_placeholder.assert_not_called()  # not a never-cited placeholder drop
 
 
 @pytest.mark.asyncio
@@ -13616,6 +13619,7 @@ async def test_maybe_remediate_dict_shaped_report_still_forwards_a_live_finding(
     await _call_maybe_remediate(harness, parent_run)
 
     assert remediation.await_count == 1
+    assert remediation.await_args is not None
     forwarded = remediation.await_args.args[2]
     assert [f['description'] for f in forwarded] == [live['description']]
 
@@ -13636,13 +13640,8 @@ async def test_run_remediation_pass_never_gates_a_superseded_finding(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     superseded = _make_superseded_finding()
 
-    persistence_calls: list = []
-
-    async def spy_persistence(project_id, finding):
-        persistence_calls.append(finding.get('description'))
-        return 0
-
-    harness._finding_persistence_count = spy_persistence
+    persistence_spy = AsyncMock(return_value=0)
+    harness._finding_persistence_count = persistence_spy
 
     _mock_stage_run(harness.stages[0])
     _mock_stage_run(harness.stages[1])
@@ -13657,9 +13656,9 @@ async def test_run_remediation_pass_never_gates_a_superseded_finding(
             scope=_scope('test-project', '/tmp/test-project'),
         )
 
-    assert persistence_calls == [], (
-        f'a superseded finding reached the persistence-gated escalation branch: '
-        f'{persistence_calls}'
+    gated = [c.args[1].get('description') for c in persistence_spy.await_args_list]
+    assert gated == [], (
+        f'a superseded finding reached the persistence-gated escalation branch: {gated}'
     )
     records = _drop_records(caplog, 'reconciliation.non_actionable_integrity_finding')
     assert [getattr(r, 'superseded_by', None) for r in records] == [_SUPERSEDER_FID]

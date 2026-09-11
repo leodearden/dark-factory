@@ -1464,8 +1464,9 @@ class TestSupersededByPersistence:
             state_b = self._make_state(store_b)
             state_b.hydrate_from_store()
 
-            items = state_b.get_assembled_report(self._RUN, self._S1)['flagged_items']
-            (item,) = [i for i in items if i['finding_id'] == stage1_fid]
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [i for i in report['flagged_items'] if i['finding_id'] == stage1_fid]
             assert item['superseded_by'] == stage2_fid
             assert item['actionable'] is False
         finally:
@@ -1510,10 +1511,13 @@ class TestSupersededByPersistence:
             state_b = self._make_state(store_b)
             state_b.hydrate_from_store()
 
-            _e, finding = state_b._resolve_finding(self._RUN, legacy_fid)
+            resolved = state_b._resolve_finding(self._RUN, legacy_fid)
+            assert resolved is not None, 'the legacy blob did not hydrate'
+            _e, finding = resolved
             assert finding.superseded_by is None
-            items = state_b.get_assembled_report(self._RUN, self._S1)['flagged_items']
-            (item,) = [i for i in items if i['finding_id'] == legacy_fid]
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [i for i in report['flagged_items'] if i['finding_id'] == legacy_fid]
             assert item['superseded_by'] is None
             assert item['actionable'] is True
         finally:

@@ -3944,6 +3944,25 @@ class TestReconReportDeleteFinding:
 # ---------------------------------------------------------------------------
 
 
+def _stored_finding(state, run_id, finding_id):
+    """Resolve the stored _Finding, failing the test if it is gone.
+
+    Narrows _resolve_finding's (entry, finding) | None so call sites read as
+    the assertion they are rather than an unpack that may explode.
+    """
+    resolved = state._resolve_finding(run_id, finding_id)
+    assert resolved is not None, f'finding {finding_id!r} unresolvable in run {run_id!r}'
+    _entry, finding = resolved
+    return finding
+
+
+def _flagged_items(state, run_id, stage):
+    """Return the assembled report's flagged_items, failing if there is none."""
+    report = state.get_assembled_report(run_id, stage)
+    assert report is not None, f'no assembled report for {run_id!r}/{stage!r}'
+    return report['flagged_items']
+
+
 class TestReconReportSupersedes:
     """``add_finding(..., supersedes=<finding_id>)`` stamps the named TARGET's
     ``superseded_by`` with the NEW finding's id.
@@ -3980,10 +3999,7 @@ class TestReconReportSupersedes:
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         fid = self._file(state)
 
-        resolved = state._resolve_finding('r1', fid)
-        assert resolved is not None
-        _entry, finding = resolved
-        assert finding.superseded_by is None
+        assert _stored_finding(state, 'r1', fid).superseded_by is None
 
     def test_supersedes_stamps_the_target_with_the_new_finding_id(self):
         state, _ = self._make_state()
@@ -4007,10 +4023,8 @@ class TestReconReportSupersedes:
 
         # The stamp lands on the TARGET, pointing FORWARD to the superseder —
         # not the other way round.
-        _e_old, old_finding = state._resolve_finding('r1', old_fid)
-        _e_new, new_finding = state._resolve_finding('r1', new_fid)
-        assert old_finding.superseded_by == new_fid
-        assert new_finding.superseded_by is None
+        assert _stored_finding(state, 'r1', old_fid).superseded_by == new_fid
+        assert _stored_finding(state, 'r1', new_fid).superseded_by is None
 
     def test_supersedes_stamps_it_does_not_purge_the_target(self):
         state, _ = self._make_state()
@@ -4062,8 +4076,11 @@ class TestReconReportSupersedes:
         stage2_fid = added['finding_id']
 
         # The superseder lives in Stage 2's entry; the stamp lands on Stage 1's row.
-        stage1_entry, stage1_finding = state._resolve_finding('r1', stage1_fid)
-        stage2_entry, _stage2_finding = state._resolve_finding('r1', stage2_fid)
+        stage1_resolved = state._resolve_finding('r1', stage1_fid)
+        stage2_resolved = state._resolve_finding('r1', stage2_fid)
+        assert stage1_resolved is not None and stage2_resolved is not None
+        stage1_entry, stage1_finding = stage1_resolved
+        stage2_entry, _stage2_finding = stage2_resolved
         assert stage1_entry.stage == 'memory_consolidator'
         assert stage2_entry.stage == 'task_knowledge_sync'
         assert stage1_finding.superseded_by == stage2_fid
@@ -4107,8 +4124,7 @@ class TestReconReportSupersedes:
         assert result == {'error': 'finding_unknown', 'error_type': 'ReconReportFindingUnknown'}
 
         # The other run's finding is untouched.
-        _e, other = state._resolve_finding('r2', other_run_fid)
-        assert other.superseded_by is None
+        assert _stored_finding(state, 'r2', other_run_fid).superseded_by is None
 
     def test_rejected_supersedes_creates_no_finding_and_leaves_no_residue(self):
         """A rejected supersession must fail the WHOLE call atomically.
@@ -4124,7 +4140,7 @@ class TestReconReportSupersedes:
         old_fid = self._file(state, flag_type='memory_mechanism_contradiction')
         entry = state._state[('r1', 's1')]
         before_count = len(entry.findings)
-        before_items = state.get_assembled_report('r1', 's1')['flagged_items']
+        before_items = _flagged_items(state, 'r1', 's1')
 
         rejected = state.add_finding(
             run_id='r1',
@@ -4138,7 +4154,7 @@ class TestReconReportSupersedes:
         )
         assert rejected == {'error': 'finding_unknown', 'error_type': 'ReconReportFindingUnknown'}
         assert len(entry.findings) == before_count
-        assert state.get_assembled_report('r1', 's1')['flagged_items'] == before_items
+        assert _flagged_items(state, 'r1', 's1') == before_items
 
         # No index residue: the SAME signature re-files cleanly.
         retry = state.add_finding(
@@ -4153,8 +4169,7 @@ class TestReconReportSupersedes:
         )
         assert 'finding_id' in retry, f'corrected re-file bounced: {retry}'
         assert len(entry.findings) == before_count + 1
-        _e, old_finding = state._resolve_finding('r1', old_fid)
-        assert old_finding.superseded_by == retry['finding_id']
+        assert _stored_finding(state, 'r1', old_fid).superseded_by == retry['finding_id']
 
     def test_supersedes_a_finding_whose_owning_entry_is_already_completed(self):
         """The production shape: Stage 1 closes, THEN Stage 2 retires its claim.
@@ -4181,8 +4196,7 @@ class TestReconReportSupersedes:
             supersedes=stage1_fid,
         )
         assert 'finding_id' in added, f'supersede of a completed target rejected: {added}'
-        _e, stage1_finding = state._resolve_finding('r1', stage1_fid)
-        assert stage1_finding.superseded_by == added['finding_id']
+        assert _stored_finding(state, 'r1', stage1_fid).superseded_by == added['finding_id']
 
         # The deliberate asymmetry: delete_finding STILL rejects exactly this
         # case, because purging a row corrupts complete()'s cached
@@ -4224,8 +4238,7 @@ class TestReconReportSupersedes:
             'error': 'report_already_completed',
             'error_type': 'ReconReportAlreadyCompleted',
         }
-        _e, old_finding = state._resolve_finding('r1', old_fid)
-        assert old_finding.superseded_by is None
+        assert _stored_finding(state, 'r1', old_fid).superseded_by is None
 
     def test_retracting_the_superseder_clears_the_targets_forward_pointer(self):
         """A retracted supersession must not leave the target permanently
@@ -4244,13 +4257,13 @@ class TestReconReportSupersedes:
             supersedes=b_fid,
         )
         a_fid = a_added['finding_id']
-        _e, b_finding = state._resolve_finding('r1', b_fid)
+        b_finding = _stored_finding(state, 'r1', b_fid)
         assert b_finding.superseded_by == a_fid
 
         assert state.delete_finding('r1', a_fid) == {'status': 'deleted', 'finding_id': a_fid}
 
         assert b_finding.superseded_by is None
-        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        items = _flagged_items(state, 'r1', 's1')
         (item,) = [i for i in items if i['finding_id'] == b_fid]
         assert item['superseded_by'] is None
         assert item['actionable'] is True
@@ -4276,7 +4289,7 @@ class TestReconReportSupersedes:
             supersedes=b_fid,
         )
         a_fid = a_added['finding_id']
-        _e, b_finding = state._resolve_finding('r1', b_fid)
+        b_finding = _stored_finding(state, 'r1', b_fid)
         assert b_finding.superseded_by == a_fid
 
         assert state.delete_finding('r1', a_fid) == {'status': 'deleted', 'finding_id': a_fid}
@@ -4337,7 +4350,7 @@ class TestSupersededFindingProjection:
         state.start_report('r1', 's1', 'dark_factory')
         fid = self._file(state, 'r1', 'f')
 
-        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        items = _flagged_items(state, 'r1', 's1')
         (item,) = [i for i in items if i['finding_id'] == fid]
         assert 'superseded_by' in item
         assert item['superseded_by'] is None
@@ -4350,7 +4363,7 @@ class TestSupersededFindingProjection:
             state, 'r1', 'memory_mechanism_contradiction_resolved', supersedes=old_fid
         )
 
-        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        items = _flagged_items(state, 'r1', 's1')
         by_id = {i['finding_id']: i for i in items}
         assert old_fid in by_id, 'the superseded claim must stay readable in the report'
         assert by_id[old_fid]['superseded_by'] == new_fid
@@ -4365,11 +4378,11 @@ class TestSupersededFindingProjection:
         self._file(state, 'r1', 'memory_mechanism_contradiction_resolved', supersedes=old_fid)
 
         state.get_assembled_report('r1', 's1')
-        _e, stored = state._resolve_finding('r1', old_fid)
+        stored = _stored_finding(state, 'r1', old_fid)
         assert stored.actionable is True, 'the neuter must not write back to the stored row'
 
         # Second read agrees with the first.
-        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        items = _flagged_items(state, 'r1', 's1')
         (item,) = [i for i in items if i['finding_id'] == old_fid]
         assert item['actionable'] is False
 
@@ -4433,7 +4446,7 @@ class TestSupersededFindingProjection:
         )
         assert 'error' not in r3, r3
 
-        items = state.get_assembled_report(run_id, 'task_knowledge_sync')['flagged_items']
+        items = _flagged_items(state, run_id, 'task_knowledge_sync')
         by_id = {i['finding_id']: i for i in items}
         assert echoing_fid in by_id, (
             'a superseded finding must not become newly eligible for the Fix-1 '
@@ -4551,7 +4564,7 @@ class TestSupersedesViaFastMCP:
         )
         assert 'finding_id' in new, f'supersede through the tool layer failed: {new}'
 
-        _e, target = state._resolve_finding('r1', old['finding_id'])
+        target = _stored_finding(state, 'r1', old['finding_id'])
         assert target.superseded_by == new['finding_id']
 
     @pytest.mark.asyncio
@@ -4566,7 +4579,7 @@ class TestSupersedesViaFastMCP:
             tm, 'f', supersedes='11111111-2222-3333-4444-555555555555'
         )
         assert result == {'error': 'finding_unknown', 'error_type': 'ReconReportFindingUnknown'}
-        assert state.get_assembled_report('r1', 's1')['flagged_items'] == []
+        assert _flagged_items(state, 'r1', 's1') == []
 
     def test_live_signature_exposes_supersedes_as_optional(self):
         from fused_memory.server.recon_report import get_recon_report_tool_signatures
