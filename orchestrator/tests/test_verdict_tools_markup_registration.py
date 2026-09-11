@@ -887,6 +887,93 @@ class TestTheDeliberateQuotingOverrideOnThisServer:
 
 
 # ---------------------------------------------------------------------------
+# task 5283 — the RIPPLE of declaring it, on the FORWARD tier.
+# ---------------------------------------------------------------------------
+
+
+#: A leak whose swallowed tail declares ``metadata``. The middleware resolves
+#: the repair vocabulary from the LIVE tool schema, so declaring the parameter
+#: made ``metadata`` a recovery TARGET here — which nothing about "make the
+#: hatch schema-legal" would lead a reader to expect.
+METADATA_TAIL_SUMMARY = (
+    'The reviewed diff leaks its own envelope.' + _close('summary') + '\n'
+    + _LT + 'parameter name="metadata">swallowed tail'
+)
+
+
+class TestTheWidenedRepairVocabularyStaysContained:
+    """FORWARD_REPAIR lets the call through, so containment is not structural.
+
+    On the reject tier nothing is written no matter what is recovered. Here
+    the call LANDS, so the question is real: a recovered ``metadata`` is a
+    verbatim ``str`` slice and the declared parameter is object-or-null, so
+    ``_coerce_recovered`` cannot type it. The tier's own rule then applies —
+    an untypable name is DROPPED rather than forwarded into a doomed call,
+    preserved verbatim in the residue channel, and reported to the caller
+    under ``unrecovered_params``.
+
+    Two independent floors, which is why both are asserted: the coercion
+    drops it, and the decorator would swallow it even if it arrived.
+    """
+
+    @staticmethod
+    async def _submit(artifacts: TaskArtifacts):
+        server = create_server(artifacts, REVIEWER_ROLE)
+        async with Client(server) as client:
+            return await client.call_tool('submit_review_verdict', {
+                'reviewer': REVIEWER_ROLE,
+                'verdict': 'PASS',
+                'issues': [],
+                'summary': METADATA_TAIL_SUMMARY,
+            })
+
+    @pytest.mark.asyncio
+    async def test_the_call_still_lands(self, artifacts: TaskArtifacts):
+        """INV-6 first: the review gate must not be stranded by the ripple."""
+        result = await self._submit(artifacts)
+
+        assert result.data['status'] == 'ok'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is not None
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_reaches_the_persisted_envelope(
+        self, artifacts: TaskArtifacts
+    ):
+        """Over the whole document: the envelope nests the payload."""
+        await self._submit(artifacts)
+
+        text = (artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json').read_text('utf-8')
+        assert 'metadata' not in text
+        assert 'swallowed tail' not in text
+
+    @pytest.mark.asyncio
+    async def test_the_caller_is_TOLD_rather_than_silently_losing_it(
+        self, artifacts: TaskArtifacts
+    ):
+        """Dropped is acceptable; dropped and unreported is not."""
+        result = await self._submit(artifacts)
+
+        assert result.meta is not None
+        warning = result.meta['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['recovered_params'] == []
+        assert warning['unrecovered_params'] == ['metadata']
+
+    @pytest.mark.asyncio
+    async def test_the_dropped_value_survives_in_the_residue_channel(
+        self, artifacts: TaskArtifacts
+    ):
+        """Nothing is guessed AND nothing is destroyed — the C2 pair."""
+        await self._submit(artifacts)
+
+        files = sorted(artifacts.root.glob('markup_residue-*.json'))
+        assert len(files) == 1, f'expected one residue file, got {files!r}'
+        stored = json.loads(files[0].read_text())
+        assert stored['field'] == 'metadata'
+        assert stored['raw_value'] == 'swallowed tail'
+
+
+# ---------------------------------------------------------------------------
 # The residue channel is the SHARED one (task 3690 review follow-up)
 # ---------------------------------------------------------------------------
 

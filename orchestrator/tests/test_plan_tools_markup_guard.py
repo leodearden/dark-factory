@@ -678,6 +678,113 @@ class TestDeliberateQuotingOverride:
 
 
 # ---------------------------------------------------------------------------
+# task 5283 — the RIPPLE of declaring it: metadata joins the repair vocabulary.
+# ---------------------------------------------------------------------------
+
+
+#: A leak whose swallowed tail declares ``metadata`` — a pseudo-parameter that
+#: was OUT of this tool's vocabulary until the declaration put it in. The
+#: middleware resolves ``schema_params`` from the LIVE tool schema, so
+#: ``repair`` now qualifies a ``metadata`` closer as a mis-close candidate and
+#: can recover a tail into it.
+METADATA_TAIL_DECISION = (
+    _DECISION_PROSE + _close('decision') + '\n' + _open_param('metadata')
+    + 'swallowed tail'
+)
+
+
+class TestTheWidenedRepairVocabularyStaysContained:
+    """Declaring a parameter widens what a repair may RECOVER, not just accept.
+
+    This is the non-obvious consequence of workstream B and the reason it is
+    pinned rather than left to be rediscovered: nothing about "make the hatch
+    schema-legal" says "let repair() recover a value into ``metadata``", but
+    the middleware reads the vocabulary off the live schema, so it does.
+
+    On THIS tier the containment is structural — REJECT_WITH_REPAIR writes
+    nothing at all — and the recovered value is handed back for the caller to
+    resubmit. That resubmission is where the widening could have gone wrong,
+    so it is driven here rather than assumed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_metadata_is_now_a_recovery_TARGET(self, harness: Harness):
+        """The premise. Without it every row below would be vacuously green."""
+        await harness.seed_plan()
+
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+
+        assert _refusal(excinfo)['recovered_params'] == ['metadata']
+
+    @pytest.mark.asyncio
+    async def test_nothing_reaches_the_plan(self, harness: Harness):
+        """The containment that matters: the document is not touched."""
+        await harness.seed_plan()
+        before = harness.plan_bytes()
+
+        with pytest.raises(ToolError):
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+
+        assert harness.plan_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_the_recovered_tail_is_handed_back_not_swallowed(
+        self, harness: Harness
+    ):
+        """``repaired_call`` is the COMPLETE map, so the tail is not lost."""
+        await harness.seed_plan()
+
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+
+        repaired_call = _refusal(excinfo)['repaired_call']
+        assert repaired_call['decision'] == _DECISION_PROSE
+        assert repaired_call['metadata'] == 'swallowed tail'
+
+    @pytest.mark.asyncio
+    async def test_resubmitting_it_fails_LEGIBLY_rather_than_writing_a_string(
+        self, harness: Harness
+    ):
+        """The one edge the widening really does add, pinned as contained.
+
+        The recovered slice is a ``str`` and the declared parameter is
+        object-or-null, so a caller who resubmits the map verbatim is bounced
+        a second time — by pydantic, naming ``metadata``, with the plan still
+        untouched. That is ``_coerce_recovered``'s unchanged-on-doubt rule
+        behaving as documented: a value it cannot confidently type is left
+        alone to produce a legible declared-type error, never retyped and
+        never invented. Loud and legible beats a string written into a field
+        the document does not have.
+        """
+        await harness.seed_plan()
+        with pytest.raises(ToolError) as first:
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+        before = harness.plan_bytes()
+
+        with pytest.raises(ToolError) as second:
+            await harness.call(
+                'add_design_decision', _refusal(first)['repaired_call']
+            )
+
+        assert 'metadata' in str(second.value)
+        assert harness.plan_bytes() == before
+        assert harness.plan()['design_decisions'] == []
+
+
+# ---------------------------------------------------------------------------
 # task 5283 — the hatch is DECLARED in the schema, not tolerated by one client.
 # ---------------------------------------------------------------------------
 
