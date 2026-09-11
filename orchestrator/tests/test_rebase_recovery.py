@@ -35,6 +35,7 @@ is impossible at the git level even if the pre-flight is refactored away).
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -830,3 +831,138 @@ class TestGitOpsAbortUniformity:
             if quoted_abort.search(line) and 'RECOVERY_GIT' not in line
         ]
         assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# The CLI the skills invoke
+# ---------------------------------------------------------------------------
+
+class TestPreflightCli:
+    """The contract both SKILL.md files already use for ``b3_gate check``.
+
+    They invoke it, parse JSON from stdout, and branch on a ``verdict`` string.
+    Matching that shape verbatim means the skills edit reuses a sentence
+    pattern already in those files rather than inventing a second convention.
+    """
+
+    def _run_cli(self, capsys, *argv: str) -> tuple[int, dict]:
+        code = rebase_recovery.main(list(argv))
+        out = capsys.readouterr().out
+        return code, json.loads(out)
+
+    def test_dangling_fixture_reports_repaired_with_the_id_and_backup(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        code, payload = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+
+        assert code == 0
+        assert payload['verdict'] == 'repaired'
+        assert [d['conflict_id'] for d in payload['dangling']] == [conflict_id]
+        assert payload['merge_rr_backup'] is not None
+        assert Path(payload['merge_rr_backup']).exists()
+
+    def test_healthy_fixture_reports_clean_with_no_backup(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+
+        code, payload = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+
+        assert code == 0
+        assert payload['verdict'] == 'clean'
+        assert payload['dangling'] == []
+        assert payload['merge_rr_backup'] is None
+
+    def test_report_only_detects_without_moving_anything(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Detection and reporting with zero mutation, so an operator can look first."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+
+        code, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+
+        assert code == 0
+        assert [d['conflict_id'] for d in payload['dangling']] == [conflict_id]
+        assert payload['merge_rr_backup'] is None
+        assert merge_rr.read_bytes() == original
+        assert list((repo / '.git').glob('MERGE_RR.quarantined-*')) == []
+
+    def test_stdout_is_exactly_one_json_object(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """A caller does ``json.loads(stdout)``; a second line or a log breaks it."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        rebase_recovery.main(['preflight', '--worktree', str(repo)])
+
+        out = capsys.readouterr().out
+        assert len([line for line in out.splitlines() if line.strip()]) == 1
+        assert isinstance(json.loads(out), dict)
+
+    def test_verdict_is_always_one_of_the_documented_enum(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        _, repaired = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+        _, again = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+
+        allowed = {
+            rebase_recovery.VERDICT_CLEAN,
+            rebase_recovery.VERDICT_REPAIRED,
+            rebase_recovery.VERDICT_BLOCKED,
+        }
+        assert repaired['verdict'] in allowed
+        assert again['verdict'] in allowed
+
+    def test_lock_stale_after_seconds_is_a_flag_not_a_config_knob(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """The threshold varies per invocation, so it is an argument, not config.
+
+        A young unheld lock is retained at the default and swept once the
+        caller lowers the threshold below its age — which is the only
+        observable difference the flag is supposed to make.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+
+        _, default = self._run_cli(capsys, 'preflight', '--worktree', str(repo))
+        assert default['locks_removed'] == []
+        assert lock.exists()
+
+        _, lowered = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo),
+            '--lock-stale-after-seconds', '0',
+        )
+        assert [Path(f['path']).name for f in lowered['locks_removed']] == [
+            'MERGE_RR.lock',
+        ]
+        assert not lock.exists()
+
+    def test_an_unresolvable_worktree_does_not_crash_the_cli(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Fail-safe all the way out: this decorates recovery, never blocks it."""
+        not_a_repo = tmp_path / 'plain'
+        not_a_repo.mkdir()
+
+        code, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(not_a_repo),
+        )
+
+        assert code == 0
+        assert payload['resolved'] is False
+        assert payload['verdict'] == 'clean'
