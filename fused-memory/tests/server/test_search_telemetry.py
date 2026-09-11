@@ -323,6 +323,139 @@ class TestGroupedPayloadIsWhatIsSummarised:
         )
 
 
+class TestCallerIdentity:
+    """Item (2), INV-1: attribution is a SEPARATE channel from the agent_id FILTER.
+
+    Conflating "who is asking" with "whose memories to return" is the design
+    conflict that left 99.7% of journal rows unattributed, so the fix is a
+    declared second channel rather than a reinterpretation of the first.
+    """
+
+    _CALLER_AGENT = 'claude-task-3212-implementer'
+    _CALLER_TASK = '3212'
+
+    @pytest.mark.asyncio
+    async def test_caller_params_are_journalled_under_those_exact_names(self, write_journal):
+        _, server = _make_server(write_journal)
+
+        await server._tool_manager.call_tool(
+            'search',
+            {
+                'query': _LONG_QUERY,
+                'project_id': _PROJECT_ID,
+                'caller_agent_id': self._CALLER_AGENT,
+                'caller_task_id': self._CALLER_TASK,
+            },
+        )
+
+        params = (await _one_search_row(write_journal))['params']
+        assert params.get('caller_agent_id') == self._CALLER_AGENT, (
+            'caller_agent_id must reach the journal under that exact key name — it is '
+            f'what makes a row attributable at all. got {params!r}. RED: param undeclared.'
+        )
+        assert params.get('caller_task_id') == self._CALLER_TASK, (
+            f'caller_task_id must reach the journal, got {params!r}. RED: param undeclared.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_caller_params_are_never_forwarded_to_the_service(self, write_journal):
+        """Attribution must not become a filter — that is the whole point."""
+        mock_service, server = _make_server(write_journal)
+
+        await server._tool_manager.call_tool(
+            'search',
+            {
+                'query': _LONG_QUERY,
+                'project_id': _PROJECT_ID,
+                'caller_agent_id': self._CALLER_AGENT,
+                'caller_task_id': self._CALLER_TASK,
+            },
+        )
+
+        kwargs = mock_service.search.call_args.kwargs
+        assert 'caller_agent_id' not in kwargs, (
+            'caller_agent_id must NEVER reach MemoryService.search — forwarding it '
+            'would silently narrow results to one authoring agent, which is exactly '
+            f'the conflation this task fixes. got {kwargs!r}. RED: forwarded.'
+        )
+        assert 'caller_task_id' not in kwargs, (
+            f'caller_task_id must NEVER reach MemoryService.search, got {kwargs!r}. RED: forwarded.'
+        )
+        assert kwargs.get('agent_id') is None, (
+            'The agent_id FILTER must be unchanged by the presence of the attribution '
+            f'params, got {kwargs!r}. RED: attribution leaked into the filter.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_filter_and_attribution_are_two_different_values_on_one_row(
+        self, write_journal
+    ):
+        """The row must be able to say "X asked for Y's memories" — it could not before."""
+        mock_service, server = _make_server(write_journal)
+
+        await server._tool_manager.call_tool(
+            'search',
+            {
+                'query': _LONG_QUERY,
+                'project_id': _PROJECT_ID,
+                'agent_id': 'someone-else',
+                'caller_agent_id': self._CALLER_AGENT,
+            },
+        )
+
+        row = await _one_search_row(write_journal)
+        assert row['agent_id'] == 'someone-else', (
+            'The journalled agent_id column keeps meaning the FILTER that was applied, '
+            f'got {row["agent_id"]!r}. RED: column repurposed.'
+        )
+        assert row['params'].get('caller_agent_id') == self._CALLER_AGENT, (
+            'The attribution channel carries who ASKED, which is a different value from '
+            f'the filter on the same row. got {row!r}. RED: the two are still conflated.'
+        )
+        assert mock_service.search.call_args.kwargs.get('agent_id') == 'someone-else', (
+            'The filter still reaches the service unchanged. '
+            f'got {mock_service.search.call_args.kwargs!r}.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_omitted_caller_params_leave_the_row_shape_unchanged(self, write_journal):
+        """98.6% of rows keep arriving un-attributed until task 3659 lands."""
+        _, server = _make_server(write_journal)
+
+        await server._tool_manager.call_tool(
+            'search', {'query': _LONG_QUERY, 'project_id': _PROJECT_ID}
+        )
+
+        params = (await _one_search_row(write_journal))['params']
+        assert 'caller_agent_id' not in params, (
+            'An un-attributed caller must produce the SAME row shape as before — a '
+            f'null-valued key is not the same as an absent one. got {params!r}. '
+            'RED: keys emitted unconditionally.'
+        )
+        assert 'caller_task_id' not in params, f'RED: got {params!r}'
+
+    @pytest.mark.asyncio
+    async def test_error_path_journals_the_caller_params_too(self, write_journal):
+        _, server = _make_server(write_journal, raises=RuntimeError('mem0 exploded'))
+
+        await server._tool_manager.call_tool(
+            'search',
+            {
+                'query': _LONG_QUERY,
+                'project_id': _PROJECT_ID,
+                'caller_agent_id': self._CALLER_AGENT,
+                'caller_task_id': self._CALLER_TASK,
+            },
+        )
+
+        params = (await _one_search_row(write_journal))['params']
+        assert params.get('caller_agent_id') == self._CALLER_AGENT, (
+            'A failed search is still an attributable read — and the one most worth '
+            f'attributing. got {params!r}. RED: error path drops attribution.'
+        )
+        assert params.get('caller_task_id') == self._CALLER_TASK, f'RED: got {params!r}'
+
+
 class TestTelemetryFaultCannotBreakSearch:
     """A telemetry fault must never turn a working search into an error."""
 
