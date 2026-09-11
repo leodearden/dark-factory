@@ -35,6 +35,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, verdict_tools
@@ -75,6 +76,40 @@ def specimen(tool_use_id: str) -> dict[str, Any]:
         if record.get('tool_use_id') == tool_use_id:
             return record
     raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
+
+
+# ---------------------------------------------------------------------------
+# Sentinel BUILDERS — how markup enters this module OTHER than via the corpus.
+# ---------------------------------------------------------------------------
+#
+# The corpus escapes every literal as ``\u003c``, which is why this file could
+# carry specimens without ever spelling one. A hand-authored specimen has to
+# earn the same property: a raw envelope literal here would corrupt the very
+# tool call that edits this file (the rationale recorded at
+# ``shared/src/shared/toolcall_markup.py`` lines 52-62), so it is BUILT from
+# ``chr(60)`` exactly as the three sibling suites build theirs.
+
+_LT = chr(60)
+
+
+def _close(name: str) -> str:
+    """Build the closing tag for *name* — the mis-close shape the harness emits."""
+    return _LT + '/' + name + '>'
+
+
+def _assert_no_raw_sentinels() -> None:
+    """Fail at IMPORT if this file's own bytes carry a raw envelope literal."""
+    source = Path(__file__).read_text(encoding='utf-8')
+    for sequence in (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter '):
+        if sequence in source:
+            raise AssertionError(
+                f'{Path(__file__).name} contains a RAW envelope sentinel '
+                f'({sequence!r}). Build it from _close() instead — a verbatim '
+                'literal here corrupts the tool call that writes this file.'
+            )
+
+
+_assert_no_raw_sentinels()
 
 
 #: Recovers the REQUIRED list-typed ``issues`` — PRD boundary row B14's shape.
@@ -737,6 +772,118 @@ class TestEveryRoleToolDeclaresTheOverrideParameter:
         schema = await self._schema(artifacts, role)
 
         assert schema.get('additionalProperties') is False
+
+
+# ---------------------------------------------------------------------------
+# task 5283 — the hatch WORKS on this server, on the branch declaring it selects
+# ---------------------------------------------------------------------------
+
+
+#: A ``summary`` that QUOTES the literals deliberately — a reviewer whose
+#: finding IS about this leak. Unrepairable by construction: the tail after the
+#: first closer is ordinary prose, so no candidate parses.
+QUOTED_SUMMARY = (
+    'The reviewed diff emits ' + _close('summary') + ' mid-value and then '
+    + _close('invoke') + ', which is what the guard matches on.'
+)
+
+#: The same field with nothing to quote. The byte-comparison row needs two runs
+#: differing ONLY in the flag.
+CLEAN_SUMMARY = 'The reviewed diff registers the guard once, on the shared path.'
+
+
+class TestTheDeliberateQuotingOverrideOnThisServer:
+    """A reviewer whose finding is ABOUT this markup has to be able to say so.
+
+    FORWARD_REPAIR still refuses an unrepairable value, so this server bounces
+    such a reviewer with the same ``_OVERRIDE_SENTENCE`` remediation — which
+    was not part of ``submit_review_verdict``'s advertised contract until the
+    parameter was declared. These rows drive the branch that declaration
+    selects: ``_apply_override`` now FORWARDS the map, and the decorator, not
+    the middleware, is what keeps it out of the artifact.
+    """
+
+    @staticmethod
+    async def _submit(
+        artifacts: TaskArtifacts, summary: str, metadata: dict[str, Any] | None
+    ):
+        arguments: dict[str, Any] = {
+            'reviewer': REVIEWER_ROLE,
+            'verdict': 'ISSUES_FOUND',
+            'issues': [],
+            'summary': summary,
+        }
+        if metadata is not None:
+            arguments['metadata'] = metadata
+        server = create_server(artifacts, REVIEWER_ROLE)
+        async with Client(server) as client:
+            return await client.call_tool('submit_review_verdict', arguments)
+
+    @staticmethod
+    def _envelope_path(artifacts: TaskArtifacts) -> Path:
+        return artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json'
+
+    @pytest.mark.asyncio
+    async def test_the_quoted_summary_lands_verbatim(self, artifacts: TaskArtifacts):
+        """(a) The finding survives, tags and all."""
+        await self._submit(artifacts, QUOTED_SUMMARY, {MARKUP_OVERRIDE_KEY: True})
+
+        envelope = artifacts.read_verdict(REVIEWER_ROLE)
+        assert envelope is not None
+        assert envelope['verdict']['summary'] == QUOTED_SUMMARY
+
+    @pytest.mark.asyncio
+    async def test_the_same_call_without_the_flag_is_still_refused(
+        self, artifacts: TaskArtifacts
+    ):
+        """(b) Otherwise the row above would prove nothing about the flag."""
+        with pytest.raises(ToolError) as excinfo:
+            await self._submit(artifacts, QUOTED_SUMMARY, None)
+
+        payload = json.loads(str(excinfo.value))
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == 'summary'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is None
+
+    @pytest.mark.asyncio
+    async def test_the_flag_is_never_written_to_the_envelope(
+        self, artifacts: TaskArtifacts
+    ):
+        """(d) Write-time-only CONTROL: it reaches no tool body, so no artifact.
+
+        Checked over the whole document rather than one key, because the
+        envelope nests the payload and an absent top-level key would say
+        nothing about what is under ``verdict``.
+        """
+        await self._submit(
+            artifacts, CLEAN_SUMMARY, {MARKUP_OVERRIDE_KEY: True, 'note': 'x'}
+        )
+
+        text = self._envelope_path(artifacts).read_text(encoding='utf-8')
+        assert MARKUP_OVERRIDE_KEY not in text
+        assert 'metadata' not in text
+
+    @pytest.mark.asyncio
+    async def test_the_flag_changes_nothing_else_in_the_envelope(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """(c) Stronger than a missing key: the two documents are the same.
+
+        ``emitted_at`` is the one field that legitimately differs between two
+        runs, so it is dropped from both sides — everything else, including
+        the schema version and the whole nested payload, must match.
+        """
+        await self._submit(artifacts, CLEAN_SUMMARY, {MARKUP_OVERRIDE_KEY: True})
+        with_flag = json.loads(self._envelope_path(artifacts).read_text('utf-8'))
+
+        other = TaskArtifacts(tmp_path / 'baseline')
+        other.init('test-1', 'Test task', 'A test')
+        await self._submit(other, CLEAN_SUMMARY, None)
+        without = json.loads(self._envelope_path(other).read_text('utf-8'))
+
+        assert with_flag.pop('emitted_at')
+        assert without.pop('emitted_at')
+        assert with_flag == without
 
 
 # ---------------------------------------------------------------------------

@@ -524,15 +524,47 @@ class TestDeliberateQuotingOverride:
     dispatch rather than forwarded as an unexpected argument.
     """
 
+    #: The rationale every row below sends alongside its decision. Clean, so
+    #: only the decision is ever the subject of a refusal.
+    _RATIONALE = 'Quoting the literals is the subject of the plan.'
+
+    #: A decision carrying NO markup at all. The byte-identity row needs two
+    #: calls whose only difference is the flag, which means the prose must not
+    #: be something the guard would treat differently in the two runs.
+    _CLEAN_DECISION = 'Register the guard at the boundary, not in each tool.'
+
+    @staticmethod
+    async def _plan_bytes_after(root: Path, metadata: dict[str, Any] | None) -> bytes:
+        """Seed a plan, add one CLEAN decision, and return the file's bytes.
+
+        A fresh artifacts root per call, because the two runs this feeds must
+        differ in the flag and in nothing else — including document history.
+        """
+        artifacts = TaskArtifacts(root)
+        artifacts.init('test-1', 'Test task', 'A test')
+        harness = Harness(artifacts)
+        await harness.seed_plan()
+
+        arguments: dict[str, Any] = {
+            'decision': TestDeliberateQuotingOverride._CLEAN_DECISION,
+            'rationale': TestDeliberateQuotingOverride._RATIONALE,
+        }
+        if metadata is not None:
+            arguments['metadata'] = metadata
+        await harness.call('add_design_decision', arguments)
+
+        return harness.plan_bytes()
+
     @pytest.mark.asyncio
     async def test_the_quoted_decision_lands_verbatim(self, harness: Harness):
+        """(a) The hatch works — now on the branch the declaration selects."""
         await harness.seed_plan()
 
         await harness.call(
             'add_design_decision',
             {
                 'decision': QUOTED_DECISION,
-                'rationale': 'Quoting the literals is the subject of the plan.',
+                'rationale': self._RATIONALE,
                 'metadata': {MARKUP_OVERRIDE_KEY: True},
             },
         )
@@ -541,6 +573,107 @@ class TestDeliberateQuotingOverride:
         assert stored['decision'] == QUOTED_DECISION
         assert 'metadata' not in stored, (
             'the override is write-time-only control, never payload'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_same_call_without_the_flag_is_still_refused(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(b) Without it, (a) would prove nothing: the guard must still bite.
+
+        Driven through the residue rig rather than the bare harness because
+        this decision is UNREPAIRABLE — its tail does not parse — so the call
+        files residue, and the rig is this suite's way of keeping that in a
+        fake queue.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision',
+            {'decision': QUOTED_DECISION, 'rationale': self._RATIONALE},
+        )
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == 'decision'
+        assert rig.harness.plan()['design_decisions'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_flag_changes_not_one_byte_of_the_document(self, tmp_path):
+        """(c) Byte-identity, which is stronger than ``'metadata' not in``.
+
+        A key absent from the record it was sent with says nothing about the
+        rest of the document; identical bytes say the flag left no trace
+        anywhere in it.
+        """
+        without = await self._plan_bytes_after(tmp_path / 'without', None)
+
+        with_flag = await self._plan_bytes_after(
+            tmp_path / 'with', {MARKUP_OVERRIDE_KEY: True}
+        )
+
+        assert with_flag == without
+
+    @pytest.mark.asyncio
+    async def test_the_flag_beside_another_key_no_longer_raises(
+        self, harness: Harness
+    ):
+        """(e) The sharp edge the declaration removes.
+
+        On a metadata-less tool ``_apply_override`` strips the flag and leaves
+        whatever else the caller sent, so a second key reached pydantic as an
+        unexpected argument and the caller was bounced a second time, with no
+        working way out. A declared parameter accepts the whole map.
+        """
+        await harness.seed_plan()
+
+        await harness.call(
+            'add_design_decision',
+            {
+                'decision': QUOTED_DECISION,
+                'rationale': self._RATIONALE,
+                'metadata': {MARKUP_OVERRIDE_KEY: True, 'note': 'ignored payload'},
+            },
+        )
+
+        assert harness.plan()['design_decisions'][-1]['decision'] == QUOTED_DECISION
+
+    @pytest.mark.asyncio
+    async def test_the_leftover_key_is_REPORTED_not_silently_dropped(
+        self, harness: Harness, caplog
+    ):
+        """The other half of (e): removing an error must not remove the signal.
+
+        The pydantic bounce was wrong as a RESPONSE and right as a REPORT — a
+        caller sending payload keys a tool does not own has a bug, and the one
+        thing worse than being bounced for it is having it silently discarded.
+        The decorator is the only place that residue exists, so it is the only
+        place that can say so, and it names KEYS only — the same names-only
+        convention ``_emit_fact`` and ``_forward`` already hold to.
+        """
+        await harness.seed_plan()
+        secret = 'THIS VALUE IS THE CALLER PAYLOAD'
+
+        with caplog.at_level(logging.WARNING, logger='shared.mcp_markup_middleware'):
+            await harness.call(
+                'add_design_decision',
+                {
+                    'decision': self._CLEAN_DECISION,
+                    'rationale': self._RATIONALE,
+                    'metadata': {MARKUP_OVERRIDE_KEY: True, 'note': secret},
+                },
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('note' in message for message in warnings), (
+            f'the leftover metadata key vanished without a word: {warnings}'
+        )
+        assert any('add_design_decision' in message for message in warnings), (
+            'a residue report that does not name the tool is not actionable'
+        )
+        assert not any(secret in message for message in warnings), (
+            'names only — the report must not become a second copy of the '
+            "caller's payload"
         )
 
 
