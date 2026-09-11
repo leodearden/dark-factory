@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -1086,6 +1087,76 @@ class TestConsecutiveDegradedAlarm:
         assert kwargs['project_id'] == 'p'
         assert kwargs['project_root'] == '/x'
         assert 'corpus-failed' in kwargs['last_justification']
+
+
+class TestStartupSelfCheck:
+    """Part D: notice an unresolvable backend binary at startup, not five days in.
+
+    The 2026-08-13 outage was diagnosable from the first curation — the binary
+    simply was not there. What it lacked was anyone asking. The check runs once
+    at construction-time wiring and reports; it must never refuse to construct
+    or raise, because the interceptor's enclosing `except Exception` would
+    swallow the refusal and disable dedupe outright — the same outage, arrived
+    at by a shorter road.
+    """
+
+    @staticmethod
+    def _curator_with_escalator():
+        escalator = AsyncMock()
+        escalator.report_backend_binary_unresolvable = AsyncMock(return_value=None)
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, escalator=escalator,
+        )
+        return curator, escalator
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_binary_reports_and_does_not_raise(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+        # Construction itself must survive an unusable environment.
+        curator, escalator = self._curator_with_escalator()
+
+        with caplog.at_level(logging.ERROR):
+            ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is False
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'an unresolvable curator backend must be loud'
+
+        escalator.report_backend_binary_unresolvable.assert_awaited_once()
+        kwargs = escalator.report_backend_binary_unresolvable.await_args.kwargs
+        assert kwargs['project_id'] == 'p'
+        assert kwargs['project_root'] == '/x'
+        assert kwargs['binary_spec'] == str(tmp_path / 'no-such-claude')
+        assert kwargs['search_path'] == os.environ.get('PATH')
+
+    @pytest.mark.asyncio
+    async def test_resolvable_binary_logs_absolute_path_and_stays_quiet(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        binary = tmp_path / 'claude'
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o755)
+        monkeypatch.setenv('CLAUDE_BINARY', str(binary))
+
+        curator, escalator = self._curator_with_escalator()
+        with caplog.at_level(logging.INFO):
+            ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is True
+        escalator.report_backend_binary_unresolvable.assert_not_awaited()
+        # The absolute path, logged — so the operator confirming a fix reads
+        # the resolution rather than inferring it from silence.
+        assert any(str(binary) in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_escalator_still_returns_false_without_raising(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        assert await curator.startup_self_check(project_id='p', project_root='/x') is False
 
 
 class TestCallLlmNeutralCwd:

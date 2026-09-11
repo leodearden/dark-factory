@@ -16,12 +16,17 @@ from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
 from fused_memory.backends.task_backend_errors import TaskmasterError
-from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.config.schema import (
+    CuratorConfig,
+    FusedMemoryConfig,
+    TaskmasterConfig,
+)
 from fused_memory.middleware import scope_violation_escalator as sve_mod
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     RewrittenTask,
+    TaskCurator,
     is_combine_eligible_status,
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -6061,6 +6066,39 @@ async def test_update_task_accepts_manifest_file(taskmaster, reconciler, event_b
         f'rejected as a directory lock; got {result}'
     )
     taskmaster.update_task.assert_called_once()
+
+
+# ── Curator startup self-check wiring (task 4448) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_curator_schedules_startup_self_check(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """The self-check is only worth having if something actually runs it.
+
+    Scheduled as a background task, alongside the backfill check, so a curator
+    construction is never delayed by a PATH lookup — and so a self-check that
+    somehow misbehaves cannot take add_task down with it.
+    """
+    cfg = FusedMemoryConfig()
+    cfg.taskmaster = TaskmasterConfig(project_root=str(tmp_path))
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+    self_check = AsyncMock(return_value=True)
+    with patch.object(TaskCurator, 'startup_self_check', new=self_check), \
+         patch.object(
+             type(interceptor), '_maybe_backfill_corpus', new=AsyncMock(return_value=None),
+         ):
+        curator = await interceptor._get_curator()
+        assert curator is not None
+        while interceptor._background_tasks:
+            await asyncio.gather(*list(interceptor._background_tasks))
+
+    self_check.assert_awaited_once()
+    kwargs = self_check.await_args.kwargs
+    args = self_check.await_args.args
+    assert (kwargs.get('project_root') or args[-1]) == str(tmp_path)
 
 
 # ── Tests for background task retention (step-3) ───────────────────────────
