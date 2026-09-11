@@ -114,6 +114,7 @@ Description=Clean Service
 [Service]
 Type=simple
 Environment=MEM0_TELEMETRY=false
+Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
 Restart=on-failure
