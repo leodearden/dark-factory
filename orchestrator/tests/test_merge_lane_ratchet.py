@@ -2498,28 +2498,60 @@ class TestBaselineIsNotVacuous:
         assert committed_baseline['enumeration']['complete'] is True
         assert committed_baseline['enumeration']['unreadable'] == []
 
+    def test_the_committed_enumeration_holds_no_test_tree_path_list(
+        self, committed_baseline: dict
+    ) -> None:
+        # THE HEADLINE SIGNAL, asserted against the real committed bytes rather
+        # than a synthetic report: no per-path test-tree manifest and no
+        # test-tree number reach the file, so churn under orchestrator/tests
+        # cannot move a single byte of it.
+        enumeration = committed_baseline['enumeration']
+        assert 'test_tree' not in enumeration
+        cluster = set(metrics.CLUSTER_PATHS)
+        for key, value in enumeration.items():
+            if not isinstance(value, list):
+                continue
+            strays = [
+                entry for entry in value
+                if isinstance(entry, str)
+                and entry.startswith('orchestrator/tests/')
+                and entry not in cluster
+            ]
+            assert strays == [], f'{key} froze {len(strays)} test-tree path(s)'
+
+    def test_the_committed_enumeration_still_names_the_whole_cluster(
+        self, committed_baseline: dict
+    ) -> None:
+        # ANTI-VACUITY for the test above, which an empty block would satisfy
+        # just as happily. Measured 22 resolved paths from 23 CLUSTER_PATHS
+        # entries (merge_lane/** expands to zero until PRD task zeta1).
+        enumeration = committed_baseline['enumeration']
+        assert enumeration['requested'] == list(metrics.CLUSTER_PATHS)
+        assert len(enumeration['resolved']) >= 15
+
     def test_the_live_sweep_denominator_covers_the_whole_test_tree(
         self, live_report: dict
     ) -> None:
-        """The FLOOR that replaces the full manifest the baseline no longer stores.
+        """The FLOOR that stands in for the manifest the baseline never stores.
 
-        `render_baseline` narrows `enumeration.requested` to lane-relevant paths
-        before committing it (esc-5021-7), so the committed file no longer
-        witnesses that the sweep walked the whole test tree. That evidence moves
-        HERE, as a one-sided floor on the LIVE measurement -- the idiom this
-        module already uses for every live-tree anchor (commit d54acca456,
+        The committed file carries the CLUSTER half of the enumeration only, so
+        nothing in it witnesses that the sweep walked the whole test tree
+        (esc-5021-7, and see `_stored_enumeration` for why the counts are not
+        stored either). This is the SOLE remaining guard against a collapsed
+        sweep quietly disarming the two test-suite measures: if the sweep stopped
+        walking, `tests` would shrink, every per-path measure in it would vanish,
+        and the ratchet would go green on a cluster nobody looked at -- a fall
+        being permitted is exactly what makes that invisible to the comparator.
+
+        A floor on a COUNT, not an equality, is the whole point: it catches the
+        collapse while staying green when an unrelated task adds one test file,
+        which is the churn that made this gate a hair trigger. Measured 568 .py
+        files under orchestrator/tests; the floor sits far below that so it
+        survives ordinary attrition rather than tracking the tree -- the idiom
+        this module uses for every live-tree anchor (commit d54acca456,
         "live-tree anchors become floors, not exact pins").
-
-        A floor, not an equality, is the whole point: it catches a COLLAPSED
-        sweep (the failure that would let the stored list silently shrink) while
-        staying green when an unrelated task adds one test file -- which is the
-        churn that made this a hair trigger in the first place. Measured 583
-        paths under orchestrator/tests; the floor sits far below that so it
-        survives ordinary attrition rather than tracking the tree.
         """
-        requested = live_report['enumeration']['requested']
-        swept = [p for p in requested if p.startswith('orchestrator/tests/')]
-        assert len(swept) >= 400, len(swept)
+        assert live_report['enumeration']['test_tree']['requested'] >= 400
 
 
 def test_baseline_matches_a_fresh_measurement(live_report: dict) -> None:
