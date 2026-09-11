@@ -71,9 +71,11 @@ corpus baseline the comparison depends on.
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import Path
 
 __all__ = [
     'ShadowShape',
+    'build_live_fixture',
 ]
 
 
@@ -108,3 +110,45 @@ class ShadowShape(StrEnum):
         stray plan be silently ignored.
         """
         return self in (ShadowShape.IMPLEMENTER, ShadowShape.ARCHITECT_CONSEQUENCE)
+
+
+def build_live_fixture(
+    task: dict,
+    *,
+    base_sha: str,
+    project_root: Path | str,
+    plan: dict | None,
+    verify_commands: dict[str, str],
+    shape: str,
+    cell_id: str,
+) -> dict:
+    """Render the LIVE *task* as an eval fixture pinned at *base_sha*.
+
+    Returns a dict accepted unchanged by ``runner.load_task``'s consumers.
+    The eight emitted keys and every deliberate omission are tabled in the
+    module docstring; the builder reads nothing but these arguments.
+
+    *base_sha* is the task's ``metadata.branch_base_sha`` — the commit the
+    production worktree was cut from, and the commit the shadow cell's own
+    worktree is created at, so the two runs start from the same tree.
+
+    *plan* is production's accepted plan for the ``implementer`` shape and the
+    candidate architect's for consequence leg 2; the two live-architect shapes
+    take ``None``. *cell_id* is the ``shadow_cells`` row's ulid, which makes
+    the fixture id unique across the cells opened for one task.
+    """
+    metadata = task.get('metadata') or {}
+    return {
+        'id': f'shadow_{task.get("id")}_{cell_id}',
+        'name': str(task.get('title') or ''),
+        'project_root': project_root,
+        'pre_task_commit': base_sha,
+        'task_definition': {
+            'title': str(task.get('title') or ''),
+            'description': str(task.get('description') or ''),
+            'details': str(task.get('details') or ''),
+        },
+        'verify_commands': verify_commands,
+        'modules': metadata.get('modules') or [],
+        'plan': plan,
+    }
