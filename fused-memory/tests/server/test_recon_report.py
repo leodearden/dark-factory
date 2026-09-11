@@ -4229,6 +4229,166 @@ class TestReconReportSupersedes:
 
 
 # ---------------------------------------------------------------------------
+# task-4653 consumer (1): the flagged_items projection.  A superseded finding
+# stays READABLE in the report but is neutered as an instruction.
+# ---------------------------------------------------------------------------
+
+
+class TestSupersededFindingProjection:
+    """get_assembled_report surfaces superseded_by and forces actionable False
+    on a superseded row, while get_findings_for_run stays raw.
+
+    The neuter is projection-only: the stored _Finding keeps its own
+    actionable value, so re-reads are idempotent and cite_* resolution is
+    unaffected.
+    """
+
+    def _build_state(self):
+        from unittest.mock import AsyncMock
+
+        from fused_memory.server.recon_report import ReconReportState
+
+        task_interceptor = AsyncMock()
+        task_interceptor.get_task = AsyncMock(return_value={
+            'title': 'Task from reify project',
+            'data': {},
+        })
+        state = ReconReportState(
+            ttl_seconds=3600,
+            clock=lambda: 0.0,
+            task_interceptor=task_interceptor,
+        )
+        state.known_projects['reify'] = '/tmp/reify'
+        return state
+
+    def _file(self, state, run_id, flag_type, supersedes=None, actionable=True):
+        added = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='c',
+            description=f'finding {flag_type}',
+            suggested_action='a',
+            actionable=actionable,
+            task_id='42',
+            flag_type=flag_type,
+            supersedes=supersedes,
+        )
+        assert 'finding_id' in added, f'add_finding failed: {added}'
+        return added['finding_id']
+
+    def test_unsuperseded_finding_projects_superseded_by_none(self):
+        """The key is ALWAYS present, matching standing_decision_id."""
+        state = self._build_state()
+        state.start_report('r1', 's1', 'dark_factory')
+        fid = self._file(state, 'r1', 'f')
+
+        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        (item,) = [i for i in items if i['finding_id'] == fid]
+        assert 'superseded_by' in item
+        assert item['superseded_by'] is None
+
+    def test_superseded_finding_stays_readable_but_is_neutered(self):
+        state = self._build_state()
+        state.start_report('r1', 's1', 'dark_factory')
+        old_fid = self._file(state, 'r1', 'memory_mechanism_contradiction', actionable=True)
+        new_fid = self._file(
+            state, 'r1', 'memory_mechanism_contradiction_resolved', supersedes=old_fid
+        )
+
+        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        by_id = {i['finding_id']: i for i in items}
+        assert old_fid in by_id, 'the superseded claim must stay readable in the report'
+        assert by_id[old_fid]['superseded_by'] == new_fid
+        assert by_id[old_fid]['actionable'] is False
+        assert by_id[new_fid]['superseded_by'] is None
+        assert by_id[new_fid]['actionable'] is True
+
+    def test_neuter_is_projection_only_and_idempotent(self):
+        state = self._build_state()
+        state.start_report('r1', 's1', 'dark_factory')
+        old_fid = self._file(state, 'r1', 'memory_mechanism_contradiction', actionable=True)
+        self._file(state, 'r1', 'memory_mechanism_contradiction_resolved', supersedes=old_fid)
+
+        state.get_assembled_report('r1', 's1')
+        _e, stored = state._resolve_finding('r1', old_fid)
+        assert stored.actionable is True, 'the neuter must not write back to the stored row'
+
+        # Second read agrees with the first.
+        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        (item,) = [i for i in items if i['finding_id'] == old_fid]
+        assert item['actionable'] is False
+
+    def test_get_findings_for_run_exposes_the_pointer_without_neutering(self):
+        """That method's raw/no-suppression contract must hold: it surfaces
+        superseded_by and deliberately does not act on it."""
+        state = self._build_state()
+        state.start_report('r1', 's1', 'dark_factory')
+        old_fid = self._file(state, 'r1', 'memory_mechanism_contradiction', actionable=True)
+        new_fid = self._file(
+            state, 'r1', 'memory_mechanism_contradiction_resolved', supersedes=old_fid
+        )
+
+        rows = {f['finding_id']: f for f in state.get_findings_for_run('r1')}
+        assert rows[old_fid]['superseded_by'] == new_fid
+        assert rows[old_fid]['actionable'] is True
+        assert rows[new_fid]['superseded_by'] is None
+
+    @pytest.mark.asyncio
+    async def test_neuter_runs_after_the_stage1_echo_check(self):
+        """Ordering guard.  A superseded finding whose citations trace
+        EXCLUSIVELY to a same-run Stage-1 finding must STILL be projected.
+
+        _traces_exclusively_to_stage1's first necessary condition is
+        actionable is False.  Neutering BEFORE that check would newly satisfy
+        it and DELETE the row from flagged_items — destroying exactly the
+        readability supersession exists to preserve.
+        """
+        state = self._build_state()
+        run_id = 'r4653-ordering'
+
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r1 = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage 1 finding about reify/3803', suggested_action='act',
+            actionable=False, task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r1, r1
+        await state.cite_task(
+            run_id=run_id, finding_id=r1['finding_id'], project_id='reify', task_id='3803'
+        )
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r2 = state.add_finding(
+            run_id=run_id, severity='high', category='cross_project',
+            description='Stage 2 actionable finding about reify/3803',
+            suggested_action='Fix this', actionable=True,
+            task_id=None, flag_type='stale_edge',
+        )
+        assert 'error' not in r2, r2
+        echoing_fid = r2['finding_id']
+        await state.cite_task(
+            run_id=run_id, finding_id=echoing_fid, project_id='reify', task_id='3803'
+        )
+
+        r3 = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='and now it is resolved', suggested_action='none',
+            actionable=True, task_id=None, flag_type='stale_edge_resolved',
+            supersedes=echoing_fid,
+        )
+        assert 'error' not in r3, r3
+
+        items = state.get_assembled_report(run_id, 'task_knowledge_sync')['flagged_items']
+        by_id = {i['finding_id']: i for i in items}
+        assert echoing_fid in by_id, (
+            'a superseded finding must not become newly eligible for the Fix-1 '
+            f'stage-1 echo drop; flagged_items: {sorted(by_id)}'
+        )
+        assert by_id[echoing_fid]['superseded_by'] == r3['finding_id']
+        assert by_id[echoing_fid]['actionable'] is False
+
+
+# ---------------------------------------------------------------------------
 # task-2410 step-7: delete_finding registered via FastMCP — RED until
 # step-8 registers the @mcp.tool() delegate.
 # ---------------------------------------------------------------------------
