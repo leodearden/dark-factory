@@ -541,6 +541,77 @@ class TestConsecutiveDegradedEscalation:
         assert any('proj-x' in r.getMessage() for r in errors)
 
 
+class TestBackendBinaryUnresolvableEscalation:
+    """The curator's backend binary does not resolve — a total, not partial, outage.
+
+    Every curation will degrade to create, for every project, until someone
+    changes the environment. That is a config break, not a flaky candidate, so
+    it carries its own category and its own remediation rather than arriving as
+    one more generic curator failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queues_one_escalation_with_remediation(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_backend_binary_unresolvable(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                binary_spec='claude',
+                search_path='/usr/bin:/bin',
+            )
+
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1
+            body = files[0].read_text()
+            assert 'curator_backend_binary_unresolvable' in body
+            assert '"level": 1' in body
+            assert '"severity": "blocking"' in body
+            assert 'claude' in body
+            assert '/usr/bin:/bin' in body
+            # An operator reading this must not have to derive the fix.
+            assert 'CLAUDE_BINARY' in body
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_bypasses_burst_suppression(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(4):
+                await escalator.report_backend_binary_unresolvable(
+                    project_root=str(tmp_path),
+                    project_id='proj-x',
+                    binary_spec='claude',
+                    search_path='/usr/bin:/bin',
+                )
+
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 4
+            assert escalator._failure_log == {}
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_logs_and_does_not_raise(self, tmp_path, caplog):
+        """Raising here would break the curator's fail-open contract at startup."""
+        escalator = CuratorEscalator()
+        with caplog.at_level(logging.ERROR):
+            await escalator.report_backend_binary_unresolvable(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                binary_spec='claude',
+                search_path='/usr/bin:/bin',
+            )
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a dropped alarm must still be loud in the log'
+        assert any('claude' in r.getMessage() for r in errors)
+
+
 class TestBurstLogCompositeKey:
     """Lever 2b — different subtypes for the same project are counted
     independently, so an error_max_budget_usd trip doesn't absorb burst
