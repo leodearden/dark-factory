@@ -1,9 +1,10 @@
 """Tests for the token-budget context assembler."""
 
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -924,4 +925,234 @@ async def test_ctx_task_event_logs_warning_when_memory_search_fails_for_hint_que
     assert record.exc_info is not None, 'Expected exc_info to be set on the WARNING record'
     assert record.exc_info[0] is RuntimeError, (
         f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
+    )
+
+
+# ── Task-3212: memory_hints executions are journalled ───────────────
+#
+# Before this change the `for query in queries[:3]` loop in `_ctx_task_event`
+# executed real searches and journalled NOTHING, so the entire memory_hints
+# read path was invisible to leaf eta's write-after-miss metric (task 3213).
+# `source` marks these rows as reconciliation-originated so they are
+# distinguishable from the MCP boundary's `mcp_tool` rows.
+
+_HINT_JOURNAL_SOURCE = 'reconciliation_hint'
+
+_LONG_HINT_QUERY = 'auth implementation decisions ' + ('x' * 250)
+
+
+@pytest_asyncio.fixture
+async def hint_journal(tmp_path):
+    from fused_memory.services.write_journal import WriteJournal
+
+    j = WriteJournal(tmp_path / 'wj_hints')
+    await j.initialize()
+    yield j
+    await j.close()
+
+
+def _hint_task(*queries: str, task_id: str = '42') -> dict:
+    return {
+        'id': task_id,
+        'title': 'Implement auth',
+        'status': 'done',
+        'dependencies': [],
+        'metadata': {
+            'memory_hints': {
+                'queries': list(queries),
+                'entities': ['AuthService'],
+            },
+        },
+    }
+
+
+async def _search_rows(journal) -> list[dict]:
+    rows = await journal.get_ops_since('1970-01-01T00:00:00+00:00', limit=500, kind='read')
+    return [r for r in rows if r['operation'] == 'search']
+
+
+async def _assemble_task_event(assembler, task_id: str = '42'):
+    return await assembler.assemble(
+        [
+            _make_event(
+                event_type=EventType.task_status_changed,
+                payload={'task_id': task_id, 'old_status': 'in-progress', 'new_status': 'done'},
+            ),
+        ],
+        _make_watermark(),
+        'test-project',
+    )
+
+
+@pytest.mark.asyncio
+async def test_hint_execution_journals_one_row_per_query(
+    mock_memory, mock_taskmaster, hint_journal,
+):
+    """(a)+(d) One `write_ops` row per EXECUTED hint query, marked as a recon read."""
+    mock_taskmaster.get_task = AsyncMock(
+        return_value=_hint_task(_LONG_HINT_QUERY, 'second hint query'),
+    )
+    mock_memory.search = AsyncMock(
+        return_value=[_make_memory_result('first'), _make_memory_result('second')],
+    )
+    mock_memory.write_journal = hint_journal
+
+    await _assemble_task_event(_make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster,
+    ))
+
+    rows = await _search_rows(hint_journal)
+    assert len(rows) == 2, (
+        'RED: hint execution journals NOTHING today — expected one search row per '
+        f'executed hint query (2), got {len(rows)}'
+    )
+    for row in rows:
+        assert row['kind'] == 'read', f"Expected kind='read', got {row['kind']!r}"
+        assert row['operation'] == 'search', (
+            f"Expected operation='search', got {row['operation']!r}"
+        )
+        assert row['source'] == _HINT_JOURNAL_SOURCE, (
+            'RED: a hint row must be distinguishable from an mcp_tool row; expected '
+            f'source={_HINT_JOURNAL_SOURCE!r}, got {row["source"]!r}'
+        )
+        assert row['project_id'] == 'test-project', (
+            f"Expected project_id='test-project', got {row['project_id']!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_hint_execution_journals_widened_result_summary(
+    mock_memory, mock_taskmaster, hint_journal,
+):
+    """(b) The row carries the SAME widened shape the MCP path emits."""
+    from fused_memory.services.read_telemetry import (
+        SEARCH_TELEMETRY_SCHEMA_VERSION,
+        SEARCH_TELEMETRY_SIZE_UNIT,
+    )
+
+    results = [_make_memory_result('alpha content'), _make_memory_result('beta')]
+    mock_taskmaster.get_task = AsyncMock(return_value=_hint_task('only hint'))
+    mock_memory.search = AsyncMock(return_value=results)
+    mock_memory.write_journal = hint_journal
+
+    await _assemble_task_event(_make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster,
+    ))
+
+    rows = await _search_rows(hint_journal)
+    assert len(rows) == 1, f'RED: expected exactly 1 hint search row, got {len(rows)}'
+    summary = json.loads(rows[0]['result_summary'])
+    assert summary['schema_version'] == SEARCH_TELEMETRY_SCHEMA_VERSION, (
+        'RED: hint rows must carry the versioned telemetry shape'
+    )
+    assert summary['size_unit'] == SEARCH_TELEMETRY_SIZE_UNIT, (
+        f"RED: expected size_unit={SEARCH_TELEMETRY_SIZE_UNIT!r}, got {summary.get('size_unit')!r}"
+    )
+    assert summary['count'] == 2, f"RED: expected count=2, got {summary.get('count')!r}"
+    logged_ids = [entry['id'] for entry in summary['results']]
+    assert logged_ids == [r.id for r in results], (
+        'RED: leaf eta needs per-result IDs to answer "was the agent SHOWN this?"; '
+        f'expected {[r.id for r in results]}, got {logged_ids}'
+    )
+    assert [entry['content_size'] for entry in summary['results']] == [
+        len(r.content) for r in results
+    ], 'RED: per-result content sizes missing from the hint row'
+    assert all(entry['relevance_score'] == 0.8 for entry in summary['results']), (
+        'RED: per-result relevance scores missing from the hint row'
+    )
+
+
+@pytest.mark.asyncio
+async def test_hint_execution_journals_full_query_and_caller_task_id(
+    mock_memory, mock_taskmaster, hint_journal,
+):
+    """(c) `params` carries the UNTRUNCATED hint query and the task id that asked."""
+    mock_taskmaster.get_task = AsyncMock(
+        return_value=_hint_task(_LONG_HINT_QUERY, task_id='3212'),
+    )
+    mock_memory.search = AsyncMock(return_value=[_make_memory_result()])
+    mock_memory.write_journal = hint_journal
+
+    await _assemble_task_event(
+        _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster),
+        task_id='3212',
+    )
+
+    rows = await _search_rows(hint_journal)
+    assert len(rows) == 1, f'RED: expected exactly 1 hint search row, got {len(rows)}'
+    params = json.loads(rows[0]['params'])
+    assert len(_LONG_HINT_QUERY) > 200, 'fixture guard: the query must exceed the old 200-char cap'
+    assert params['query'] == _LONG_HINT_QUERY, (
+        'RED: the hint query must be journalled in full — a truncated query cannot be '
+        'matched against a later write'
+    )
+    assert params['caller_task_id'] == '3212', (
+        'RED: the event task id is the one identity in scope at this site; without it '
+        f'the row is unattributable. Got {params.get("caller_task_id")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_hints_writes_no_search_rows(mock_memory, mock_taskmaster, hint_journal):
+    """(e) A task without memory_hints executes no searches and journals nothing."""
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={'id': '42', 'title': 'No hints', 'status': 'done', 'dependencies': []},
+    )
+    mock_memory.write_journal = hint_journal
+
+    await _assemble_task_event(_make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster,
+    ))
+
+    rows = await _search_rows(hint_journal)
+    assert rows == [], f'Expected no search rows when memory_hints is absent, got {len(rows)}'
+
+
+@pytest.mark.asyncio
+async def test_hint_execution_survives_journal_failure(mock_memory, mock_taskmaster):
+    """(f) A journalling fault must never cost the caller its hint results."""
+    hit = _make_memory_result('still returned')
+    mock_taskmaster.get_task = AsyncMock(return_value=_hint_task('one hint'))
+    mock_memory.search = AsyncMock(return_value=[hit])
+    broken = MagicMock()
+    broken.log_write_op = AsyncMock(side_effect=RuntimeError('journal down'))
+    mock_memory.write_journal = broken
+
+    result = await _assemble_task_event(_make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster,
+    ))
+
+    assert len(result.events) == 1, 'Expected the event to assemble despite a journal fault'
+    assert 'task:42' in result.context_items, 'Expected the task context item to survive'
+    assert hit.id in result.context_items, (
+        'RED: the hint ContextItems must survive a journalling fault; journalling is '
+        f'telemetry, not the caller\'s result. Got {list(result.context_items.keys())}'
+    )
+    assert broken.log_write_op.await_count == 1, (
+        'Expected the journal write to have actually been attempted'
+    )
+
+
+@pytest.mark.asyncio
+async def test_hint_journalling_does_not_lift_the_three_query_cap(
+    mock_memory, mock_taskmaster, hint_journal,
+):
+    """(g) The pre-existing `queries[:3]` cap still bounds executions AND rows."""
+    mock_taskmaster.get_task = AsyncMock(
+        return_value=_hint_task('q1', 'q2', 'q3', 'q4', 'q5'),
+    )
+    mock_memory.search = AsyncMock(return_value=[_make_memory_result()])
+    mock_memory.write_journal = hint_journal
+
+    await _assemble_task_event(_make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster,
+    ))
+
+    rows = await _search_rows(hint_journal)
+    assert len(rows) == 3, (
+        'RED: journalling must not silently lift the existing queries[:3] cap; '
+        f'expected 3 rows for 5 hint queries, got {len(rows)}'
+    )
+    assert [json.loads(r['params'])['query'] for r in rows] == ['q1', 'q2', 'q3'], (
+        'Expected the first three hint queries only'
     )
