@@ -82,6 +82,7 @@ from fused_memory.services.memory_metadata_census import (
     emit_schema_warnings,
     file_unknown_key_storm_escalation,
 )
+from fused_memory.services.read_telemetry import summarize_search_results
 from fused_memory.services.topic_anchor import (
     _ANCHOR_SCROLL_LIMIT,
     _MAX_ANCHOR_TOPICS,
@@ -2793,6 +2794,21 @@ class MemoryService:
     def set_write_journal(self, journal: WriteJournal) -> None:
         """Wire the write journal for durable auditing."""
         self._write_journal = journal
+
+    @property
+    def write_journal(self) -> WriteJournal | None:
+        """The wired journal, or None — a supported accessor for out-of-package readers.
+
+        ``reconciliation/context_assembler.py`` journals its memory_hints
+        executions (task 3212 item 3) and has no journal of its own: it receives
+        only (memory_service, taskmaster, config, project_root), and adding a
+        fifth constructor parameter would break six
+        ``fake_assembler_factory(...)`` stubs in ``tests/test_harness.py``.
+        This read-only property is the smallest honest alternative to reaching
+        across the package boundary into ``_write_journal``.  None means
+        unwired, which callers treat as "skip journalling", never as an error.
+        """
+        return self._write_journal
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -7197,6 +7213,23 @@ class MemoryService:
 
         # Log search when causation_id is present (recon paths)
         if causation_id and self._write_journal:
+            # The SECOND producer of the shape whose single home is
+            # fused_memory/services/read_telemetry.py::summarize_search_results
+            # (INV-5).  This site summarises the RAW `final` list, unlike the MCP
+            # tool site which summarises the GROUPED payload — correct in both
+            # places, because grouping is applied only at the MCP boundary, so
+            # below it the raw list IS what the caller receives.
+            try:
+                search_summary: dict[str, Any] = summarize_search_results(final)
+            except Exception:
+                # A telemetry fault must never break a search.
+                logger.warning(
+                    'search telemetry FAILED for project=%s; journalling count only',
+                    project_id,
+                    exc_info=True,
+                )
+                search_summary = {'count': len(final)}
+            search_summary['failed_stores'] = [s.value for s in failed_stores]
             await self._write_journal.log_write_op(
                 write_op_id=str(uuid_mod.uuid4()),
                 causation_id=causation_id,
@@ -7206,11 +7239,8 @@ class MemoryService:
                 agent_id=agent_id,
                 session_id=session_id,
                 kind='read',
-                params={'query': query[:200], 'limit': limit},
-                result_summary={
-                    'count': len(final),
-                    'failed_stores': [s.value for s in failed_stores],
-                },
+                params={'query': query, 'limit': limit},
+                result_summary=search_summary,
                 success=not degraded,
             )
 
