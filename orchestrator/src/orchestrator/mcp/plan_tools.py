@@ -637,7 +637,12 @@ def _repair_one_field(
         'tool': _COLLECTION_SCHEMA_TOOL[record.collection],
         'also_written_by': list(record.also_written_by),
         'param': record.field,
-        'pattern': result.pattern,
+        # The GATE's pattern, exactly as the unrepairable arm above publishes
+        # it, so one field cannot carry two semantics depending on whether the
+        # repair happened to succeed. ``result.pattern`` is the same expression
+        # on the same inputs since task 5283; naming the local keeps the two
+        # arms visibly identical rather than identical by coincidence.
+        'pattern': pattern,
         'misclose': result.misclose,
         'outcome': 'repaired',
         # What was recovered AND WRITTEN, versus what the tail declared and this

@@ -895,8 +895,22 @@ class MarkupGuardMiddleware(Middleware):
         The schema read happens HERE and not on the fast path, so the awaited
         ``get_tool`` round-trip is paid only by the 0.26% of calls that
         actually carry a leak.
+
+        ONE PATTERN PER EVENT (task **5283**). *pattern* arrives from
+        :meth:`_first_markup_argument`, which deliberately holds only *param* —
+        it will not pay ``get_tool`` on the 99.7% clean path. Once the schema
+        IS resolved, it is re-derived on the same ``(value, param,
+        schema_params)`` triple :func:`repair` now uses, so ``fix.pattern`` and
+        this local name are the same expression on the same inputs and
+        :meth:`_reject` and :meth:`_forward` need no extra argument to agree.
+        The rebinding is free: it sits past the clean-path gate, beside an
+        awaited round-trip. It can only widen — ``detect_for`` over a superset
+        of needles reports earliest-by-text-position — so it is non-``None``
+        whenever the gate fired, and the ``or pattern`` is a belt-and-braces
+        guard that no measured input reaches.
         """
         properties = await self._schema_properties(context, name)
+        pattern = detect_for(value, param, tuple(properties)) or pattern
         fix = repair(value, param, tuple(properties), tuple(arguments))
 
         # All three emissions sit SIDE BY SIDE, and every one of them runs
@@ -1077,11 +1091,21 @@ class MarkupGuardMiddleware(Middleware):
         escalation's job, on the one path where it would otherwise be lost.
 
         ``pattern`` and ``misclose`` are kept APART on purpose. ``pattern`` is
-        the envelope literal :func:`detect` matched; ``misclose`` is the tag
-        that actually drifted, verbatim, including the blended dialect's stray
-        quote — which is not a literal at all. PRD section 2.2: collapsing them
-        is what left the old guard blaming whatever happened to follow a
-        mis-closed ``description``.
+        the needle :func:`~shared.toolcall_markup.detect_for` matched — the
+        earliest by text position over the fixed literals WIDENED by the
+        parameter's own closer and the tool's schema closers, i.e. the HEAD of
+        the leak (it said ":func:`detect` matched" until task **5283**, which
+        was stale from task 4696 and, on the repaired path, wrong). ``misclose``
+        is the tag that actually drifted, verbatim, including the blended
+        dialect's stray quote — which is not a literal at all. PRD section 2.2:
+        collapsing them is what left the old guard blaming whatever happened to
+        follow a mis-closed ``description``.
+
+        ONE PATTERN PER EVENT. This key and the caller-facing
+        ``matched_pattern`` are now the same expression over the same
+        ``(value, param, schema_params)`` triple — see
+        :meth:`_handle_markup` — so a consumer joining the fact stream to a
+        refusal payload can join on it.
 
         The log line carries the same fields, mirroring ``markup_tripwire``'s
         split: the structured record goes to the operator-facing channel while

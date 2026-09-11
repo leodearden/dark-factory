@@ -410,9 +410,18 @@ class Repair(NamedTuple):
     #: The dropped parameters, name -> value. Empty is a success, not a
     #: refusal — the last-parameter case (PRD boundary row B4) drops nothing.
     recovered: dict[str, str]
-    #: The envelope literal :func:`detect` matched, i.e. the earliest one BY
-    #: TEXT POSITION. Falls back to :attr:`misclose` when the drifted tag is
-    #: not itself a literal and no literal appears anywhere in the value.
+    #: The needle :func:`detect_for` matched for this ``(value, param,
+    #: schema_params)`` triple, i.e. the earliest one BY TEXT POSITION over the
+    #: fixed literals widened by the names the repair itself qualifies on.
+    #: Falls back to :attr:`misclose` when no needle appears anywhere.
+    #:
+    #: ONE PATTERN PER EVENT. Every gate in front of :func:`repair` asks that
+    #: same predicate on those same inputs, so the value published here, the
+    #: fact's ``pattern`` and the caller's ``matched_pattern`` agree BY
+    #: CONSTRUCTION rather than by convention — and all three name the HEAD of
+    #: the leak rather than whatever fixed literal happens to trail it (PRD
+    #: section 2.2). Asking the blanket :func:`detect` here instead is what
+    #: made one event publishable with two answers; see the accept site.
     pattern: str
     #: The wrong closing tag, verbatim as it appeared — including the dialect
     #: blend's stray quote. This is the diagnostic PRD section 2.2 says the
@@ -679,15 +688,33 @@ def repair(
         # unchanged by task 4696: the accept path now pays the WIDENED scan
         # above, and the refuse path still pays neither.
         #
-        # DELIBERATELY the BLANKET predicate, unlike the guard above (4696).
-        # `pattern` below already falls back to `misclose` when no literal is
-        # present, so it ALREADY self-heals for a name outside the literal set
-        # and detect_for here would change no observable value — while making
-        # the blanket/param-aware split at this one site harder to read. It
-        # matters that it keeps its exact current values: Repair.pattern is
-        # what mcp_markup_middleware's _reject and _forward publish as
-        # `matched_pattern`.
-        detected = detect(value)
+        # THE SAME PARAMETER-AWARE PREDICATE the guard above and every gate in
+        # front of this function ask (task 5283). This site used to ask the
+        # blanket `detect`, on the argument that the `misclose` fallback below
+        # "ALREADY self-heals for a name outside the literal set and detect_for
+        # here would change no observable value".
+        #
+        # MEASURED FALSE. Where a fixed literal is present the fallback never
+        # fires, so the two predicates are free to disagree — and they do.
+        # Specimen: prose, the absorbing parameter's own closer, then a
+        # canonical opener naming the swallowed sibling, with param='how' and
+        # schema=('what','where','how'):
+        #
+        #     detect(value)            '\x3cparameter name='   offset 39
+        #     detect_for(value, ...)   the `how` closer        offset 33
+        #
+        # Repair.pattern is published as `matched_pattern` by
+        # mcp_markup_middleware's _reject and _forward and as the repaired
+        # fact's `pattern` by plan_tools, so the disagreement put ONE event on
+        # the wire with TWO answers: the fact stream naming the head of the
+        # leak and the caller's payload naming a literal that merely trails it
+        # — the exact diagnostic defect PRD section 2.2 exists to close.
+        #
+        # detect_for is a strict superset of detect's needle set and reports
+        # earliest-by-text-position, so this can only ever name an earlier-or-
+        # equal literal. The `misclose` fallback is unchanged and still covers
+        # the case where nothing at all is found.
+        detected = detect_for(value, param, schema)
         return Repair(
             clean_value=clean_value,
             recovered=recovered,

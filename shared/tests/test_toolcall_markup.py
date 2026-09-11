@@ -629,14 +629,23 @@ class TestRepairSpecimens:
         assert result.pattern == _CANONICAL_CLOSER
         assert result.misclose == _CANONICAL_CLOSER
 
-    def test_pattern_is_the_envelope_literal_misclose_is_the_wrong_tag(self):
-        """The two fields differ whenever the mis-closed name is not a literal.
+    def test_pattern_names_the_HEAD_of_the_leak_not_the_literal_trailing_it(self):
+        """PRD section 2.2's diagnostic ambiguity, and its resolution.
 
-        PRD section 2.2's diagnostic ambiguity in miniature: ``/rationale`` is
-        a real drift but is not in the literal set, so ``pattern`` reports the
-        envelope literal that actually matched (the trailing invoke closer,
-        earliest by text position among the literals) while ``misclose``
-        reports the tag that actually went wrong.
+        ``/rationale`` is a real drift and is not in the FIXED literal set, so
+        this specimen used to report ``pattern`` as the trailing invoke closer
+        — earliest by text position among the fixed literals, and about 60
+        characters downstream of where the envelope actually starts. That is
+        section 2.2's complaint verbatim: a guard reporting whatever follows.
+
+        MOVED BY TASK 5283 (expectation ``INVOKE_CLOSER`` -> the ``rationale``
+        closer). ``pattern`` is now derived from ``detect_for`` on the same
+        ``(value, param, schema_params)`` triple the candidate qualification
+        above already uses, so it names the earliest needle over the literals
+        WIDENED by those names — here the self-name closer that opens the leak.
+        ``misclose`` is unchanged and still reports the tag that went wrong;
+        the two coincide on this specimen because the head of the leak IS the
+        mis-close, which is the common case rather than a special one.
         """
         clean = 'Because the split is calibrated in opposite directions.'
         value = (
@@ -656,7 +665,11 @@ class TestRepairSpecimens:
         assert result is not None
         assert_repair_invariants(value, result)
         assert result.misclose == _closer('rationale')
-        assert result.pattern == INVOKE_CLOSER
+        assert result.pattern == _closer('rationale')
+        assert value.index(result.pattern) < value.index(INVOKE_CLOSER), (
+            'the reported pattern must be the HEAD of the leak — the trailing '
+            'invoke closer is what this row used to report'
+        )
         assert result.recovered == {'agent_id': 'claude-interactive'}
 
 

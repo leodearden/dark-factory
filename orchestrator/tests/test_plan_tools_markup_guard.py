@@ -770,11 +770,14 @@ class TestUnrepairableResidueIsPreserved:
     ):
         """(b) INV-7's contracted keys, and the only surviving copy of the data.
 
-        ``matched_pattern`` is the SCAN's pattern, not a repair's. On the
-        reject and forward paths the two coincide; here ``repair`` returned
-        ``None``, so there is no ``Repair`` to read one off and the guard
-        publishes what ``_first_markup_argument`` actually matched on --
-        ``detect_for(value, param)`` since task 4696 widened it. Asserting
+        ``matched_pattern`` is the SCAN's pattern. Since task 5283 that is the
+        ONLY pattern there is: the reject and forward paths read it off
+        ``Repair.pattern``, which is derived from the same
+        ``detect_for(value, param, schema_params)`` triple the scan asks, so
+        the three sites agree BY CONSTRUCTION rather than coinciding. Here
+        ``repair`` returned ``None``, so there is no ``Repair`` to read one off
+        at all and the guard publishes what ``_first_markup_argument``
+        actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
         event, which already carries the widened value.
@@ -957,11 +960,14 @@ class TestUnrepairableResidueIsPreserved:
         The refusal is already decided before escalation is attempted, so every
         failure mode degrades to a logged ``None`` plus an unchanged payload.
 
-        ``matched_pattern`` is the SCAN's pattern, not a repair's. On the
-        reject and forward paths the two coincide; here ``repair`` returned
-        ``None``, so there is no ``Repair`` to read one off and the guard
-        publishes what ``_first_markup_argument`` actually matched on --
-        ``detect_for(value, param)`` since task 4696 widened it. Asserting
+        ``matched_pattern`` is the SCAN's pattern. Since task 5283 that is the
+        ONLY pattern there is: the reject and forward paths read it off
+        ``Repair.pattern``, which is derived from the same
+        ``detect_for(value, param, schema_params)`` triple the scan asks, so
+        the three sites agree BY CONSTRUCTION rather than coinciding. Here
+        ``repair`` returned ``None``, so there is no ``Repair`` to read one off
+        at all and the guard publishes what ``_first_markup_argument``
+        actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
         event, which already carries the widened value.

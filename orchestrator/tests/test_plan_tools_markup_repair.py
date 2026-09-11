@@ -1291,6 +1291,16 @@ class TestRepairPlanFieldsTrailing:
     """
 
     def test_trailing_rationale_repairs_with_a_full_fact(self):
+        """MOVED BY TASK 5283: ``pattern`` ``_INVOKE_CLOSER`` -> the closer.
+
+        ``TRAILING_RATIONALE`` is prose, ``rationale``'s own closer, then the
+        invoke closer that terminates the leak. The repaired arm used to
+        publish ``result.pattern`` — derived from the blanket ``detect``, which
+        spells no parameter name and therefore reported the trailing invoke
+        closer — while the UNREPAIRABLE arm published the gate's widened value
+        for the very same field. Both arms now publish the gate's value, so the
+        fact names the head of the leak whichever way the repair goes.
+        """
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
 
@@ -1309,7 +1319,7 @@ class TestRepairPlanFieldsTrailing:
                 # writer the fact says so rather than overstating its precision.
                 'also_written_by': [],
                 'param': 'rationale',
-                'pattern': _INVOKE_CLOSER,
+                'pattern': _close('rationale'),
                 'misclose': _close('rationale'),
                 'outcome': 'repaired',
                 'recovered_params': [],

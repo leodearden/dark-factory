@@ -1016,10 +1016,18 @@ class TestB3StrandRiskTierForwards:
         assert warning['outcome'] == 'repaired'
 
     async def test_the_warning_names_the_pattern_and_the_misclose(self):
+        """MOVED BY TASK 5283: ``INVOKE_CLOSER`` -> the ``detail`` closer.
+
+        This specimen's leak opens with ``detail``'s own closer and the invoke
+        closer merely terminates the swallowed tail, so the old expectation
+        named a literal ~40 characters downstream of the defect. Both channels
+        now derive ``matched_pattern`` from ``detect_for`` over the same
+        ``(value, param, schema_params)`` triple, which reports the HEAD.
+        """
         _, result = await self._forward()
 
         warning = meta_of(result)['markup_repair']
-        assert warning['matched_pattern'] == INVOKE_CLOSER
+        assert warning['matched_pattern'] == _closer('detail')
         assert warning['misclose'] == _closer('detail')
 
     async def test_fastmcps_own_meta_is_preserved_not_replaced(self):
@@ -3703,13 +3711,17 @@ class TestSelfNameCloserIsSeenAtTheBoundary:
         assert payload['recovered_params'] == []
 
     async def test_the_two_pattern_channels_AGREE(self):
-        """``matched_pattern`` and the fact's ``pattern`` are fed differently.
+        """``matched_pattern`` and the fact's ``pattern`` name one literal.
 
-        ``matched_pattern`` comes from ``Repair.pattern``, which falls back to
-        the misclose when no literal is present — so it already reported the
-        self-name closer even while the gate was blind. The fact's ``pattern``
-        is fed DIRECTLY by the boundary scan, so it is the one that goes red
-        today. Asserting both in one place is what pins them together.
+        ``matched_pattern`` comes from ``Repair.pattern`` and the fact's
+        ``pattern`` from the boundary scan, so the two are fed through
+        different code paths and this row is where they are pinned together.
+
+        This specimen carries NO fixed literal, so it is the easy half: both
+        derivations fall through to the same self-name closer whatever they
+        ask. ``TestOnePatternPerEvent`` covers the hard half — a value where a
+        fixed literal TRAILS the leak, which is where the two used to
+        disagree — and records why they now cannot.
         """
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
