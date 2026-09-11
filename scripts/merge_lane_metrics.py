@@ -1516,12 +1516,21 @@ def _render_table(report: dict, root: Path) -> str:
     # INV-11's user-observable signal: completeness is legible in the RESULT,
     # not only in a log line. A partial sweep measures LOW, so a reader who
     # cannot see this row cannot tell an improvement from a skipped file.
+    #
+    # THE TEST-TREE COUNTS ARE ONLY HERE. They are reported, never ratcheted --
+    # the same call this function already makes for `mi` -- so the committed
+    # baseline carries no test-tree number at all and this row is the one place
+    # the sweep's breadth is visible. `.get` is tolerant on purpose: a stored
+    # baseline block has no `test_tree` key, and rendering one must not raise.
     enumeration = report.get('enumeration', {})
     unreadable = list(enumeration.get('unreadable', ()))
+    test_tree = enumeration.get('test_tree', {})
     lines.append(
         f'enumeration: complete={enumeration.get("complete")}  '
-        f'requested={len(enumeration.get("requested", ()))}  '
+        f'cluster requested={len(enumeration.get("requested", ()))} '
         f'resolved={len(enumeration.get("resolved", ()))}  '
+        f'test tree requested={test_tree.get("requested")} '
+        f'resolved={test_tree.get("resolved")}  '
         f'unreadable={len(unreadable)}'
     )
     if unreadable:
