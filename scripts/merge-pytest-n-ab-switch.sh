@@ -15,10 +15,11 @@
 #   --dry-run         edit a temp copy, print the diff, no commit, no reload
 #
 # Modelled on scripts/merge-deep-set-cap.sh (same commit --only + single-shot
-# MCP tools/call reload). Exit 0 only when the reload's `applied` disposition
-# carries verify_env with the new value; the last stdout line is a JSON verdict
-# for a kind='predicate' before_done note — {switched_to, commit, outcome},
-# where `outcome` names how the value came to be live ('applied').
+# MCP tools/call reload). Exit 0 on either of the two ways the value can be
+# live: the reload hot-applied it ('applied'), or the running config already
+# carried it and the reload provably re-read THIS config file
+# ('already_converged'). The last stdout line is a JSON verdict —
+# {switched_to, commit, outcome} — for a kind='predicate' before_done note.
 set -euo pipefail
 die() { echo "merge-pytest-n-ab-switch: $*" >&2; exit 1; }
 
@@ -82,7 +83,8 @@ fi
 # 2. Commit only that file (machine-operated checkout: never sweep up unrelated
 #    state). Idempotent: if the file already carried the value (a re-run after a
 #    runner crash-resume), there is nothing to commit and that is success — the
-#    reload below still runs so the in-memory config is known to match the file.
+#    reload below still runs, and step 4's converged branch reads its "nothing
+#    changed here" answer as that same success rather than as a failure.
 if git -C "$REPO" diff --quiet -- "$CONFIG_BASE"; then
     SHA="already-at-${VALUE}"
 else
@@ -99,14 +101,21 @@ RESP="$(curl -sS -X POST "http://127.0.0.1:${PORT}/mcp" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reload_config","arguments":{}}}')" \
     || die "reload_config request to 127.0.0.1:${PORT} failed (committed as ${SHA}; the value lands at the next restart)"
 
-# 4. Assert the applied disposition carries verify_env with the new value.
+# 4. Assert the value is live, in either of its two shapes. `applied` carrying
+#    verify_env with the new value is the flip. ABSENCE of verify_env from
+#    `applied` is the converged re-run — and absence is the ONLY converged
+#    signal on the wire, because `unchanged` is a bare int COUNT of equal leaves
+#    (config.py::ConfigDiff), naming no keys and carrying no values. Absence is
+#    weaker than convergence, though: a rolled-back reload and a reload of a
+#    DIFFERENT orchestrator both produce it, which is what the two corroborators
+#    below exclude.
 #    The response travels as an ARGUMENT, never on stdin: `python3 -` reads its
 #    program from stdin, and the heredoc below IS that stdin, so a
 #    `printf '%s' "$RESP" | python3 - <<'PY'` pipe is swallowed whole by the
 #    heredoc and json.load(sys.stdin) then sees EOF on every single run.
-python3 - "$KEY" "$VALUE" "$SHA" "$RESP" <<'PY'
-import json, sys
-key, value, sha, resp = sys.argv[1:5]
+python3 - "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$RESP" <<'PY'
+import json, os, sys
+key, value, sha, config_path, resp = sys.argv[1:6]
 env = json.loads(resp)
 res = env.get('result', {})
 tool = res.get('structuredContent')
@@ -117,6 +126,16 @@ if tool.get('error'):
     print(f'reload_config error: {tool["error"]}', file=sys.stderr); sys.exit(1)
 entry = (tool.get('applied') or {}).get('verify_env')
 if entry is None:
+    reloaded = tool.get('reloaded')
+    reported = tool.get('config_path')
+    if not reloaded:
+        print(f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
+              f'(a failed reload rolls every leaf back, so the live config is untouched)', file=sys.stderr)
+        sys.exit(1)
+    if not reported or os.path.realpath(reported) != config_path:
+        print(f'reload reported no verify_env change, but re-read a different file: '
+              f'config_path={reported!r} expected={config_path!r}', file=sys.stderr)
+        sys.exit(1)
     outcome = 'already_converged'
 else:
     new = (entry or {}).get('new') or {}
