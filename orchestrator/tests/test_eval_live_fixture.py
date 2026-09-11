@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -28,9 +29,18 @@ import pytest
 
 from orchestrator.config import load_config
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.live_fixture import ShadowShape, build_live_fixture
+from orchestrator.evals.live_fixture import (
+    ShadowShape,
+    build_live_fixture,
+    live_stratum,
+    live_verify_commands,
+)
 from orchestrator.evals.runner import build_eval_orch_config, load_task
-from orchestrator.evals.task_sampler import default_verify_commands
+from orchestrator.evals.task_sampler import (
+    CompletedTaskCandidate,
+    cell_of,
+    default_verify_commands,
+)
 
 
 class TestShadowShape:
@@ -540,3 +550,112 @@ class TestLiveFixtureRoundTrip:
         # worktree, so the plan reaching it intact is the whole point.
         loaded = self._round_trip(tmp_path)
         assert loaded.get('plan') == live_plan()
+
+
+class TestLiveVerifyCommands:
+    """The gates a live shadow cell runs — one definition, task_sampler's."""
+
+    @pytest.mark.parametrize(
+        'project,repo',
+        [
+            ('dark_factory', 'df'),
+            ('dark-factory', 'df'),
+            ('reify', 'reify'),
+            ('know_live', 'kl'),
+        ],
+    )
+    def test_resolves_the_repo_gate_set(self, project, repo):
+        assert live_verify_commands(project) == default_verify_commands(repo)
+
+    def test_returns_a_fresh_copy_the_caller_may_mutate(self):
+        first = live_verify_commands('dark_factory')
+        first['test'] = 'echo pwned'
+        assert live_verify_commands('dark_factory') == default_verify_commands('df')
+
+    def test_unrecognised_project_propagates_rather_than_defaulting(self):
+        # Silently defaulting to 'df' would run a Rust task's cell under
+        # pytest and score the resulting red gate as a candidate failure.
+        with pytest.raises(ValueError) as excinfo:
+            live_verify_commands('nope')
+        assert repr('nope') in str(excinfo.value)
+
+
+class TestLiveStratum:
+    """The (repo, kind, path) cell for a LIVE record — the sampler's own axes."""
+
+    def test_returns_the_structured_triple_not_a_delimited_string(self):
+        stratum = live_stratum(live_task(), project='dark_factory')
+        assert isinstance(stratum, tuple)
+        assert len(stratum) == 3
+        assert all(isinstance(axis, str) for axis in stratum)
+
+    def test_bugfix_title_without_complexity(self):
+        task = live_task(
+            title='Fix the settle deadline comparison',
+            description='The deadline is compared the wrong way round.',
+            metadata={},
+        )
+        assert live_stratum(task, project='dark_factory') == ('df', 'bugfix', 'full')
+
+    def test_feature_title_declared_simple(self):
+        task = live_task(
+            title='Add a shadow cell store',
+            description='Store rows and read them back.',
+            metadata={'complexity': 'simple'},
+        )
+        assert live_stratum(task, project='dark_factory') == ('df', 'feature', 'simple')
+
+    def test_declared_simple_is_vetoed_by_a_blocker_token(self):
+        # classify_path reuses production's has_simple_task_blocker veto, so
+        # the stratum matches how the orchestrator would actually have routed
+        # the task — not merely what its author declared.
+        task = live_task(
+            title='Refactor the shadow coordinator',
+            description='Touches the architecture of the merge lane.',
+            metadata={'complexity': 'simple'},
+        )
+        assert live_stratum(task, project='dark_factory') == ('df', 'refactor', 'full')
+
+    def test_project_selects_the_repo_axis(self):
+        task = live_task(title='Add a new subcommand', description='', metadata={})
+        assert live_stratum(task, project='reify')[0] == 'reify'
+        assert live_stratum(task, project='dark_factory')[0] == 'df'
+
+    def test_unrecognised_project_propagates(self):
+        with pytest.raises(ValueError) as excinfo:
+            live_stratum(live_task(), project='nope')
+        assert repr('nope') in str(excinfo.value)
+
+    def test_reads_only_the_record(self, tmp_path, monkeypatch):
+        # No project_root parameter to pass, and no subprocess to run: the
+        # stratum of a live cell is a property of the task record alone.
+        parameters = inspect.signature(live_stratum).parameters
+        assert list(parameters) == ['task', 'project']
+        assert parameters['project'].kind is inspect.Parameter.KEYWORD_ONLY
+
+        monkeypatch.chdir(tmp_path)
+
+        def _fail(*args, **kwargs):
+            raise AssertionError('live repo read')
+
+        for attr in ('run', 'Popen', 'check_output', 'check_call', 'call'):
+            monkeypatch.setattr(subprocess, attr, _fail)
+        assert live_stratum(live_task(), project='dark_factory')[0] == 'df'
+
+    def test_agrees_with_the_sampler_over_the_same_facts(self):
+        # SPOT: live_stratum must be the sampler's classifiers applied to a
+        # live record, not a second implementation that can drift from them.
+        task = live_task(
+            title='Fix the settle deadline comparison',
+            description='The deadline is compared the wrong way round.',
+            metadata={'complexity': 'simple'},
+        )
+        equivalent = CompletedTaskCandidate(
+            task_id=task['id'],
+            project='dark_factory',
+            project_root='',
+            title=task['title'],
+            description=task['description'],
+            complexity='simple',
+        )
+        assert live_stratum(task, project='dark_factory') == cell_of(equivalent)
