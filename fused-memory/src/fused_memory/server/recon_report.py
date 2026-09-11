@@ -1987,6 +1987,15 @@ class ReconReportState:
         fold anchor (task-2432) — see :meth:`cite_task`'s docstring for both
         folds.
 
+        Also clears every ``superseded_by`` back-reference AT *finding*
+        anywhere in this run (task-4653).  A dangling forward pointer is
+        exactly the class of stale pointer this helper exists to prevent:
+        left in place it would keep the superseded finding neutered forever,
+        pointing at a row that no longer exists.  The sweep is run-scoped
+        because a superseder routinely lives in a later stage's entry than
+        its target.  Doing it here covers BOTH removal paths for free, so
+        they cannot drift apart.
+
         Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
         cited-task fold's retract path in :meth:`cite_task`, so the
         run-level dedup indices can never drift out of sync between the two
@@ -2044,6 +2053,17 @@ class ReconReportState:
             run_sig_index = self._run_sig_index.get(run_id, {})
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
+
+        # task-4653: clear any forward pointer AT this finding.  The sweep is
+        # run-scoped, not entry-scoped: the superseder routinely lives in a
+        # later stage's entry than its target (see add_finding's supersedes),
+        # so walking only owning_entry would leave the pointer dangling.
+        for (r_id, _stage), other_entry in self._state.items():
+            if r_id != run_id:
+                continue
+            for other in other_entry.findings:
+                if other.superseded_by == finding.finding_id:
+                    other.superseded_by = None
 
     def _derived_sig_anchor_project_id(
         self, run_id: str, anchor_finding_id: str, c_cited_task_id: str | None
