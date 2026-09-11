@@ -1362,6 +1362,27 @@ class TestPathScopeAdjudicatorConfigBudget:
         )
 
 
+class TestCuratorDegradedStreakThreshold:
+    """The knob behind the class-agnostic degraded-streak alarm (task 4448).
+
+    Distinct from ``zero_output_breaker_threshold``, which counts only ZOT
+    failures and exists to stop burning 180s per hung call. This one counts
+    degraded DECISIONS of any cause and exists to make the outage visible.
+    """
+
+    def test_default_is_five(self):
+        assert CuratorConfig().degraded_streak_threshold == 5, (
+            'N=5 is chosen against the 2026-08-13 to 08-18 outage: 08-15 alone '
+            'saw 38 consecutive degradations, so N=5 would have escalated '
+            'within minutes of that day starting instead of on day five.'
+        )
+
+    def test_rejects_below_one(self):
+        """N=0 would fire on a healthy curator's first non-LLM decision."""
+        with pytest.raises(ValidationError):
+            CuratorConfig(degraded_streak_threshold=0)
+
+
 class TestCuratorConfigBudgetRaise:
     """Regression guard: TaskCurator per-call budget is a durable flat $2.00 (task 1980).
 

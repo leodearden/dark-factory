@@ -983,6 +983,111 @@ class TestUnexpectedExceptionArmReports:
         assert exc_name in kwargs['subtype']
 
 
+class TestConsecutiveDegradedAlarm:
+    """Part B: a run of degraded curations is itself the alarm, whatever caused it.
+
+    Every degraded arm counts toward one streak — capped accounts, a reported
+    LLM failure, an unexpected exception, a corpus failure, an open breaker.
+    That is deliberate: a curator degrading for days is the same outage to the
+    fleet no matter which arm it came out of, and an alarm that enumerated
+    causes would have the same hole per-class instrumentation always has.
+
+    Every case here uses a DISTINCT candidate title. Identical titles hash to
+    the same payload and the idempotency cache serves call 2..N from call 1's
+    decision, so no second arm is ever entered and the streak never grows.
+    """
+
+    @staticmethod
+    def _curator_with_escalator():
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, escalator=escalator,
+        )
+        return curator, escalator
+
+    @staticmethod
+    async def _empty_corpus(*a, **k):
+        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+    @staticmethod
+    async def _curate(curator, i):
+        return await curator.curate(
+            CandidateTask(title=f'T{i}'), project_id='p', project_root='/x',
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_arms_share_one_streak_and_fire_once(self):
+        curator, escalator = self._curator_with_escalator()
+
+        # Five degraded calls across THREE different arms, then a sixth to
+        # prove the latch, a success to prove the reset, then five more.
+        outcomes = [
+            AllAccountsCappedException(
+                retries=3, elapsed_secs=1.0, label='task-curator[p]',
+            ),
+            CuratorFailureError('boom'),
+            RuntimeError('llm down'),
+            FileNotFoundError(2, 'No such file or directory', 'claude'),
+            RuntimeError('llm down again'),
+            RuntimeError('sixth, already latched'),
+            CuratorDecision(action='drop', target_id='42', justification='dup'),
+            RuntimeError('e1'),
+            RuntimeError('e2'),
+            RuntimeError('e3'),
+            RuntimeError('e4'),
+            RuntimeError('e5'),
+        ]
+
+        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
+             patch.object(curator, '_call_llm', side_effect=outcomes):
+            for i in range(5):
+                await self._curate(curator, i)
+            escalator.report_consecutive_degraded.assert_awaited_once()
+            assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
+
+            # One-shot latch: a sixth degradation must not re-fire.
+            await self._curate(curator, 5)
+            escalator.report_consecutive_degraded.assert_awaited_once()
+
+            # A real LLM success clears counter AND latch.
+            result = await self._curate(curator, 6)
+            assert result.action == 'drop'
+
+            for i in range(7, 12):
+                await self._curate(curator, i)
+
+        assert escalator.report_consecutive_degraded.await_count == 2
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
+
+    @pytest.mark.asyncio
+    async def test_corpus_failures_alone_fire_the_alarm(self):
+        """Class-agnostic across NON-exception-arm degradations too.
+
+        These five never reach the LLM at all, so no per-exception-class
+        instrumentation on the LLM arms could ever see them — yet they are the
+        same outage shape: five candidates filed without dedupe.
+        """
+        curator, escalator = self._curator_with_escalator()
+
+        async def boom(*a, **k):
+            raise RuntimeError('qdrant down')
+
+        with patch.object(curator, '_build_corpus', side_effect=boom):
+            for i in range(5):
+                result = await self._curate(curator, i)
+                assert 'corpus-failed' in result.justification
+
+        escalator.report_consecutive_degraded.assert_awaited_once()
+        kwargs = escalator.report_consecutive_degraded.await_args.kwargs
+        assert kwargs['streak'] == 5
+        assert kwargs['threshold'] == 5
+        assert kwargs['project_id'] == 'p'
+        assert kwargs['project_root'] == '/x'
+        assert 'corpus-failed' in kwargs['last_justification']
+
+
 class TestCallLlmNeutralCwd:
     """Task 1989: the CLI cwd forwarded for the pure prompt-contained classifier
     call is a neutral scratch dir, decoupled from the filing project's
