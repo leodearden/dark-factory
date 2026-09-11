@@ -17,6 +17,13 @@ Routing policy (keyed off orchestrator liveness):
   failure so the MCP caller sees a loud error instead of a silent
   curator outage.
 
+* **N consecutive degraded curations** (``report_consecutive_degraded``) —
+  reached by COUNT rather than by exception class, and queued unconditionally
+  while an orchestrator is running. Every other route above needs to know what
+  failed; this one only needs to know that curation has stopped working, which
+  is what makes it the backstop for the failure class nobody has handled yet.
+  It never raises, because its caller is already degrading.
+
 Liveness is probed via ``flock(LOCK_SH | LOCK_NB)`` on
 ``{project_root}/data/orchestrator/orchestrator.lock`` (the orchestrator
 holds ``LOCK_EX`` on startup). Treat a missing file as "no orchestrator".
@@ -522,6 +529,105 @@ class CuratorEscalator:
             'project %s — StructuredOutput tool blocked by cli_invoke deny-list; '
             'dedupe disabled until fixed',
             escalation.id, project_id,
+        )
+
+    async def report_consecutive_degraded(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        streak: int,
+        threshold: int,
+        last_justification: str,
+        candidate_title: str,
+    ) -> None:
+        """Alarm on a run of degraded curations, regardless of what caused them.
+
+        Every other path in this module is reached by exception CLASS. This one
+        is reached by COUNT, which is the whole point: per-class instrumentation
+        is always one unknown class behind the next outage, and the hole is
+        invisible precisely while it matters. A streak alarm cannot know what
+        went wrong, but it cannot be evaded by a novel failure mode either.
+
+        Never raises. The caller is already inside ``curate()``'s degraded path,
+        so raising would escalate a curator that is merely degrading into one
+        that fails ``add_task`` outright.
+
+        Never touches ``_failure_log``: burst suppression would hide a sustained
+        outage behind a single stale L1, which is the failure shape this alarm
+        exists to end.
+        """
+        if not HAS_ESCALATION:
+            logger.warning(
+                'curator_escalator: %d consecutive degraded curations for project '
+                '%s (threshold %d) but the escalation package is unavailable — '
+                'alarm not queued. last_justification=%r candidate_title=%r',
+                streak, project_id, threshold, last_justification, candidate_title,
+            )
+            return
+
+        if not self._orchestrator_running(project_root):
+            logger.error(
+                'curator_escalator: %d consecutive degraded curations for project '
+                '%s (threshold %d) and no orchestrator is running — alarm not '
+                'queued. last_justification=%r candidate_title=%r',
+                streak, project_id, threshold, last_justification, candidate_title,
+            )
+            return
+
+        detail = '\n'.join([
+            f'project_id={project_id!r}',
+            f'streak={streak}',
+            f'threshold={threshold}',
+            f'candidate_title={candidate_title!r}',
+            f'last_justification={last_justification}',
+            '',
+            'NOTE: this alarm is class-agnostic BY DESIGN. It does not know '
+            'what failed — it counts consecutive degraded decisions and trips '
+            'at the threshold. Every other escalation here keys off a specific '
+            'exception class, and that instrumentation will always have a hole: '
+            'the next outage arrives as a class nobody has handled yet. On '
+            '2026-08-13 to 08-18 such a hole (a FileNotFoundError for the '
+            'claude binary) kept the curator degrading to action=create for '
+            'five days, costing >=80h of fleet-wide dedupe. This path is the '
+            'backstop that bounds the next one at `threshold` curations.',
+            '',
+            'Every curation since the streak began returned action=create '
+            'WITHOUT consulting the LLM, so duplicate tasks filed in that '
+            'window were never deduped and may need a sweep.',
+        ])
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('curator'),
+            task_id='task-curator',
+            agent_role='fused-memory/task-curator',
+            severity='blocking',
+            category='curator_consecutive_degraded',
+            summary=(
+                f'curator degraded {streak} consecutive curations (threshold '
+                f'{threshold}) — every candidate in that run was filed without '
+                f'dedupe. Cause unknown to this alarm by design; see detail.'
+            ),
+            detail=detail,
+            level=1,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.exception(
+                'curator_escalator: failed to submit consecutive-degraded '
+                'escalation for project %s',
+                project_id,
+            )
+            # Do not re-raise — falling through to action='create' is safer than
+            # failing add_task just because queue I/O broke.
+            return
+
+        logger.error(
+            'curator_escalator: queued consecutive-degraded L1 escalation %s for '
+            'project %s — streak=%d threshold=%d last_justification=%r',
+            escalation.id, project_id, streak, threshold, last_justification,
         )
 
     async def _submit_zero_output_timeout(
