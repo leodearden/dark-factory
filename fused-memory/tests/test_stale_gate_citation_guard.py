@@ -135,3 +135,49 @@ class TestFindGateCitationIds:
     def test_marker_alternation_is_module_level(self):
         # The regex is frozen at import time, not rebuilt per call.
         assert stale_gate_citation_guard.GATE_CITATION_RE.groups == 1
+
+
+class TestTerminalOutcomeEscape:
+    """A RETROSPECTIVE statement about gates that already landed is a
+    legitimate relay, even when written against an already-emptied
+    `dependencies` array. Suppressing those is the false-positive class the
+    trailing-tail escape exists to remove."""
+
+    def test_have_landed_is_not_a_pending_gate_assertion(self):
+        assert find_gate_citation_ids(
+            'external deps 3658/3659 have landed and this task is unblocked'
+        ) == set()
+
+    def test_are_all_done_is_not_a_pending_gate_assertion(self):
+        assert find_gate_citation_ids(
+            'The external deps 3658/3659/4856 are all done'
+        ) == set()
+
+    def test_were_merged_is_not_a_pending_gate_assertion(self):
+        assert find_gate_citation_ids(
+            'pending external gates 3658/3659 were merged last week'
+        ) == set()
+
+    def test_escape_does_not_suppress_the_live_stale_spelling(self):
+        # THE LOAD-BEARING ASSERTION. The corpus spells the defect
+        # '… 3658/3659/3660 landing so this task (γ) can be dispatched', and
+        # TERMINAL_OUTCOME_RE's `\blanded\b` does not match 'landing'. Measured:
+        # with the escape applied, the would-fire count over task 3708's 9
+        # matches stays exactly 3.
+        assert find_gate_citation_ids(STALE_A) == {3658, 3659, 3660}
+
+    def test_escape_does_not_suppress_the_transitive_relay(self):
+        # Tail is ' landing (via their own upstream gates …' — no terminal cue.
+        assert find_gate_citation_ids(TRANSITIVE) == {3659, 4856}
+
+    def test_escape_does_not_suppress_the_out_of_sample_caps_relay(self):
+        # Tail is ' OBSERVED (append-only; not evidence of …' — no terminal cue.
+        assert find_gate_citation_ids(CAPS_GATING) == {4987}
+
+    def test_terminal_cue_beyond_the_tail_window_does_not_suppress(self):
+        # 'done' here is far past the end of the citation, describing something
+        # else entirely; only a cue in the immediate tail is a retrospective.
+        assert find_gate_citation_ids(
+            'external deps 3658/3659 landing so this task can finally be '
+            'dispatched once everything is done'
+        ) == {3658, 3659}
