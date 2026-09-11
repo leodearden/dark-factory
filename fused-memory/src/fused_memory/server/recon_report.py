@@ -1751,6 +1751,19 @@ class ReconReportState:
         Suppression is skipped entirely when ``stage == 'memory_consolidator'``
         to prevent two sibling non-actionable Stage-1 findings that cite the
         same target from mutually suppressing each other.
+
+        Supersession (task-4653): a finding carrying ``superseded_by`` is
+        projected with ``actionable`` forced False — neutered as an
+        instruction for every ``actionable``-keyed consumer, while the row
+        itself stays in ``flagged_items`` as a readable record of a claim that
+        was made and then retired.  The flip runs AFTER the Fix-1 check above,
+        never before: ``actionable is False`` is that predicate's first
+        necessary condition, so flipping earlier would newly qualify a
+        superseded row for the drop and delete exactly the record supersession
+        exists to keep.  Like :func:`_apply_cross_project_routing_guard`, the
+        mutation is on the freshly-built projection dict only — the stored
+        ``_Finding.actionable`` is untouched, so reads stay idempotent and
+        ``cite_*`` resolution is unaffected.
         """
         entry = self._state.get((run_id, stage))
         if entry is None:
@@ -1804,6 +1817,7 @@ class ReconReportState:
                 'cited_runs': list(f.cited_runs),  # task-2595
                 'standing_decision_id': f.standing_decision_id,  # task 2897 δ
                 'citation_failures': list(f.citation_failures),  # task 2979
+                'superseded_by': f.superseded_by,  # task 4653
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -1821,6 +1835,14 @@ class ReconReportState:
                 # to a same-run Stage-1 finding.  Finding row remains in _state
                 # so cite_* resolution is unaffected.
                 continue
+            # task-4653: neuter a superseded finding as an INSTRUCTION while
+            # keeping it in the report as a RECORD.  Runs after the Fix-1
+            # check above, never before: actionable is False is that
+            # predicate's first necessary condition, so flipping it earlier
+            # would newly qualify the row for the drop and destroy the very
+            # readability supersession exists to preserve.
+            if f.superseded_by is not None:
+                finding_dict['actionable'] = False
             flagged_items.append(finding_dict)
 
         return {
@@ -1857,6 +1879,14 @@ class ReconReportState:
         findings through this channel should use :meth:`get_assembled_report`
         instead if it needs the guarded/downgraded taxonomy.
 
+        ``superseded_by`` (task-4653) is surfaced on every row, but this
+        method deliberately does not act on it: unlike
+        :meth:`get_assembled_report` it does NOT force ``actionable`` False
+        on a superseded row.  Suppression happens at the poll site
+        (``stages/task_knowledge_sync.py::_query_recon_report_findings``),
+        mirroring the task-2453 guard's precedent named above, so this
+        channel's raw, no-suppression contract stays intact.
+
         Returns ``[]`` for an unknown ``run_id`` (never raises).
         """
         results: list[dict[str, Any]] = []
@@ -1880,6 +1910,7 @@ class ReconReportState:
                     'cited_runs': list(f.cited_runs),  # task-2595
                     'standing_decision_id': f.standing_decision_id,  # task 2897 δ
                     'citation_failures': list(f.citation_failures),  # task 2979
+                    'superseded_by': f.superseded_by,  # task 4653
                 })
         return results
 
