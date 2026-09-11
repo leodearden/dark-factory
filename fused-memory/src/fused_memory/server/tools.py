@@ -3904,6 +3904,21 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         include_planned: bool = False,
+        # ATTRIBUTION, not filtering (task 3212, INV-1).  These record WHO IS
+        # ASKING in the journal and are never passed to memory_service.search —
+        # conflating them with the agent_id FILTER above is the design conflict
+        # that left 99.7% of journal rows unattributed.
+        #
+        # _resolve_identity's clientInfo read is deliberately left exactly as it
+        # is and is NOT repurposed for this: clientInfo is hardcoded to
+        # 'orchestrator' in orchestrator/mcp/mcp_lifecycle.py and is dropped
+        # entirely by stateless HTTP, so it can never carry per-task identity.
+        #
+        # Consumer: task 3659 threads these from the briefing assembler across
+        # all its builders.  This task is server-side only and edits no
+        # orchestrator briefing code.  No other tool gains these params.
+        caller_agent_id: str | None = None,
+        caller_task_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Search across both memory stores with automatic routing.
@@ -3932,6 +3947,8 @@ def create_mcp_server(
             agent_id: Filter by authoring agent (optional, auto-derived from MCP context)
             session_id: Filter by session (optional, auto-derived from MCP context)
             include_planned: Include planning-episode edges (default: False)
+            caller_agent_id: Who is ASKING — recorded in the journal, never used to filter
+            caller_task_id: Which task is asking — recorded in the journal, never used to filter
 
         Returns:
             {'results': [...]} — plus 'degraded'/'failed_stores'/
@@ -4003,6 +4020,16 @@ def create_mcp_server(
             }
         if limit > 1000:
             limit = 1000
+        # One params dict for both journalling sites (success and error), built
+        # once so the two cannot drift.  The FULL query is recorded for search
+        # rows — see the summarise site below.  The caller-identity keys are
+        # present only when supplied, so an un-attributed caller's row shape is
+        # byte-identical to what it was before this channel existed.
+        journal_params: dict[str, Any] = {'query': query, 'limit': limit}
+        if caller_agent_id is not None:
+            journal_params['caller_agent_id'] = caller_agent_id
+        if caller_task_id is not None:
+            journal_params['caller_task_id'] = caller_task_id
         try:
             results = await memory_service.search(
                 query=query,
@@ -4084,7 +4111,7 @@ def create_mcp_server(
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query, 'limit': limit},
+                params=journal_params,
                 result_summary=search_summary,
             )
             return response
@@ -4094,7 +4121,7 @@ def create_mcp_server(
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query, 'limit': limit},
+                params=journal_params,
                 success=False,
                 error=str(e),
             )
