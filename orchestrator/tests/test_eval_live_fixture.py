@@ -22,7 +22,8 @@ import json
 
 import pytest
 
-from orchestrator.evals.live_fixture import ShadowShape
+from orchestrator.evals.live_fixture import ShadowShape, build_live_fixture
+from orchestrator.evals.task_sampler import default_verify_commands
 
 
 class TestShadowShape:
@@ -69,3 +70,160 @@ class TestShadowShape:
     )
     def test_requires_plan_is_total_over_the_vocabulary(self, shape, requires_plan):
         assert shape.requires_plan is requires_plan
+
+
+# ---------------------------------------------------------------------------
+# Synthetic live task records + plans (inline, hermetic — no live data)
+# ---------------------------------------------------------------------------
+
+BASE_SHA = 'a' * 40
+
+
+def live_task(**overrides) -> dict:
+    """A synthetic LIVE production task record, shaped as fused-memory stores it."""
+    task = {
+        'id': '5383',
+        'title': 'Live fixture builder',
+        'description': 'Render a production task as an eval fixture.',
+        'details': 'Implement build_live_fixture per PRD contract C3.',
+        'metadata': {
+            'modules': ['orchestrator/evals'],
+            'complexity': 'simple',
+            'files': ['orchestrator/src/orchestrator/evals/live_fixture.py'],
+            'branch_base_sha': BASE_SHA,
+        },
+    }
+    task.update(overrides)
+    return task
+
+
+def live_plan() -> dict:
+    return {
+        'task_id': '5383',
+        'steps': [
+            {'id': 'step-1', 'description': 'RED', 'status': 'pending'},
+            {'id': 'step-2', 'description': 'GREEN', 'status': 'pending'},
+        ],
+    }
+
+
+DF_VERIFY = {
+    'test': 'cd orchestrator && uv run pytest tests/ -x',
+    'lint': 'cd orchestrator && uv run ruff check src/',
+    'typecheck': 'cd orchestrator && uv run pyright src/',
+}
+
+# Every key load_task's consumers read that this builder deliberately does NOT
+# emit, so the runner's documented default stands. Pinned as an executable
+# absence assertion rather than left to the module docstring's prose.
+OMITTED_KEYS = (
+    'reference',
+    'post_task_commit',
+    'setup_commands',
+    'timeout_minutes',
+    'max_execute_iterations',
+    'max_review_cycles',
+    'judge_after_each_iteration',
+    'max_architect_turns',
+    'adversarial',
+    'complexity',
+    'project',
+    'cohort',
+    'provenance',
+    'verify_outcome',
+)
+
+
+class TestBuildLiveFixtureKeySurface:
+    """Exactly the eight emitted keys, key by key — and the omissions."""
+
+    def _build(self, tmp_path, task=None, plan=None):
+        return build_live_fixture(
+            task if task is not None else live_task(),
+            base_sha=BASE_SHA,
+            project_root=tmp_path,
+            plan=plan if plan is not None else live_plan(),
+            verify_commands=default_verify_commands('df'),
+            shape=ShadowShape.IMPLEMENTER,
+            cell_id='01JCELL',
+        )
+
+    def test_id_is_the_shadow_cell_id(self, tmp_path):
+        assert self._build(tmp_path)['id'] == 'shadow_5383_01JCELL'
+
+    def test_pre_task_commit_is_the_callers_base_sha_byte_equal(self, tmp_path):
+        # Never "HEAD now", and never normalised — create_eval_worktree
+        # compares it against `git rev-parse HEAD` literally.
+        assert self._build(tmp_path)['pre_task_commit'] == BASE_SHA
+
+    def test_name_is_the_task_title(self, tmp_path):
+        task = live_task()
+        assert self._build(tmp_path, task=task)['name'] == task['title']
+
+    def test_task_definition_carries_title_description_details(self, tmp_path):
+        task = live_task()
+        assert self._build(tmp_path, task=task)['task_definition'] == {
+            'title': task['title'],
+            'description': task['description'],
+            'details': task['details'],
+        }
+
+    def test_task_definition_withholds_the_live_task_id_and_metadata(self, tmp_path):
+        # briefing.py::_format_task renders task_definition into the agent's
+        # brief. An `id` line would hand the shadow agent the key to look up
+        # the very task it is shadowing — a contamination path into the
+        # measurement — and metadata.files is queue-time guesswork, not task
+        # statement.
+        task_def = self._build(tmp_path)['task_definition']
+        assert 'id' not in task_def
+        assert 'metadata' not in task_def
+        assert set(task_def) == {'title', 'description', 'details'}
+
+    def test_verify_commands_are_the_callers_gates(self, tmp_path):
+        assert self._build(tmp_path)['verify_commands'] == default_verify_commands('df')
+
+    def test_modules_come_from_the_record_metadata(self, tmp_path):
+        task = live_task()
+        assert self._build(tmp_path, task=task)['modules'] == task['metadata']['modules']
+
+    def test_plan_is_the_plan_as_given(self, tmp_path):
+        plan = live_plan()
+        assert self._build(tmp_path, plan=plan)['plan'] == plan
+
+    def test_emits_exactly_the_eight_keys(self, tmp_path):
+        assert set(self._build(tmp_path)) == {
+            'id',
+            'name',
+            'project_root',
+            'pre_task_commit',
+            'task_definition',
+            'verify_commands',
+            'modules',
+            'plan',
+        }
+
+    @pytest.mark.parametrize('key', OMITTED_KEYS)
+    def test_deliberately_omits(self, tmp_path, key):
+        assert key not in self._build(tmp_path)
+
+    def test_missing_details_becomes_an_empty_string(self, tmp_path):
+        task = live_task()
+        del task['details']
+        assert self._build(tmp_path, task=task)['task_definition'] == {
+            'title': task['title'],
+            'description': task['description'],
+            'details': '',
+        }
+
+    def test_missing_metadata_entirely_yields_no_modules(self, tmp_path):
+        task = live_task()
+        del task['metadata']
+        fixture = self._build(tmp_path, task=task)
+        assert fixture['modules'] == []
+        # The rest of the record still lands — an absent metadata block is a
+        # thin task, not a malformed one.
+        assert fixture['id'] == 'shadow_5383_01JCELL'
+
+    def test_null_description_becomes_an_empty_string(self, tmp_path):
+        fixture = self._build(tmp_path, task=live_task(description=None))
+        assert fixture['task_definition']['description'] == ''
