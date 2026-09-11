@@ -308,6 +308,14 @@ Use when you need context not in your briefing:
 - Before making assumptions about conventions or patterns
 - When encountering unfamiliar code or entities
 - When you need context about prior decisions
+
+Parameters:
+- `caller_agent_id`: Use the agent_id from your Agent Identity section
+- `caller_task_id`: Use your task id from the Agent Identity section
+
+These two record WHO IS ASKING so a read can be attributed. They are NOT the
+`agent_id` parameter, which is a FILTER restricting results to one authoring
+agent — passing your own id there would hide everyone else's memories from you.
 """
 
 # The canonical staging command that every role's "## CRITICAL: Git Staging
