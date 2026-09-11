@@ -425,6 +425,12 @@ def _serialize_entry(
     ``_Finding`` and the entry's own scalar/collection fields are all built from
     JSON-safe primitives already (str / bool / float / None / list[dict]), so
     ``dataclasses.asdict`` needs no custom encoder.
+
+    ``recon_report_store`` holds the result in one opaque ``entry_json`` TEXT
+    column, so ADDING a ``_Finding`` field costs no schema change: give it a
+    default and ``asdict`` starts writing it here while
+    :func:`_deserialize_entry` keeps hydrating rows persisted before it
+    existed.  No migration script has ever been needed for one.
     """
     payload = {
         'run_id': entry.run_id,
@@ -450,6 +456,11 @@ def _deserialize_entry(entry_json: str) -> _ReportEntry:
     Does NOT restore the fold-anchor slices — call
     :func:`_deserialize_fold_anchor_slices` on the same *entry_json* for those;
     they are run-level, not part of ``_ReportEntry``.
+
+    ``_Finding(**fd)`` is what makes a newly-added DEFAULTED field readable on
+    an older blob: the key is simply absent and the default supplies it.  A
+    field added WITHOUT a default would instead raise ``TypeError`` on every
+    pre-existing row — see :func:`_serialize_entry` for the other half.
     """
     data = json.loads(entry_json)
     findings = [_Finding(**fd) for fd in data['findings']]
