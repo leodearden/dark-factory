@@ -2144,6 +2144,39 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
     wdog.log("hello")  # must not raise — both journal routes are gone
 
 
+def test_log_never_raises_when_the_stderr_fallback_is_closed(monkeypatch):
+    """A CLOSED stderr must not escape log() either — not just a broken one.
+
+    ``contextlib.suppress(OSError)`` covers the broken-stream case above (a
+    broken pipe or a full/failing journal socket: BrokenPipeError IS an
+    OSError). It does NOT cover a CLOSED stream: ``print`` to one raises
+    ``ValueError: I/O operation on closed file``, which is not an OSError and
+    so escapes the guard entirely. Same best-effort situation, same already-
+    gone journal routes, opposite outcome.
+
+    The consequence is the one the never-raises contract above spells out: an
+    escape aborts tick() mid-branch and skips the save_state() that follows —
+    the startup-grace streak reset, the healthy-again streak reset, or the
+    ceiling re-trip log preceding the ceiling_open write — on a 30s timer.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(argv, *args, **kwargs):
+        raise FileNotFoundError("systemd-cat not found")
+
+    class _ClosedStderr:
+        def write(self, _s: str) -> int:
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self) -> None:
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.sys, "stderr", _ClosedStderr())
+
+    wdog.log("hello")  # must not raise — both journal routes are gone
+
+
 def test_log_stderr_fallback_still_emits_when_stderr_is_healthy(monkeypatch, capsys):
     """The stderr fallback must still emit the message when stderr is healthy.
 

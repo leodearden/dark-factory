@@ -8743,6 +8743,41 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(
     wdog.log("hello")  # must not raise — both journal routes are gone
 
 
+def test_log_never_raises_when_the_stderr_fallback_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLOSED stderr must not escape log() either — not just a broken one.
+
+    ``contextlib.suppress(OSError)`` covers the broken-stream case above (a
+    broken pipe or a full/failing journal socket: BrokenPipeError IS an
+    OSError). It does NOT cover a CLOSED stream: ``print`` to one raises
+    ``ValueError: I/O operation on closed file``, which is not an OSError and
+    so escapes the guard entirely. Same best-effort situation, same already-
+    gone journal routes, opposite outcome.
+
+    The consequence is the one the never-raises contract above spells out:
+    main() calls log() from INSIDE its per-unit ``except Exception`` block, so
+    an escape aborts the for-loop and leaves the remaining WATCHED units
+    unprobed for that tick.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError("systemd-cat not found")
+
+    class _ClosedStderr:
+        def write(self, _s: str) -> int:
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self) -> None:
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.sys, "stderr", _ClosedStderr())
+
+    wdog.log("hello")  # must not raise — both journal routes are gone
+
+
 # ---------------------------------------------------------------------------
 # orchestrator-watchdog.service TimeoutStartSec pin (task 3392)
 # ---------------------------------------------------------------------------
