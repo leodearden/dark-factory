@@ -1375,3 +1375,146 @@ class TestHydrateReanchorEviction:
             ] == []
         finally:
             state_b.stop_persistence()
+
+
+# ---------------------------------------------------------------------------
+# task-4653: superseded_by is durable across stages and restarts, and needs no
+# migration — recon_report_store holds entry_json as an opaque TEXT blob.
+# ---------------------------------------------------------------------------
+
+
+class TestSupersededByPersistence:
+    """A cross-stage supersession stamp survives serialization and a restart,
+    and a legacy blob written before the field existed still hydrates.
+    """
+
+    _RUN = 'sup-run-1'
+    _S1 = 'memory_consolidator'
+    _S2 = 'task_knowledge_sync'
+
+    def _make_state(self, store):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: 0.0,
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    def _file_cross_stage(self, state):
+        """Stage 1 files and closes; Stage 2 supersedes it.  Returns both ids."""
+        state.start_report(run_id=self._RUN, stage=self._S1, project_id='dark_factory')
+        stage1_fid = state.add_finding(
+            run_id=self._RUN, severity='moderate', category='memory_stale',
+            description='mechanism X contradicts Y', suggested_action='act',
+            actionable=True, task_id='42', flag_type='memory_mechanism_contradiction',
+        )['finding_id']
+        state.complete(self._RUN, 'stage1 summary')
+
+        state.start_report(run_id=self._RUN, stage=self._S2, project_id='dark_factory')
+        stage2_fid = state.add_finding(
+            run_id=self._RUN, severity='low', category='memory_stale',
+            description='mechanism X was fixed', suggested_action='none',
+            actionable=True, task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=stage1_fid,
+        )['finding_id']
+        return stage1_fid, stage2_fid
+
+    def _stage1_row(self, store):
+        (row,) = [r for r in store.load_all() if r['stage'] == self._S1]
+        return row
+
+    def test_cross_stage_stamp_survives_serialization(self, tmp_path):
+        """_persist_run upserts EVERY entry of the run, so the stamp written
+        onto the EARLIER stage's row is durably stored."""
+        from fused_memory.server.recon_report import _deserialize_entry
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            state = self._make_state(store)
+            stage1_fid, stage2_fid = self._file_cross_stage(state)
+
+            restored = _deserialize_entry(self._stage1_row(store)['entry_json'])
+            (finding,) = [f for f in restored.findings if f.finding_id == stage1_fid]
+            assert finding.superseded_by == stage2_fid
+        finally:
+            store.close()
+
+    def test_stamp_and_neuter_survive_a_restart(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        try:
+            stage1_fid, stage2_fid = self._file_cross_stage(self._make_state(store_a))
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b)
+            state_b.hydrate_from_store()
+
+            items = state_b.get_assembled_report(self._RUN, self._S1)['flagged_items']
+            (item,) = [i for i in items if i['finding_id'] == stage1_fid]
+            assert item['superseded_by'] == stage2_fid
+            assert item['actionable'] is False
+        finally:
+            store_b.close()
+
+    def test_a_legacy_blob_without_the_key_still_hydrates(self, tmp_path):
+        """Rows persisted before superseded_by existed must load with None
+        rather than raising TypeError from _Finding(**fd) — no migration."""
+        import json
+
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        try:
+            state_a = self._make_state(store_a)
+            state_a.start_report(run_id=self._RUN, stage=self._S1, project_id='dark_factory')
+            legacy_fid = state_a.add_finding(
+                run_id=self._RUN, severity='moderate', category='memory_stale',
+                description='filed before the field existed', suggested_action='act',
+                actionable=True, task_id='42', flag_type='orphaned_knowledge',
+            )['finding_id']
+
+            # Rewrite the persisted blob as a pre-task-4653 writer would have
+            # produced it: every finding dict lacking the key entirely.
+            row = self._stage1_row(store_a)
+            payload = json.loads(row['entry_json'])
+            for fd in payload['findings']:
+                del fd['superseded_by']
+            store_a.upsert_entry(
+                run_id=row['run_id'], stage=row['stage'], project_id=row['project_id'],
+                is_active=row['is_active'], entry_json=json.dumps(payload),
+                updated_at=row['updated_at'],
+            )
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b)
+            state_b.hydrate_from_store()
+
+            _e, finding = state_b._resolve_finding(self._RUN, legacy_fid)
+            assert finding.superseded_by is None
+            items = state_b.get_assembled_report(self._RUN, self._S1)['flagged_items']
+            (item,) = [i for i in items if i['finding_id'] == legacy_fid]
+            assert item['superseded_by'] is None
+            assert item['actionable'] is True
+        finally:
+            store_b.close()
