@@ -24,6 +24,12 @@ Routing policy (keyed off orchestrator liveness):
   is what makes it the backstop for the failure class nobody has handled yet.
   It never raises, because its caller is already degrading.
 
+* **Backend binary unresolvable** (``report_backend_binary_unresolvable``) —
+  raised by the curator's startup self-check. A total outage: nothing is
+  deduped anywhere until an operator changes the environment, so the
+  escalation carries the remediation rather than just the symptom. Also
+  never raises.
+
 Liveness is probed via ``flock(LOCK_SH | LOCK_NB)`` on
 ``{project_root}/data/orchestrator/orchestrator.lock`` (the orchestrator
 holds ``LOCK_EX`` on startup). Treat a missing file as "no orchestrator".
@@ -628,6 +634,103 @@ class CuratorEscalator:
             'curator_escalator: queued consecutive-degraded L1 escalation %s for '
             'project %s — streak=%d threshold=%d last_justification=%r',
             escalation.id, project_id, streak, threshold, last_justification,
+        )
+
+    async def report_backend_binary_unresolvable(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        binary_spec: str,
+        search_path: str,
+    ) -> None:
+        """Alarm on a curator backend binary that does not resolve at all.
+
+        Total, not partial: while this holds, every curation on every project
+        degrades to ``action='create'`` without consulting the LLM, and nothing
+        in the environment will change on its own. It is a config break rather
+        than a flaky candidate, so it carries its own category and its own
+        remediation — an operator reading the escalation should not have to
+        derive the fix.
+
+        Like :meth:`report_consecutive_degraded`: never raises (the caller is
+        curator startup) and never touches ``_failure_log``.
+        """
+        if not HAS_ESCALATION:
+            logger.warning(
+                'curator_escalator: curator backend binary %r does not resolve '
+                '(PATH=%s) and the escalation package is unavailable — alarm '
+                'not queued for project %s',
+                binary_spec, search_path, project_id,
+            )
+            return
+
+        if not self._orchestrator_running(project_root):
+            logger.error(
+                'curator_escalator: curator backend binary %r does not resolve '
+                '(PATH=%s) and no orchestrator is running — alarm not queued '
+                'for project %s',
+                binary_spec, search_path, project_id,
+            )
+            return
+
+        detail = '\n'.join([
+            f'project_id={project_id!r}',
+            f'binary_spec={binary_spec!r}',
+            f'search_path={search_path}',
+            '',
+            'CONSEQUENCE: every curate() call degrades to action=create without '
+            'consulting the LLM, so NOTHING is deduped for as long as this '
+            'holds. The decisions look ordinary downstream — that is exactly '
+            'how the 2026-08-13 to 08-18 outage stayed invisible for five days '
+            'and cost >=80h of fleet-wide dedupe.',
+            '',
+            'FIX (either):',
+            '  1. Set CLAUDE_BINARY to the CLI\'s ABSOLUTE path in the '
+            'fused-memory service environment. This removes PATH from the '
+            'equation entirely and is the more robust of the two.',
+            '  2. Pin Environment=PATH= in '
+            '~/.config/systemd/user/fused-memory.service so the unit stops '
+            'inheriting whatever PATH systemd happens to hand it. '
+            'scripts/fused-memory.service.template carries the correct line; '
+            'scripts/check_fused_memory_unit_parity.py --fix appends it to a '
+            'deployed unit that is missing it.',
+            '',
+            'Then restart the fused-memory user unit and confirm the curator\'s '
+            'startup self-check logs a resolved absolute path.',
+        ])
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('curator'),
+            task_id='task-curator',
+            agent_role='fused-memory/task-curator',
+            severity='blocking',
+            category='curator_backend_binary_unresolvable',
+            summary=(
+                f'curator backend binary {binary_spec!r} does not resolve — '
+                f'dedupe will degrade to create on EVERY call until the '
+                f'environment is fixed. Config break, not a flaky candidate.'
+            ),
+            detail=detail,
+            level=1,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.exception(
+                'curator_escalator: failed to submit backend-binary-unresolvable '
+                'escalation for project %s',
+                project_id,
+            )
+            # Do not re-raise — falling through to action='create' is safer than
+            # failing add_task just because queue I/O broke.
+            return
+
+        logger.error(
+            'curator_escalator: queued backend-binary-unresolvable L1 escalation '
+            '%s for project %s — binary_spec=%r PATH=%s',
+            escalation.id, project_id, binary_spec, search_path,
         )
 
     async def _submit_zero_output_timeout(
