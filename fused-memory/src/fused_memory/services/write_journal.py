@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import time
 import uuid as uuid_mod
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,12 @@ import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 logger = logging.getLogger(__name__)
+
+#: The clock ``prune_write_ops`` measures its wall-clock deadline against, named
+#: at module scope so a test can substitute one without reaching into the stdlib
+#: ``time`` module globally. Monotonic, so a clock adjustment mid-sweep cannot
+#: turn a 30 s budget into an unbounded one.
+_monotonic = time.monotonic
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS write_ops (
@@ -817,6 +824,142 @@ class WriteJournal:
             return deleted
         except Exception as e:
             logger.error(f'Failed to prune mem0_intents: {e}')
+            return 0
+
+    async def prune_write_ops(
+        self,
+        *,
+        read_older_than_days: float = 30.0,
+        search_older_than_days: float = 365.0,
+        write_older_than_days: float = 730.0,
+        batch_size: int = 5000,
+        max_rows: int = 500_000,
+        max_seconds: float = 30.0,
+    ) -> int:
+        """Age out ``write_ops`` past three independent retention horizons.
+
+        Same fire-and-forget contract as ``prune_mem0_intents`` — logs loudly,
+        never raises, returns the count deleted, returns 0 when uninitialised.
+        Intended to run once at startup.
+
+        THREE HORIZONS, because the rows are not interchangeable. Measured
+        2026-09-11 over a never-pruned 157-day span: non-search READS are
+        34,669,782 rows (97.9% of the table — ``get_task``, ``get_tasks``,
+        ``get_statuses``, ``get_external_statuses``, ~220,800/day) and have no
+        downstream consumer, so 30 days is generous incident-forensics headroom.
+        SEARCH reads are the opposite in both directions: only 481,447 rows
+        (1.36%, ~3,066/day), and they are the SOLE data source for leaf eta's
+        write-after-miss metric (task 3213) plus leaf theta's retro corpus
+        (task 3214), which evaluate against trailing baseline windows — so a
+        short horizon would silently starve the metric, and a long one is nearly
+        free (365 days is ~1.1M rows). WRITES are the durable audit trail joined
+        by ``causation_id`` in ``reconciliation/stats_verifier.py`` and are 0.73%
+        of volume, so 730 days costs essentially nothing.
+
+        BATCHED AND DOUBLY BOUNDED, unlike this file's two sibling prunes, whose
+        tables are small enough for a single unbounded DELETE. This one runs
+        against a table measured at 35,428,715 rows / 16 GB, and the
+        ``idx_wo_created`` note in ``SCHEMA_SQL`` above measures 47 s merely to
+        build one index on a copy of it, against ``STARTUP_GRACE_SECS = 120`` in
+        ``scripts/orchestrator-watchdog.py``. That same note states the failure
+        mode: a long write-lock on a serving instance SILENTLY DROPS journal rows,
+        because ``busy_timeout`` is 5000 ms and ``log_write_op`` swallows its own
+        errors. A multi-minute startup DELETE would therefore corrupt the very
+        telemetry it is pruning. Each batch commits in its own transaction so the
+        lock is released between batches (chunked-delete precedent:
+        ``services/durable_queue.py::delete_dead``), and the sweep stops on
+        whichever bound comes first. ``max_rows`` is only a PROXY for the risk;
+        ``max_seconds`` bounds it directly, because rows-per-second is not
+        knowable in advance — it depends on page-cache warmth and on six index
+        b-trees per delete. The deadline is checked BETWEEN batches, never
+        mid-batch. A first run against the current backlog will legitimately need
+        many restarts to drain, which the WARNING discloses rather than hides.
+
+        ``terminal_status='dead'`` rows are NOT exempted, unlike the dead-letters
+        ``prune_mem0_intents`` deliberately preserves: a dead ``write_ops`` row
+        carries no replay payload, only a record that an outcome was terminal, so
+        age is the only thing that should decide its fate.
+
+        THIS BOUNDS GROWTH; IT DOES NOT RECLAIM DISK. Measured on the live
+        journal: ``PRAGMA auto_vacuum`` is 0 (NONE) and ``freelist_count`` is 0.
+        With auto-vacuum off a DELETE returns pages to SQLite's freelist for
+        REUSE by later inserts; it does not return them to the filesystem, so
+        ``ls -lh`` still reports ~16 GB after a fully successful prune — and the
+        freed pages are exactly what absorbs the new per-result search detail in
+        place. Reclaiming the space needs an offline ``VACUUM``, a full-file
+        rewrite requiring another ~16 GB of scratch, which is categorically not
+        a startup operation.
+        """
+        horizons = (
+            # Cheapest first, each written to range-seek an index that already
+            # exists — no new DDL, because building one on this table would
+            # reintroduce the startup stall the batching exists to avoid.
+            ('read', "kind = 'read' AND operation <> 'search' AND created_at < ?",
+             read_older_than_days),       # idx_wo_kind_time
+            ('search', "operation = 'search' AND created_at < ?",
+             search_older_than_days),     # idx_wo_operation
+            ('write', "kind = 'write' AND created_at < ?",
+             write_older_than_days),      # idx_wo_kind_time
+        )
+        try:
+            deadline = _monotonic() + max_seconds
+            total = 0
+            by_horizon: dict[str, int] = {}
+            halted = ''
+            backlog: list[str] = []
+
+            for label, predicate, older_than_days in horizons:
+                if halted:
+                    # Never attempted under this run's bounds — unknown, so
+                    # reported as a backlog rather than assumed drained.
+                    backlog.append(label)
+                    continue
+                cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+                while True:
+                    limit = min(batch_size, max_rows - total)
+                    if limit <= 0:
+                        halted = 'row budget'
+                        backlog.append(label)
+                        break
+                    async with self._txn() as db:
+                        cursor = await db.execute(
+                            f'DELETE FROM write_ops WHERE id IN '
+                            f'(SELECT id FROM write_ops WHERE {predicate} LIMIT ?)',
+                            (cutoff, limit),
+                        )
+                        removed = max(cursor.rowcount, 0)
+                    total += removed
+                    by_horizon[label] = by_horizon.get(label, 0) + removed
+                    if removed < limit:
+                        break  # a short batch means this horizon is drained
+                    if total >= max_rows:
+                        halted = 'row budget'
+                        backlog.append(label)
+                        break
+                    if _monotonic() >= deadline:
+                        halted = 'deadline'
+                        backlog.append(label)
+                        break
+
+            if total:
+                logger.info(
+                    'Pruned %d write_ops rows (read>%sd: %d, search>%sd: %d, '
+                    'write>%sd: %d); frees pages for reuse, does not shrink the file',
+                    total,
+                    read_older_than_days, by_horizon.get('read', 0),
+                    search_older_than_days, by_horizon.get('search', 0),
+                    write_older_than_days, by_horizon.get('write', 0),
+                )
+            if halted:
+                logger.warning(
+                    'write_ops prune stopped early on the %s after %d rows; '
+                    'horizons still holding a backlog: %s. The table drains over '
+                    'successive restarts.',
+                    halted, total, ', '.join(backlog),
+                )
+            return total
+        except Exception as e:
+            logger.error(f'Failed to prune write_ops: {e}')
             return 0
 
     async def get_usage_stats(
