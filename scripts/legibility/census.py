@@ -410,6 +410,73 @@ class CensusHeadroomExhausted(Exception):
         self.unverified = unverified
 
 
+class CensusPostRefusedUnderTest(RuntimeError):
+    """Raised when a pytest process tries to POST to a real MCP endpoint
+    through this module.
+
+    The contract: a pytest process never speaks to a real MCP endpoint
+    through census.py. A caller that serves or fakes its OWN endpoint is
+    entitled to, and DECLARES that by neutralizing
+    :func:`_refuse_real_post_under_test` at the call site.
+
+    A distinct type, not a bare ``RuntimeError``, so the regression test has
+    something falsifiable to assert on and an operator reading a log can tell
+    a refused test POST from an ordinary transport failure.
+    """
+
+
+def _refuse_real_post_under_test(url: str, tool_name: str) -> None:
+    """Refuse a real MCP POST from inside a pytest process; no-op otherwise.
+
+    WHY HERE. :func:`_post_mcp_tool_call` is THE single MCP boundary for both
+    consumers -- :func:`default_submit_fn`'s ``submit_task`` (:8002) and
+    :func:`_build_default_escalate_fn`'s ``escalate_info`` (:8103) -- so one
+    call covers both with no second mechanism. It is also default-safe for
+    tests not yet written: a new ``main()``-level test is protected without
+    doing anything, which matters because the leak arrives through
+    ``main()``'s fail-loud catch-all, i.e. through a test whose
+    monkeypatched ``run_census`` raised UNEXPECTEDLY.
+
+    WHY IT MATTERS. A test-minted escalation is indistinguishable at triage
+    from a genuine census failure -- same synthetic ``task_id``, same
+    ``agent_role`` -- in the one human-facing channel the
+    recon-escalation-watcher closes; ``esc-legibility-census-dark_factory-2``
+    reached ``dedupe_count=21`` that way.
+
+    WHY RAISE. Loud over silent (no-silent-fail-soft): a sentinel return
+    would make a suppressed POST look like a successful one to
+    :func:`default_submit_fn`, whose caller has no best-effort swallow and
+    would record a filing that never happened. Raising costs nothing on the
+    escalation path -- ``_escalate_fn``'s existing ``except Exception``
+    already turns any transport failure into its established WARNING and
+    returns ``{}``, so ``main()`` still prints ``census: FAILED`` and returns
+    1.
+
+    WHY A DECLARED HATCH RATHER THAN A SNIFFED ONE. No automatic signal
+    separates "a server this test brought up on an ephemeral port" from "the
+    ambient production server on 8103": the leaking tests write
+    ``escalation_port: 8103`` into their own tmp_path config, so port, config
+    shape and project_id all match. Entitlement is therefore a human
+    judgement about who owns the endpoint, declared by monkeypatching this
+    function -- see ``escalation/tests/test_legibility_census_escalation_e2e.py``
+    (task 3644's live-server acceptance suite, which must keep reaching the
+    real streamable-HTTP protocol). A caller who forgets fails loud with a
+    message naming the hatch; the opposite default -- allow, and remember to
+    block -- is what produced the dedupe_count above.
+    """
+    current_test = os.environ.get("PYTEST_CURRENT_TEST")
+    if current_test is None:
+        return
+    raise CensusPostRefusedUnderTest(
+        f"census: refusing to POST MCP tool {tool_name!r} to a real endpoint "
+        f"({url}) from inside a pytest process (PYTEST_CURRENT_TEST="
+        f"{current_test!r}). A test-minted escalation is indistinguishable at "
+        f"triage from a genuine census failure. If this caller serves or fakes "
+        f"its OWN endpoint, declare that at the call site by monkeypatching "
+        f"census._refuse_real_post_under_test to a no-op."
+    )
+
+
 @dataclass
 class HeadroomResult:
     """Verdict from ``preflight_headroom``: ``ok=True`` means the probe
@@ -2238,7 +2305,13 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     (:8002) is STATELESS by contrast -- one bare POST, ``application/json``,
     no session -- and ``post_mcp_tool_call`` handshakes only on a 400, so
     :func:`default_submit_fn`'s path is unchanged.
+
+    Being the single boundary is also why the pytest guard lives here:
+    :func:`_refuse_real_post_under_test` covers both consumers in one call,
+    and a caller entitled to post for real under pytest neutralizes it at the
+    call site.
     """
+    _refuse_real_post_under_test(url, tool_name)
     return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=30.0)
 
 

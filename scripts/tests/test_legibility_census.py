@@ -3368,7 +3368,7 @@ class _FakeHttpxResponse:
         return self._payload
 
 
-def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx):
+def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx, monkeypatch):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint --
@@ -3390,6 +3390,12 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_ht
         return _FakeHttpxResponse(rpc_response)
 
     install_fake_httpx(_fake_post)
+    # ENTITLED to reach census's real delegate: this test owns the endpoint --
+    # `install_fake_httpx` substitutes a stub httpx BELOW the transport, so
+    # nothing leaves the process, and the whole point is to assert the real
+    # outbound request shape. Declared at the call site rather than inferred
+    # (task 5279 W1).
+    monkeypatch.setattr(mod, "_refuse_real_post_under_test", lambda url, tool_name: None)
 
     result = mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
 
