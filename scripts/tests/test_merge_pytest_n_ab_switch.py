@@ -18,6 +18,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parent.parent / "merge-pytest-n-ab-switch.sh"
 KEY = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 
@@ -249,3 +251,91 @@ def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tm
         "the idempotent rewrite must restore the prior A/B marker byte for "
         "byte, not stack a fresh one"
     )
+
+
+# ---------------------------------------------------------------------------
+# Responses that must NOT be read as success
+#
+# Absence of verify_env from `applied` is strictly WEAKER than "converged":
+# the very same absence is produced by a reload that rolled every leaf back,
+# and by a reload of a different orchestrator entirely (the port is a
+# caller-supplied argument, so a wrong one reaches another project's MCP).
+# This is a DEPLOY gate -- blessing an undeployed arm is worse than the
+# over-strict assertion the converged branch removes.
+# ---------------------------------------------------------------------------
+
+def _converged_verdict_lines(proc):
+    """Every stdout line that parses as a verdict claiming convergence."""
+    claims = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("outcome") == "already_converged":
+            claims.append(line)
+    return claims
+
+
+# Each builder takes (this repo's config, another project's config) and
+# returns a reload response with verify_env ABSENT from `applied`.
+_UNCORROBORATED_ABSENCE = {
+    # Control: the existing error branch already rejects this one, so a green
+    # here proves the group's harness really drives the script.
+    "reload_failed_loudly": lambda config, other: _envelope(
+        reloaded=False, error="load_config: while parsing a block mapping",
+        config_path=str(config),
+    ),
+    # apply_reload rolled every leaf back, so the live config is untouched.
+    "reload_failed_silently": lambda config, other: _envelope(
+        reloaded=False, error=None, config_path=str(config),
+    ),
+    # We reloaded something that is not the file we just edited, so its
+    # verify_env says nothing about ours.
+    "different_config_file": lambda config, other: _envelope(
+        reloaded=True, config_path=str(other),
+    ),
+    "no_config_path": lambda config, other: _envelope(
+        reloaded=True, config_path=None,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "build_response",
+    list(_UNCORROBORATED_ABSENCE.values()),
+    ids=list(_UNCORROBORATED_ABSENCE),
+)
+def test_uncorroborated_absence_is_not_convergence(tmp_path, build_response):
+    """An absent verify_env that is NOT corroborated by a committed reload of
+    THIS config file must fail, not pass."""
+    config = _make_repo(tmp_path, "8", marker=True)
+    other = tmp_path / "other-project" / "dark-factory-orchestrator.yaml"
+    other.parent.mkdir()
+    other.write_text(f'verify_env:\n  {KEY}: "2"\n')
+
+    proc = _run(tmp_path, config, "8", build_response(config, other))
+
+    assert proc.returncode != 0, (
+        f"an uncorroborated absence was read as success: stdout={proc.stdout}"
+    )
+    assert not _converged_verdict_lines(proc)
+
+
+def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
+    """The strict branch stays strict: a PRESENT verify_env carrying some
+    other value is a contradiction, never convergence."""
+    config = _make_repo(tmp_path, "8", marker=True)
+
+    proc = _run(tmp_path, config, "8", _envelope(
+        reloaded=True,
+        config_path=str(config),
+        applied={"verify_env": {"old": {KEY: "8"}, "new": {KEY: "16"}}},
+    ))
+
+    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert "applied.verify_env does not carry" in proc.stderr
+    assert not _converged_verdict_lines(proc)
