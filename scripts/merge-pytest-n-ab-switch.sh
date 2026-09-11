@@ -116,10 +116,14 @@ if not isinstance(tool, dict):
 if tool.get('error'):
     print(f'reload_config error: {tool["error"]}', file=sys.stderr); sys.exit(1)
 entry = (tool.get('applied') or {}).get('verify_env')
-new = (entry or {}).get('new') or {}
-if str(new.get(key)) != value:
-    print(f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
-          f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}', file=sys.stderr)
-    sys.exit(1)
-print(json.dumps({'switched_to': value, 'commit': sha, 'outcome': 'applied'}))
+if entry is None:
+    outcome = 'already_converged'
+else:
+    new = (entry or {}).get('new') or {}
+    if str(new.get(key)) != value:
+        print(f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
+              f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}', file=sys.stderr)
+        sys.exit(1)
+    outcome = 'applied'
+print(json.dumps({'switched_to': value, 'commit': sha, 'outcome': outcome}))
 PY
