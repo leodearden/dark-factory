@@ -4227,6 +4227,61 @@ class TestReconReportSupersedes:
         _e, old_finding = state._resolve_finding('r1', old_fid)
         assert old_finding.superseded_by is None
 
+    def test_retracting_the_superseder_clears_the_targets_forward_pointer(self):
+        """A retracted supersession must not leave the target permanently
+        neutered, pointing at a row that no longer exists."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        b_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        a_added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=b_fid,
+        )
+        a_fid = a_added['finding_id']
+        _e, b_finding = state._resolve_finding('r1', b_fid)
+        assert b_finding.superseded_by == a_fid
+
+        assert state.delete_finding('r1', a_fid) == {'status': 'deleted', 'finding_id': a_fid}
+
+        assert b_finding.superseded_by is None
+        items = state.get_assembled_report('r1', 's1')['flagged_items']
+        (item,) = [i for i in items if i['finding_id'] == b_fid]
+        assert item['superseded_by'] is None
+        assert item['actionable'] is True
+
+    def test_the_back_reference_sweep_is_run_scoped_not_entry_scoped(self):
+        """Cross-stage variant: the superseder lives in Stage 2's entry, the
+        target in Stage 1's, so a sweep confined to the purged finding's own
+        entry would leave the pointer dangling."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        b_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        state.complete('r1', 'stage 1 done')
+
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        a_added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='resolved after all',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=b_fid,
+        )
+        a_fid = a_added['finding_id']
+        _e, b_finding = state._resolve_finding('r1', b_fid)
+        assert b_finding.superseded_by == a_fid
+
+        assert state.delete_finding('r1', a_fid) == {'status': 'deleted', 'finding_id': a_fid}
+        assert b_finding.superseded_by is None
+
 
 # ---------------------------------------------------------------------------
 # task-4653 consumer (1): the flagged_items projection.  A superseded finding
