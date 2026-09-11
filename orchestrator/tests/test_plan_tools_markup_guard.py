@@ -545,6 +545,120 @@ class TestDeliberateQuotingOverride:
 
 
 # ---------------------------------------------------------------------------
+# task 5283 — the hatch is DECLARED in the schema, not tolerated by one client.
+# ---------------------------------------------------------------------------
+
+
+def _type_alternatives(schema: dict[str, Any]) -> set[str]:
+    """The JSON-Schema type names *schema* accepts, however it spells them.
+
+    ``anyOf`` branches and a list-valued ``type`` are the two renderings a
+    ``dict | None`` annotation can produce, and which one a given fastmcp
+    emits is its business, not this contract's. Reading both keeps the row
+    asserting what the schema MEANS rather than how the library formats it.
+    """
+    if isinstance(schema.get('anyOf'), list):
+        return {
+            branch.get('type')
+            for branch in schema['anyOf']
+            if isinstance(branch, dict) and isinstance(branch.get('type'), str)
+        }
+    declared = schema.get('type')
+    if isinstance(declared, list):
+        return {name for name in declared if isinstance(name, str)}
+    return {declared} if isinstance(declared, str) else set()
+
+
+class TestEveryToolDeclaresTheOverrideParameter:
+    """``metadata`` must be part of the ADVERTISED contract of every tool here.
+
+    The deliberate-quoting hatch is the documented remediation this server's
+    own rejection hint gives a caller (``_OVERRIDE_SENTENCE``), and until this
+    task it worked on plan-tools only because ``claude`` CLI 2.1.250 transmits
+    an argument the schema does not declare — measured 2026-08-28 on a
+    transparent stdio JSON-RPC tee proxy (task 4817 / esc-4817-1; memory
+    records 4012ec18-55c0-4a7c-9806-04d2d397f868 and
+    decb3e1b-05af-4761-9e08-486fa08044c0). Every tool here advertises
+    ``additionalProperties: false``, so a stricter client is entitled to reject
+    that call before it is ever sent, and the remediation would simply not
+    exist for it. A property of one client build is not a contract.
+
+    UNIFORM over the whole listing, ENUMERATED FROM THE LISTING. The guard
+    scans every string argument of every tool on this server, so any tool here
+    can be the one that bounces a caller — which makes "the tools that happen
+    to carry prose" the wrong scope. Reading the names off the round-trip
+    rather than spelling them means a seventeenth tool cannot be added without
+    the parameter.
+    """
+
+    @staticmethod
+    async def _listing(harness: Harness) -> dict[str, dict[str, Any]]:
+        """``{tool name: inputSchema}`` from a real ``tools/list`` round-trip.
+
+        Through the ``Client``, not off ``server._tool_manager``: the schema a
+        caller is held to is the one that crosses the wire.
+        """
+        async with Client(harness.server) as client:
+            tools = await client.list_tools()
+        assert tools, 'the plan-tools server registered no tools at all'
+        return {tool.name: tool.inputSchema for tool in tools}
+
+    @pytest.mark.asyncio
+    async def test_every_registered_tool_declares_metadata(self, harness: Harness):
+        listing = await self._listing(harness)
+
+        missing = sorted(
+            name for name, schema in listing.items()
+            if 'metadata' not in schema.get('properties', {})
+        )
+        assert missing == [], (
+            f'{len(missing)} of {len(listing)} plan-tools tools do not declare '
+            f'metadata: {missing} — the documented override is unavailable to '
+            'any client that honours additionalProperties: false'
+        )
+
+    @pytest.mark.asyncio
+    async def test_metadata_is_never_required(self, harness: Harness):
+        """The hatch is opt-in; requiring it would break every ordinary call."""
+        listing = await self._listing(harness)
+
+        required = {
+            name: schema.get('required', [])
+            for name, schema in listing.items()
+            if 'metadata' in schema.get('required', [])
+        }
+        assert required == {}
+
+    @pytest.mark.asyncio
+    async def test_metadata_accepts_an_object_or_null(self, harness: Harness):
+        """An object because the flag lives in a map; null because it defaults."""
+        listing = await self._listing(harness)
+
+        for name, schema in listing.items():
+            declared = schema.get('properties', {}).get('metadata')
+            assert isinstance(declared, dict), name
+            assert _type_alternatives(declared) == {'object', 'null'}, (
+                f'{name} declares metadata as {declared!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_schemas_stay_CLOSED(self, harness: Harness):
+        """Declaring one parameter must not be done by opening the door.
+
+        ``additionalProperties: true`` would also make the hatch legal, and it
+        would legalise every typo alongside it — the unknown-parameter error is
+        a real diagnostic these tools should keep.
+        """
+        listing = await self._listing(harness)
+
+        open_schemas = sorted(
+            name for name, schema in listing.items()
+            if schema.get('additionalProperties') is not False
+        )
+        assert open_schemas == []
+
+
+# ---------------------------------------------------------------------------
 # Residue preservation on the UNREPAIRABLE path.
 # ---------------------------------------------------------------------------
 #

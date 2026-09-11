@@ -635,6 +635,111 @@ class TestUnrepairableResidueIsPreserved:
 
 
 # ---------------------------------------------------------------------------
+# task 5283 — the hatch is DECLARED in the schema, on every role's one tool.
+# ---------------------------------------------------------------------------
+
+
+#: The single tool each ``--verdict-role`` server registers. Spelled here so a
+#: role that silently stopped registering anything cannot pass these rows by
+#: having nothing left to check.
+_ROLE_TOOL = {
+    'judge': 'submit_completion_verdict',
+    'triage': 'submit_triage',
+    'merger': 'submit_merge_disposition',
+    REVIEWER_ROLE: 'submit_review_verdict',
+}
+
+
+def _type_alternatives(schema: dict[str, Any]) -> set[str]:
+    """The JSON-Schema type names *schema* accepts, however it spells them.
+
+    ``anyOf`` branches and a list-valued ``type`` are the two renderings a
+    ``dict | None`` annotation can produce; which one a given fastmcp emits is
+    its business, not this contract's.
+    """
+    if isinstance(schema.get('anyOf'), list):
+        return {
+            branch.get('type')
+            for branch in schema['anyOf']
+            if isinstance(branch, dict) and isinstance(branch.get('type'), str)
+        }
+    declared = schema.get('type')
+    if isinstance(declared, list):
+        return {name for name in declared if isinstance(name, str)}
+    return {declared} if isinstance(declared, str) else set()
+
+
+class TestEveryRoleToolDeclaresTheOverrideParameter:
+    """FORWARD_REPAIR still bounces a caller, so the hatch must exist here too.
+
+    This server repairs and forwards rather than rejecting, but the guard can
+    still refuse — an unrepairable value is reported and the caller is pointed
+    at the deliberate-quoting override. That remediation was reachable only
+    because ``claude`` CLI 2.1.250 transmits an undeclared ``metadata``
+    argument anyway (measured 2026-08-28, task 4817 / esc-4817-1; memory
+    records 4012ec18-55c0-4a7c-9806-04d2d397f868 and
+    decb3e1b-05af-4761-9e08-486fa08044c0), which is a property of one client
+    build and not a contract. Each role registers exactly one tool, so the
+    declaration is checked on all four branches.
+    """
+
+    @staticmethod
+    async def _schema(artifacts: TaskArtifacts, role: str) -> dict[str, Any]:
+        """This role's one tool's ``inputSchema``, off a real ``tools/list``."""
+        server = create_server(artifacts, role)
+        async with Client(server) as client:
+            tools = await client.list_tools()
+        assert [tool.name for tool in tools] == [_ROLE_TOOL[role]], (
+            f'role {role!r} no longer registers exactly its one expected tool'
+        )
+        return tools[0].inputSchema
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_the_role_tool_declares_metadata(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        schema = await self._schema(artifacts, role)
+
+        assert 'metadata' in schema.get('properties', {}), (
+            f'{_ROLE_TOOL[role]} does not declare metadata — the documented '
+            'override is unavailable to any client honouring '
+            'additionalProperties: false'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_metadata_is_never_required(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        """These tools already declare required parameters; this is not one."""
+        schema = await self._schema(artifacts, role)
+
+        assert 'metadata' not in schema.get('required', [])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_metadata_accepts_an_object_or_null(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        schema = await self._schema(artifacts, role)
+        declared = schema.get('properties', {}).get('metadata')
+
+        assert isinstance(declared, dict)
+        assert _type_alternatives(declared) == {'object', 'null'}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_the_schema_stays_CLOSED(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        """One declared parameter, not an open door for every typo."""
+        schema = await self._schema(artifacts, role)
+
+        assert schema.get('additionalProperties') is False
+
+
+# ---------------------------------------------------------------------------
 # The residue channel is the SHARED one (task 3690 review follow-up)
 # ---------------------------------------------------------------------------
 
