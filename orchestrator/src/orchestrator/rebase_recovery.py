@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -275,6 +276,31 @@ def lock_holder_pids(path: Path) -> tuple[int, ...]:
     return tuple(holders)
 
 
+def survey_locks(
+    git_dir: Path, *, now: datetime | None = None,
+) -> tuple[LockFinding, ...]:
+    """Measure every ``*.lock`` directly under *git_dir*, removing nothing.
+
+    The observation half of :func:`sweep_stale_locks`, which consumes it and
+    then partitions on the conjunction.  Keeping the measurement in one place
+    means the report-only path and the removing path cannot drift into
+    disagreeing about what they saw.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    findings: list[LockFinding] = []
+    for lock in sorted(git_dir.glob('*.lock')):
+        try:
+            age = moment.timestamp() - lock.stat().st_mtime
+        except OSError:
+            continue
+        findings.append(
+            LockFinding(
+                path=lock, age_seconds=age, holder_pids=lock_holder_pids(lock),
+            ),
+        )
+    return tuple(findings)
+
+
 def sweep_stale_locks(
     *,
     git_dir: Path,
@@ -298,21 +324,14 @@ def sweep_stale_locks(
     long as they are held, so a 0-byte lock is exactly as likely to be live as
     it is to be abandoned.
     """
-    moment = now if now is not None else datetime.now(UTC)
     removed: list[LockFinding] = []
     retained: list[LockFinding] = []
 
-    for lock in sorted(git_dir.glob('*.lock')):
-        try:
-            age = moment.timestamp() - lock.stat().st_mtime
-        except OSError:
-            continue
-        finding = LockFinding(
-            path=lock, age_seconds=age, holder_pids=lock_holder_pids(lock),
-        )
-        if finding.holder_pids or age <= stale_after_seconds:
+    for finding in survey_locks(git_dir, now=now):
+        if finding.holder_pids or finding.age_seconds <= stale_after_seconds:
             retained.append(finding)
             continue
+        lock = finding.path
         try:
             lock.unlink()
         except OSError:
@@ -326,3 +345,145 @@ def sweep_stale_locks(
         )
 
     return LockSweep(removed=tuple(removed), retained=tuple(retained))
+
+
+#: Verdicts the CLI and the skills branch on.  ``blocked`` is the only one
+#: that means "do not proceed": something still holds a lock open, so the abort
+#: will hit git's "Another git process seems to be running" and a human has to
+#: decide what that process is.
+VERDICT_CLEAN = 'clean'
+VERDICT_REPAIRED = 'repaired'
+VERDICT_BLOCKED = 'blocked'
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    """Everything the preflight found and everything it changed."""
+
+    worktree: Path
+    dangling: tuple[MergeRrRecord, ...]
+    unparsable: tuple[bytes, ...]
+    merge_rr_backup: Path | None
+    locks_removed: tuple[LockFinding, ...]
+    locks_retained: tuple[LockFinding, ...]
+    resolved: bool = True
+
+    @property
+    def verdict(self) -> str:
+        if any(finding.holder_pids for finding in self.locks_retained):
+            return VERDICT_BLOCKED
+        if self.merge_rr_backup is not None or self.locks_removed:
+            return VERDICT_REPAIRED
+        return VERDICT_CLEAN
+
+    def as_json(self) -> dict:
+        """The CLI payload — structured values, never a rendered sentence."""
+        return {
+            'verdict': self.verdict,
+            'worktree': str(self.worktree),
+            'resolved': self.resolved,
+            'dangling': [
+                {'conflict_id': r.conflict_id, 'path': r.path} for r in self.dangling
+            ],
+            'unparsable_record_count': len(self.unparsable),
+            'merge_rr_backup': (
+                str(self.merge_rr_backup) if self.merge_rr_backup else None
+            ),
+            'locks_removed': [_lock_json(f) for f in self.locks_removed],
+            'locks_retained': [_lock_json(f) for f in self.locks_retained],
+        }
+
+
+def _lock_json(finding: LockFinding) -> dict:
+    return {
+        'path': str(finding.path),
+        'age_seconds': round(finding.age_seconds, 3),
+        'holder_pids': list(finding.holder_pids),
+    }
+
+
+def resolve_git_dirs(worktree: Path) -> tuple[Path, Path] | None:
+    """Resolve *worktree*'s ``(git_dir, common_dir)``, or ``None`` if it cannot.
+
+    The two differ in a linked worktree, which is the case that matters here:
+    MERGE_RR is per-worktree while rr-cache is shared.  One ``git rev-parse``
+    answers both, so this is the module's only subprocess.
+    """
+    proc = subprocess.run(
+        ['git', 'rev-parse', '--git-dir', '--git-common-dir'],
+        cwd=str(worktree), capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    lines = proc.stdout.splitlines()
+    if len(lines) != 2:
+        return None
+    # Split on LINES, not whitespace: git prints one path per line and a git
+    # dir may legally contain spaces.  Each path is relative to *worktree*
+    # unless already absolute, which ``os.path.join`` handles either way.
+    git_dir, common_dir = (Path(os.path.join(worktree, line)) for line in lines)
+    return git_dir, common_dir
+
+
+def preflight_rebase_recovery(
+    worktree: Path,
+    *,
+    now: datetime | None = None,
+    lock_stale_after_seconds: float = DEFAULT_LOCK_STALE_AFTER_SECONDS,
+    report_only: bool = False,
+) -> PreflightResult:
+    """Make a ``git rebase``/``merge --abort`` in *worktree* safe to run.
+
+    Scans MERGE_RR, quarantines it when suspect, and sweeps abandoned locks.
+    The abort itself is the CALLER's to issue, prefixed with
+    :data:`RECOVERY_GIT` — see ``git_ops._guarded_abort``.
+
+    *report_only* performs detection and reporting with no mutation, so an
+    operator can inspect before authorising a repair.
+
+    FAIL-SAFE: a preflight that cannot resolve the git directories logs and
+    returns an unresolved-but-clean result rather than raising.  This decorates
+    a RECOVERY path, so it must never itself become the reason recovery fails —
+    an unguarded abort that might crash still beats no abort at all.
+    """
+    worktree = Path(worktree)
+    dirs = resolve_git_dirs(worktree)
+    if dirs is None:
+        logger.warning(
+            'Rebase-recovery preflight could not resolve git dirs for %s; '
+            'proceeding unguarded.', worktree,
+        )
+        return PreflightResult(
+            worktree=worktree, dangling=(), unparsable=(), merge_rr_backup=None,
+            locks_removed=(), locks_retained=(), resolved=False,
+        )
+
+    git_dir, common_dir = dirs
+    scan = scan_merge_rr(git_dir=git_dir, common_dir=common_dir)
+    backup = None if report_only else quarantine_merge_rr(scan)
+    if report_only and scan.suspect:
+        logger.warning(
+            'Rebase-recovery preflight (report-only) found a suspect MERGE_RR '
+            'at %s — dangling rr-cache refs: [%s]; unparsable records: %d. '
+            'Nothing was moved.',
+            scan.merge_rr_path,
+            ', '.join(record.conflict_id for record in scan.dangling),
+            len(scan.unparsable),
+        )
+
+    sweep = (
+        LockSweep(removed=(), retained=survey_locks(git_dir, now=now))
+        if report_only
+        else sweep_stale_locks(
+            git_dir=git_dir, now=now, stale_after_seconds=lock_stale_after_seconds,
+        )
+    )
+
+    return PreflightResult(
+        worktree=worktree,
+        dangling=scan.dangling,
+        unparsable=scan.unparsable,
+        merge_rr_backup=backup,
+        locks_removed=sweep.removed,
+        locks_retained=sweep.retained,
+    )
