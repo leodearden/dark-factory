@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -452,7 +453,7 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
 
 def _minimal_argv(**overrides):
     """build_claude_argv with the smallest viable kwargs, for argv[0] assertions."""
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         model='opus',
         max_budget_usd=5.0,
         system_prompt='sys',

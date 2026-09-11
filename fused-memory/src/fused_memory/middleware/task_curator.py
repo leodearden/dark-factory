@@ -1434,7 +1434,7 @@ class TaskCurator:
             )
             return True
 
-        search_path = os.environ.get('PATH')
+        search_path = os.environ.get('PATH', '')
         logger.error(
             'task_curator: backend binary %r does not resolve (PATH=%s) — every '
             'curation for project %s will degrade to action=create WITHOUT '

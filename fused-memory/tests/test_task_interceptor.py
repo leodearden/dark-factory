@@ -6096,9 +6096,9 @@ async def test_get_curator_schedules_startup_self_check(
             await asyncio.gather(*list(interceptor._background_tasks))
 
     self_check.assert_awaited_once()
-    kwargs = self_check.await_args.kwargs
-    args = self_check.await_args.args
-    assert (kwargs.get('project_root') or args[-1]) == str(tmp_path)
+    await_args = self_check.await_args
+    assert await_args is not None
+    assert (await_args.kwargs.get('project_root') or await_args.args[-1]) == str(tmp_path)
 
 
 # ── Tests for background task retention (step-3) ───────────────────────────
