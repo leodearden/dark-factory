@@ -14,7 +14,14 @@ observed in that run, not a guess.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+
+from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation import stale_gate_citation_guard
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.stale_gate_citation_guard import find_gate_citation_ids
 
 # --------------------------------------------------------------------------- #
@@ -317,3 +324,187 @@ class TestStaleGateCitationError:
             AGENT_ID,
             live_dependencies=[],
         ) is None
+
+
+# --------------------------------------------------------------------------- #
+# Interceptor boundary fixtures (copied from test_recon_write_policy.py — this
+# repo defines the quartet per test file rather than in a conftest)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def taskmaster():
+    tm = AsyncMock()
+    tm.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'})
+    tm.set_task_status = AsyncMock(return_value={'success': True})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
+    tm.update_task = AsyncMock(return_value={'success': True})
+    tm.remove_tasks = AsyncMock(return_value={'success': True})
+    tm.add_dependency = AsyncMock(return_value={'success': True})
+    tm.remove_dependency = AsyncMock(return_value={'success': True})
+    return tm
+
+
+@pytest.fixture
+def reconciler():
+    r = AsyncMock()
+    r.reconcile_task = AsyncMock(return_value={'actions': [{'type': 'knowledge_captured'}]})
+    return r
+
+
+@pytest_asyncio.fixture
+async def event_buffer(tmp_path):
+    buf = EventBuffer(db_path=tmp_path / 'interceptor_eb.db', buffer_size_threshold=100)
+    await buf.initialize()
+    yield buf
+    await buf.close()
+
+
+@pytest.fixture
+def interceptor(taskmaster, reconciler, event_buffer):
+    return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+@pytest.fixture
+def live_row(taskmaster):
+    """Task 3708's live row. `taskmaster.get_task`'s return value IS the fake
+    live row — no real sqlite backend is needed for these boundary tests."""
+    row = {
+        'id': '3708',
+        'status': 'pending',
+        'title': 'γ',
+        'dependencies': [3658, 3659, 3707, 4856, 4987],
+    }
+    taskmaster.get_task = AsyncMock(return_value=row)
+    return row
+
+
+class TestUpdateTaskBoundary:
+    """The guard must actually be wired into TaskInterceptor.update_task —
+    a green predicate that nothing calls closes nothing."""
+
+    @pytest.mark.asyncio
+    async def test_stale_citation_is_rejected_before_the_write(
+        self, interceptor, taskmaster, live_row,
+    ):
+        result = await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=True, agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconStaleGateCitationRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_corrected_citation_is_written(self, interceptor, taskmaster, live_row):
+        result = await interceptor.update_task(
+            '3708', '/project', details=TRANSITIVE, append=True, agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert result.get('error_type') is None
+
+    @pytest.mark.asyncio
+    async def test_non_recon_writer_is_not_policed(self, interceptor, taskmaster, live_row):
+        await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=True,
+            agent_id='claude-task-4919-implementer',
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_write_without_details_is_a_no_op(self, interceptor, taskmaster, live_row):
+        await interceptor.update_task(
+            '3708', '/project', metadata={'x_relay_note': 'ok'}, agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_guard_keys_on_details_not_on_append_mode(
+        self, interceptor, taskmaster, live_row,
+    ):
+        await interceptor.update_task(
+            '3708', '/project', details=TRANSITIVE, agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_replace_mode_is_also_rejected(self, interceptor, taskmaster, live_row):
+        result = await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=False, agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconStaleGateCitationRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dependency_rewrite_in_the_same_call_is_judged_against_the_kwarg(
+        self, interceptor, taskmaster, live_row,
+    ):
+        # One call may legitimately rewire the array AND relay that change.
+        # The citation must be checked against the array the write LEAVES
+        # BEHIND, so 3660 becoming a real dependency makes STALE_A correct.
+        # The string form is deliberate: that is the kwarg's declared type on
+        # sqlite_task_backend.TaskBackend.update_task, so this also pins that
+        # the int/str normalisation is reached on the real path.
+        await interceptor.update_task(
+            '3708', '/project', details=STALE_A,
+            dependencies=['3658', '3659', '3660', '3707'], agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dependency_rewrite_that_drops_a_cited_gate_is_rejected(
+        self, interceptor, taskmaster, live_row,
+    ):
+        result = await interceptor.update_task(
+            '3708', '/project', details=CAPS_GATING,
+            dependencies=['3658'], agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconStaleGateCitationRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_row_without_dependencies_fails_open(self, interceptor, taskmaster):
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '3708', 'status': 'pending', 'title': 'γ'},
+        )
+
+        await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=True, agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rejection_issues_no_second_read(self, interceptor, taskmaster, live_row):
+        # The guard reuses the `before` read the recon-write-policy gate already
+        # took; a recon-stage write still issues exactly one get_task.
+        await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=True, agent_id=AGENT_ID,
+        )
+
+        assert taskmaster.get_task.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_terminal_write_policy_keeps_priority(self, interceptor, taskmaster):
+        # Ordering: the pre-existing gate fires first, so a stale citation on a
+        # done task reports the terminal rejection, not this guard's.
+        taskmaster.get_task = AsyncMock(
+            return_value={
+                'id': '3708', 'status': 'done', 'title': 'γ',
+                'dependencies': [3658, 3659, 3707, 4856, 4987],
+            },
+        )
+
+        result = await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=True, agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
