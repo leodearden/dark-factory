@@ -73,6 +73,8 @@ from __future__ import annotations
 from enum import StrEnum
 from pathlib import Path
 
+from orchestrator.landing_evidence import is_valid_sha_40
+
 __all__ = [
     'ShadowShape',
     'build_live_fixture',
@@ -112,6 +114,22 @@ class ShadowShape(StrEnum):
         return self in (ShadowShape.IMPLEMENTER, ShadowShape.ARCHITECT_CONSEQUENCE)
 
 
+def _resolved_shape(shape: str) -> ShadowShape:
+    """Coerce *shape* to a :class:`ShadowShape`, naming the vocabulary on miss.
+
+    Mirrors ``task_sampler.default_verify_commands``'s message style: the
+    offending value and the full set of valid ones, so a caller reading the
+    error never has to go find the enum.
+    """
+    try:
+        return ShadowShape(shape)
+    except ValueError:
+        valid = ', '.join(member.value for member in ShadowShape)
+        raise ValueError(
+            f'build_live_fixture: unknown shape {shape!r} (expected one of {valid})'
+        ) from None
+
+
 def build_live_fixture(
     task: dict,
     *,
@@ -136,10 +154,48 @@ def build_live_fixture(
     candidate architect's for consequence leg 2; the two live-architect shapes
     take ``None``. *cell_id* is the ``shadow_cells`` row's ulid, which makes
     the fixture id unique across the cells opened for one task.
+
+    Raises ``ValueError`` — never logs and continues — on an unrecognised
+    *shape*, a *plan* that disagrees with the shape's ``requires_plan``, a
+    *base_sha* that is not a 40-hex sha, an empty *cell_id*, or a record with
+    no task id. All of these are data-plumbing bugs in the caller, and every
+    one of them survives to a LATER failure that has already created an eval
+    worktree if it is not refused here.
     """
+    resolved_shape = _resolved_shape(shape)
+    if resolved_shape.requires_plan and not plan:
+        raise ValueError(
+            f'build_live_fixture: shape {resolved_shape.value!r} requires a '
+            f'plan (got {plan!r}); it runs the frozen-plan implementer path, '
+            f'which needs the accepted plan to execute'
+        )
+    if not resolved_shape.requires_plan and plan is not None:
+        raise ValueError(
+            f'build_live_fixture: shape {resolved_shape.value!r} forbids a '
+            f'plan (got a plan); its runner plans live and never reads one, '
+            f'so a plan here would be silently ignored'
+        )
+    if not is_valid_sha_40(base_sha):
+        raise ValueError(
+            f'build_live_fixture: base_sha must be a 40-char lowercase hex '
+            f'sha (got {base_sha!r}); the eval worktree is created at this '
+            f'commit and compared against `git rev-parse HEAD` literally'
+        )
+    if not str(cell_id or '').strip():
+        raise ValueError(
+            f'build_live_fixture: cell_id must be non-empty (got {cell_id!r}); '
+            f'it is what distinguishes the cells opened for one task'
+        )
+    task_id = str(task.get('id') or '').strip()
+    if not task_id:
+        raise ValueError(
+            f'build_live_fixture: task record has no id (got '
+            f'{task.get("id")!r}); the id is half the fixture id'
+        )
+
     metadata = task.get('metadata') or {}
     return {
-        'id': f'shadow_{task.get("id")}_{cell_id}',
+        'id': f'shadow_{task_id}_{cell_id}',
         'name': str(task.get('title') or ''),
         'project_root': project_root,
         'pre_task_commit': base_sha,
