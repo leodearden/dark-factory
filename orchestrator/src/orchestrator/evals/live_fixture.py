@@ -70,6 +70,7 @@ corpus baseline the comparison depends on.
 
 from __future__ import annotations
 
+import copy
 from enum import StrEnum
 from pathlib import Path
 
@@ -204,7 +205,13 @@ def build_live_fixture(
             'description': str(task.get('description') or ''),
             'details': str(task.get('details') or ''),
         },
-        'verify_commands': verify_commands,
-        'modules': metadata.get('modules') or [],
-        'plan': plan,
+        'verify_commands': dict(verify_commands),
+        'modules': list(metadata.get('modules') or []),
+        # Deep, not shallow: run_eval hands this plan to a real workflow that
+        # flips step status in place, and the dict the coordinator passed in is
+        # production's freshly-read .task-meta/<worktree>/plan.json. A shadow
+        # cell must never write through to the live task's plan. The fixture
+        # stays `==` to the caller's plan, which is all C3's "plan as given"
+        # asks; it is simply not the same object.
+        'plan': copy.deepcopy(plan),
     }
