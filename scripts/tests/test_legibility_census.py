@@ -2059,8 +2059,12 @@ def _codebook_with_adjudicated_candidate(disposition, *, promoted_to=None, extra
 
 
 def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
-    """`run_census` kwargs for a single-cluster run the verifier REJECTS.
-    *overrides* win, so a caller can substitute its own `verify_fn`."""
+    """`run_census` kwargs for a single-cluster run over the `_REJECTED_TITLE`
+    cluster, whose DEFAULT `verify_fn` rejects it.
+
+    The verdict is chosen by `verify_fn` alone, not by this builder --
+    *overrides* win, so `_verified_run_kwargs` below is this same run with the
+    opposite verdict and a caller can substitute any verifier at all."""
     defaults = dict(
         invoke=_make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-rejected", "a spurious one-off")]],
@@ -2073,8 +2077,61 @@ def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
     return _run_census_kwargs(tmp_path, **{**defaults, **overrides})
 
 
+def _verified_run_kwargs(tmp_path, codebook_dict, **overrides):
+    """The same single-cluster run with the OPPOSITE verdict: the verifier
+    VERIFIES `_REJECTED_TITLE`. A thin call of `_rejected_run_kwargs` rather
+    than a second defaults dict -- only `verify_fn` differs, and a fork of the
+    defaults would drift."""
+    return _rejected_run_kwargs(
+        tmp_path, codebook_dict,
+        **{"verify_fn": _make_fake_verify_fn(verified_titles={_REJECTED_TITLE}), **overrides},
+    )
+
+
+def _promoted_entry() -> dict:
+    """The live codebook ENTRY a `promoted` standing candidate points at.
+    Seeded alongside the candidate so `promoted_to` resolves and the codebook
+    stays valid."""
+    return {
+        "id": "entry-spurious",
+        "title": _REJECTED_TITLE,
+        "severity": "medium",
+        "status": "open",
+        "origin_phase": "review",
+        "manifested_phase": "merge",
+        "sightings": [],
+    }
+
+
+def _codebook_with_standing(disposition):
+    """`_codebook_with_adjudicated_candidate` with the `promoted` case's
+    required live entry supplied, so the two dispositions differ only in the
+    word. That is exactly what the inversion test needs: the same run, the
+    same seeding, one word changed, the opposite marker expected."""
+    if disposition == "promoted":
+        return _codebook_with_adjudicated_candidate(
+            "promoted", promoted_to="entry-spurious", extra_entry=_promoted_entry(),
+        )
+    return _codebook_with_adjudicated_candidate(disposition)
+
+
+def _verify_fn_with_unknown_titles(*, verified=(), rejected=()):
+    """A verifier whose verdicts name titles the merge never saw -- the
+    shortest route to N dropped verdicts in one run, on EITHER adjudication
+    loop or both at once, independent of any codebook seeding."""
+    def fake_verify_fn(clusters, *, model):
+        return {
+            "verified": [{"title": t, "sightings": []} for t in verified],
+            "rejected": [{"title": t, "sightings": []} for t in rejected],
+            "fixed": [],
+        }
+
+    return fake_verify_fn
+
+
 def _dropped_verdict_warnings(caplog):
-    """Every WARNING naming `_REJECTED_TITLE` as a dropped reject verdict."""
+    """Every WARNING naming `_REJECTED_TITLE` as a dropped verdict -- either
+    loop's, since both name the title and both say DROPPED."""
     return [
         r.getMessage() for r in caplog.records
         if r.levelno == logging.WARNING
@@ -2092,19 +2149,7 @@ def test_run_census_dropped_reject_over_a_promoted_candidate_is_a_contradiction(
     An operator has to know, because only a hand re-open will change it --
     nothing in the system reconciles a standing promotion against a later
     verdict that the title is unfounded."""
-    promoted_entry = {
-        "id": "entry-spurious",
-        "title": _REJECTED_TITLE,
-        "severity": "medium",
-        "status": "open",
-        "origin_phase": "review",
-        "manifested_phase": "merge",
-        "sightings": [],
-    }
-    codebook_dict = _codebook_with_adjudicated_candidate(
-        "promoted", promoted_to="entry-spurious", extra_entry=promoted_entry,
-    )
-    kwargs = _rejected_run_kwargs(tmp_path, codebook_dict)
+    kwargs = _rejected_run_kwargs(tmp_path, _codebook_with_standing("promoted"))
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
@@ -2200,18 +2245,162 @@ def test_run_census_dropped_reject_with_no_standing_candidate_says_so_plainly(
     assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
 
 
-def _verify_fn_rejecting_unknown_titles(*titles):
-    """A verifier whose rejects name titles the merge never saw -- the
-    shortest route to N dropped verdicts in one run, independent of any
-    codebook seeding."""
-    def fake_verify_fn(clusters, *, model):
-        return {
-            "verified": [],
-            "rejected": [{"title": t, "sightings": []} for t in titles],
-            "fixed": [],
-        }
+# ---------------------------------------------------------------------------
+# task 5279 review remedy (a): the SAME drop on the `verified` loop.
+#
+# The reject loop above got its three branches; the verified loop kept a bare
+# `if cand_id is None: continue`. That half is the more consequential one: a
+# confusion pattern the census just paid a Sonnet call to CONFIRM never enters
+# the codebook, no entry records it, and the operator-facing tally reports a
+# clean run. Every later census codes against ENTRIES, so a confirmed pattern
+# with no entry is invisible from then on.
+#
+# `promoted` and `rejected` swap roles between the two loops -- see
+# `test_dropped_verdict_contradiction_marker_inverts_between_the_loops`, which
+# pins both directions so the two branch ladders can never be "unified".
+# ---------------------------------------------------------------------------
 
-    return fake_verify_fn
+def test_run_census_dropped_verify_over_a_rejected_candidate_is_a_contradiction(
+    tmp_path, caplog,
+):
+    """A standing REJECT holds against a fresh VERIFY: this run PAID to
+    confirm the pattern and the confirmation is discarded.
+
+    Only a hand re-open changes it -- nothing reconciles a standing rejection
+    against a later verdict that the title is real."""
+    kwargs = _verified_run_kwargs(tmp_path, _codebook_with_standing("rejected"))
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    messages = _dropped_verdict_warnings(caplog)
+    assert len(messages) == 1, (
+        f"exactly one WARNING must name the dropped verify verdict; got: {messages}"
+    )
+    message = messages[0]
+    # The same four facts the reject branches name, so an operator finds the
+    # standing record by hand from either loop's line.
+    assert _REJECTED_TITLE in message
+    assert "cand-20260701-7" in message
+    assert "rejected" in message
+    assert "2026-07-01" in message
+    assert "CONTRADICT" in message.upper()
+
+    # WHAT WAS ACTUALLY LOST. The reject-side trio has no analogue for this
+    # assertion, and it is the one that would have caught the silence: a
+    # pattern this run CONFIRMED never became a codebook entry.
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert [e["id"] for e in persisted["entries"]] == ["entry-a"], (
+        "the confirmed pattern silently failed to enter the codebook -- that "
+        "loss is exactly what the WARNING has to announce"
+    )
+    assert outcome.status == "done"
+    assert codebook.validate(persisted) == []
+
+
+def test_run_census_dropped_verify_over_a_promoted_candidate_is_agreement(
+    tmp_path, caplog,
+):
+    """The agreement case on this loop: the title is ALREADY a live codebook
+    entry, so a fresh VERIFY confirms what stands. Nothing is lost but the
+    verify call.
+
+    It still gets a line -- a recurring count is the cue that a title keeps
+    being re-mined and re-confirmed against an entry that already records it
+    -- but it must be DISTINGUISHABLE from the contradiction above."""
+    kwargs = _verified_run_kwargs(tmp_path, _codebook_with_standing("promoted"))
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    messages = _dropped_verdict_warnings(caplog)
+    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
+    message = messages[0]
+    assert _REJECTED_TITLE in message
+    assert "cand-20260701-7" in message
+    assert "promoted" in message
+    assert "2026-07-01" in message
+    # Asserted as an ABSENCE against the presence asserted above, so the two
+    # messages cannot converge on one wording later.
+    assert "CONTRADICT" not in message.upper()
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_dropped_verdict_contradiction_marker_inverts_between_the_loops(tmp_path, caplog):
+    """`promoted` and `rejected` swap roles between the two adjudication
+    loops: a standing PROMOTION contradicts a fresh REJECT, and a standing
+    REJECT contradicts a fresh VERIFY.
+
+    Both directions pinned in ONE test, because the failure this guards
+    against is an edit that copies one loop's branch conditions verbatim into
+    the other -- which passes every single-direction test while mislabelling
+    every drop it touches. Asserted here so that edit fails at the inversion
+    rather than in an operator's journal."""
+    cases = [
+        ("fresh VERIFY vs standing reject", _verified_run_kwargs, "rejected", True),
+        ("fresh VERIFY vs standing promotion", _verified_run_kwargs, "promoted", False),
+        ("fresh REJECT vs standing promotion", _rejected_run_kwargs, "promoted", True),
+        ("fresh REJECT vs standing reject", _rejected_run_kwargs, "rejected", False),
+    ]
+    for label, build_kwargs, standing, expect_contradiction in cases:
+        caplog.clear()
+        kwargs = build_kwargs(
+            tmp_path / label.replace(" ", "-"), _codebook_with_standing(standing),
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome = mod.run_census(**kwargs)
+
+        messages = _dropped_verdict_warnings(caplog)
+        assert len(messages) == 1, f"{label}: expected one WARNING; got: {messages}"
+        marked = "CONTRADICT" in messages[0].upper()
+        assert marked is expect_contradiction, (
+            f"{label}: contradiction marker present={marked}, expected "
+            f"{expect_contradiction} -- the two loops invert, they do not share "
+            f"one branch ladder. Message: {messages[0]}"
+        )
+        assert outcome.status == "done"
+        assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_run_census_dropped_verify_with_no_standing_candidate_says_so_plainly(
+    tmp_path, caplog,
+):
+    """No same-title candidate exists at all, so there is no standing verdict
+    to explain the drop -- the merge and this run's cluster list disagree about
+    the title.
+
+    The message must say that plainly rather than inventing a standing record;
+    an explanation that is fabricated is worse than an admitted gap."""
+    ghost = "A verified title the merge never saw"
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _minimal_v2_codebook(),
+        verify_fn=_verify_fn_with_unknown_titles(verified=(ghost,)),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    messages = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and ghost in r.getMessage()
+        and "DROPPED" in r.getMessage()
+    ]
+    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
+    message = messages[0]
+    assert "no same-title candidate" in message.lower()
+    assert "disagree" in message.lower()
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def _verify_fn_rejecting_unknown_titles(*titles):
+    """The reject-only spelling of `_verify_fn_with_unknown_titles`, kept
+    because its call sites read better named for the verdict they drive."""
+    return _verify_fn_with_unknown_titles(rejected=titles)
 
 
 def _run_summary_records(caplog):
@@ -2289,6 +2478,51 @@ def test_run_census_carries_unresolved_verdicts_as_an_outcome_field(tmp_path, ca
 
     assert dropping_outcome.unresolved_verdicts == 2
     assert clean_outcome.unresolved_verdicts == 0
+
+
+def test_unresolved_verdicts_is_one_counter_reached_by_both_loops(tmp_path, caplog):
+    """The counter's own comment claims it is "shared by both adjudication
+    loops" and `CensusOutcome.unresolved_verdicts` says "verify verdicts",
+    loop-agnostically. This is what makes those two statements TRUE rather
+    than aspirational.
+
+    A reject-only counter satisfies every other test in this block, so the
+    mixed run is the only shape that can tell the two apart: one dropped
+    VERIFY plus one dropped REJECT must tally to 2 on ONE counter and emit ONE
+    summary line, and a verify-only run must reach a non-zero count at all."""
+    mixed = _rejected_run_kwargs(
+        tmp_path / "mixed", _minimal_v2_codebook(),
+        verify_fn=_verify_fn_with_unknown_titles(
+            verified=("Ghost verified",), rejected=("Ghost rejected",),
+        ),
+    )
+    verify_only = _rejected_run_kwargs(
+        tmp_path / "verify-only", _minimal_v2_codebook(),
+        verify_fn=_verify_fn_with_unknown_titles(
+            verified=("Ghost verified one", "Ghost verified two"),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        mixed_outcome = mod.run_census(**mixed)
+    summaries = _run_summary_records(caplog)
+    assert len(summaries) == 1, (
+        f"one summary for the whole run, not one per loop; got: {summaries}"
+    )
+    assert "2 unresolved verdict(s)" in summaries[0], (
+        "a reject-only tally reports 1 here -- the verify-loop drop must land "
+        f"on the same counter. Got: {summaries[0]}"
+    )
+    assert mixed_outcome.unresolved_verdicts == 2
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        verify_only_outcome = mod.run_census(**verify_only)
+    assert verify_only_outcome.unresolved_verdicts == 2, (
+        "the field is not reject-only: two dropped VERIFY verdicts and no "
+        "dropped reject must still count"
+    )
+    assert len(_run_summary_records(caplog)) == 1
 
 
 def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
