@@ -258,11 +258,17 @@ function layoutFlow(model, { width = 640, height = 260, nodeWidth = 14, nodePad 
   return { nodes, ribbons, width, height, colX };
 }
 
-const API = { aggregateFlow, layoutFlow };
+// Module-unique export const, never a bare `API` — see the
+// shared-classic-script-scope note in graph_layout.js's header, enforced by
+// dashboard/tests/js/classic_script_scope.test.mjs. Not hypothetical here:
+// this file shipped with a bare `const API` copied from graph_layout.js, which
+// collided with graph_layout.js's own, left window.DF_ESC_FLOW_LAYOUT
+// undefined, and silently broke the Workflow panel's mini-Sankey.
+const ESC_FLOW_LAYOUT_API = { aggregateFlow, layoutFlow };
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = API;
+  module.exports = ESC_FLOW_LAYOUT_API;
 }
 if (typeof window !== 'undefined') {
-  window.DF_ESC_FLOW_LAYOUT = API;
+  window.DF_ESC_FLOW_LAYOUT = ESC_FLOW_LAYOUT_API;
 }

@@ -28,11 +28,11 @@ from __future__ import annotations
 import enum
 
 __all__ = [
-    "TaskStatus",
-    "TERMINAL",
-    "ACTIVE",
-    "WORKFLOW_PRESERVE",
-    "STATUS_TRIGGERS",
+    'TaskStatus',
+    'TERMINAL',
+    'ACTIVE',
+    'WORKFLOW_PRESERVE',
+    'STATUS_TRIGGERS',
 ]
 
 
@@ -45,15 +45,15 @@ class TaskStatus(enum.StrEnum):
     at every legacy call site.
     """
 
-    PENDING = "pending"
-    IN_PROGRESS = "in-progress"
-    BLOCKED = "blocked"
-    DEFERRED = "deferred"
-    REVIEW = "review"
-    MERGE_DEFERRED = "merge-deferred"
-    INFRA_HOLD = "infra-hold"
-    DONE = "done"
-    CANCELLED = "cancelled"
+    PENDING = 'pending'
+    IN_PROGRESS = 'in-progress'
+    BLOCKED = 'blocked'
+    DEFERRED = 'deferred'
+    REVIEW = 'review'
+    MERGE_DEFERRED = 'merge-deferred'
+    INFRA_HOLD = 'infra-hold'
+    DONE = 'done'
+    CANCELLED = 'cancelled'
 
 
 # Parity: orchestrator/task_status.py TERMINAL_STATUSES;

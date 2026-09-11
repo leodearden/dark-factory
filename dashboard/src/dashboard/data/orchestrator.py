@@ -21,6 +21,18 @@ the upstream format changes, this module must be updated by hand.
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
 
+2. Config DEFAULTS layering (:func:`read_max_concurrent_tasks`) — the
+   orchestrator's effective config is ``_deep_merge(_load_defaults(),
+   project_config)`` (``orchestrator/src/orchestrator/config.py``), so a key
+   a project's YAML omits is still in force from
+   ``orchestrator/src/orchestrator/defaults.yaml``. Reading a project YAML
+   alone therefore under-reports, and for a parity DENOMINATOR that silently
+   disables the alarm rather than loosening it. The one default this module
+   needs is restated as
+   :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`; anyone changing
+   ``max_concurrent_tasks`` in ``defaults.yaml`` must update it (a test
+   asserts the two agree whenever the orchestrator source is present).
+
 RETIRED: this module used to re-derive a second format — the ``.task/``
 artifact layout (``metadata.json``, ``plan.json``, ``iterations.jsonl``,
 ``reviews/*.json``) — via a hand-rolled reader (``read_task_artifacts`` /
@@ -43,9 +55,34 @@ from pathlib import Path
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 
 logger = logging.getLogger(__name__)
+
+# --- Budget constants -------------------------------------------------------
+#
+# ``discover_orchestrators`` walks its project roots SEQUENTIALLY, so it needs
+# the same two-layer bound ``active_tasks.collect_tasks_with_counts`` uses: a
+# per-root budget AND a whole-loop deadline. A per-root bound alone leaves a
+# worst case of ``roots * budget``, which on a machine with several roots
+# overruns the browser's fetch abort and throws away the very degraded payload
+# the bound exists to deliver.
+
+# Whole-operation bound for ONE root's ``fetch_tasks`` call. Bound to the
+# shared default rather than restating the literal, so the arithmetic lives in
+# exactly one place; a site may later TIGHTEN its own constant (the structural
+# test enforces that it can never widen it).
+_ORCHESTRATORS_PER_ROOT_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
+
+# Whole-loop deadline for the entire per-root walk.
+#
+# Strictly below ``data.js``'s 30 000 ms fetch abort with 10 s of headroom for
+# HTTP and JSON serialisation, so the PARTIAL payload the deadline produces is
+# actually deliverable to the browser that asked for it. The reasoning is
+# ``active_tasks._TASKS_TOTAL_BUDGET``'s, restated here rather than imported
+# because this bounds a DIFFERENT handler: coupling the two would make a
+# future adjustment to one silently move the other.
+_ORCHESTRATORS_TOTAL_BUDGET = 20.0
 
 
 def _resolve_project_root(prd: str, default_root: Path) -> Path:
@@ -72,14 +109,28 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     return default_root.resolve()
 
 
+def _expand_env_placeholders(value: str) -> str:
+    """Expand ``${VAR}`` / ``${VAR:default}`` in an orchestrator-config scalar.
+
+    Matches orchestrator ``config.py`` behaviour: an unset ``VAR`` with no
+    default expands to the empty string, and callers decide what that means
+    (for both readers below: "unknown", never a usable value).
+    """
+    import os
+
+    return re.sub(
+        r'\$\{([^:}]+)(?::([^}]*))?\}',
+        lambda m: os.environ.get(m.group(1), m.group(2) or ''),
+        value,
+    )
+
+
 def _read_project_root_from_config(config_path: str) -> Path | None:
     """Extract ``project_root`` from an orchestrator config YAML file.
 
     Handles ``${VAR:default}`` env-var expansion for the project_root value.
     Returns ``None`` if the file can't be read or doesn't contain project_root.
     """
-    import os
-
     import yaml
 
     try:
@@ -91,14 +142,181 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     value = raw.get('project_root')
     if not isinstance(value, str):
         return None
-    # Expand ${VAR:default} patterns (matching orchestrator config.py behavior)
-    expanded = re.sub(
-        r'\$\{([^:}]+)(?::([^}]*))?\}',
-        lambda m: os.environ.get(m.group(1), m.group(2) or ''),
-        value,
-    )
-    p = Path(expanded)
+    p = Path(_expand_env_placeholders(value))
     return p.resolve() if p.is_absolute() else None
+
+
+def _load_config_mapping(path: Path) -> dict | None:
+    """``yaml.safe_load`` *path* and return it if it is a mapping, else ``None``.
+
+    Never raises: this runs inside the burndown collector loop, where an
+    exception would take down a whole collection cycle — strictly worse than
+    an unknown value. ``ValueError`` covers ``UnicodeDecodeError`` for a
+    non-text file.
+    """
+    import yaml
+
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        logger.debug('Unreadable orchestrator config %s: %s', path, exc)
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+# FORMAT COUPLING item 2 (see the module docstring). Restates
+# ``orchestrator/src/orchestrator/defaults.yaml``'s ``max_concurrent_tasks``,
+# which ``orchestrator.config`` deep-merges UNDER every project config. A
+# project that omits the key therefore runs with this cap, not with no cap —
+# so the reader must layer it the same way or the parity alarm silently never
+# fires for those projects (the exact E12 miss it exists to catch).
+# ``dashboard/tests/test_orchestrator.py`` asserts this constant against that
+# file whenever the orchestrator source is present, so drift fails a test
+# rather than degrading an alarm.
+_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS = 24
+
+_CAP_KEY_ABSENT = object()
+"""Sentinel: the config mapping has no ``max_concurrent_tasks`` key at all.
+
+Distinct from an explicit ``max_concurrent_tasks:`` (YAML null). Absent means
+"the orchestrator's own default applies"; an explicit null is a config defect —
+``OrchestratorConfig`` types the field ``int``, so such a config fails
+validation and no orchestrator runs from it at all.
+"""
+
+
+def _coerce_concurrency_cap(value: object, path: Path) -> int | None:
+    """Coerce a raw ``max_concurrent_tasks`` value to a usable cap, or ``None``.
+
+    ``None`` means UNKNOWN, which the parity alarm must never conflate with
+    "not breaching", and is now reserved STRICTLY for "the file is unreadable
+    or the value is malformed". A malformed value logs a WARNING naming the
+    file and the value, because that is a config defect an operator needs
+    to see.
+
+    An ABSENT key (*value* is :data:`_CAP_KEY_ABSENT`) is not unknown: the
+    orchestrator deep-merges ``defaults.yaml`` under the project config, so
+    the project runs with :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`.
+    Returning ``None`` here would exclude the whole project from the parity
+    alarm — of the live configs under ``/home/leo/src``, two omit the key.
+
+    Boundaries:
+
+    * ``bool`` is rejected explicitly — it is an ``int`` subclass, so a bare
+      ``isinstance(value, int)`` would silently read ``true`` as a cap of 1.
+    * ``0`` is KEPT as a real cap ("dispatch nothing"). Tasks still
+      in-progress against a 0 cap are a genuine breach; reporting that as
+      unknown would hide it.
+    * Negative caps are nonsense and rejected.
+    * An explicit YAML null is MALFORMED, not absent — see
+      :data:`_CAP_KEY_ABSENT`.
+    * A numeric *string* is accepted after ``${VAR:default}`` expansion —
+      that is how a config spells an env-driven int.
+    """
+    if value is _CAP_KEY_ABSENT:
+        logger.debug(
+            'No max_concurrent_tasks in %s — applying the orchestrator default '
+            'of %d (defaults.yaml is merged under every project config)',
+            path,
+            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
+        )
+        return _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
+
+    raw = value
+    if isinstance(value, bool):
+        cap = None
+    elif isinstance(value, int):
+        cap = value
+    elif isinstance(value, str):
+        expanded = _expand_env_placeholders(value).strip()
+        try:
+            cap = int(expanded)
+        except ValueError:
+            cap = None
+    else:
+        cap = None
+
+    if cap is None or cap < 0:
+        logger.warning(
+            'Ignoring unusable max_concurrent_tasks %r in %s — treating the '
+            'concurrency cap as unknown',
+            raw,
+            path,
+        )
+        return None
+    return cap
+
+
+def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
+    """Read *project_root*'s orchestrator concurrency cap, or ``None`` if unknown.
+
+    This is the burndown parity alarm's denominator. ``max_concurrent_tasks``
+    is restart-only (red-tier: it is absent from ``config.py``'s hot-reload
+    allowlist, and the scheduler semaphore is sized once at startup), but a
+    burndown window spans restarts and the cap varies between projects, so it
+    is TIME-VARYING across the window regardless. The collector therefore calls
+    this once per snapshot and stores the answer ON the snapshot row: comparing
+    a historical in-progress census against today's cap would forgive a past
+    breach after a cap raise and invent one after a cut. Callers must treat
+    ``None`` as UNKNOWN, never as "not breaching".
+
+    ``None`` is reserved for a config that is ABSENT, unreadable, or carries a
+    malformed value. A readable config that simply OMITS the key yields the
+    orchestrator's own default
+    (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`), because
+    ``orchestrator.config`` deep-merges ``defaults.yaml`` under every project
+    config — every running orchestrator has a cap, whether or not its YAML
+    spells one. Reading such a project as capless would drop it out of the
+    parity alarm entirely.
+
+    Resolution mirrors ``dashboard.config._discover_root_escalation_url`` and
+    reuses its filename constants so the two cannot fork: the canonical
+    ``dark-factory-orchestrator.yaml`` is authoritative once it exists on
+    disk (a live config must not be masked by a stale legacy file — including
+    when it omits the key, where the default applies rather than the legacy
+    file's value), and only its outright absence falls through to
+    ``_LEGACY_CONFIG_NAMES`` in order, taking the first readable one.
+
+    Unlike that startup-time discovery helper, the legacy-spelling nudge here
+    is logged at DEBUG, not WARNING: this runs every collection cycle
+    (~10 min per project), so a WARNING would be recurring log spam rather
+    than the bounded once-per-process reminder that one is.
+
+    Never raises — see :func:`_load_config_mapping`.
+    """
+    from dashboard.config import _CANONICAL_CONFIG_NAME, _LEGACY_CONFIG_NAMES
+
+    root = Path(project_root)
+
+    canonical = root / _CANONICAL_CONFIG_NAME
+    if canonical.is_file():
+        data = _load_config_mapping(canonical)
+        if data is None:
+            return None
+        return _coerce_concurrency_cap(
+            data.get('max_concurrent_tasks', _CAP_KEY_ABSENT), canonical
+        )
+
+    for legacy_name in _LEGACY_CONFIG_NAMES:
+        legacy_path = root / legacy_name
+        if not legacy_path.is_file():
+            continue
+        data = _load_config_mapping(legacy_path)
+        if data is None:
+            continue
+        cap = _coerce_concurrency_cap(
+            data.get('max_concurrent_tasks', _CAP_KEY_ABSENT), legacy_path
+        )
+        if cap is not None:
+            logger.debug(
+                'Project %s: read max_concurrent_tasks from legacy config path %s '
+                '(expected %s)',
+                root.name,
+                legacy_path,
+                _CANONICAL_CONFIG_NAME,
+            )
+            return cap
+    return None
 
 
 def find_running_orchestrators() -> list[dict]:
@@ -174,6 +392,54 @@ async def discover_orchestrators(
 
     Returns [] if no orchestrator processes are running.
     Per-project task fetches that hit MCP errors degrade to an empty list.
+
+    **Bounded as a whole, not merely per root.** The per-root walk below is
+    SEQUENTIAL, so without a deadline the worst case is the SUM of every
+    root's worst case — on a machine with several roots that overruns
+    ``data.js``'s 30 000 ms fetch abort and throws away the very degraded
+    payload the bound exists to deliver. Hence both layers, matching
+    ``active_tasks.collect_tasks_with_counts``: a per-root
+    ``_ORCHESTRATORS_PER_ROOT_BUDGET`` and a whole-loop
+    ``_ORCHESTRATORS_TOTAL_BUDGET`` deadline.
+
+    Both degraded outcomes — a root that TIMED OUT and a root that never got
+    its TURN — surface through this module's existing offline marker, because
+    that is the honest fact available here: the entry contract carries one
+    boolean and no separate degraded channel, and ``redux_api.shape_orchestrators``
+    projects only ``offline``/``error``. The cause is therefore carried in
+    ``error`` (two distinct messages, so an operator can tell a
+    proven-unreachable root from a merely-unmeasured one) and in a WARNING,
+    rather than being silently dropped. The alternative — leaving ``offline``
+    False with empty tasks — would render a starved root as a healthy project
+    with zero tasks, which is exactly the invisible-failure class this bound
+    exists to close.
+
+    **This site deliberately DIVERGES from the sibling invariant.**
+    ``active_tasks.collect_tasks_with_counts`` states that "*degraded* and
+    *offline* are DISTINCT FACTS and must never be merged by a consumer:
+    *offline* means the fetch demonstrably failed (the project is proven
+    unreachable), *degraded* means the budget expired first and this project's
+    state is simply UNKNOWN"
+    (``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``),
+    and that is right — collapsing them can send an operator to restart a
+    healthy service. Honouring it HERE, though, means adding a third state to
+    this entry contract, to ``redux_api.shape_orchestrators`` and to the React
+    orchestrators tab, which is outside a change whose remit is "wrap each call
+    site in ``asyncio.wait_for``". So the divergence is a scope boundary, not a
+    disagreement, and it is bounded rather than silent: the distinction
+    survives verbatim in ``error`` and in the WARNING, and a follow-up is filed
+    to widen the entry contract with a ``degraded`` key so the two facts can be
+    carried separately on the wire.
+
+    Until that lands, a CONSUMER of this function must not read ``offline``
+    alone as "fused-memory is proven down" — both budget paths set it with an
+    ``error`` that names the budget verbatim, and neither means the fetch was
+    attempted and failed.
+
+    The two-layer bound is complementary, not redundant: ``fetch_tasks``'
+    ``DEFAULT_PER_CALL_TIMEOUT`` is a PER-HTTP-REQUEST budget bounding
+    connect/read/write and pool acquisition, and never bounds the operation as
+    a whole; only this ``wait_for`` does.
     """
     processes = await asyncio.to_thread(find_running_orchestrators)
     if not processes:
@@ -207,19 +473,64 @@ async def discover_orchestrators(
     project_cache: dict[Path, tuple[list[dict], bool, str | None]] = {}
 
     result: list[dict] = []
+    # Taken BEFORE the loop so every root's cost is inside the budget rather
+    # than being free time the later roots then pay for.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _ORCHESTRATORS_TOTAL_BUDGET
     for project_root, group in groups.items():
         if project_root not in project_cache:
-            fetched = await fetch_tasks(client, config, project_root)
-            if isinstance(fetched, list):
-                tasks = fetched
-                offline = False
-                fetch_error: str | None = None
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Never got its turn. Reported through the offline marker
+                # rather than silently omitted or rendered as zero tasks.
+                message = (
+                    f'skipped — the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
+                    'orchestrators budget was already spent before this root '
+                    'was reached; its task tree is UNKNOWN for this render '
+                    '(not zero)'
+                )
+                logger.warning('project %s: %s', project_root, message)
+                project_cache[project_root] = ([], True, message)
             else:
-                # Offline marker: {'offline': True, 'error': ...}
-                tasks = []
-                offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
-                fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
-            project_cache[project_root] = (tasks, offline, fetch_error)
+                # The EFFECTIVE share, hoisted so the operator message can
+                # report the bound this root actually got. Late in the walk
+                # the whole-loop deadline, not the per-root constant, is the
+                # binding constraint — reporting the constant there would tell
+                # an operator a root blew a 7.0s share when it was in fact
+                # given 1.2s, which is the same illegibility this change set
+                # exists to close.
+                share = min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET)
+                try:
+                    fetched = await asyncio.wait_for(
+                        fetch_tasks(client, config, project_root),
+                        timeout=share,
+                    )
+                except TimeoutError:
+                    # On 3.11+ ``asyncio.TimeoutError`` IS the builtin, and so
+                    # is ``socket.timeout``, so a ``TimeoutError`` raised
+                    # INSIDE the fetch is deliberately folded into this same
+                    # budget path rather than propagating. The message is
+                    # therefore authoritative about the OUTCOME — this root's
+                    # task tree is unknown — and not about the cause.
+                    message = (
+                        f'exceeded its {share:.1f}s share of the '
+                        f'{_ORCHESTRATORS_TOTAL_BUDGET:.1f}s orchestrators '
+                        'budget; its task tree is UNKNOWN for this render '
+                        '(not zero)'
+                    )
+                    logger.warning('project %s: %s', project_root, message)
+                    project_cache[project_root] = ([], True, message)
+                else:
+                    if isinstance(fetched, list):
+                        tasks = fetched
+                        offline = False
+                        fetch_error: str | None = None
+                    else:
+                        # Offline marker: {'offline': True, 'error': ...}
+                        tasks = []
+                        offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
+                        fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
+                    project_cache[project_root] = (tasks, offline, fetch_error)
 
         tasks, offline, fetch_error = project_cache[project_root]
         summary = {

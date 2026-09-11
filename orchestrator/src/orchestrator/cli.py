@@ -16,6 +16,7 @@ import click
 from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, load_config
+from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -342,6 +343,31 @@ def status(config_path: Path | None):
     asyncio.run(_show())
 
 
+@main.command('flake-ledger')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+def flake_ledger_cmd(config_path: Path | None):
+    """Print the flake ledger report: open debt, recurrence chains, health counters.
+
+    READ ONLY. This command opens no debt, files no task, resolves nothing and
+    escalates nothing, and it will NOT create a ledger DB for a project that has
+    none — it reports the absence instead.
+    """
+    # Named flake_ledger_cmd so the function does not shadow the flake_ledger module.
+    from orchestrator.flake_ledger import ledger_db_path
+    from orchestrator.flake_report import build_report, render_report
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    click.echo(render_report(build_report(ledger_db_path(Path(config.project_root)))))
+
+
 @main.command('probe-models')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None,
@@ -391,6 +417,162 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     out_path.write_text(artifact)
 
     click.echo(f'Wrote model availability artifact to {out_path}')
+
+
+@main.command('check-config')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to the project orchestrator config YAML to lint (REQUIRED '
+                   'unless ORCH_CONFIG_PATH is set).')
+def check_config(config_path: Path | None):
+    """Lint a project config YAML for unknown keys that pydantic silently drops.
+
+    OrchestratorConfig uses ``extra='ignore'``, so any key with no matching model
+    field is DISCARDED before validation with no error — the 2026-07-22 incident
+    where a top-level ``spare_warm_lanes: 8`` (the field lives on ``git.``) was
+    dropped for weeks.  This offline gate walks the RAW project YAML against the
+    schema via ``census_config_keys`` DIRECTLY (not a full validated load), so it
+    still reports phantom keys even when the config has an unrelated value-level
+    validation error.
+
+    A key deliberately present for NON-OrchestratorConfig consumers (e.g. one the
+    project's own scripts read) can be excused two ways, and is then listed in an
+    INFORMATIONAL section that never affects the exit code:
+
+    \b
+      * name it with the reserved ``x_``/``x-`` prefix (works at any depth, no
+        config ceremony) — the preferred form for a NEW knob;
+      * add it to ``config_key_census.ignore`` in the same YAML (fnmatch globs,
+        so ``cpu_governance.*`` opts out a whole namespace) — for existing
+        names other tooling already greps for.
+
+    An ignore entry is an ASSERTION that some non-orchestrator consumer reads
+    the key, so it should carry a justification:
+
+    \b
+      config_key_census:
+        ignore:
+          - path: cpu_governance.weights
+            reason: read verbatim by scripts/cpu-governed-exec.sh
+          - path: warm_lane_pool
+            reason: temporary — pending #5908, which deletes this entry
+
+    A bare string still works but reports as un-reasoned DEBT.  If the consumer
+    has NOT landed yet, the reason must cite its tracking task as ``#NNNN``:
+    an uncited "pending" claim has no expiry, so nothing will ever re-check it.
+
+    \b
+    Exit codes:
+      0 — no unknown keys and no HARD ignore-entry findings (advisory findings
+          are reported but stay exit-neutral).  An EMPTY project YAML is a
+          legitimate clean result — it means "use all defaults" — and exits 0;
+      1 — at least one GENUINELY-unknown key, OR the file could not be read or
+          parsed at all (a census of nothing is not a clean census, task 4124);
+          dominates 2;
+      2 — no unknown keys, but at least one HARD ignore-entry finding
+          (self-refuting / missing-cite / orphaned).
+    """
+    from orchestrator.config import census_config_keys
+    from orchestrator.config_census_ignore import HARD_KINDS
+
+    # Resolve the config path (arg wins, then ORCH_CONFIG_PATH) without
+    # constructing a validated config — census only needs the raw YAML path.
+    if config_path is None:
+        env_path = os.environ.get('ORCH_CONFIG_PATH')
+        if not env_path:
+            click.echo(
+                'Error: --config is required (or set ORCH_CONFIG_PATH).', err=True
+            )
+            sys.exit(1)
+        config_path = Path(env_path)
+        if not config_path.exists():
+            click.echo(f'Error: Config file not found: {config_path}', err=True)
+            sys.exit(1)
+
+    census = census_config_keys(config_path)
+
+    # An empty census has two very different causes.  Fail CLOSED when nothing
+    # could be parsed: the census's own fail-open contract (config.py) makes
+    # `unknown` empty for an unreadable/unparseable file, so printing the
+    # affirmative OK below would tell an operator a config is safe precisely
+    # when it could not be inspected at all.  The ignored/OK sections are both
+    # vacuous in this case, so return before either — and so is the
+    # ignore-entry audit below, which re-reads the same unparseable file.
+    if census.parse_error:
+        click.echo(f'Error: {census.parse_error}', err=True)
+        click.echo(
+            'Could not lint this file, so its config keys are UNKNOWN — this is '
+            'NOT a clean result. Fix the file and re-run.',
+            err=True,
+        )
+        sys.exit(1)
+
+    # A broken lint must never turn a working gate into a crash, so the audit
+    # (which reaches the filesystem and a sqlite store) degrades to "no
+    # findings" rather than taking check-config down with it.
+    try:
+        findings = audit_census_ignore_entries(config_path)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        click.echo(f'WARNING: ignore-entry audit failed ({exc}) — skipped.', err=True)
+        findings = []
+
+    # Informational FIRST, and explicitly marked as such: these keys were
+    # deliberately excused, so listing them keeps an over-broad glob auditable
+    # without ever reading as a failure or touching the exit code.
+    if census.ignored:
+        _REASONS = {
+            'reserved_prefix': 'ignored: reserved prefix',
+            'allowlist': 'ignored: config_key_census.ignore',
+        }
+        click.echo(
+            f'{len(census.ignored)} key(s) excused from the census '
+            '(informational — does not affect the exit code):'
+        )
+        for ik in census.ignored:
+            label = _REASONS.get(ik.reason, f'ignored: {ik.reason}')
+            # An allowlisted key with no operator justification is DEBT, and
+            # saying so is the whole point: an unexplained entry is an
+            # unfalsifiable assertion about a consumer nobody can check.
+            if ik.note:
+                suffix = f'  — {ik.note}'
+            elif ik.reason == 'allowlist':
+                suffix = '  — no reason given (undocumented debt)'
+            else:
+                suffix = ''
+            click.echo(f'  {ik.path}  ({label}){suffix}')
+        click.echo('')
+
+    hard = [f for f in findings if f.kind in HARD_KINDS]
+    if findings:
+        advisory = [f for f in findings if f.kind not in HARD_KINDS]
+        click.echo(f'{len(findings)} finding(s) in config_key_census.ignore entries:')
+        for f in hard + advisory:
+            click.echo(f'  [{f.severity}] {f.kind}: {f.detail}')
+        click.echo(
+            f'  ({len(advisory)} advisory finding(s) do not affect the exit code.)'
+        )
+        click.echo('')
+
+    if not census.unknown:
+        if hard:
+            click.echo(
+                f'FAIL: {config_path} has {len(hard)} hard ignore-entry '
+                'finding(s) (no unknown config keys).'
+            )
+            sys.exit(2)
+        click.echo(f'OK: {config_path} has no unknown config keys.')
+        sys.exit(0)
+
+    click.echo(f'Found {len(census.unknown)} unknown config key(s) in {config_path}:')
+    for uk in census.unknown:
+        if uk.shadow_hint:
+            # Advisory ONLY: a shadow hint is a NAME match against the model
+            # tree and may be a coincidental collision, so it stays phrased as a
+            # question rather than an instruction to move the key.
+            click.echo(f'  {uk.path}  → did you mean {uk.shadow_hint}?')
+        else:
+            click.echo(f'  {uk.path}')
+    sys.exit(1)
 
 
 @main.command('verify-merge')
@@ -753,7 +935,57 @@ def cancel_verify(request_id: str, config_path: Path | None):
     git_ops = GitOps(config.git, config.project_root)
     pgf = pgid_file(git_ops.worktree_base, request_id)
     failed_pids: list[int] = []
-    rc = cancel_request(pgf, failed_pids_out=failed_pids)
+    killed_pgid: list[int] = []
+    rc = cancel_request(
+        pgf, failed_pids_out=failed_pids, killed_pgid_out=killed_pgid,
+    )
+    # ── task 3186 (PRD δ): CLEAR THE FIXED-KEY HOLDER RENDEZVOUS ────────────
+    # `cancel_request` SIGKILLs the verify-merge tree, which skips that
+    # process's own `finally` — the one that would have called
+    # `remove_lock_holder_pgid`.  The per-request pgid file it removes itself
+    # is harmless when leaked (request ids are uuid4 and never revisited), but
+    # the FIXED key is a different animal: every run overwrites it, and
+    # `GitOps._merge_verify_lease_active` probes it with `killpg(pgid, 0)`.  A
+    # leaked — or, once the pid counter wraps, RECYCLED — entry there reads as
+    # a LIVE holder, and `reset_persistent_merge_worktree` consumes that
+    # predicate FAIL-CLOSED: it raises `MergeVerifyLeaseHeld` and the warm
+    # `_merge-verify` lane is wedged until some later run happens to overwrite
+    # the key.  See verify_cancel.py's stale-file / PID-reuse note for the
+    # measured picture.
+    #
+    # GATED ON IDENTITY, NOT ON rc.  Two facts make an unconditional
+    # `if rc == 0` clear unsafe:
+    #
+    #   * rc == 0 does not mean anything was killed.  Three of `cancel_request`'s
+    #     four return-0 paths never send a signal (absent file, corrupt content,
+    #     `pgid <= 0`), and the absent-file one is the COMMON case — a
+    #     verify-merge that completes normally removes its own per-request pgid
+    #     file in its `finally`, so a cancel racing normal completion (exactly
+    #     the race δ's head teardown creates) kills nothing at all.
+    #   * The key is SHARED.  Its owner writes it only when it won the build-lane
+    #     flock and clears it only in its own `finally` (see the `verify-merge`
+    #     span above), so it routinely names a DIFFERENT, live verify than the
+    #     request being cancelled.
+    #
+    # Clearing it in either of those situations makes the lease read fail-OPEN
+    # (`read_lock_holder_pgid` -> None -> "not held"): the typed
+    # `MergeVerifyLeaseHeld` diagnosis is lost and DF-3071's admission guard
+    # reads `_merge-verify` as IDLE while a verify is live, so the fleet
+    # REDEPLOYS over it instead of deferring — trading the wedged-lane risk
+    # above for a strictly worse one.  So clear only when this cancel actually
+    # swept a pgid AND the key names that same pgid.
+    #
+    # The rc != 0 case is subsumed and stays fail-closed for its own reason: a
+    # LIVE process refused SIGKILL, so it plausibly still holds both lease axes
+    # and `cancel_request` reports no kill.  Same reasoning as its retention of
+    # the per-request pgid file on that path.
+    #
+    # SCOPE: this closes the merge-worker-initiated cancel — the route δ's
+    # head-verify teardown takes for a REMOTE lease.  The `fire_watchdog_kill`
+    # `os._exit(1)` leak (verify_cancel.py's stale-file note) is a different
+    # route and is deliberately NOT addressed here.
+    if killed_pgid and read_lock_holder_pgid(git_ops.worktree_base) == killed_pgid[0]:
+        remove_lock_holder_pgid(git_ops.worktree_base)
     for pid in failed_pids:
         click.echo(
             f'cancel-verify: PermissionError: could not SIGKILL pid {pid} '
@@ -1095,9 +1327,30 @@ def _run_single_eval(
                 )
                 architect_results.append(result)
                 plan_quality = result.metrics.get('plan_quality')
+                # A cap-tainted cell names its infra failure inline, so an
+                # operator watching the run sees it LIVE rather than a bare
+                # `plan_quality=None` that reads like a scoring quirk. Healthy
+                # cells echo exactly as before.
+                #
+                # 'unmeasurable', not 'cap-tainted': the flag covers every cause
+                # that left no model content (cap hit, auth failure,
+                # model-not-found, wedge, harness error), and a PERMANENT config
+                # error must not read to the operator as a transient cap window.
+                # The marker that follows always names the actual cause.
+                taint = (
+                    f' unmeasurable: {result.metrics.get("invocation_error")}'
+                    if result.metrics.get('cap_tainted') else ''
+                )
+                # `steps=` is echoed BESIDE the score (task 3302) because it is
+                # the plan-production predicate the whole pipeline now keys on:
+                # `steps=0` beside any plan_quality means the architect produced
+                # nothing, which the final table floors to 0.0. Showing it live
+                # is what stops a no-plan candidate from looking healthy for the
+                # length of a campaign.
                 click.echo(
                     f'{result.task_id} × {result.config_name}: '
                     f'{result.outcome} plan_quality={plan_quality} '
+                    f'steps={result.metrics.get("plan_steps")}{taint} '
                     f'({result.wall_clock_ms / 1000:.1f}s)'
                 )
             else:
@@ -1185,14 +1438,31 @@ def _emit_composite_report(results, price_table) -> None:
     composite/cost/latency/CI95/judge report and prints
     :func:`format_composite_table`. The quality figure is single-sourced in λ's
     ``compute_composite`` — the driver never re-derives a score.
+
+    When *results* contain any PLAN-ONLY architect run, the θ plan-quality table
+    is emitted after it (task 3099), mirroring the precedent already in
+    :func:`_run_single_eval` rather than inventing a second rendering path. The
+    two tables are complementary, not redundant: the composite row reports the
+    cap-exclusion as a COUNT, while only the plan-quality table breaks it out BY
+    CAUSE — and that is what tells an operator reading an OFAT run whether a
+    missing architect cell is a transient cap window (rerun it) or a permanent
+    model-not-found (that candidate can never run at all). A result set with no
+    architect rows emits the composite table alone, so the existing
+    ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
     from orchestrator.evals.report import (
         build_composite_report,
+        build_plan_quality_report,
         format_composite_table,
+        format_plan_quality_table,
     )
 
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))
+
+    if any(r.metrics.get('role_under_test') == 'architect' for r in results):
+        click.echo('')
+        click.echo(format_plan_quality_table(build_plan_quality_report(results)))
 
 
 def _run_ofat_driver(

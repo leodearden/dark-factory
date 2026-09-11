@@ -13,12 +13,16 @@ import gc
 import inspect
 import json
 import logging
+import os
 import threading
 import time
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Sequence
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.psi import PsiSample
@@ -28,6 +32,9 @@ if TYPE_CHECKING:
     from orchestrator.harness import Harness
 
 _log = logging.getLogger(__name__)
+
+# task 3980: return-type variable for `wait_responsive` below.
+_WaitT = TypeVar('_WaitT')
 
 
 def mock_lock_table(held: dict[str, set[str]] | None = None) -> MagicMock:
@@ -67,11 +74,11 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     scheduler_mock._workflow_cancel_at = {}
     scheduler_mock._RECONCILE_CANCEL_GRACE_S = 30.0
     scheduler_mock.is_dispatched = lambda tid: tid in scheduler_mock._dispatched
-    scheduler_mock.note_workflow_cancelled = (
-        lambda tid: scheduler_mock._workflow_cancel_at.__setitem__(tid, time.monotonic())
+    scheduler_mock.note_workflow_cancelled = lambda tid: (
+        scheduler_mock._workflow_cancel_at.__setitem__(tid, time.monotonic())
     )
-    scheduler_mock.clear_workflow_cancel = (
-        lambda tid: scheduler_mock._workflow_cancel_at.pop(tid, None)
+    scheduler_mock.clear_workflow_cancel = lambda tid: scheduler_mock._workflow_cancel_at.pop(
+        tid, None
     )
 
     def _workflow_cancel_recent(tid: str) -> bool:
@@ -88,6 +95,135 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
         or scheduler_mock.workflow_cancel_recent(tid)
     )
 
+
+# task 3492/4215: the pyproject-configured default per-test timeout ceiling
+# that every heavy test in this suite must clear.  MIRROR of
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
+# (currently 60).  It was a bare literal in
+# test_merge_queue_concurrent_verify.py, whose own comment admitted the
+# defect -- "it is still a literal and CAN drift if that setting changes
+# without a matching edit here; there is no automated link between the two."
+# Task 4215 moved the single definition here and made that link EXECUTABLE:
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
+# pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
+# add a second copy -- import this one.
+PYPROJECT_DEFAULT_TIMEOUT = 60
+
+# task 4215: per-test ceiling for the family of guard tests that sweep the
+# WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
+# cannot be sized by the ordinary 60s default.  This comment is the SINGLE
+# home of that rationale: the ~13 modules that carry the mark point HERE
+# instead of repeating it, so switching `timeout_method`, retuning the
+# multiple, or revising the measurements is one edit rather than fourteen.
+#
+# It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
+# with `@pytest.mark.timeout(N)`", the comment on
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- applied
+# at MODULE level, which is the only form that is a sound LOWER bound on every
+# collected item (a per-test decorator leaves any test added later at the
+# default).  A tighter decorator still WINS where one is present, so the
+# module mark narrows nothing.  Coverage of the family is ENFORCED, not
+# sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the census from
+# source on every run and fails a scanner that lacks the mark OR pins it below
+# this ceiling.
+#
+# MECHANISM -- why a breach here is far more expensive than a red test:
+#   * `[tool.pytest.ini_options].timeout_method = "thread"` means pytest-timeout
+#     answers a breach by `os._exit()`ing the whole xdist worker ("node down:
+#     Not properly terminated"), NOT by failing the offending test;
+#   * `--max-worker-restart=0` (in `[tool.pytest.ini_options].addopts`, task
+#     1907) then declines to replace that worker, degrading the run to a
+#     TRUNCATED whole-suite session whose surviving failure names some innocent
+#     guard that merely shared the dead worker.
+#   So one slow tree-scan costs a whole verify run AND misattributes the blame.
+#
+# MEASURED basis for 5x rather than a tuned literal:
+#   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
+#     (test_merge_queue_reachback_patch_guard), 6.70s
+#     (test_event_loop_antipattern_guard), 6.46s
+#     (test_serial_merge_worker_import_guard);
+#   * the SAME serial_merge_worker guard measured 17.85 / 21.32 / 30.75s per
+#     call at loadavg 120-176 under `-n auto` -- ~4.8x load inflation;
+#   * xdist worker deaths were then observed at loadavg 250-423, one further
+#     inflation step past the 60s default (esc-3980-1 on branch task/3980,
+#     esc-3787-1 on branch task/3787).
+#   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
+#   test_merge_queue_reachback_patch_guard.py and
+#   test_serial_merge_worker_import_guard.py -- which is what makes this a
+#   FAMILY defect rather than three accidents, and why the rest are marked
+#   preemptively: a marked-but-fast test costs nothing, while an
+#   unmarked-and-slow one costs a whole session.
+# 300s is ~36x the unloaded worst case and ~10x the measured-under-load worst
+# case.  DERIVED from PYPROJECT_DEFAULT_TIMEOUT because that ini default IS the
+# hazard being cleared -- deliberately NOT from HEAVY_BARRIER_TEST_TIMEOUT,
+# which happens to equal 300 but is merge-wait arithmetic
+# (`5 * MERGE_RESULT_TIMEOUT + 75`); an AST sweep performs zero merge waits, so
+# borrowing it would let a future merge-timing retune silently move this
+# ceiling.  Never-narrow.
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 5 * PYPROJECT_DEFAULT_TIMEOUT  # 300s
+
+
+# task 3540: the claimant-liveness TTL the row builder below derives its
+# symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
+# imports this same constant to pin `config.claimant_liveness_ttl_secs`, so a
+# fixture row's "fresh"/"stale" age can never drift out of step with the knob
+# `Harness._resume_repend_liveness` actually reads.  Mirrors
+# `OrchestratorConfig.claimant_liveness_ttl_secs`'s production default.
+CLAIMANT_TTL_SECS: float = 300.0
+
+# task 3540: a well-formed claimant identity in `shared.task_claimant.
+# compose_claimant_run_id` shape (`f'{run_id}/{session_id}/pid={owner_pid}'`).
+LIVE_CLAIMANT: str = 'run-abc/sess-def/pid=4242'
+
+
+def claimant_row(
+    status: str,
+    *,
+    task_id: str = 'x',
+    claimant: str | None = None,
+    heartbeat: str | None = None,
+    metadata: dict | None = None,
+    ttl_secs: float = CLAIMANT_TTL_SECS,
+) -> dict:
+    """Build a fused-memory task row for the claimant-liveness oracle (3540).
+
+    Shared by `test_cascade_unblock.py` and `test_resume_claimant_liveness.py`
+    — the two suites that drive `Harness._resume_repend_liveness` — so the
+    fresh/stale/absent branches cannot diverge between them.
+
+    Deliberately defaults to a STRANDED row (no claimant, no heartbeat), the
+    common production shape for the orphan re-pend both suites cover, so a
+    test that says nothing about liveness still exercises the flip.
+
+    `heartbeat` is a SYMBOLIC age derived from `ttl_secs` rather than a magic
+    literal, so a TTL change cannot silently invert a fixture:
+
+      - `'fresh'` -> `now` (well inside the TTL -> live, GIVEN a claimant)
+      - `'stale'` -> `now - 2 * ttl_secs` (outside the TTL -> not live)
+      - `None`    -> no `heartbeat_at` at all (unparseable -> not live)
+
+    `claimant=None` means "no claimant at all", which reads as not-live
+    regardless of the heartbeat.
+    """
+    now = datetime.now(UTC)
+    if heartbeat == 'fresh':
+        heartbeat_at: str | None = now.isoformat()
+    elif heartbeat == 'stale':
+        heartbeat_at = (now - timedelta(seconds=2 * ttl_secs)).isoformat()
+    elif heartbeat is None:
+        heartbeat_at = None
+    else:  # pragma: no cover — fixture misuse
+        raise ValueError(f'unknown heartbeat age {heartbeat!r}')
+
+    return {
+        'id': task_id,
+        'status': status,
+        'claimant_run_id': claimant,
+        'heartbeat_at': heartbeat_at,
+        'metadata': dict(metadata or {}),
+    }
+
+
 # task 2376: generous merge-pipeline result-wait ceiling that tolerates host
 # oversubscription; never-narrow — only replaces literals <=15 across the
 # merge-pipeline test files (test_merge_queue.py, test_merge_speculation.py,
@@ -95,6 +231,274 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_merge_queue_permit_conservation.py,
 # test_merge_queue_invariant_integration_gate.py).
 MERGE_RESULT_TIMEOUT = 45
+
+# task 3980: how far `wait_responsive` below may stretch a wait's REAL wall
+# clock past its nominal, loop-responsive budget.  SINGLE SOURCE of the ratio:
+# the helper's per-call default cap is
+# `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and
+# test_merge_queue_concurrent_verify.py's AST wait-budget auditor
+# (`_call_wait_budget`) bills a `wait_responsive` site by IMPORTING this same
+# constant.  One definition is what makes the auditor's number an exact upper
+# bound on the helper rather than an estimate free to drift below it.
+RESPONSIVE_WAIT_STRETCH = 2.0
+
+# task 3980: ABSOLUTE hard wall-clock backstop for `wait_responsive` below,
+# DERIVED from MERGE_RESULT_TIMEOUT rather than written as a literal so a
+# reviewer can check the arithmetic instead of trusting a number.  It bounds
+# the scaled per-call cap above whatever nominal a call site passes.  Sizing
+# check: the worst per-method budget the auditor computes for
+# test_merge_speculation.py is 240s (TestLateArrivalCleanCAS /
+# TestLateArrivalFailCascade / TestLateArrivalSubmissionOrderCAS: 2 gate
+# barriers x 30 + 2 result waits x 90), under HEAVY_BARRIER_TEST_TIMEOUT
+# (300s, itself `5 * MERGE_RESULT_TIMEOUT + 75` in
+# test_merge_queue_concurrent_verify.py).  Never-narrow.
+RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
+
+# task 3980: nominal budget for the merge-pipeline `asyncio.Event` GATE
+# barriers (`gate_a_entered.wait()` and friends in the late-arrival block of
+# test_merge_speculation.py), as distinct from the result-future waits above.
+# DERIVED rather than literal, and deliberately equal to the 15.0 those sites
+# already used.  `wait_responsive` grants such a site at most
+# `RESPONSIVE_WAIT_STRETCH * 15` = 30s of real wall clock.
+#
+# DECISION — keep 15s; do NOT raise it to MERGE_RESULT_TIMEOUT.  Recorded
+# because the amendment pass asked the question directly: in the regime where
+# THIS process is scheduled normally but its child `git`/verify subprocesses
+# are starved, the stretch buys a gate barrier nothing at all (see the helper's
+# "Limitation" section), so is 15 still right?  Yes, on three grounds:
+#   1. No gate-barrier failure has ever been MEASURED.  All three archived
+#      failures were result-future waits (45s, 45s, 25s).  Raising a nominal
+#      that has not been observed to fail is a plain widening, which this repo
+#      forbids as a flake fix (plans/flake-ledger-prd.md:216-223).
+#   2. It would be actively harmful.  Gates at a 45s nominal are billed 90s
+#      each, taking the worst per-method budget from 240s to 360s and blowing
+#      the paired @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (300s) —
+#      under `timeout_method = "thread"` plus `--max-worker-restart=0` that is
+#      an os._exit() of the xdist worker, i.e. a worker death instead of a
+#      clean failure.
+#   3. It is not tight.  Every barrier in the LateArrival suite resolves inside
+#      a test that completes in ~5s end to end, against a 15s nominal and a 30s
+#      ceiling.
+# If a gate-barrier flake is ever measured, the fix is to make child-process
+# progress observable to the accounting, not to grow this number.  Never-narrow.
+MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
+
+# task 3307: generous synchronization-barrier ceiling for the workflow
+# CancellationScope tests (test_workflow_cancellation.py).  These barriers
+# wait for REAL work — git worktree creation, artifact writes, stubbed
+# agent round-trips — to reach a known point; they assert nothing about
+# cancellation latency, so a slow-but-correct host must never fail them.
+# Measured on a 32-core host at load avg ~100: the same two tests span
+# 0.26s-3.09s green and were observed failing at exactly 5.01s (the
+# retired inline 5.0s literal), i.e. a >=19x wall-clock tail — which is
+# why 5.0s was inside the distribution rather than above it.  45s is 16x
+# the worst green observation and matches the value already established
+# for this exact shape (task 2350's `wait_for(<event>.wait(), timeout=45.0)`
+# in test_merge_queue_concurrent_verify.py, and MERGE_RESULT_TIMEOUT above).
+# Never-narrow: only replaces literals <=15 in test_workflow_cancellation.py.
+# Any class using it MUST also carry @pytest.mark.timeout(180) — two of
+# these barriers exceed the 60s pyproject default, which pytest-timeout's
+# thread method answers by os._exit()ing the xdist worker.
+CANCEL_SCOPE_BARRIER_TIMEOUT = 45
+
+# task 3307 (reviewer follow-up): small ceiling for the two PURE in-memory
+# CancellationScope barriers in TestCancellationScopeHardCancel — asyncio
+# Task cancellation + on_terminal recording only, no git worktree, no
+# artifact writes, no agent round-trip.  Pairing those with the much larger
+# CANCEL_SCOPE_BARRIER_TIMEOUT above bought no green-path benefit (they
+# resolve in microseconds) while making a genuine CancellationScope
+# regression there take 45s — or up to 180s under a paired
+# @pytest.mark.timeout — to report red instead of pytest's 60s default.
+# Kept above the retired 5.0s literal (never-narrow) for headroom against
+# scheduler jitter under host oversubscription, without borrowing the
+# I/O-sized budget above.  Do NOT use this for a test that drives a real
+# TaskWorkflow — use CANCEL_SCOPE_BARRIER_TIMEOUT for those.
+CANCEL_SCOPE_PURE_UNIT_TIMEOUT = 10
+
+
+# task 3980: module-level indirection for the clock `wait_responsive` reads,
+# so its starvation behaviour is deterministically unit-testable via
+# `monkeypatch.setattr(_orch_helpers, '_monotonic', fake)` WITHOUT patching
+# the global `time.monotonic` that asyncio's own event loop reads.
+_monotonic = time.monotonic
+
+
+async def wait_responsive(
+    aw: Awaitable[_WaitT],
+    *,
+    timeout: float = MERGE_RESULT_TIMEOUT,
+    label: str,
+    slice_s: float = 0.25,
+    max_wall_s: float | None = None,
+) -> _WaitT:
+    """Await *aw*, charging the deadline in EVENT-LOOP-RESPONSIVE time rather
+    than wall clock, and failing LOUDLY by *label* on give-up (task 3980).
+
+    Why this exists
+    ---------------
+    The late-arrival tests in test_merge_speculation.py wait on a
+    ``MergeRequest.result`` future (and on ``asyncio.Event`` gate barriers)
+    with a fixed real-time deadline.  Measured on this branch: the green path
+    is 4.55s / 4.08s / 3.79s in isolation, yet three of those tests were
+    observed failing at their 45s (``MERGE_RESULT_TIMEOUT``) and 25s deadlines
+    under load avg 246.59 on 32 cores — a >=11x wall-clock tail.  The archived
+    verify log is decisive that this is starvation, not a bug: the CleanCAS
+    run logged ``verify end (passed=True)`` and a heartbeat reading
+    ``oldest age=46s ... state=finalizing``.  The logic ran correctly; only
+    the deadline expired.
+
+    Widening the deadline is the wrong fix and this repo says so explicitly
+    (plans/flake-ledger-prd.md:216-223, "do not widen a timeout as a fix for
+    anything" — citing task 1836, where a 10s→30s widening MASKED a real
+    SIGHUP bug for a day).  It also may not work: the bare-main control passed
+    at comparable load, so the flake is probabilistic rather than a fixed
+    threshold.
+
+    What the accounting actually does — and its exact bound
+    ------------------------------------------------------
+    Each polling slice contributes only ``min(observed, slice_s)`` to the
+    budget, so ``charged`` tracks EVENT-LOOP-RESPONSIVE time: a slice that
+    consumed 3.0s of wall clock for a 0.25s nominal sleep is evidence this
+    process was descheduled, and the awaited work is handed back the time it
+    was denied rather than billed for it.
+
+    The wait ends when ``charged >= timeout`` OR ``wall >= cap``, where the
+    default ``cap`` is ``min(RESPONSIVE_WAIT_STRETCH * timeout,
+    RESPONSIVE_WAIT_WALL_CAP)``.  Read that second clause carefully, because
+    it bounds everything below: THE MAXIMUM REAL WALL CLOCK IS 2x THE NOMINAL
+    (hard-ceilinged at 90s), never the observed oversubscription ratio.  The
+    accounting on its own would stretch without limit; the cap exists because
+    a paired ``@pytest.mark.timeout`` must be a finite number.  So this helper
+    is NOT "the deadline stretches as far as the host is loaded" — an earlier
+    revision of this docstring claimed that and it was wrong.
+
+    What it buys over simply widening the deadline to 2x, which is the fair
+    comparison:
+      * A real hang on a RESPONSIVE loop still reports at ~*timeout* (45s),
+        not at 90s.  Charging in responsive time is what lets the ceiling rise
+        without the hang-detection deadline rising with it.
+      * The give-up message states WHICH regime ended the wait — the charged
+        total, the true wall clock and the implied starvation ratio — so a
+        starved run is self-diagnosing instead of an opaque timeout.
+      * Sizing, against measurement: the green path is ~4s and the archived
+        failures came at 45s (a >=11x tail).  A 90s ceiling covers a ~22x tail
+        on that green path.
+
+    Limitation — child-process starvation gets NO stretch
+    ----------------------------------------------------
+    The accounting observes ONE thing: whether *this* process's event loop is
+    descheduled, inferred from ``asyncio.wait(timeout=slice_s)`` overrunning
+    ``slice_s``.  That is a PROXY for host scheduling pressure, not a
+    measurement of it, and the merge round-trip these tests await is dominated
+    by child ``git`` subprocesses and verify runners.
+
+    In the regime where this process is scheduled normally while its CHILDREN
+    are starved, the loop IS responsive, so every slice is charged in full,
+    ``charged >= timeout`` trips first, and the cap is never reached: the wait
+    gives up at the SAME nominal wall clock as the old ``asyncio.wait_for``,
+    with zero added headroom.  ``RESPONSIVE_WAIT_STRETCH`` does not cover that
+    case — do not read it as though it did.  For the gate barriers
+    (``timeout=MERGE_GATE_BARRIER_TIMEOUT``) that regime makes the migration
+    behaviourally identical to the old ``timeout=15.0``; the one site that
+    genuinely gained wall clock is
+    ``test_predecessor_fail_cascades_to_late_arrival``, whose raw
+    ``timeout=25.0`` became ``MERGE_RESULT_TIMEOUT`` — an ordinary widening,
+    named as such.
+
+    The regime actually MEASURED (load avg 246.59 on 32 cores) starves parent
+    and children alike, so the proxy does fire there.  Load-independence is
+    therefore real for whole-host oversubscription and absent for starvation
+    confined to child processes.  Closing the latter needs child-progress
+    observability, not a bigger number.
+
+    COUPLED OBLIGATION
+    ------------------
+    Any class using this MUST carry an adequate ``@pytest.mark.timeout`` —
+    exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.
+    orchestrator/pyproject.toml sets ``timeout = 60`` with
+    ``timeout_method = "thread"`` and ``--max-worker-restart=0``: exceeding
+    the per-test timeout does not fail the test, it ``os._exit()``s the xdist
+    worker, degrading a clean per-test failure into a worker death.  A
+    stretched wait without a paired mark is therefore strictly worse than the
+    flake it fixes.
+
+    The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
+    the 90s ceiling, and that is what makes the paired marks checkable:
+    ``_call_wait_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
+    RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
+    not an under-count.  With a flat default a ``timeout=15`` site the auditor
+    billed at 30s could consume 90s, and TestLateArrivalCleanCAS's true worst
+    case would be 360s against a 300s mark.
+
+    That exactness carries ONE qualifier, load-bearing and currently a
+    CONVENTION rather than a structural guarantee: an explicit ``max_wall_s``
+    wins over the scaled default and the auditor does not scan for it, so a
+    hypothetical ``wait_responsive(f, timeout=1.0, max_wall_s=1000.0)`` would
+    be billed 2.0s while being allowed 1000s.  No scanned site passes
+    ``max_wall_s`` — only the hermetic unit tests in
+    test_orch_helpers_wait_responsive.py do, and they carry no mark obligation
+    — so the marks hold today.  Teaching the auditor to resolve ``max_wall_s``
+    (or to reject any scanned site passing it) is tracked as follow-up.
+
+    The kwarg is named literally ``timeout`` so task 3492's AST wait-budget
+    scanner (``_call_wait_budget`` in test_merge_queue_concurrent_verify.py)
+    can resolve call sites without a special case.
+
+    Accepts a Future, a Task or a coroutine.  When a coroutine is wrapped, the
+    wrapper task is cancelled on give-up so nothing leaks into pytest-asyncio
+    teardown; a caller-owned Future is left untouched.
+    """
+    cap = (
+        min(RESPONSIVE_WAIT_STRETCH * timeout, float(RESPONSIVE_WAIT_WALL_CAP))
+        if max_wall_s is None
+        else max_wall_s
+    )
+    task = asyncio.ensure_future(aw)
+    owned = task is not aw
+    started = _monotonic()
+    charged = 0.0
+    try:
+        while True:
+            before = _monotonic()
+            done, _pending = await asyncio.wait({task}, timeout=slice_s)
+            observed = _monotonic() - before
+            if done:
+                return task.result()
+
+            # Charge the NOMINAL slice, never the observed one: an observed
+            # slice much longer than nominal is evidence of descheduling, not
+            # of the awaited work taking longer.
+            charged += min(observed, slice_s)
+            wall = _monotonic() - started
+
+            budget_spent = charged >= timeout
+            cap_reached = wall >= cap
+            if not (budget_spent or cap_reached):
+                continue
+
+            reason = (
+                'the loop-responsive budget was exhausted (the event loop '
+                'stayed responsive, so this is a REAL hang, not starvation)'
+                if budget_spent
+                else 'the hard wall-clock cap was reached'
+            )
+            ratio = (wall / charged) if charged > 0 else float('inf')
+            pytest.fail(
+                f'{label}: wait_responsive gave up — {reason}. '
+                f'charged={charged:.2f}s of budget={timeout}s, '
+                f'wall={wall:.2f}s (cap={cap}s), '
+                f'starvation={ratio:.1f}x. '
+                f'A starvation ratio near 1.0x means the host was NOT '
+                f'oversubscribed and this is a genuine regression; a large '
+                f'ratio means the worker was descheduled and the cap, not '
+                f'the budget, ended the wait.'
+            )
+    finally:
+        if owned and not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -233,17 +637,19 @@ class HermeticMcpSession:
             # the response never falls into the resolver-degraded
             # missing-key branch by accident — see class docstring.
             deps = arguments.get('deps') or []
-            statuses = {
-                dep: self._external_statuses.get(dep, 'unknown_task')
-                for dep in deps
-            }
+            statuses = {dep: self._external_statuses.get(dep, 'unknown_task') for dep in deps}
             return self._envelope(json.dumps(statuses))
         if name == 'set_task_claimant':
             return self._envelope(json.dumps({}))
         if name == 'set_task_status':
-            return self._envelope(json.dumps({
-                'id': arguments.get('id'), 'status': arguments.get('status'),
-            }))
+            return self._envelope(
+                json.dumps(
+                    {
+                        'id': arguments.get('id'),
+                        'status': arguments.get('status'),
+                    }
+                )
+            )
         if name == 'get_task':
             return self._envelope(json.dumps({'id': arguments.get('id')}))
         if name == 'update_task':
@@ -300,8 +706,7 @@ def drain_async_mock_coroutines() -> int:
     for obj in gc.get_objects():
         if (
             inspect.iscoroutine(obj)
-            and getattr(getattr(obj, 'cr_code', None), 'co_name', None)
-            == '_execute_mock_call'
+            and getattr(getattr(obj, 'cr_code', None), 'co_name', None) == '_execute_mock_call'
             and inspect.getcoroutinestate(obj) == inspect.CORO_CREATED
         ):
             obj.close()
@@ -337,9 +742,19 @@ async def reap_leaked_aiosqlite_connections() -> int:
     dies loudly and pytest's threadexception plugin attributes the failure to
     whatever unrelated test happens to be executing when the thread fires —
     under CPU starvation (``pytest -n auto`` on an oversubscribed host) that
-    is reliably a *different*, innocent test. orchestrator/pyproject.toml
-    promotes the resulting ``PytestUnhandledThreadExceptionWarning`` to a
-    hard error.
+    is reliably a *different*, innocent test. The resulting
+    ``PytestUnhandledThreadExceptionWarning`` is promoted to a hard error by
+    the ``error::pytest.PytestUnhandledThreadExceptionWarning`` entry in
+    orchestrator/pyproject.toml's ``[tool.pytest.ini_options] filterwarnings``
+    (task 4075). That entry governs the ORCHESTRATOR-BOUND invocation the
+    merge-verify harness uses (``cd orchestrator && uv run pytest tests/``,
+    dark-factory-orchestrator.yaml:142); a root-bound run resolves the
+    repo-root inifile instead — pytest reads exactly one, never merging across
+    workspace members — and does NOT promote. All three claims here are pinned
+    by tests/test_aiosqlite_leak_isolation.py's
+    "PytestUnhandledThreadExceptionWarning promotion" section, which skips
+    (naming the governing inifile) rather than false-failing on a root-bound
+    run.
 
     FIX: at every test's teardown boundary — while that test's own event loop
     is STILL OPEN — find any live aiosqlite worker thread and gracefully
@@ -355,9 +770,14 @@ async def reap_leaked_aiosqlite_connections() -> int:
     ``_thread`` attribute, and ``aiosqlite.core._connection_worker_thread`` as
     the pre-check thread target. If a future aiosqlite release renames or
     removes any of these, the guarded import below makes this helper a no-op
-    (returns 0) rather than raising — but the leak protection this provides
-    would then be silently lost, so re-verify this helper against aiosqlite's
-    source whenever the pinned version changes.
+    (returns 0) rather than raising — the leak protection this provides is
+    then lost, so re-verify this helper against aiosqlite's source whenever
+    the pinned version changes. That loss is no longer SILENT, which is the
+    whole point of the promotion described above: a leaked worker thread's
+    ``RuntimeError: Event loop is closed`` becomes a hard failure attributed
+    to some innocent test rather than a warning nobody reads. The promotion
+    makes the degradation loud; it does not restore the reaping, so the
+    re-verification instruction stands.
 
     PERFORMANCE NOTE: mirrors ``drain_async_mock_coroutines``'s gc-walk
     shape, but gates the (relatively expensive) ``gc.get_objects()`` walk
@@ -452,14 +872,13 @@ async def reap_leaked_claimant_heartbeats() -> int:
         if task.done():
             continue
         coro = task.get_coro()
-        if not getattr(coro, '__qualname__', '').endswith(
-            'TaskWorkflow._claimant_heartbeat_loop'
-        ):
+        if not getattr(coro, '__qualname__', '').endswith('TaskWorkflow._claimant_heartbeat_loop'):
             continue
         task.cancel()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
-                asyncio.gather(task, return_exceptions=True), timeout=10.0,
+                asyncio.gather(task, return_exceptions=True),
+                timeout=10.0,
             )
         if task.done():
             reaped += 1
@@ -749,8 +1168,7 @@ def make_gate_yielding(slots, *, active_account_name=None) -> MagicMock:
     gate = make_mock_gate(
         account_count=len(slots),
         active_account_name=(
-            active_account_name if active_account_name is not None
-            else slots[0].account_name
+            active_account_name if active_account_name is not None else slots[0].account_name
         ),
         before_invoke=AsyncMock(return_value=slots[0].token),
     )
@@ -903,10 +1321,445 @@ def assert_update_wire_mode(
     )
     arguments = update_calls[0]['arguments']
     assert arguments.get('metadata_mode') == expected_mode, (
-        f'update_task wire call must forward metadata_mode={expected_mode!r}; '
-        f'got: {arguments}'
+        f'update_task wire call must forward metadata_mode={expected_mode!r}; got: {arguments}'
     )
-    assert 'append' not in arguments, (
-        f"'append' key must not appear on the wire; got: {arguments}"
-    )
+    assert 'append' not in arguments, f"'append' key must not appear on the wire; got: {arguments}"
     return arguments
+
+
+# task 4389: THE canonical name for the inert `project_root` placeholders in the
+# TaskWorkflow mock-config factories.  Spelled distinctly — and project-prefixed
+# — following the `_REVIEW_PROJECT_ROOT` precedent in test_out_of_band_routing.py
+# so a future grep-driven cleanup can tell a deliberate placeholder from an
+# accident, and so it cannot collide with an unrelated project's fixture the way
+# the generic `/tmp/non-existent-for-test` it replaces could.
+MOCK_WORKFLOW_PROJECT_ROOT = Path('/tmp/dark-factory-mock-workflow-project-root')
+"""Inert stand-in ``project_root`` for the ``TaskWorkflow`` mock-config factories.
+
+THE CLASSIFICATION RECORD for the 16 sites task 3551's sweep flagged and task
+4389 adjudicated.  Every one sits inside a module-level ``_make*()`` factory
+building a ``MagicMock(spec_set=pydantic_spec(OrchestratorConfig))`` for a
+``TaskWorkflow``, across 15 modules.  All 16 now point here, which also collapses
+an accidental divergence: ``test_workflow_train_halt_owner.py`` spelled the same
+sentinel two ways (``/tmp/non-existent-for-test`` at one factory,
+``/tmp/non-existent`` at the other).
+
+VERDICT: deliberate-but-inert, and deliberately NOT sandboxed under ``tmp_path``.
+Recorded here rather than in prose because the lineage's demonstrated failure
+mode is prose being re-litigated from scratch by each successor task.
+
+WHY NOT ``tmp_path``.  Structural, not preference: those factories are plain
+module-level FUNCTIONS, not fixtures, so they cannot request ``tmp_path`` at all.
+Sandboxing them means threading a ``project_root`` argument through 16 factories
+and ~327 call sites across 15 files — a large mechanical diff and real
+merge-conflict surface — for no measured benefit, per the three measurements
+below.
+
+THE THREE MEASUREMENTS (task 4389, on this branch):
+
+1. THE VALUE IS INERT.  Flipping all 16 literals to an EXISTING directory
+   (``/tmp``) and running the 15 affected modules gave 327 passed; flipping them
+   to a pytest-SHAPED path gave 327 passed again.  So nothing branches on the
+   path's non-existence, and the ``ReviewCheckpoint`` ``/tmp/pytest`` trap that
+   task 3551 hit does not reach these modules.
+2. NOTHING HAS EVER WRITTEN THROUGH THEM.  ``/tmp/non-existent-for-test``,
+   ``/tmp/non-existent`` and ``/tmp/pr`` were all ABSENT from the machine's
+   ``/tmp`` despite a long history of suite runs.  Four ``config.project_root``
+   reads can ``mkdir(parents=True)``:
+   ``workflow.py::TaskWorkflow._archive_then_cleanup_config_dir`` and
+   ``workflow.py::TaskWorkflow._invoke`` (transcript archive),
+   ``workflow.py::TaskWorkflow._run_scoped_verification_with_infra_retry``
+   (verify archive), and ``workflow.py::TaskWorkflow._maybe_file_chronic_flakes``
+   (chronic-flake ledger).  Their absence on disk is direct evidence those paths
+   are never reached under these mocks.  There is no file leak to fix — and that
+   claim is not left to age, it is TRIPWIRED by
+   ``TestMockWorkflowProjectRootContract`` in test_steward_scaffolding_guards.py,
+   which asserts this path does not exist.
+3. ``ReviewCheckpoint`` IS NOT ON THIS PATH.  Its ``/tmp/pytest`` guard is the
+   first statement of ``review_checkpoint.py::ReviewCheckpoint._run_review``
+   only, and the comment on ``workflow.py::_ESCALATION_CAPABLE_ROLES`` states
+   explicitly that ``ReviewCheckpoint`` runs in its own dispatcher rather than
+   through ``TaskWorkflow._invoke`` — which is why measurement 1's pytest-shaped
+   path was harmless.
+
+FOR A NEW FACTORY, PREFER THE SANDBOXED SHAPE.  This constant is the adjudicated
+resting place for the EXISTING population, not the pattern to copy.
+``test_workflow_already_done.py::_make`` is the in-tree shape to follow: a
+``_make(*, project_root: Path, ...)`` keyword parameter with each call site
+passing ``tmp_path / 'proj'``.  A new factory that takes that argument keeps its
+writes inside pytest's retention sweep by construction and needs no adjudication
+at all.
+
+The full sanctioned population of absolute-``/tmp`` ``project_root`` literals —
+this constant and the five review-family sites — is censused by
+``TestAbsoluteTmpProjectRootLiteralsAreCensused`` in
+test_steward_scaffolding_guards.py, each with its recorded reason.
+"""
+
+
+def assert_sandboxed_project_root(project_root, tmp_path: Path) -> None:
+    """Assert *project_root* is a created directory strictly below *tmp_path*.
+
+    THE canonical spelling of the steward-scaffolding sandbox invariant, owned
+    here so it cannot drift again.  Consolidation lineage 3461 → 3514 → 3551 →
+    3647: task 3551 propagated the recipe by COPY to a second factory, and by
+    3647 the two inline assertion blocks had already diverged — the one in
+    ``test_conftest_helpers.py`` had lost the ``.is_dir()`` clause, and NEITHER
+    carried the strictness clause.  Both now call this instead; the recurrence
+    guard in ``test_steward_scaffolding_guards.py`` keeps it that way.
+
+    ``conftest.py``'s ``make_steward`` fixture is the PRODUCER that must keep
+    satisfying it: it builds ``tmp_path / 'project'`` and ``mkdir``s it.  It is
+    deliberately not self-checked there — the value is structurally guaranteed
+    two lines from where it is constructed, and a self-check would re-verify it
+    on every one of the suite's ~250 steward builds.  This helper is for the
+    SEPARATE factories that reproduce the recipe.
+
+    Four clauses, ordered so the message a reader sees is the most specific one
+    that failed:
+
+    1. **a real** ``Path``.  A ``MagicMock`` silently satisfies every ``/``-join
+       the steward performs without ever producing a directory, so a mock root
+       is never caught downstream.  This clause runs FIRST so a non-``Path``
+       raises ``AssertionError`` rather than an ``AttributeError`` from a later
+       clause — a sandbox escape must read as a test FAILURE, not an ERROR.
+       *project_root* is therefore deliberately UNANNOTATED: annotating it
+       ``Path`` would make this clause read as unreachable.
+    2. **created**.  The retired ``Path('/tmp/fake-project')`` literal was never
+       created by anything, and a dangling root is a latent ``cwd=`` failure the
+       moment a test stops patching the invoke seam.
+    3. **not** *tmp_path* **itself**.  ``Path.is_relative_to`` returns ``True``
+       for a path against itself, so clause 4 alone does not mean "strictly
+       below".  Same spelling as ``make_steward``'s worktree guard
+       (``resolved == root or not resolved.is_relative_to(root)``), and it
+       matters for the same reason: the steward derives its artifacts root as a
+       SIBLING of the directory it is given.
+    4. **strictly below** *tmp_path*.  The retired ``/tmp/project`` and
+       ``/tmp/fake-project`` literals pointed OUTSIDE the test sandbox, so
+       anything the steward wrote relative to ``config.project_root`` escaped
+       pytest's ``tmp_path`` retention sweep.
+
+    Clauses 3 and 4 compare RESOLVED paths on both sides, which is what makes a
+    symlink escape detectable: a link created *under* ``tmp_path`` that points
+    outside it is lexically contained but physically is not, and everything the
+    steward writes through it lands outside the retention sweep.  Dropping
+    either ``.resolve()`` would leave that case silently accepted, so clause 4's
+    message reports the resolved target alongside the value as given.
+
+    SANCTIONED EXCEPTIONS are not listed here, and deliberately so.  This
+    paragraph used to name ``test_out_of_band_routing.py``'s
+    ``_REVIEW_PROJECT_ROOT`` as the ONE exception; task 4389 adjudicated 17 more
+    absolute-``/tmp`` ``project_root`` literals, at which point a hand-maintained
+    list in this docstring would have become exactly the fourth drifting address
+    the lineage above warns about — authoritative-looking, unasserted, and wrong
+    the moment the population changes.
+
+    The record instead lives at ONE address that is CHECKED:
+    ``_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS`` in
+    test_steward_scaffolding_guards.py, whose census fails if a module grows an
+    un-adjudicated literal, and equally if an allowlisted one disappears.  A
+    reader who greps this invariant and lands on a root outside ``tmp_path``
+    should look there for its reason before "fixing" the site.  The shape of
+    those exceptions, for orientation only: ``ReviewCheckpoint._run_review``
+    raises ``ValueError`` on any ``project_root`` containing ``/tmp/pytest``
+    (moving ``_REVIEW_PROJECT_ROOT`` under a pytest path fails 5 tests —
+    measured, task 3551), and ``MOCK_WORKFLOW_PROJECT_ROOT`` above is an inert
+    placeholder for factories that structurally cannot request ``tmp_path``.
+
+    Raises:
+        AssertionError: naming both the offending value and the sandbox root it
+            was checked against, whenever any clause fails.
+    """
+    assert isinstance(project_root, Path), (
+        f'expected project_root to be a real Path, got '
+        f'{type(project_root).__name__!r} ({project_root!r}) — a MagicMock child '
+        f'silently satisfies every "/"-join the steward performs without ever '
+        f'producing a directory'
+    )
+    root = tmp_path.resolve()
+    resolved = project_root.resolve()
+
+    assert project_root.is_dir(), (
+        f'expected project_root {project_root} to be a CREATED directory (checked '
+        f'against tmp_path={tmp_path}); the retired /tmp/fake-project literal was '
+        f'never created by anything, so a dangling project_root is a latent cwd= '
+        f'failure the moment a test stops patching the invoke seam'
+    )
+    assert resolved != root, (
+        f'project_root must be strictly below tmp_path, got {project_root} == '
+        f'tmp_path={tmp_path}; the steward derives its artifacts root as a SIBLING '
+        f'of the directory it is given, so a root AT tmp_path lands it in '
+        f"tmp_path.parent — outside the directory pytest's retention sweep reclaims"
+    )
+    assert resolved.is_relative_to(root), (
+        f'expected project_root under tmp_path={tmp_path} (resolved to {root}), got '
+        f'{project_root} which resolves to {resolved} — both sides are resolved so a '
+        f'symlink created UNDER tmp_path but pointing outside it is caught here; the '
+        f"retired '/tmp/project' and '/tmp/fake-project' literals pointed OUTSIDE "
+        f'the test sandbox, so anything the steward wrote relative to '
+        f"config.project_root escaped pytest's tmp_path retention sweep"
+    )
+
+
+# ===========================================================================
+# Git repository isolation (esc-3072-3)
+# ===========================================================================
+
+
+class NonIsolatedGitRepoError(AssertionError):
+    """A test helper was asked to run git against a directory that is not a
+    git repository root, so git's upward discovery would have retargeted an
+    enclosing repository.
+
+    Subclasses ``AssertionError`` deliberately: an unguarded call is the test
+    suite breaking its own isolation contract, not a product error.  Raised by
+    :func:`assert_isolated_git_repo`.
+    """
+
+
+def _enclosing_git_repo(start: Path) -> Path | None:
+    """Best-effort: the repo root git's upward walk would resolve from *start*.
+
+    Returns ``None`` when no ancestor carries a ``.git`` entry.  Used only to
+    make :class:`NonIsolatedGitRepoError` self-diagnosing — never to decide
+    whether a call is permitted.
+    """
+    try:
+        resolved = Path(start).resolve()
+    except OSError:  # pragma: no cover - resolve() on a pathological path
+        return None
+    for parent in resolved.parents:
+        if (parent / '.git').exists():
+            return parent
+    return None
+
+
+def assert_isolated_git_repo(cwd: Path) -> None:
+    """Refuse *cwd* unless it is ITSELF a git repository root.
+
+    Incident esc-3072-3.  Git repository discovery walks UP the directory tree.
+    A test helper that shells out to git with a caller-supplied ``cwd`` does not
+    operate on "the directory the caller named" — it operates on *whatever repo
+    encloses that directory*.  When pytest's basetemp lives inside a live task
+    worktree (``.worktrees/<task>/.pytest-tmp/``), a helper handed a bare
+    ``tmp_path`` silently retargets production state: ``_inject_uu_state``
+    wrote three blobs into a live worktree's object store and staged ``foo.py``
+    at stages 1/2/3, leaving ``UU foo.py`` in a real task's index.
+
+    This is a PURE-FILESYSTEM pre-flight — it spawns no child process, so it can
+    be called before the first subprocess and thereby guarantee that a rejected
+    call writes NOTHING anywhere.  That property is exactly what a mid-sequence
+    git failure cannot provide: ``git hash-object -w`` writes its blobs before a
+    later ``git update-index`` has any chance to fail, so "git errors out in a
+    non-repo directory" is not a defence.
+
+    The predicate is ``(cwd / '.git').exists()``, which matches BOTH shapes a
+    legitimate caller passes — a normal checkout (``.git`` is a directory) and a
+    linked worktree (``.git`` is a gitdir FILE).  The same idiom is documented
+    on ``conftest.py``'s ``repo_root`` fixture.  This is deliberately NOT a
+    "reject anything under ``.worktrees/``" rule: two legitimate
+    ``_inject_uu_state`` call sites target ``<tmp repo>/.worktrees/<task>``
+    roots produced by ``git_ops.create_worktree(...)``, and such a rule would
+    reject them while still permitting every other escape path.
+
+    Pair with :func:`git_env_with_ceiling` for defence in depth: the pre-flight
+    guarantees zero writes, the ceiling makes escape physically impossible at
+    the git level even if the pre-flight is refactored away.
+
+    Raises:
+        NonIsolatedGitRepoError: if *cwd* is missing, is not a directory, or
+            carries no ``.git`` entry of its own.
+    """
+    path = Path(cwd)
+
+    if (path / '.git').exists():
+        return
+
+    if not path.exists():
+        problem = 'it does not exist'
+    elif not path.is_dir():
+        problem = 'it is not a directory'
+    else:
+        problem = "it has no '.git' entry of its own, so it is not a repo root"
+
+    enclosing = _enclosing_git_repo(path)
+    if enclosing is not None:
+        victim = (
+            f'git discovery walks UP the directory tree, so this call would '
+            f'instead have operated on the enclosing repository:\n'
+            f'    {enclosing}\n'
+        )
+    else:
+        victim = (
+            'No enclosing repository is reachable from here right now — but '
+            'that is a property of where this test run happens to live, not a '
+            'guarantee. Under a basetemp nested inside a live task worktree '
+            'the very same call reaches production state.\n'
+        )
+
+    raise NonIsolatedGitRepoError(
+        f'Refusing to run git with cwd={path} — {problem}.\n'
+        f'{victim}'
+        f'Remedy: pass a repo root this test created itself, e.g. the '
+        f'`git_repo` fixture, `git_ops.project_root`, or a worktree root from '
+        f'`git_ops.create_worktree(...)`.\n'
+        f'See esc-3072-3: an unguarded helper wrote blobs into a live task '
+        f'worktree and left it with an unmerged index.'
+    )
+
+
+def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
+    """Environment for a git child process whose repo discovery cannot leave *cwd*.
+
+    Layer 2 of the esc-3072-3 defence, behind :func:`assert_isolated_git_repo`.
+    The two are complementary and neither is sufficient alone:
+
+    * The pre-flight guarantees ZERO writes, because it runs before any child
+      process exists.  A ceiling alone only makes git *fail*, and it fails
+      mid-sequence — ``git hash-object -w`` writes its blobs first, so a
+      ceiling-only fix would still have leaked objects into the victim's object
+      store before ``git update-index`` errored out.
+    * The ceiling makes escape physically impossible at the git level regardless
+      of whether a future refactor drops, bypasses or forgets the pre-flight.
+
+    ``GIT_CEILING_DIRECTORIES`` is set to *cwd*'s parent, so git's upward walk
+    may inspect ``cwd`` itself and then stops.  Both normalizations applied here
+    are load-bearing, not cosmetic: git ignores ceiling entries that are not
+    absolute, and compares the remainder against the symlink-resolved path — so
+    a relative or unresolved entry silently never matches and the containment
+    would be inert.  ``os.environ`` is COPIED (not replaced) because a git child
+    spawned with a blank environment loses ``PATH``, ``HOME`` and its config
+    discovery.
+
+    A normal repo root and a linked-worktree root both still resolve under this
+    ceiling; only a directory that reaches a repo purely by the upward walk is
+    refused.
+
+    In-repo precedent for the same containment applied via ``monkeypatch.setenv``
+    (the right seam when the git call is made by production code rather than by
+    a subprocess this test spawns): test_warm_base_coherence.py:409-415,
+    test_session_hooks.py:1491, test_warm_lane_scripts_shipped.py:250.
+    """
+    env = os.environ.copy()
+    env['GIT_CEILING_DIRECTORIES'] = str(Path(cwd).resolve().parent)
+    return env
+
+
+# ===========================================================================
+# Pytest-invocation helpers: subproject paths, probe environments, inifile
+# guards (task 4075 review amendment)
+#
+# Hoisted here because each of these had already been re-derived per module:
+# ``Path(__file__).resolve().parents[1] / 'pyproject.toml'`` in
+# test_marker_registration_drift.py, test_lane_lock_leak_guard.py,
+# test_offline_lane_integration.py, test_offline_lane_infra_integration.py and
+# test_warm_lane_bash_bucket_placement.py; a ``_HOSTILE_ENV_KEYS`` /
+# ``_sanitized_env`` pair in test_warm_lane_bash_suite.py,
+# test_warm_lane_scripts_shipped.py and test_warm_lane_bash_bucket_placement.py;
+# and the skip-vs-fail inifile guard inline in three of those. Every copy is
+# another place that has to change when the sanitize set or the guard semantics
+# do. New call sites should import from here; the existing ones migrate
+# opportunistically (the warm-lane pair additionally strips
+# ``REIFY_WARM_LANE_*`` and takes a ceiling/extra, so it is NOT a drop-in for
+# them yet — see ``drop``/``extra`` below).
+# ===========================================================================
+
+#: The ``orchestrator/`` subproject root and its inifile, resolved from THIS
+#: FILE and never from the process CWD: the merge-verify harness runs pytest
+#: from the ``orchestrator/`` cwd (dark-factory-orchestrator.yaml:142) while a
+#: plain ``pytest orchestrator/tests`` runs from the repo root, and a contract
+#: pinned against either path must hold identically under both.
+ORCH_DIR = Path(__file__).resolve().parents[1]
+ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
+
+#: Environment keys stripped from a pytest/git subprocess probe by
+#: :func:`sanitized_probe_env`. Each one can silently turn a probe's result
+#: into an artifact of the ambient environment instead of a measurement:
+#:
+#: * ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_INDEX_FILE`` — an inherited git
+#:   pointer (git hook, ``git rebase --exec``) aims the child at the wrong
+#:   tree, and makes even a bare ``git init`` in a synthetic repo fail.
+#: * ``PYTEST_ADDOPTS`` — an outer value carrying its own flags is appended
+#:   AFTER the child's own ``-o addopts=`` / ``-m``, so it can re-introduce
+#:   ``-n auto`` or override a marker selection and make the probe slow, or
+#:   its exit code ambiguous, or the whole pin vacuous.
+#: * ``PYTEST_CURRENT_TEST`` — leaks the parent's node id into the child.
+#: * ``PYTHONWARNINGS`` — CPython applies it as a warning filter in the child
+#:   ahead of anything the inifile says. An ambient ``PYTHONWARNINGS=error``
+#:   makes a control arm (deliberately configured NOT to promote) fail anyway,
+#:   which reads as a broken harness; an ambient promotion of the very category
+#:   under test makes a treatment arm pass for the wrong reason. Strictly
+#:   on-topic for any probe that measures warning behaviour.
+PROBE_HOSTILE_ENV_KEYS = frozenset({
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'PYTEST_ADDOPTS',
+    'PYTEST_CURRENT_TEST',
+    'PYTHONWARNINGS',
+})
+
+
+def sanitized_probe_env(
+    *, extra: dict[str, str] | None = None, drop: Sequence[str] = (),
+) -> dict[str, str]:
+    """``os.environ`` minus the keys that would contaminate a subprocess probe.
+
+    ``os.environ`` is COPIED rather than replaced wholesale: a child spawned
+    with a blank environment loses ``PATH``, ``HOME`` and its own config
+    discovery, which fails the probe for reasons that have nothing to do with
+    what it measures.
+
+    Args:
+        extra: entries to set in the child (applied after the strip, so a
+            caller may deliberately reinstate a stripped key with a value it
+            chose itself).
+        drop: additional keys to strip beyond :data:`PROBE_HOSTILE_ENV_KEYS` —
+            the seam by which a caller with its own resolution-hostile vars
+            (e.g. the warm-lane suites' ``REIFY_WARM_LANE_*``) can migrate onto
+            this helper without weakening it for everyone else.
+    """
+    hostile = PROBE_HOSTILE_ENV_KEYS.union(drop)
+    env = {k: v for k, v in os.environ.items() if k not in hostile}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def require_orchestrator_inifile(pytestconfig, *, subject: str) -> None:
+    """Skip unless ``orchestrator/pyproject.toml`` governs the current run.
+
+    MANDATORY in front of any assertion about an
+    ``[tool.pytest.ini_options]`` key of the orchestrator subproject. pytest
+    reads exactly ONE inifile — the rootdir's — and never merges across
+    workspace members (the repo-root pyproject.toml documents this in its own
+    comment block). The root inifile declares neither ``filterwarnings`` nor
+    ``timeout``, so under a root-bound run (``pytest orchestrator/tests`` from
+    the repo root, ``-c pyproject.toml``, or an arg set spanning two
+    subprojects) ``getini(...)`` returns the empty default and an unguarded pin
+    FALSE-FAILS on an invocation artifact rather than on drift.
+
+    The merge-verify command is ``cd orchestrator && uv run pytest tests/``
+    (dark-factory-orchestrator.yaml:142), which IS orchestrator-bound, so this
+    guard never weakens the hot path.
+
+    Deliberately asymmetric, and that asymmetry is the whole design: it SKIPS
+    (never fails) when some other inifile governs, and simply RETURNS when ours
+    does — leaving the caller to make the real assertion and emit its own
+    diagnostic. Message shape and the skip-vs-fail split are the ones
+    test_lane_lock_leak_guard.py:1344-1365 arrived at for the ``timeout`` key.
+
+    Args:
+        subject: what the caller is about to pin, named in the skip reason so
+            the message says which contract was not checked (e.g. ``"the
+            'error::pytest.PytestUnhandledThreadExceptionWarning' promotion"``).
+    """
+    governing_inifile = pytestconfig.inipath
+    if governing_inifile is not None and Path(governing_inifile).resolve() == ORCH_PYPROJECT:
+        return
+    pytest.skip(
+        f'the governing inifile for this run is {governing_inifile!r}, not '
+        f'{ORCH_PYPROJECT} — {subject} lives in the latter and pytest reads '
+        f'exactly one inifile (never merging across workspace members), so '
+        f'this is an invocation artifact (e.g. a root-bound run), not drift'
+    )

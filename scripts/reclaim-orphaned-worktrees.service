@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic verified reclaim of .worktrees-orphaned/ parkings (task 2980)
+Documentation=file:///home/leo/src/dark-factory/scripts/reclaim_orphaned_worktrees.py
+
+[Service]
+Type=oneshot
+# All logic lives in the committed wrapper script -- the unit itself is a
+# thin systemd shell around it (mirrors
+# scripts/fused-memory-flag-marker-sweep.service).
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/src/dark-factory/scripts/reclaim-orphaned-worktrees.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target

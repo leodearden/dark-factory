@@ -27,7 +27,8 @@ from fused_memory.config.reload import (
     apply_reload,
     diff_config,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import EntityMintConfig, FusedMemoryConfig
+from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
@@ -405,3 +406,552 @@ class TestReloadConfigTool:
         assert isinstance(result['error'], str) and 'timed out' in result['error']
         # Live config completely untouched — no apply on the timeout path.
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
+
+
+class TestMem0UpdateLeavesAreGreenTier:
+    """All five mem0_update.* leaves must hot-apply (task 3088).
+
+    Modelled on TestWriteTriageLeavesAreGreenTier below — the direct precedent
+    for registering TOP-LEVEL (non-reconciliation.*) leaves. The existing
+    test_reloadable_fields_are_all_real_leaves guards these paths against typos
+    automatically.
+
+    The kill switch is the load-bearing one: mem0_update.enabled is what an
+    operator flips to stop an in-flight rewrite incident, and a restart-only
+    kill switch is no kill switch. The two storm leaves are only genuinely
+    reload-safe because StormCounter takes threshold/window per record() call.
+    """
+
+    PATHS = (
+        'mem0_update.enabled',
+        'mem0_update.content_amend_allowed_agent_prefixes',
+        'mem0_update.metadata_patch_allowed_agent_prefixes',
+        'mem0_update.storm_threshold',
+        'mem0_update.storm_window_seconds',
+    )
+
+    @pytest.mark.parametrize('path', PATHS)
+    def test_leaf_is_allowlisted(self, path):
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+    @pytest.mark.parametrize(
+        ('path', 'new_value'),
+        [
+            ('mem0_update.enabled', False),
+            ('mem0_update.content_amend_allowed_agent_prefixes', []),
+            # NB: must differ from the shipped default (which already carries
+            # recon-stage- and curator-), or the diff is vacuously empty.
+            (
+                'mem0_update.metadata_patch_allowed_agent_prefixes',
+                ['recon-stage-', 'curator-', 'auditor-'],
+            ),
+            ('mem0_update.storm_threshold', 5),
+            ('mem0_update.storm_window_seconds', 600.0),
+        ],
+    )
+    def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        field = path.split('.', 1)[1]
+        old = getattr(live.mem0_update, field)
+        object.__setattr__(fresh.mem0_update, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates, (
+            f'{path} must hot-apply so an operator can retune without a restart'
+        )
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    def test_kill_switch_flip_is_observed_live_without_a_restart(self):
+        """A reload must be visible to the resolver through the SHARED config
+        object — the precondition config/reload.py's reload-safety rule states
+        before a leaf may be registered at all."""
+        from types import SimpleNamespace
+
+        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
+
+        live = FusedMemoryConfig()
+        svc = SimpleNamespace(config=live)
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=False,
+        ).allowed is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.mem0_update, 'enabled', False)
+        result = apply_reload(live, fresh)
+
+        assert result['reloaded'] is True, f'reload failed: {result.get("error")!r}'
+        assert 'mem0_update.enabled' in result['applied']
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=False,
+        ).allowed is False, (
+            'the resolver reads the same shared config object apply_reload '
+            'mutated in place, so the flip takes effect with no restart'
+        )
+
+    def test_widened_metadata_bar_is_observed_live(self):
+        """The operator story: admit an interactive tagging flow on a running
+        server WITHOUT granting content-amend authority.
+
+        auditor- as the example prefix, NOT curator-: curator- moved onto the
+        shipped default of BOTH arms (esc-3524-1 + the 2026-08-12 ruling), so
+        widening to it would be a vacuous no-op diff and the content-amend
+        denial below would fail."""
+        from types import SimpleNamespace
+
+        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
+
+        live = FusedMemoryConfig()
+        svc = SimpleNamespace(config=live)
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.mem0_update,
+            'metadata_patch_allowed_agent_prefixes',
+            ['recon-stage-', 'curator-', 'auditor-'],
+        )
+        apply_reload(live, fresh)
+
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='auditor-session', content_amend=False, metadata_patch=True,
+        ).allowed is True
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='auditor-session', content_amend=True, metadata_patch=False,
+        ).allowed is False, 'widening one bar must not widen the other'
+
+
+class TestWriteTriageLeavesAreGreenTier:
+    """The calibration script's config write must be hot-reloadable.
+
+    Modelled on test_topic_guard_clusters_leaf_is_green_tier_applied_candidate.
+    The existing test_reloadable_fields_are_all_real_leaves guards these
+    paths against typos automatically.
+    """
+
+    PATHS = (
+        'write_triage.t_high',
+        'write_triage.t_low',
+        'write_triage.calibration_report_path',
+        # Operator knobs (task 3127, PRD leaf beta), green-tier for a
+        # DIFFERENT reason than their calibrated siblings above. `enabled` is
+        # the staged-rollout kill switch: it is what an operator flips to stop
+        # an in-flight triage incident, and a restart-only kill switch is no
+        # kill switch (the mem0_update.enabled lesson, reload.py). `candidate_k`
+        # is the retrieval width, tuned against measured recall on a running
+        # server rather than by redeploying.
+        'write_triage.enabled',
+        'write_triage.candidate_k',
+    )
+
+    @pytest.mark.parametrize('path', PATHS)
+    def test_leaf_is_allowlisted(self, path):
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+    @pytest.mark.parametrize(
+        ('path', 'new_value'),
+        [
+            ('write_triage.t_high', 0.87),
+            ('write_triage.t_low', 0.61),
+            ('write_triage.calibration_report_path', 'calibration/report.json'),
+            ('write_triage.enabled', True),
+            ('write_triage.candidate_k', 37),
+        ],
+    )
+    def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        field = path.split('.', 1)[1]
+        old = getattr(live.write_triage, field)
+        # The precondition this needs is only that the leaf actually CHANGES —
+        # diff_config reports nothing otherwise and the lookup below raises
+        # KeyError on a test that is not about that. It used to be spelled
+        # `old is None`, which stopped being true of the whole section when the
+        # operator knobs landed with real defaults (there is no such thing as
+        # an uncalibrated kill switch). The `defaults to None` invariant for
+        # the three CALIBRATED fields is pinned where it belongs, in
+        # test_config_schema.py::TestWriteTriageConfig.
+        assert old != new_value, f'{path} must actually change for this to assert anything'
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates, (
+            f'{path} must hot-apply so a calibration run is picked up without a restart'
+        )
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+
+class TestWriteTriageJudgeLeavesAreGreenTier:
+    """The judge knobs (task 3128, PRD leaf gamma) are ALL green tier.
+
+    The expected leaf set is DERIVED from ``WriteTriageConfig.model_fields``
+    rather than listed by hand, and that inversion is the whole point: a
+    SEVENTH ``judge_*`` leaf added later without a reload registration fails
+    here instead of silently degrading to restart-only. ``config/reload.py``
+    states the rule its own way — "anything absent from this frozenset
+    silently degrades to restart-only" — and a kill switch that quietly needs
+    a restart is no kill switch, because the operator believes they turned it
+    off.
+
+    Follows ``TestTopicAnchoredRecallReloadTier``'s shape: the classification
+    test is paired with the live-read test that EARNS the classification.
+    Green tier is not assertable on its own — a value captured at
+    construction cannot observe an in-place mutation, and would have to stay
+    restart-only however it were registered here.
+    """
+
+    #: Every judge leaf the schema declares, discovered rather than restated.
+    JUDGE_FIELDS = tuple(sorted(
+        name for name in FusedMemoryConfig().write_triage.__class__.model_fields
+        if name.startswith('judge_')
+    ))
+
+    def test_the_schema_actually_declares_judge_leaves(self):
+        """Guards the derivation itself: an empty set would pass vacuously."""
+        assert len(self.JUDGE_FIELDS) >= 6, self.JUDGE_FIELDS
+
+    @pytest.mark.parametrize('field', JUDGE_FIELDS)
+    def test_every_judge_leaf_is_allowlisted(self, field):
+        path = f'write_triage.{field}'
+        assert path in RELOADABLE_FIELDS, (
+            f'{path} must be allowlisted for hot-reload — an unregistered leaf '
+            'silently degrades to restart-only, and a restart-only judge kill '
+            'switch is no kill switch'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'new_value'),
+        [
+            ('judge_enabled', False),
+            ('judge_provider', 'anthropic'),
+            ('judge_model', 'gpt-4.1-nano'),
+            ('judge_timeout_seconds', 3.5),
+            ('judge_candidate_count', 3),
+            ('judge_accuracy_report_path', 'calibration/judge_report.json'),
+        ],
+    )
+    def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        path = f'write_triage.{field}'
+        old = getattr(live.write_triage, field)
+        assert old != new_value, f'{path} must actually change for this to assert anything'
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    @pytest.mark.parametrize(
+        ('field', 'resolver_name', 'new_value'),
+        [
+            ('judge_enabled', 'resolve_judge_enabled', False),
+            ('judge_provider', 'resolve_judge_provider', 'anthropic'),
+            ('judge_model', 'resolve_judge_model', 'gpt-4.1-nano'),
+            ('judge_timeout_seconds', 'resolve_judge_timeout', 3.5),
+            ('judge_candidate_count', 'resolve_judge_candidate_count', 3),
+        ],
+    )
+    def test_an_applied_reload_is_observed_by_the_live_resolver(
+        self, field, resolver_name, new_value,
+    ):
+        """The live-read property that MAKES the green-tier classification honest.
+
+        `judge_accuracy_report_path` has no resolver by design — it is a
+        traceability pointer read by the operator and the eval's own test, not
+        by the write path — so it is covered by the allowlist and
+        applied-candidate legs above and not by this one.
+        """
+        from fused_memory.server import write_triage_judge
+
+        resolver = getattr(write_triage_judge, resolver_name)
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolver(memory_service) != new_value
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert f'write_triage.{field}' in report['applied']
+        # No service reconstruction: the SAME object now resolves differently.
+        assert resolver(memory_service) == new_value
+
+
+class TestEntityMintLeavesAreGreenTier:
+    """The five ``entity_mint`` knobs (task 4932) are ALL green tier.
+
+    The expected leaf set is DERIVED from ``EntityMintConfig.model_fields``
+    rather than listed by hand — the ``TestWriteTriageJudgeLeavesAreGreenTier``
+    variant, deliberately NOT the hand-listed ``TestMem0UpdateLeavesAreGreenTier``
+    one — so a SIXTH ``entity_mint`` leaf added later without a reload
+    registration fails HERE instead of silently degrading to restart-only.
+    ``config/reload.py`` states the rule its own way: "anything absent from this
+    frozenset silently degrades to restart-only", and a restart-only kill switch
+    is no kill switch, because the operator believes they turned it off.
+
+    Third leg is the live-read test that EARNS the classification. Green tier is
+    not assertable on its own — a value captured at construction cannot observe
+    an in-place mutation, and would have to stay restart-only however it were
+    registered in the allowlist.
+    """
+
+    #: Every entity_mint leaf the schema declares, discovered rather than restated.
+    LEAVES = tuple(sorted(EntityMintConfig.model_fields))
+
+    def test_the_schema_actually_declares_entity_mint_leaves(self):
+        """Guards the derivation itself: an empty set would pass vacuously."""
+        assert len(self.LEAVES) >= 5, self.LEAVES
+
+    @pytest.mark.parametrize('field', LEAVES)
+    def test_every_leaf_is_allowlisted(self, field):
+        path = f'entity_mint.{field}'
+        assert path in RELOADABLE_FIELDS, (
+            f'{path} must be allowlisted for hot-reload — an unregistered leaf '
+            'silently degrades to restart-only, and a restart-only entity-mint '
+            'kill switch is no kill switch'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'new_value'),
+        [
+            ('enabled', False),
+            ('allowed_agent_prefixes', ['recon-stage-', 'curator-', 'auditor-']),
+            ('lock_timeout_seconds', 1.5),
+            ('storm_threshold', 3),
+            ('storm_window_seconds', 600.0),
+        ],
+    )
+    def test_a_changed_leaf_lands_in_applied_candidates(self, field, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        path = f'entity_mint.{field}'
+        old = getattr(live.entity_mint, field)
+        assert old != new_value, (
+            f'{path} must actually change for this to assert anything — a value '
+            'equal to the shipped default makes the diff vacuously empty'
+        )
+        object.__setattr__(fresh.entity_mint, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    def test_an_applied_kill_switch_reload_denies_the_very_next_call(self):
+        """The live-read property that MAKES the green-tier classification honest.
+
+        No service reconstruction anywhere: the SAME SimpleNamespace holding the
+        SAME config object flips from allowed to denied.
+        """
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolve_entity_mint_authorization(
+            memory_service, agent_id='recon-stage-1',
+        ).allowed is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.entity_mint, 'enabled', False)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'entity_mint.enabled' in report['applied']
+        decision = resolve_entity_mint_authorization(
+            memory_service, agent_id='recon-stage-1',
+        )
+        assert decision.allowed is False
+        assert decision.error_type == 'EntityMintToolDisabled', decision
+
+    def test_an_applied_allowlist_reload_admits_a_previously_denied_agent(self):
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolve_entity_mint_authorization(
+            memory_service, agent_id='auditor-x',
+        ).allowed is False, 'auditor- is not on the shipped default bar'
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.entity_mint, 'allowed_agent_prefixes',
+            ['recon-stage-', 'curator-', 'auditor-'],
+        )
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'entity_mint.allowed_agent_prefixes' in report['applied']
+        assert resolve_entity_mint_authorization(
+            memory_service, agent_id='auditor-x',
+        ).allowed is True
+
+
+class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
+    """The per-category cutoff map (task 3357), reloaded as ONE leaf.
+
+    Same green tier as its pooled sibling, and for the same reason: a
+    re-calibration must take effect on a running server. Atomicity is the
+    part that matters here — _iter_leaves yields a container WHOLE (as it
+    already does for reconciliation.procedural_knowledge_topic_guard_clusters),
+    so a half-applied set of per-category cutoffs can never gate a sweep.
+    """
+
+    PATH = 'write_triage.t_high_by_category'
+    # SYNTHETIC, deliberately: a real cutoff copied in here would be one
+    # re-calibration away from equalling the live config's map, at which
+    # point diff_config would report no change and the applied_candidates
+    # lookup below would raise KeyError on a test that is not about that.
+    SYNTHETIC = {'procedural_knowledge': 0.5}
+
+    def test_the_leaf_is_allowlisted(self):
+        assert self.PATH in RELOADABLE_FIELDS, (
+            f'{self.PATH} must be allowlisted so a re-calibration needs no restart'
+        )
+
+    def test_iter_leaves_yields_the_map_as_exactly_one_whole_leaf(self):
+        """Not one leaf per category — the map reloads all-or-nothing."""
+        from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        object.__setattr__(config.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+        paths = [path for path, _ in _iter_leaves(config)]
+
+        assert paths.count(self.PATH) == 1, (
+            f'expected exactly one leaf at {self.PATH}, got {paths.count(self.PATH)}'
+        )
+        assert not [p for p in paths if p.startswith(f'{self.PATH}.')], (
+            'the map must not be descended into: a per-category leaf would let '
+            'one cutoff land while another did not'
+        )
+        assert dict(_iter_leaves(config))[self.PATH] == self.SYNTHETIC, (
+            'the leaf value must be the whole mapping'
+        )
+
+    def test_a_changed_map_lands_in_applied_candidates(self):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.write_triage.t_high_by_category
+        assert old != self.SYNTHETIC, (
+            'the fixture must DIFFER from the live map, or diff_config reports '
+            'no change and this test asserts nothing'
+        )
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates[self.PATH] == {'old': old, 'new': self.SYNTHETIC}
+        assert self.PATH not in d.restart_required
+
+    def test_apply_reload_replaces_the_map_wholesale(self):
+        """Never merged into the old map.
+
+        A merge would leave a category calibrated after the run that
+        calibrated it stopped deriving a cutoff for it — a stale number
+        outliving its own evidence.
+        """
+        from fused_memory.config.reload import apply_reload  # noqa: PLC0415
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(live.write_triage, 't_high_by_category', {
+            'procedural_knowledge': 0.5, 'observations_and_summaries': 0.6,
+        })
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+
+        apply_reload(live, fresh)
+
+        assert live.write_triage.t_high_by_category == self.SYNTHETIC
+
+
+class TestTopicAnchoredRecallReloadTier:
+    """The topic pin's kill switch is GREEN TIER (task 3111).
+
+    Green-tier classification is EARNED, not asserted: a knob captured by value
+    at construction would not observe an in-place reload and would have to stay
+    restart-only (config/reload.py's module docstring states the rule). So the
+    classification test is paired with the live-consumer test that justifies it.
+    """
+
+    def test_classified_hot_reloadable_not_restart_required(self):
+        """RED while the field is absent from RELOADABLE_FIELDS — it buckets as restart."""
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.reconciliation.topic_anchored_recall_enabled
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates['reconciliation.topic_anchored_recall_enabled'] == {
+            'old': old,
+            'new': not old,
+        }
+        assert 'reconciliation.topic_anchored_recall_enabled' not in d.restart_required
+
+    def test_flip_observed_by_live_resolver_without_reconstruction(self):
+        """The live-read property that MAKES the green-tier classification honest."""
+        from fused_memory.services.topic_anchor import resolve_topic_anchor_enabled
+
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert memory_service.config.reconciliation.topic_anchored_recall_enabled is True
+        assert resolve_topic_anchor_enabled(memory_service) is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'reconciliation.topic_anchored_recall_enabled' in report['applied']
+        # No service reconstruction: the SAME object now resolves differently.
+        assert resolve_topic_anchor_enabled(memory_service) is False
+
+    @pytest.mark.asyncio
+    async def test_flip_changes_the_next_searchs_behaviour(self, mock_config):
+        """End of the chain: the in-place flip changes real search behaviour.
+
+        Asserts on the observable consequence — whether the metadata lookup is
+        made at all — rather than on the resolver's return value, so this
+        cannot pass while the search path ignores the knob.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from _fm_helpers import install_identity_mocks
+
+        from fused_memory.services.memory_service import MemoryService
+
+        service = MemoryService(mock_config)
+        service.graphiti = MagicMock()
+        service.graphiti.search = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        install_identity_mocks(service.graphiti)
+        service.mem0 = MagicMock()
+        service.mem0.search = AsyncMock(return_value={'results': [{
+            'id': 'sibling-1',
+            'memory': 'a narrow sibling',
+            'score': 0.85,
+            'metadata': {'category': 'procedural_knowledge', 'topic': 'topic-a'},
+        }]})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        async def _search() -> None:
+            # Spelled out rather than splatted from a dict: a heterogeneous
+            # dict literal infers `str | list[str] | int` for every value and
+            # pyright rejects the splat against search's real signature.
+            await service.search(
+                query='q',
+                project_id='dark_factory',
+                categories=['procedural_knowledge'],
+                stores=['mem0'],
+                limit=5,
+            )
+
+        await _search()
+        assert service.mem0.scroll_by_metadata.await_count == 1
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+        apply_reload(service.config, fresh)
+
+        # Same service object, no reconstruction — the next search skips the I/O.
+        await _search()
+        assert service.mem0.scroll_by_metadata.await_count == 1

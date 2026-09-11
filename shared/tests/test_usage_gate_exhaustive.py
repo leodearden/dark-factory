@@ -29,6 +29,7 @@ from shared.invocation_outcome import (
 from shared.usage_gate import (
     AccountLease,
     AccountPhase,
+    InvokeSlot,
     SessionBudgetExhausted,
     UsageGate,
     _extract_cap_message,
@@ -2225,6 +2226,39 @@ class TestReleaseProbeSlot:
         assert gate._open.is_set() is False  # still closed — NOT re-opened
         assert acct.capped is True  # capped flag untouched
 
+    async def test_near_cap_via_detect_cap_hit_releases_probe(self):
+        """Near-cap detected while PROBE_IN_FLIGHT must still release the probe
+        claim: ``_handle_near_cap_warning`` is annotation-only and never
+        transitions phase, so only ``detect_cap_hit``'s explicit release
+        reopens the gate. Scoped counterpart:
+        ``test_usage_gate_scope_attribution.py::TestScopedCapHitReleasesProbeSlot``.
+        """
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        # Legacy boolean shim: bypasses _transition, so no resume-probe
+        # background task spawns (make_gate only AsyncMocks _run_probe);
+        # before_invoke() then takes the real `if acct.probing:` branch and
+        # performs the genuine PROBING -> PROBE_IN_FLIGHT claim.
+        acct.probing = True
+        lease = await gate.before_invoke(scope=None)
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+        assert gate._open.is_set() is False  # single-account gate closed by the claim
+        slot = InvokeSlot(gate, lease, scope=None)
+
+        near_cap_stderr = "You're close to your usage limit. resets in 2h"
+        assert slot.detect_cap_hit(near_cap_stderr, '') is True
+
+        assert acct.near_cap is True  # annotation kept (clear_near_cap=False)
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+        # Bounded: in the RED state before_invoke() blocks forever, so a bare
+        # await would fail as a 60s suite timeout instead of a sub-second,
+        # legible TimeoutError.
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.name == 'a'
+
 
 # =========================================================================
 # TestAuthReprobeDemoteOnCapMessage — when an auth_failed account's reprobe
@@ -2497,9 +2531,10 @@ class TestB5AttributionSkew:
 
 # =========================================================================
 # TestLeaseIsCurrent — gate.lease_is_current(lease) detects a lease gone
-# stale from a mid-flight account re-transition (PRD §7.4, task W4-δ). This
-# is the detectability primitive consumer ε's InvokeSlot.report() Q4
-# log-and-proceed fail-safe hooks into.
+# stale from either of two signals: a mid-flight account re-transition, or
+# the leased account no longer being present in gate._accounts (PRD §7.4,
+# task W4-δ). This is the detectability primitive consumer ε's
+# InvokeSlot.report() Q4 log-and-proceed fail-safe hooks into.
 # =========================================================================
 
 
@@ -2522,3 +2557,20 @@ class TestLeaseIsCurrent:
 
         assert gate.lease_is_current(lease) is False
         assert lease.generation != acct.generation
+
+    async def test_stale_when_account_removed_from_account_list(self):
+        """Pins the `acct is not None` branch: a lease naming an account
+        no longer in `gate._accounts` is stale."""
+        gate = make_gate(['a', 'b'])
+        async with gate.invoke_slot() as slot:
+            lease = slot.lease
+
+        assert isinstance(lease, AccountLease)
+        assert gate.lease_is_current(lease) is True
+
+        # Drop only the leased account, resolved by name; the sibling stays.
+        gate._accounts[:] = [a for a in gate._accounts if a.name != lease.name]
+        assert all(a.name != lease.name for a in gate._accounts)
+        assert gate._accounts, 'sibling account must survive — this is not the empty-gate case'
+
+        assert gate.lease_is_current(lease) is False

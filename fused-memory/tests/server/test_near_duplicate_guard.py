@@ -4,8 +4,15 @@
 of already-fetched ``MemoryResult`` search hits and a similarity threshold,
 it selects the single best near-duplicate candidate (or ``None``). It does
 no I/O and makes no assumptions about embedding accuracy — callers inject
-explicit ``relevance_score`` values, so these tests exercise pure comparison
-logic only.
+explicit cosine values, so these tests exercise pure comparison logic only.
+
+Task 3658 moved the cosine those callers inject: ``MemoryService.search`` now
+returns an ORDINAL RRF value in ``relevance_score`` (single-store rank-1 is
+1/61 ~ 0.0164) and carries the honest per-store cosine in
+``metadata['store_score']``.  The guard's 0.92 threshold is a cosine
+threshold, so it must read the cosine — hence ``_result`` below builds the
+post-RRF result shape, and every threshold expectation in this module is
+unchanged.
 """
 
 from __future__ import annotations
@@ -27,6 +34,14 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_threshold,
     resolve_topic_guard_clusters,
 )
+from fused_memory.services.memory_service import RRF_K
+
+# The real post-RRF relevance_score for a rank-1 hit on the guard's
+# single-store search(stores=['mem0'], limit=5) path — 1/(RRF_K + 1).
+# RRF_K comes from production rather than being restated as the literal 60, so
+# a retune of the constant carries this fixture with it instead of leaving it
+# silently modelling a shape ``search()`` no longer emits.
+_RRF_RANK1 = 1.0 / (RRF_K + 1)
 
 
 def _result(
@@ -36,13 +51,22 @@ def _result(
     category: MemoryCategory | None = MemoryCategory.procedural_knowledge,
     source_store: SourceStore = SourceStore.mem0,
     content: str = 'some procedural content',
+    relevance_score: float = _RRF_RANK1,
+    store_rank: int = 1,
 ) -> MemoryResult:
+    """Build a POST-RRF ``MemoryResult``: *score* is the cosine, in metadata.
+
+    ``relevance_score`` defaults to the ordinal RRF value a real rank-1 mem0
+    hit now carries, deliberately UNRELATED to *score* — so any test that
+    passes only because the guard still reads ``relevance_score`` fails.
+    """
     return MemoryResult(
         id=id_,
         content=content,
         category=category,
         source_store=source_store,
-        relevance_score=score,
+        relevance_score=relevance_score,
+        metadata={'store_rank': store_rank, 'store_score': score},
     )
 
 
@@ -85,11 +109,15 @@ class TestFindNearDuplicateMemory:
         assert match is None
 
     def test_picks_max_score_among_multiple_qualifying_results(self):
+        # Distinct cosines, IDENTICAL fused scores (all rank-1 ordinals): the
+        # selection must be driven by the cosine, not by relevance_score, which
+        # here cannot discriminate at all.
         results = [
             _result('m1', 0.93),
             _result('m2', 0.99),
             _result('m3', 0.95),
         ]
+        assert len({r.relevance_score for r in results}) == 1
         match = find_near_duplicate_memory(results, 0.92)
         assert match is not None
         assert match.id == 'm2'
@@ -103,6 +131,70 @@ class TestFindNearDuplicateMemory:
         match = find_near_duplicate_memory(results, 0.92)
         assert match is not None
         assert match.id == 'm2'
+
+    # --- task 3658 / esc-3658-1 -------------------------------------------
+
+    def test_post_rrf_result_still_matches_on_its_cosine(self):
+        """The regression this guard would otherwise have suffered silently.
+
+        A real rank-1 mem0 hit on the guard's ``stores=['mem0']`` search path
+        now carries ``relevance_score`` ~ 0.0164.  Comparing THAT against the
+        0.92 cosine threshold can never be true, so the guard would have
+        returned ``None`` for every input — silently disabling the documented
+        write-time soft-block without even entering its own fail-open logging
+        branch.
+        """
+        result = _result('m1', 0.97, relevance_score=_RRF_RANK1)
+        assert result.relevance_score < 0.02, 'fixture must model the real fused value'
+
+        match = find_near_duplicate_memory([result], 0.92)
+
+        assert match is not None, (
+            'The guard must threshold on the cosine in metadata.store_score, '
+            'not on the ordinal RRF relevance_score'
+        )
+        assert match.id == 'm1'
+
+    def test_result_without_store_score_never_qualifies(self):
+        """A missing cosine is "not comparable", never "compared and passed"."""
+        no_metadata = MemoryResult(
+            id='m1',
+            content='some procedural content',
+            category=MemoryCategory.procedural_knowledge,
+            source_store=SourceStore.mem0,
+            relevance_score=0.99,
+        )
+        assert find_near_duplicate_memory([no_metadata], 0.92) is None
+        # ...at ANY threshold, including one a 0.0 default would clear.
+        assert find_near_duplicate_memory([no_metadata], 0.0) is None
+
+    def test_result_with_none_store_score_never_qualifies(self):
+        """The Graphiti shape (store_score=None) can never be a near-duplicate."""
+        none_score = MemoryResult(
+            id='m1',
+            content='some procedural content',
+            category=MemoryCategory.procedural_knowledge,
+            source_store=SourceStore.mem0,
+            relevance_score=0.99,
+            metadata={'store_rank': 1, 'store_score': None},
+        )
+        assert find_near_duplicate_memory([none_score], 0.92) is None
+        assert find_near_duplicate_memory([none_score], 0.0) is None
+
+    def test_non_numeric_store_score_never_qualifies(self):
+        """A bool or string cosine is not a measurement (mirrors the config readers)."""
+        for bogus in (True, '0.99', object()):
+            bad = MemoryResult(
+                id='m1',
+                content='some procedural content',
+                category=MemoryCategory.procedural_knowledge,
+                source_store=SourceStore.mem0,
+                relevance_score=_RRF_RANK1,
+                metadata={'store_rank': 1, 'store_score': bogus},
+            )
+            assert find_near_duplicate_memory([bad], 0.92) is None, (
+                f'{bogus!r} must not be read as a cosine'
+            )
 
 
 def _memory_service_with_reconciliation(**fields) -> types.SimpleNamespace:
@@ -169,11 +261,13 @@ def _cluster(
     topic_id: str = 'topic-a',
     phrases: list[str] | None = None,
     min_phrase_hits: int = 2,
+    sufficient_phrases: list[str] | None = None,
 ) -> ProceduralTopicCluster:
     return ProceduralTopicCluster(
         topic_id=topic_id,
         phrases=phrases if phrases is not None else ['alpha', 'beta', 'gamma'],
         min_phrase_hits=min_phrase_hits,
+        sufficient_phrases=sufficient_phrases if sufficient_phrases is not None else [],
     )
 
 
@@ -225,6 +319,150 @@ class TestFindMatchingTopicCluster:
     def test_whitespace_content_returns_none(self):
         cluster = _cluster(phrases=['alpha', 'beta'], min_phrase_hits=1)
         assert find_matching_topic_cluster('   \n\t ', [cluster]) is None
+
+
+class TestFindMatchingTopicClusterSufficientPhrases:
+    """A single DECLARED-sufficient phrase qualifies its cluster alone (task 3054).
+
+    Count-only matching cannot block a write that straddles several
+    clusters at one hit each; a phrase distinctive enough that it cannot
+    appear incidentally should not have to wait for a second one.
+    """
+
+    def test_single_sufficient_phrase_matches_below_min_phrase_hits(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('only alpha here', [cluster])
+        assert match is not None
+
+    def test_sufficient_match_still_returns_the_two_tuple_shape(self):
+        """The return shape is load-bearing: server/tools.py destructures a 2-tuple.
+
+        ``matched_phrases`` is deliberately SHORTER than ``min_phrase_hits``
+        here -- it reports exactly what fired, which is the one sufficient
+        phrase.
+        """
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('only alpha here', [cluster])
+        assert match is not None
+        matched_cluster, matched_phrases = match
+        assert matched_cluster.topic_id == cluster.topic_id
+        assert matched_phrases == ['alpha']
+        assert len(matched_phrases) < cluster.min_phrase_hits
+
+    def test_single_non_sufficient_phrase_still_returns_none(self):
+        # 'beta' is a phrase but NOT declared sufficient -- one hit is still
+        # below min_phrase_hits, so the count-only path must still apply.
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('only beta here', [cluster]) is None
+
+    def test_sufficient_matching_is_case_insensitive_and_lowercases(self):
+        # Same convention as test_matching_is_case_insensitive above.
+        cluster = _cluster(
+            phrases=['Alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['ALPHA'],
+        )
+        match = find_matching_topic_cluster('SOME AlPhA content', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['alpha']
+
+    def test_empty_sufficient_phrases_behaves_exactly_as_today(self):
+        cluster = _cluster(phrases=['alpha', 'beta'], min_phrase_hits=2, sufficient_phrases=[])
+        assert find_matching_topic_cluster('only alpha here', [cluster]) is None
+        match = find_matching_topic_cluster('alpha and beta', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['alpha', 'beta']
+
+    def test_count_path_still_qualifies_when_no_sufficient_phrase_hits(self):
+        # Reaching min_phrase_hits on NON-sufficient phrases must still match:
+        # sufficiency is an additional way to qualify, not a replacement.
+        cluster = _cluster(
+            phrases=['alpha', 'beta', 'gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('beta and gamma only', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['beta', 'gamma']
+
+    def test_empty_content_returns_none_even_with_sufficient_phrases(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('', [cluster]) is None
+
+    def test_whitespace_content_returns_none_even_with_sufficient_phrases(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('   \n\t ', [cluster]) is None
+
+    def test_earlier_cluster_wins_on_a_sufficient_phrase(self):
+        # First-qualifying-cluster ordering is unchanged by sufficiency.
+        cluster_a = _cluster(
+            topic_id='topic-a',
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        cluster_b = _cluster(topic_id='topic-b', phrases=['alpha', 'delta'], min_phrase_hits=1)
+        match = find_matching_topic_cluster('alpha only', [cluster_a, cluster_b])
+        assert match is not None
+        assert match[0].topic_id == 'topic-a'
+
+    def test_earlier_count_match_wins_over_a_later_sufficient_match(self):
+        """The converse precedence, pinned deliberately rather than left incidental.
+
+        Sufficiency decides WHETHER a cluster qualifies, never WHICH
+        qualifying cluster wins: the scan is a single pass in list order, so
+        an earlier cluster reaching ``min_phrase_hits`` on ordinary phrases
+        beats a later cluster whose declared-sufficient phrase also fired.
+        Seed order stays the single priority knob.
+        """
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_a, cluster_b])
+        assert match is not None
+        assert match[0].topic_id == 'topic-a'
+        assert match[1] == ['alpha', 'beta']
+
+    def test_reordering_the_same_clusters_hands_the_win_to_the_sufficient_one(self):
+        """Confirms the previous test pins ORDER, not a count-beats-sufficiency rule."""
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_b, cluster_a])
+        assert match is not None
+        assert match[0].topic_id == 'topic-b'
+        assert match[1] == ['gamma']
 
 
 class TestResolveTopicGuardClusters:

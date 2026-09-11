@@ -693,6 +693,20 @@ def shape_escalations(
                         use the literal ``'reconciliation'`` key which is never in
                         ``task_maps``.
 
+    Each shaped subsection carries, alongside its ``escalations`` rows:
+
+    - ``skipped`` — list of ``{'path': str, 'error': str}`` records for the
+      queue ``*.json`` files ``load_queue_escalations`` could not parse.  Always
+      a list (a missing or ``None`` upstream value shapes to ``[]``), so the
+      client can iterate unconditionally.
+    - ``summary.skipped_count`` — ``len(skipped)`` for that subsection; the
+      top-level ``summary.skipped_count`` is the sum across all of them.  It
+      says how short the ``by_level``/``by_status`` counts beside it may be.
+
+    Both are the payload's statement that a queue holds escalations it could not
+    read — without them the loss is only a server-side WARNING line, and the tab
+    renders short with nothing saying so (INV-2, ``structured-facts-at-failure``).
+
     Returns:
         ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
     """
@@ -762,6 +776,12 @@ def shape_escalations(
             'label': sub_label,
             'kind': sub_kind,
             'summary': dict(sub.get('summary') or {}),
+            # Degraded-state facts sit beside the counts they qualify.  `or []`
+            # handles both a missing key and an explicit None (a stale or partial
+            # upstream dict) so the JSX can iterate unconditionally; the per-entry
+            # dict(e) copy matches how `summary` is copied and keeps the shaped
+            # payload from aliasing the caller's list.
+            'skipped': [dict(e) for e in sub.get('skipped') or []],
             'escalations': rows,
         })
     return {
@@ -821,7 +841,31 @@ def shape_performance(
 # ---------------------------------------------------------------------------
 
 
-_BURNDOWN_KEYS = ('done', 'in_progress', 'blocked', 'pending')
+# ``concurrency_cap`` is deliberately NOT here: it is a per-project scalar
+# series, not an additive count.  Summing caps across projects invents a
+# denominator no single orchestrator ever enforced — the parity alarm is
+# aggregated by OR-ing per-project verdicts instead (see below).
+_BURNDOWN_KEYS = (
+    'done', 'in_progress', 'in_progress_live', 'in_progress_stranded', 'blocked', 'pending',
+)
+
+
+def _with_split(series: Mapping[str, Any]) -> dict[str, Any]:
+    """Return *series* with the live/stranded split guaranteed present.
+
+    A series predating the split (an un-migrated burndown.db) carries neither
+    key.  ``get_burndown_series`` already degrades that case to all-live, and
+    this seam degrades it identically: contributing 0 to both bands while the
+    ``in_progress`` band they split stays fully populated would break the
+    conservation invariant (``live + stranded == in_progress``) that makes the
+    stacked chart and the parity alarm auditable.
+    """
+    live = list(series.get('in_progress_live') or [])
+    stranded = list(series.get('in_progress_stranded') or [])
+    if not live and not stranded:
+        in_progress = list(series.get('in_progress') or [])
+        live, stranded = in_progress, [0] * len(in_progress)
+    return {**series, 'in_progress_live': live, 'in_progress_stranded': stranded}
 
 
 def shape_burndown(
@@ -831,44 +875,121 @@ def shape_burndown(
 
     ``BURNDOWN`` is the sum across projects, aligned by label.
     ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks
-    carry ``forecast_low`` / ``forecast_high`` (None when <7 days history).
+    carry ``forecast_low`` / ``forecast_high`` (None when <7 days history),
+    the ``in_progress_live`` / ``in_progress_stranded`` split, and a parity
+    block from :func:`dashboard.data.burndown.compute_parity_alarm`.
+
+    Consumer contract — the two label rows are NOT interchangeable:
+
+    * ``BURNDOWN['labels']`` is the sorted UNION of every project's snapshot
+      timestamps, and the four aggregate series are densified onto it by
+      ``index_map`` below, so each is always ``len(labels)``.
+    * Each ``BURNDOWN_BY_PROJECT[p]`` block carries that project's OWN
+      snapshot row, generally SHORTER than the union row.  Its four series are
+      copied verbatim, so they are co-length with that row exactly as far as
+      the caller made them so — :func:`~dashboard.data.burndown.get_burndown_series`
+      appends one value per key per snapshot row, which is what establishes
+      the invariant; this function preserves it but does not enforce it (a
+      ragged input is passed through unnormalized, with ``completed`` /
+      ``velocity`` zeroed by the length guard in ``compute_window_completion``).
+
+    So a consumer must pair per-project values with per-project ``labels``.
+    Pairing them with ``BURNDOWN['labels']`` both overruns the values and
+    index-shifts them onto the wrong timestamps — the defect fixed at the
+    per-project status-mix chart in ``static/redux/tabs.jsx``.
+
+    Per-project rows are deliberately not densified onto the union row: a
+    0-fill would assert a measurement that was never taken, and a null-fill
+    would first require every downstream consumer (``deriveVelocitySeries``,
+    the summary-table last-value reads, ``compute_window_completion``) to be
+    made hole-aware.
+
+    The aggregate parity block is an **OR over per-project alarms**, never a
+    comparison of summed in-progress against summed caps.  Summing hides a
+    real breach behind an idle project's headroom (33-against-24 beside
+    3-against-100 reads as 35-against-124) and invents a fake one when a
+    capless project inflates the numerator against a partial denominator.
+    ``parity_peak`` / ``parity_cap`` travel as a matched pair from the
+    worst-margin breaching project — a peak from one project beside a cap from
+    another explains nothing — and are ``None`` when nothing breaches.
+    ``parity_projects`` names the breaching projects so an operator reading the
+    aggregate banner is not left hunting for which one.
     """
     # Local import avoids circular import: burndown.py imports stats and
     # this module imports config/no-burndown.
     from dashboard.data.burndown import (
         aggregate_window_completion,
         compute_forecast_confidence,
+        compute_parity_alarm,
         compute_window_completion,
     )
 
     by_project: dict[str, dict] = {}
+    filled_by_project: list[dict[str, Any]] = []
     label_set: set[str] = set()
     for pid, series in series_by_project.items():
+        filled = _with_split(series)
+        filled_by_project.append(filled)
         labels = list(series.get('labels') or [])
         label_set.update(labels)
         forecast = compute_forecast_confidence(series)
         completion = compute_window_completion(series)
+        parity = compute_parity_alarm(series)
         by_project[_project_label(pid)] = {
             'labels': labels,
-            **{k: list(series.get(k) or []) for k in _BURNDOWN_KEYS},
+            **{k: list(filled.get(k) or []) for k in _BURNDOWN_KEYS},
             **forecast,
             **completion,
+            **parity,
         }
 
     sorted_labels = sorted(label_set)
     aggregate: dict[str, Any] = {'labels': sorted_labels, **{k: [0] * len(sorted_labels) for k in _BURNDOWN_KEYS}}
-    for series in series_by_project.values():
-        labels = list(series.get('labels') or [])
-        index_map = {lbl: i for i, lbl in enumerate(sorted_labels)}
+    index_map = {lbl: i for i, lbl in enumerate(sorted_labels)}
+    for filled in filled_by_project:
+        labels = list(filled.get('labels') or [])
         for k in _BURNDOWN_KEYS:
-            for lbl, val in zip(labels, series.get(k) or [], strict=False):
+            for lbl, val in zip(labels, filled.get(k) or [], strict=False):
                 if lbl in index_map:
                     aggregate[k][index_map[lbl]] += int(val or 0)
 
     aggregate.update(compute_forecast_confidence(aggregate))
     aggregate.update(aggregate_window_completion(by_project, sorted_labels))
+    aggregate.update(_aggregate_parity(by_project))
 
     return {'BURNDOWN': aggregate, 'BURNDOWN_BY_PROJECT': by_project}
+
+
+def _aggregate_parity(by_project: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Fold per-project parity verdicts into one aggregate block.
+
+    See :func:`shape_burndown` for why this is an OR rather than a comparison
+    of summed counts against summed caps.
+    """
+    breaching = sorted(
+        (label for label, block in by_project.items() if block.get('parity_alarm')),
+    )
+    breach_count = sum(int(b.get('parity_breach_count') or 0) for b in by_project.values())
+
+    worst_peak: int | None = None
+    worst_cap: int | None = None
+    worst_margin: int | None = None
+    for label in breaching:
+        block = by_project[label]
+        peak, cap = block.get('parity_peak'), block.get('parity_cap')
+        if not isinstance(peak, int) or not isinstance(cap, int):
+            continue  # an alarm always carries both; belt-and-braces
+        margin = peak - cap
+        if worst_margin is None or margin > worst_margin:
+            worst_margin, worst_peak, worst_cap = margin, peak, cap
+
+    return {
+        'parity_alarm': bool(breaching),
+        'parity_cap': worst_cap,
+        'parity_peak': worst_peak,
+        'parity_breach_count': breach_count,
+        'parity_projects': breaching,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -955,15 +1076,33 @@ def shape_scheduler(
     events_by_task: dict,
     offline_projects: list,
     paused_projects: list,
+    recovery_events: dict,
     snapshot_at: str | None,
 ) -> dict:
-    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects}}``.
+    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` style.  Shallow-copies top-level
     containers only (``list(rows)``, ``dict(events_by_task)``); inner dicts and
     sparkline lists are still aliased to the caller's objects.  This is benign
     because the collector builds fresh dicts, but callers must not mutate the
     inner objects if they need the originals to remain unchanged.
+
+    ``recovery_events`` arrives from the collector keyed by project label
+    (see the shape contract in ``dashboard.data.scheduler``) and is projected
+    onto the wire as two fields:
+
+    * ``recovery_events`` — a FLAT list; every row already carries its own
+      ``project`` tag, so flattening loses nothing and the UI can render one
+      table without walking a nested map.
+    * ``recovery_event_counts`` — ``{project_label: int}``.  A project that
+      answered but had no sweeps reads ``0``; an OFFLINE project has no key at
+      all, because it never appears in the collector's map.  That asymmetry is
+      the point: zero and unknown must not collapse, or a dead orchestrator
+      renders as a quiet one.
+
+    ``recovery_events`` is a required keyword: a new collector element must be
+    threaded through here deliberately, and until it is the mismatch is a loud
+    ``TypeError`` rather than a field that silently never reaches the UI.
     """
     return {
         'SCHEDULER': {
@@ -976,5 +1115,67 @@ def shape_scheduler(
             'offline_projects': list(offline_projects),
             'paused': bool(paused_projects),
             'paused_projects': list(paused_projects),
+            'recovery_events': [
+                ev for rows_ in recovery_events.values() for ev in rows_
+            ],
+            'recovery_event_counts': {
+                label: len(rows_) for label, rows_ in recovery_events.items()
+            },
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# MEMORY_EVALS
+# ---------------------------------------------------------------------------
+
+
+def shape_memory_evals(
+    *,
+    generated_at: str | None = None,
+    root_present: bool = False,
+    storm_escape: dict | None = None,
+    evals: list[dict] | None = None,
+    issues: list[dict] | None = None,
+    issue_count: int = 0,
+    unmatched_escalations: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Return ``{MEMORY_EVALS: {generated_at, root_present, storm_escape, evals, issues, issue_count, unmatched_escalations}}``.
+
+    Pure, I/O-free — mirrors ``shape_curator`` / ``shape_scheduler`` style.
+    The route calls this with ``**build_memory_evals(...)``; all disk access
+    lives in that builder (which the route runs off the event loop), so nothing
+    here reads.
+
+    **These field names are the contract.**  ``docs/prds/memory-eval-dashboard.md``
+    open question 4 assigns the payload vocabulary to this shape fn plus
+    ``dashboard/tests/test_memory_evals_data.py``; the React section consumes
+    exactly these names.  The parameters are spelled out rather than swallowed
+    by ``**_``: a new builder key must be threaded through here deliberately,
+    and until it is, the mismatch is a loud ``TypeError`` rather than a field
+    that silently never reaches the UI.
+
+    ``storm_escape`` is the run-scoped, program-wide escape block — one banner
+    source, carried beside the eval rows rather than only inside them, so the
+    UI never has to elect a row to read it from and it survives a root with
+    zero eval dirs.
+
+    Shallow-copies top-level containers only (``list(evals)``); the inner eval
+    /issue /escalation dicts stay aliased to the builder's objects, which is
+    benign because the builder constructs them fresh per call.  Defaults are
+    fresh literals per call, never a shared module-level constant, so one
+    response can never mutate another's.  A default-shaped body is structurally
+    identical to a real one — same keys, ``root_present=False`` — so the UI
+    never has to branch on which it got.
+    """
+    return {
+        'MEMORY_EVALS': {
+            'generated_at': generated_at,
+            'root_present': root_present,
+            'storm_escape': dict(storm_escape) if storm_escape else None,
+            'evals': list(evals) if evals else [],
+            'issues': list(issues) if issues else [],
+            'issue_count': issue_count,
+            'unmatched_escalations': list(unmatched_escalations) if unmatched_escalations else [],
         }
     }

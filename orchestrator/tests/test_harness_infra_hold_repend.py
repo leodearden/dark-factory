@@ -5,9 +5,21 @@ Step 13 (RED): _revert_in_progress_if_no_live_claimant — task with infra_hold
 on a non-degenerate branch must NOT be reverted to pending when the claimant
 is gone.  Currently RED because the guard does not exist yet.
 
-Step 15 (RED): _on_escalation_resolved — an infra_issue resolution for an
-infra_hold task resumes-at-verify (set in-progress) instead of the default
-resume→pending flip.
+Step 15: _on_escalation_resolved — an infra_issue resolution for an infra-held
+task takes the dedicated is_infra_held branch rather than falling through the
+blocked-only gate (an infra-held row is never 'blocked', so without the pre-gate
+it would never resume at all).
+
+Amended by task 3538 (PRD γ3, D6): that branch's TARGET is now 'pending', not
+'in-progress'.  The branch itself is unchanged and still load-bearing; only the
+status it writes moved.  Rationale — 'in-progress' with no claimant IS the
+stranded shape, is undispatchable under the pending-only dispatch gate, and was
+recoverable only by the stranded sweep (which re-pends anyway, and which skips
+any task with an open escalation, so an open record starved the task forever).
+Resume-at-verify is preserved because it was never status-keyed: it comes from
+TaskWorkflow._has_prior_implementation reading the worktree.  See
+test_harness_infra_resume_truthful.py for the full statement and the
+status-independence evidence.
 """
 
 from __future__ import annotations
@@ -20,6 +32,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
 
 from orchestrator.harness import Harness
 
@@ -42,6 +55,10 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
+    # Task 3540: is_actively_held auto-mocks TRUTHY on a bare MagicMock,
+    # so every row would read as having a live claimant and every
+    # resume flip would be silently skipped. Wire the real accessors.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
@@ -302,25 +319,29 @@ def _make_infra_esc(
 
 @pytest.mark.asyncio
 class TestInfraHoldEscalationResolution:
-    """_on_escalation_resolved with an infra-held task → resume-at-verify
-    (in-progress), not pending.
+    """_on_escalation_resolved with an infra-held task → the is_infra_held
+    branch resumes it to 'pending'.
 
-    RED before step-16: _cascade_unblock_member always calls set_task_status('pending'),
-    so the infra-held task gets wrongly re-pended.
-    GREEN after step-16: is_infra_held (status='infra-hold'; task 2200/ω4,
-    formerly metadata.infra_hold) intercepts the flip and sets 'in-progress'
-    instead.
+    The invariant this class has always pinned is that an infra-held row DOES
+    resume on escalation resolution — it must not be dropped by the blocked-only
+    gate (its status is 'infra-hold', never 'blocked').  That intent is
+    unchanged.
+
+    What changed (task 3538 / PRD γ3): the branch's target. It was
+    'in-progress' — a claimant-less write that is stranded on arrival and
+    undispatchable under the pending-only dispatch gate.  It is now 'pending',
+    which is dispatchable; resume-at-verify still holds because the skip is
+    branch-keyed (_has_prior_implementation), not status-keyed.
     """
 
-    async def test_infra_hold_escalation_resolved_resumes_at_verify(
+    async def test_infra_hold_escalation_resolved_repends_for_dispatch(
         self, harness: Harness
     ):
         """status='infra-hold' task: resolved infra_issue escalation →
-        'in-progress', NOT 'pending'.
+        'pending', and never a claimant-less 'in-progress'.
 
-        After step-16 (re-keyed onto the first-class status by task 2200/ω4)
-        _cascade_unblock_member checks is_infra_held before the blocked-gate
-        and calls 'in-progress' instead of 'pending'.
+        _cascade_unblock_member checks is_infra_held BEFORE the blocked-gate
+        (task 2200/ω4) and, since task 3538, writes 'pending' there.
         """
         tid = '1883'
 
@@ -342,25 +363,27 @@ class TestInfraHoldEscalationResolution:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        # Must NOT flip to 'pending'
-        pending_calls = [
-            c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-            if c.args[1] == 'pending'
-        ]
-        assert not pending_calls, (
-            f"set_task_status('pending') was called despite status='infra-hold'. "
-            f'An infra-held task must resume-at-verify (in-progress), not re-pend. '
-            f'Calls: {pending_calls}'
-        )
-
-        # Must flip to 'in-progress' (resume-at-verify)
+        # Must NOT write 'in-progress': the orphan path stamps no claimant, so
+        # that row is stranded on the write and undispatchable.
         inprog_calls = [
             c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
             if c.args[1] == 'in-progress'
         ]
-        assert inprog_calls, (
-            f"set_task_status('in-progress') was never called for status='infra-hold' "
-            f'task. Expected resume-at-verify but got: '
+        assert not inprog_calls, (
+            f"set_task_status('in-progress') was called for status='infra-hold'. "
+            f'That is the claimant-less strand shape; the resume must re-pend. '
+            f'Calls: {inprog_calls}'
+        )
+
+        # Must re-pend — the only status the dispatch gate accepts.
+        pending_calls = [
+            c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+            if c.args[1] == 'pending'
+        ]
+        assert pending_calls, (
+            f"set_task_status('pending') was never called for status='infra-hold' "
+            f'task. The escalation resolved, so the row must become dispatchable; '
+            f'got: '
             f'{[c.args for c in harness.scheduler.set_task_status.await_args_list]}'  # type: ignore[attr-defined]
         )
 
@@ -372,9 +395,14 @@ class TestInfraHoldEscalationResolution:
         """
         tid = '1884'
 
-        # No infra_hold in metadata
+        # No infra_hold in metadata.  'status' must be present and must AGREE
+        # with get_status below — task 3540's _cascade_unblock_member re-reads
+        # the row immediately before the write and re-applies the
+        # status/liveness gate to THAT snapshot (INV-3), so a row omitting
+        # 'status' reads as "left the re-pendable statuses" and no flip lands.
         harness.scheduler.get_task = AsyncMock(return_value={
             'id': tid,
+            'status': 'blocked',
             'metadata': {},
         })
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
@@ -514,22 +542,26 @@ class TestReconcileSweepExcludesInfraHold:
 class TestCascadeUnblockKeysOnInfraHoldStatus:
     """_cascade_unblock_member must key its infra-hold resume branch on
     is_infra_held(task) — the task's first-class status — checked BEFORE the
-    status != 'blocked' early return, and resume-at-verify from that status
-    alone (no metadata.infra_hold flag to read or clear).
+    status != 'blocked' early return, resuming from that status alone (no
+    metadata.infra_hold flag to read or clear).
 
-    RED before step-8: the cascade reads status via get_status() and
-    early-returns whenever it is not 'blocked' — an infra-held task's status
-    is 'infra-hold', so it never reaches the (also still metadata-keyed)
-    infra branch at all.
+    The KEYING is what this class pins, and it is unchanged: the cascade reads
+    status via get_status() and early-returns whenever it is not 'blocked', so
+    without the is_infra_held pre-gate an 'infra-hold' row never reaches a
+    resume branch at all.
+
+    Task 3538 changed only the target that branch writes: 'pending', not
+    'in-progress'. See this module's docstring.
     """
 
-    async def test_status_infra_hold_resumes_at_verify(
+    async def test_status_infra_hold_repends_for_dispatch(
         self, harness: Harness,
     ):
         """status='infra-hold' (no metadata.infra_hold flag) on a resolved
-        infra_issue L1, via the orphan path -> resume-at-verify
-        ('in-progress'), never 'pending', and no update_task call (there is
-        no flag to clear under the first-class status).
+        infra_issue L1, via the orphan path -> the is_infra_held branch fires
+        and writes 'pending' (never a claimant-less 'in-progress'), with no
+        update_task call (there is no flag to clear under the first-class
+        status).
         """
         tid = '1887'
 
@@ -548,17 +580,17 @@ class TestCascadeUnblockKeysOnInfraHoldStatus:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        # Must resume-at-verify: 'in-progress'.
-        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'in-progress')  # type: ignore[attr-defined]
+        # The pre-gate fired and re-pended the row for dispatch.
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
 
-        # Must NOT flip to 'pending'.
-        pending_calls = [
+        # Must NOT write the claimant-less 'in-progress' strand shape.
+        inprog_calls = [
             c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-            if c.args[1] == 'pending'
+            if c.args[1] == 'in-progress'
         ]
-        assert not pending_calls, (
-            f"set_task_status('pending') was called for a status='infra-hold' "
-            f'task. Calls: {pending_calls}'
+        assert not inprog_calls, (
+            f"set_task_status('in-progress') was called for a status='infra-hold' "
+            f'task. Calls: {inprog_calls}'
         )
 
         # No metadata.infra_hold clear — there is no flag left to clear.

@@ -13,6 +13,7 @@
 # Tracking them creates gitlink (160000) entries that conflict with
 # checkout, stash, and merge operations.
 .worktrees/
+.worktrees-orphaned/
 .eval-worktrees/
 .claude/worktrees/
 
@@ -42,11 +43,52 @@
 __pycache__/
 *.pyc
 
+# ── Coverage artifacts — pytest-cov run products ─────────────────────
+# .coverage is a SQLite DB rewritten by every `pytest --cov` run.  One was
+# committed accidentally as shared/.coverage (task 3324).  Because the
+# project_root checkout is machine-operated (merge worker, startup
+# reconciler, git hooks all act on the working tree directly), a tracked
+# copy shows up as a perpetually-modified binary after any local test run.
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
 # OverrideStore creates an SQLite DB at config.overrides_db_path; when
 # tests pass an unpatched MagicMock as config the stringified mock name
 # becomes the path, producing files like "<MagicMock name='...' id='...'>".
+# That is the str(mock)/repr shape, which always carries a leading "<".
+# A MagicMock is ALSO a valid os.PathLike[str]: os.fspath(mock) returns a
+# repr-derived string whose first component is a plain "MagicMock", with
+# no angle bracket, so code that coerces one with Path() and then calls
+# mkdir() materialises a real directory tree named MagicMock/ under the
+# CWD.  The pattern below cannot match that second shape, so it needs its
+# own entry.  Both are containment only — the real fix is to give the
+# test a genuine path (see orchestrator/tests/conftest.py's autouse
+# stray-artifact guard, which fails loudly on the directory shape).
 <MagicMock*
+MagicMock/
+
+# ── pytest scratch debris — `--basetemp` inside a checkout ───────────
+# An agent passing `pytest --basetemp=.pytest-tmp` (legal and expected —
+# see orchestrator/tests/test_warm_lane_scripts_shipped.py and
+# _orch_helpers.py) drops scratch dirs inside the checkout. Those dirs
+# can contain embedded git repos (e.g. a fixture's own `git init`), which
+# breaks the mandated `git add -- .` staging command two ways: a
+# commit-less embedded repo makes git exit 128 ("does not have a commit
+# checked out" / "fatal: adding files failed"), aborting the whole
+# staging operation; one that HAS a commit exits 0 but silently stages a
+# 160000 gitlink that would then ride the task branch into the merge
+# lane. Deliberately NOT anchored — unlike /data/ above — because the
+# verify chain runs `cd <subproject> && uv run pytest`, so scratch also
+# lands at e.g. orchestrator/.pytest-tmp/, not just at the repo root.
+.pytest-tmp/
+# Same debris class. Previously ignored only in fused-memory/.gitignore,
+# leaving the other six subprojects exposed to the same staging
+# pollution. `git ls-files` confirms nothing is tracked under any
+# .pytest_cache, so promoting it here untracks nothing.
+.pytest_cache/
 
 # ── Runtime / debug artifacts ────────────────────────────────────────
 # Transient output from verification screenshots, MCP tooling, log runs,
@@ -62,6 +104,13 @@ __pycache__/
 /logs/
 # Runtime data (combine_audit.jsonl, etc.) — note /data/ above is root-only:
 orchestrator/data/
+# Same gap for the dashboard: DashboardConfig.project_root defaults off cwd, so
+# running `python -m dashboard` (or anything that boots the app lifespan) from
+# dashboard/ creates live WAL stores at dashboard/data/burndown/*.db.  Two such
+# empty DBs were committed by accident on branch task/3549 and removed again.
+# Keep the /data/ anchor above intact so dashboard/src/dashboard/data/ (a real
+# Python package) stays tracked — this rule is deliberately narrower than that.
+dashboard/data/
 # recon-escalation-watcher run manifests (mcp.json + run.sh stay tracked):
 recon-watch/close-manifest*.json
 # /review skill phase outputs (review/briefing.yaml stays tracked):
@@ -71,6 +120,18 @@ review/reports/
 *.tmp.*
 # Same, scoped explicitly to Python source backups:
 *.py.tmp.*
+# pytest marker-probe scratch dirs.  These fixtures mkdtemp INTO the tests
+# dir on purpose (a system-tmp path makes pytest walk from / when locating
+# the config, costing tens of seconds), and clean up with
+# ignore_errors=True, so a killed run leaves one behind.  One rode a
+# `git add -A` WIP commit onto a task branch and broke the
+# `ruff check fused-memory/tests` directory sweep with I001 (task 3581).
+# Generators: fused-memory/tests/test_integration_marker_config.py:85,
+# cockpit/tests/test_smoke_marker_config.py:64.
+# Deliberately unanchored — these land under <pkg>/tests/, not the repo
+# root — for the same reason recorded for .pytest-tmp/ above:
+.integration_marker_probe*/
+.smoke_marker_probe*/
 
 # ── Node / codex CLI install (ad-hoc, not a project dependency) ──────
 node_modules/

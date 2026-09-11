@@ -2,7 +2,8 @@
 
 The operator's runbook for running Dark Factory day-to-day: starting and
 stopping a project, watching a run, unblocking stuck work, merging, config
-reload, model routing, fleet redeploy, and troubleshooting.
+reload, model routing, fleet redeploy, nightly maintenance timers, and
+troubleshooting.
 
 This document assumes the factory is already installed and at least one
 project has been onboarded. For first-time setup see [README.md](README.md)
@@ -170,6 +171,103 @@ the task tree directly. For status of a *running* orchestrator's live
 state, prefer the fused-memory/escalation MCP reads in [§4](#4-watching-a-run)
 or the dashboard.
 
+### Reading the flake ledger
+
+```bash
+cd <dark-factory-repo>
+uv run --project orchestrator orchestrator flake-ledger --config /path/to/target/dark-factory-orchestrator.yaml
+```
+
+Prints three things: **open flake debt** (each suppressed test with its
+owning task id and how long the debt has been open), **per-test recurrence
+chains** (how many times a test has been re-suppressed, and when and by
+which commit it was last resolved), and **three health counters** — gate
+blind, non-convergence, and systemic. Like `orchestrator status` it reads
+persisted state and needs no running orchestrator.
+
+It is strictly read-only: it opens no debt, files no task, resolves
+nothing and escalates nothing. It will not create a ledger DB for a
+project that has none, and it will not add the flake tables to a
+`runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
+and exits 0 instead.
+
+**Read the header line before the counters.** A report only measures
+anything when the ledger was actually readable. If the header says
+`NO LEDGER`, `NO FLAKE TABLES`, or `LEDGER UNREADABLE` (a corrupt,
+truncated, or locked `runs.db`), every counter below it reads
+`status: not measured` and none of the numbers are a reading — that is
+a broken or absent ledger to go fix, not a clean bill of health. A
+`WARNING: … TRUNCATED` line means the opposite problem: the window held
+more occurrences than one read returns, so the counters cover a partial
+window.
+
+### Reading the merge-lane throughput baseline
+
+```bash
+cd <dark-factory-repo>
+uv run --project shared python scripts/merge_lane_throughput.py \
+  --project-root /home/leo/src/dark-factory \
+  --project-root /home/leo/src/reify \
+  --window 14d
+```
+
+`--project-root` is **repeatable**, and that is the only way to get a
+per-project view: the `events` table has no project column, and the
+`project_id` that does exist belongs to `account_events` in a different
+store with a disjoint event vocabulary and no join key. Each root
+resolves its own `<root>/data/orchestrator/runs.db`, and every row is
+labelled with the root it came from — the projects are never pooled into
+one tally. A root whose store is missing or unreadable is reported as a
+named per-project error with **empty** sections (never a bundle of
+zeros), the remaining projects still print, and the exit code is 1.
+
+Prints six sections per project — landings/day, the four-segment
+lead-time split (queue wait → verify → finalize+CAS residual), verify
+duration by runner, host occupancy, heartbeat queue depth, and the
+`merge_attempt`/`merge_finalized` outcome mixes — plus two behind flags:
+`--speculation` (depth distributions, the chain-dead void rate, and a
+cross-project void-rate block) and `--chains` (deep merge-ahead chain
+landings and observed chain lengths). `--json` emits the same numbers
+keyed by project root and nothing else on stdout.
+
+It is strictly read-only: every connection is a `mode=ro` SQLite URI. It
+writes nothing, files nothing, escalates nothing and emits no events, so
+it is safe to run against a live store while the orchestrator is
+merging.
+
+**Four caveats, all of which change how you read the output.**
+*(a) Match the window to the row you are reading.* The
+`plans/merge-lane-throughput-prd.md` § Background table is not
+single-windowed: most rows are a 14-day window, but four are explicitly
+30-day (speculative merges/verdicts voided, the speculative-ahead
+landing share, the `merge_attempt` outcome mix, and the 30d occupancy
+parenthetical). Pass `--window 14d` or `--window 30d` to match the row,
+and `--window <iso>..<iso>` (e.g.
+`2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00`) to reproduce a
+dated baseline exactly — `14d` resolves against *now*, so it covers a
+different fortnight every day and cannot reproduce a table with a fixed
+date in its header. Every section header is stamped with the concrete
+resolved window for exactly this reason. *(b) The three occupancy
+estimators disagree by design.* LOCF integral, raw-sample fraction and
+verify-duration sum measure different things and are printed side by
+side, unreconciled; none is authoritative, and the spread between them
+is itself the finding. *(c) The script asserts no numeric target.* It
+reproduces a dated baseline and prints what it measures — it does not
+check the numbers against the PRD's, and no test asserts a live-store
+number. Do not "fix" it until a 30d run matches a 14d row; that would
+corrupt the baseline the PRD's decompositions inherit. *(d) `n/a` is not
+zero.* Every unmeasured figure prints as `n/a` and never as `0.0` —
+"the laptop ran no verify this window" and "the laptop's verifies took
+0.0 minutes" are different findings, and reading the first as the second
+is the most consequential misreading this report can produce. A real
+measured zero (four complete day buckets in which nothing landed) does
+print as `0.0`. Two lines exist to keep that honest: a host that ran
+verifies but appeared in no heartbeat is still listed, with `0 sample(s)`
+and both sample-based estimators `n/a`, rather than dropped; and if the
+lead-time split fails to decompose for some landing, a `WARNING …
+NEGATIVE finalize+CAS residual` line names the count instead of letting
+it average away inside the residual percentile.
+
 ### Stopping gracefully
 
 Send `SIGTERM` to the **innermost `orchestrator` process**, not the shell
@@ -220,14 +318,62 @@ For any project running unattended, keep one long-running
    automatically inside the orchestrator itself.
 3. Handles each pending escalation, dispatching by category:
    - `review_issues` / `task_failure` / `wip_conflict` / `unmerged_state` /
-     unmatched `dependency_discovered` / blocking `cleanup_needed` → spawn
-     an interactive `/unblock` session via `/spawn`.
+     `stash_failed` / unmatched `dependency_discovered` / blocking
+     `cleanup_needed` → spawn an interactive `/unblock` session via `/spawn`.
    - `scope_violation` / matched `dependency_discovered` → resolve
      directly.
    - `design_concern` / `risk_identified` → always a human judgment call —
      never auto-resolved.
 4. Waits for the next escalation to fire (or for a spawned sub-agent to
    finish), heartbeats its lease, and repeats.
+
+**Inspecting and repairing a watcher lease.** Use the `lease-show` verb, not
+`cat` — the lease body carries the holder's slug/pid and an immutable
+`start_ts`, but the heartbeat is the file's **mtime**, so `cat` alone cannot
+tell you whether a holder is still beating:
+
+```bash
+python3 orchestrator/src/orchestrator/session_registry.py lease-show --name watcher-df
+```
+
+It prints `key=value` lines — `state`, `holder_slug`, `holder_pid`,
+`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable` —
+computed by the same reader `lease-claim` decides with, and never touches the
+lease. A lease is stale only when the holder pid is dead **and** the heartbeat
+is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is never reclaimable however
+quiet it has been.
+
+`lease-claim`'s `holder_liveness=<none|held|orphaned>` line is a **pid check
+only** — `orphaned` means the pid recorded in the lease body is not running,
+nothing more; `none` means the claim was acquired and there is no contending
+holder at all. Treat `orphaned` as one diagnostic, never as grounds to
+force-release on its own: a quiet-but-live holder that reads as dead is the
+duplicate-spawn incident.
+
+A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
+pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and
+logs a WARNING). Such a lease is protected only by its heartbeat and always
+reads `orphaned`; that is deliberate, because recording some other durable pid
+(the shell) instead would make it unreapable forever.
+
+`lease-heartbeat` and `lease-release` require the `--slug` the lease was
+claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),
+so no session can evict another's lease or keep a stranger's alive. `--force`
+is the deliberate operator-recovery override: it acts anyway and logs at
+WARNING naming both the forcing slug and the displaced holder.
+
+`result=absent` differs by verb: on a **release** it is plain idempotence, but
+on a **heartbeat** it means that session's lease is gone (reaped, or
+force-released by you) and the session is now running un-leased — a duplicate
+can claim the name freely. Both watcher skills tell a heartbeating session to
+re-claim on `absent` rather than continue; if you force-release a live
+watcher's lease, expect it to re-claim on its next cycle.
+
+**Rollout note (task 3994).** Any watcher session already running on the
+pre-3994 prescription must be **restarted** so it re-reads its skill: its
+`lease-heartbeat`/`lease-release` calls pass no `--slug` and now exit 2
+(argparse) instead of mutating. Nothing is stranded — such a lease stops being
+heartbeated and ages out normally within `LEASE_HEARTBEAT_TTL`, then is reaped.
 
 Its priority order when triaging is: infra stability first, software
 quality second, task progress third. Clear-cut issues get acted on
@@ -293,6 +439,30 @@ session:
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
 | `mcp__fused-memory__get_statuses` | Compact `{id: status}` map — cheap when you only need status, not full records |
+| `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
+| `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+### Is reconciliation halted, or just behind?
+
+A large `reconciliation_backlog` has two causes with **opposite remedies**,
+and they look identical from the number alone — that ambiguity cost two days
+of mis-triage on 2026-07-20.
+
+- Read `reconciliation_halt.halted` from the **same** `get_queue_stats` /
+  `get_status` probe; `halt_reason` and `halted_at` say why and since when.
+- **Halted** → `mcp__fused-memory__unhalt_reconciliation(project_id=...)`.
+- **Not halted** → it's capacity; the backlog is draining too slowly (task 3049).
+
+`trigger_reconciliation` on a halted project now answers `status='halted'`
+(with the reason and remedy) instead of `'requested'` — it used to report
+success while the harness skipped every cycle.
+
+This deployment runs `reconciliation.auto_unhalt_after_cooldown: true`
+(`fused-memory/config/config.yaml`, where the rationale sits next to the
+knob): a halt auto-resumes once its cooldown expires, and the judge re-halts
+if the pipeline is still sick. So a halt you find with an already-expired
+cooldown is about to clear itself on the next ~5s tick — in that one window a
+manual trigger IS consumed, and the tool says so.
 
 ---
 
@@ -376,9 +546,9 @@ what you intended — the parameter ordering matters (`action` before a long
 free-text `resolution`) and a mis-ordered call can silently record the
 wrong action.
 
-### Merge-halt semantics (`wip_conflict` / `unmerged_state`)
+### Merge-halt semantics (`wip_conflict` / `unmerged_state` / `stash_failed`)
 
-These two escalation categories mean the **entire merge queue is halted**
+These three escalation categories mean the **entire merge queue is halted**
 — no other task can merge until the one escalation that owns the halt is
 resolved. The orchestrator tracks exactly one "halt owner" escalation
 internally; resolving any *other* escalation, even another `wip_conflict`,
@@ -391,11 +561,113 @@ does **not** release the halt.
   (`UU`/`AA`/`DD`) *before* the merge queue tried to advance — pre-existing
   corruption, not caused by the attempted merge. Needs `git mergetool`,
   manual resolution, or `git reset`, depending on intent.
+- `stash_failed` — the merge queue could not park `project_root`'s dirty
+  tracked WIP before advancing (task 2758). Like the other two this is a
+  shared main-checkout-hygiene fault rather than a fault of the merging task,
+  so the queue halts once instead of failing task after task. Inspect the main
+  checkout's uncommitted work and commit it — or get its owner to. **Do not
+  reach for `git stash`**: it is forbidden in *any* dark-factory checkout,
+  `project_root` or task worktree, for the reasons stated canonically in
+  CLAUDE.md § "Working in the main checkout" (incident 13674d3c68). Park WIP as
+  commits on a branch instead.
 
 Resolve the halt-owner escalation specifically (check `get_merge_halt_status`
 if unsure which one owns it) — `resolve_issue` on it un-halts the whole
 queue. If the log shows the halt cleared but the escalation record still
 shows `pending`, that's a genuine bug, not something to dismiss.
+
+#### `park_lock_contended` — a blocked merge, **not** a halt
+
+Contrast the two categories above, and `stash_failed` (which *does* halt:
+`project_root` carries dirty tracked files that could not be parked — a
+shared hygiene fault that recurs identically for every subsequent task).
+`park_lock_contended` is the opposite and **never halts the queue**: a
+foreign git process held `project_root`'s `.git/index.lock` — dominantly a
+`git commit --only` holding it across its pre-commit hook (see CLAUDE.md
+§"Working in the main checkout"). `advance_main` stands off for up to
+`git.merge_park_lock_grace_seconds` (default 300s) and, if the lock is
+still held, gives up having modified **nothing** — no ref move, no tree
+write, no park, and the foreign lock left strictly alone.
+
+That one merge is reported as a per-task **blocked** merge whose reason
+names the lock path, how long it had been held, and how long we waited.
+This is the ordinary, self-clearing shape — note that it ends there, with
+**no** recovery sentence:
+
+> `advance_main deferred: a foreign git process held /…/.git/index.lock
+> for 301s (waited 300s). The merge did NOT land and NOTHING in
+> project_root was modified. … transient and will be retried on
+> re-dispatch.`
+
+If the foreign lock appeared *mid-park* — after the pre-snapshot gate
+probed it clear — `advance_main` already knew which uncommitted tracked
+files it was about to park, and the reason names them so you can see
+whether real WIP is implicated:
+
+> `… Uncommitted tracked WIP in project_root at the moment of contention:
+> CLAUDE.md, docs/task-authoring.md.`
+
+That clause is absent on the ordinary gate path, where the dirty snapshot
+has not been taken yet and no WIP is known to be at risk.
+
+A normal `git commit --only` whose pre-commit hook outlives the 300s
+grace produces exactly that: a blocked merge, **no** recovery advice, and
+**nothing for you to do** — it is retried on re-dispatch.
+
+There is exactly one genuine operator action, and it is triggered by the
+lock having **already been older, the moment the merge worker first
+observed it, than the staleness floor** — not by the age in the line
+above. That post-wait age necessarily exceeds the grace whenever we
+waited the grace out (it is the initial age *plus* the wait), so it says
+nothing about staleness; the 301s example above is a perfectly live
+commit. The distinguishing sentence is spelled out in the reason and
+simply does not appear otherwise:
+
+> `… The lock was ALREADY 3600s old when the merge worker FIRST observed
+> it — older than the 300s staleness floor (max of the configured 300s
+> grace and the 300s pre-commit budget) — so it is likely a crashed-git
+> leftover rather than a live commit: confirm no git process is running
+> in project_root, then clear it with rm -f /…/.git/index.lock.`
+
+The floor is `max(git.merge_park_lock_grace_seconds, 300s)`, **not** the
+configured grace alone. Tuning the grace *down* (including to `0`, the
+probe-only fail-fast off-switch) shortens how long the worker **waits**;
+it must never widen what counts as a crashed leftover, or a live
+half-second-old `git commit --only` would be reported as one. Tuning the
+grace *up* does raise the bar — an operator who allows longer hooks has
+declared locks that old to be normal.
+
+Only when you see that sentence should you clear the lock by hand, and
+only after confirming no git process is running in `project_root`. The
+advice is gated this narrowly because `rm -f` on a **live** commit's
+index lock corrupts that in-flight commit — the same reason
+`advance_main` never removes the lock itself.
+
+A lock that is *already* past the staleness floor when first observed
+**skips the wait entirely** — it is reported immediately, with the same
+recovery sentence. Waiting cannot change a verdict that is already
+"crashed leftover", and the merge worker is serialized, so burning the
+full grace on every queued task until you clear the file would just be a
+slow-motion version of the stall this whole mechanism removes. So the
+blocked reason for a leftover reads `waited 0s`; that is correct, not a
+mis-report.
+
+One window the gate cannot cover: it is a *probe*, so a foreign process
+can still grab the index between it and the post-advance
+`read-tree -u --reset HEAD` that syncs `project_root` to the new HEAD. By
+then main has already landed, so this is **not** reported as
+`park_lock_contended`; instead the sync stands off for the same grace and
+**retries in place**. If both attempts fail you get a
+`read-tree failed after advancing main — working tree is stale` ERROR in
+the log with the merge still reported as `advanced` — at which point
+`project_root`'s tree is genuinely out of sync with `main` and a manual
+`git -C <project_root> read-tree -u --reset HEAD` (after confirming no
+git process is running there) is the fix. Left alone, the next advance
+reads the whole old-main→new-main delta as dirty WIP.
+
+The stand-off budget is **green tier** — retune it live with
+`mcp__escalation__reload_config`, no restart (the value is re-read per
+advance).
 
 ---
 
@@ -417,8 +689,16 @@ takes no arguments: it always re-reads that process's own
 - Scheduler and watcher tuning knobs
 - `review.*` checkpoint knobs
 - `unblock_auto.*`
+- `session_resume.*` (whole submodel, including the `restore_from_archive`
+  rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `verify_env`
+- `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
+  stand-off budget — re-read per advance, see
+  [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
 - The `git.offline_lane_*` leaf tunables
+- `config_key_census.*` (the unknown-key census escape hatch — see
+  [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
+  false-positive L2 can be cleared on a live unit)
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
@@ -438,12 +718,264 @@ can report success while individual fields you cared about landed in the
 restart-only bucket. See `plans/config-hot-reload-prd.md` for the
 authoritative allowlist.
 
+**Fused-memory has its own, separate green tier.** Everything above is the
+*orchestrator*'s (`dark-factory-orchestrator.yaml`, applied by
+`mcp__escalation__reload_config`). The fused-memory server keeps a second
+allowlist over `fused-memory/config/config.yaml`, applied by
+`mcp__fused-memory__reload_config` — same tier discipline, different
+process, different file. Do not look for one config's leaves in the
+other's list. Its green tier currently covers several `reconciliation.*`
+leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
+`write_triage.*`, and the five in-place-update leaves below — read
+`RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
+the authoritative list rather than treating this enumeration as exhaustive:
+
+- `mem0_update.enabled` — **the kill switch for `update_memory`**, the
+  in-place Mem0 amend tool. Green-tier on purpose: this is what you flip
+  to stop an in-flight silent-rewrite incident, and a restart-only kill
+  switch is no kill switch. Flipping it to `false` denies every caller on
+  the next call, allowlisted or not.
+- `mem0_update.content_amend_allowed_agent_prefixes` and
+  `mem0_update.metadata_patch_allowed_agent_prefixes` — two independently
+  configurable `agent_id`-prefix allowlists, both shipping as
+  `['recon-stage-', 'curator-']`: `recon-stage-` admits every
+  reconciliation stage agent, and `curator-` admits the interactive
+  memory-consolidation sitting defined by `skills/curate-fused-memories`
+  (esc-3524-1 ruling (b), promoted to an all-deployments schema default on
+  2026-08-12; it deliberately holds both arms because retain-and-tag
+  stamps retained peers via metadata-only patches). The lists are separate
+  because the arms carry different risk: widening
+  **`metadata_patch_allowed_agent_prefixes` alone** remains the supported
+  way to admit a new interactive tagging flow without granting anyone
+  content-amend authority. A mistagged record is cheap to notice and cheap
+  to correct; a silent content rewrite is neither. (`agent_id` is
+  self-reported, so this is a misuse deterrent for cooperating callers,
+  not a security boundary.)
+- `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
+  the content-amend burst alarm (escalates, never blocks; metadata-only
+  calls do not count toward it). Genuinely reload-safe because the shared
+  `StormCounter` takes both values per `record()` call rather than
+  capturing them at construction.
+
 A full restart is expensive by comparison: a graceful stop (SIGTERM, up to
 90s before SIGKILL) cancels in-flight agent tasks and verify suites, then
 the cold start pays a warm-lane reseed, a module-tagger pass, and up to a
 few minutes waiting on fused-memory to answer. For a pure tuning-knob
 change, reload buys you all of that for free — reserve a restart for
 red-tier changes.
+
+---
+
+## 6a. Unknown-config-key census
+
+`OrchestratorConfig` uses pydantic `extra='ignore'`, which **discards
+unknown keys before validation** — on the top-level model *and* on every
+nested one. A misplaced key is therefore accepted silently, with no error
+and no log line. On 2026-07-22 a top-level `spare_warm_lanes: 8` in a
+project YAML did nothing for three weeks for exactly this reason: the
+field lives on `git.`, so the top-level spelling was dropped.
+
+Pydantic can never detect this itself (it never sees the dropped keys), so
+a **separate raw-YAML-vs-model pass** walks the project config and reports
+keys with no matching model field. It runs in three places, all off the
+same single walk:
+
+- **at startup** — a clean census resolves any prior escalation; a dirty
+  one files a born-at-L2 (`critical`, `agent_role`
+  `orchestrator-config-key-guard`), deduped on the unknown-key-set
+  signature so an unchanged key-set files exactly once;
+- **on `reload_config`** — the report carries `unknown_config_keys` and
+  `ignored_config_keys`, and files/self-heals the L2 symmetrically with
+  startup;
+- **offline**, via the gate below.
+
+### The offline gate
+
+```bash
+uv run --project orchestrator orchestrator check-config \
+    --config /path/to/dark-factory-orchestrator.yaml
+```
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| **0** | No unknown keys and no *hard* ignore-entry findings. Excused keys and **advisory** findings are still listed — they are exit-neutral. A legitimately **empty** project YAML (meaning "use all defaults") is a clean result and lands here. |
+| **1** | At least one genuinely-unknown key, **or** the file could not be read or parsed *at all*. **Dominates 2** when both are present, so the two signals stay distinguishable to a caller. |
+| **2** | No unknown keys, but at least one **hard** ignore-entry finding (see *Auditing the reasons* below). |
+
+The unparseable half of exit **1** covers malformed YAML, a directory, an
+unreadable file (permission-denied, or bytes that are not valid UTF-8), and
+a top-level document that is not a mapping. A census of nothing is not a
+clean census, so the gate refuses to print `OK` and instead names the file
+and the underlying fault (a YAML error renders line and column). It returns
+there **before** the excused-key listing and the ignore-entry audit alike —
+both are vacuous for a file that was never parsed.
+
+It calls the census directly rather than building a validated config, so it
+still reports phantom keys when the config has an unrelated value-level
+validation error that a full load would raise on first.
+
+That fail-closed behaviour is what makes "Verify with `check-config`
+first" (under [Clearing the escalation](#clearing-the-escalation), below)
+trustworthy: the gate speaks for a config only when it actually inspected
+one.
+
+Each unknown key may carry a placement hint (`→ did you mean
+git.spare_warm_lanes?`). **Hints are advisory**: a hint is a *name* match
+against the model tree and can be a coincidental collision. Confirm the
+key is really misplaced before moving it — see the worked example below
+for a case where following the hint would take the unit down.
+
+### Excusing an intentional key
+
+A project YAML may legitimately carry keys for **non-orchestrator**
+consumers — knobs the project's own scripts read. Those must not be
+deleted, and must not file a permanent L2. Two opt-outs, both classified
+at the same point in the walk:
+
+| Opt-out | Scope | Use for |
+|---|---|---|
+| Reserved `x_` / `x-` name prefix | any depth, case-insensitive, no config ceremony | **new** non-orchestrator knobs — mirrors the task-metadata Tier-C `x_` namespace in `docs/task-authoring.md` |
+| `config_key_census.ignore` | dotted paths in the same YAML, fnmatch globs | **existing** key names other tooling already greps for, where renaming would be a breaking change |
+
+An ignore entry is an **assertion** that some non-orchestrator consumer
+reads the key, so it must carry a `reason:` naming that consumer:
+
+```yaml
+config_key_census:
+  ignore:
+    - path: 'cpu_governance.*'      # `*` spans dots → whole namespace
+      reason: read verbatim by scripts/cpu-governed-exec.sh
+    - path: 'warm_lane_pool'        # top-level dict key — MUST be exact
+      reason: temporary — pending #5908, which deletes this entry
+    - 'fairness.scheduler_v2'       # bare form: accepted, reports as debt
+```
+
+> **fnmatch trap:** `<name>.*` does **not** match the bare parent key
+> `<name>`. Opting out a top-level dict key requires listing it exactly.
+> Getting this wrong leaves the L2 firing.
+
+> **Order matters:** matching is **first-match-wins**, so a specific entry
+> listed before a broad glob keeps its own reason.
+
+Excused keys are **listed by `check-config`** with both their
+classification label (`reserved prefix` / `config_key_census.ignore`) and
+the operator `reason:` you wrote — or an explicit `no reason given
+(undocumented debt)` marker when there is none — and reported as
+`ignored_config_keys` by `reload_config` (the reason travels as `note`), so
+an over-broad glob stays auditable instead of becoming an invisible blind
+spot.
+
+### Auditing the reasons
+
+A bare-string entry is an **unfalsifiable** claim: nothing re-checks it, and
+the grammar cannot express "temporary, until task X lands". `check-config`
+therefore grades every reason. The citation grammar and this taxonomy are
+adopted from reify's `docs/prds/reify-audit-ptodo-detector.md` §8 rather
+than invented separately; `skills/review-briefing/SKILL.md` states the same
+invariant in prose.
+
+The canonical citation form is **`#NNNN`**, strictly.
+
+| Kind | Trigger | Severity |
+|---|---|---|
+| `unreasoned` | bare string, or a blank `reason:` | advisory |
+| `malformed-cite` | only a non-canonical form (`task 5908`, `task-5`) | advisory |
+| `unknown-id` | `#NNNN` parses but the id is absent from the task DB | advisory |
+| `parked-on-anchor` | cited task is non-terminal but `metadata.do_not_complete` | advisory |
+| `self-refuting` | the reason names dark-factory / the orchestrator / `OrchestratorConfig` as the consumer | **hard** |
+| `missing-cite` | not-yet-landed prose (`pending`, `until … lands`, `will be …`) with no `#NNNN` | **hard** |
+| `orphaned` | every cited task has closed (`done` / `cancelled`) | **hard** |
+
+Advisory kinds are exit-neutral **by design**: the grandfathered bare
+entries surface as visible debt without turning a currently-green config
+red on upgrade, and a task-DB sync artifact (`unknown-id`) can never
+hard-fail a gate.
+
+**Why `self-refuting` is rejected outright.** dark-factory owns the schema,
+so a key dark-factory consumed would be a *field on the model*, hence
+classified `known`, hence never in need of an ignore entry. Membership in
+the ignore list therefore **proves** dark-factory does not read the key —
+an entry claiming otherwise is wrong by construction. The remedy is the
+schema-field route: add the key to the model, don't excuse it. This is the
+check that *could* have caught reify's `cpu_governance.DF_AGENT_CPU_GOVERN`
+weeks before the outage was found by hand — but only under two conditions
+that do not hold today: the reasoned form would have to be **mandatory**
+(that entry is a bare string, so as shipped it grades `unreasoned`, advisory,
+and nothing else), and its author would have to have written a reason that
+names dark-factory as the consumer. The grader reads the `reason:` prose
+only — never the key name — so a `DF_`-prefixed key is never itself the
+evidence.
+
+**Why an orphaned citation is its own diagnostic** (and exit **2**) rather
+than being reclassified as an `unknown` key: reclassifying would wire an
+unrelated task-status change into a gate that can hard-fail orchestrator
+startup, and would make the census signature non-deterministic w.r.t. the
+YAML — the same file would produce different signatures on different days,
+re-filing the L2 as statuses move. The census stays a **pure function of
+the config file**; the born-at-L2 stays keyed on unknown keys alone.
+
+**When the task DB is unavailable** — no `project_root`, or a machine
+without that project's `.taskmaster/tasks/tasks.db`, which is the normal
+case when linting another project's YAML — the liveness kinds
+(`orphaned` / `unknown-id` / `parked-on-anchor`) simply **do not fire**,
+while the structural kinds are still reported in full. Absence means
+"cannot know", never "clean"; a breadcrumb names the path that was looked
+for. The audit is loudest where it knows most, never where it knows least.
+
+`load_config` logs a WARNING for **hard** findings on every startup and
+every hot-reload. Advisory findings are deliberately not logged there — a
+warning that always fires is one operators learn to ignore.
+
+### The sanctioned alternative: `verify_env`
+
+Before adding an ignore entry at all, check whether the value belongs in
+`verify_env:`. It is a **dict DATA field**, so `_walk_unknown_keys`
+deliberately does not descend into it — arbitrary keys there are operator
+data, never phantom keys. A value a project wants handed to
+framework-spawned processes belongs there rather than as a bespoke
+top-level key that then needs excusing. reify already carries ~10 custom
+keys under `verify_env:` with no census entries and no noise.
+
+### Worked example: a mixed-consumer namespace
+
+`reify`'s config puts reify-owned knobs in the *same YAML blocks* as real
+model fields — `cpu_governance.enabled` is an `OrchestratorConfig` field,
+while its siblings `cpu_governance.weights` / `agent_admit` /
+`DF_AGENT_CPU_GOVERN` / `fleet_load_detector` are read verbatim by
+`scripts/cpu-governed-exec.sh` and friends. Same for
+`fairness.skip_threshold` (model) vs `fairness.scheduler_v2` (reify).
+
+Its top-level `warm_lane_pool:` is the cautionary case: the census hints at
+`git.warm_lane_pool`, but that field is a **`bool`** and reify already sets
+it correctly — the top-level key is an unrelated reify-owned *dict*.
+Following the hint would feed a dict to a bool field and hard-fail config
+validation, taking the unit down. It belongs in the allowlist (listed
+exactly), not moved.
+
+Its five entries are all still the **bare** form, so `check-config` reports
+them as `unreasoned` debt (advisory — exit stays 0). That cleanup is owned
+by reify task **#5908**, which deletes `cpu_governance.DF_AGENT_CPU_GOVERN`
+outright — the entry asserted dark-factory did not read the key while it
+was added in the expectation that it would, which is what made the
+CPU-governance outage permanent and silent — and gives the remaining
+`cpu_governance.*` entries real reasons. dark-factory ships the mechanism
+only; it does not edit reify's YAML.
+
+### Clearing the escalation
+
+Fix the config — move/remove a genuinely misplaced key, or excuse an
+intentional one — then **restart, or hot-reload** (`config_key_census.*`
+is green-tier, see [§6](#6-config-reload-vs-restart)). Either path re-runs
+the census, and an empty census **auto-resolves** the pending L2; no manual
+resolve is needed. Verify with `check-config` first.
+
+**Scope:** the census walks the **top-level project config only**.
+`defaults.yaml` is version-controlled and trusted, and the per-package
+`orchestrator.yaml` files found by module discovery are not censused —
+a typo in one of those is still silently dropped. Extending the walk to
+module configs is a known follow-up, not an oversight.
 
 ---
 
@@ -597,24 +1129,58 @@ restart:
   any fleet-wide clock, and it never stamps that clock. A single
   wedged-unit revive is not a fleet deploy.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
-  is the backstop: capped to at most one fleet-wide redeploy per 8 hours
+  is the backstop: *intended* to cap the fleet at one redeploy per 8 hours
   (`orchestrator_restart_min_interval_secs`, default 28800) via a shared
-  clock file (`data/orchestrator/last_redeploy_orchestrator.json`),
+  clock file (`data/orchestrator/last_redeploy_orchestrator.json`) — see
+  the correction below for why that cap does not currently hold,
   delegating the actual restart to
   `scripts/restart-all-orchestrators.sh --drain` — which is drain-aware
-  (defers a unit that's mid-merge, then force-restarts it after roughly 75
-  minutes of continuous busy) and stamps the clock only once the restart
-  is fully verified (the script exits 0).
+  (defers a unit that's mid-merge, then force-restarts it after
+  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` of continuous busy: 10 minutes
+  since 2026-08-26, 75 minutes before that) and stamps the clock only
+  once the restart is fully verified (the script exits 0). Note this env
+  knob is a *different* setting from the coordinator's
+  `orchestrator_restart_force_fire_after_secs` config field below, despite
+  the near-identical name — one bounds a per-unit drain wait inside the
+  script, the other bounds how long the coordinator stays pending before
+  it force-fires. Separately, the backstop holds a 30-minute head start
+  AFTER the 8h window opens before it will act, so the event-driven
+  coordinator gets first refusal at each boundary (task 4754). Neither
+  force-fire setting above is that head start.
 - **Coordinator = the polite, event-driven trigger for that same deploy.**
   It fires on a clean idle window, or force-fires after
   `orchestrator_restart_force_fire_after_secs` (default 4500s / 75 min) of
   eligibility — bypassing the idle/debounce gates — but honors the same
-  shared 8-hour clock, so the coordinator and the watchdog backstop never
-  both redeploy inside the same window.
+  shared 8-hour clock.
 
-Both staleness and the coordinator funnel through the single
-`restart-all-orchestrators.sh --drain` chokepoint, so drain behavior and
-clock-stamping are defined once and can't drift between the two triggers.
+Both staleness and the coordinator invoke the same
+`restart-all-orchestrators.sh` chokepoint, so **clock-stamping** is defined
+once: the script is the sole on-disk writer of the shared clock, and only on
+its all-units-verified-fresh exit-0 path.
+
+**Drain behavior is NOT defined once, and the two tiers CAN both redeploy
+inside one 8-hour window.** Two corrections measured 2026-08-24/25:
+
+- Only the staleness backstop passes `--drain`. The coordinator invokes the
+  script with no arguments (`script_args=[]`), so it restarts a mid-merge unit
+  with no drain gate at all. Confirmed from the transient units' own command
+  lines — `orch-fleet-staleness-redeploy.service` carries `--drain`,
+  `orch-selfrestart-on-merge-N.service` does not.
+- Because the clock is stamped only when a sweep *completes*, a long sweep
+  leaves the clock reading the previous deploy for its whole duration, and any
+  other tier's min-interval check then legitimately passes. With one unit stuck
+  reporting `merge_idle:false`, sweeps ran ~81 minutes and the fleet was
+  redeployed twice per window — dark_factory runs of 1.26h / 0.92h / 1.33h.
+  Task **4754** has since landed the head-start half: both staleness tiers now
+  hold their 30-minute head start until *after* their own min-interval
+  expires, so the backstop no longer wins the boundary race purely on poll
+  cadence. That does NOT make the window collision-free. The residual case is
+  **4755**'s (in-flight lease, which also stops a liveness probe from
+  cancelling the sweep's own restart jobs): a sweep still stamps the clock
+  only on completion, so a long sweep can let the other tier's min-interval
+  check pass mid-sweep. Until 4755 lands, treat "one deploy per 8h" as the
+  intent, not a guarantee, and read the clock file's timestamp rather than
+  assuming it.
 
 ### Reading `--report`
 
@@ -674,9 +1240,31 @@ directly, not just interactive sessions. Treat it accordingly:
 - For a direct-to-main commit under contention, use
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
-- `pre-commit` runs pyright three times — pass a generous timeout (five
-  minutes or more) to whatever you use to run commit commands, or run it
-  detached and poll, rather than letting a default timeout kill it mid-hook.
+- `pre-commit` path-filters its pyright stage (since task 2551 — see
+  `hooks/project-checks` for the authoritative logic), so what a commit
+  costs depends on what it stages:
+  - **No staged `.py` files** — pyright is skipped entirely; the hook
+    prints `pre-commit: pyright skipped (no Python changes)` and the
+    commit completes in seconds. A docs/plans-only commit needs no
+    bumped timeout: reach for a plain gated `git commit --only <paths>`
+    first.
+  - **Staged `.py` under `shared/` or `escalation/`** — every dependent
+    package imports them, so the hook runs a full sweep across all three
+    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`).
+    This is the 3x worst case and can comfortably exceed two minutes.
+  - **Staged `.py` under exactly one of `fused-memory`, `orchestrator`,
+    or `dashboard`** — pyright runs once, for that package only.
+  - **Staged `.py` outside every prefix above** (e.g. `scripts/`, a
+    root-level `conftest.py`) — pyright is skipped for the whole commit,
+    and unlike the no-Python case the hook prints *nothing*, so there is
+    no signal that it was skipped. This over-narrowing is deliberate
+    (root-level Python is itself unconfigured for pyright); if the changed
+    file is imported by a package, run `uv run pyright` there by hand.
+
+  In the two middle cases — the only ones that actually invoke pyright —
+  pass a generous timeout (five minutes or more) to whatever you use to
+  run commit commands, or run it detached and poll, rather than letting a
+  default timeout kill it mid-hook.
 - **Never run `git stash`** in the main checkout: the stash stack is
   consumed by the merge worker's own advance path, so a stash you push can
   be popped out from under you by an unrelated process. Park work-in-progress
@@ -684,7 +1272,10 @@ directly, not just interactive sessions. Treat it accordingly:
 - A pure docs-only commit landing under contention (index lock held by a
   concurrent process) may use `--no-verify` — docs changes don't need the
   code-quality hooks, and retrying past a lock contest is safe for a
-  no-code change. Reach for `--only` first regardless.
+  no-code change. Reach for `--only` first regardless. Since task 2551 a
+  docs-only commit passes the hook cheaply anyway (pyright is skipped),
+  so this is a last resort for genuine index-lock contention — not a way
+  to dodge a slow hook.
 
 ---
 
@@ -698,10 +1289,11 @@ directly, not just interactive sessions. Treat it accordingly:
 | Escalation MCP calls time out or connect-refuse from a Claude session | The target project's `.mcp.json` escalation port doesn't match its `dark-factory-orchestrator.yaml`'s `escalation.port` | Sync the two files — the port is per-project and must match exactly; see [SETUP.md](SETUP.md) for the onboarding step that sets both |
 | Reconciliation escalation queue looks permanently poisoned for a project | The project's `project_id` was never registered on fused-memory's `DASHBOARD_KNOWN_PROJECT_ROOTS` before its first task was queued | This must be prevented, not fixed after the fact — always complete project registration (factory-init Stage 6) before queuing any task. If it's already happened, this needs an operator-level fused-memory intervention, not a task-level fix |
 | A task blocks at VERIFY with failures unrelated to its own changes | Verification currently runs test/lint/typecheck **repo-wide** by default, not scoped to the task's own modules | Check whether the failures are pre-existing on main outside the task's scope; if so, fix main's cleanliness first (module-scoped verification is planned but not yet implemented) |
-| A task blocks at VERIFY with `AttributeError` / assertion mismatches for code it just wrote | Worktrees share the main checkout's `.venv` — Python imports resolve the *installed* (main) package, not the worktree's modified source | Manually verify the worktree's code is actually correct, merge to main, and confirm tests pass post-merge — don't trust the worktree-local verify result for import-level correctness |
+| An agent reports `AttributeError` / assertion mismatches **in its own shell** for code it just wrote in a worktree | An agent subprocess inherits the orchestrator's environment verbatim (`orchestrator/src/orchestrator/agents/invoke.py` passes a copy of `os.environ`), so its shell carries the MAIN checkout's `VIRTUAL_ENV` and a first-party `import` resolves main's editable source rather than the worktree's edits — and a worktree gets its own `.venv` only once it has been cold-verified (`verify_cold_preprovision_command`, `uv sync --all-packages && npm ci …`, runs inside it). **Verify itself is insulated and this cannot cause a VERIFY-stage failure**: every verify command is spawned through `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips `VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its OWN `.venv` (the 2026-05-29 ghost-venv fix) | Trust verify's result over a hand-run import — verify is the one reading the worktree. Use the one-line provenance check in `### Locating installed code` in `CLAUDE.md` to see which tree a shell import actually came from. A genuine verify-stage interpreter fault looks nothing like this (hundreds of `could not be resolved` imports, `pytest` among them); it is detected by `orchestrator/src/orchestrator/verify_classify.py::is_interpreter_missing_workspace_packages` and held as an infra issue rather than blamed on the branch |
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 529 (overloaded), not a real failure | Check host health via PSI (`full` pressure), not load average; these typically clear on their own — avoid treating them as a code regression |
 | MCP tools stop responding mid-session for every open Claude session | fused-memory was restarted while sessions were live — it's a single shared process, so every session's MCP connection is severed at once | Never restart fused-memory without explicit operator sign-off (it affects the whole fleet, not one project); expect to reconnect/restart affected sessions after a planned restart |
+| `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
 
 ---
 
@@ -737,6 +1329,710 @@ an operator must call `mcp__escalation__resume_scheduler` once the
 underlying cause is understood and addressed. Check `get_pending_escalations`
 first — a park-and-stop trip is usually accompanied by a cluster of related
 escalations worth triaging before you resume, not just resuming blind.
+
+---
+
+## 12. Nightly maintenance timers
+
+Recurring maintenance runs as systemd **user** timers, not as orchestrator
+work. Each job is the same four files — a committed wrapper `.sh` (all the
+logic, so it is testable and runnable by hand), a thin `Type=oneshot`
+`.service` whose `ExecStart` is that wrapper, a `.timer` carrying the
+cadence, and an idempotent self-verifying `install-*-timer.sh`.
+
+The cadence lives in the unit's `OnCalendar` — **not** in
+`dark-factory-orchestrator.yaml`. The orchestrator process is not the thing
+being scheduled, and that file loads once at startup with no hot-reload, so
+a re-cadence there would cost a cross-repo commit plus a fleet redeploy
+instead of a one-line unit edit and a re-run of the installer.
+
+### The nightly ladder
+
+Slots are staggered deliberately: these jobs share one machine and, in two
+cases, the same backing stores. **Check this table before adding a job** —
+04:00 is already double-booked.
+
+| Slot | Job | Units |
+|---|---|---|
+| 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
+| 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
+| 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
+| 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
+| 04:30 | reify closure-staleness sweep + drain | `reify-closure-staleness-sweep.timer` |
+| 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
+
+All timers carry `Persistent=true` (a night missed to a sleeping laptop is
+caught up on next boot/login rather than silently skipped) and
+`RandomizedDelaySec=300`.
+
+Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
+for the 03:30 job; the two sections below for the 04:30 and 05:00 ones.
+
+### Nightly reify closure-staleness sweep (04:30)
+
+**What it does.** Runs reify's deterministic-gate closure-staleness sweep,
+then drains the re-dispatch requests that sweep emitted — one job, in
+sequence, so the consumer always reads a directory the sweep has just
+refreshed.
+
+This is a **cross-repo seam**: reify ships the primitive, dark-factory wires
+the invocation. reify's
+`scripts/deterministic-gate-closure-staleness-sweep.sh` is read-only on all
+task state by design (its invariant L6); it adjudicates stranded rows and
+writes one request file per confirmed hit into
+`/home/leo/src/reify/data/redispatch-requests/`. dark-factory's
+`scripts/consume_redispatch_requests.py` performs the actual writes through
+the fused-memory MCP server, so every transition goes through the
+reconciliation-triggering path.
+
+**The normative contract is the reify script itself** — its
+`--emit-requests consumer contract` header block and `_write_request`. Not
+this section, and not reify's
+`docs/notes/deterministic-gate-closure-staleness-sweep.md` digest. Read the
+script before changing either half.
+
+| File | Role |
+|---|---|
+| `scripts/reify-closure-staleness-sweep.sh` | Wrapper: sweep, then consume |
+| `scripts/reify-closure-staleness-sweep.service` | `Type=oneshot` around the wrapper |
+| `scripts/reify-closure-staleness-sweep.timer` | `OnCalendar=*-*-* 04:30:00` |
+| `scripts/install-reify-closure-staleness-sweep-timer.sh` | Installer |
+| `scripts/consume_redispatch_requests.py` | The consumer |
+
+**The three actions**, fixed by the sweep's class of finding:
+
+| Class | Action | Write | Legal row status |
+|---|---|---|---|
+| `gate_closure` | `close` | `set_task_status('cancelled')` | `blocked` only |
+| `merge_verify_red` | `reverify` | clear claimant, then `set_task_status('pending')` | `blocked`, `in-progress` |
+| `unmet_dependency` | `redispatch` | clear claimant, then `set_task_status('pending')` | `blocked` only |
+
+The claimant clear goes **first**: once the row reads `pending` a competing
+dispatcher may stamp a fresh claimant that a late-landing clear would
+clobber (same ordering, and same reason, as the orchestrator's own
+stranded-blocked re-dispatch path in `scheduler.py`).
+
+**The guards.** Before each write the consumer re-reads the row and skips
+when it is already at the target status (an already-applied request is a
+no-op, not a second transition), when its status is outside the class's
+legal scope above, or when its `updatedAt`/`heartbeat_at` post-dates the
+request file's mtime — the row moved after the sweep observed it, so the
+next sweep re-adjudicates. The request body deliberately carries no
+wall-clock field (re-emission is byte-idempotent), which is why mtime is the
+recency signal. Every uncertainty skips: the fail-safe direction is always
+do-nothing.
+
+`--max-writes` (default 5) caps the blast radius. It counts write-bearing
+**attempts** — applied *plus* failed — not successes: the re-dispatch path
+clears the claimant before it flips the status, so a run whose flips are all
+being rejected still mutates every row it touches, and a cap keyed on
+successes alone would never engage on exactly that run. The remainder is
+reported as deferred and picked up next run.
+
+Applied requests are archived into a `consumed/` subdirectory —
+retraction-safe, since the sweep's retraction globs `redispatch-*.json` at
+the top level only. A failed apply leaves its file in place so the retry is
+immediate rather than waiting on re-emission. If the archive move itself
+fails the write still counts as applied and says so loudly; the next run's
+guard then skips the file as already-applied rather than re-transitioning
+the row.
+
+**Two things the consumer deliberately will not do.**
+
+1. **Re-derive the sweep's predicates.** None of the L1 heartbeat/claimant
+   liveness guard, the escalation terminal-allowlist oracle, merge-verify
+   ancestry, the dependency roll-up, or the corruption signatures is
+   reproduced on this side. There is one implementation of the
+   adjudication, in reify, where the evidence lives.
+2. **Act on a `CORRUPT-HOLD` row.** The sweep emits only on
+   `verdict=STALE` (its invariant L5), so a corrupt-hold row produces no
+   file at all — declining to read the sweep's stdout report is sufficient
+   to honour it. Those rows need the human git-history adjudication in
+   reify's `docs/notes/offline-lane-red-corruption-remediation.md` §4.
+
+**First run: dry-run before arming.** The installer deliberately does *not*
+kick an immediate run — unlike its two siblings, this job mutates the live
+reify task store. Read the planned writes first:
+
+```bash
+python3 scripts/consume_redispatch_requests.py --dry-run \
+    --requests-dir /home/leo/src/reify/data/redispatch-requests
+```
+
+Then arm the timer:
+
+```bash
+scripts/install-reify-closure-staleness-sweep-timer.sh
+```
+
+No `dark-factory-orchestrator.yaml` change and no orchestrator redeploy is
+involved in either step.
+
+**Reading the output.** Every line is prefixed
+`consume_redispatch_requests:` and the run ends with exactly one summary
+line — on **every** exit path, including a night that could not reach the
+server at all:
+
+```
+consume_redispatch_requests: task 5321 (gate_closure): close applied -> cancelled [escalation esc-5321-1 resolved 2026-07-29T04:11Z]
+consume_redispatch_requests: SUMMARY applied=2 skipped=7 failed=0 deferred=0 planned=0
+```
+
+The bracketed tail on an applied (or `--dry-run` `WOULD`) line is the
+sweep's own `evidence` string — the only statement of *why* that travels
+with a request, and worth reading before undoing anything, since the file
+itself is archived out of the way the moment the write lands.
+
+- `applied` — writes that landed (checked against the tool response, not
+  assumed from the absence of an exception: a JSON-RPC `error` envelope, a
+  FastMCP `isError` result, and an embedded `success: False` all count as
+  failures)
+- `skipped` — a guard declined, or the file failed validation; the reason is
+  on its own line above
+- `failed` — a write was attempted and did not land; the file stays put
+- `deferred` — `--max-writes` was reached
+- `planned` — `--dry-run` only: writes that *would* have been made
+
+```bash
+journalctl --user -u reify-closure-staleness-sweep.service -n 100
+systemctl --user list-timers reify-closure-staleness-sweep.timer
+```
+
+The service always exits 0 on a valid invocation: a recurring `oneshot` that
+can fail enters systemd `failed` state and stays there, silently stopping
+the whole nightly job. Per-request failures are reported and counted
+instead, so a red run is found by reading the summary line, not the unit
+state.
+
+A night that could not run at all logs a `RUN FAILED` line ahead of its
+(zeroed) summary, and distinguishes the two cases it could be — `could not
+reach the MCP server` (a transport problem: check the fused-memory unit) vs
+`aborted on an unexpected error` (a bug in the consumer: read the exception
+type on that line). Requests are left in place either way.
+
+### Nightly canonical/topic coverage census (05:00)
+
+**What it does.** Measures how much of the memory corpus actually carries
+the `topic` / `canonical` metadata the vocabulary contract specifies, trends
+that against the previous runs, and then **rehearses** the sweep that would
+close the gap — one job, in that order, so an operator reads the shortfall
+and the proposed stamping in the same journal entry.
+
+The measurement is a deterministic paginated Qdrant `count` + `scroll`, not
+a semantic search: a coverage number derived from ranked retrieval could not
+distinguish "the record is absent" from "the record ranks below *k*", which
+is the exact ambiguity this instrument exists to resolve.
+
+**Why its own timer, and not task 3136's report.** The charter strongly
+preferred emitting these columns from task 3136's duplicate-audit report over
+standing up a second timer, and made that conditional on 3136's state. 3136 is
+still `pending` — neither its report script
+(`fused-memory/scripts/duplicate_cluster_report.py`) nor its timer
+(`scripts/fused-memory-duplicate-audit.timer`) exists — so there is no report
+to add columns to and no cadence to borrow, and a dedicated timer is what ships
+a measurement now. Should 3136 land later, folding this census into its report
+and retiring this timer is the cheaper shape and is the preferred follow-up.
+
+| File | Role |
+|---|---|
+| `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, rehearse, then commit |
+| `scripts/memory-metadata-coverage-census.service` | `Type=oneshot` around the wrapper |
+| `scripts/memory-metadata-coverage-census.timer` | `OnCalendar=*-*-* 05:00:00` |
+| `scripts/install-memory-metadata-coverage-census-timer.sh` | Installer |
+| `fused-memory/scripts/census_memory_metadata.py` | The census (the gauge) |
+| `fused-memory/scripts/retro_stamp_topics.py` | Task 3201's retro sweep (the mechanism) |
+
+**The artifacts**, all committed, all regenerated by every run:
+
+| Path | What it carries |
+|---|---|
+| `plans/memory-metadata-census-report.json` | Full report: every value, every named row |
+| `plans/memory-metadata-census-report.md` | The human twin, rendered from that same dict |
+| `plans/memory-metadata-coverage-history.json` | Append-only trend — headline **scalars only** |
+
+The history file carries scalars and no per-topic tables on purpose: a
+nightly timer appending a full topic breakdown would grow a committed file
+without bound. Retention is capped at 90 runs and any drop is **disclosed in
+the file** rather than silently truncated. Measured on the committed file
+(16,022 bytes for 3 runs at the current two-project shape): **~5.2 KiB per
+run, so ~470 KiB once the retention window is full** — the bound the cap
+buys, worth knowing before reading the per-night figure below, because the
+file is rewritten whole every night rather than appended to in place.
+
+**What committing all three nightly costs, stated rather than assumed.** The
+two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /
+markdown 223 KiB raw; 90 KiB / 47 KiB zlib-compressed, which is what git
+stores loose), against 5.2 KiB for the history *today* — the history is
+rewritten whole each night too, so its share of the nightly write grows with
+the series toward the ~470 KiB full-window bound above, rather than staying
+at one row's worth. Counts shift nightly on a live corpus, so a quiet night
+is rare and the job writes roughly **140 KiB of new loose object content per
+night, ~50 MiB per year** before `git gc` delta-compresses the
+near-identical successive versions. That is deliberate,
+not an oversight: the JSON is a **cited, read** artifact —
+`fused-memory/scripts/memory_eval_retrieval_probe.py`
+(`DEFAULT_CENSUS_PATH`) reads it from the repo, so a snapshot that is
+only regenerated on demand would be silently stale for whoever reads it
+next. Not committing them is worse still: the wrapper regenerates them in
+the machine-operated `project_root` checkout regardless, so skipping the
+commit leaves that checkout carrying an uncommitted diff every morning. If
+the growth ever needs bounding, the `ARTIFACTS` array in the wrapper is the
+single place that decides which paths are committed — change it there, and
+update this paragraph.
+
+**The regen command** — what the report's own `regen` line reproduces, and
+the exact invocation the wrapper makes:
+
+```bash
+uv run --frozen --project fused-memory python \
+    fused-memory/scripts/census_memory_metadata.py --top-n 400
+```
+
+`--top-n 400` matches the committed artifact's recorded params, so a
+regeneration diffs as content drift and never as a rendering-width change.
+For an **ad-hoc look that must not enter the trend**, add `--no-history`:
+the committed series belongs to the nightly run.
+
+**The job commits its own artifacts.** All three land in the `project_root`
+checkout — the census resolves them from its own `__file__`, so they go
+there regardless of cwd — and that checkout is machine-operated (the merge
+worker, the startup reconciler and git hooks act on it directly). Leaving
+them dirty every morning would not be untidiness but **data loss**: the
+history file is append-only and *is* the trend, so an uncommitted append
+that the merge worker's advance path resets away takes that night's row with
+it, permanently and with no error anywhere. The wrapper therefore closes
+with a scoped `git commit --only <the three paths>` — never a bare `git
+commit` (it would sweep up a concurrent process's staged work), never `git
+add -A`, never `git stash`. Same seam the 03:00 legibility job already uses
+for `docs/legibility/census-state.json`.
+
+Like both other steps it is **best-effort**: a failed commit is narrated and
+never propagated, and a night whose corpus did not drift is a no-op rather
+than a failure. For an ad-hoc run that must leave the checkout alone, set
+`CENSUS_COMMIT=0` (pairs with the census's own `--no-history`).
+
+**Reading the output.** Every line is prefixed
+`memory-metadata-coverage-census:` and the run ends with one summary line
+carrying all three steps' exit codes:
+
+```
+memory-metadata-coverage-census: done (census=0 stamp=0 commit=0)
+```
+
+```bash
+journalctl --user -u memory-metadata-coverage-census.service -n 100
+systemctl --user list-timers memory-metadata-coverage-census.timer
+```
+
+**`census=1` is routine, not a fault.** The census exits 1 whenever
+`coverage.complete` is false — the corpus is live and orchestrators write to
+it *during* the scroll, so unsynchronised reads disagree on some nights. The
+artifacts are written anyway and carry the evidence of exactly which cell
+fell short. The wrapper always exits 0 for the reason the whole §12 family
+shares: a recurring `oneshot` that can fail enters systemd `failed` state
+and stays there, silently ending the trend. A red run is found by reading
+the summary line, not the unit state — and a `commit=` other than 0 is the
+one worth acting on, since it means the regenerated artifacts are sitting
+uncommitted in a checkout other processes operate on.
+
+**The rehearsal is never `--apply`.** Committing bulk `canonical: true`
+stamps stays an operator decision, run by hand after reading the rehearsal:
+
+```bash
+uv run --frozen --project fused-memory python \
+    fused-memory/scripts/retro_stamp_topics.py --apply
+```
+
+Under the shipped `memory_metadata.enforce: false`, the write-time
+per-(project, topic) uniqueness check censuses a violation and lets the
+write through, so an unattended bulk stamp could manufacture exactly the
+violations this census counts.
+
+**First run: arm the timer.** The installer kicks no immediate run — that
+would put an unreviewed, off-cadence row into the trend the nightly job
+owns.
+
+```bash
+scripts/install-memory-metadata-coverage-census-timer.sh
+```
+
+**Reading the uniqueness-violation count.** A non-zero
+`topics_with_multiple_canonical` is **partly backlog, not purely a live
+defect**: task 3198 ships warn-mode-first. The report therefore prints the
+live `memory_metadata.enforce` state beside the count, plus the standing
+preconditions for flipping it, so "the guard is off" is never misread as
+"the guard broke". The report is also the standing instrument for gate
+**3626**'s re-measurement — it emits both slug-conformance partitions that
+gate's recipe asks for. The obligation, the target and the honest baseline
+are owned in `docs/prds/memory-metadata-vocabulary.md` §9.
+
+---
+
+## 13. One-off: transcript archive gunzip migration
+
+`scripts/migrate_transcript_archive_gunzip.py` converts the agent-transcript
+archive (`data/orchestrator/agent-transcripts/`) from `.jsonl.gz` to one
+plain, greppable `.jsonl` corpus. Task 3618, leaf α of
+`plans/transcript-preservation-seam-prd.md`.
+
+**This is a HUMAN-OPERATED step.** The task's implementer deliberately did not
+run `--apply`: an autonomous agent must not delete thousands of live files
+(the norm from task 1500, with precedents 1939/1945). The repo change and the
+live migration are separate acts, and the second one is yours.
+
+### The contract
+
+| | |
+|---|---|
+| Default | **Dry-run.** A bare invocation changes nothing. |
+| `--apply` | Opts into mutation. Without it, nothing is written or deleted. |
+| `--root` | Archive root (default `data/orchestrator/agent-transcripts`). |
+| Exit 0 | Every file migrated (or was already migrated). |
+| Exit 1 | **At least one file failed** — act on it. Unlike the `gc_agent_transcripts` sweep, which always exits 0 so a watchdog does not alarm, this is a one-off whose failures need a human. |
+| Exit 2 | **At least one conflict needs adjudication** (and nothing failed) — see below. Nothing is damaged; a `.gz` was retained next to a longer plain twin. Exit 1 wins when both are present. |
+
+stdout is a single JSON summary (`scanned` / `migrated` / `skipped` /
+`conflicts` / `conflict_paths` / `failed` / `failed_paths`); the LOUD lines go
+to stderr, so `... --apply | jq` works while failures stay visible.
+
+Per file it decompresses to a staging sibling (`<name>.jsonl.migrate-tmp`),
+**reads the result back**, mirrors the `.gz` mtime, atomically renames it over
+`<name>.jsonl`, and only then unlinks the source. A file it cannot corroborate
+is never destroyed — it is retained, counted and named. The mtime mirror
+matters: `gc_agent_transcripts` derives each task dir's retention age from its
+newest descendant mtime, so stamping `now` would silently reset the whole
+90-day retention window.
+
+Nothing is ever written over a plain `.jsonl` in place, which is what makes the
+re-run in step 5 safe when both forms coexist: if the `.gz` turns out to be
+damaged, the existing plain twin is left whole rather than being truncated by
+the attempt. A hard kill (SIGKILL, power loss) can strand a `.migrate-tmp`
+file; it is inert — no reader's `*.jsonl` glob matches it — and the next
+`--apply` rewrites it, so `find data/orchestrator/agent-transcripts -name
+'*.migrate-tmp' -delete` is cleanup, never recovery.
+
+It is **idempotent and re-runnable**. A `.gz` whose `.jsonl` twin already
+reads back cleanly is skipped and its source dropped, so a run you kill
+half-way resumes correctly — and so you can re-sweep later residue (see
+below).
+
+### The operator sequence
+
+```bash
+cd /home/leo/src/dark-factory
+
+# 1. Baseline.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+
+# 2. Dry-run first — READ-ONLY, and real validation: it decompresses and
+#    UTF-8-decodes every source without writing anything.
+python3 scripts/migrate_transcript_archive_gunzip.py | jq
+
+#    Gate: `scanned` should equal the baseline count and `failed` MUST be 0.
+#    A non-zero `failed` names the offending files in `failed_paths` —
+#    investigate those before going further.
+#    `conflicts` need NOT be 0 to proceed — the sweep leaves those files
+#    untouched — but read `conflict_paths` first and resolve them per below.
+
+# 3. Migrate.
+python3 scripts/migrate_transcript_archive_gunzip.py --apply | jq
+
+# 4. Confirm.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+#    expect 0 — or exactly `conflicts + failed` from step 3. BOTH counters
+#    leave their `.gz` on disk: conflicts are the files deliberately retained
+#    for you to resolve, and a failed file retains its source precisely
+#    because it could not be corroborated. Account for the residue against
+#    that sum, not against `conflicts` alone, or a run that develops new
+#    failures during `--apply` reads as an unexplained leftover. Resolve
+#    both, then re-run 3 and 4.
+```
+
+**Run this only AFTER the fleet has redeployed** past the task-3618 merge
+(§8). Until every orchestrator restarts, live units keep writing `.gz`, so a
+migration run before then leaves transition-window residue. Re-run step 3
+after the redeploy to sweep it — that is exactly what idempotency buys.
+
+### Resolving a conflict
+
+That re-run is also what produces conflicts, so expect them on the second
+pass. A session in flight ACROSS the redeploy has BOTH forms on disk: the
+pre-redeploy process archived `<sid>.jsonl.gz`, then the post-redeploy
+producer hook wrote a plain `<sid>.jsonl` for the same session — resumed, and
+therefore **longer**.
+
+A residual `.gz` with a longer plain twin beside it is exactly that shape.
+**The plain file is the authoritative copy.** The sweep refuses to gunzip over
+it (that would overwrite a live transcript with stale content and roll its
+mtime backwards, aging the task dir out early), and refuses to delete the
+`.gz` on its own judgement — being longer proves the twin is not a truncated
+stub, but never proves it *contains* the archived bytes. That last step is
+yours:
+
+```bash
+# For each path in conflict_paths — confirm the plain twin really is a superset
+# before deleting anything.
+(
+  set -o pipefail
+  gzip -t <sid>.jsonl.gz \
+    && n=$(zcat <sid>.jsonl.gz | wc -c) \
+    && zcat <sid>.jsonl.gz | diff - <(head -c "$n" <sid>.jsonl) \
+    && rm <sid>.jsonl.gz
+)
+```
+
+**`gzip -t` and `pipefail` are load-bearing, not decoration.** A bare
+`zcat ... | diff ... && rm` takes its exit status from `diff`, never from
+`zcat`. A *damaged* `.gz` still emits a short prefix before it dies, so `diff`
+would compare that prefix against the same-length head of the twin, succeed,
+and the `&& rm` would delete the only copy of the unrecoverable tail — exactly
+the unverified destruction the sweep refuses to do on its own judgement.
+`gzip -t` rejects such a file up front; `pipefail` makes the comparison itself
+fail loudly if `zcat` dies mid-stream anyway. A `.gz` that fails `gzip -t` is
+not a conflict to resolve — it is a damaged archive copy, and the plain twin
+beside it is all you have.
+
+If the two disagree, do NOT delete: that is a genuinely divergent pair, and
+the archive copy is the only record of the pre-redeploy content.
+
+Expect roughly a 4x expansion (≈485 MB → ≈1.9 GB at the sampled 3.93x ratio),
+a one-off cost against ~2.1 TB free.
+
+### The accepted gap between merge and your run
+
+The reader-side changes in task 3618 land at merge, but this migration runs
+later. In that window the legibility toolchain **under-reports** the archive:
+`_iter_archive_transcripts` now walks `rglob('*.jsonl')`, so a residual `.gz`
+is not enumerated at all — skipped rather than loudly failed.
+
+The gap announces itself rather than relying on you to remember it:
+
+- `inventory._iter_archive_transcripts` counts the residue on every walk and
+  emits one greppable WARNING — `rg 'residual \*.jsonl.gz'` over the nightly
+  logs — naming the count and this runbook.
+- `memory_eval_transcript_corpus`'s coverage JSON carries a `residual_gz`
+  field, and its report says in words how many transcripts the run could not
+  see. That is separate from `transcripts_found` and from `parse_failures`:
+  the residue was never found, and never failed to parse.
+
+Both are counts, not reads — no reader reopens a gzip stream — and both go to
+zero on their own once you have run the sweep.
+
+This is a known, accepted cost of not letting an agent delete live data, not
+a defect. It closes when you complete the sequence above. Validation for the
+migration itself was done at full scale: a dry run over all 4,574 live files
+decompressed and decoded every one of them with zero failures.
+
+---
+
+## 14. Transcript preservation & the archival guard
+
+Agent transcripts are the only durable record of what an agent actually did,
+and the substrate `--resume` reads. Task 3619 (leaf 2 of
+`plans/transcript-preservation-seam-prd.md` §8) changed *when* they are made
+durable. This is the operator-facing surface of that change.
+
+### Archival is a precondition of deletion, not a step before it
+
+Every path that deletes a per-task config dir now goes through
+`shared.transcript_archive.archive_before_delete`, which archives first and
+deletes only what it has made durable. The three sites are
+`TaskWorkflow._cleanup_config_dir`, `_recycle_config_dir`, and the
+`GitOps.cleanup_worktree` backstop.
+
+The call is **synchronous** on purpose. It used to be
+`await asyncio.to_thread(...)`, which meant a SIGTERM arriving mid-teardown
+cancelled the archive and destroyed the transcript anyway — the failure this
+task exists to remove. There is nothing left to cancel: same-filesystem
+archival is an `os.rename` (O(1) metadata), and the cross-device fallback is a
+copy of a file whose median size is 381 KB.
+
+**Consequence for you:** you can no longer lose a transcript by restarting the
+orchestrator at the wrong moment. A transcript is either archived or still on
+disk.
+
+### A failed archive holds the transcript — and only the transcript
+
+When a transcript cannot be made durable (disk full, permissions, read-only
+remount), `archive_before_delete` **holds** that `.jsonl` in place rather than
+deleting it. Everything else in the config dir is deleted **unconditionally**:
+`.credentials.json`, the `~/.claude` settings symlinks (unlinked, never
+followed), `sessions/`, `telemetry/`, and every other non-transcript member.
+
+That scoping is the point. A permanently-failing archive must never convert
+into an unbounded hold on a credential-bearing directory. If the purge itself
+somehow leaves `.credentials.json` behind, that is reported loudly through the
+same archival-failure counter — it is not allowed to be silent.
+
+At the `cleanup_worktree` backstop a held transcript is destroyed moments
+later by `git worktree remove --force`. That is deliberate: the guard's
+promise is that *it* never deletes an un-archived transcript, and blocking
+worktree removal would trade a bounded, counted, escalated transcript loss for
+an unbounded hold on a worktree and its lane slot.
+
+### The boot-time sweeper covers the SIGKILL tail
+
+Nothing above runs when the process is SIGKILLed.
+`Harness._sweep_orphaned_transcripts` runs at startup, inside crash recovery
+(after the pool-storage guard, before any worktree is cleaned up), and
+archives whatever transcripts survive in
+`<worktree>/.task/claude-config-*/`. It also drains the held
+backlog from the previous point — which is what bounds a hold to "until the
+next process start".
+
+It **only ever copies**. The worktrees it walks are the ones recovery is about
+to adopt; moving a transcript out from under a session that is about to
+`--resume` would degrade that resume to a fresh dispatch. Deletion stays with
+the teardown sites, which know the session is finished.
+
+The sweep is deadline-bounded (30s). A truncated pass logs a WARNING naming
+itself `INCOMPLETE` with the examined/archived counts — if you see it, the
+untouched worktrees are simply swept at the next start.
+
+### The archival-storm L1
+
+One failed archive is routine and only increments a counter. A **burst** files
+one L1, deduped so a runaway files once, not hundreds of times:
+
+| | |
+|---|---|
+| Sentinel / role | `__transcript_archival_storm__` / `orchestrator-transcript-archival-storm` |
+| Severity | `blocking`, `category=infra_issue`, level 1 |
+| Knobs | `transcript_archive.storm_threshold` (default 5), `transcript_archive.storm_window_secs` (default 600.0) |
+| Tier | **Green** — both hot-reload via `reload_config`, and are read live on every failure (no restart needed) |
+
+The escalation names the archive root, the failing paths, and the errnos
+symbolically (`ENOSPC(28)`, `EACCES(13)`, …) — that distinction *is* the next
+action. Check, in order: free space and inode headroom on the archive root;
+that the path exists and is writable by this process (a read-only remount
+looks exactly like a permissions failure); and that the archive root is on the
+expected device. Held transcripts are retried automatically by the next
+start's sweeper, so a fixed root self-heals on restart with no manual copy.
+
+### Verifying the fix on your own host
+
+The claim is scoped to the **post-fix cohort** — sessions preserved by a
+restart that ran this code. Archive coverage of sessions preserved by a
+SIGTERM restart should read 100%, against the 12.5% (2 of 16) measured
+2026-08-04 before the guard existed. The historical cohort is not
+retroactively recoverable, so do not expect an all-time number to move.
+
+After a graceful restart with sessions in flight, from `project_root`:
+
+```bash
+for sc in .worktrees/*/.task/agent_session.json; do
+  [ -e "$sc" ] || continue
+  sid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session_id",""))' "$sc")
+  [ -n "$sid" ] || continue
+  if compgen -G "data/orchestrator/agent-transcripts/*/*/$sid.jsonl" >/dev/null; then
+    echo "OK   $sid"
+  else
+    echo "MISS $sid  ($sc)"
+  fi
+done
+```
+
+Every preserved session should print `OK`. A `MISS` means that session will
+fall back to a fresh dispatch on re-dispatch — check the orchestrator log for
+`transcript_archive:` WARNINGs and for an open archival-storm L1.
+
+Note this task makes the archive *exist*; whether a given session actually
+resumes from it is task 3578's separate eligibility guard — see the next
+subsection.
+
+### Resuming from the archive, and measuring the resumes that are lost
+
+Making the archive *exist* (above) is not the same as a session actually
+resuming from it. Task 3578 wires the two together at the dispatch path and
+instruments what still gets lost.
+
+**What now happens on a resumed dispatch.** Immediately before arming
+`--resume`, `TaskWorkflow._invoke` corroborates the recovered session against
+`self._config_dir` — the directory it is about to export as
+`CLAUDE_CONFIG_DIR`, which under a pooled warm lane is *not* the boot-time
+path the harness eligibility guard checked. If the transcript is not there, it
+is rehydrated from the durable archive (`restore_archived_transcript`, which
+decompresses a legacy `.jsonl.gz` and publishes atomically). If it still is not
+there, the resume is **vetoed**: the task dispatches FRESH with a new session
+id rather than arming a `--resume` the CLI would reject before it ever contacts
+the API. Both outcomes are journalled — INFO `rehydrated session … from the
+durable archive`, WARNING `has no transcript under … — dispatching FRESH`.
+
+**The knob.** `session_resume.restore_from_archive` (default `true`) is the
+reversible kill switch for the rehydration *specifically*. **Green tier** — the
+whole `session_resume` submodel hot-reloads via `reload_config` ([§6](#6-config-reload-vs-restart)).
+Distinct from `session_resume.enabled`, which kills the whole feature at the
+harness guard: turning restoration off alone keeps the veto, its WARNING and
+the events below, so you do not go blind on the population while you have it
+disabled. It deliberately does **not** consult `transcript_archive.enabled` —
+with archival off there is simply nothing on disk to find, and gating on the
+flag would add a second source of truth that can disagree with the filesystem
+(archival on last week still leaves restorable archives today).
+
+**The event.** `session_resume_failed` in `runs.db` records an adopted resume
+that still failed to happen — a population that was previously journal-only and
+runs.db-invisible, because the CLI exits before contacting the API so no cost,
+cap or outcome row ever recorded the loss. `data.stage` splits it:
+
+| `stage` | Meaning | `data` |
+|---|---|---|
+| `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
+| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+
+```sql
+SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+  FROM events WHERE event_type = 'session_resume_failed'
+ GROUP BY stage;
+```
+
+`data.restore` on the `pre_flight` rows is what tells you *which* thing is
+broken, so split on it before concluding anything:
+
+| `restore` | What it means | What to do |
+|---|---|---|
+| `miss` | The durable archive holds no entry for that session. | **Archive-coverage problem, not a resume problem** — work the archival subsection above (`transcript_archive:` WARNINGs, archival-storm L1). |
+| `fault` | The restore itself raised. Two classes: **archive-root composition** (malformed `transcript_archive.root`, a `None` `project_root`) and **restore-internal I/O** (unreadable archive, ENOSPC part-way, corrupt gzip member, an unwritable destination parent) — the second is the common one. | Grep the log for `session_resume_restore_fault` (dispatch layer: task, role, session) and `transcript_restore_fault` (helper layer: `errno`, `path`). The two fire as a **pair for one fault**, so count one of them, not their sum. It is a config/IO fault, and the dispatch degraded to FRESH rather than failing. |
+| `disabled` | `session_resume.restore_from_archive` is off. | Expected while the kill switch is pulled; the veto and these events keep running so you do not go blind. |
+| `published` | The restore reported success and the CLI-facing locator still could not see it. | Unreachable by construction — a real occurrence is a bug in the restore/locator pair, not an operations issue. Escalate with the session id. |
+
+```sql
+SELECT json_extract(data, '$.restore') AS restore, COUNT(*)
+  FROM events WHERE event_type = 'session_resume_failed'
+   AND json_extract(data, '$.stage') = 'pre_flight'
+ GROUP BY restore;
+```
+
+**Do not add it to the per-dispatch ratio denominator.** `session_resume`,
+`session_resume_fallback` and `session_resume_capped` are emitted by the
+`_run_slot` guard exactly once per **dispatch**; `session_resume_failed` is
+emitted by `_invoke`, once per **invocation**, and one dispatch invokes several
+roles. Summing them compares populations counted on different units and
+silently inflates the attempt count. Read it against `session_resume` alone:
+*of the resumes we decided to make, how many did not survive to the agent?*
+
+That reading holds because BOTH stages are subsets of the adopted-resume
+population by construction: `pre_flight` fires only where a recovered session
+was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
+also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
+hit, which a plain fresh dispatch can reach — so the emit is gated on the
+orchestrator's own armed session id. Without that gate the ratio would count
+invocations that never resumed anything and could exceed 1.
+
+**Caveat U2 — the fallback rate will not go to zero.** What *removes* the live
+transcript from a lane's config dir is still unknown. This work restores from
+the archive; it does not stop the removal. So a steady `pre_flight` count is
+expected; what matters is *why*, and the `restore` split above answers it
+without a filesystem sweep. `restore='miss'` dominating means **archives are
+missing** — the transcript was gone and there was nothing to rehydrate from, so
+work archive coverage (the `OK`/`MISS` loop above) rather than the resume path.
+That advice is sound *because* faults no longer land in `miss`: the restore is
+called in strict mode, so a broken restore raises into `fault` instead of
+returning the same empty-handed `None` an absent archive does.
+`restore='fault'` dominating means the restore path itself is broken and
+coverage is a red herring. Note `restore='published'` should never appear at
+all: a published restore satisfies the corroboration, so no veto — and no
+event — follows it. Its absence is not evidence about archive coverage.
 
 ---
 

@@ -94,7 +94,8 @@ def _claimant_liveness_stranded(task: Mapping, now: datetime, ttl: timedelta) ->
         return True
 
     heartbeat, ok = parse_timestamp_or_warn(
-        task.get('heartbeat_at'), context='task_claimant._claimant_liveness_stranded',
+        task.get('heartbeat_at'),
+        context='task_claimant._claimant_liveness_stranded',
     )
     if not ok:
         return True

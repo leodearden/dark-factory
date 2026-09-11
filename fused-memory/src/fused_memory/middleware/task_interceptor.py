@@ -10,7 +10,7 @@ import uuid as uuid_mod
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, get_args
+from typing import TYPE_CHECKING, Any, NamedTuple, get_args
 
 try:
     from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
@@ -60,13 +60,20 @@ from fused_memory.middleware.operational_routing_guard import (
 )
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
+    all_files_foreign_owner,
     check_files_for_scope,
     check_text_for_scope,
     is_routing_override,
+    local_attesting_signals,
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
 from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
+from fused_memory.middleware.soft_scope_signals import (
+    SoftScopeFinding,
+    collect_soft_scope_signals,
+    soft_scope_enforced,
+)
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -74,6 +81,7 @@ from fused_memory.middleware.task_curator import (
     PreparedCandidate,
     TaskCurator,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 from fused_memory.models.reconciliation import (
@@ -82,6 +90,12 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.reconciliation.consolidation_gate import (
+    GATE_METADATA_KEY,
+    evaluate_closure,
+    handrolled_member_enumeration,
+    resolve_unstamped_live_ids,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
@@ -109,6 +123,20 @@ logger = logging.getLogger(__name__)
 # `task_metadata.schema_warning` census that θ2's enforce-flip gate greps
 # for zero lines against schema-clean metadata.
 _METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
+
+# The escalation-gate stamp, named once so the writers stay greppably
+# coupled. WRITERS: ``operational_routing_guard.inject_operational_routing``
+# (the declared execution_class='operational'|'decision' boundary coercion)
+# and ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
+# route_deterministic fallback), which between them set every key below.
+#
+# NOT a reader-coupling: ``TaskInterceptor._is_gate_metadata`` (task 3446)
+# does NOT consult this constant — its gate predicate is deliberately
+# narrower than this tuple and hardcodes its three keys inline, and
+# 'task_kind' is intentionally excluded from that predicate. The sole
+# consumer of this constant is the combine-guard refusal WARNING below,
+# which uses it to build the `declared` dict named in the log line.
+_GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always_escalates')
 
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
@@ -492,6 +520,18 @@ class TaskInterceptor:
         # unexpected status/claimant_run_id divergence. None (default) ->
         # exact current behavior (the pre-existing inline write).
         self._lifecycle_reset_filer: FileFindingFn | None = None
+        # Task 3112: the consolidation-gate closure scroll. Optional and
+        # DORMANT when unwired — the interceptor holds no MemoryService, and
+        # self.reconciler is None at server/main.py's reconciliation-disabled
+        # site and in most tests, so it is not a safe dependency to reach
+        # through. Wired by set_consolidation_scroll (see its docstring).
+        self._consolidation_scroll: Any | None = None
+        self._consolidation_count: Any | None = None
+        # Task 4808: the per-candidate existence probe that makes
+        # `unstamped_cluster_member` reachable. DORMANT on the same terms as
+        # the scroll above — unwired, the derivation returns () and the gate
+        # behaves exactly as it did before.
+        self._consolidation_exists: Any | None = None
 
     def set_write_journal(self, journal: 'WriteJournal') -> None:
         """Wire the write journal for durable auditing of task writes.
@@ -556,6 +596,196 @@ class TaskInterceptor:
         behavior change.
         """
         self._lifecycle_reset_filer = filer
+
+    def set_consolidation_scroll(
+        self, scroll: Any, count: Any = None, exists: Any = None
+    ) -> None:
+        """Wire the consolidation-gate closure scroll (task 3112).
+
+        *scroll* is an async ``(filters, *, limit, project_id) -> list[payload]``
+        and *count* an async ``(filters, *, project_id) -> int`` — in
+        production, ``project_id``-adapting wrappers over
+        ``MemoryService.get_memories_by_metadata`` /
+        ``count_memories_by_metadata``, whose own first positional argument
+        is that scope. Scoping is not optional: a cross-project scroll would
+        judge one project's gate against another project's memories.
+        *count* when omitted it is taken from
+        ``scroll.count`` if present, so a single bound collaborator object also
+        works. Bootstrap calls this once at each ``server/main.py``
+        ``TaskInterceptor`` construction site, where ``memory_service`` is
+        already in scope.
+
+        *exists* (task 4808) is an async ``(memory_id, *, project_id) -> bool``
+        — in production a wrapper over ``MemoryService.get_memory_by_id``,
+        built by ``consolidation_gate.py::closure_exists_probe`` (the shared
+        factory ``server/main.py::_wire_closure_collaborators`` and
+        ``scripts/check_consolidation_closure.py`` both bind). It is what lets
+        the seam derive ``unstamped_live_ids`` from the gate block's inert
+        provenance, and it is scoped for the same non-optional reason the
+        scroll is. Like *count* it falls back to ``scroll.exists`` when
+        omitted, so one bound collaborator object still carries all three.
+        When it is not wired the unstamped-member derivation is DORMANT and
+        the gate behaves exactly as it did before: without a probe an observed
+        id missing from the scroll cannot be told apart from one that was
+        absorbed and deleted, and guessing would make every correctly executed
+        delete-arm consolidation permanently uncloseable.
+
+        *scroll* stays positional and *count* keeps its position, so existing
+        positional callers are untouched.
+
+        Before the call — and in every test that does not configure one — the
+        consolidation-closure gate is DORMANT and status transitions proceed
+        exactly as before: zero behaviour change, mirroring
+        :meth:`set_lifecycle_reset_filer`.
+        """
+        self._consolidation_scroll = scroll
+        self._consolidation_count = count if count is not None else getattr(scroll, 'count', None)
+        self._consolidation_exists = (
+            exists if exists is not None else getattr(scroll, 'exists', None)
+        )
+
+    #: Per-check cap on the consolidation-closure scroll. Mirrors the
+    #: `consolidate_memories` topic-members listing: a single Qdrant scroll,
+    #: capped, with truncation DISCLOSED rather than silently swallowed.
+    _CONSOLIDATION_SCROLL_LIMIT = 200
+
+    async def _consolidation_closure_error(
+        self, task_id: str, before: Any, project_id: str
+    ) -> dict | None:
+        """Refuse a ``done`` transition on a consolidation gate whose cluster
+        is not in the Option-C end state (task 3112, Defect 2).
+
+        Returns ``None`` — proceed — when the gate is dormant (no scroll wired,
+        no gate marker, not a gate) or when the live cluster checks out.
+
+        FAIL-CLOSED. Any exception from the scroll becomes a REFUSAL, never a
+        pass: ``get_memories_by_metadata`` propagates a read ``TimeoutError``
+        rather than returning ``[]``, so an unreadable store is reachable, and
+        a gate whose entire job is refuting a false closure claim must not pass
+        when it cannot see (INV-3).
+
+        COST ORDERING copies the landed op: count first, scroll only on a
+        non-zero count, and disclose truncation — so the common path is cheap
+        and a capped scroll never reads as complete.
+
+        UNSTAMPED MEMBERS (task 4808). The seam also derives
+        ``unstamped_live_ids`` from the gate block's inert provenance, via
+        ``consolidation_gate.py::resolve_unstamped_live_ids``. This is the ONE
+        thing provenance may contribute, and it can only ever ADD a refusal —
+        never grant a pass — which is the design statement
+        ``consolidation_gate.py::build_consolidation_gate_task`` already makes
+        about the enumeration it writes. The derivation sits INSIDE the
+        fail-closed ``try`` below on purpose: a probe timeout then becomes the
+        same refusal an unreadable scroll already produces, with no new policy
+        and no second decision to keep in sync.
+        """
+        scroll = self._consolidation_scroll
+        if scroll is None:
+            return None
+        meta = self._extract_metadata_dict(before.get('metadata') if isinstance(before, dict) else None)
+        if not meta or meta.get('operational_mode') != 'gate':
+            return None
+        block = meta.get(GATE_METADATA_KEY)
+        if not isinstance(block, dict):
+            # Task 4808, the SECOND gap. `operational_mode == 'gate'` is a
+            # GENERIC human-gate marker, so a block-less gate cannot be
+            # refused — that would brick the 123 measured gates that
+            # legitimately carry no block. But a gate that hand-rolled its own
+            # member list under `memory_ids`/`related_memory_ids` is very
+            # likely a consolidation gate the seam simply cannot see, so it is
+            # FLAGGED rather than silently skipped. See
+            # `consolidation_gate.py::handrolled_member_enumeration` for the
+            # measured basis and the flag-don't-refuse decision.
+            handrolled = handrolled_member_enumeration(meta)
+            if handrolled is not None:
+                key, ids = handrolled
+                logger.warning(
+                    'task=%s enumerates cluster members under `metadata.%s` '
+                    '(%s) but carries no `%s` block, so the consolidation '
+                    'gate is DORMANT for it and this `done` transition '
+                    'closes it unchecked. File it through '
+                    '`build_consolidation_gate_task` to arm the gate.',
+                    task_id,
+                    key,
+                    ', '.join(str(i) for i in ids),
+                    GATE_METADATA_KEY,
+                )
+            return None
+        topic = block.get('topic')
+        if not isinstance(topic, str) or not topic:
+            # A gate whose topic is missing/malformed can never be corroborated,
+            # so it cannot be closed — the same direction as an unreadable store.
+            return _consolidation_not_closed_error(
+                task_id,
+                topic='',
+                reasons=[
+                    {
+                        'code': 'gate_topic_missing',
+                        'ids': [],
+                        'detail': (
+                            f'The {GATE_METADATA_KEY} block carries no usable '
+                            '`topic`, so the live cluster cannot be located.'
+                        ),
+                    }
+                ],
+            )
+
+        filters = {'topic': topic}
+        limit = self._CONSOLIDATION_SCROLL_LIMIT
+        # Initialised BEFORE the try so the except path cannot raise
+        # UnboundLocalError — a handler that itself raises would convert a
+        # fail-closed refusal into a 500. That path forces available=False
+        # anyway, which makes evaluate_closure return `scroll_unavailable`
+        # and ignore everything else.
+        unstamped: tuple[str, ...] = ()
+        try:
+            total: int | None = None
+            if self._consolidation_count is not None:
+                total = await self._consolidation_count(filters, project_id=project_id)
+            members = (
+                []
+                if total == 0
+                else list(await scroll(filters, limit=limit, project_id=project_id))
+            )
+            available = True
+            truncated = len(members) >= limit or (
+                total is not None and total > len(members)
+            )
+            if total is None:
+                total = len(members)
+            unstamped = await resolve_unstamped_live_ids(
+                block,
+                members=members,
+                exists=self._consolidation_exists,
+                project_id=project_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — every failure is a refusal
+            logger.warning(
+                'consolidation closure scroll or probe failed for task=%s '
+                'topic=%s: %s; REFUSING the done transition (fail-closed)',
+                task_id,
+                topic,
+                exc,
+            )
+            members, total, truncated, available = [], None, False, False
+
+        verdict = evaluate_closure(
+            block,
+            members=members,
+            scroll_total=total,
+            scroll_truncated=truncated,
+            scroll_available=available,
+            unstamped_live_ids=unstamped,
+        )
+        if verdict.closed:
+            return None
+        return _consolidation_not_closed_error(
+            task_id,
+            topic=verdict.topic,
+            reasons=list(verdict.reasons),
+            waived=list(verdict.waived),
+            message=verdict.message,
+        )
 
     async def _journal_around(
         self,
@@ -924,6 +1154,53 @@ class TaskInterceptor:
             # meanwhile — the same pattern curator_escalator.py's
             # _persist_state uses to offload a blocking write while holding
             # _persist_lock.
+            #
+            # task_metadata (task 3751) comes off the SAME `before` snapshot
+            # as old_status, so the metadata and live_status the gate sees can
+            # never disagree, and no second get_task is issued. The RAW value
+            # is forwarded deliberately: check() owns the coercion (via
+            # _coerce_metadata_dict), so a dict, a JSON-object string, a
+            # malformed blob, or an absent key all degrade to
+            # task_kind=None / pure_gate=False — fail-safe TOWARD live. What
+            # the forwarding enables at gate 2 is live_workflow_detector's
+            # task_kind-scoped rules: rule 2 (blocked + deterministic, task
+            # 2067), rule 3 (blocked + normal + bare, task 2409) and rule 5
+            # (pending + deterministic + pure gate, task 3751). Only rule 5
+            # actually changes gate 2's verdict — rule 3 already fired there
+            # on the previous implicit task_kind=None, and rule 2's extra
+            # coverage is masked because gate 2 reads is_live, which ORs in
+            # the per-task worktree/commit evidence. See check()'s Gate 2
+            # docstring for the full no-widening argument and the tests
+            # pinning it.
+            #
+            # task_snapshot (task 2964) is that SAME `before` dict — not a
+            # second read. old_status, task_metadata and the claimant fields
+            # the corroboration gate needs (`claimant_run_id`/`heartbeat_at`,
+            # the same top-level pair live_task_write_guard.has_live_claimant
+            # (before) consumes further down this method) therefore all come
+            # from one snapshot taken under _write_lock, so they can never
+            # disagree, and no extra get_task is issued. It is passed as a
+            # SEPARATE kwarg from task_metadata because those two claimant
+            # fields live at the task's top level, not inside `metadata` — see
+            # check()'s Gate 2 docstring. The corroboration assembly performs
+            # two more blocking on-disk reads (scheduler_state.json and
+            # orchestrator.lock); they ride the asyncio.to_thread hop that
+            # already exists for gate 2's blocking git I/O rather than needing
+            # a second hop or re-blocking the event loop, which is why the
+            # verdict is computed inside check() rather than here. What it
+            # unlocks is the detector's in-progress corroboration gate (task
+            # 2963): an in-progress task killed by a fleet redeploy, whose
+            # lingering worktree registration and freshly re-acquired
+            # project-wide lock both still assert liveness with no recent
+            # commit, is now downgraded here exactly as the render-time
+            # Live-Workflow Signals section already downgrades it — closing
+            # the task 599/600 Gate-2-vs-renderer divergence (5 consecutive
+            # guard rejections, run dbfa3df8-0d7d-40e6-bc4a-bc30cce38228).
+            #
+            # The other check() call site — update_task's, further down this
+            # module — is deliberately NOT given a task_snapshot: gate 2 fires
+            # only for op == 'set_task_status', so the kwarg would be inert
+            # there and would only buy that path two pointless disk reads.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -940,6 +1217,8 @@ class TaskInterceptor:
                     target_status=status,
                     live_status=old_status,
                     snapshot_token=None,
+                    task_metadata=before.get('metadata') if isinstance(before, dict) else None,
+                    task_snapshot=before if isinstance(before, dict) else None,
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
@@ -1125,6 +1404,27 @@ class TaskInterceptor:
                 _hook_err = await _run_hook(task_id, project_root)
                 if _hook_err is not None:
                     return _hook_err
+
+            # 2d-bis. Consolidation-closure gate (task 3112). Placed here
+            # deliberately: the pre-done hook gate above is the closest
+            # existing analogue — likewise status == 'done'-scoped, likewise
+            # returning error-dict-or-None — and this must run BEFORE the
+            # transition-legality gate and inside the write lock, reusing the
+            # `before` snapshot already fetched rather than re-reading.
+            #
+            # Unconditional when wired AND marked, but dormant by construction
+            # otherwise: it only fires for a task carrying operational_mode ==
+            # 'gate' AND the x_recon_consolidation_gate block, which only gates
+            # filed by build_consolidation_gate_task carry. No task on the
+            # current corpus can regress, so there is nothing a warn-mode soak
+            # could learn — and a default-off flag would ship the machinery and
+            # none of the protection (PRD delta point 2).
+            if status == 'done':
+                _closure_err = await self._consolidation_closure_error(
+                    task_id, before, project_id
+                )
+                if _closure_err is not None:
+                    return _closure_err
 
             # 2e. Transition-legality gate (Table A, task 2175/rho1b).
             # Classifies the caller into an ActorClass and checks the
@@ -1512,14 +1812,47 @@ class TaskInterceptor:
         Priority: ``files`` (canonical orchestrator field) →
         ``files_to_modify`` (legacy curator-internal name). Coerces the
         result to a list of non-empty strings, and returns ``[]`` when
-        neither key is present or the value is empty / falsy.
+        neither key is present, both values are empty / falsy, or both
+        values are malformed (see below).
+
+        Malformed-value guard (task 3407): mirrors
+        :meth:`_extract_deliverable_signals_from_meta`'s guard (task 3106).
+        ``metadata`` is unvalidated caller kwargs at this seam and
+        :meth:`_parse_metadata` deliberately warns-and-continues rather than
+        raising, so a value that is neither a string nor a list/tuple/set
+        (e.g. ``files: 5``) is discarded the same way instead of raising
+        ``TypeError`` out of :func:`check_files_for_scope` /
+        :func:`all_files_foreign_owner` as an unstructured crash — a
+        discarded ``files`` falls through to ``files_to_modify``, same as
+        an absent/falsy one. A dict value (e.g. ``files: {'a/b.py': 1}``)
+        is the quiet variant: plain iteration would walk its KEYS and could
+        silently drive the FILES-certain hard reject off metadata the
+        author never meant as a path list, so it is discarded too rather
+        than iterated.
 
         Callers that have not yet parsed metadata should use the kwargs-taking
         entry point :meth:`_extract_meta_files` instead.
         """
-        files = meta.get('files') or meta.get('files_to_modify') or []
-        if isinstance(files, str):
-            files = [files]
+        files: list | tuple | set | None = None
+        for key in ('files', 'files_to_modify'):
+            value = meta.get(key)
+            if not value:
+                continue
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, (list, tuple, set)):
+                logger.warning(
+                    'task_metadata.schema_warning source=%s error=%s '
+                    '(type=%s); meta-files key discarded',
+                    'TaskInterceptor._extract_meta_files_from_meta',
+                    f'metadata.{key} is not a list/tuple/set of paths',
+                    type(value).__name__,
+                )
+                continue
+            files = value
+            break
+        if files is None:
+            files = []
         return [str(f) for f in files if f]
 
     @staticmethod
@@ -1541,6 +1874,80 @@ class TaskInterceptor:
         """
         meta = TaskInterceptor._parse_metadata(kwargs)
         return TaskInterceptor._extract_meta_files_from_meta(meta)
+
+    @staticmethod
+    def _extract_deliverable_signals_from_meta(meta: dict) -> list[str]:
+        """Extract the UNION of declared deliverable signals from *meta*.
+
+        Reads ``files``, ``files_to_modify`` and ``modules`` in that order,
+        coercing a scalar string to a one-element list, ``str()``-coercing
+        each entry, dropping falsy ones, and deduplicating while preserving
+        first-occurrence order.
+
+        SEPARATE HELPER, NOT A WIDENING of
+        :meth:`_extract_meta_files_from_meta` — deliberately (task 3106).
+        That helper feeds the FILES-CERTAIN hard reject
+        (:func:`check_files_for_scope`) and the cross-repo tagger
+        (:func:`all_files_foreign_owner`), where its ``files``-over-
+        ``files_to_modify`` PRECEDENCE is correct because those callers need
+        ONE authoritative declared file list, and where admitting ``modules``
+        would mean a foreign lock-key entry starts hard-REJECTING
+        submissions — a behaviour change well outside this task.
+
+        Attribution wants the widest view of what the filer declared, and
+        this list feeds ONLY :meth:`_local_attesting_signals`, so it can
+        never weaken a rejection.  :func:`local_attesting_signals` documents
+        how the extra keys are treated in BOTH directions — they can attest,
+        and a foreign one vetoes.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        for key in ('files', 'files_to_modify', 'modules'):
+            values = meta.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, (list, tuple, set)):
+                # Malformed caller metadata (``modules: 5``, ``modules:
+                # {...}``).  ``metadata`` is still unvalidated kwargs at this
+                # seam and :func:`_parse_metadata` deliberately
+                # warns-and-continues rather than raising, so degrade the
+                # same way: an unusable value contributes NO signal (falling
+                # back to the unchanged advisory) instead of raising
+                # ``TypeError`` out of ``submit_task`` as an unstructured
+                # crash.  A dict is the quiet variant — iterating it would
+                # walk its KEYS and could silently attest.
+                logger.warning(
+                    'task_metadata.schema_warning source=%s error=%s '
+                    '(type=%s); deliverable-signal key discarded',
+                    'TaskInterceptor._extract_deliverable_signals_from_meta',
+                    f'metadata.{key} is not a list/tuple/set of paths',
+                    type(values).__name__,
+                )
+                continue
+            for value in values:
+                if not value:
+                    continue
+                entry = str(value)
+                if entry in seen:
+                    continue
+                seen.add(entry)
+                out.append(entry)
+        return out
+
+    @staticmethod
+    def _extract_deliverable_signals(kwargs: dict[str, Any]) -> list[str]:
+        """Extract declared deliverable signals from add_task kwargs.
+
+        Thin wrapper around :meth:`_extract_deliverable_signals_from_meta`
+        that handles the ``kwargs → meta`` parsing step via
+        :meth:`_parse_metadata` — the SAME parsing path
+        :meth:`_extract_meta_files` uses, so JSON-string metadata is
+        normalised identically with no new parsing branch.  Only the
+        key-selection policy differs (union of three keys vs. precedence
+        over two); see that method's docstring for why.
+        """
+        meta = TaskInterceptor._parse_metadata(kwargs)
+        return TaskInterceptor._extract_deliverable_signals_from_meta(meta)
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
@@ -1599,6 +2006,70 @@ class TaskInterceptor:
         )
         return check_files_for_scope(files, project_id, registry)
 
+    def _all_files_foreign_owner(
+        self,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_id: str,
+    ) -> str | None:
+        """Return the single foreign owner iff EVERY declared file is owned by
+        ONE other project (the cross-repo deliverable shape, task 3004).
+
+        Reads the same ``metadata.files`` list as :meth:`_files_scope_check`
+        and delegates to the pure :func:`all_files_foreign_owner`. This is the
+        cross-repo *allow-and-tag* counterpart to the FILES-certain hard reject
+        (:func:`check_files_for_scope`): a task filed under *project_id* whose
+        files are ALL owned by one OTHER registered project (the reify-task
+        5308 shape) is a legitimate cross-repo deliverable, not a scope error —
+        its own branch is empty because the deliverable lands on that project's
+        branch.
+
+        Returns ``None`` when no :attr:`_prefix_registry` is configured (the
+        caller then falls through to the existing hard reject), when any file
+        is locally owned, when no file is foreign, or when foreign files span
+        more than one owner — i.e. the partial/mixed case that
+        :func:`check_files_for_scope` still hard-rejects (task 2206 preserved).
+        """
+        registry = self._prefix_registry
+        if registry is None:
+            return None
+        files = (
+            candidate.files_to_modify if candidate is not None
+            else self._extract_meta_files(kwargs)
+        )
+        return all_files_foreign_owner(files, project_id, registry)
+
+    def _local_attesting_signals(
+        self,
+        kwargs: dict[str, Any],
+        project_id: str,
+    ) -> list[str]:
+        """Return the declared deliverable signals that ATTEST *project_id*.
+
+        Thin wrapper — registry guard here, all registry logic in the pure
+        :func:`local_attesting_signals` (which documents the two conditions
+        attestation requires and why).  Same shape as the sibling
+        :meth:`_all_files_foreign_owner`, and, like it, returns the WITNESS
+        rather than a bare bool so the caller can name it in the log.
+
+        Reads ``kwargs`` directly rather than ``candidate.files_to_modify``:
+        the candidate's list has already been narrowed by
+        :meth:`_extract_meta_files_from_meta`'s ``files``-over-
+        ``files_to_modify`` precedence and carries no ``modules`` at all, so
+        it is the wrong signal for attribution, which wants the UNION (see
+        :meth:`_extract_deliverable_signals_from_meta`).
+
+        Returns ``[]`` when no :attr:`_prefix_registry` is configured — with
+        no owner map nothing can attest, so the caller falls through to the
+        unchanged advisory.
+        """
+        registry = self._prefix_registry
+        if registry is None:
+            return []
+        return local_attesting_signals(
+            self._extract_deliverable_signals(kwargs), project_id, registry,
+        )
+
     def _path_guard_check(
         self,
         candidate: CandidateTask | None,
@@ -1635,6 +2106,228 @@ class TaskInterceptor:
             )
         return check_text_for_scope(text, project_id, registry)
 
+    def _soft_scope_check(
+        self,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_id: str,
+    ) -> SoftScopeFinding:
+        """Collect the SOFT (non-structural) scope signals for a candidate.
+
+        The third classifier at this seam, and the only one that sees the
+        FILELESS class.  :meth:`_files_scope_check` classifies declared paths
+        exactly; :meth:`_path_guard_check` lexes repo-relative prefixes out of
+        prose; both are blind to a task that declares no files and cites no
+        repo-relative prefix — roughly half of the measured real misfiles.
+        This one reads the leading ``<project>:`` title convention, absolute
+        foreign roots, and bare foreign project names instead (see
+        :mod:`fused_memory.middleware.soft_scope_signals`).
+
+        A no-op (empty finding) when no :attr:`_prefix_registry` is
+        configured, mirroring :meth:`_files_scope_check`'s defensive guard —
+        without a registry there are no foreign roots or names to match
+        against.
+        """
+        registry = self._prefix_registry
+        if not registry:
+            return SoftScopeFinding()
+        title, description, details = self._soft_scope_texts(candidate, kwargs)
+        return collect_soft_scope_signals(
+            title, description, details, project_id, registry,
+        )
+
+    @staticmethod
+    def _soft_scope_texts(
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """The ``(title, description, details)`` the soft signals scan.
+
+        Factored out so :meth:`_soft_scope_branch` can hand the CONFIRMATION
+        step exactly the text the SCAN matched on.  Deriving them
+        independently at the two call sites is how the two drift apart, and
+        the drift is silent: the adjudicator would be asked to rule on
+        evidence it was never shown, and would answer from whatever text it
+        did get.
+        """
+        if candidate is not None:
+            return (
+                candidate.title or '',
+                candidate.description or '',
+                candidate.details or '',
+            )
+        return (
+            str(kwargs.get('title') or ''),
+            str(kwargs.get('description') or kwargs.get('prompt') or ''),
+            str(kwargs.get('details') or ''),
+        )
+
+    async def _soft_scope_branch(
+        self,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_root: str,
+        project_id: str,
+    ) -> None:
+        """Soft-signal branch: adjudicate a fileless misfile candidate.
+
+        Always returns ``None`` — this branch NEVER blocks creation, in
+        either warn-only or enforce mode.  The measured prose precision of
+        this signal family is 10.7%, so the maximum action it may take is
+        advisory.
+
+        WHERE THIS RUNS, AND WHY ONLY THERE.  It attaches to exactly ONE of
+        :meth:`_path_guard_or_skip`'s exits — the ``not verdict.is_rejection``
+        early return, which IS the fileless path: a task with no declared
+        files and no repo-relative prose prefix produces a non-rejection
+        verdict and leaves the function there.  Every other exit has already
+        classified the submission, and re-opening any of them would be
+        actively wrong:
+
+        * ROUTING OVERRIDE — a deliberate operator bypass.  Spending an LLM
+          call there would defeat the override.
+        * FILES-CERTAIN reject — ``project_for_path`` is exact.  A file's
+          owner is either known and different or it isn't; there is nothing
+          to adjudicate.
+        * CROSS-REPO allow-and-tag (task 3004) — already tagged
+          ``cross_repo`` + ``cross_repo_project`` from a CERTAIN single-owner
+          result.
+        * PROSE-ADVISORY SUPPRESSED BY LOCAL ATTRIBUTION (task 3106) — a
+          deliberate attribution decision reached with the CERTAIN
+          ``project_for_path`` classifier over declared deliverables, whose
+          stated purpose is REMOVING operator-queue noise.  Re-adjudicating
+          it would spend an LLM call to second-guess a certain classifier
+          with an uncertain one and re-raise precisely the noise 3106
+          removed.  Declared-file attribution is 3106's problem; this branch
+          is solely about producing a signal where none exists at all.
+        * PROSE-ADVISORY fired — already stamped and escalated; running here
+          would double-stamp.
+        """
+        finding = self._soft_scope_check(candidate, kwargs, project_id)
+        adjudicator = self._path_scope_adjudicator
+        if not finding.should_adjudicate or adjudicator is None:
+            return None
+        # SHOW THE CONFIRMATION STEP THE EVIDENCE IT IS RULING ON.  The
+        # signals scan title/description/details JOINED, so a strong signal
+        # can be found in `details` alone; adjudicating that on a
+        # title+description prompt would ask the classifier to rule on text
+        # it was never shown.  `adjudicate` has no `details` parameter, so
+        # details ride along in `description` — the same joined blob the scan
+        # matched on, via the same extraction helper.
+        title, description, details = self._soft_scope_texts(candidate, kwargs)
+        prompt_description = '\n'.join(p for p in (description, details) if p)
+        try:
+            adjudication = await adjudicator.adjudicate(
+                title=title,
+                description=prompt_description,
+                matched_paths=finding.matched_paths,
+                project_id=project_id,
+                suggested_project=finding.suggested_project,
+                project_root=project_root,
+            )
+        except Exception:
+            # adjudicate() is documented never to raise, but this branch is a
+            # pure OBSERVATION on an allowed submission — mirroring
+            # _emit_scope_violation_escalation's never-raise convention, a
+            # future regression there must not turn a soft observation into a
+            # failed submit.
+            logger.warning(
+                'soft_scope_lint: adjudication raised for project_id=%s; '
+                'treating as no-signal',
+                project_id,
+                exc_info=True,
+            )
+            return None
+
+        # CENSUS — the line the enforce flip is meant to be based on,
+        # following FUSED_ROUTING_INTENT_ENFORCE's precedent exactly (ship
+        # warn-only, measure from a greppable WARNING, then flip).
+        #
+        # UNCONDITIONAL ON THE VERDICT, deliberately.  Precision is
+        # confirmations over firings; the firing rate is already known from
+        # corpus measurement, but the CONFIRMATION rate only exists once the
+        # adjudicator actually runs.  Logging only confirmations would give
+        # the flip decision a numerator and no denominator.  It keeps firing
+        # in enforce mode too, so the census does not go dark exactly when
+        # the change starts acting.
+        enforced = soft_scope_enforced()
+        logger.warning(
+            'soft_scope_lint.flagged kinds=%s suggested_project=%s '
+            'verdict=%s failed=%s enforced=%s',
+            ','.join(sig.kind for sig in finding.signals),
+            finding.suggested_project,
+            getattr(adjudication, 'verdict', None),
+            getattr(adjudication, 'failed', None),
+            enforced,
+        )
+
+        # ENFORCE — advisory only, and ONLY on an affirmatively CONFIRMED
+        # misroute.  `is_confirmed_misroute` rather than `not
+        # should_allow_creation` is the whole polarity argument: this
+        # branch's base state is allow-and-do-nothing, so reading the
+        # reject-polarised property would stamp a misroute on every timeout,
+        # breaker-open and exception (see AdjudicationVerdict for the full
+        # writeup).
+        if not (enforced and getattr(adjudication, 'is_confirmed_misroute', False)):
+            return None
+
+        # PathGuardVerdict purely as the transport shape for the two existing
+        # seams — reusing them inherits escalation wording, dedupe,
+        # root_for_project resolution and metadata normalisation rather than
+        # reimplementing any of it.  advisory=True because creation is NOT
+        # blocked, which also inherits task 4159's submit-phase-1 wording
+        # (the escalation must not claim a task already exists).
+        transport = PathGuardVerdict(
+            outcome='rejection',
+            project_id=project_id,
+            matched_paths=finding.matched_paths,
+            suggested_project=finding.suggested_project,
+        )
+        self._emit_scope_violation_escalation(
+            transport, candidate, kwargs, project_root, project_id,
+            llm_reason=getattr(adjudication, 'reason', None),
+            advisory=True,
+        )
+        self._attach_possible_scope_mismatch(
+            kwargs, transport, source='soft-signal',
+        )
+        return None
+
+    def _escalation_suggested_root(self, suggested_project: str | None) -> str | None:
+        """Resolve the filesystem root of *suggested_project*, or ``None``.
+
+        Shared by both scope_violation emit helpers so the resolution — and in
+        particular the defensive ``registry is not None`` guard — exists once.
+        That guard is belt-and-suspenders (see :meth:`_files_scope_check`): the
+        constructor has guaranteed a non-None :attr:`_prefix_registry` since
+        task 2208, but ``root_for_project`` must never be reached on a None
+        registry from an escalation path, where an AttributeError would
+        convert a reporting side-effect into a guard exception.
+        """
+        registry = self._prefix_registry
+        if not suggested_project or registry is None:
+            return None
+        return registry.root_for_project(suggested_project)
+
+    @staticmethod
+    def _escalation_candidate_title(
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+    ) -> str:
+        """Best available human label for an escalation record, length-bounded.
+
+        Shared by both scope_violation emit helpers.  Note where the ``[:200]``
+        binds: it applies to the WHOLE expression, so a candidate-supplied
+        title is bounded too.  Binding it to the fallback branch alone (the
+        earlier shape) left the common case — a real ``CandidateTask`` whose
+        title came from caller-supplied text — unbounded in a field that is
+        rendered verbatim into agent briefings.
+        """
+        return (
+            (candidate.title if candidate else '')
+            or str(kwargs.get('title') or kwargs.get('prompt') or '<unknown>')
+        )[:200]
+
     def _emit_scope_violation_escalation(
         self,
         verdict: PathGuardVerdict,
@@ -1644,14 +2337,36 @@ class TaskInterceptor:
         project_id: str,
         *,
         llm_reason: str | None = None,
+        advisory: bool = False,
     ) -> None:
-        """Fire the scope_violation escalation on a rejection verdict.
+        """Fire the scope_violation escalation for EITHER guard outcome.
 
         Pure side-effect helper: resolves the suggested root, builds the
         candidate title, and delegates to :attr:`_scope_violation_escalator`.
         Errors are logged and swallowed so a queue failure can never convert
-        a rejection into an exception (matches the never-raise convention).
-        No-ops when no escalator is configured.
+        a guard outcome into an exception (matches the never-raise
+        convention).  No-ops when no escalator is configured.
+
+        This helper is the SEAM where the two outcomes of
+        :meth:`_path_guard_or_skip` are distinguished, so *advisory* selects
+        which one the operator-facing escalation describes (task 3119):
+
+        * ``False`` (default) — the FILES-certain hard reject.  No task was
+          created; the caller receives the ``DarkFactoryPathScopeViolation``
+          error dict.
+        * ``True`` — the PROSE-only advisory.  Nothing was blocked: the
+          submission proceeds, stamped with
+          ``metadata.possible_scope_mismatch``.
+
+        Getting this wrong is not cosmetic — an advisory filed with rejection
+        wording tells the operator (and any agent reading it in a briefing)
+        that a task was rejected when nothing was blocked, and instructs a
+        resubmission of work that was never turned away.  The advisory
+        wording must not over-claim in the other direction either: this seam
+        sits in ``submit_task`` PHASE-1, before ``tm.add_task`` and before
+        the submission has been resolved (it may yield a new task, be folded
+        into an existing one, or be dropped), so neither this docstring nor
+        the escalation may state that a task exists (task 4159).
 
         The optional *llm_reason* is forwarded to ``report_rejection``
         (task 1822) so genuine-misroute / fail-safe cases carry the LLM
@@ -1659,16 +2374,8 @@ class TaskInterceptor:
         """
         if self._scope_violation_escalator is None:
             return
-        registry = self._prefix_registry
-        suggested_root: str | None = None
-        # `registry is not None` is defensive belt-and-suspenders here too
-        # (see :meth:`_files_scope_check`): the constructor guarantees a
-        # non-None :attr:`_prefix_registry` since task 2208.
-        if verdict.suggested_project and registry is not None:
-            suggested_root = registry.root_for_project(verdict.suggested_project)
-        candidate_title = (candidate.title if candidate else '') or str(
-            kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
-        )[:200]
+        suggested_root = self._escalation_suggested_root(verdict.suggested_project)
+        candidate_title = self._escalation_candidate_title(candidate, kwargs)
         try:
             self._scope_violation_escalator.report_rejection(
                 project_root=project_root,
@@ -1678,6 +2385,7 @@ class TaskInterceptor:
                 suggested_project=verdict.suggested_project,
                 suggested_root=suggested_root,
                 llm_reason=llm_reason,
+                advisory=advisory,
             )
         except Exception:  # pragma: no cover — defensive only
             # Escalator is built to never raise (queue failures are
@@ -1686,6 +2394,95 @@ class TaskInterceptor:
             logger.exception(
                 'task_interceptor: scope_violation_escalator raised; '
                 'continuing with rejection error',
+            )
+
+    @staticmethod
+    def _override_matched_paths(
+        files_verdict: PathGuardVerdict,
+        prose_verdict: PathGuardVerdict,
+    ) -> tuple[str, ...]:
+        """Union the two REPORTING-ONLY verdicts' paths for the audit record.
+
+        Files-certain paths first (they are exact owner lookups), then any
+        prose prefixes not already present.  Order-stable and deduplicated so
+        the recorded list is reproducible — the record's whole value is that
+        it can be checked against the guard's behaviour after the fact.
+        """
+        paths: list[str] = []
+        for verdict in (files_verdict, prose_verdict):
+            for path in verdict.matched_paths:
+                if path not in paths:
+                    paths.append(path)
+        return tuple(paths)
+
+    def _emit_routing_override_escalation(
+        self,
+        *,
+        reason: str,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_root: str,
+        project_id: str,
+        files_verdict: PathGuardVerdict,
+        prose_verdict: PathGuardVerdict,
+    ) -> None:
+        """File the AUDIT record for a routing-override bypass.
+
+        Pure side-effect helper modelled on
+        :meth:`_emit_scope_violation_escalation`, with the same never-raise
+        contract — and here it matters MORE, not less: the submission this
+        describes has already been allowed, so a queue failure must not
+        convert an allowed submission into an exception.  No-ops when no
+        escalator is configured.
+
+        *files_verdict* / *prose_verdict* are computed for REPORTING ONLY by
+        the caller; nothing is enforced from them.  ``suggested_project`` is
+        the files verdict's suggestion when it rejected AND named one, else
+        the prose verdict's, else ``None``.
+        """
+        if self._scope_violation_escalator is None:
+            return
+        # UNCONDITIONAL — deliberately NOT gated on `matched_paths` being
+        # non-empty.  The defect being fixed is "a bypass leaves no
+        # operator-visible record", not "a bypass that MATTERED leaves no
+        # record".  An override whose verdicts both came back clean is the
+        # single most useful data point available: direct evidence that the
+        # parameter was reached for unnecessarily, which is what any later
+        # tightening of it has to be measured against.  Gating on "the guard
+        # would have fired" would reproduce the original defect for exactly
+        # the over-cautious caller, and would make the census under-count.
+        # Flood risk is handled by the escalator's content-fingerprint fold,
+        # not by suppressing the signal.
+        matched_paths = self._override_matched_paths(files_verdict, prose_verdict)
+        # The files verdict wins when it rejected — it is the CERTAIN signal
+        # (an exact metadata.files owner mismatch) against the prose scan's
+        # heuristic.  But it can reject and STILL yield no suggestion: with
+        # two distinct foreign owners in metadata.files, check_files_for_scope
+        # cannot pick one and returns None.  Falling through to the prose
+        # suggestion there rather than reporting None keeps the degradation
+        # symmetric with :meth:`_override_matched_paths`, which unions both
+        # signals for exactly this multi-signal case.  Nothing enforces on
+        # this field — it is the audit record's best-available hint.
+        suggested_project = (
+            (files_verdict.suggested_project if files_verdict.is_rejection else None)
+            or prose_verdict.suggested_project
+        )
+        suggested_root = self._escalation_suggested_root(suggested_project)
+        candidate_title = self._escalation_candidate_title(candidate, kwargs)
+        try:
+            self._scope_violation_escalator.report_routing_override(
+                project_root=project_root,
+                project_id=project_id,
+                candidate_title=candidate_title,
+                reason=reason,
+                matched_paths=matched_paths,
+                suggested_project=suggested_project,
+                suggested_root=suggested_root,
+            )
+        except Exception:  # pragma: no cover — defensive only
+            logger.exception(
+                'task_interceptor: scope_violation_escalator raised on the '
+                'routing-override audit path; the submission stays allowed',
             )
 
     async def _path_guard_or_skip(
@@ -1700,31 +2497,68 @@ class TaskInterceptor:
         """Run the path-scope guard, escalate on rejection, return error dict.
 
         Returns the structured error dict on a hard rejection, or ``None``
-        when the submission is allowed (including the PROSE-ADVISORY case
-        below, which allows creation but attaches a marker).
+        when the submission is allowed (including the PROSE-ADVISORY case,
+        which allows creation but attaches a marker).
 
-        Split by signal quality (task 2206):
+        This method IS the evaluation order the three-outcome taxonomy in
+        :mod:`fused_memory.middleware.path_scope_guard`'s module docstring
+        describes — read it there rather than re-deriving it here; only the
+        facts specific to this seam are recorded below.
 
-        * FILES-CERTAIN (:meth:`_files_scope_check`) — an exact
-          ``metadata.files`` owner-mismatch is a hard reject.  No LLM
-          adjudication: the file's owner is either known and different, or
-          it isn't, so there is nothing to adjudicate.
-        * PROSE-ADVISORY (:meth:`_path_guard_check`) — a regex-over-prose
-          heuristic hit in title/description/details, with no files-level
-          mismatch.  This never rejects: the submission proceeds, but
+        * Outcome (0), AUDITED BYPASS — a non-blank *routing_override_reason*.
+          Checked FIRST, and deliberately so: it makes "no enforcement
+          side-effect fires on the override path" a STRUCTURAL property of
+          this method rather than one every future branch would have to
+          re-establish.  Since task 3123 the verdicts ARE computed inside
+          this branch, purely to populate an audit record — they are pure
+          functions returning frozen verdicts, and NONE of the enforcement
+          side-effects (the reject dict, the ``possible_scope_mismatch``
+          stamp, the ``cross_repo`` tag, ``report_rejection``) is reachable
+          from it.  That computation is itself guarded, so a defect anywhere
+          in the guard machinery degrades the audit record's path list rather
+          than breaking a submission that explicitly asked to bypass it.
+          A ``scope_violation`` override record is filed via
+          :meth:`_emit_routing_override_escalation` so the bypass is visible
+          in the operator queue and not only in a ``logger.warning``.
+        * Outcome (1), FILES-CERTAIN reject — :meth:`_files_scope_check`.  No
+          LLM adjudication: the file's owner is either known and different,
+          or it isn't, so there is nothing to adjudicate.
+        * Outcome (2), CROSS-REPO allow-and-tag — :meth:`_all_files_foreign_owner`.
+        * Outcome (3), PROSE-ADVISORY — :meth:`_path_guard_check`, gated on
+          :meth:`_local_attesting_signals`.  The registry is always present
+          (defaults to ``ProjectPrefixRegistry.default()``, task 2208), so
+          the advisory is the ONLY prose path — the pre-task-2208
+          hard-reject-on-prose back-compat branch has been retired.  On an
+          unsuppressed hit,
           ``kwargs['metadata']['possible_scope_mismatch']`` is attached (via
           :meth:`_attach_possible_scope_mismatch`) and a ``scope_violation``
-          escalation still fires (loud, non-blocking).  The registry is
-          always present (defaults to ``ProjectPrefixRegistry.default()``,
-          task 2208), so this is the ONLY path — the pre-task-2208
-          hard-reject-on-prose back-compat branch has been retired.
+          escalation fires (loud, non-blocking).  Both act on the
+          SUBMISSION: this runs in ``submit_task`` phase-1, so the stamp
+          reaches a task only if one is later CREATED from that submission,
+          and the escalation must not claim otherwise (task 4159).
 
-        The inline Stage-2 LLM adjudicator (task 1822) is no longer
-        consulted here: FILES-certain rejects have nothing to adjudicate,
-        and PROSE hits no longer gate a rejection for the adjudicator to
-        downgrade.  :attr:`_path_scope_adjudicator` is retained as an
-        attribute for future async triage but is dead weight in this
-        method now.
+          NOT SILENT when suppressed: one structured INFO record carries the
+          matched prose prefixes, the prose-suggested owner, the filing
+          project and the attesting signals, so the branch stays auditable
+          without putting a non-actionable item in the operator queue.
+
+        * Outcome (4), SOFT-SIGNAL (task 3122) — :meth:`_soft_scope_branch`,
+          attached to the ``not verdict.is_rejection`` EARLY RETURN below.
+          That exit is the FILELESS path: no declared files and no
+          repo-relative prose prefix, which is what roughly half the measured
+          real misfiles look like and what outcomes (1)-(3) are all
+          structurally blind to.  A STRONG soft signal (the leading
+          ``<project>:`` title convention, or an absolute foreign root in the
+          prose) invokes :attr:`_path_scope_adjudicator` as a confirmation
+          step.  NEVER blocks creation.
+
+        The inline Stage-2 LLM adjudicator (task 1822) is not consulted on
+        outcomes (1)-(3): FILES-certain rejects have nothing to adjudicate,
+        and PROSE hits no longer gate a rejection for it to downgrade.
+        Outcome (4) is its ONLY caller here, and it reads
+        ``AdjudicationVerdict.is_confirmed_misroute`` rather than ``not
+        should_allow_creation``, because its base state is allow-and-do-
+        nothing (see that property's docstring for the polarity argument).
 
         On any rejection or advisory, fires a ``scope_violation`` escalation
         via :attr:`_scope_violation_escalator` (when configured) so the
@@ -1739,15 +2573,64 @@ class TaskInterceptor:
         Call-site pattern:
             ``if err := await self._path_guard_or_skip(kwargs, project_root, project_id): return err``
         """
-        # Routing override: deliberate bypass of BOTH the FILES-certain
-        # reject and the PROSE-advisory.  Must be the FIRST action so no
-        # verdict computation or escalation fires.
+        # Routing override, outcome (0) — AUDITED BYPASS.  Deliberate bypass
+        # of BOTH the FILES-certain reject and the PROSE-advisory.  Stays the
+        # FIRST action so that "no enforcement side-effect fires here" is
+        # STRUCTURAL rather than a property every future branch would have to
+        # re-establish independently.
+        #
+        # Since task 3123 the verdicts ARE computed inside this branch — for
+        # REPORTING ONLY.  check_files_for_scope / check_text_for_scope are
+        # pure and return frozen PathGuardVerdicts, so this cannot leak an
+        # enforcement action: no reject dict, no possible_scope_mismatch
+        # stamp, no cross_repo tag and no report_rejection is reachable from
+        # here.  It buys the audit record its paths.
         if is_routing_override(routing_override_reason):
+            # NEVER-RAISE, and the reason is stronger here than for the
+            # escalation emit below.  Before task 3123 this branch did
+            # literally nothing, which made an override caller STRUCTURALLY
+            # immune to any defect in the guard machinery; buying the audit
+            # record its paths must not hand that immunity back.  A raise out
+            # of candidate-building or either verdict — a future extractor
+            # meeting a malformed metadata shape, a registry/regex change, a
+            # path string that trips normpath/expanduser — would turn a
+            # submission the caller EXPLICITLY asked to bypass into an
+            # exception out of submit_task, which is the precise failure the
+            # reporting-only design exists to be immune to.  Degrade to empty
+            # verdicts instead: the audit record is still filed (with no
+            # paths, which is honest — the guard genuinely produced none), and
+            # the bypass still bypasses.
+            try:
+                if candidate is None:
+                    candidate = self._build_candidate(kwargs)
+                files_verdict = self._files_scope_check(candidate, kwargs, project_id)
+                prose_verdict = self._path_guard_check(candidate, kwargs, project_id)
+            except Exception:
+                logger.exception(
+                    'task_interceptor: path-guard verdict computation raised on '
+                    'the ROUTING-OVERRIDE reporting path for project_id=%s; '
+                    'filing the audit record with no paths and leaving the '
+                    'submission allowed',
+                    project_id,
+                )
+                files_verdict = PathGuardVerdict(outcome='ok', project_id=project_id)
+                prose_verdict = PathGuardVerdict(outcome='ok', project_id=project_id)
+            override_paths = self._override_matched_paths(files_verdict, prose_verdict)
             logger.warning(
                 'path-guard ROUTING OVERRIDE: skipping path guards for '
-                'project_id=%s reason=%r',
+                'project_id=%s reason=%r would_have_matched=%s',
                 project_id,
                 routing_override_reason.strip(),
+                list(override_paths),
+            )
+            self._emit_routing_override_escalation(
+                reason=routing_override_reason,
+                candidate=candidate,
+                kwargs=kwargs,
+                project_root=project_root,
+                project_id=project_id,
+                files_verdict=files_verdict,
+                prose_verdict=prose_verdict,
             )
             return None
 
@@ -1759,6 +2642,22 @@ class TaskInterceptor:
         # below.
         files_verdict = self._files_scope_check(candidate, kwargs, project_id)
         if files_verdict.is_rejection:
+            # CROSS-REPO DELIVERABLE (task 3004): a submission whose declared
+            # files are ALL owned by ONE other project is not a scope error —
+            # its own branch is legitimately empty because the deliverable
+            # lands on the owner's branch (the reify-task 5308 shape). Tag it
+            # (cross_repo=True + cross_repo_project=<owner>) and ALLOW it, so
+            # the orchestrator pre-merge gate routes it to
+            # OutcomeKind.plan_files_cross_repo instead of flagging 'files not
+            # touched'. Only the ALL-foreign single-owner shape qualifies; a
+            # partial/mixed submission returns None here and falls through to
+            # the existing hard reject (task 2206 preserved).
+            cross_repo_owner = self._all_files_foreign_owner(
+                candidate, kwargs, project_id,
+            )
+            if cross_repo_owner is not None:
+                self._attach_cross_repo_marker(kwargs, cross_repo_owner)
+                return None
             self._emit_scope_violation_escalation(
                 files_verdict, candidate, kwargs, project_root, project_id,
                 llm_reason=None,
@@ -1767,13 +2666,51 @@ class TaskInterceptor:
 
         verdict = self._path_guard_check(candidate, kwargs, project_id)
         if not verdict.is_rejection:
+            # SOFT-SIGNAL branch (task 3122).  THIS early return IS the
+            # FILELESS path — no declared files, no repo-relative prose
+            # prefix — so it is the only exit where a soft signal is still
+            # worth asking about.  See _soft_scope_branch for why it must not
+            # attach anywhere else.  Never blocks: returns None regardless.
+            return await self._soft_scope_branch(
+                candidate, kwargs, project_root, project_id,
+            )
+
+        # PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION (task 3106): the declared
+        # deliverables attest local work (see local_attesting_signals for the
+        # exact conditions), so the foreign path in the prose is an incidental
+        # citation ("mirror the logic in <other-project>/x.rs"), not a
+        # misrouting — neither the stamp nor the escalation fires.
+        #
+        # INFO, not WARNING, and deliberately not an escalation: this is a
+        # CORRECT attribution decision replacing operator-queue noise, so it
+        # belongs in the log trail rather than in a queue an operator has to
+        # triage. But it is never SILENT — the guard's most consequential
+        # branch has to stay auditable by anyone asking why a task was not
+        # flagged, so the record carries every fact the decision turned on.
+        attesting_signals = self._local_attesting_signals(kwargs, project_id)
+        if attesting_signals:
+            logger.info(
+                'path-guard PROSE ADVISORY SUPPRESSED: declared deliverable '
+                'attests local work, so the prose citation is incidental — '
+                'no possible_scope_mismatch stamp and no escalation. '
+                'project_id=%s matched_paths=%s suggested_project=%s '
+                'attested_by=%s',
+                project_id,
+                list(verdict.matched_paths),
+                verdict.suggested_project,
+                attesting_signals,
+            )
             return None
 
         # PROSE-ADVISORY: a heuristic hit never blocks creation — the
         # escalation below preserves the signal loudly; the marker lets
-        # async triage see it too.
+        # async triage see it too.  advisory=True so the escalation the
+        # operator reads says nothing was blocked, rather than reporting a
+        # rejection (task 3119) — and, since this is submit_task phase-1,
+        # without claiming a task exists either (task 4159).
         self._emit_scope_violation_escalation(
-            verdict, candidate, kwargs, project_root, project_id, llm_reason=None,
+            verdict, candidate, kwargs, project_root, project_id,
+            llm_reason=None, advisory=True,
         )
         self._attach_possible_scope_mismatch(kwargs, verdict)
         return None
@@ -1782,19 +2719,49 @@ class TaskInterceptor:
         self,
         project_root: str,
         decision: CuratorDecision,
+        *,
+        candidate_metadata: Any = None,
     ) -> dict | None:
         """Apply a curator combine decision to the target task.
 
         Returns the update_task result on success, None on failure (caller
         falls back to create). Combine is implemented via Taskmaster's
-        ``update_task`` with a ``prompt`` that instructs a verbatim replacement
-        plus metadata carrying the combine marker.
+        ``update_task``, writing the curator's rewrite as structured fields
+        and MERGING a three-key combine marker into the target's existing
+        metadata blob (``metadata_mode='merge'``) — it does not replace that
+        blob. See the comment at the write for why (task 3446).
 
-        Before writing, verifies the target's fingerprint and status. A
-        mismatched fingerprint (curator targeted the wrong task) or terminal
-        status (done/cancelled) aborts the write and returns None so the
-        caller degrades to ``create`` instead of silently clobbering an
-        unrelated task.
+        Before writing, verifies the decision found its target and that the
+        target is still combine-ELIGIBLE, IN THAT ORDER. A mismatched
+        fingerprint (curator targeted the wrong task) aborts first, so a
+        misdirected decision can never be recorded as an eligibility refusal
+        against a row it never meant. Eligibility is then the shared
+        ``is_combine_eligible_status`` (task_curator) — the same predicate the
+        curator's selection snapshot uses, so the two cannot drift apart —
+        conjoined with an execution-only check the snapshot cannot make: a
+        target carrying a ``claimant_run_id`` stamp is refused even when its
+        status is pending (task 4035). That conjunct tests only for a present,
+        non-blank stamp; unlike ``shared.task_claimant.has_live_claimant`` it
+        does NOT check heartbeat freshness, so a stale stamp refuses too —
+        conservative by design, since refusing only degrades to ``create``.
+        Every abort returns None so the caller degrades to ``create`` instead
+        of clobbering a task that has moved on since selection. Eligibility
+        refusals are recorded in the combine audit with a ``refused_reason``
+        token so the refusal rate is countable.
+
+        A third abort condition joins those two: *candidate_metadata*
+        declaring an escalation gate while the live target does not. The
+        candidate's own metadata is never written anywhere by this path, so
+        such a combine would silently strip a human decision gate — the
+        target-side ``'merge'`` above cannot help. Refusing degrades to
+        ``create``, which files the gate as its own task (task 3446).
+
+        A corrupt *existing* metadata blob on the target now also aborts the
+        combine: ``_merge_metadata`` refuses to merge into unparseable bytes
+        and raises, which the ``except`` below turns into a WARNING plus
+        ``None``. Under the old ``'replace'`` that same row was silently
+        overwritten — combine is not a corrupt-row repair, so refusing is the
+        wanted behaviour (loud over silent).
         """
         if decision.rewritten_task is None or decision.target_id is None:
             return None
@@ -1821,17 +2788,18 @@ class TaskInterceptor:
             )
             return None
 
-        target_status = str(target.get('status', '') or '')
-        if target_status in {'done', 'cancelled'}:
-            logger.warning(
-                'combine-guard: target %s has terminal status %r — aborting '
-                'combine to avoid silently losing candidate work',
-                decision.target_id,
-                target_status,
-            )
-            return None
-
         target_title = str(target.get('title', '') or '')
+
+        # ── Guard: the decision must be aimed at the task it named ──
+        # Ordered FIRST, ahead of the eligibility check, precisely because the
+        # eligibility refusal is AUDITED. A mismatched fingerprint means the
+        # curator targeted the wrong row, so this row's status/title/
+        # description describe a task that was never the intended target;
+        # auditing it as an eligibility refusal would write an actively
+        # misleading old.* record AND contaminate the refusal-rate metric
+        # with a separate population (mis-targeting, not raced-target).
+        # Refusing here keeps the audited population exactly "decisions that
+        # found their target but arrived too late" (task 4035).
         expected_fp = normalize_title(target_title)
         got_fp = normalize_title(decision.target_fingerprint or '')
         if not got_fp or expected_fp != got_fp:
@@ -1841,6 +2809,130 @@ class TaskInterceptor:
                 decision.target_id,
                 target_title[:80],
                 (decision.target_fingerprint or '')[:80],
+            )
+            return None
+
+        # ── Guard: the target must still be combine-ELIGIBLE right now ──
+        # Shared with the curator's selection snapshot (task_curator's
+        # is_combine_eligible_status) so the two cannot drift apart again —
+        # the hand-copied `status == 'pending'` that used to live here as
+        # `in {'done','cancelled'}` let 20.2% of combines rewrite targets
+        # that had moved on since selection (task 4035).
+        target_status = str(target.get('status', '') or '')
+        # Present-and-non-blank, NOT `is not None`: a blank/whitespace
+        # claimant is this codebase's spelling for "unclaimed"
+        # (shared/task_claimant.py; live_task_write_guard.has_live_claimant),
+        # and .get() keeps it safe on a row with no such key at all.
+        #
+        # Deliberately WEAKER than shared.task_claimant.has_live_claimant:
+        # this checks only that a claimant STAMP is present, not that its
+        # heartbeat is fresh, so a stale stamp left by a hard-crashed run
+        # also refuses. That is the conservative direction (refusing degrades
+        # to create, which loses no work), and reading heartbeat_at against a
+        # configured TTL here would put a liveness policy in the combine path
+        # that the selection snapshot cannot mirror. Do not describe this as
+        # a "live" claimant — it is not that check.
+        target_claimant = target.get('claimant_run_id')
+        target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
+
+        if not is_combine_eligible_status(target_status):
+            refused_reason = COMBINE_REFUSED_NOT_PENDING
+            logger.warning(
+                'combine-guard: target %s is not combine-eligible (status=%r) — '
+                'aborting combine to avoid silently losing candidate work',
+                decision.target_id,
+                target_status,
+            )
+        elif target_is_claimed:
+            # Status alone has the same TOCTOU shape one level down: a target
+            # can read 'pending' at the check above and be dispatched a moment
+            # later. The claimant rides along on the dict already re-read
+            # above, so this closes the inner window at no extra I/O.
+            refused_reason = COMBINE_REFUSED_CLAIMED
+            logger.warning(
+                'combine-guard: target %s carries a claimant stamp — aborting '
+                'combine to avoid rewriting a task under an agent that may '
+                'still be running',
+                decision.target_id,
+            )
+        else:
+            refused_reason = None
+
+        if refused_reason is not None:
+            # Audit the refusal so it is COUNTABLE, not merely logged: a
+            # refusal rate cannot be computed from success records alone. The
+            # old.* fields come from the live re-read above — and, thanks to
+            # the fingerprint guard ABOVE, they always describe the task the
+            # curator actually meant to combine into. The new.* fields record
+            # the rewrite that was averted.
+            _append_combine_audit(
+                project_id=project_id,
+                target_id=decision.target_id,
+                old_title=target_title,
+                old_description=str(target.get('description', '') or ''),
+                old_status=target_status,
+                new_title=rt.title,
+                new_description=rt.description,
+                justification=decision.justification,
+                refused_reason=refused_reason,
+            )
+            return None
+
+        # ONE read of the target's stored metadata blob, shared by the guard's
+        # verdict below and by the wording that explains it: both must be
+        # derived from the same bytes, or the log could name a cause the
+        # refusal that actually fired did not have.
+        target_metadata = target.get('metadata')
+
+        # ── Guard: never absorb a gated CANDIDATE into an ungated target ──
+        # metadata_mode='merge' fixes the target-side loss only; the
+        # candidate's metadata is never written anywhere by this path, so a
+        # human decision gate folded into ordinary agent work would still
+        # lose its gate status and be dispatched to an architect.
+        #
+        # Refuse rather than propagate the candidate's markers onto the
+        # target: the pure-gate stamp is task_kind='deterministic' +
+        # always_escalates=True with before_done DELETED, but under shallow
+        # merge a before_done already on the target SURVIVES (the incoming
+        # blob carries no such key), so propagation could construct exactly
+        # the combination deterministic_task_guard invariant 6 rejects.
+        # Degrading to create files the gate as its own task, which is the
+        # right conservative outcome for a duplicate human gate.
+        #
+        # Placed before the success-path _append_combine_audit so this refusal
+        # writes no audit record, matching the fingerprint guard above. Only
+        # the ELIGIBILITY guard is audited (task 4035): its refusal rate is
+        # the operational signal being measured, whereas a gate-metadata or
+        # fingerprint refusal means the curator targeted the wrong task —
+        # a decision-quality problem the audit's old-vs-new record does not
+        # help diagnose. Guard ORDER is what keeps those populations apart:
+        # fingerprint runs before eligibility, so a mis-targeted decision
+        # exits above and never lands in the audited count.
+        if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
+            target_metadata
+        ):
+            candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
+            declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
+            # _is_gate_metadata answers False both when the target genuinely
+            # has no gate AND when its metadata blob is unparseable/corrupt
+            # (permissive-on-parse-failure by design). Distinguish the two in
+            # the log text — a shape-level re-check via _parse_metadata_value
+            # (not _extract_metadata_dict, to avoid a second schema_warning
+            # emission for the same blob) is enough. The refuse-and-degrade
+            # decision itself is unchanged either way. Re-checks the SAME
+            # `target_metadata` the condition above consulted, deliberately.
+            target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+            if target_metadata and target_meta is None:
+                target_reason = 'the target metadata could not be read (corrupt/unparseable)'
+            else:
+                target_reason = 'the target does not declare a gate'
+            logger.warning(
+                'combine-guard: candidate declares an escalation gate (%s) but %s '
+                '(target=%s) — aborting combine; a human decision gate must not be '
+                'absorbed into an ungated task. Degrading to create.',
+                declared,
+                target_reason,
+                decision.target_id,
             )
             return None
 
@@ -1879,12 +2971,32 @@ class TaskInterceptor:
                     task_id=decision.target_id,
                     project_root=project_root,
                     metadata=combine_metadata,
-                    # Whole-blob overwrite via the explicit replace co-signal —
-                    # NOT a bare append=False (rejected by the task-2180
-                    # metadata-wipe guard in _resolve_metadata_mode). Behaviour-
-                    # preserving: metadata still resolves to 'replace', and the
-                    # details path stays replace since append is now None (falsy).
-                    metadata_mode='replace',
+                    # Combine MERGES its marker keys into the target's blob; it
+                    # does NOT overwrite the blob. Shallow last-write-wins
+                    # ({**old, **new}, sqlite_task_backend._merge_metadata) keeps
+                    # the three keys above authoritative while everything else
+                    # already on the target survives: the escalation-gate stamp
+                    # (execution_class / operational_mode / task_kind /
+                    # always_escalates / gate_escalated_at) plus source,
+                    # spawned_from, candidate_key, milestone, model_overrides, …
+                    #
+                    # Task 3446: under the previous 'replace' this write deleted
+                    # every pre-existing key. Task 3426 ("Human gate: …") was
+                    # combined into, silently lost always_escalates=True, and was
+                    # then dispatched to an architect — a human decision gate
+                    # handed to an agent.
+                    #
+                    # Do NOT "restore" 'replace'. It was never a design choice:
+                    # bc4344db10 (task 2751 step-6) mechanically migrated a legacy
+                    # bare append=False onto the explicit co-signal the task-2180
+                    # metadata-wipe guard demands, annotated "Behaviour-
+                    # preserving" — i.e. it inherited the pre-2180 destructive
+                    # default rather than selecting it.
+                    #
+                    # append stays None, so the task-2180 bare-append=False
+                    # rejection in _resolve_metadata_mode is still satisfied and
+                    # the details path is unaffected (append falsy → replace).
+                    metadata_mode='merge',
                     title=rt.title,
                     description=rt.description,
                     details=details_with_files,
@@ -1953,6 +3065,34 @@ class TaskInterceptor:
         if warnings:
             _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
         return parsed
+
+    @staticmethod
+    def _is_gate_metadata(metadata: Any) -> bool:
+        """True when *metadata* declares an escalation gate (task 3446).
+
+        Normalises through :meth:`_extract_metadata_dict` so a JSON-string
+        blob, a dict, and ``None`` are all handled by the one shared shape
+        policy — never a hand-rolled ``json.loads``. Unparseable or non-dict
+        metadata answers False (ungated): the shape WARNING is already emitted
+        by the helper, and the permissive answer keeps a malformed blob from
+        turning into a hard failure of the combine path.
+
+        The test is VALUE-sensitive, mirroring
+        :mod:`deterministic_task_guard`'s own strictness — it uses
+        ``always_escalates is True`` precisely so non-bool truthy values
+        (``'false'``, ``1``) do NOT satisfy the gate, since ``bool('false')``
+        is True and would silently accept the opposite of the caller's
+        intent. Reading the same keys loosely here would let a task the guard
+        considers ungated be treated as gated (and vice versa).
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if not meta:
+            return False
+        return (
+            meta.get('always_escalates') is True
+            or meta.get('operational_mode') == 'gate'
+            or meta.get('execution_class') == 'operational'
+        )
 
     @staticmethod
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
@@ -2032,6 +3172,8 @@ class TaskInterceptor:
     def _attach_possible_scope_mismatch(
         kwargs: dict[str, Any],
         verdict: PathGuardVerdict,
+        *,
+        source: str = 'prose',
     ) -> None:
         """Attach a ``possible_scope_mismatch`` advisory marker to ``kwargs['metadata']``.
 
@@ -2045,7 +3187,22 @@ class TaskInterceptor:
         Called from :meth:`_path_guard_or_skip`, which runs BEFORE
         ``submit_task`` pops ``kwargs['metadata']`` and serialises it into the
         ticket blob — so this in-place mutation is sufficient to carry the
-        marker onto the created task with no new plumbing.
+        marker onto the task the curator creates from that ticket, when one
+        is created, with no new plumbing.  It does not reach a ``combine``
+        target: :meth:`_execute_combine` merges only the ``curator_*`` keys
+        onto the existing task (task 4159).
+
+        *source* names the PROVENANCE of the finding and is the marker's only
+        discriminator between them: ``'prose'`` (the default, so every
+        pre-existing caller is unchanged byte-for-byte) for the task-2206
+        repo-relative prose hit, ``'soft-signal'`` for the task-3122
+        adjudicator-confirmed fileless finding.  ONE key serves both
+        deliberately: ``possible_scope_mismatch`` is the sole member of
+        ``recon_write_policy.CLEARABLE_ANNOTATION_KEYS``, a frozen-by-default
+        allowlist (task 2684) whose contract is that a NEWLY introduced
+        metadata key stays BLOCKED on terminal tasks until deliberately
+        added — so a second marker key would be silently un-clearable there,
+        and would force every consumer to read two keys where one suffices.
         """
         metadata = kwargs.get('metadata')
         meta = TaskInterceptor._extract_metadata_dict(metadata)
@@ -2063,8 +3220,45 @@ class TaskInterceptor:
         meta['possible_scope_mismatch'] = {
             'matched_paths': list(verdict.matched_paths),
             'suggested_project': verdict.suggested_project,
-            'source': 'prose',
+            'source': source,
         }
+        kwargs['metadata'] = meta
+
+    @staticmethod
+    def _attach_cross_repo_marker(kwargs: dict[str, Any], owner: str) -> None:
+        """Tag ``kwargs['metadata']`` as a cross-repo deliverable (task 3004).
+
+        Set when every declared ``metadata.files`` entry is owned by ONE other
+        project (:meth:`_all_files_foreign_owner` / :func:`all_files_foreign_owner`):
+        the task's own branch is legitimately empty because the deliverable
+        lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
+        :meth:`_attach_possible_scope_mismatch`'s in-place metadata
+        normalisation (None / JSON-string / dict / unparseable via
+        :meth:`_extract_metadata_dict`; malformed input discarded with a
+        WARNING) and, like it, runs inside :meth:`_path_guard_or_skip` BEFORE
+        ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
+        so the in-place write carries the marker with no new plumbing.
+
+        The orchestrator pre-merge narrowing gate reads ``metadata.cross_repo``
+        + ``cross_repo_project`` to route the task to
+        ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
+        touched'.
+        """
+        metadata = kwargs.get('metadata')
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            if metadata is not None:
+                logger.warning(
+                    'cross-repo-marker: non-dict metadata discarded (type=%s); '
+                    'using fresh dict. Original value: %r',
+                    type(metadata).__name__,
+                    metadata,
+                )
+            meta = {}
+        else:
+            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta['cross_repo'] = True
+        meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
 
     async def _check_escalation_idempotency(
@@ -2545,6 +3739,38 @@ class TaskInterceptor:
             'rows': rows,
         }
 
+    async def get_ticket_row(self, ticket_id: str) -> dict | None:
+        """Return the ticket row for ``ticket_id``, or None if it does not exist.
+
+        A PURE READ: no wait, no mutation, no created_at window. It is the
+        existence authority for ``tkt_`` claims in the completion-claim
+        verification gate (task 3142,
+        :mod:`fused_memory.services.completion_claim_gate`).
+
+        Deliberately NOT :meth:`list_tickets`, which the task text named:
+        list_tickets defaults to a 7-day window and requires a project_root, so
+        it would report a genuine but older ticket as absent (a FALSE
+        unverified verdict) and would force a project-scoping choice.
+        :meth:`TicketStore.get` is a primary-key lookup over the single shared
+        ``tickets.db``, so it is window-free, exact and project-agnostic — and
+        the row it returns NAMES its owning ``project_id``, which is what lets
+        a cross-project claim (esc-3085-1 instance (2): a reify agent claiming
+        a dark_factory ticket) be adjudicated without knowing the writer's
+        project.
+
+        Returns None — never raises — when no ticket store is configured, so
+        the ingestion path can map that onto "unresolvable" and tag the episode
+        instead of failing the write.
+        """
+        if self._ticket_store is None:
+            logger.warning(
+                'get_ticket_row: ticket_store not configured; '
+                'existence of ticket %s is unresolvable',
+                ticket_id,
+            )
+            return None
+        return await self._ticket_store.get(ticket_id)
+
     async def cancel_ticket(self, ticket_id: str) -> dict:
         """Cancel a pending curator ticket by ticket_id.
 
@@ -2912,12 +4138,51 @@ class TaskInterceptor:
         curator: Any,  # TaskCurator | None
         curator_degrade_reason: str | None = None,
     ) -> tuple[str, str | None, str | None, dict | None, str | None]:
-        """Execute the drop/combine/create dispatch for one curator decision.
+        """Execute the refuse/drop/combine/create dispatch for one curator decision.
 
         Returns (status, task_id, reason, result_dict, curator_degrade_reason).
         Does NOT call mark_resolved, _signal_ticket_event, journal, or commit —
         those are the caller's responsibility.
+
+        This is the single dispatch chokepoint shared by both worker paths
+        (``_process_add_ticket`` and ``_process_add_tickets_batch_prepared``), so
+        a branch added here is inherited by both.
         """
+        if decision is not None and decision.action == 'refuse':
+            # Deterministic refusal (cancelled-premise blocklist / recon premise
+            # guard): the candidate's premise is dead. Unlike 'drop' — which means
+            # "fold into existing target task N" and needs a target — this creates
+            # NOTHING and must never reach tm.add_task.
+            #
+            # Checked FIRST, ahead of the drop branch, so a refusal carrying a
+            # stray target_id cannot be shadowed into the dedupe path and silently
+            # reported as 'combined'.
+            #
+            # task_id is None so _format_ticket_result omits the key entirely — a
+            # caller therefore cannot mistake a refusal for a creation. That makes
+            # `reason` the only legibility channel reaching the caller (result_json
+            # is deliberately not exposed), so it states outright that no task was
+            # created.
+            logger.info(
+                'ticket %s: curator REFUSED the candidate (no task created): %s',
+                ticket_id, decision.justification,
+            )
+            result_dict = {
+                'id': None,
+                'title': candidate.title if candidate else '',
+                'created': False,
+                'refused': True,
+                'action': 'refuse',
+                'justification': decision.justification,
+            }
+            return (
+                'refused',
+                None,
+                f'refused (no task created): {decision.justification}',
+                result_dict,
+                None,
+            )
+
         if decision is not None and decision.action == 'drop' and decision.target_id:
             # Drop: fold candidate into the existing target task (status='combined').
             # Preserves legacy result shape for the add_task facade.
@@ -2939,7 +4204,14 @@ class TaskInterceptor:
         if decision is not None and decision.action == 'combine' and decision.target_id:
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
-                combine_result = await self._execute_combine(project_root, decision)
+                # candidate_metadata is this ticket's post-inject_operational_routing
+                # submission metadata — the same object stamped by
+                # _inject_deterministic_pure_gate and serialised into tm.add_task
+                # below. _execute_combine reads it to refuse absorbing a gated
+                # candidate into an ungated target (task 3446).
+                combine_result = await self._execute_combine(
+                    project_root, decision, candidate_metadata=metadata,
+                )
             if combine_result is not None:
                 if decision.rewritten_task is not None and curator is not None:
                     rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
@@ -4444,6 +5716,44 @@ _DONE_PROVENANCE_KINDS_TEXT = (
 )
 
 
+# ── Git-probe failure carriers (task 3455) ──────────────────────────────
+#
+# Both git probes used by _validate_done_provenance (_resolve_commit_sha,
+# _verify_commit_on_main) can fail two ways that need OPPOSITE remedies:
+# git ran and affirmatively rejected the input, or the probe never
+# completed (timeout / missing binary / unexpected error). Each returns a
+# NamedTuple whose leading field names that distinction, so the semantics
+# travel with the value instead of living in a call-site variable name.
+# The authoritative branch-by-branch contract is each probe's docstring.
+
+
+class _CommitResolutionFailure(NamedTuple):
+    """`git rev-parse --verify` did not yield a SHA. See _resolve_commit_sha."""
+
+    confirmed_absent: bool
+    reason: str
+
+
+class _AncestorCheckFailure(NamedTuple):
+    """`git merge-base --is-ancestor` did not accept. See _verify_commit_on_main."""
+
+    confirmed_off_main: bool
+    detail: str
+
+
+def _provenance_stamp_now() -> str:
+    """Wall-clock for ``done_provenance.stamped_at`` (task 3576).
+
+    Same convention as the module's other timestamp sites (``reopen_at``,
+    ``combined_at``): ``datetime.now(UTC).isoformat()``. Broken out as a
+    named module-level function purely so tests can monkeypatch it and
+    assert an exact string — here the timestamp IS the artifact under test,
+    so a loose "is parseable / within a range" assertion would let a
+    wrong-timezone or wrong-format regression through.
+    """
+    return datetime.now(UTC).isoformat()
+
+
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -4456,20 +5766,23 @@ async def _validate_done_provenance(
 
     Schema:
         {
-            "kind": "merged" | "found_on_main" | "deterministic-deploy"
-                    | "deterministic-deploy-scheduled" | "operational-verified",
-                                                 # required
+            "kind": <one of shared.task_metadata.DoneProvenance.kind>,
+                                                 # required; that Literal is the
+                                                 # SINGLE source of truth (I2) and
+                                                 # feeds _DONE_PROVENANCE_KINDS_TEXT.
+                                                 # Per-kind table: docs/task-authoring.md
             "commit": <sha-or-ref>,              # required for "merged"/"found_on_main"
-            "note":   <free text>,               # required if kind="found_on_main" or
-                                                 # kind="operational-verified"; optional
-                                                 # for "deterministic-deploy" and
-                                                 # "deterministic-deploy-scheduled"
+            "note":   <free text>,               # required for "found_on_main" and
+                                                 # "operational-verified"; optional
+                                                 # for the deterministic-* kinds
             "pid":    <int>,                     # deterministic-deploy: new MainPID
             "unit":   <str>,                     # deterministic-deploy(-scheduled): target unit name
             "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
             "transient_unit": <str>,             # deterministic-deploy-scheduled: scheduled restart unit
             "fire_delay_secs": <int>,            # deterministic-deploy-scheduled: --on-active delay
-            "escalation_id": <str>,              # required for "operational-verified"
+            "escalation_id": <str>,              # required for "operational-verified";
+                                                 # optional for "deterministic-gate" (cites
+                                                 # the resolving gate escalation)
         }
 
     - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
@@ -4498,6 +5811,17 @@ async def _validate_done_provenance(
       ``transient_unit`` (str) is the scheduled restart unit's name, and
       ``fire_delay_secs`` (int) is its ``--on-active`` delay; ``note`` may
       carry a human-readable annotation (e.g. the crash-resume path).
+    - ``kind="deterministic-gate"``: a PURE deterministic gate (a gate task
+      with no ``before_done`` action) resolved. There is no deploy evidence
+      and no ``commit`` — the kind exists precisely so such a close passes
+      ``require_done_provenance`` without claiming a deploy happened (task
+      2331). ``note`` carries the gate-resolution text and ``escalation_id``
+      may cite the resolving gate escalation. Stamped by DeterministicRunner
+      (deterministic_runner.py), never supplied by hand.
+    - ``kind="deterministic-milestone"``: a ``before_done`` ``kind="predicate"``
+      milestone check exited 0. No ``commit`` is required or expected; ``note``
+      carries a bounded structured verdict summarizing the predicate's stdout.
+      Stamped by DeterministicRunner, never supplied by hand.
     - ``kind="operational-verified"``: the task was a no-code operational ask
       (e.g. a restart/redeploy/confirm) closed out via a resolved escalation
       rather than a code merge or a DeterministicRunner action. No ``commit``
@@ -4534,8 +5858,8 @@ async def _validate_done_provenance(
             'set_task_status(%s, done) called without done_provenance; '
             'Stage-2 reconciliation will treat this task as provenance-unknown. '
             'Pass done_provenance={"kind": "merged", "commit": "..."} or '
-            '{"kind": "found_on_main", "note": "..."} to record verified '
-            'evidence.',
+            '{"kind": "found_on_main", "commit": "...", "note": "..."} to '
+            'record verified evidence.',
             task_id,
         )
         return None, None
@@ -4571,17 +5895,15 @@ async def _validate_done_provenance(
     if kind is None:
         return _done_provenance_error(
             task_id,
-            'done_provenance.kind is required (must be "merged", '
-            '"found_on_main", "deterministic-deploy", or '
-            '"deterministic-deploy-scheduled"). Use kind="merged" '
-            'with commit=<merge-sha> after a successful merge_request, '
-            'kind="found_on_main" with note=<explanation> when the '
-            'implementation is already on main from a sibling task, '
-            'kind="deterministic-deploy" for a cross-unit service-restart '
-            'deploy (no commit required), or '
-            'kind="deterministic-deploy-scheduled" for an own-unit '
-            'self-restart that was scheduled but not yet verified (no '
-            'commit required).',
+            f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
+            'Use kind="merged" with commit=<merge-sha> after a successful '
+            'merge_request; kind="found_on_main" with commit=<sha> and '
+            'note=<explanation> when the implementation is already on main '
+            'from a sibling task; or kind="operational-verified" with '
+            'escalation_id=<id> and note=<text> for a no-code operational ask '
+            'closed via a resolved escalation. The deterministic-* kinds are '
+            'stamped by DeterministicRunner, not supplied by hand — see the '
+            'per-kind table in docs/task-authoring.md.',
         ), None
     if kind not in _DONE_PROVENANCE_KINDS:
         return _done_provenance_error(
@@ -4594,7 +5916,10 @@ async def _validate_done_provenance(
             task_id,
             'done_provenance with kind="merged" requires commit=<sha-or-ref> '
             '(the merge commit on main). Use kind="found_on_main" instead '
-            'when no single commit applies.',
+            'when this branch did not supply the merge but the work is '
+            'already on main under a different commit — it also requires '
+            'commit=<sha-or-ref> (ancestor-checked) plus note=<explanation> '
+            'citing the impl-providing task/commit.',
         ), None
     if kind == 'found_on_main' and commit_input is None:
         return _done_provenance_error(
@@ -4636,11 +5961,13 @@ async def _validate_done_provenance(
     resolved: dict = {'kind': kind}
     if commit_input is not None:
         sha_or_err = await _resolve_commit_sha(project_root, commit_input)
-        if isinstance(sha_or_err, dict):
+        if isinstance(sha_or_err, _CommitResolutionFailure):
+            # Only a git-issued rejection is a "not found" verdict; see
+            # _resolve_commit_sha for the branch-by-branch contract.
+            verb = 'not found in' if sha_or_err.confirmed_absent else 'could not be resolved in'
             return _done_provenance_error(
                 task_id,
-                f'commit {commit_input!r} not found in {project_root}: '
-                f'{sha_or_err.get("reason", "rev-parse failed")}',
+                f'commit {commit_input!r} {verb} {project_root}: {sha_or_err.reason}',
             ), None
         resolved['commit'] = sha_or_err
         if sha_or_err != commit_input:
@@ -4649,15 +5976,26 @@ async def _validate_done_provenance(
         # 'found_on_main' are validated identically; they differ only in
         # audit semantics).  Unknown kinds are rejected by the early-return
         # above, so this check is always reached for any valid kind.
-        ancestor_err = await _verify_commit_on_main(project_root, sha_or_err)
-        if ancestor_err is not None:
+        ancestor_result = await _verify_commit_on_main(project_root, sha_or_err)
+        if ancestor_result is not None:
+            # rc=1 is the only confirmed off-main verdict; every other
+            # failure is NOT-YET-CONFIRMED and carries the opposite remedy.
+            # See _verify_commit_on_main for the full contract.
+            prefix = (
+                'is not on main'
+                if ancestor_result.confirmed_off_main
+                else 'could not be confirmed on main'
+            )
             return _done_provenance_error(
                 task_id,
-                f'kind={kind!r} but commit {sha_or_err} is not on main: {ancestor_err}.',
+                f'kind={kind!r} but commit {sha_or_err} {prefix}: {ancestor_result.detail}.',
             ), None
     if note is not None:
         resolved['note'] = note
-    if kind == 'operational-verified':
+    if kind in ('operational-verified', 'deterministic-gate') and escalation_id is not None:
+        # Required (and already validated non-None above) for
+        # 'operational-verified'; optional for 'deterministic-gate', which
+        # may cite the resolving gate escalation but need not (task 2331).
         resolved['escalation_id'] = escalation_id
 
     if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
@@ -4695,13 +6033,69 @@ async def _validate_done_provenance(
         if isinstance(fire_delay_secs, int):
             resolved['fire_delay_secs'] = fire_delay_secs
 
+    if kind == 'found_on_main':
+        # THE SINGLE WRITE SITE for done_provenance.stamped_at (task 3576).
+        #
+        # Every found_on_main producer funnels through this function: the
+        # fresh-done path (_apply_status_transition), the same-status repair
+        # seam (_repair_done_provenance_same_status), agent-authored
+        # set_task_status calls, and the orchestrator's
+        # Scheduler.mark_done(kind='found_on_main', ...) which reaches here
+        # via set_task_status. So no producer-side change is needed, and no
+        # future producer can forget to stamp. That matters: this defect
+        # class's history (1087 -> 1091 -> 1180 -> 2372 -> 2500 -> 2648 ->
+        # 2787 -> 2794 -> 3057) is a chain of point fixes each reopened by an
+        # unguarded seam the previous fix missed.
+        #
+        # Scoped to found_on_main deliberately — it is the
+        # attribution-by-inference kind the soak gate watches. `merged`
+        # already carries independent landing evidence (merge-queue journal +
+        # is_ancestor + commit citation), and stamping it would perturb the
+        # exact-equality merged-kind assertions across the existing suites
+        # for no benefit.
+        #
+        # A caller-supplied value is DISCARDED with a warning rather than
+        # rejected. Rejection would break the same-status repair seam:
+        # _repair_done_provenance_same_status re-submits a previously-stored
+        # blob, which post-3576 carries its own stamped_at, so a hard reject
+        # would fail every repair of an already-stamped blob. Refreshing on
+        # repair is also the correct semantics — a repair is a fresh
+        # assertion of the attribution, and a repair that leaves the task
+        # still misattributed SHOULD re-enter the gate window. The warning
+        # keeps the override visible rather than silent.
+        supplied_stamp = raw.get('stamped_at')
+        if supplied_stamp is not None:
+            logger.warning(
+                'done_provenance.stamped_at is server-generated; discarding '
+                'caller-supplied value %r for task %s',
+                supplied_stamp,
+                task_id,
+            )
+        resolved['stamped_at'] = _provenance_stamp_now()
+
     return None, resolved
 
 
-async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
+async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckFailure | None:
     """Verify ``sha`` is reachable from ``main`` via ``merge-base --is-ancestor``.
 
-    Returns None on success (commit is on main), or a reason string on failure.
+    Returns None on success (commit is on main). On failure, returns an
+    :class:`_AncestorCheckFailure`:
+
+    - ``confirmed_off_main=True`` only for rc=1 — git affirmatively
+      determined ``sha`` is NOT reachable from ``main``. This is the only
+      case that actually means "not on main", and the only one whose
+      remedy is to re-derive the landing SHA.
+    - ``confirmed_off_main=False`` for every other failure (a non-1 git
+      error such as an unresolvable ``main`` ref, a timeout, a missing git
+      binary, or any unexpected exception) — the check never completed, so
+      the caller must treat it as NOT-YET-CONFIRMED rather than a
+      not-on-main verdict. The remedy there is the opposite one: fetch /
+      fix the checkout / retry. Task 3455: conflating the two under a
+      single "is not on main" wording is the same defect class as task
+      3119's premature outcome assertions. Any failure branch added later
+      inherits ``False``, i.e. the weaker (honest) claim, by default.
+
     Used as a backstop for kind="merged" provenance so that a SHA from a
     feature branch cannot pass as a merge commit.
     """
@@ -4721,11 +6115,11 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except TimeoutError:
             proc.kill()
-            return 'git merge-base timed out'
+            return _AncestorCheckFailure(False, 'git merge-base timed out')
     except FileNotFoundError:
-        return 'git binary not found'
+        return _AncestorCheckFailure(False, 'git binary not found')
     except Exception as e:
-        return f'{type(e).__name__}: {e}'
+        return _AncestorCheckFailure(False, f'{type(e).__name__}: {e}')
 
     # Exit codes from `git merge-base --is-ancestor`:
     #   0 — sha is reachable from main
@@ -4734,15 +6128,28 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
     if proc.returncode == 0:
         return None
     if proc.returncode == 1:
-        return 'commit is not an ancestor of main'
+        return _AncestorCheckFailure(True, 'commit is not an ancestor of main')
     msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
-    return msg
+    return _AncestorCheckFailure(False, msg)
 
 
-async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
+async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitResolutionFailure:
     """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
 
-    Returns the SHA on success or a ``{'reason': ...}`` dict on failure.
+    Returns the SHA on success, or a :class:`_CommitResolutionFailure` whose
+    ``confirmed_absent`` flag says whether git actually rendered a verdict
+    (task 3455, mirroring :func:`_verify_commit_on_main`):
+
+    - ``confirmed_absent=True`` for a non-zero rev-parse exit — git ran,
+      evaluated the ref against this checkout, and rejected it. Only then
+      may the caller say the commit was "not found in <project_root>".
+    - ``confirmed_absent=False`` for a timeout, a missing git binary, an
+      unexpected exception, or empty output on rc=0 — rev-parse never
+      rendered a verdict on the ref, so the honest report is "could not be
+      resolved", with the same fetch / fix-the-checkout / retry remedy as
+      an unconfirmed ancestor check. Any failure branch added later
+      inherits ``False``, i.e. the weaker claim, by default.
+
     Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
     commit resolves to the commit SHA directly.
     """
@@ -4761,18 +6168,18 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except TimeoutError:
             proc.kill()
-            return {'reason': 'git rev-parse timed out'}
+            return _CommitResolutionFailure(False, 'git rev-parse timed out')
     except FileNotFoundError:
-        return {'reason': 'git binary not found'}
+        return _CommitResolutionFailure(False, 'git binary not found')
     except Exception as e:
-        return {'reason': f'{type(e).__name__}: {e}'}
+        return _CommitResolutionFailure(False, f'{type(e).__name__}: {e}')
 
     if proc.returncode != 0:
         msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'no such ref'
-        return {'reason': msg}
+        return _CommitResolutionFailure(True, msg)
     sha = stdout.decode('utf-8', errors='replace').strip()
     if not sha or len(sha) < 7:
-        return {'reason': 'empty rev-parse output'}
+        return _CommitResolutionFailure(False, 'empty rev-parse output')
     return sha
 
 
@@ -5284,6 +6691,16 @@ def _combine_audit_path() -> Path:
     return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
 
 
+# Refusal-reason vocabulary for the combine audit (task 4035). Two stable
+# coarse tokens, deliberately NOT one per status: an operator greps these to
+# compute the refusal rate, while the record's own old.status field supplies
+# the per-status breakdown for free. A token per status would make this
+# vocabulary track the status enum and force a consumer update every time a
+# status is added.
+COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
+COMBINE_REFUSED_CLAIMED = 'target_claimed'
+
+
 def _append_combine_audit(
     *,
     project_id: str,
@@ -5294,8 +6711,19 @@ def _append_combine_audit(
     new_title: str,
     new_description: str,
     justification: str,
+    refused_reason: str | None = None,
 ) -> None:
-    """Append a one-line JSON record documenting an about-to-happen combine.
+    """Append a one-line JSON record documenting a combine.
+
+    Records both about-to-happen combines (``refused_reason=None``) and
+    REFUSED ones (task 4035) — an operator cannot compute a refusal rate from
+    success records alone. When *refused_reason* is None the emitted record is
+    byte-for-byte the historical shape, so existing records stay parseable and
+    ``rec.get('refused_reason')`` cleanly partitions refusal from success.
+
+    The ``new`` block is populated on a refusal too: it records the title and
+    description that would have overwritten the target, which is precisely the
+    work that was almost lost.
 
     Append-only, best-effort. Failures log WARN but never propagate —
     a flaky audit write should not block task-merge progress.
@@ -5316,6 +6744,8 @@ def _append_combine_audit(
         },
         'justification_truncated': justification[:500],
     }
+    if refused_reason is not None:
+        record['refused_reason'] = refused_reason
     path = _combine_audit_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -5327,3 +6757,42 @@ def _append_combine_audit(
             target_id,
             exc,
         )
+
+
+def _consolidation_not_closed_error(
+    task_id: str,
+    *,
+    topic: str,
+    reasons: list[dict],
+    waived: list[dict] | None = None,
+    message: str = '',
+) -> dict:
+    """Structured error returned when the consolidation-closure gate trips.
+
+    Mirrors :func:`_terminal_exit_error` / :func:`_done_gate_error` in shape so
+    MCP callers handle the rejection uniformly. The ``'error'`` key is
+    MANDATORY, not decorative: the CSV branch computes ``all_ok`` from
+    ``r['result'].get('error') is None``, so a refusal lacking it would be
+    reported to the caller as a SUCCESS.
+    """
+    return {
+        'success': False,
+        'error': 'consolidation_not_closed',
+        'task_id': task_id,
+        'topic': topic,
+        'reasons': reasons,
+        'waived': waived or [],
+        'message': message,
+        'hint': (
+            f'This consolidation gate cannot be closed while the live '
+            f'`metadata.topic={topic!r}` cluster is not in the Option-C end '
+            'state (N short single-claim peers, exactly one `canonical: true`, '
+            'nothing claimed in `supersedes` still live). Surviving same-topic '
+            'PEERS are never the problem — see `reasons` for the offending '
+            'ids. Run `scripts/check_consolidation_closure.py` to reproduce '
+            'this verdict by hand. If a flagged live entry was considered and '
+            f'deliberately kept, record it under `metadata.{GATE_METADATA_KEY}'
+            ".considered_and_kept` as {id, note, recorded_at, recorded_by} — "
+            'the note is mandatory.'
+        ),
+    }

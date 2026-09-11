@@ -14,7 +14,6 @@ import argparse
 import fcntl
 import json
 import logging
-import os
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from shared import safe_io
 from shared.safe_io import load_json_or_warn
 
 from orchestrator.stop_instruction import detect_stop_instruction
@@ -114,15 +114,21 @@ def _load_state(path: Path) -> dict[str, Any]:
 
 
 def _save_state(path: Path, state: dict[str, Any]) -> None:
-    """Atomically write *state* to *path* (tmp + os.replace).
+    """Atomically write *state* to *path*.
 
-    Modelled on digest.py:482 — writes to a sibling .tmp file then
-    os.replace so the file is never partially written.
+    ``mode`` is deliberately left at the helper's umask default rather than
+    narrowed: this file is read by other processes.
+
+    Exceptions propagate — this site has no fail-open boundary, and callers
+    hold ``_locked_state`` around the read-modify-write, so a silent write
+    failure would drop a charge or launch record.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(state), encoding='utf-8')
-    os.replace(str(tmp), str(path))
+    safe_io.atomic_write_text(
+        path,
+        json.dumps(state),
+        encoding='utf-8',
+        mkdir=True,
+    )
 
 
 @contextmanager

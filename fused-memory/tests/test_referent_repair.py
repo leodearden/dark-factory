@@ -1,0 +1,2458 @@
+"""The write-time referent REPAIR path (task 3672, PRD leaf eta of
+plans/memory-referent-fidelity-prd.md).
+
+Leaf zeta (task 3671) detects and records: it walks a committed episode's edges
+and produces structured `ReferentFinding`s naming every edge END that landed on
+a node the write was not about.  It performs no writes at all.  This leaf is the
+only WRITER: it consumes zeta's `ReferentStats` inside the same identity-lock
+critical section and repairs each resolvable finding with
+
+    ensure_entity_node  ->  reassign_edge  ->  refresh_entity_summary
+
+plus two harvested edge cases (a degenerate both-ends-on-one-node edge is
+skipped WHOLE; a node this pass emptied and that parses as a canonical task
+label is deleted), and the INV-4 consecutive-repair-streak escalation.
+
+NEVER GUESS is the structural default, inherited from zeta: a finding whose
+correct target could not be determined is RECORDED and LEFT ALONE.  `'failed'`
+is a THIRD disposition, distinct from both — "we tried and the backend did not
+cooperate" is an infrastructure signal, not a refusal to guess, and conflating
+them would let a FalkorDB outage read as a scanner regression.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import json
+import logging
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from _fm_helpers import install_identity_mocks
+from test_referent_verification import _WRITE_PRIMITIVES, assert_never_repaired
+
+from fused_memory.backends.graphiti_client import ActiveEdgesError, EdgeNotFoundError
+from fused_memory.services.memory_service import (
+    REFERENT_REPAIR_OUTCOMES,
+    MemoryService,
+    ReconcileStats,
+    ReferentFinding,
+    ReferentRepair,
+    ReferentRepairStats,
+    ReferentStats,
+)
+from fused_memory.utils import canonical_labels
+from fused_memory.utils.canonical_labels import Referent
+
+
+def _repair(**overrides) -> ReferentRepair:
+    """A minimally-valid repair record; overrides tune whichever field a test pins."""
+    # Annotated because the literal below is all-str: without it the inferred
+    # `dict[str, str]` rejects the `**fields` unpack for `ReferentRepair`'s
+    # bool and tuple fields, which only ever arrive via *overrides*.
+    fields: dict[str, Any] = {
+        'edge_uuid': 'e1',
+        'which_end': 'source',
+        'outcome': 'repaired',
+        'old_endpoint_uuid': 'n-3129',
+        'check': 'set-membership',
+    }
+    fields.update(overrides)
+    return ReferentRepair(**fields)
+
+
+class TestReferentRepairRecordVocabulary:
+    """INV-2: repairs are STRUCTURED RECORDS, not a log line."""
+
+    def test_outcome_vocabulary_is_closed_and_exactly_the_four_dispositions(self):
+        """The single normative site for "what happened to this finding"."""
+        assert REFERENT_REPAIR_OUTCOMES == (
+            'repaired', 'unrepairable', 'degenerate', 'failed',
+        )
+
+    def test_required_fields_construct_and_defaults_are_inert(self):
+        record = _repair()
+
+        assert record.edge_uuid == 'e1'
+        assert record.which_end == 'source'
+        assert record.outcome == 'repaired'
+        assert record.old_endpoint_uuid == 'n-3129'
+        assert record.check == 'set-membership'
+        # Every optional field defaults to "nothing happened", so a record
+        # never claims a write it did not perform.
+        assert record.new_endpoint_uuid == ''
+        assert record.intended_referent == ''
+        assert record.minted is False
+        assert record.moved is False
+        assert record.summaries_refreshed == ()
+        assert record.deleted_emptied_node == ''
+        assert record.reason == ''
+
+    def test_is_keyword_only(self):
+        """Positional construction of a twelve-field evidence record is how a
+        field silently lands in the wrong slot."""
+        with pytest.raises(TypeError):
+            ReferentRepair('e1', 'source', 'repaired')  # type: ignore[misc]
+
+    def test_is_frozen(self):
+        """A repair record is evidence for DESTRUCTIVE edge surgery — a
+        consumer must not be able to rewrite which edge end it names."""
+        record = _repair()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            record.outcome = 'unrepairable'  # type: ignore[misc]
+
+    def test_summaries_refreshed_is_a_tuple_not_a_list(self):
+        """`frozen=True` blocks attribute REBINDING only — a list field would
+        leave `record.summaries_refreshed.append(...)` open, letting a consumer
+        quietly widen the evidence of what this pass actually refreshed."""
+        record = _repair(summaries_refreshed=('n-3129', 'n-3127'))
+        assert isinstance(record.summaries_refreshed, tuple)
+
+    @pytest.mark.parametrize('outcome', list(REFERENT_REPAIR_OUTCOMES))
+    def test_every_registered_outcome_constructs(self, outcome):
+        assert _repair(outcome=outcome).outcome == outcome
+
+    def test_an_unregistered_outcome_raises_naming_the_vocabulary(self):
+        """Exactly as `ReferentFinding.__post_init__` does for `check`: a
+        disposition no consumer can key off must not be recordable."""
+        with pytest.raises(ValueError) as exc:
+            _repair(outcome='partially-repaired')
+        message = str(exc.value)
+        assert 'partially-repaired' in message
+        for registered in REFERENT_REPAIR_OUTCOMES:
+            assert registered in message
+
+    def test_to_dict_is_json_safe_and_keyed_by_field_names(self):
+        record = _repair(
+            new_endpoint_uuid='n-3127',
+            intended_referent='Task 3127',
+            minted=True,
+            moved=True,
+            summaries_refreshed=('n-3129', 'n-3127'),
+            deleted_emptied_node='n-3129',
+            reason='',
+        )
+        payload = record.to_dict()
+
+        assert payload == {
+            'edge_uuid': 'e1',
+            'which_end': 'source',
+            'outcome': 'repaired',
+            'old_endpoint_uuid': 'n-3129',
+            'new_endpoint_uuid': 'n-3127',
+            'intended_referent': 'Task 3127',
+            'check': 'set-membership',
+            'minted': True,
+            'moved': True,
+            'summaries_refreshed': ['n-3129', 'n-3127'],
+            'deleted_emptied_node': 'n-3129',
+            'reason': '',
+        }
+        # The tuple renders as a LIST — the escalation detail carries this
+        # verbatim through `json.dumps`, and a tuple is not JSON.
+        assert isinstance(payload['summaries_refreshed'], list)
+        json.dumps(payload)
+
+
+class TestReferentRepairStats:
+    """The counts are @property comprehensions, never stored fields, so they
+    CANNOT drift from the list they summarize."""
+
+    def test_an_empty_stats_reports_every_count_as_zero(self):
+        stats = ReferentRepairStats()
+
+        assert stats.repairs == []
+        assert stats.repaired == 0
+        assert stats.flagged_unrepairable == 0
+        assert stats.degenerate_edges == 0
+        assert stats.failed == 0
+        assert stats.nodes_minted == 0
+        assert stats.nodes_deleted == 0
+
+    def test_repaired_counts_only_records_that_actually_moved_an_endpoint(self):
+        """A `moved=False` result is `reassign_edge`'s own corroborate-before-
+        acting no-op — the edge was ALREADY correct, which is the opposite of a
+        repair, and must never feed the storm streak."""
+        stats = ReferentRepairStats(repairs=[
+            _repair(edge_uuid='e1', moved=True),
+            _repair(edge_uuid='e2', moved=False),
+        ])
+        assert stats.repaired == 1
+
+    def test_unrepairable_and_degenerate_share_one_flagged_bucket(self):
+        """The task's NEVER GUESS rule assigns both the same disposition —
+        recorded and left alone — so the operator reads one number for
+        "we refused to act"."""
+        stats = ReferentRepairStats(repairs=[
+            _repair(edge_uuid='e1', outcome='unrepairable'),
+            _repair(edge_uuid='e2', outcome='degenerate'),
+            _repair(edge_uuid='e2', outcome='degenerate'),
+        ])
+        assert stats.flagged_unrepairable == 3
+
+    def test_degenerate_edges_counts_EDGES_not_findings(self):
+        """A degenerate edge produces one record per END; the operator's
+        question is "how many edges did we skip whole"."""
+        stats = ReferentRepairStats(repairs=[
+            _repair(edge_uuid='e1', which_end='source', outcome='degenerate'),
+            _repair(edge_uuid='e1', which_end='target', outcome='degenerate'),
+            _repair(edge_uuid='e2', which_end='source', outcome='degenerate'),
+            _repair(edge_uuid='e2', which_end='target', outcome='degenerate'),
+        ])
+        assert stats.degenerate_edges == 2
+        assert stats.flagged_unrepairable == 4
+
+    def test_failed_is_a_third_disposition_counted_separately(self):
+        """"We tried and the backend did not cooperate" is an infrastructure
+        signal — never folded into the NEVER-GUESS bucket."""
+        stats = ReferentRepairStats(repairs=[
+            _repair(edge_uuid='e1', outcome='failed', reason='falkor down'),
+            _repair(edge_uuid='e2', outcome='unrepairable'),
+        ])
+        assert stats.failed == 1
+        assert stats.flagged_unrepairable == 1
+        assert stats.repaired == 0
+
+    def test_nodes_minted_and_nodes_deleted_are_derived_from_the_records(self):
+        stats = ReferentRepairStats(repairs=[
+            _repair(edge_uuid='e1', minted=True, moved=True,
+                    deleted_emptied_node='n-3129'),
+            _repair(edge_uuid='e2', minted=False, moved=True),
+        ])
+        assert stats.nodes_minted == 1
+        assert stats.nodes_deleted == 1
+
+    def test_nodes_deleted_counts_DISTINCT_nodes(self):
+        """Two repairs moving endpoints off the same node produce one
+        deletion, stamped onto both records."""
+        stats = ReferentRepairStats(repairs=[
+            _repair(edge_uuid='e1', moved=True, deleted_emptied_node='n-3129'),
+            _repair(edge_uuid='e2', moved=True, deleted_emptied_node='n-3129'),
+        ])
+        assert stats.nodes_deleted == 1
+
+
+class TestReconcileStatsCarriesTheRepairRecord:
+    """The aggregate the reconcile chain returns grows an eta field alongside
+    zeta's, so a caller reads detection AND repair off one object."""
+
+    def test_repair_stats_defaults_to_an_empty_instance(self):
+        stats = ReconcileStats()
+        assert isinstance(stats.repair_stats, ReferentRepairStats)
+        assert stats.repair_stats.repairs == []
+
+    def test_the_default_is_per_instance_not_shared(self):
+        """A mutable default shared across instances would let one episode's
+        repairs show up on another's audit record."""
+        first = ReconcileStats()
+        second = ReconcileStats()
+        first.repair_stats.repairs.append(_repair())
+        assert second.repair_stats.repairs == []
+
+
+# ---------------------------------------------------------------------------
+# The repair sequence: ensure_entity_node -> reassign_edge -> refresh_entity_summary
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def service(mock_config):
+    """MemoryService with fully-mocked backends.
+
+    `install_identity_mocks` is REQUIRED, not decorative: the end-to-end wiring
+    test drives `_execute_graphiti_write`, which wraps its critical section in
+    `async with self.graphiti._identity_lock_for(...)`, which a bare MagicMock
+    cannot satisfy — and alpha's `ensure_entity_node` LOCK CONTRACT is the
+    thing that section exists to honour.
+    """
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    svc.graphiti.add_episode = AsyncMock(return_value=None)
+    svc.graphiti._require_client = MagicMock()
+    svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+    for name in _WRITE_PRIMITIVES:
+        setattr(svc.graphiti, name, AsyncMock(return_value=None))
+    svc.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+    svc.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+    svc.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+    svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    # `0` keeps the established positive path deleting exactly as it did before
+    # the fourth condition existed. It must be an explicit AsyncMock: without
+    # it the attribute autospecs to a truthy MagicMock that cannot be awaited,
+    # and every deletion test in this file breaks on the await rather than on
+    # anything it means to assert.
+    svc.graphiti.count_foreign_relationships = AsyncMock(return_value=0)
+    svc.graphiti.delete_entity = AsyncMock(return_value={})
+    install_identity_mocks(svc.graphiti)
+    return svc
+
+
+def _finding(**overrides) -> ReferentFinding:
+    """A RESOLVABLE finding — eta's common case. Overrides tune what a test pins."""
+    fields = {
+        'edge_uuid': 'e1',
+        'which_end': 'source',
+        'check': 'set-membership',
+        'old_endpoint_uuid': 'n-3129',
+        'old_endpoint_name': 'Task 3129',
+        'endpoint_referent': Referent(number='3129'),
+        'referent_set': ('Task 3127',),
+        'intended_referent': Referent(number='3127'),
+        'new_endpoint_uuid': 'n-3127',
+        'resolvable': True,
+    }
+    fields.update(overrides)
+    return ReferentFinding(**fields)
+
+
+def _stats(*findings, endpoints_checked: int | None = None) -> ReferentStats:
+    """zeta's return value, carrying *findings*.
+
+    `endpoints_checked` defaults to the finding count so the INV-4 "did we
+    actually look" question has a truthful answer without every test spelling
+    it; a test pinning the checked-nothing arm passes 0 explicitly.
+    """
+    stats = ReferentStats(
+        edges_scanned=len({f.edge_uuid for f in findings}),
+        endpoints_checked=(
+            len(findings) if endpoints_checked is None else endpoints_checked
+        ),
+    )
+    stats.findings.extend(findings)
+    return stats
+
+
+def _reassigned(**overrides) -> dict:
+    """`reassign_edge`'s audit dict, defaulting to a real move whose internal
+    summary refresh SUCCEEDED for both affected endpoints (the ~100% path)."""
+    payload = {
+        'uuid': 'e1',
+        'which_end': 'source',
+        'old_endpoint_uuid': 'n-3129',
+        'new_endpoint_uuid': 'n-3127',
+        'unchanged_endpoint_uuid': 'n-other',
+        'moved': True,
+        'refreshed_nodes': ['n-3129', 'n-3127'],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestTheEpisodeIdentityParameter:
+    """`episode_uuid` is keyword-only and defaults to `''` — the fail-closed one.
+
+    The pass needs the identity of the episode whose write is in flight because
+    the emptied-node cleanup's guard claims to distinguish "MINTED by this very
+    episode out of the mis-resolved reference alone" from "the project GENUINELY
+    OWNS the task", and until now it had no datum capable of making that
+    distinction — it inferred mintedness from valid-edge emptiness, a different
+    and much weaker proposition.
+
+    Keyword-only and DEFAULTED so the change is additive: every direct-call test
+    in this file keeps working unchanged, and anything that forgets to thread it
+    degrades to the STRICTER predicate, never a looser one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_positional_misuse_is_rejected(self, service):
+        """Keyword-only-ness pinned EXECUTABLY, not by reading the signature
+        object: a caller that tries to pass the identity positionally is
+        refused outright rather than silently binding it to ``group_id``."""
+        with pytest.raises(TypeError):
+            await service._repair_episode_referents(
+                _stats(_finding()), 'dark_factory', 'ep-1',
+            )
+
+    @pytest.mark.asyncio
+    async def test_omitting_it_still_repairs_exactly_as_before(self, service):
+        """The additive-ness pinned directly: the repair sequence is unchanged
+        by the new parameter's absence."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        assert stats.repaired == 1
+
+
+class TestTheRepairSequence:
+    """ensure_entity_node THEN reassign_edge, in that order, per resolvable finding."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_then_reassign_in_order_with_the_contract_arguments(
+        self, service,
+    ):
+        """The mint step graphiti_core will never do for us, then the lossless
+        endpoint move — ORDER pinned, not just arguments."""
+        manager = MagicMock()
+        manager.attach_mock(service.graphiti.ensure_entity_node, 'ensure_entity_node')
+        manager.attach_mock(service.graphiti.reassign_edge, 'reassign_edge')
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        assert [c[0] for c in manager.mock_calls] == [
+            'ensure_entity_node', 'reassign_edge',
+        ]
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_the_reassign_target_comes_from_ensure_entity_node_not_from_zeta(
+        self, service,
+    ):
+        """THE assertion that keeps a stale zeta lookup from becoming the repair
+        target.  `ensure_entity_node` re-reads under the lock and COLLAPSES a
+        duplicate-name group; `finding.new_endpoint_uuid` is audit metadata its
+        own docstring already calls "an audit convenience"."""
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+
+        await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid='n-stale')), group_id='dark_factory',
+        )
+
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+
+    @pytest.mark.asyncio
+    async def test_ensure_entity_node_is_called_even_when_zeta_already_resolved_a_uuid(
+        self, service,
+    ):
+        """UNCONDITIONALLY, not only on zeta's None branch: it is idempotent
+        (the resolve path mints nothing), and branching would create a second
+        site that can disagree about what the edge should point at."""
+        await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid='n-3127')), group_id='dark_factory',
+        )
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_repair_record_carries_every_contract_field(self, service):
+        stats = await service._repair_episode_referents(
+            _stats(_finding(check='per-edge-pairing')), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.edge_uuid == 'e1'
+        assert record.which_end == 'source'
+        assert record.outcome == 'repaired'
+        assert record.moved is True
+        assert record.old_endpoint_uuid == 'n-3129'
+        assert record.new_endpoint_uuid == 'n-3127'
+        assert record.intended_referent == 'Task 3127'
+        # Carried through from the finding that justified the repair, so a
+        # reader never has to join back to the ReferentStats to learn why.
+        assert record.check == 'per-edge-pairing'
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_the_old_endpoint_is_read_from_reassign_edge_not_from_the_finding(
+        self, service,
+    ):
+        """INV-3 corroborate-before-acting, preserved by DELEGATION:
+        `reassign_edge` re-reads BOTH endpoints from topology, so its report of
+        what the edge actually hung off outranks zeta's in-memory snapshot."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-actually-3130'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].old_endpoint_uuid == 'n-actually-3130'
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_finding_with_no_intended_referent_is_unrepairable(
+        self, service,
+    ):
+        """A shape zeta forbids but the TYPE permits.  Fail closed — record it,
+        do not crash, and above all do not guess a target."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(resolvable=True, intended_referent=None)),
+            group_id='dark_factory',
+        )
+
+        assert_never_repaired(service)
+        assert len(stats.repairs) == 1
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_no_findings_costs_nothing(self, service):
+        """The ~99.8% clean path must issue ZERO backend calls inside the
+        per-group identity lock."""
+        stats = await service._repair_episode_referents(
+            _stats(), group_id='dark_factory',
+        )
+        assert_never_repaired(service)
+        assert stats.repairs == []
+
+
+class TestTheRefreshBackstop:
+    """Step 3 is a CONDITIONAL backstop, not an unconditional third call.
+
+    `reassign_edge` already refreshes both AFFECTED endpoint summaries after a
+    real move — but per-node try/except that LOGS AND SWALLOWS, reporting only
+    what actually succeeded in `refreshed_nodes`.  So an unconditional third
+    call doubles the summary regeneration on the ~100% happy path (inside the
+    per-group identity lock, where every extra round-trip serializes same-group
+    writes), while omitting step 3 leaves the PRD's stated user-observable
+    signal — "the `Task N±1` summary no longer contains it" — silently
+    degradable whenever that swallowed exception fires.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_backstop_fires_for_both_endpoints_when_the_internal_refresh_failed(
+        self, service,
+    ):
+        """`refreshed_nodes == []` is reassign_edge reporting that its own
+        best-effort refresh was swallowed.  This is what makes the PRD's
+        observable signal a GUARANTEE rather than a best effort."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=[]),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        refreshed = {
+            c.args[0] for c in service.graphiti.refresh_entity_summary.await_args_list
+        }
+        assert refreshed == {'n-3129', 'n-3127'}
+        for call in service.graphiti.refresh_entity_summary.await_args_list:
+            assert call.kwargs == {'group_id': 'dark_factory'}
+        assert set(stats.repairs[0].summaries_refreshed) == {'n-3129', 'n-3127'}
+
+    @pytest.mark.asyncio
+    async def test_no_double_work_when_reassign_edge_already_refreshed_both(
+        self, service,
+    ):
+        """The happy path costs ZERO extra round-trips inside the identity
+        lock — and the record still reports both, because it says what is true
+        of the GRAPH, not what this method happened to call."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=['n-3129', 'n-3127']),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+        assert set(stats.repairs[0].summaries_refreshed) == {'n-3129', 'n-3127'}
+
+    @pytest.mark.asyncio
+    async def test_a_partial_internal_refresh_re_refreshes_only_the_remainder(
+        self, service,
+    ):
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=['n-3127']),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.refresh_entity_summary.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory',
+        )
+        assert set(stats.repairs[0].summaries_refreshed) == {'n-3129', 'n-3127'}
+
+    @pytest.mark.asyncio
+    async def test_the_inv3_no_op_arm_refreshes_nothing_and_is_not_a_repair(
+        self, service,
+    ):
+        """`moved=False` is `reassign_edge`'s own corroborate-before-acting
+        guard: the edge had ALREADY been repointed, so no summary can have
+        changed and no repair happened.  A corroborated no-op must not later
+        feed the storm streak."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(moved=False, refreshed_nodes=[]),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is False
+        assert stats.repairs[0].summaries_refreshed == ()
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failing_backstop_refresh_is_swallowed_and_the_repair_stands(
+        self, service, caplog,
+    ):
+        """The topology move ALREADY COMMITTED.  Un-counting it because the
+        cosmetic summary regeneration failed would report zero repairs for an
+        episode that performed one."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=['n-3127']),
+        )
+        service.graphiti.refresh_entity_summary = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is True
+        assert stats.repaired == 1
+        # Only what actually succeeded — the record never claims a refresh
+        # that raised.
+        assert stats.repairs[0].summaries_refreshed == ('n-3127',)
+        assert any('n-3129' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_backstop_never_swallows_cancellation(self, service, exc_type):
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=[]),
+        )
+        service.graphiti.refresh_entity_summary = AsyncMock(
+            side_effect=exc_type('interrupted'),
+        )
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_wholesale_backstop_failure_never_downgrades_a_committed_move(
+        self, service, caplog, monkeypatch,
+    ):
+        """THE GUARD SPLIT AT THE COMMIT POINT, pinned.
+
+        The backstop swallows per node, so reaching THIS arm takes a wholesale
+        failure — a malformed `reassign_edge` result, say.  What matters is
+        that it happens AFTER the endpoint move committed, so it must not be
+        caught by the write guard around `ensure_entity_node`/`reassign_edge`:
+        that would record `outcome='failed'` with `moved` never set, booking a
+        real repair as an infrastructure fault that did nothing.  The
+        downstream damage is not cosmetic — the repair vanishes from
+        `stats.repaired`, its streak increment is suppressed, and the node it
+        emptied drops out of the cleanup's candidate set.
+        """
+        async def _boom(*_a, **_kw):
+            raise TypeError('malformed reassign_edge result')
+
+        monkeypatch.setattr(service, '_backstop_endpoint_summaries', _boom)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is True
+        assert stats.repaired == 1
+        # Falls back to what `reassign_edge` itself reported refreshing — the
+        # recovery path reports the graph, and cannot itself raise.
+        assert stats.repairs[0].summaries_refreshed == ('n-3129', 'n-3127')
+        # The three downstream consequences of a wrong `'failed'`, all absent.
+        assert service._referent_repair_streaks['dark_factory'] == 1
+        service.graphiti.delete_entity.assert_awaited_once()
+        assert any('committed' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_wholesale_backstop_guard_never_swallows_cancellation(
+        self, service, monkeypatch, exc_type,
+    ):
+        async def _interrupted(*_a, **_kw):
+            raise exc_type('interrupted')
+
+        monkeypatch.setattr(service, '_backstop_endpoint_summaries', _interrupted)
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+
+class TestNeverGuess:
+    """An unresolvable finding is RECORDED and LEFT ALONE.
+
+    The PRD's live boundary row, verbatim: the unary fact "Umbrella task 2519
+    was filed and then cancelled to avoid orphaning its vector" sitting on the
+    `Task 2520` node.  There is no correct target — the fact names exactly one
+    task and it is not the one the edge landed on — so zeta records it with
+    `resolvable=False` and a reason, and eta must not invent one.
+    """
+
+    UNARY_REASON = (
+        'no candidate target could be determined from the declared referents'
+    )
+
+    def _unary_finding(self, **overrides) -> ReferentFinding:
+        fields = {
+            'edge_uuid': 'e-2520',
+            'old_endpoint_uuid': 'n-2520',
+            'old_endpoint_name': 'Task 2520',
+            'endpoint_referent': Referent(number='2520'),
+            'referent_set': ('Task 2519',),
+            'intended_referent': None,
+            'new_endpoint_uuid': None,
+            'resolvable': False,
+            'reason': self.UNARY_REASON,
+        }
+        fields.update(overrides)
+        return _finding(**fields)
+
+    @pytest.mark.asyncio
+    async def test_no_write_primitive_is_awaited_at_all(self, service):
+        """Not "attempted and rolled back" — never attempted.  The refusal is
+        decided before any backend call."""
+        await service._repair_episode_referents(
+            _stats(self._unary_finding()), group_id='dark_factory',
+        )
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_the_record_carries_zetas_own_reason_verbatim(self, service):
+        """The operator must see zeta's explanation, not an eta-authored
+        paraphrase — a paraphrase is a second site that can drift from the rule
+        that actually fired."""
+        stats = await service._repair_episode_referents(
+            _stats(self._unary_finding()), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'unrepairable'
+        assert record.reason == self.UNARY_REASON
+        assert record.edge_uuid == 'e-2520'
+        assert record.which_end == 'source'
+        assert record.old_endpoint_uuid == 'n-2520'
+        assert record.check == 'set-membership'
+        # Nothing was targeted, minted, moved or refreshed.
+        assert record.new_endpoint_uuid == ''
+        assert record.intended_referent == ''
+        assert record.moved is False
+        assert record.minted is False
+        assert record.summaries_refreshed == ()
+        assert record.deleted_emptied_node == ''
+
+    @pytest.mark.asyncio
+    async def test_it_lands_in_the_flagged_bucket_and_never_in_repaired(
+        self, service,
+    ):
+        stats = await service._repair_episode_referents(
+            _stats(self._unary_finding()), group_id='dark_factory',
+        )
+        assert stats.flagged_unrepairable == 1
+        assert stats.repaired == 0
+        assert stats.failed == 0
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_batch_repairs_the_resolvable_one_and_records_both(
+        self, service,
+    ):
+        """Different EDGES, so the degenerate-edge guard is not what is being
+        exercised here — one finding refusing to be guessed at must not stop
+        an unrelated edge's repair."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), self._unary_finding()),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        assert len(stats.repairs) == 2
+        assert {r.outcome for r in stats.repairs} == {'repaired', 'unrepairable'}
+        assert stats.repaired == 1
+        assert stats.flagged_unrepairable == 1
+
+
+class TestDegenerateEdges:
+    """EDGE CASE (a): both ends of one edge would sit on one node.  Skip the
+    edge WHOLE — never half-move it.
+
+    Moving one end leaves the edge half-attributed between two different
+    referents, and moving the second makes `reassign_edge` raise its
+    self-referential-RELATES_TO ValueError — by which point the FIRST end has
+    already committed, so the exception arrives far too late to be a guard.
+    The decision therefore has to be made BEFORE any write for that edge.
+    """
+
+    @pytest.mark.asyncio
+    async def test_case_a_a_self_loop_on_the_wrong_node_is_skipped_whole(
+        self, service, caplog,
+    ):
+        """The LITERAL shape: one edge whose source and target are the SAME
+        node, producing two findings that share an `old_endpoint_uuid`.
+        Reachable, not hypothetical — `get_valid_edges_for_node`'s own
+        docstring documents that an A->A RELATES_TO edge exists in this graph
+        and double-matches its undirected query."""
+        findings = (
+            _finding(
+                edge_uuid='e1', which_end='source',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+                new_endpoint_uuid='n-2519',
+            ),
+            _finding(
+                edge_uuid='e1', which_end='target',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+                new_endpoint_uuid='n-2519',
+            ),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(*findings), group_id='dark_factory',
+            )
+
+        # Decided BEFORE any write, not by catching the ValueError after one
+        # end has already moved.
+        assert_never_repaired(service)
+        assert len(stats.repairs) == 2
+        for record in stats.repairs:
+            assert record.outcome == 'degenerate'
+            assert record.moved is False
+            assert record.minted is False
+        assert stats.flagged_unrepairable == 2
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'e1' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert 'n-2520' in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_case_b_two_ends_converging_on_one_target_is_skipped_whole(
+        self, service, caplog,
+    ):
+        """The PROJECTED shape: different `old_endpoint_uuid`s, but the SAME
+        `intended_referent`, so applying both would leave `source == target` —
+        exactly the self-loop `reassign_edge` refuses.  Equally reachable
+        through zeta's rules: `_candidate_targets` subtracts `endpoint` and
+        `other_endpoint`, neither of which removes a THIRD referent both ends
+        would move onto."""
+        findings = (
+            _finding(
+                edge_uuid='e2', which_end='source',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+            ),
+            _finding(
+                edge_uuid='e2', which_end='target',
+                old_endpoint_uuid='n-2521', old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+                intended_referent=Referent(number='2519'),
+            ),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(*findings), group_id='dark_factory',
+            )
+
+        assert_never_repaired(service)
+        assert [r.outcome for r in stats.repairs] == ['degenerate', 'degenerate']
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'e2' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert 'n-2520' in warnings[0].getMessage()
+        assert 'n-2521' in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_case_c_a_legitimate_both_ends_repair_is_not_swallowed(
+        self, service,
+    ):
+        """THE negative that keeps the guard from eating real work: different
+        old endpoints AND different intended referents is a legitimate
+        both-ends repair, and both ends must be repaired."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=['n-2519', 'n-2518'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(
+                uuid='e3', which_end='source',
+                old_endpoint_uuid='n-2520', new_endpoint_uuid='n-2519',
+                refreshed_nodes=['n-2520', 'n-2519'],
+            ),
+            _reassigned(
+                uuid='e3', which_end='target',
+                old_endpoint_uuid='n-2521', new_endpoint_uuid='n-2518',
+                refreshed_nodes=['n-2521', 'n-2518'],
+            ),
+        ])
+        findings = (
+            _finding(
+                edge_uuid='e3', which_end='source',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+            ),
+            _finding(
+                edge_uuid='e3', which_end='target',
+                old_endpoint_uuid='n-2521', old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+                intended_referent=Referent(number='2518'),
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(*findings), group_id='dark_factory',
+        )
+
+        assert service.graphiti.ensure_entity_node.await_count == 2
+        assert service.graphiti.reassign_edge.await_count == 2
+        assert stats.repaired == 2
+        assert stats.degenerate_edges == 0
+        assert stats.flagged_unrepairable == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_second_finding_does_not_make_an_edge_degenerate(
+        self, service,
+    ):
+        """The converging-target arm compares RESOLVABLE findings only: a
+        finding eta will never act on cannot converge with anything."""
+        findings = (
+            _finding(edge_uuid='e4', which_end='source'),
+            _finding(
+                edge_uuid='e4', which_end='target',
+                old_endpoint_uuid='n-other', old_endpoint_name='Task 9999',
+                endpoint_referent=Referent(number='9999'),
+                intended_referent=None, new_endpoint_uuid=None,
+                resolvable=False, reason='no candidate target',
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(*findings), group_id='dark_factory',
+        )
+
+        assert stats.degenerate_edges == 0
+        assert stats.repaired == 1
+        assert stats.flagged_unrepairable == 1
+
+    @pytest.mark.asyncio
+    async def test_convergence_is_decided_by_the_rendered_name_not_Referent_identity(
+        self, service, monkeypatch,
+    ):
+        """The projected arm must compare what `ensure_entity_node` KEYS ON.
+
+        `Referent.node_name` returns `f'{project_id}:{number}'` whenever
+        `project_id` is non-empty, IGNORING `kind` — so two `Referent`s
+        differing only in `kind` render the SAME node name while comparing
+        unequal as frozen dataclasses.  Comparing the objects would let both
+        ends converge onto one node with the pre-write gate seeing nothing,
+        leaving `reassign_edge`'s ValueError to arrive after the first end had
+        already committed — precisely the half-attributed edge the gate exists
+        to prevent.
+
+        `_KIND_LABELS` has exactly one entry today, which is the ONLY reason
+        the object comparison was not already observably wrong; registering a
+        second kind is what this monkeypatch simulates, so the guarantee does
+        not silently depend on that registry's size.
+        """
+        monkeypatch.setattr(
+            canonical_labels, '_KIND_LABELS', {'task': 'Task', 'ticket': 'Ticket'},
+        )
+        first = Referent(number='3127', kind='task', project_id='reify')
+        second = Referent(number='3127', kind='ticket', project_id='reify')
+        assert first != second, 'distinct Referents, or the test proves nothing'
+        assert first.node_name == second.node_name == 'reify:3127'
+
+        findings = (
+            _finding(edge_uuid='e5', which_end='source', intended_referent=first),
+            _finding(
+                edge_uuid='e5', which_end='target',
+                old_endpoint_uuid='n-other', old_endpoint_name='Task 9999',
+                endpoint_referent=Referent(number='9999'),
+                intended_referent=second,
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(*findings), group_id='dark_factory',
+        )
+
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+        assert [r.outcome for r in stats.repairs] == ['degenerate', 'degenerate']
+        service.graphiti.reassign_edge.assert_not_awaited()
+
+
+class TestEmptiedNodeCleanup:
+    """EDGE CASE (b): delete a node this pass emptied — under THREE conditions,
+    all of which must hold.
+
+    Two situations the node can be in, and the narrow guard is what
+    distinguishes them.  If the project GENUINELY OWNS the task, the node keeps
+    its pre-existing edges after the repair and must never be deleted —
+    deleting a real task entity to fix an attribution error would be a far more
+    damaging bug than the one being fixed.  If the node was MINTED by this very
+    episode out of the mis-resolved reference alone, the repair leaves it
+    edgeless and semantically wrong, and it would otherwise persist as a
+    phantom entity future writes keep re-colliding with — leaving the fix only
+    half-working, and keeping the duplicate-name key that disables
+    `dedup_helpers`' deterministic exact-match protection.
+    """
+
+    @pytest.mark.asyncio
+    async def test_positive_an_emptied_canonical_task_node_is_deleted(self, service):
+        """`force=False` SPECIFICALLY: it guards a genuine RACE on valid edges
+        — a node that gains a live edge between our read and the delete — and
+        `force=True` would discard that.
+
+        It is NOT, however, an independent check of the emptiness this cleanup
+        is predicated on: `delete_entity` re-checks by calling
+        `get_valid_edges_for_node`, the SAME query, so it is blind to exactly
+        what condition 4 exists to see. See
+        `TestTheFourthConditionOnTheCleanup`.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory',
+        )
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', force=False,
+        )
+        assert stats.repairs[0].deleted_emptied_node == 'n-3129'
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    async def test_negative_1_a_node_the_project_genuinely_owns_is_never_deleted(
+        self, service,
+    ):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other', 'fact': 'unrelated', 'name': 'X'}],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_negative_2_a_name_that_is_not_a_canonical_task_label_is_never_deleted(
+        self, service,
+    ):
+        """`parse_node_name` is the single normative label vocabulary and is
+        ANCHORED by design, so 'merge worker' — and 'Task 42 orchestrator' —
+        are never deletion candidates however empty they look."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-worker'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(
+                old_endpoint_uuid='n-worker', old_endpoint_name='merge worker',
+                endpoint_referent=Referent(number='3129'),
+            )),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+
+    @pytest.mark.asyncio
+    async def test_negative_3i_a_no_op_move_is_not_even_a_candidate(self, service):
+        """`moved=False` means no endpoint LEFT the node — this pass emptied
+        nothing, so it has no business asking whether the node is empty."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(moved=False, refreshed_nodes=[]),
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+
+    @pytest.mark.asyncio
+    async def test_negative_3ii_the_node_that_GAINED_the_edge_is_never_a_candidate(
+        self, service,
+    ):
+        """Only the OLD endpoint lost an edge.  Deleting the repair TARGET
+        would undo the repair."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        deleted = [c.args[0] for c in service.graphiti.delete_entity.await_args_list]
+        assert 'n-3127' not in deleted
+        assert deleted == ['n-3129']
+
+    @pytest.mark.asyncio
+    async def test_negative_4_a_node_only_flagged_is_never_a_candidate(self, service):
+        """Nothing moved off a node whose finding was recorded 'unrepairable'
+        or 'degenerate' — by definition, since eta refused to act on it."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        unresolvable = _finding(
+            edge_uuid='e-u', old_endpoint_uuid='n-2520',
+            old_endpoint_name='Task 2520',
+            endpoint_referent=Referent(number='2520'),
+            intended_referent=None, new_endpoint_uuid=None,
+            resolvable=False, reason='no candidate target',
+        )
+        degenerate = (
+            _finding(
+                edge_uuid='e-d', which_end='source', old_endpoint_uuid='n-2521',
+                old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+            ),
+            _finding(
+                edge_uuid='e-d', which_end='target', old_endpoint_uuid='n-2521',
+                old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(unresolvable, *degenerate), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.nodes_deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_set_is_deduplicated(self, service):
+        """Two repairs moving endpoints off the SAME node produce exactly ONE
+        emptiness check and ONE delete — the check is a query inside the
+        identity lock, and the delete is irreversible."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'),
+        ])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory',
+        )
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', force=False,
+        )
+        # Stamped onto BOTH records — each one is evidence for the same delete.
+        assert [r.deleted_emptied_node for r in stats.repairs] == ['n-3129', 'n-3129']
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    async def test_a_lost_race_is_a_clean_skip_not_a_destroyed_entity(
+        self, service, caplog,
+    ):
+        """`ActiveEdgesError` means the node GAINED an edge between our check
+        and the delete.  `force=False` is exactly what turns that lost race
+        into a refusal — and a refusal must not un-count the repair that
+        already committed."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.delete_entity = AsyncMock(
+            side_effect=ActiveEdgesError('Entity n-3129 has 1 valid active edge(s)'),
+        )
+
+        with caplog.at_level(logging.INFO):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+        assert any('n-3129' in r.getMessage() for r in caplog.records)
+
+
+class TestTheFourthConditionOnTheCleanup:
+    """The node must have NO relationship of ANY type or validity other than
+    THIS episode's own `MENTIONS` link.
+
+    THE DEFECT THIS CLOSES. The original three-condition guard could
+    irreversibly destroy a real, project-owned task entity together with its
+    entire temporal history, and the exposure is neither cross-episode nor
+    hypothetical — it is reachable inside ONE critical section:
+
+    * `get_valid_edges_for_node` is `MATCH (n:Entity {uuid:$uuid})-[e:RELATES_TO]-()
+      WHERE e.invalid_at IS NULL`. It sees ONLY currently-valid RELATES_TO, and
+      is blind to invalidated RELATES_TO history and to `MENTIONS` from
+      Episodic nodes.
+    * `delete_entity(force=False)` re-checks by calling THAT SAME function, so
+      it supplies no independent protection here; a same-query recheck cannot
+      see what the first query is blind to. It still guards a genuine race on
+      VALID edges, which is worth keeping, and nothing more.
+    * `delete_entity_node` issues a bare `MATCH (n:Entity {uuid:$uuid}) DETACH
+      DELETE n`, destroying EVERY relationship.
+    * `parse_node_name` cannot discriminate: a genuine `Task 3129` node passes
+      that guard BY CONSTRUCTION, since it is exactly a canonical task label.
+
+    `_invalidate_stale_superseded_ttl_edges` is sub-pass FOUR of the same
+    `_reconcile_episode_identity` chain and this cleanup is sub-pass EIGHT. So a
+    real, project-owned `Task N` node whose facts were TTL-invalidated at pass 4
+    reads as "empty" at pass 8 the moment eta moves its one remaining valid edge
+    away — and is deleted with its full history, inside one critical section.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_node_whose_history_is_merely_INVALIDATED_is_never_deleted(
+        self, service,
+    ):
+        """THE CONFIRMED DEFECT, pinned. `Task 3129` is a real task the project
+        owns; sub-pass four TTL-invalidated its facts earlier in this very
+        chain, so `get_valid_edges_for_node` reports it empty while its
+        temporal history is still in the graph and DETACH DELETE would destroy
+        it.
+
+        Refusing the cleanup must never un-count the reassignment that already
+        committed: the endpoint move is the correctness fix, the deletion is
+        opportunistic hygiene, and their outcomes are independent.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=2)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_a_node_mentioned_by_a_DIFFERENT_episode_is_never_deleted(
+        self, service,
+    ):
+        """`(ep:Episodic)-[:MENTIONS]->(n:Entity)` provenance from any episode
+        other than the one in flight proves the node pre-existed this write.
+        Those links are load-bearing content — `maintenance/cross_graph_move.py`
+        recreates them precisely because losing them loses provenance — and are
+        invisible to every RELATES_TO-typed query in the backend."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=1)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_the_exclusion_is_LIVE_not_dead_code(self, service):
+        """THE PHANTOM THE CLEANUP EXISTS TO REMOVE still gets removed.
+
+        graphiti_core's extraction mints the mis-resolved node AND its
+        `MENTIONS` link from the same episodic node in the same `add_episode`,
+        so a strict zero-degree predicate would NEVER fire on it — shipping
+        dead code while leaving the duplicate-name key that disables
+        `dedup_helpers`' deterministic exact-match protection. Excluding only
+        this episode's own MENTIONS is what makes the guard both safe and
+        useful.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=0)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-live-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='ep-live-1',
+        )
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', force=False,
+        )
+        assert stats.repairs[0].deleted_emptied_node == 'n-3129'
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    async def test_FAIL_CLOSED_an_unknown_episode_costs_a_deletion_never_grants_one(
+        self, service,
+    ):
+        """With `episode_uuid=''` the exclusion is dropped, so the node's own
+        in-flight MENTIONS now COUNTS and the delete is refused.
+
+        Losing the episode identity must cost a deletion, never grant one. That
+        is the whole reason the parameter defaults to `''` rather than to
+        something permissive.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=1)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='',
+        )
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+
+    # ---- call shape and ORDER --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_it_is_consulted_with_the_candidate_uuid_and_group(self, service):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_node_with_a_surviving_valid_edge_is_never_even_queried(
+        self, service,
+    ):
+        """THE CHEAP GUARDS STAY FIRST. Condition 3 is the cheap typed query;
+        condition 4 is a new UNTYPED degree query, and both run inside the
+        per-group identity lock where every avoidable round-trip is contention
+        every other writer pays for. The new query is an ADDITION to the
+        existing conditions, never a substitute for them."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other', 'fact': 'unrelated', 'name': 'X'}],
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_non_canonical_name_is_never_even_queried(self, service):
+        """Condition 2 is a free local check and stays ahead of both queries."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-worker'),
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding(
+                old_endpoint_uuid='n-worker', old_endpoint_name='merge worker',
+                endpoint_referent=Referent(number='3129'),
+            )),
+            group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_move_is_never_even_queried(self, service):
+        """Condition 1 is a free local check: nothing left the node, so it has
+        no business asking anything about the node's degree."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(moved=False, refreshed_nodes=[]),
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_call_per_deduplicated_candidate(self, service):
+        """Two repairs moving endpoints off the SAME node produce ONE degree
+        query, matching the existing one-emptiness-check-per-candidate pin."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'),
+        ])
+
+        await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+    # ---- guarded exactly like its neighbours ------------------------------
+
+    @pytest.mark.asyncio
+    async def test_a_raise_is_a_clean_per_candidate_skip(self, service, caplog):
+        """It shares the SAME per-candidate try/except as the other two cleanup
+        primitives — no new guard is introduced. A degree query that cannot be
+        read is a refusal to delete, which is the safe direction, and it must
+        not touch the reassignment that already committed."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.repaired == 1
+        assert stats.nodes_deleted == 0
+        assert any(r.exc_info for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_one_unreadable_candidate_does_not_strand_the_rest(self, service):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1', old_endpoint_uuid='n-3129'),
+            _reassigned(uuid='e2', old_endpoint_uuid='n-3130',
+                        refreshed_nodes=['n-3130', 'n-3127']),
+        ])
+        service.graphiti.count_foreign_relationships = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), 0],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e1'),
+                _finding(edge_uuid='e2', old_endpoint_uuid='n-3130',
+                         old_endpoint_name='Task 3130',
+                         endpoint_referent=Referent(number='3130')),
+            ),
+            group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3130', group_id='dark_factory', force=False,
+        )
+        assert stats.repaired == 2
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_it_never_swallows_cancellation(self, service, exc_type):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(
+            side_effect=exc_type('interrupted'),
+        )
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+
+class TestCleanupIsGuardedIndependently:
+    """A cleanup failure must never discard or un-count reassignments that
+    already succeeded.
+
+    The guard is the CLEANUP's OWN try/except, not the outer `_run_pass`:
+    `_run_pass` substitutes an EMPTY `ReferentRepairStats` on a raise, which
+    would discard the structured record of every reassignment that had already
+    committed to the graph — reporting zero repairs for an episode that
+    performed several.  Cleanup is opportunistic hygiene; the reassignment is
+    the correctness fix, and their failure domains must not be shared.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('failing', [
+        'get_valid_edges_for_node', 'count_foreign_relationships', 'delete_entity',
+    ])
+    async def test_a_cleanup_failure_leaves_every_reassignment_intact(
+        self, service, caplog, failing,
+    ):
+        setattr(
+            service.graphiti, failing,
+            AsyncMock(side_effect=RuntimeError('falkor down')),
+        )
+        if failing != 'get_valid_edges_for_node':
+            service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        # Returns NORMALLY, with a POPULATED stats — proving the guard is the
+        # cleanup's own, not `_run_pass`'s empty-default substitution.
+        assert isinstance(stats, ReferentRepairStats)
+        assert len(stats.repairs) == 1
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].summaries_refreshed == ('n-3129', 'n-3127')
+        assert stats.repaired == 1
+        assert stats.nodes_deleted == 0
+        assert any(r.exc_info for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('failing', [
+        'get_valid_edges_for_node', 'count_foreign_relationships', 'delete_entity',
+    ])
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_cleanup_never_swallows_cancellation(
+        self, service, failing, exc_type,
+    ):
+        setattr(
+            service.graphiti, failing, AsyncMock(side_effect=exc_type('interrupted')),
+        )
+        if failing != 'get_valid_edges_for_node':
+            service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+    @pytest.mark.asyncio
+    async def test_one_bad_candidate_does_not_stop_the_remaining_candidates(
+        self, service,
+    ):
+        """Per-CANDIDATE, so a single node whose emptiness cannot be read does
+        not leave every other phantom node behind."""
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1', old_endpoint_uuid='n-3129'),
+            _reassigned(uuid='e2', old_endpoint_uuid='n-3130',
+                        refreshed_nodes=['n-3130', 'n-3127']),
+        ])
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), []],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e1'),
+                _finding(edge_uuid='e2', old_endpoint_uuid='n-3130',
+                         old_endpoint_name='Task 3130',
+                         endpoint_referent=Referent(number='3130')),
+            ),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3130', group_id='dark_factory', force=False,
+        )
+        assert stats.repaired == 2
+        assert stats.nodes_deleted == 1
+
+
+class TestPerFindingFailureContainment:
+    """`'failed'` is a THIRD disposition, distinct from both `'repaired'` and
+    `'unrepairable'`.
+
+    Unrepairable means WE REFUSED TO GUESS; failed means WE TRIED AND THE
+    BACKEND DID NOT COOPERATE.  Conflating them would let a FalkorDB outage
+    read as a scanner regression in leaf iota's rate, and would feed a false
+    repair-storm streak whose whole claim is "the scanner or the resolver has
+    REGRESSED".
+
+    Containment is per-FINDING because each finding names a distinct
+    (edge, end): one failure carries no information about the others, and
+    aborting the batch would leave the graph in a state neither zeta's findings
+    nor eta's records describe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failing_ensure_entity_node_contains_to_that_finding(
+        self, service, caplog,
+    ):
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), 'n-3127'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+                group_id='dark_factory',
+            )
+
+        # No reassign for the failed finding; the OTHER one is fully repaired.
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e2', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        failed = [r for r in stats.repairs if r.outcome == 'failed']
+        assert len(failed) == 1
+        assert failed[0].edge_uuid == 'e1'
+        assert 'falkor down' in failed[0].reason
+        assert stats.repaired == 1
+        assert stats.failed == 1
+        # The operator sees WHICH edge end was left unrepaired.
+        assert any('e1' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc', [
+        EdgeNotFoundError('edge e1 not found'),
+        ValueError('reassign_edge: refusing to create a self-referential edge'),
+    ])
+    async def test_a_failing_reassign_edge_contains_to_that_finding(
+        self, service, exc,
+    ):
+        """`EdgeNotFoundError` = the edge was tombstoned between zeta and eta.
+        `ValueError` = the self-loop refusal.  Both contain identically."""
+        service.graphiti.reassign_edge = AsyncMock(
+            side_effect=[exc, _reassigned(uuid='e2')],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        assert stats.failed == 1
+        assert stats.repaired == 1
+        assert [r.outcome for r in stats.repairs] == ['failed', 'repaired']
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reassign_leaves_the_node_out_of_the_cleanup_candidates(
+        self, service,
+    ):
+        """Nothing moved off it, so there is nothing to clean up — and a node
+        deleted on the strength of a move that did not happen would be the
+        most damaging possible outcome of this pass."""
+        service.graphiti.reassign_edge = AsyncMock(
+            side_effect=ValueError('refusing to create a self-referential edge'),
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.nodes_deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_record_never_counts_as_a_repair(self, service):
+        """A broken backend must not masquerade as a repair storm."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repaired == 0
+        assert stats.flagged_unrepairable == 0, (
+            "'failed' must not be folded into the NEVER-GUESS bucket"
+        )
+        assert stats.failed == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'primitive', ['ensure_entity_node', 'reassign_edge'],
+    )
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_per_finding_guard_never_swallows_cancellation(
+        self, service, primitive, exc_type,
+    ):
+        setattr(
+            service.graphiti, primitive, AsyncMock(side_effect=exc_type('interrupted')),
+        )
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+
+@pytest.mark.asyncio
+class TestReferentRepairStreakSemantics:
+    """INV-4: the consecutive-repair streak, per group_id.
+
+    The counter half of the storm escape.  It copies
+    `MergeWorker._record_runner_unavailable` / `_record_runner_recovered`
+    exactly, including their ASYMMETRY: the streak is cleared only by a
+    POSITIVE health signal (a pass that actually looked and found nothing to
+    repair), never by the mere absence of a failure.  A pass that checked
+    nothing has produced no evidence either way, and letting it clear the
+    streak would make the alarm unreachable in a corpus where most writes
+    carry no referent set at all.
+    """
+
+    async def test_the_streak_map_is_constructed_unconditionally(self, service):
+        """Like the three storm counters already in `__init__`: an alarm bound
+        to a conditionally-constructed component goes dark in exactly the
+        degraded configuration where a repair storm is least likely to be
+        noticed any other way."""
+        assert service._referent_repair_streaks == {}
+        assert isinstance(service._referent_repair_streaks, dict)
+
+    async def test_a_pass_that_repaired_increments_the_streak_by_exactly_one(
+        self, service,
+    ):
+        """The streak counts consecutive EPISODES; the per-episode repair count
+        rides separately, so three repairs in one pass is still +1."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 1
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+
+    async def test_many_repairs_in_one_pass_still_increment_by_one(self, service):
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'), _reassigned(uuid='e3'),
+        ])
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e1'),
+                _finding(edge_uuid='e2'),
+                _finding(edge_uuid='e3'),
+            ),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 3
+        assert service._referent_repair_streaks['dark_factory'] == 1
+
+    async def test_a_pass_that_checked_and_repaired_nothing_resets_the_streak(
+        self, service,
+    ):
+        """The POSITIVE health signal — we looked, the graph was clean."""
+        service._referent_repair_streaks['dark_factory'] = 7
+
+        await service._repair_episode_referents(
+            ReferentStats(edges_scanned=4, endpoints_checked=8),
+            group_id='dark_factory',
+        )
+
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_a_pass_that_checked_nothing_leaves_the_streak_unchanged(
+        self, service,
+    ):
+        """"We did not look" is not evidence of health."""
+        service._referent_repair_streaks['dark_factory'] = 7
+
+        await service._repair_episode_referents(
+            ReferentStats(edges_scanned=0, endpoints_checked=0),
+            group_id='dark_factory',
+        )
+
+        assert service._referent_repair_streaks['dark_factory'] == 7
+
+    async def test_a_checked_nothing_pass_does_not_even_create_the_key(
+        self, service,
+    ):
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=0), group_id='reify',
+        )
+        assert 'reify' not in service._referent_repair_streaks
+
+    async def test_an_unrepairable_only_pass_does_not_increment(self, service):
+        service._referent_repair_streaks['dark_factory'] = 3
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(resolvable=False, intended_referent=None)),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 0
+        assert service._referent_repair_streaks['dark_factory'] == 0, (
+            'it CHECKED an endpoint and performed no repair — that is the '
+            'reset arm, not the unchanged arm'
+        )
+
+    async def test_a_degenerate_only_pass_does_not_increment(self, service):
+        service._referent_repair_streaks['dark_factory'] = 3
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(which_end='source', old_endpoint_uuid='n-2520'),
+                _finding(which_end='target', old_endpoint_uuid='n-2520'),
+            ),
+            group_id='dark_factory',
+        )
+
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_a_failed_only_pass_does_not_increment(self, service):
+        """A broken backend must never masquerade as a repair storm."""
+        service._referent_repair_streaks['dark_factory'] = 3
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.failed == 1
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_a_moved_false_no_op_pass_does_not_increment(self, service):
+        """`reassign_edge`'s corroborate-before-acting no-op: the edge was
+        ALREADY correct, so the graph is healthy, not storming."""
+        service._referent_repair_streaks['dark_factory'] = 3
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(
+            moved=False, old_endpoint_uuid='n-3127', refreshed_nodes=[],
+        ))
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repaired == 0
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_streaks_are_independent_per_group_id(self, service):
+        """The escalation queue is per-project: a regression in one project's
+        graph must not be masked by another project's clean writes."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+        assert 'reify' not in service._referent_repair_streaks
+
+        # A clean pass in `reify` must not touch dark_factory's streak.
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=4), group_id='reify',
+        )
+        assert service._referent_repair_streaks['reify'] == 0
+        assert service._referent_repair_streaks['dark_factory'] == 2
+
+        # ...and a repair in `reify` does not increment dark_factory's.
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+        assert service._referent_repair_streaks['reify'] == 1
+        assert service._referent_repair_streaks['dark_factory'] == 2
+
+
+@pytest.mark.asyncio
+class TestReferentRepairCountsAccessor:
+    """The read side leaf IOTA consumes."""
+
+    async def test_every_bucket_exists_from_construction(self, service):
+        """A reader never has to distinguish "zero" from "absent"."""
+        counts = service.referent_repair_counts()
+        assert counts == {
+            'repaired': 0,
+            'flagged_unrepairable': 0,
+            'failed': 0,
+            'nodes_minted': 0,
+            'nodes_deleted': 0,
+            'streaks': {},
+        }
+
+    async def test_totals_are_process_lifetime_not_per_episode(self, service):
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'),
+        ])
+
+        await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1')), group_id='dark_factory',
+        )
+        await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e2'),
+                _finding(edge_uuid='e9', resolvable=False, intended_referent=None),
+            ),
+            group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['repaired'] == 2
+        assert counts['flagged_unrepairable'] == 1
+
+    async def test_totals_accumulate_across_group_ids(self, service):
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+
+        assert service.referent_repair_counts()['repaired'] == 2
+
+    async def test_minted_and_deleted_are_reported(self, service):
+        """`new_endpoint_uuid is None` is zeta reporting no pre-existing node,
+        so `ensure_entity_node` took the MINT path; the emptied old endpoint is
+        then a canonical task label with no valid edges left."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid=None)), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['nodes_minted'] == 1
+        assert counts['nodes_deleted'] == 1
+
+    async def test_failed_is_reported_separately_from_flagged(self, service):
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['failed'] == 1
+        assert counts['flagged_unrepairable'] == 0
+
+    async def test_live_streaks_ride_alongside_the_totals(self, service):
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['streaks'] == {'dark_factory': 1}
+
+    async def test_returns_a_copy_the_caller_cannot_use_to_mutate_state(
+        self, service,
+    ):
+        """A read-only escape hatch a consumer can write through is not an
+        escape hatch."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        counts['repaired'] = 9999
+        counts['streaks']['dark_factory'] = 9999
+        counts['streaks']['injected'] = 1
+
+        fresh = service.referent_repair_counts()
+        assert fresh['repaired'] == 1
+        assert fresh['streaks'] == {'dark_factory': 1}
+        assert service._referent_repair_streaks == {'dark_factory': 1}
+
+
+@pytest.fixture
+def to_thread_spy(monkeypatch):
+    """Records every `asyncio.to_thread` dispatch and whether it COMPLETED.
+
+    Patching the real hop rather than the escalator seam is deliberate: the
+    thing under test is that the blocking escalation I/O leaves the event loop
+    at all (`memory_service.py`'s "ASYNC ON PURPOSE — do not re-inline the
+    escalation hop"), which a mock on the escalator alone cannot observe.
+    """
+    calls: list[tuple] = []
+    completed: list[tuple] = []
+    real_to_thread = asyncio.to_thread
+
+    async def _spy(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        if getattr(func, '__module__', '').startswith('fused_memory.middleware'):
+            # Don't touch a real escalation queue from a unit test.
+            completed.append((func, args, kwargs))
+            return None
+        result = await real_to_thread(func, *args, **kwargs)
+        completed.append((func, args, kwargs))
+        return result
+
+    monkeypatch.setattr(asyncio, 'to_thread', _spy)
+    _spy.calls = calls  # type: ignore[attr-defined]
+    _spy.completed = completed  # type: ignore[attr-defined]
+    return _spy
+
+
+def _escalations(spy) -> list[tuple]:
+    return [
+        (args, kwargs) for func, args, kwargs in spy.calls
+        if getattr(func, '__name__', '') == 'emit_referent_repair_storm_escalation'
+    ]
+
+
+@pytest.mark.asyncio
+class TestTheStormGate:
+    """INV-4: the alarm fires from the tail of the repair pass — and the
+    repairs go right on happening while it does."""
+
+    async def test_the_threshold_constant_is_ten(self):
+        """The resolution of PRD Open Question 1, chosen against the measured
+        ~0.22% base rate. Pinned so a silent retune is a test failure."""
+        from fused_memory.services import memory_service as ms_mod
+
+        assert ms_mod._REFERENT_REPAIR_STREAK_THRESHOLD == 10
+
+    async def test_below_the_threshold_nothing_is_escalated(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        for _ in range(2):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert _escalations(to_thread_spy) == []
+
+    async def test_the_predicate_is_ge_not_eq_so_every_breach_fires(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """Single-firing is the ESCALATOR's dedupe-fold job, not the counter's
+        — the merge_liveness division of labour. A counter that fired only on
+        the exact boundary would go permanently silent the moment one breach
+        was missed."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        for _ in range(5):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        fired = _escalations(to_thread_spy)
+        assert [kwargs['streak'] for _, kwargs in fired] == [3, 4, 5]
+
+    async def test_the_escalator_is_dispatched_off_the_event_loop_and_awaited(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """`EscalationQueue` construction, a directory scan and an fsync'd
+        write would otherwise block the loop — inside the per-group identity
+        lock, no less. Awaited rather than fire-and-forgotten so it can never
+        outlive the write or be dropped by task GC."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert len(_escalations(to_thread_spy)) == 1
+        assert len(to_thread_spy.completed) == 1, (
+            'the hop must have COMPLETED before the pass returned'
+        )
+
+    async def test_the_dispatch_carries_the_root_positionally_and_the_payload(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        repair_stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        (args, kwargs), = _escalations(to_thread_spy)
+        assert args == ('/tmp/df-root',)
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['streak'] == 1
+        assert kwargs['threshold'] == 1
+        assert kwargs['repairs'] == 1
+        assert kwargs['records'] == [r.to_dict() for r in repair_stats.repairs], (
+            'INV-2: the alarm ships the structured evidence, not a count'
+        )
+
+    async def test_repairs_continue_while_the_alarm_fires(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """The escalation is the ALARM, NOT A HALT."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        repair_stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.reassign_edge.assert_awaited_once()
+        assert repair_stats.repaired == 1
+        assert [r.outcome for r in repair_stats.repairs] == ['repaired']
+
+    async def test_an_escalator_failure_is_caught_logged_and_never_propagates(
+        self, service, monkeypatch, caplog,
+    ):
+        """Belt to the escalator's own never-raise braces: a raise here would
+        fail an already-committed episode's reconcile chain because the
+        COMPLAINT about the write failed."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        async def _boom(*_a, **_kw):
+            raise OSError('queue exploded')
+
+        monkeypatch.setattr(asyncio, 'to_thread', _boom)
+
+        with caplog.at_level(logging.WARNING):
+            repair_stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert repair_stats.repaired == 1
+        assert [r.outcome for r in repair_stats.repairs] == ['repaired']
+        assert caplog.records
+
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_gate_guard_never_swallows_cancellation(
+        self, service, monkeypatch, exc_type,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        async def _interrupted(*_a, **_kw):
+            raise exc_type('interrupted')
+
+        monkeypatch.setattr(asyncio, 'to_thread', _interrupted)
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+    async def test_a_reset_restarts_the_streak_so_the_next_alarm_needs_a_fresh_one(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        for _ in range(3):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+        assert len(_escalations(to_thread_spy)) == 1
+
+        # A pass that LOOKED and found nothing — the positive health signal.
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=6), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+        for _ in range(2):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+        assert len(_escalations(to_thread_spy)) == 1, (
+            'the streak restarted at 1, so the next alarm needs a full fresh '
+            'run to the threshold'
+        )
+
+    async def test_a_checked_nothing_pass_never_re_pages_an_already_breached_streak(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """THE UNCHANGED ARM, which is not the reset arm.
+
+        The gate thresholds the value `_record_referent_repair_pass` RETURNED
+        for this pass, never a re-read of `_referent_repair_streaks`.  That
+        distinction is the whole reason the recorder returns `int | None`, and
+        only this case can tell the two formulations apart: an episode that
+        checked nothing performs no repair and leaves a breached streak exactly
+        where it was, so it has produced no evidence and must not re-page the
+        alarm.  A gate rewritten as `if self._referent_repair_streaks.get(
+        group_id, 0) >= _REFERENT_REPAIR_STREAK_THRESHOLD:` would fire on every
+        such no-op episode — and, without this test, would pass the whole
+        suite: the reset arm above exercises `endpoints_checked > 0`, which
+        zeroes the streak and therefore cannot distinguish them.
+        """
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+        service._referent_repair_streaks['dark_factory'] = 5
+
+        # Looked at nothing: no referents declared, no edges, no findings.
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=0), group_id='dark_factory',
+        )
+
+        assert _escalations(to_thread_spy) == []
+        assert service._referent_repair_streaks['dark_factory'] == 5, (
+            'a pass that checked nothing is no evidence of health either — it '
+            'leaves the streak alone rather than resetting it'
+        )
+
+
+@pytest.mark.asyncio
+class TestTheStormGateProjectRoot:
+    """Where the alarm is FILED, and the fallback that must not exist."""
+
+    async def test_the_root_is_resolved_from_known_projects(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """graphiti `group_id == project_id` (models/scope.py), so the map
+        injected by `set_known_projects` is the correct resolution."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({
+            'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root',
+        })
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+
+        (args, _kwargs), = _escalations(to_thread_spy)
+        assert args == ('/tmp/reify-root',)
+
+    async def test_an_unknown_group_escalates_nothing_and_warns_structurally(
+        self, service, to_thread_spy, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'reify': '/tmp/reify-root'})
+
+        with caplog.at_level(logging.WARNING):
+            repair_stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert _escalations(to_thread_spy) == []
+        message = '\n'.join(record.getMessage() for record in caplog.records)
+        assert 'dark_factory' in message
+        assert '1' in message
+        # ...and the repairs still happened. An unfileable alarm is a lost
+        # heads-up, never a lost repair.
+        assert repair_stats.repaired == 1
+
+    async def test_the_taskmaster_project_root_is_never_used_as_a_fallback(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """`config.taskmaster.project_root` defaults to '.', so a fallback
+        would file into the SERVER CWD — where no operator is watching — and
+        report success doing it. Explicitly forbidden by the mem0 escalator's
+        docstring."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({})
+        service.config.taskmaster.project_root = '/tmp/server-cwd-trap'
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert _escalations(to_thread_spy) == [], (
+            'no root is a REFUSAL to file, never a guess at one'
+        )
+
+
+@pytest.mark.asyncio
+class TestEndToEndThroughTheWritePath:
+    """The PRD's user-observable signal, driven through `_execute_graphiti_write`.
+
+    A write about Task 3127 whose edge landed on the `Task 3129` node: after
+    the episode commits, the edge hangs off `Task 3127` and the `Task 3129`
+    node's summary no longer carries the sentence. Every earlier test in this
+    file drives `_repair_episode_referents` directly; this one is the only
+    proof that the chain actually reaches it, under the lock, on a real payload.
+    """
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            'content': 'Task 3127 landed the referent repair path.',
+            'group_id': 'dark_factory',
+            'name': 'episode-1',
+            'source': 'text',
+            'referents': {
+                'source': 'declared',
+                'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            },
+        }
+
+    @staticmethod
+    def _result():
+        from _fm_helpers import MockAddEpisodeResult, MockEdge, MockNode
+
+        result = MockAddEpisodeResult(
+            edges=[MockEdge(
+                fact='the referent repair path landed on main',
+                uuid='e1',
+                source_node_uuid='n-3129',
+                target_node_uuid='n-worker',
+            )],
+            nodes=[
+                MockNode(name='Task 3129', uuid='n-3129'),
+                MockNode(name='merge worker', uuid='n-worker'),
+            ],
+        )
+        result.entity_edges = []
+        return result
+
+    async def test_the_whole_path_repairs_the_conflated_endpoint(self, service):
+        service.graphiti.add_episode = AsyncMock(return_value=self._result())
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(
+            refreshed_nodes=[],
+        ))
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e-other'},
+        ])
+
+        await service._execute_graphiti_write('add_episode', self._payload())
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        refreshed = {
+            call.args[0]
+            for call in service.graphiti.refresh_entity_summary.await_args_list
+        }
+        assert 'n-3129' in refreshed, (
+            "the PRD's observable signal: the Task 3129 summary is regenerated "
+            'so it no longer carries the sentence'
+        )
+
+    async def test_the_repair_is_structurally_recorded_on_the_aggregate(
+        self, service,
+    ):
+        """INV-2 all the way out to the caller, not just inside the pass."""
+        recorded: list[ReconcileStats] = []
+        real_reconcile = service._reconcile_episode_identity
+
+        async def _capture(*args, **kwargs):
+            stats = await real_reconcile(*args, **kwargs)
+            recorded.append(stats)
+            return stats
+
+        service._reconcile_episode_identity = _capture
+        service.graphiti.add_episode = AsyncMock(return_value=self._result())
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other'}],
+        )
+
+        await service._execute_graphiti_write('add_episode', self._payload())
+
+        stats, = recorded
+        assert isinstance(stats.repair_stats, ReferentRepairStats)
+        assert stats.repair_stats.repaired == 1
+        record, = stats.repair_stats.repairs
+        assert record.outcome == 'repaired'
+        assert record.edge_uuid == 'e1'
+        assert record.which_end == 'source'
+        assert record.old_endpoint_uuid == 'n-3129'
+        assert record.new_endpoint_uuid == 'n-3127'
+        assert record.intended_referent == 'Task 3127'
+
+    async def test_the_identity_lock_is_held_while_ensure_entity_node_runs(
+        self, service,
+    ):
+        """ALPHA'S LOCK CONTRACT, checked rather than assumed.
+
+        `ensure_entity_node`'s docstring states that callers MUST hold
+        `_identity_lock_for(group_id)` — it performs no locking of its own, and
+        a concurrent same-group writer between its resolve and its mint
+        produces exactly the duplicate-name pair the identity gate exists to
+        prevent. eta satisfies that by PLACEMENT, which is precisely the kind
+        of guarantee that decays silently under refactoring unless a test
+        observes it from INSIDE the call.
+        """
+        held: list[bool] = []
+
+        async def _observe_lock(_name, *, group_id, **_kw):
+            held.append(service.graphiti._identity_lock_for(group_id).locked())
+            return 'n-3127'
+
+        service.graphiti.add_episode = AsyncMock(return_value=self._result())
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=_observe_lock)
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other'}],
+        )
+
+        await service._execute_graphiti_write('add_episode', self._payload())
+
+        assert held == [True], (
+            'ensure_entity_node ran OUTSIDE the per-group identity lock — '
+            "alpha's contract is violated by placement"
+        )

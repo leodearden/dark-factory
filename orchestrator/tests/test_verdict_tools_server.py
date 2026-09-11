@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+from typing import Any
+
 import pytest
+from fastmcp import FastMCP
 
 from orchestrator.agents.roles import ALL_REVIEWERS
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import verdict_tools
 from orchestrator.mcp.verdict_tools import (
     _SINGLETON_ROLE_TOOLS,
     _artifacts_from_args,
@@ -319,3 +324,54 @@ class TestArtifactsFromArgs:
                 '--worktree', str(wt),
                 '--verdict-role', '../escape',
             ])
+
+
+# ---------------------------------------------------------------------------
+# main() suppresses the FastMCP startup banner + PyPI update-check (task 2942).
+#
+# Same root cause as plan_tools.main(): FastMCP 3.x's banner rendering fires a
+# synchronous PyPI update-check (check_for_newer_version -> httpx.get) on the
+# stdio startup path BEFORE serving, which can delay the MCP initialize
+# handshake past the CLI's MCP_TIMEOUT and get this server silently dropped
+# for reviewer/judge/merger verdict submission. This pins that main() passes
+# show_banner=False. Mirrors test_plan_tools_server.TestMainSuppressesBanner.
+# ---------------------------------------------------------------------------
+
+
+class TestMainSuppressesBanner:
+    """verdict_tools.main() calls server.run(transport='stdio', show_banner=False)."""
+
+    def test_main_runs_stdio_with_banner_disabled(self, tmp_path, monkeypatch):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        mr = tmp_path / 'base' / '.task-meta' / 'wt'
+        mr.mkdir(parents=True)
+
+        monkeypatch.setattr(
+            sys, 'argv',
+            [
+                'verdict_tools',
+                '--worktree', str(wt),
+                '--meta-root', str(mr),
+                '--verdict-role', 'judge',
+            ],
+        )
+
+        captured: dict[str, Any] = {}
+
+        def recorder(self, *args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+            return None
+
+        # Class-level patch: create_server builds a real FastMCP instance, so
+        # patching the class method intercepts its .run() without serving.
+        monkeypatch.setattr(FastMCP, 'run', recorder)
+
+        verdict_tools.main()
+
+        kwargs = captured.get('kwargs', {})
+        args = captured.get('args', ())
+        transport = kwargs.get('transport', args[0] if args else None)
+        assert transport == 'stdio'
+        assert kwargs.get('show_banner') is False

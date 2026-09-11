@@ -36,9 +36,27 @@ def _mk_result(
     composite: float = 0.8,
     cost: float = 1.5,
     dur_ms: int = 120_000,
-    tests_pass: bool = True,
+    tests_pass: bool | None = True,
+    plan_quality: float | None = None,
+    plan_steps: int | None = None,
+    cap_tainted: bool = False,
+    invocation_error: str | None = None,
 ) -> EvalResult:
-    """A canned PASSING EvalResult carrying the C4 metrics the report reads."""
+    """A canned PASSING EvalResult carrying the C4 metrics the report reads.
+
+    ``plan_quality`` / ``cap_tainted`` / ``invocation_error`` mirror the
+    PLAN-ONLY architect shape ``run_architect_eval`` writes (task 3099): a
+    plan-only cell runs no test, so it carries ``tests_pass=None`` and its
+    quality in ``plan_quality``.
+
+    ``plan_steps`` (task 3302) defaults to the step count implied by *role*:
+    NONZERO for an architect cell — the ordinary case is a cell that actually
+    produced a plan, and ``plan_steps > 0`` is the predicate the report layer
+    reads to know it — and 0 for an implementer cell, which the plan-production
+    surfaces never consult. Pass it explicitly for the no-plan shape.
+    """
+    if plan_steps is None:
+        plan_steps = 6 if role == 'architect' else 0
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
@@ -52,6 +70,10 @@ def _mk_result(
             'judge_invocations': 2,
             'judge_cost_usd': 0.05,
             'cost_source': 'price_table',
+            'plan_quality': plan_quality,
+            'plan_steps': plan_steps,
+            'cap_tainted': cap_tainted,
+            'invocation_error': invocation_error,
         },
         worktree_path='/tmp/eval-wt',
         wall_clock_ms=dur_ms,
@@ -268,3 +290,90 @@ def test_eval_help_still_lists_judge_trials_vllm_options():
     assert r.exit_code == 0, r.output
     for opt in ('--judge', '--trials', '--vllm-url'):
         assert opt in r.output, f'{opt!r} missing from `eval --help`'
+
+
+# ---------------------------------------------------------------------------
+# task 3099 — _emit_composite_report's architect surface.
+#
+# _emit_composite_report is the ONE shared surface behind eval-ofat /
+# eval-matrix / eval-confirm. The composite row can only report an exclusion
+# COUNT; only the plan-quality table breaks it out BY CAUSE, which is what tells
+# an operator whether a missing architect cell is a transient cap window (rerun
+# it) or a permanent model-not-found (that candidate can never run).
+# ---------------------------------------------------------------------------
+
+def _arch_ofat_results():
+    """The OFAT shape ``ofat_candidates()`` actually produces: architect
+    plan-only cells alongside full-workflow implementer cells."""
+    return [
+        _mk_result('arch-opus-high', role='architect', plan_quality=0.9,
+                   tests_pass=None, cost=0.3, dur_ms=60_000),
+        _mk_result('arch-fable-high', role='architect', plan_quality=None,
+                   tests_pass=None, cost=0.0, dur_ms=0, cap_tainted=True,
+                   invocation_error='architect:model_not_found: no such model'),
+        _mk_result('impl-opus-high', role='implementer'),
+    ]
+
+
+class TestEmitCompositeReportArchitectSurface:
+    def test_architect_result_set_emits_both_tables(self, capsys):
+        cli_module._emit_composite_report(_arch_ofat_results(), {})
+
+        out = capsys.readouterr().out
+        assert 'composite report:' in out
+        # The per-cell θ scores AND the cap-exclusion CAUSES the composite row
+        # can only report as a count.
+        assert 'plan_quality report:' in out
+        assert 'model_not_found' in out
+
+    def test_architect_surface_reuses_the_plan_quality_table_verbatim(self, capsys):
+        """No second rendering path: the emitted section IS
+        format_plan_quality_table(build_plan_quality_report(results))."""
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = _arch_ofat_results()
+        cli_module._emit_composite_report(results, {})
+
+        out = capsys.readouterr().out
+        assert format_plan_quality_table(build_plan_quality_report(results)) in out
+
+    def test_non_architect_result_set_emits_exactly_todays_output(self, capsys):
+        """The existing eval-matrix / eval-confirm end_to_end surfaces are
+        unchanged — no extra section when no architect ran."""
+        from orchestrator.evals.report import format_composite_table
+
+        results = [
+            _mk_result('e2e-opus-opus', role='end_to_end', composite=0.85),
+            _mk_result('e2e-sonnet-sonnet', role='end_to_end', composite=0.70),
+        ]
+        cli_module._emit_composite_report(results, {})
+
+        out = capsys.readouterr().out
+        assert 'plan_quality report:' not in out
+        expected = format_composite_table(
+            build_composite_report(results, price_table={})
+        )
+        assert out.strip() == expected.strip()
+
+    def test_ofat_run_with_architect_candidates_surfaces_both_tables(
+        self, monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
+    ):
+        """End-to-end through the `eval-ofat` command, not just the helper."""
+        monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+
+        async def fake_ofat(*args, **kwargs):
+            return _arch_ofat_results()
+
+        monkeypatch.setattr(runner_module, 'run_ofat_stage', fake_ofat)
+
+        r = CliRunner().invoke(main, [
+            'eval-ofat', '--config', str(dummy_cfg_file),
+            '--tasks-dir', str(fixtures_dir),
+        ])
+
+        assert r.exit_code == 0, r.output
+        assert 'composite report:' in r.output
+        assert 'plan_quality report:' in r.output

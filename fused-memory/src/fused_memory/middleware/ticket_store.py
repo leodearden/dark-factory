@@ -310,7 +310,10 @@ class TicketStore:
         """Return tickets for a project, newest-first, optionally filtered.
 
         ``status`` matches against the status column literal ('pending',
-        'created', 'failed', 'combined'). ``since`` filters by ``created_at``.
+        'created', 'failed', 'combined', 'refused'). A ``refused`` row is
+        terminal and has a NULL ``task_id`` — a deterministic guard rejected
+        the candidate and no task was created. ``since`` filters by
+        ``created_at``.
         Default window when ``since`` is None: last 7 days.
         """
         db = self._require_db()
@@ -342,6 +345,17 @@ class TicketStore:
         as ``status='combined'`` so are already excluded by the status filter,
         but the explicit guard belts-and-braces against future renames). Rows
         are ordered by ``resolved_at`` so the oldest failure escalates first.
+
+        ``status='refused'`` is DELIBERATELY excluded and must stay excluded.
+        A refusal is a successful, intended outcome of an operator-authored
+        policy (the cancelled-premise blocklist / recon premise registry) —
+        not an error. Sweeping refusals into the janitor's failure path would
+        page a steward every time the blocklist did its job, training
+        operators to ignore the signal. Do not "fix" this omission — it is
+        pinned by
+        ``tests/test_ticket_store.py::test_fetch_unescalated_failures_never_returns_refused``,
+        so broadening this predicate (e.g. to "all terminal non-created
+        statuses") fails there rather than in production.
 
         Args:
             project_id: When set, restrict to a single project. Default None

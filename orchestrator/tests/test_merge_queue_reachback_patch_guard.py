@@ -42,6 +42,21 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This guard AST-parses every *.py under orchestrator/tests/ -- 535 files at
+# authorship time -- via rglob. MEASURED at 8.25s/call unloaded and serial
+# (-n0) on a 32-core box, the slowest in the family, and CRASHED live rather
+# than hypothetically: branch task/3980 @ d4182e4642, loadavg ~250-336 --
+# "FAILED test_no_new_merge_queue_private_reachback_patches" / "[gw17] node
+# down", session truncated at 44% (esc-3980-1).
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _THIS_FILE = Path(__file__).name
 _TESTS_DIR = Path(__file__).parent
 _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
@@ -245,6 +260,15 @@ def _find_merge_queue_private_patches(source: str, forbidden: set[str]) -> list[
 #   _run_drift_check                      merge_drift.py:254   (_maybe_run_drift_check)
 #   _run_shadow_compare                   merge_shadow.py:1012 (_maybe_schedule_shadow_compare)
 #
+# FIX 2 (task 2886, PRD leaf delta §3.4) locks two further reach-back names for
+# the map-less COARSE shadow-compare path.  Each is resolved via a function-local
+# `from orchestrator.merge_queue import X` (mirroring the _run_shadow_compare /
+# _run_cold_shadow_verify locks above), so the satellite copy is off the
+# resolution path and patching it directly would pass vacuously:
+#
+#   _run_coarse_shadow_compare            merge_shadow.py (_maybe_schedule_shadow_compare)
+#   _run_cold_shadow_verify_suite         merge_shadow.py (_run_coarse_shadow_compare)
+#
 # A name drops off this table -- and its ALLOWLIST pairs become genuine
 # repoint candidates -- once a later scope deletes the back-import that
 # locks it.
@@ -271,6 +295,14 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_queue.py', '_resolve_second_parent'),
     ('test_merge_queue.py', '_reverify_rebased_tree'),
     ('test_merge_queue_concurrent_verify.py', '_maybe_schedule_shadow_compare'),
+    # Task 3186 (deep merge-ahead delta) — the adopted-head shadow-compare
+    # cadence test.  Same genuinely-unavoidable reach-back as the four other
+    # ('_maybe_schedule_shadow_compare') pairs here: the consumer at
+    # merge_queue.py::_finalize_inflight resolves the name through the
+    # merge_queue module global (imported at merge_queue.py:124), so a spy
+    # installed on merge_shadow would sit off the resolution path and the
+    # test's `len(head_calls) == 1` assertion would pass vacuously.
+    ('test_merge_queue_deep_landing.py', '_maybe_schedule_shadow_compare'),
     ('test_merge_queue_equivalence.py', '_check_post_merge_pyright'),
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_equivalence'),
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_pyright'),
@@ -282,9 +314,12 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_queue_multihost_wiring.py', '_run_drift_check'),
     ('test_merge_queue_train_attribution.py', '_finalize_advanced_merge'),
     ('test_merge_queue_warm_cold_shadow.py', '_maybe_schedule_shadow_compare'),
+    ('test_merge_queue_warm_cold_shadow.py', '_run_coarse_shadow_compare'),
     ('test_merge_queue_warm_cold_shadow.py', '_run_cold_shadow_verify'),
     ('test_merge_queue_warm_cold_shadow.py', '_run_shadow_compare'),
+    ('test_merge_shadow.py', '_run_coarse_shadow_compare'),
     ('test_merge_shadow.py', '_run_cold_shadow_verify'),
+    ('test_merge_shadow.py', '_run_cold_shadow_verify_suite'),
     ('test_merge_shadow.py', '_run_shadow_compare'),
     ('test_merge_speculation.py', '_acquire_warm_verify_worktree'),
     ('test_merge_speculation.py', '_finalize_advanced_merge'),
@@ -293,6 +328,12 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_speculation.py', '_maybe_schedule_shadow_compare'),
     ('test_merge_speculation.py', '_reverify_rebased_tree'),
     ('test_merge_speculation.py', '_run_cold_shadow_verify'),
+    # Task 3539 — the already-landed carve-out's workflow-side tests.  Same
+    # genuinely-unavoidable reach-back as ('test_workflow.py', ...) above: the
+    # consumer in `_submit_to_merge_queue` resolves this name through the
+    # merge_queue shim, so a stub installed on merge_gates would sit off the
+    # resolution path and the test would pass vacuously.
+    ('test_convert_to_blocked.py', '_check_plan_files_touched_in_branch'),
     ('test_workflow.py', '_check_plan_files_touched_in_branch'),
 })
 

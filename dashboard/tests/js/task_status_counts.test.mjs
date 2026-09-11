@@ -1,0 +1,297 @@
+// Module-contract tests for task_status_counts.js — a plain-JS (no
+// JSX/Babel) module holding the pure per-project header counting logic for
+// the Tasks tab (tab_tasks.jsx). Run via `node --test` (see
+// dashboard/tests/test_graph_layout_js.py for the pytest wrapper that
+// surfaces this suite in CI via its `**/*.test.mjs` glob — no wrapper
+// change needed for this new file).
+//
+// task_status_counts.js has no package.json in the repo, so it resolves as
+// CommonJS (`module.exports = <object>`). Node's cjs-module-lexer cannot
+// statically detect named exports assigned from a variable, so
+// `import { projectStatusCounts } from '...'` would come back undefined. We
+// therefore default-import the module and destructure instead (mirrors
+// prd_grouping.test.mjs / graph_layout.test.mjs).
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+import statusCounts from '../../src/dashboard/static/redux/task_status_counts.js';
+
+const { projectStatusCounts, activityPips } = statusCounts;
+
+const EXPECTED_FUNCTION_NAMES = [
+  'projectStatusCounts',
+  'activityPips',
+];
+
+// The statuses the legacy single "N active" pip merged into one number.
+// Every split-bucket test below is cross-checked against this set so the
+// split can never silently drift from the population it replaced.
+const LEGACY_ACTIVE_STATUSES = ['in-progress', 'blocked', 'merge-deferred'];
+
+// Builds a minimal task fixture — only the fields task_status_counts.js
+// actually reads (id, status). Trimmed from prd_grouping.test.mjs's mkTask.
+function mkTask(id, { status } = {}) {
+  return {
+    id,
+    ...(status !== undefined ? { status } : {}),
+  };
+}
+
+// n tasks all carrying `status`, with ids unique across the whole list they
+// are concatenated into (the prefix keeps ids distinct per status bucket).
+function tasksWithStatus(status, n) {
+  return Array.from({ length: n }, (_, i) => mkTask(`${status}-${i}`, { status }));
+}
+
+test('default-imported module exposes the status-counting functions', () => {
+  for (const name of EXPECTED_FUNCTION_NAMES) {
+    assert.equal(
+      typeof statusCounts[name],
+      'function',
+      `statusCounts.${name} should be a function`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// projectStatusCounts — one pass, splitting the legacy merged "active" number
+// into its three independent components.
+// ---------------------------------------------------------------------------
+
+test('projectStatusCounts: splits the 2026-07-30 false-alarm population into three counts', () => {
+  // The shape that triggered the false alarm: the header read "43 active"
+  // against a max_concurrent_tasks cap of 24, so an operator saw a cap
+  // breach that never happened — only the 24 in-progress tasks are bounded
+  // by the cap; blocked and merge-deferred tasks hold no agent slot. The
+  // 24/14/5 split reproduces that same 43 (the number quoted in
+  // task_status_counts.js's header, tab_tasks.jsx's counts-site comment and
+  // test_tab_tasks_status_counts.py's docstring — keep all four in step).
+  const tasks = [
+    ...tasksWithStatus('in-progress', 24),
+    ...tasksWithStatus('blocked', 14),
+    ...tasksWithStatus('merge-deferred', 5),
+  ];
+
+  const counts = projectStatusCounts(tasks);
+
+  assert.equal(counts.running, 24);
+  assert.equal(counts.blocked, 14);
+  assert.equal(counts.mergeDeferred, 5);
+  // The whole point: `running` is NOT the merged 43.
+  assert.notEqual(counts.running, 43);
+  assert.equal(counts.total, 43);
+});
+
+test('projectStatusCounts: "deferred" is not "merge-deferred", and neither is running', () => {
+  // 'deferred' and 'merge-deferred' share a suffix, and a substring/prefix
+  // test (or an `.includes("deferred")`) would conflate them. They are
+  // wholly different states: merge-deferred work is finished and waiting on
+  // the merge lane; deferred work is parked and not in flight at all.
+  const tasks = [
+    ...tasksWithStatus('deferred', 7),
+    ...tasksWithStatus('merge-deferred', 3),
+  ];
+
+  const counts = projectStatusCounts(tasks);
+
+  assert.equal(counts.mergeDeferred, 3, 'only literal "merge-deferred" counts as merge-deferred');
+  assert.equal(counts.running, 0, 'neither deferred nor merge-deferred is running');
+  assert.equal(counts.blocked, 0);
+  assert.equal(counts.pending, 0, 'deferred is not pending');
+  assert.equal(counts.total, 10, 'deferred still counts toward total');
+});
+
+test('projectStatusCounts: counts pending, done and total; parks the rest in total only', () => {
+  const tasks = [
+    ...tasksWithStatus('in-progress', 2),
+    ...tasksWithStatus('blocked', 1),
+    ...tasksWithStatus('merge-deferred', 1),
+    ...tasksWithStatus('pending', 6),
+    ...tasksWithStatus('done', 4),
+    ...tasksWithStatus('cancelled', 3),
+    ...tasksWithStatus('deferred', 2),
+    ...tasksWithStatus('some-future-status', 5),
+  ];
+
+  const counts = projectStatusCounts(tasks);
+
+  assert.equal(counts.pending, 6);
+  assert.equal(counts.done, 4);
+  assert.equal(counts.running, 2);
+  assert.equal(counts.blocked, 1);
+  assert.equal(counts.mergeDeferred, 1);
+  // cancelled / deferred / an unrecognized status reach total and nothing else.
+  assert.equal(counts.total, 24);
+  const bucketed = counts.running + counts.blocked + counts.mergeDeferred
+    + counts.pending + counts.done;
+  assert.equal(counts.total - bucketed, 10, 'cancelled + deferred + unknown are total-only');
+});
+
+test('projectStatusCounts: a task with no status at all lands in total only', () => {
+  const counts = projectStatusCounts([mkTask('t1'), mkTask('t2', { status: 'in-progress' })]);
+
+  assert.equal(counts.total, 2);
+  assert.equal(counts.running, 1);
+  assert.equal(counts.blocked, 0);
+  assert.equal(counts.mergeDeferred, 0);
+  assert.equal(counts.pending, 0);
+  assert.equal(counts.done, 0);
+});
+
+test('projectStatusCounts: empty / undefined / null input yields an all-zero result', () => {
+  // The per-project header renders before task data has necessarily
+  // arrived; throwing here would blank the whole Tasks tab.
+  const allZero = { total: 0, running: 0, blocked: 0, mergeDeferred: 0, pending: 0, done: 0 };
+  for (const input of [[], undefined, null]) {
+    assert.deepEqual(
+      projectStatusCounts(input),
+      allZero,
+      `projectStatusCounts(${JSON.stringify(input)}) should be all-zero, not a throw`,
+    );
+  }
+});
+
+test('projectStatusCounts: the three components exactly partition the legacy merged set', () => {
+  // The decomposition invariant. The legacy pip showed ONE number over
+  // {in-progress, blocked, merge-deferred}; the split must reproduce that
+  // population exactly — losing a task would under-report in-flight work,
+  // and double-counting one would re-create the inflated number this task
+  // exists to remove. `statusMatches`'s `active` filter toggle still uses
+  // the same three-status disjunction, so this also pins that the header
+  // and the filter keep describing the same population.
+  const tasks = [
+    ...tasksWithStatus('in-progress', 4),
+    ...tasksWithStatus('blocked', 3),
+    ...tasksWithStatus('merge-deferred', 2),
+    ...tasksWithStatus('pending', 5),
+    ...tasksWithStatus('done', 6),
+    ...tasksWithStatus('cancelled', 1),
+    ...tasksWithStatus('deferred', 1),
+  ];
+
+  const counts = projectStatusCounts(tasks);
+  const legacyActive = tasks.filter(t => LEGACY_ACTIVE_STATUSES.includes(t.status)).length;
+
+  assert.equal(legacyActive, 9);
+  assert.equal(
+    counts.running + counts.blocked + counts.mergeDeferred,
+    legacyActive,
+    'the split must neither lose nor double-count a task from the legacy merged set',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// activityPips — turns a projectStatusCounts result into the ordered list of
+// header pips to render. Pure: no colours, no DOM (the caller owns those).
+// ---------------------------------------------------------------------------
+
+test('activityPips: fixed running -> blocked -> merge-deferred order with stable keys', () => {
+  // Ordering lives here, not at the call site, so no caller has to
+  // re-derive it and none can drift out of agreement with another.
+  const pips = activityPips({ running: 4, blocked: 3, mergeDeferred: 2 });
+
+  assert.deepEqual(pips.map(p => p.key), ['running', 'blocked', 'merge-deferred']);
+  assert.deepEqual(pips.map(p => p.count), [4, 3, 2]);
+  for (const p of pips) {
+    assert.equal(typeof p.label, 'string');
+    assert.ok(p.label.length > 0, `pip ${p.key} should carry an operator-facing label`);
+  }
+});
+
+test('activityPips: labels are the literal task status strings', () => {
+  // Not just "some non-empty string": the `running` pip is labelled
+  // 'in-progress' ON PURPOSE. The dashboard already uses three words for
+  // this one population — the status 'in-progress', the filter toggle
+  // 'active' (deliberately still merged), and 'running', which the
+  // Orchestrators tab uses for orchestrator PROCESS liveness. Labelling
+  // the pip with the task status string is the only spelling that cannot
+  // be read as either of the other two, and the point of this module is an
+  // unambiguous number to compare against max_concurrent_tasks.
+  const pips = activityPips({ running: 4, blocked: 3, mergeDeferred: 2 });
+
+  assert.deepEqual(
+    pips.map(p => p.label),
+    ['in-progress', 'blocked', 'merge-deferred'],
+  );
+  // Keys are the code-facing handle (tab_tasks.jsx's PIP_DOT_COLOR_T is
+  // keyed by them) and are NOT required to match the label.
+  assert.equal(pips[0].key, 'running');
+  assert.notEqual(pips[0].key, pips[0].label);
+});
+
+test('activityPips: each entry carries its own count, individually readable', () => {
+  const pips = activityPips({ running: 24, blocked: 14, mergeDeferred: 5 });
+  const byKey = Object.fromEntries(pips.map(p => [p.key, p.count]));
+
+  // The three numbers an operator could not tell apart when they were one
+  // merged "43 active" (the 2026-07-30 false alarm).
+  assert.deepEqual(byKey, { running: 24, blocked: 14, 'merge-deferred': 5 });
+});
+
+test('activityPips: suppresses a zero-valued component', () => {
+  // Most projects have no merge-deferred tasks; a permanent "0
+  // merge-deferred" pip would be noise in every header that has one.
+  const pips = activityPips({ running: 24, blocked: 14, mergeDeferred: 0 });
+
+  assert.equal(pips.length, 2);
+  assert.deepEqual(pips.map(p => p.key), ['running', 'blocked']);
+  assert.ok(!pips.some(p => p.key === 'merge-deferred'), 'no zero merge-deferred pip');
+});
+
+test('activityPips: suppression is per-component, not all-or-nothing', () => {
+  assert.deepEqual(
+    activityPips({ running: 0, blocked: 0, mergeDeferred: 3 }).map(p => p.key),
+    ['merge-deferred'],
+  );
+  assert.deepEqual(
+    activityPips({ running: 0, blocked: 2, mergeDeferred: 0 }).map(p => p.key),
+    ['blocked'],
+  );
+});
+
+test('activityPips: an all-zero project still renders exactly one "0 in-progress" pip', () => {
+  // Suppressing all three would leave the activity region of the header
+  // empty — indistinguishable from a failed data load, which is the same
+  // ambiguity class this task exists to remove, just inverted.
+  const pips = activityPips({ running: 0, blocked: 0, mergeDeferred: 0 });
+
+  assert.equal(pips.length, 1);
+  assert.equal(pips[0].key, 'running');
+  assert.equal(pips[0].label, 'in-progress');
+  assert.equal(pips[0].count, 0);
+});
+
+test('activityPips: rendered counts sum to the three components when any is non-zero', () => {
+  // No pip may silently absorb another's tasks: what the header displays
+  // must add back up to what projectStatusCounts measured.
+  const cases = [
+    { running: 24, blocked: 14, mergeDeferred: 5 },
+    { running: 24, blocked: 14, mergeDeferred: 0 },
+    { running: 0, blocked: 0, mergeDeferred: 7 },
+    { running: 1, blocked: 0, mergeDeferred: 0 },
+  ];
+  for (const counts of cases) {
+    const shown = activityPips(counts).reduce((sum, p) => sum + p.count, 0);
+    assert.equal(
+      shown,
+      counts.running + counts.blocked + counts.mergeDeferred,
+      `pips for ${JSON.stringify(counts)} should display every in-flight task exactly once`,
+    );
+  }
+});
+
+test('activityPips: accepts a projectStatusCounts result directly', () => {
+  // The two functions compose: the header calls one on the other's output,
+  // so a rename of a count key can never quietly zero a pip.
+  const counts = projectStatusCounts([
+    ...tasksWithStatus('in-progress', 3),
+    ...tasksWithStatus('merge-deferred', 2),
+    ...tasksWithStatus('done', 9),
+  ]);
+  const pips = activityPips(counts);
+
+  assert.deepEqual(
+    pips.map(p => [p.key, p.count]),
+    [['running', 3], ['merge-deferred', 2]],
+  );
+});

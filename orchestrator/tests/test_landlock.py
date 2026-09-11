@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import functools
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -30,6 +33,54 @@ def _reset_landlock_probe():
     _landlock_reset_probe()
     yield
     _landlock_reset_probe()
+
+
+_VAR_TMP_SKIP_REASON = '/var/tmp not writable in this sandbox'
+
+
+@functools.cache
+def _var_tmp_writable() -> bool:
+    """Probe whether /var/tmp is actually usable for scratch dirs in this process.
+
+    Catches ANY OS-level refusal, not just permission denial: agent sandboxes
+    deny the write via a syscall filter (EACCES) even though the directory's
+    own mode (1777) permits it, minimal containers may not ship /var/tmp at all
+    (ENOENT), and a read-only bind mount surfaces as EROFS. All three must
+    degrade to a skip — an escaping OSError here would abort collection of the
+    whole module, the exact failure mode these guards exist to prevent. Must be
+    an actual write attempt rather than an os.access/stat-mode check.
+
+    NOTE: duplicated verbatim in test_sandbox_enforcement_matrix.py and in
+    fused-memory/tests/reconciliation/test_recon_sandbox_guard.py — no shared
+    test-helper module spans both packages, so keep the three copies in sync.
+    """
+    try:
+        probe = tempfile.mkdtemp(dir='/var/tmp')
+    except OSError:
+        return False
+    shutil.rmtree(probe, ignore_errors=True)
+    return True
+
+
+def _skip_var_tmp() -> bool:
+    """Whether /var/tmp-dependent tests should be skipped in this environment.
+
+    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — set by CI jobs known to have a
+    writable /var/tmp and a landlock-capable kernel — an unwritable /var/tmp is
+    an environment regression, not a reason to skip: quietly dropping the
+    real-kernel enforcement surface (TestLandlockEnforcement, TestLandlockRefer,
+    TestLandlockClaudeHomeNarrowing, all 12 matrix rows) would leave the suite
+    green while every denial assertion stopped running. Fail loudly there.
+    """
+    if _var_tmp_writable():
+        return False
+    if os.environ.get('DF_REQUIRE_SANDBOX_TESTS') == '1':
+        pytest.fail(
+            f'DF_REQUIRE_SANDBOX_TESTS=1 but {_VAR_TMP_SKIP_REASON}: refusing to '
+            'silently skip the real-kernel sandbox enforcement tests.',
+            pytrace=False,
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +158,7 @@ class TestBuildLandlockCommand:
     not is_landlock_available(),
     reason='landlock not supported on this kernel',
 )
+@pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
 class TestLandlockEnforcement:
     def test_allowed_and_denied_writes(self):
         # /var/tmp — outside the wrapper's default writable /tmp. pytest's
@@ -146,6 +198,80 @@ class TestLandlockEnforcement:
         assert 'sibling_denied' in result.stdout
         assert 'outside_denied' in result.stdout
         assert 'end' in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Test 3b: REFER (cross-directory rename) — fleet-outage regression guard
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    landlock_mod._syscall_probe_abi() < 2,
+    reason='landlock ABI < 2 has no REFER; the wrapper correctly omits it there',
+)
+@pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+class TestLandlockRefer:
+    """Guard against re-omitting LANDLOCK_ACCESS_FS_REFER from the ruleset.
+
+    When ``handled_access_fs`` omits REFER, the kernel denies *every* rename
+    that reparents a file across directories — surfaced to userspace as EXDEV,
+    even within one granted tree on a single filesystem. rustc's
+    ``encode_and_write_metadata`` writes ``.rmeta`` into a temp subdirectory
+    and renames it up one level, so that omission broke every ``cargo
+    build/check/test`` under the sandbox, on untouched dependency crates as
+    much as on edited ones. It took the whole fleet down on 2026-07-29.
+
+    The second test is the other half of the contract: REFER must restore
+    rename *within* the writable set without widening that set.
+    """
+
+    def test_cross_directory_rename_inside_writable_tree_is_allowed(self):
+        base = Path(tempfile.mkdtemp(prefix='landlock-refer-', dir='/var/tmp'))
+        try:
+            worktree = base / 'wt'
+            worktree.mkdir()
+            mod = worktree / 'mod_a'
+            (mod / 'sub').mkdir(parents=True)
+            (mod / 'sub' / 'f').write_text('x')
+
+            inner = [
+                '/bin/sh', '-c',
+                f'mv {mod}/sub/f {mod}/f_moved && echo refer_ok',
+            ]
+            cmd = build_landlock_command(inner, worktree, ['mod_a'])
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+            assert result.returncode == 0, f'stderr={result.stderr}'
+            assert 'refer_ok' in result.stdout
+            assert (mod / 'f_moved').exists()
+            assert not (mod / 'sub' / 'f').exists()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_refer_does_not_widen_the_write_boundary(self):
+        """Renaming OUT of the writable set stays denied even with REFER."""
+        base = Path(tempfile.mkdtemp(prefix='landlock-refer-esc-', dir='/var/tmp'))
+        try:
+            worktree = base / 'wt'
+            worktree.mkdir()
+            mod = worktree / 'mod_a'
+            mod.mkdir()
+            (mod / 'f').write_text('x')
+            outside = base / 'outside'
+            outside.mkdir()
+
+            inner = [
+                '/bin/sh', '-c',
+                f'(mv {mod}/f {outside}/escaped 2>/dev/null || echo escape_denied) && echo end',
+            ]
+            cmd = build_landlock_command(inner, worktree, ['mod_a'])
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+            assert result.returncode == 0, f'stderr={result.stderr}'
+            assert 'escape_denied' in result.stdout
+            assert not (outside / 'escaped').exists()
+            assert (mod / 'f').exists()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -224,3 +350,83 @@ class TestSandboxConfigBackendField:
         from orchestrator.config import SandboxConfig
         with pytest.raises(ValidationError):
             SandboxConfig(backend='seccomp-magic')  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Test 6: ~/.claude narrowing — deny settings.json, allow fleet/, allow
+# redirected in-worktree transcript writes (PRD enforcement matrix rows 9/10)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not is_landlock_available(),
+    reason='landlock not supported on this kernel',
+)
+@pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+class TestLandlockClaudeHomeNarrowing:
+    def test_denies_settings_but_allows_fleet_and_transcript(self):
+        # /var/tmp — outside the wrapper's blanket /tmp grant, so writes here
+        # are governed only by the rules under test. HOME is overridden to a
+        # fake home (below) so this never touches the real ~/.claude.
+        base = Path(tempfile.mkdtemp(prefix='landlock-claude-home-', dir='/var/tmp'))
+        try:
+            fake_home = base / 'home'
+            fake_home.mkdir()
+            fleet_dir = fake_home / '.claude' / 'fleet'
+            fleet_dir.mkdir(parents=True)
+            settings_path = fake_home / '.claude' / 'settings.json'
+            settings_path.write_text(json.dumps({'orig': True}))
+
+            worktree = base / 'wt'
+            worktree.mkdir()
+
+            self._run_enforcement(fake_home, fleet_dir, settings_path, worktree)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def _run_enforcement(
+        self, fake_home: Path, fleet_dir: Path, settings_path: Path, worktree: Path,
+    ) -> None:
+        # Mirrors the production compute_write_set() -> sandbox_extras ->
+        # build_landlock_command(writable_extras=...) chain: fleet/ is the
+        # only ~/.claude subpath granted, passed the same way the real
+        # workflow wiring passes it.
+        transcript_dir = worktree / '.task' / 'claude-config-x' / 'projects'
+        poisoned = json.dumps({'pwned': True})
+
+        inner = [
+            '/bin/sh', '-c',
+            (
+                f'(touch {fleet_dir}/rec 2>/dev/null && echo fleet_ok || echo fleet_denied) && '
+                f"(printf '%s' '{poisoned}' > {settings_path} 2>/dev/null && "
+                'echo settings_wrote || echo settings_denied) && '
+                f'(mkdir -p {transcript_dir} 2>/dev/null && '
+                f'printf transcript > {transcript_dir}/transcript.jsonl 2>/dev/null && '
+                'echo transcript_ok || echo transcript_denied) && '
+                'echo end'
+            ),
+        ]
+        cmd = build_landlock_command(
+            inner, worktree, [], writable_extras=[str(fleet_dir)],
+        )
+        result = subprocess.run(
+            cmd,
+            env={**os.environ, 'HOME': str(fake_home)},
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        assert result.returncode == 0, f'stderr={result.stderr}'
+        assert 'end' in result.stdout
+
+        # Row 10 (over-narrow guard): the fleet/ extra stays writable.
+        assert 'fleet_ok' in result.stdout, result.stdout
+
+        # Row 9 (the property under test): settings.json is NOT writable via
+        # the narrowed ~/.claude grant, and its content is left untouched.
+        assert 'settings_denied' in result.stdout, result.stdout
+        assert 'settings_wrote' not in result.stdout
+        assert json.loads(settings_path.read_text()) == {'orig': True}
+
+        # Acceptance: redirected in-worktree transcript writes still work.
+        assert 'transcript_ok' in result.stdout, result.stdout

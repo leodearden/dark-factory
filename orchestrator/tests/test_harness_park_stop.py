@@ -22,6 +22,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cost_store import CostStore
 
+import orchestrator.digest as digest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
@@ -109,6 +110,46 @@ class TestHarnessPauseScheduler:
 
         assert harness.scheduler.is_paused is True
         assert harness.scheduler.pause_reason == 'test reason'
+
+    @pytest.mark.asyncio
+    async def test_pause_persists_current_ewa_value(self, tmp_path: Path) -> None:
+        """pause_scheduler records the live EWA on the persisted pause row (task 4559).
+
+        Without it a restart mid-pause loses the number the halt was based on,
+        so the halt can only ever be re-asserted blind.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness._ewa_value = 73.59
+
+        await harness.pause_scheduler('ewa_trip_73.5900')
+
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        recorded = mock_run_store.save_scheduler_pause.call_args.kwargs.get('ewa_value')
+        assert recorded == pytest.approx(73.59), (
+            f'Expected ewa_value=73.59 persisted; got {recorded!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_also_persists_ewa_value(self, tmp_path: Path) -> None:
+        """Every pause class records the EWA — it is evidence, not a trip flag.
+
+        The pause CLASS is carried by the reason string, and the restore-time
+        predicate keys on that reason, never on the presence of a value.  So a
+        park-stop pause records the EWA too: it is forensic context for the
+        operator reading the row, and recording it uniformly is what makes the
+        evidence-vs-halt split structural to pause_scheduler rather than
+        EWA-specific.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness._ewa_value = 4.2
+
+        await harness.pause_scheduler('park-stop: 5 blocked')
+
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        recorded = mock_run_store.save_scheduler_pause.call_args.kwargs.get('ewa_value')
+        assert recorded == pytest.approx(4.2), (
+            f'Expected ewa_value=4.2 persisted for a non-EWA pause; got {recorded!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_pause_scheduler_persists_via_runstore(self, tmp_path: Path) -> None:
@@ -202,6 +243,205 @@ class TestHarnessSchedulerParkStopWiring:
 class TestHarnessRestartPersistence:
     """Tests for restart-time rehydration of persisted scheduler pause state."""
 
+    @staticmethod
+    def _seed_and_load(
+        tmp_path: Path,
+        *,
+        reason: str,
+        ewa_value: float | None,
+        threshold: float = 24.6,
+    ) -> tuple[Harness, RunStore, Path]:
+        """Seed a real runs.db pause row, then run the restore path over it."""
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = db_dir / 'runs.db'
+        seeder = RunStore(db_path)
+        seeder.save_scheduler_pause(
+            project_id='dark_factory',
+            reason=reason,
+            pause_at_iso='2026-05-13T22:00:00+00:00',
+            set_by_run_id='prior-run-id',
+            ewa_value=ewa_value,
+        )
+        config = OrchestratorConfig(project_root=tmp_path, digest_ewa_threshold=threshold)
+        harness = Harness(config)
+        harness._run_store = seeder
+        harness._run_id = 'new-run-id'
+        harness.event_store = EventStore(tmp_path / 'events.db', 'new-run-id')
+        return harness, seeder, db_path
+
+    @pytest.mark.asyncio
+    async def test_ewa_pause_still_tripped_is_reasserted(self, tmp_path: Path) -> None:
+        """A restart whose stored EWA still exceeds the threshold re-asserts the halt."""
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=73.59, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True, 'Halt must be re-asserted'
+        assert harness._ewa_value == pytest.approx(73.59), (
+            f'Evidence must be restored, not zeroed; got {harness._ewa_value}'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is not None, (
+            'The row must survive a re-asserted halt'
+        )
+        assert harness.event_store is not None, 'The helper wires a real EventStore'
+        events = _query_events(harness.event_store, 'scheduler_pause_restored')
+        assert len(events) == 1, f'Expected one restored event; got {events}'
+        payload = json.loads(events[0]['data'])
+        assert payload.get('reasserted') is True, (
+            f'Expected reasserted=True; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ewa_pause_below_threshold_is_not_reasserted(self, tmp_path: Path) -> None:
+        """A restart whose stored EWA no longer exceeds the threshold releases the halt.
+
+        This is NOT auto-resume of a live pause: nothing new reads _ewa_value to
+        unpause a running scheduler.  It is a refusal to RE-ASSERT, across a
+        process boundary, a halt whose stored predicate no longer holds.
+        """
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=9.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is False, (
+            'A halt whose predicate no longer holds must not be re-asserted'
+        )
+        assert harness._ewa_value == pytest.approx(9.0), (
+            'Restoration into live state is scoped to ewa_trip_ pauses, whose '
+            f'stored value IS the live statistic; got {harness._ewa_value}'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is None, (
+            'The stale pause row must be cleared'
+        )
+        assert harness._restored_pause_reason is None, (
+            'No L1 may be filed for a halt that was not re-asserted'
+        )
+        assert harness.event_store is not None, 'The helper wires a real EventStore'
+        events = _query_events(harness.event_store, 'scheduler_pause_restored')
+        assert len(events) == 1, f'Expected one restored event; got {events}'
+        payload = json.loads(events[0]['data'])
+        assert payload.get('reasserted') is False, f'Expected reasserted=False; got {payload!r}'
+        assert payload.get('ewa_value') == pytest.approx(9.0), (
+            f'The event must carry the value that decided it; got {payload!r}'
+        )
+        assert payload.get('ewa_threshold') == pytest.approx(24.6), (
+            f'The event must carry the threshold that decided it; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_pre_migration_row_restores_blind(self, tmp_path: Path) -> None:
+        """A NULL ewa_value on an ewa_trip_ reason restores the halt exactly as today.
+
+        Fail-safe toward KEEPING the halt when the predicate is unknowable,
+        never toward releasing it.
+        """
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=None, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True, (
+            'An unknowable predicate must restore the halt, not release it'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is not None
+        assert harness._restored_pause_reason == 'ewa_trip_73.5900'
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_never_consults_predicate(self, tmp_path: Path) -> None:
+        """A park-stop pause is restored blind even with a low stored EWA.
+
+        Honours task 3328's 'Non-5xx park-stop pauses NEVER auto-resume': the
+        predicate re-check is scoped strictly to ewa_trip_* reasons, the one
+        pause class whose predicate is a stored scalar.
+        """
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=9.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True, (
+            'A park-stop halt must be restored blind regardless of the stored EWA'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is not None
+        assert harness._restored_pause_reason == 'park-stop: 5 blocked'
+        assert harness._ewa_value == pytest.approx(0.0), (
+            'A non-ewa_trip row carries the EWA as forensic evidence only; it '
+            f'must never be seeded into live state. got {harness._ewa_value}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_does_not_seed_live_ewa_value(self, tmp_path: Path) -> None:
+        """A park-stop restore keeps the stored EWA as forensics, not live state.
+
+        For an ``ewa_trip_*`` row the stored scalar IS the live statistic, so
+        restoring it is correct.  For every other pause class it is forensic
+        evidence about a value that never tripped anything — seeding it into
+        ``_ewa_value`` turns a restart into a head start toward the threshold.
+        The evidence must still survive where the operator reads it: the
+        WARNING log and the ``scheduler_pause_restored`` event payload.
+        """
+        harness, _, _ = self._seed_and_load(
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness._ewa_value == pytest.approx(0.0), (
+            'A non-ewa_trip pause row must not seed live EWA state; got '
+            f'{harness._ewa_value}'
+        )
+        # The blind halt restore is unchanged for this pause class.
+        assert harness.scheduler.is_paused is True, (
+            'A park-stop halt must still be restored blind'
+        )
+        assert harness._restored_pause_reason == 'park-stop: 5 blocked'
+        # ...and the forensics survive where the operator actually reads them.
+        assert harness.event_store is not None, 'The helper wires a real EventStore'
+        events = _query_events(harness.event_store, 'scheduler_pause_restored')
+        assert len(events) == 1, f'Expected one restored event; got {events}'
+        payload = json.loads(events[0]['data'])
+        assert payload.get('ewa_value') == pytest.approx(22.0), (
+            f'The restored event must still carry the stored value; got {payload!r}'
+        )
+        assert payload.get('ewa_threshold') == pytest.approx(24.6), (
+            f'The restored event must still carry the threshold; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_after_non_ewa_restore_leaves_ewa_at_zero(
+        self, tmp_path: Path,
+    ) -> None:
+        """The end-to-end carryover: a park-stop restore + resume leaves EWA at 0.
+
+        ``resume_scheduler`` deliberately resets ``_ewa_value`` only when the
+        prior pause reason starts with ``ewa_trip_`` (harness.py:14965), so a
+        value seeded from a non-EWA row would never be cleared by an operator
+        resume.  It would sit in live state as a head start toward the
+        threshold and the next digest step with even a modest submission ratio
+        could halt fleet-wide dispatch.  The only place to break that chain is
+        to never seed it.
+        """
+        harness, _, _ = self._seed_and_load(
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+        await harness.resume_scheduler()
+
+        assert harness.scheduler.is_paused is False, 'The operator resume must take effect'
+        assert harness._ewa_value == pytest.approx(0.0), (
+            'resume_scheduler resets _ewa_value only for ewa_trip_ pauses, so a '
+            'non-EWA restore must never have seeded it; got '
+            f'{harness._ewa_value}'
+        )
+
     @pytest.mark.asyncio
     async def test_harness_restart_loads_persisted_pause(self, tmp_path: Path) -> None:
         """_load_persisted_scheduler_pause() restores is_paused and pause_reason from runs.db.
@@ -248,6 +488,8 @@ class TestHarnessRestartPersistence:
             'reason': 'pre-restart park-stop',
             'pause_at': '2026-05-13T22:00:00+00:00',
             'set_by_run_id': 'prior-run-id',
+            # Task 4559: the seed above omits ewa_value, so it reads back NULL.
+            'ewa_value': None,
         }, (
             f'Persisted row must be unchanged after restart load (no re-write '
             f'with new run_id); got {reloaded!r}'
@@ -1577,6 +1819,66 @@ class TestHarnessEscalationEventCounter:
             f'Expected 5 (3 submit + 2 resolve); got {harness._escalation_event_count}'
         )
 
+    def test_submit_counter_zero_on_construction(self, tmp_path: Path) -> None:
+        """The task-4559 submissions counters are zero on harness construction.
+
+        ``_escalation_submit_count`` is the EWA NUMERATOR and
+        ``_last_digest_submit_count`` its per-digest snapshot, mirroring the
+        existing event-count pair.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        assert harness._escalation_submit_count == 0, (
+            f'Expected 0; got {harness._escalation_submit_count}'
+        )
+        assert harness._last_digest_submit_count == 0, (
+            f'Expected 0; got {harness._last_digest_submit_count}'
+        )
+
+    def test_on_escalation_bumps_both_counters(self, tmp_path: Path) -> None:
+        """A submission advances BOTH the digest gate and the EWA numerator."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+
+        assert harness._escalation_event_count == 3, (
+            f'Expected 3 events; got {harness._escalation_event_count}'
+        )
+        assert harness._escalation_submit_count == 3, (
+            f'Expected 3 submissions; got {harness._escalation_submit_count}'
+        )
+
+    def test_on_escalation_resolved_bumps_events_only(self, tmp_path: Path) -> None:
+        """A resolution advances the digest GATE but NOT the EWA numerator.
+
+        This is the defect task 4559 fixes.  Today a single escalation
+        contributes TWO lifecycle events to the one counter that serves as
+        both gate and numerator — once when filed, once when resolved — so
+        merely DRAINING a backlog re-trips the breaker that the backlog
+        caused.  Splitting the counters means resolutions still keep the
+        digest firing (which is what lets a drain window decay the EWA)
+        without inflating the numerator that decides the trip.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation_resolved(esc)
+        harness._on_escalation_resolved(esc)
+
+        assert harness._escalation_event_count == 5, (
+            f'Expected 5 lifecycle events (3 submit + 2 resolve); '
+            f'got {harness._escalation_event_count}'
+        )
+        assert harness._escalation_submit_count == 3, (
+            f'Expected 3 submissions (resolutions excluded from the EWA '
+            f'numerator); got {harness._escalation_submit_count}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestHarnessMaybeWriteDigest (step-19)
@@ -1604,6 +1906,10 @@ class TestHarnessMaybeWriteDigest:
         # diff=5 >= 3 → should trigger
         harness._escalation_event_count = 5
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 5
+        harness._last_digest_submit_count = 0
 
         await harness._maybe_write_digest()
 
@@ -1615,6 +1921,143 @@ class TestHarnessMaybeWriteDigest:
         )
         assert harness._ewa_value != 0.0, (
             f'Expected _ewa_value to be updated (non-zero); got {harness._ewa_value}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ewa_numerator_is_submissions_not_events(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """The gate fires on lifecycle events; the EWA numerator uses submissions only.
+
+        Task 4559.  20 lifecycle events satisfy the gate of 10, but only 4 of
+        them were submissions.  With alpha=1.0 the EWA collapses to the raw
+        ratio, so the numerator is directly observable: it must be 4.0 (4
+        submissions / max(0 dones, 1)) and NOT 20.0.
+
+        Both snapshots advance to their own entry values, so the two counters
+        stay independently correct across digest steps.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=10,
+            digest_ewa_alpha=1.0,        # EWA collapses to the raw ratio
+            digest_ewa_threshold=999.0,  # high threshold — no trip
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 20   # gate: 20 >= 10
+        harness._escalation_submit_count = 4   # numerator
+        harness._last_digest_event_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md'))
+        assert len(files) == 1, (
+            f'Expected the gate (20 lifecycle events >= 10) to fire one digest; got {files}'
+        )
+        assert harness._ewa_value == pytest.approx(4.0), (
+            f'Expected EWA 4.0 (4 submissions / max(0 dones, 1)); '
+            f'got {harness._ewa_value} — 20.0 would mean the numerator is '
+            f'still the lifecycle-event count'
+        )
+        assert harness._last_digest_event_count == 20, (
+            f'Expected the event snapshot to advance to 20; '
+            f'got {harness._last_digest_event_count}'
+        )
+        assert harness._last_digest_submit_count == 4, (
+            f'Expected the submissions snapshot to advance to 4; '
+            f'got {harness._last_digest_submit_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_backlog_drain_decays_ewa_instead_of_tripping(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """The headline defect: a pure backlog drain decays the EWA and does not trip.
+
+        Models the 2026-08-20 window — 196 escalation-lifecycle events, of which
+        ZERO were new submissions (the window drained a pre-existing backlog),
+        with the landing collapse giving 0 dones.
+
+        Phase A starts from ``_ewa_value = 73.59``, the recorded trip value the
+        OLD statistic produced, and shows the drain now moves it DOWN
+        (0.7 * 73.59 = 51.513).  One decay step from 73.59 is still above 24.6,
+        so the halt correctly persists there; the no-trip claim is therefore
+        asserted in phase B, at the only starting point where it can hold — a
+        healthy pre-window EWA.  See esc-4559-5: the plan's single-phase form of
+        this test asserted 51.513 and ``is_paused is False`` together, which is
+        arithmetically impossible since 51.513 >= 24.6.
+
+        Phase B replays the same 196-event drain from a healthy prev_ewa=4.0.
+        The NEW statistic gives 2.8 and leaves the scheduler running; the OLD
+        statistic on the byte-identical window gives 61.6 >= 24.6 and would have
+        tripped.  The contrast is computed through digest.update_ewa itself, so
+        it is exact rather than prose.
+        """
+        # --- Phase A: an already-tripped EWA decays under a pure-drain window ---
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=10,
+            digest_ewa_alpha=0.3,
+            digest_ewa_threshold=24.6,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 196   # gate satisfied by resolutions alone
+        harness._escalation_submit_count = 0    # zero submissions — a pure drain
+        harness._last_digest_event_count = 0
+        harness._last_digest_submit_count = 0
+        harness._ewa_value = 73.59              # the recorded 2026-08-20 trip value
+
+        await harness._maybe_write_digest()
+
+        files = list((tmp_path / 'data' / 'digests').glob('digest-*.md'))
+        assert len(files) == 1, (
+            f'Expected the drain window to still fire a digest — that is what '
+            f'lets a tripped EWA decay at all; got {files}'
+        )
+        assert harness._ewa_value == pytest.approx(51.513), (
+            f'Expected 51.513 (= 0.7 * 73.59, pure decay); got {harness._ewa_value}'
+        )
+        assert harness._ewa_value < 73.59, (
+            'A pure-drain window must move the EWA DOWN, never up'
+        )
+
+        # --- Phase B: the same drain from a healthy EWA does not trip --------
+        harness_b, _, _ = _make_harness_with_mocks(tmp_path / 'b')
+        harness_b.config = OrchestratorConfig(
+            project_root=tmp_path / 'b',
+            digest_every_n_escalations=10,
+            digest_ewa_alpha=0.3,
+            digest_ewa_threshold=24.6,
+        )
+        harness_b.cost_store = await _cost_store_factory('cost_b.db')
+        harness_b._escalation_event_count = 196
+        harness_b._escalation_submit_count = 0
+        harness_b._last_digest_event_count = 0
+        harness_b._last_digest_submit_count = 0
+        harness_b._ewa_value = 4.0              # healthy pre-window EWA
+
+        await harness_b._maybe_write_digest()
+
+        assert harness_b._ewa_value == pytest.approx(2.8), (
+            f'Expected 2.8 (= 0.7 * 4.0); got {harness_b._ewa_value}'
+        )
+        assert harness_b.scheduler.is_paused is False, (
+            'Draining a backlog must not trip the breaker that the backlog caused'
+        )
+        # The identical window under the OLD statistic (resolutions counted in
+        # the numerator) would have tripped — computed, not asserted in prose.
+        old_statistic = digest.update_ewa(
+            prev_ewa=4.0, escalations_in_step=196, done_in_step=0, alpha=0.3
+        )
+        assert old_statistic == pytest.approx(61.6), (
+            f'Expected the old statistic to give 61.6; got {old_statistic}'
+        )
+        assert old_statistic >= 24.6, (
+            'Sanity: the old statistic must trip on this window — that is the defect'
         )
 
     @pytest.mark.asyncio
@@ -1722,6 +2165,10 @@ class TestHarnessEwaTrip:
         # 1 new escalation, 0 done → EWA = 1.0*(1/1) = 1.0 >= 0.01
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         await harness._maybe_write_digest()
 
@@ -1760,6 +2207,12 @@ class TestHarnessEwaTrip:
         harness.cost_store = await _cost_store_factory()
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        # Without it the EWA would be 0 and the trip would never fire, so this
+        # test would pass vacuously rather than proving the already-paused skip.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         # Pre-pause the scheduler.
         await harness.pause_scheduler('pre-existing-pause')
@@ -1789,6 +2242,10 @@ class TestHarnessEwaTrip:
         harness.cost_store = await _cost_store_factory()
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         await harness._maybe_write_digest()
 
@@ -1803,6 +2260,167 @@ class TestHarnessEwaTrip:
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_held_ewa_trip_pause_refreshes_the_persisted_value(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """A drain step under a HELD ewa_trip_ halt rewrites the stored scalar (task 4559).
+
+        Without this the persisted value is a trip-TIME snapshot that nothing
+        ever refreshes: ``pause_scheduler`` is the only writer and the trip
+        path only fires ``if tripped and not is_paused``.  Two things break as
+        a result — the restart-time predicate re-check in
+        ``_load_persisted_scheduler_pause`` can essentially never observe
+        recovery (a stored value is >= the threshold by construction at write
+        time), and a restart re-seeds live ``_ewa_value`` with the stale high
+        number, discarding the decay the drain achieved.  On the 8h
+        fleet-redeploy cadence that reset the healing progress on every
+        restart, which is precisely the mechanism this task introduces.
+
+        Drain window: 10 lifecycle events (the gate), ZERO submissions (the
+        numerator), so update_ewa reduces to pure decay 0.7 * 73.59 = 51.513.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=24.6,
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._ewa_value = 73.59               # the recorded 2026-08-20 trip value
+        await harness.pause_scheduler('ewa_trip_73.5900')
+        mock_run_store.reset_mock()              # drop the pause-time save
+
+        # A pure-drain window: resolutions advance the GATE, nothing advances
+        # the NUMERATOR.
+        harness._escalation_event_count = 10
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        mock_run_store.refresh_scheduler_pause_ewa.assert_called_once()
+        args = mock_run_store.refresh_scheduler_pause_ewa.call_args.args
+        assert args[1] == pytest.approx(0.7 * 73.59), (
+            f'Expected the decayed value 0.7*73.59 persisted; got {args[1]!r}'
+        )
+        assert harness._ewa_value == pytest.approx(args[1]), (
+            'The refreshed row must carry the SAME number as live state, '
+            f'else a restart re-seeds a different one; live={harness._ewa_value} '
+            f'persisted={args[1]}'
+        )
+        # The halt itself is untouched — this refreshes evidence, it does not
+        # resume anything (live auto-resume is explicitly out of scope).
+        assert harness.scheduler.is_paused is True, (
+            'Refreshing the stored value must never release the halt'
+        )
+        mock_run_store.save_scheduler_pause.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_is_not_refreshed(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """A park-stop halt keeps its trip-time evidence — the refresh is ewa_trip_ only.
+
+        Same scoping as the restore-time predicate: ``ewa_trip_`` is the one
+        pause class whose stored scalar IS the live statistic.  For every other
+        class the value is forensic evidence ABOUT that pause, and overwriting
+        it with an unrelated later EWA would destroy it.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=24.6,
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._ewa_value = 4.2
+        await harness.pause_scheduler('park-stop: 5 blocked')
+        mock_run_store.reset_mock()
+
+        harness._escalation_event_count = 10
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        mock_run_store.refresh_scheduler_pause_ewa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unpaused_digest_step_does_not_refresh(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """With no halt held there is no row to refresh, so the write is skipped.
+
+        Guards against turning every digest step into a needless DB write —
+        and, with RunStore's UPDATE-not-upsert semantics, against any reading
+        in which a routine step could fabricate a pause row.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=1_000_000_000.0,  # never trips
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 3
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 3
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        assert harness.scheduler.is_paused is False, 'Fixture sanity: not paused'
+        mock_run_store.refresh_scheduler_pause_ewa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_is_fail_open(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """A RunStore hiccup during the refresh must not break the digest.
+
+        The refresh is observability plus a restart hint, never a correctness
+        gate — the same fail-open contract the rest of ``_maybe_write_digest``
+        holds to.  The digest file and the advanced counters must survive it.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=24.6,
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._ewa_value = 73.59
+        await harness.pause_scheduler('ewa_trip_73.5900')
+        mock_run_store.reset_mock()
+        mock_run_store.refresh_scheduler_pause_ewa.side_effect = sqlite3.OperationalError(
+            'database is locked'
+        )
+
+        harness._escalation_event_count = 10
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        files = list((tmp_path / 'data' / 'digests').glob('digest-*.md'))
+        assert len(files) == 1, f'Expected the digest to still be written; got {files}'
+        assert harness._last_digest_event_count == 10, (
+            'Counters must still advance when the refresh fails; got '
+            f'{harness._last_digest_event_count}'
+        )
+        assert harness._ewa_value == pytest.approx(0.7 * 73.59), (
+            'Live EWA state must still decay when the refresh fails; got '
+            f'{harness._ewa_value}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestWatcherSupervisorCallsMaybeWriteDigest (step-23)
@@ -1810,9 +2428,18 @@ class TestHarnessEwaTrip:
 
 
 class TestWatcherSupervisorCallsMaybeWriteDigest:
-    """Tests that _watcher_supervisor_loop calls _maybe_write_digest after each rotation.
+    """Tests that _watcher_supervisor_loop calls _maybe_write_digest.
 
     Task 1327 — AFK hardening (step-24 impl).
+
+    Task 4559 moved the single call site from after the rotation to the TOP of
+    the loop body, above the empty-queue precheck, so a paused-and-drained
+    fleet still re-evaluates the EWA that paused it.  The digest therefore runs
+    once per supervisor ITERATION rather than once per completed rotation.
+    Each fixture below enters two iterations (the second one cancels at the
+    rotation), so the expected await count is 2, not 1.  What these tests pin
+    is unchanged: clean AND unclean rotations both reach the digest, and a
+    raising digest never breaks the supervisor.
     """
 
     @pytest.mark.asyncio
@@ -1839,7 +2466,12 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
             await harness._watcher_supervisor_loop()
 
-        harness._maybe_write_digest.assert_awaited_once()
+        # Two iterations are entered; the digest runs at the top of each
+        # (task 4559 hoist).
+        assert harness._maybe_write_digest.await_count == 2, (
+            f'Expected one digest check per supervisor iteration (2 iterations '
+            f'entered); await_count={harness._maybe_write_digest.await_count}'
+        )
 
     @pytest.mark.asyncio
     async def test_unclean_exit_also_triggers_maybe_write_digest(
@@ -1870,7 +2502,12 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
             await harness._watcher_supervisor_loop()
 
-        harness._maybe_write_digest.assert_awaited_once()
+        # Two iterations are entered; the digest runs at the top of each
+        # (task 4559 hoist).
+        assert harness._maybe_write_digest.await_count == 2, (
+            f'Expected one digest check per supervisor iteration (2 iterations '
+            f'entered); await_count={harness._maybe_write_digest.await_count}'
+        )
 
     @pytest.mark.asyncio
     async def test_maybe_write_digest_raising_does_not_break_supervisor(
@@ -1907,8 +2544,12 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
             f'Supervisor must loop to next rotation after digest failure; '
             f'rotation_count={rotation_count}'
         )
-        # _maybe_write_digest was called once (on the first rotation).
-        harness._maybe_write_digest.assert_awaited_once()
+        # The digest ran (and raised) at the top of BOTH iterations — proving
+        # the swallow keeps the loop alive every time, not just once.
+        assert harness._maybe_write_digest.await_count == 2, (
+            f'Expected one digest check per supervisor iteration (2 iterations '
+            f'entered); await_count={harness._maybe_write_digest.await_count}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1943,6 +2584,10 @@ class TestHarnessDigestDoneCountSource:
         harness.cost_store = await _cost_store_factory()
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         # Seed EventStore with 4 task_completed rows with outcome='done' inside
         # the 24h default window (timestamps 10–13 minutes in the past).
@@ -2038,6 +2683,46 @@ class TestHarnessDigestEscalationCounterSnapshot:
         assert harness._last_digest_event_count == 5, (
             f'Expected _last_digest_event_count=5 (entry snapshot); '
             f'got {harness._last_digest_event_count} '
+            f'(live value after concurrent +100 would be 105)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_counter_snapshotted_at_entry(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """_last_digest_submit_count advances to the entry snapshot, not the live value.
+
+        Task 4559: the submissions counter is the EWA numerator and must obey
+        the same once-at-entry discipline as the event counter — otherwise a
+        submission arriving at the cost_in_window await point would be silently
+        skipped by the advance instead of counted in the next digest step.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,   # diff=5 >= 3 → triggers
+            digest_ewa_threshold=999.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 5
+        harness._last_digest_submit_count = 0
+
+        from orchestrator.digest import CostStats
+
+        def _concurrent_bump(*_args, **_kwargs):
+            harness._escalation_submit_count += 100
+            return CostStats()
+
+        with patch(
+            'orchestrator.digest.cost_in_window', new=AsyncMock(side_effect=_concurrent_bump)
+        ):
+            await harness._maybe_write_digest()
+
+        assert harness._last_digest_submit_count == 5, (
+            f'Expected _last_digest_submit_count=5 (entry snapshot); '
+            f'got {harness._last_digest_submit_count} '
             f'(live value after concurrent +100 would be 105)'
         )
 

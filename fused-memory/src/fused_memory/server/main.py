@@ -21,7 +21,13 @@ load_dotenv()
 
 from functools import partial  # noqa: E402
 
+from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+    closure_exists_probe,
+)
+from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
@@ -625,6 +631,26 @@ async def run_server():
     # ReconciliationHarness and TicketJanitor so all three consumers share the
     # same snapshot (task 1164).
     _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
+    # Task 3088: the same snapshot, injected into MemoryService so update_memory's
+    # storm escalator can resolve a project_root. Deliberately HERE — before the
+    # `if config.reconciliation ... enabled:` block below — because the alarm is
+    # owned by MemoryService and constructed unconditionally: it has to keep
+    # working with reconciliation off, which is exactly the degraded
+    # configuration where an unattended in-place rewrite loop is least likely to
+    # be noticed any other way. Pure data, no lifetime coupling, same injection
+    # pattern ReconciliationHarness and TicketJanitor already use.
+    #
+    # KNOWINGLY UNCOVERED, and the asymmetry is the reason. Those two components
+    # need no wiring test because each DEFENDS ITSELF — omit the kwarg and it
+    # calls build_known_projects_map. This escalator has no such fallback (a
+    # safe fallback source is an open question: the module docstring forbids
+    # config.taskmaster.project_root, which defaults to '.'), so it depends on
+    # this one call. Deleting or reordering the line degrades the storm alarm to
+    # a WARN with no test failure. Do NOT "cover" it with a grep- or ast-based
+    # meta-test: that shape was deleted from this repo in fb3c47dccf on a
+    # CONFIRMED review finding. The real fix is tracked as a follow-up to task
+    # 3088 (escalation agent-followup-3088).
+    memory_service.set_known_projects(_known_projects_map)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
             ProjectPrefixRegistry.from_roots(list(_known_projects_map.values()))
@@ -699,6 +725,7 @@ async def run_server():
     # PRD γ §11: fail loudly before harness construction if reconciliation is
     # enabled but the transport cannot host the recon-report MCP server.
     _require_http_transport_for_reconciliation(config)
+
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -849,6 +876,7 @@ async def run_server():
             targeted.task_interceptor = task_interceptor
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
+        _wire_closure_collaborators(task_interceptor, memory_service)
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -866,6 +894,12 @@ async def run_server():
             memory_service=memory_service,
             task_interceptor=task_interceptor,
             known_projects=_known_projects_map,
+            # task 3065: repair_memory_citation needs the durable journal to
+            # reach a CLOSED run's findings — recon-report's own in-process
+            # state is TTL-evicted (300s) and GC'd at run quiescence, so it
+            # cannot serve a repair of a run that completed days ago. Safe to
+            # pass here: recon_journal was constructed and initialize()d above.
+            recon_journal=recon_journal,
         )
 
         # Task 2624: wire the code-enforced before/after live-task-write
@@ -920,6 +954,7 @@ async def run_server():
         )
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
+        _wire_closure_collaborators(task_interceptor, memory_service)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -931,12 +966,11 @@ async def run_server():
         known_projects=_known_projects_map,
     )
 
-    # Defence-in-depth wrapper at FastMCP's central tool-dispatch chokepoint.
-    # Catches BaseException escapes (SystemExit, BaseExceptionGroup, etc.) that
-    # would otherwise poison StreamableHTTPSessionManager's shared task group
-    # and cascade into uvicorn's main loop. Re-raises CancelledError because
-    # it is required for asyncio cancellation semantics.
-    _install_safe_tool_wrapper(mcp)
+    # Both ToolManager.call_tool wrappers, in the ONE order that works. The
+    # ordering rationale lives on the helper, and is pinned by
+    # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
+    # than by this comment.
+    _install_tool_dispatch_guards(mcp, known_projects=_known_projects_map)
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
@@ -1093,6 +1127,10 @@ async def run_server():
             # so the harness and the uvicorn server share the SAME ReconReportState
             # object. For reconciliation-disabled runs, build them now.
             if recon_report_state is None:
+                # No recon_journal here, deliberately (task 3065): this is the
+                # reconciliation-DISABLED path, where no journal was ever opened.
+                # repair_memory_citation then answers journal_unavailable, which
+                # is the honest result — there is no durable run history to repair.
                 recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
                     config,
                     memory_service=memory_service,
@@ -1682,6 +1720,59 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
     tool_manager._fused_memory_safe_wrapped = True
 
 
+def _install_tool_dispatch_guards(
+    mcp: Any, *, known_projects: dict[str, str] | None = None
+) -> None:
+    """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+
+    Two independent concerns share this chokepoint, and the order they are
+    installed in is not cosmetic — it decides which one ends up OUTSIDE, and
+    therefore what the caller sees when both fire:
+
+    1. :func:`_install_safe_tool_wrapper` — defence-in-depth. Catches
+       BaseException escapes (SystemExit, BaseExceptionGroup, ...) that would
+       otherwise poison StreamableHTTPSessionManager's shared task group and
+       cascade into uvicorn's main loop. Re-raises CancelledError, which
+       asyncio cancellation semantics require.
+    2. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+       write-boundary markup guard (task 4458, PRD
+       ``plans/toolcall-markup-containment-prd.md``). Rejects a call whose
+       argument absorbed MCP tool-call envelope markup and hands the caller a
+       ``repaired_call`` to resubmit verbatim.
+
+    DO NOT tidy these two calls into the other order. The guard REJECTS by
+    raising :class:`fastmcp.exceptions.ToolError` — measured as the only shape
+    that survives every output schema, since a returned dict is destroyed by
+    the output validation of any tool annotated ``-> str``. Installed second it
+    is the OUTER wrapper, so that ToolError reaches the lowlevel server intact.
+    Installed FIRST it ends up inside ``_safe_call_tool``, which catches
+    BaseException and flattens the rejection into its own
+    ``{'error': str, 'error_type': 'ToolError'}`` shape: ``repaired_call``
+    stops being a key the caller can read and survives only as text inside an
+    opaque string, so the agent cannot resubmit the repair.
+
+    Nor can that be fixed by teaching ``_safe_call_tool`` to re-raise ToolError:
+    the bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
+    such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
+    pins. Order is the whole mechanism.
+
+    *known_projects* is run_server's ``project_id -> project_root`` registry,
+    which the guard's storm-escalation sink uses to place a burst in the right
+    queue.
+
+    REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
+    C2), declared HERE at the interception point rather than inferred per tool
+    (INV-1). This is also the primary server only: the recon-report server
+    hosts no write tools and keeps the bare defence-in-depth wrapper.
+    """
+    _install_safe_tool_wrapper(mcp)
+    install_markup_guard(
+        mcp,
+        policy=RepairPolicy.REJECT_WITH_REPAIR,
+        known_projects=known_projects,
+    )
+
+
 def _build_uvicorn_config(
     app: Any,
     *,
@@ -1721,6 +1812,8 @@ def _build_recon_report_components(
     memory_service: Any = None,
     task_interceptor: Any = None,
     known_projects: dict[str, str] | None = None,
+    *,
+    recon_journal: Any = None,
 ) -> tuple[Any, Any, Any]:  # (ReconReportState, FastMCP, uvicorn.Config)
     """Construct the recon_report state, FastMCP server, and uvicorn.Config.
 
@@ -1729,6 +1822,14 @@ def _build_recon_report_components(
 
     Optional service args (task β): when provided they are injected into the
     returned ReconReportState so cite_* tools can validate citations at call time.
+
+    Args:
+        recon_journal: the open ReconciliationJournal (task 3065), used solely by
+            ``repair_memory_citation`` to reach the durable ``runs.stage_reports``
+            blob of an already-completed run.  Only the reconciliation-ENABLED
+            boot path has one; the disabled path passes nothing and the tool then
+            degrades to a structured ``journal_unavailable`` refusal rather than
+            half-working against a store that does not exist.
 
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
@@ -1754,6 +1855,7 @@ def _build_recon_report_components(
         memory_service=memory_service,
         task_interceptor=task_interceptor,
         store=recon_report_store,
+        journal=recon_journal,
     )
     if known_projects is not None:
         state.known_projects = known_projects
@@ -2034,6 +2136,67 @@ def _acquire_singleton_lock() -> None:
             'Kill it first or use systemctl --user restart fused-memory'
         )
         raise SystemExit(1) from None
+
+
+def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> None:
+    """Hand the interceptor all three consolidation-gate closure collaborators.
+
+    Task 3112 wired the deterministic metadata *scroll* (and its *count*):
+    the gate is DORMANT until wired, so this call is the ONLY thing that arms
+    the close-time refusal at all. Task 4808 added *exists* as the THIRD
+    collaborator — it is what makes the ``unstamped_cluster_member`` refusal
+    reachable in production, because without a probe an observed member that
+    is live but never stamped into the topic stays invisible (and an id
+    missing from the scroll cannot be told apart from one that was absorbed
+    and deleted).
+
+    All three are ``project_id``-adapting wrappers: the ``MemoryService``
+    methods take that scope FIRST positionally, while the interceptor passes
+    it by keyword because it resolves scope per task. *exists* is NOT built
+    here — it comes from the shared
+    ``consolidation_gate.py::closure_exists_probe``, the same factory
+    ``scripts/check_consolidation_closure.py`` binds, so the CLI and the seam
+    cannot disagree about that argument adaptation (INV-5). Its docstring
+    carries the fail-closed ``TimeoutError`` contract.
+
+    ONE wiring block, called from both ``TaskInterceptor`` construction sites
+    in ``server/main.py::run_server`` (reconciliation enabled and disabled).
+    "Both construction sites wire all three collaborators" therefore holds BY
+    CONSTRUCTION rather than by assertion — which is why the source-text test
+    that used to guard it (``'exists=' in`` an ``inspect.getsource`` fragment)
+    is gone rather than replaced in kind: it could not distinguish an armed
+    probe from ``exists=None``. What guards this now is
+    ``tests/test_consolidation_closure_seam.py::TestClosureCollaboratorWiring``,
+    which awaits each captured collaborator against a recording stub.
+
+    The extraction also RETIRES the ``NameError`` hazard the previous comment
+    recorded: the collaborator definitions used to sit in ``run_server``'s own
+    scope, above the reconciliation branch, because defining them inside the
+    enabled arm left the disabled arm raising ``NameError`` at startup. They
+    now live in this helper's scope, so neither arm can reference an
+    undefined name.
+
+    RESIDUAL RISK, stated rather than papered over: a future construction arm
+    could still forget to CALL this helper. That failure is strictly smaller
+    and louder than the one the deleted test allowed — one missing call
+    leaves the whole gate visibly dormant for that config, versus a silently
+    half-armed gate that passed a green ``'exists=' in call`` check. It is
+    not worth a second meta-test.
+    """
+
+    async def _closure_scroll(filters, *, limit, project_id):
+        return await memory_service.get_memories_by_metadata(
+            project_id, filters, limit=limit
+        )
+
+    async def _closure_count(filters, *, project_id):
+        return await memory_service.count_memories_by_metadata(project_id, filters)
+
+    task_interceptor.set_consolidation_scroll(
+        _closure_scroll,
+        count=_closure_count,
+        exists=closure_exists_probe(memory_service),
+    )
 
 
 def main():

@@ -139,17 +139,37 @@ class TestForceExitWatchdog:
 
         The subprocess-level counterpart (`test_shutdown_watchdog_force_exits_on_thread_leak`
         in test_shutdown.py) pins the opposite — fires when a non-daemon thread is leaked.
+
+        Structural fix (same class as test_disarm_prevents_force_exit below):
+        this previously armed with timeout_secs=2.0 and used a fixed
+        ``time.sleep(0.2)`` as a "10x margin" before checking ``calls == []``.
+        No fixed margin is safe under full-suite xdist load — the main thread's
+        wakeup from ``sleep(0.2)`` can itself be delayed by scheduler noise, and
+        if that delay pushes the check past the 2.0s deadline the watchdog has
+        legitimately fired by the time ``calls`` is read (same failure shape as
+        test_disarm_prevents_force_exit's observed ``calls == [137]``). Arming
+        with an effectively-unbounded timeout_secs instead makes the deadline
+        unreachable within the test's lifetime, so ``thread.join(timeout=...)``
+        can be used as the "has not fired yet" probe without racing a wall-clock
+        deadline: no matter how delayed the join itself is in landing,
+        ``is_alive()`` cannot go False before 3600s have elapsed.
         """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        handle = _force_exit_after_delay(timeout_secs=2.0, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
 
-        # Sleep well within the timeout — 0.2s is 10x margin under any scheduler load.
-        time.sleep(0.2)
-
+        # "Has not fired yet" probe: join blocks for up to 0.2s or until the
+        # watchdog thread exits, whichever comes first. Unlike a free-standing
+        # sleep, there is no deadline here for scheduler noise to run past —
+        # timeout_secs is unreachable within the test's lifetime, so is_alive()
+        # cannot go False regardless of how delayed the join is in landing.
+        handle.thread.join(timeout=0.2)
+        assert handle.thread.is_alive(), (
+            'watchdog thread exited before its timeout elapsed — fired early?'
+        )
         assert calls == [], (
             f'watchdog fired before timeout elapsed (clean-exit window): {calls}'
         )
@@ -162,24 +182,57 @@ class TestForceExitWatchdog:
         )
 
     def test_disarm_prevents_force_exit(self):
-        """Calling disarm() before timeout prevents os._exit from being called."""
+        """Calling disarm() before timeout prevents os._exit from being called.
+
+        Structural fix (same class as done tasks 1836/1851/2320/2840/2921/2959/
+        3491): the watchdog thread blocks on ``threading.Event.wait(timeout_secs)``
+        and ``disarm()`` calls ``_event.set()``, which wakes the thread and makes
+        it return WITHOUT ever calling ``_exit_fn`` — regardless of how large
+        timeout_secs is, and regardless of whether the event is set before or
+        after the thread reaches ``.wait()`` (Event is stateful, not an
+        edge-triggered signal, so ordering can't be missed). The correctness
+        condition is only "does disarm() land before timeout_secs elapses" — a
+        small timeout_secs (previously 0.2s) instead raced the main thread's next
+        bytecode (the disarm() call) against the watchdog's internal deadline;
+        under full-suite xdist load that arm→disarm gap can exceed hundreds of ms
+        and the watchdog fires before disarm() lands (observed: `calls == [137]`
+        on a saturated worker). Using an effectively-unbounded timeout_secs makes
+        that gap structurally impossible to exceed rather than merely widening a
+        still-tight window, and removes the need for a compensating sleep.
+
+        Synchronisation note (load-bearing, keep this ordering): ``calls`` is
+        mutated by the watchdog thread and read by the main thread, so it is
+        only meaningfully observable after a happens-before edge between the
+        two. ``thread.join()`` is that edge. The join below is therefore NOT
+        cleanup — it MUST run, and its ``is_alive()`` check MUST be asserted,
+        BEFORE the ``calls == []`` assertion. Checking `calls` first would be
+        vacuous: right after `disarm()` the watchdog thread has had no chance
+        to run at all, so `calls` reads `[]` regardless of whether the
+        production guard (`cli.py`'s `fired = not _event.wait(timeout_secs)`)
+        is correct or inverted, letting a real regression go undetected. The
+        join timeout is deliberately generous (30.0s, not the usual 1.0s used
+        for pure cleanup joins elsewhere in this file): once `disarm()` sets
+        the Event the thread wakes in microseconds on the happy path, so the
+        bound is free there, but on a saturated xdist worker a tight bound
+        could itself manufacture a spurious `is_alive()` failure — exactly the
+        load-sensitive flake class this task removes. Do not reorder or
+        shrink this without re-deriving both properties.
+        """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        # Use 0.2s timeout and a 2.0s wait to give ample margin under CI load;
-        # disarm() sets the event immediately so the watchdog thread returns
-        # without calling os._exit even if the scheduler is delayed.
-        handle = _force_exit_after_delay(timeout_secs=0.2, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
         handle.disarm()
-        time.sleep(2.0)
 
-        assert calls == [], f'expected no calls, got {calls}'
-        handle.thread.join(timeout=1.0)
+        # Synchronisation point FIRST: join before making any claim about
+        # `calls`, which the watchdog thread mutates (see docstring above).
+        handle.thread.join(timeout=30.0)
         assert not handle.thread.is_alive(), (
             'watchdog thread did not exit after disarm'
         )
+        assert calls == [], f'expected no calls, got {calls}'
 
     def test_diagnostic_dump_lists_live_threads(self):
         """When the watchdog fires, it writes a diagnostic dump to the stream."""
@@ -2127,15 +2180,92 @@ def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.1) -> bool:
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
-    import time
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            return True
+def _communicate_or_empty(
+    child: 'subprocess.Popen', *, timeout: float = 10.0
+) -> tuple[bytes, bytes]:
+    """child.communicate(), tolerating a still-open pipe held by an orphaned
+    descendant instead of propagating subprocess.TimeoutExpired.
+
+    verify-merge's spec spawns descendants (a `sleep`-based test command,
+    build subprocesses) that inherit the Popen stdout/stderr pipe write
+    ends. If verify-merge itself dies nonzero while an orphaned descendant
+    still holds those pipes open, a plain communicate() can time out even
+    though *child* has already been reaped -- which would replace the
+    intended crash/timeout pytest.fail below with an unrelated
+    TimeoutExpired, losing the exit-code and output diagnostics.
+    """
+    try:
+        return child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return (b'', b'')
+
+
+def _wait_for_pgid_file_or_report_crash(
+    pgf: 'Path',
+    child: 'subprocess.Popen',
+    *,
+    timeout: float = 30.0,
+    interval: float = 0.1,
+) -> None:
+    """Poll for *pgf* to appear; fail promptly and distinctly if *child* has
+    already exited instead of burning the full *timeout* budget.
+
+    verify-merge writes its pgid file before doing any work and removes it
+    in a `finally` (orchestrator/src/orchestrator/cli.py::verify_merge) --
+    so a subprocess that crashes fast writes-and-removes the file well
+    inside a single poll interval, and a naive poll-then-timeout mislabels
+    that crash as a timeout. Checking child.poll() on every iteration lets
+    a crash (nonzero exit) fail immediately with an honest headline; a
+    subprocess still running after the budget remains a genuine timeout
+    (tasks 2350 and 2770 widened this budget repeatedly for load flakiness,
+    not for crash attribution -- do not fold that budget into this change).
+    A fast *successful* exit could also legitimately race the pgid-file
+    window, so the crash/timeout split is on exit code, not merely on
+    exit -- and is reported through its own message below rather than the
+    deadline headline, since the elapsed time in that case is not the
+    timeout.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    fast_clean_exit = False
+    while True:
+        if pgf.exists():
+            return
+        exit_code = child.poll()
+        if exit_code is not None:
+            # Re-check once more: a fast SUCCESSFUL exit can legitimately
+            # race the write-then-remove window.
+            if pgf.exists():
+                return
+            if exit_code != 0:
+                stdout, stderr = _communicate_or_empty(child)
+                pytest.fail(
+                    f'verify-merge exited with code {exit_code} before/without '
+                    f'writing a stable pgid file (crash, not a timeout)\n'
+                    f'STDOUT: {stdout.decode()[:2000]!r}\n'
+                    f'STDERR: {stderr.decode()[:2000]!r}'
+                )
+            fast_clean_exit = True
+            break  # exit_code == 0 -- fast successful race; fall through below
+        if time.monotonic() >= deadline:
+            break
         time.sleep(interval)
-    return False
+
+    stdout, stderr = _communicate_or_empty(child) if child.poll() is not None else (b'', b'')
+    if fast_clean_exit:
+        pytest.fail(
+            f'verify-merge exited cleanly (code 0) after '
+            f'{time.monotonic() - start:.1f}s without a visible pgid file -- '
+            f'fast successful race or a no-op invocation\n'
+            f'STDOUT: {stdout.decode()[:2000]!r}\n'
+            f'STDERR: {stderr.decode()[:2000]!r}'
+        )
+    pytest.fail(
+        f'verify-merge did not write pgid file within {timeout:.0f}s '
+        f'(subprocess poll={child.poll()!r})\n'
+        f'STDOUT: {stdout.decode()[:2000]!r}\n'
+        f'STDERR: {stderr.decode()[:2000]!r}'
+    )
 
 
 def _wait_pgid_gone(pgid: int, *, timeout: float = 20.0, interval: float = 0.1) -> None:
@@ -2258,14 +2388,11 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     pgid_val = None
     try:
         # --- Poll for the pgid file (written before asyncio.run) ---
-        if not _wait_for_file_cli(pgf, timeout=30):
-            _debug_stdout, _debug_stderr = child.communicate(timeout=10) if child.poll() is not None else (b'', b'')
-            pytest.fail(
-                f'verify-merge did not write pgid file within 30s '
-                f'(subprocess poll={child.poll()!r})\n'
-                f'STDOUT: {_debug_stdout.decode()[:2000]!r}\n'
-                f'STDERR: {_debug_stderr.decode()[:2000]!r}'
-            )
+        # Distinguishes a crashed verify-merge subprocess (reported
+        # immediately, exit code != 0) from a genuine timeout (subprocess
+        # still running after the budget) -- see
+        # _wait_for_pgid_file_or_report_crash's docstring.
+        _wait_for_pgid_file_or_report_crash(pgf, child, timeout=30)
 
         # Save pgid BEFORE cancel-verify removes the file
         pgid_val = int(pgf.read_text().strip())
@@ -2338,6 +2465,56 @@ def test_wait_pgid_gone_raises_for_live_group():
     try:
         with pytest.raises(AssertionError, match='still alive'):
             _wait_pgid_gone(child.pid, timeout=1.0, interval=0.05)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 4279 — _wait_for_pgid_file_or_report_crash: crash vs. timeout unit tests
+# ---------------------------------------------------------------------------
+#
+# test_verify_merge_cancel_end_to_end only ever exercises this helper's happy
+# path (the pgid file appears on the first poll), leaving the exit_code != 0
+# crash branch and the still-running deadline branch dead in CI. These mirror
+# the _wait_pgid_gone pair above, using cheap synthetic children instead of a
+# real verify-merge subprocess.
+
+
+def test_wait_for_pgid_file_or_report_crash_reports_crash_not_timeout(tmp_path):
+    """A child that exits nonzero before writing the pgid file fails
+    immediately with a crash-shaped message, not the generic timeout one.
+    """
+    import sys
+
+    never_created = tmp_path / 'does-not-exist.pgid'
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.exit(3)'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(pytest.fail.Exception, match='crash, not a timeout'):
+            _wait_for_pgid_file_or_report_crash(never_created, child, timeout=5, interval=0.05)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_wait_for_pgid_file_or_report_crash_reports_timeout_for_live_child(tmp_path):
+    """A child still running at the deadline is reported as a genuine
+    timeout, not a crash -- even though it has not written the pgid file.
+    """
+    never_created = tmp_path / 'does-not-exist.pgid'
+    child = subprocess.Popen(
+        ['sleep', '30'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(pytest.fail.Exception, match='did not write pgid file'):
+            _wait_for_pgid_file_or_report_crash(never_created, child, timeout=0.5, interval=0.05)
     finally:
         child.kill()
         child.wait(timeout=5)

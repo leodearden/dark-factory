@@ -94,7 +94,8 @@ submit_result = submit_task(
         "source": "review-cycle",
         "review_id": "{timestamp}",
         "spawn_context": "review",
-        "modules": ["{affected/module/path}"],
+        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+        "files": ["{affected/file/path.py}"],
         "memory_hints": {
             "search_queries": ["{relevant search query}"],
             "entity_names": ["{relevant entity}"]
@@ -110,6 +111,11 @@ if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task — use for add_dependency calls
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+elif resolve["status"] == "refused":
+    # A deterministic guard rejected the candidate: no task was created and there
+    # is no task_id (so it can carry no add_dependency edge). Intended outcome —
+    # record resolve["reason"] in the review report. Do NOT retry.
+    note_refused(resolve["reason"])
 elif resolve["status"] == "failed":
     # On `failed`: record the reason in the review report and skip this finding.
     # See skills/_shared/ticket-failure-handling.md for the retryable/terminal

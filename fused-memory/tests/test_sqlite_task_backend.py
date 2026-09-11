@@ -6,9 +6,11 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
@@ -20,9 +22,11 @@ from fused_memory.backends.sqlite_task_backend import (
     _emit_schema_warning,
     _format_task_id,
     _merge_metadata,
+    _migrate_v3_to_v4,
     _parse_qualified_dep,
     _parse_task_id,
     _resolve_metadata_mode,
+    _StatusWriteNotPersisted,
 )
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
@@ -571,6 +575,138 @@ async def test_set_task_claimant_no_kwargs_is_a_noop(backend, project_root):
     assert one['heartbeat_at'] is None
 
 
+# ── set_task_claimant terminal tripwire (task 4674, PRD E-3) ───────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_status', ['done', 'cancelled'])
+async def test_set_task_claimant_on_terminal_row_logs_error_and_still_persists(
+    backend, project_root, caplog, terminal_status,
+):
+    """A manual claimant mint onto a terminal row logs ONE ERROR tripwire but still persists.
+
+    PRD docs/prds/claimant-invariant-detection.md, contract E-3 / decision D-6:
+    observation, not refusal.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status('1', terminal_status, project_root=project_root)
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id='run-manual-mint',
+            heartbeat_at='2026-08-24T00:00:00+00:00',
+        )
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].message.startswith('claimant_stamped_on_terminal')
+    assert 'task_id=1' in errors[0].message
+    assert f'status={terminal_status}' in errors[0].message
+    assert 'claimant_run_id=run-manual-mint' in errors[0].message
+    assert 'tag=master' in errors[0].message
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] == 'run-manual-mint'
+    assert one['heartbeat_at'] == '2026-08-24T00:00:00+00:00'
+    assert one['status'] == terminal_status
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_heartbeat_only_tick_on_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """B9 negative control (PRD-named): a heartbeat-only tick on an already-terminal row
+
+    must not trip the wire — claimant_run_id is left at the _UNSET default (the wire shape
+    orchestrator/src/orchestrator/workflow.py::TaskWorkflow._claimant_heartbeat_loop
+    produces), so no claimant is persisted by this call.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-live',
+        heartbeat_at='2026-08-24T00:00:00+00:00',
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            heartbeat_at='2026-08-24T00:01:00+00:00',
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'B9 negative control: heartbeat-only tick must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['heartbeat_at'] == '2026-08-24T00:01:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_explicit_clear_on_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """The release/un-claim path (harness.py, scheduler.py) fires right as a task goes
+
+    terminal and must never trip the wire — it stamps SQL NULL, not a claimant.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-live',
+        heartbeat_at='2026-08-24T00:00:00+00:00',
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id=None,
+            heartbeat_at=None,
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'negative control: explicit release/clear must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_on_non_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """The ordinary dispatch claim onto a non-terminal row must stay silent — regression guard."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id='run-x',
+            heartbeat_at='2026-08-24T00:00:00+00:00',
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'regression guard: non-terminal row must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] == 'run-x'
+
+
 # ── set_task_status claimant extension (task 2182 step-5/6) ────────
 
 
@@ -625,7 +761,7 @@ async def test_set_task_status_without_claimant_kwargs_leaves_claimant_intact(ba
     assert one['heartbeat_at'] == '2026-07-07T00:00:00+00:00'
 
 
-def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
+def _make_v2_stamped_db_without_claimant_columns(db_path: Path, *, status: str = 'pending') -> None:
     """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
 
     Simulates a connection whose claimant columns never got ALTERed in —
@@ -634,6 +770,10 @@ def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
     candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
     and is skipped for an already-v2 DB), so the claimant columns stay
     absent, exercising set_task_status's fail-safe (WARNING, no error) path.
+
+    ``status`` seeds the single row's status column (default ``'pending'``,
+    matching every pre-existing caller); pass e.g. ``'done'`` to exercise
+    the fail-safe path on an already-terminal row.
     """
     import sqlite3
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -667,7 +807,8 @@ def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
     """)
     conn.execute(
         "INSERT INTO tasks (tag, id, title, status, updated_at) "
-        "VALUES ('master', 1, 'stranded-shape task', 'pending', '2026-01-01T00:00:00.000Z')",
+        "VALUES ('master', 1, 'stranded-shape task', ?, '2026-01-01T00:00:00.000Z')",
+        (status,),
     )
     conn.execute("PRAGMA user_version = 2")
     conn.commit()
@@ -732,6 +873,43 @@ async def test_set_task_claimant_fails_safe_when_columns_absent(tmp_path, caplog
 
     warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_msgs, 'Expected a WARNING when claimant columns are absent'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_columns_absent_on_terminal_row_emits_no_tripwire(
+    tmp_path, caplog,
+):
+    """A call that writes NOTHING (claimant-columns-absent fail-safe) must not trip the wire.
+
+    E-3 scopes the ERROR to a call that PERSISTS a non-NULL claimant; the fail-safe path
+    returns early before the UPDATE ever runs.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v2_stamped_db_without_claimant_columns(db_path, status='done')
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+            result = await b.set_task_claimant(
+                '1', project_root=project_root,
+                claimant_run_id='run-x', heartbeat_at='2026-08-24T00:00:00+00:00',
+            )
+    finally:
+        await b.close()
+
+    assert 'Claimant columns unavailable' in result['message']
+
+    warning_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'columns absent' in r.message
+    ]
+    assert warning_msgs, 'Expected the pre-existing fail-safe WARNING to still fire'
+
+    tripwire_msgs = [r.message for r in caplog.records if 'claimant_stamped_on_terminal' in r.message]
+    assert tripwire_msgs == [], 'A no-write fail-safe call must never trip the wire'
 
 
 # ── status vocabulary guard ─────────────────────────────────────────
@@ -1158,6 +1336,31 @@ class _RowUpdateSuppressedBackend(SqliteTaskBackend):
         return
 
 
+class _WriteStatusSeamSpyBackend(SqliteTaskBackend):
+    """Test double: records every ``_write_status_and_verify`` call and
+    suppresses the write, so a caller that does NOT route through the
+    shared tail is detectable through the public API."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.seam_calls: list[dict] = []
+
+    async def _write_status_and_verify(self, conn, **kwargs):
+        # **kwargs (rather than mirroring the real helper's parameter list
+        # positionally) so this double can't silently mis-wire a call if the
+        # helper's signature is ever reordered — the real call sites pass
+        # everything but `conn` by keyword (task 4057 amendment), and a
+        # rename here would raise a loud KeyError instead of a silent
+        # mismatch.
+        self.seam_calls.append({
+            'caller_name': kwargs['caller_name'],
+            'write_desc': kwargs['write_desc'],
+            'set_columns': list(kwargs['set_columns']),  # snapshot, not aliased
+            'status': kwargs['status'],
+        })
+        raise _StatusWriteNotPersisted(kwargs['task_id'], kwargs['status'], 'seam-suppressed')
+
+
 @pytest.mark.asyncio
 async def test_set_task_status_reports_explicit_error_when_write_not_persisted(tmp_path):
     """Plain set_task_status: a suppressed UPDATE must not report success."""
@@ -1177,6 +1380,34 @@ async def test_set_task_status_reports_explicit_error_when_write_not_persisted(t
         'task_id': '1',
         'requested_status': 'done',
         'actual_status': 'pending',
+    }
+    assert task['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_routes_through_write_status_and_verify(tmp_path):
+    """set_task_status must route through the shared `_write_status_and_verify`
+    tail (task 4057) instead of inlining its own copy of the claimant/
+    collision/read-back logic."""
+    project_root = str(tmp_path / 'proj')
+    spy = _WriteStatusSeamSpyBackend(TaskmasterConfig(project_root=project_root))
+    await spy.start()
+    try:
+        await spy.add_task(project_root=project_root, title='x')
+        result = await spy.set_task_status('1', 'done', project_root=project_root)
+        task = await spy.get_task('1', project_root=project_root)
+    finally:
+        await spy.close()
+
+    assert len(spy.seam_calls) == 1
+    call = spy.seam_calls[0]
+    assert call['set_columns'] == ['status = ?', 'updated_at = ?']
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'done',
+        'actual_status': 'seam-suppressed',
     }
     assert task['status'] == 'pending'
 
@@ -1218,6 +1449,52 @@ async def test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_
     }
     assert task['status'] == 'done'
     assert 'reopen_reason' not in (task['metadata'] or {})
+
+
+@pytest.mark.asyncio
+async def test_set_status_and_stamp_audit_routes_through_write_status_and_verify(tmp_path):
+    """set_status_and_stamp_audit must route through the shared
+    `_write_status_and_verify` tail (task 4057) instead of inlining its own
+    copy of the claimant/collision/read-back logic.
+
+    Both-or-neither rollback of the metadata merge is NOT re-verified here —
+    the spy replaces `_write_status_and_verify` itself and raises before any
+    SQL runs, so no write is ever attempted and a rollback check against
+    that would be vacuous. That property is already covered, genuinely, by
+    `test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_persisted`,
+    which suppresses the write one seam deeper (`_apply_status_row_update`)
+    and lets the real `_write_status_and_verify` read-back-and-raise logic
+    run for real."""
+    project_root = str(tmp_path / 'proj')
+    setup = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await setup.start()
+    await setup.add_task(project_root=project_root, title='x')
+    await setup.set_task_status('1', 'done', project_root=project_root)
+    await setup.close()
+
+    spy = _WriteStatusSeamSpyBackend(TaskmasterConfig(project_root=project_root))
+    await spy.start()
+    try:
+        result = await spy.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+            '1', 'pending', project_root=project_root,
+            audit_fields={
+                'reopen_reason': 'regression found',
+                'reopen_from': 'done',
+            },
+        )
+    finally:
+        await spy.close()
+
+    assert len(spy.seam_calls) == 1
+    call = spy.seam_calls[0]
+    assert call['set_columns'] == ['status = ?', 'metadata = ?', 'updated_at = ?']
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'pending',
+        'actual_status': 'seam-suppressed',
+    }
 
 
 @pytest.mark.asyncio
@@ -2960,6 +3237,41 @@ def _make_v3_db_with_dup_groups(
     conn.close()
 
 
+class _FailingExecuteConn:
+    """Delegating proxy over an aiosqlite.Connection that raises from
+    `execute()` when `should_fail(sql, self)` returns True.
+
+    Used to inject a deterministic mid-migration failure into
+    `_migrate_v3_to_v4` without monkeypatching aiosqlite internals: every
+    other attribute (`commit`, `rollback`, `row_factory`, ...) is forwarded
+    verbatim via `__getattr__`, so the migration exercises the real
+    connection for everything except the one statement under test.
+    """
+
+    def __init__(self, inner, should_fail):
+        self._inner = inner
+        self._should_fail = should_fail
+        self.cancel_updates = 0          # counts `SET status = 'cancelled'` executes
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def execute(self, sql, *args, **kwargs):
+        if "SET status = 'cancelled'" in str(sql):
+            self.cancel_updates += 1
+        if self._should_fail(str(sql), self):
+            raise sqlite3.OperationalError('injected failure (test)')
+        return await self._inner.execute(sql, *args, **kwargs)
+
+
+async def _open_raw_v3_conn(db_path: Path) -> aiosqlite.Connection:
+    """Open a bare aiosqlite connection over a v3 DB — the minimal connection
+    shape `_migrate_v3_to_v4` needs (it indexes rows by column name)."""
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    return conn
+
+
 @pytest.mark.asyncio
 async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     backend, project_root,
@@ -3446,6 +3758,307 @@ async def test_v3_to_v4_mixed_db_heals_genuine_while_flagging_ambiguous(tmp_path
             'task_ids': ['3', '4'], 'count': 2, 'reason': 'mixed_status',
         },
     ], residual_groups
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_midloop_heal_failure_leaves_no_partial_heal_on_cached_connection(
+    tmp_path,
+):
+    """A heal-loop failure partway through a group (id=3's metadata blob is
+    corrupt, so `_merge_metadata` raises `TaskmasterError` while cancelling
+    it) must not leave id=2's already-executed cancel UPDATE sitting
+    uncommitted on the cached write connection. Without a rollback on the
+    failure path, the very next unrelated successful write -- `_txn` commits
+    with no BEGIN/rollback preamble -- silently flushes that partial heal to
+    disk. This reproduces the reported bug end-to-end through the real
+    backend rather than by calling `_migrate_v3_to_v4` directly.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Dup task', 'pending', []),   # canonical (lowest id)
+        (2, 'Dup task', 'pending', []),   # cancel target #1 -- metadata None, UPDATE succeeds
+        (3, 'Dup task', 'pending', []),   # cancel target #2 -- corrupted below, raises
+    ])
+    # Corrupt id=3's blob directly rather than widening the shared seeding
+    # helper. Files must stay empty on every row (see module docstring on
+    # _make_v3_db_with_dup_groups / plan rationale): _files_for_key falls
+    # back to [] on a malformed blob, so the corrupt row only recomputes to
+    # the group's stored candidate_key -- and stays classified `heal` rather
+    # than `title_divergent` -- when that key was itself computed from an
+    # empty files list.
+    corrupt_conn = sqlite3.connect(str(db_path))
+    corrupt_conn.execute("UPDATE tasks SET metadata = '{not json' WHERE tag='master' AND id=3")
+    corrupt_conn.commit()
+    corrupt_conn.close()
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Drives connection-open (_migrate); must NOT raise (never-raise
+        # contract) even though the heal loop below raises mid-group.
+        await b.get_tasks(project_root=project_root)
+
+        # The very next unrelated successful write -- exactly the "later
+        # flushed" scenario from the bug report. A title distinct from
+        # 'Dup task' so the write-path dedup guard doesn't reject it.
+        add_result = await b.add_task(project_root=project_root, title='unrelated follow-up')
+
+        # Read through an INDEPENDENT connection while the backend is still
+        # open, so only durably committed rows are visible -- uncommitted
+        # writes on the backend's own cached connection are invisible here
+        # by construction.
+        check_conn = sqlite3.connect(str(db_path))
+        try:
+            statuses = dict(
+                check_conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag='master' AND id IN (1,2,3)",
+                ),
+            )
+            unrelated_status = check_conn.execute(
+                "SELECT status FROM tasks WHERE tag='master' AND id=?",
+                (int(add_result['id']),),
+            ).fetchone()
+            user_version = check_conn.execute('PRAGMA user_version').fetchone()[0]
+            indexes = {row[1] for row in check_conn.execute('PRAGMA index_list(tasks)')}
+        finally:
+            check_conn.close()
+    finally:
+        await b.close()
+
+    # RED today: id=2's cancel rides in on the unrelated write's commit, so
+    # this comes back {1: 'pending', 2: 'cancelled', 3: 'pending'}.
+    assert statuses == {1: 'pending', 2: 'pending', 3: 'pending'}, (
+        f'a later unrelated write flushed a partial self-heal onto disk: {statuses}'
+    )
+    # The rollback must scope itself to the failed migration only -- it must
+    # not eat the caller's own unrelated write.
+    assert unrelated_status is not None and unrelated_status[0] == 'pending', unrelated_status
+    # Unchanged pre-existing behaviour on a failed migration pass -- guards
+    # against over-correcting.
+    assert user_version == 3, user_version
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_reports_healed_groups_when_the_index_build_step_raises(tmp_path):
+    """When a LATER step (the index build / user_version stamp) raises after
+    a genuine duplicate group has already been healed and committed, the
+    result dict must report that heal -- not hard-code `healed: []` -- since
+    the cancel is durably on disk and callers (`reaudit_candidate_key_index`,
+    the `rebuild_candidate_key_index` MCP tool) surface this dict verbatim.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Alpha task', 'pending', ['a.py']),   # canonical
+        (2, 'Alpha task', 'pending', ['a.py']),   # cancelled by the self-heal
+    ])
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        # Fails at 'PRAGMA user_version = 4' -- AFTER the heal loop's cancel
+        # UPDATE(s) and their commit have already happened.
+        proxy = _FailingExecuteConn(conn, lambda sql, _p: 'user_version = 4' in sql)
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy), project_root=project_root,
+        )
+
+        assert result['index_built'] is False, result
+        assert result['flagged'] == [], result
+        assert result['healed'] == [
+            {
+                'tag': 'master',
+                'candidate_key': compute_candidate_key('Alpha task', ['a.py']),
+                'canonical_id': 1,
+                'cancelled_ids': [2],
+            },
+        ], f'the failure path must report the heal it already committed; got {result}'
+
+        # Confirm the report is not merely optimistic -- the heal really WAS
+        # durable. rollback() discards anything still pending (the failed
+        # index-build's own transaction); whatever survives was committed
+        # before the failure.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        assert statuses == {1: 'pending', 2: 'cancelled'}, statuses
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_commits_each_healed_group_so_a_later_failure_cannot_unwind_it(
+    tmp_path,
+):
+    """A group that fully healed must be COMMITTED -- not merely reported --
+    before a later group in the same loop raises. Without a per-group
+    commit, the except handler's rollback (added so a partial heal can't
+    ride on the NEXT unrelated write) would also unwind an EARLIER
+    already-completed group's cancel from the SAME pass, while the hoisted
+    accumulator still reports it as healed -- trading the original
+    under-claim bug for an over-claim. This pins the invariant that keeps
+    the report and on-disk state in agreement: `healed` must name exactly
+    the groups whose cancels are durably committed.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Alpha task', 'pending', ['a.py']),
+        (2, 'Alpha task', 'pending', ['a.py']),
+        (3, 'Beta task', 'pending', ['b.py']),
+        (4, 'Beta task', 'pending', ['b.py']),
+    ])
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        # One cancel target per group -- this makes the test order-
+        # independent. The audit query has no ORDER BY and SQLite does not
+        # specify GROUP BY result order (a probe against this worktree
+        # showed it iterating the 'Beta' group before 'Alpha', not the
+        # lowest-id one), but with a single cancel target per group,
+        # cancel-UPDATE #1 always belongs to whichever group is iterated
+        # first (heals fully) and #2 always belongs to the second (raises
+        # before writing anything) -- regardless of which named group that is.
+        proxy = _FailingExecuteConn(
+            conn,
+            lambda sql, p: "SET status = 'cancelled'" in sql and p.cancel_updates == 2,
+        )
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy), project_root=project_root,
+        )
+
+        assert result['index_built'] is False, result
+        assert result['flagged'] == [], result
+        assert len(result['healed']) == 1, (
+            f'exactly the one fully-healed group must be reported; got {result["healed"]}'
+        )
+
+        # rollback() discards anything still pending (the second group's
+        # failed attempt); whatever survives was committed before it raised.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        cancelled_on_disk = {tid for tid, status in statuses.items() if status == 'cancelled'}
+
+        # Catches BOTH directions at once: under-claiming (a cancel on disk
+        # that isn't reported) and over-claiming (a reported cancel that the
+        # rollback actually unwound).
+        assert cancelled_on_disk == set(result['healed'][0]['cancelled_ids']), (
+            f"reported healed group {result['healed'][0]} does not match what is "
+            f'durably on disk: cancelled_on_disk={cancelled_on_disk}'
+        )
+        # The survivor survived.
+        assert result['healed'][0]['canonical_id'] not in cancelled_on_disk, result['healed'][0]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_reports_flagged_groups_and_skips_escalation_on_the_failure_path(
+    tmp_path,
+):
+    """The except-path result dict must report BOTH halves of a mixed pass --
+    a genuinely healed group AND an already-classified ambiguous (flagged)
+    group -- when a LATER group's cancel raises, and must NEVER invoke
+    `residual_dup_escalation_cb` from that path. Neither behaviour was
+    previously exercised: the other two failure-path tests both assert
+    `flagged == []`, so `flagged_groups` being hoisted/reported on this path
+    was unpinned, and nothing asserted the (documented, but untested)
+    decision not to escalate a partial pass.
+
+    Three residual duplicate groups:
+
+    * a title-divergent (flagged) group, given an EXPLICIT stored
+      candidate_key starting with `!` (0x21) -- every REAL
+      `compute_candidate_key` output is a 16-char lowercase sha256-hex
+      string (`[0-9a-f]`, see its docstring), all of which sort AFTER `!` in
+      SQLite's default BINARY collation. `_migrate_v3_to_v4`'s audit query
+      has no ORDER BY and SQLite implements this GROUP BY via a temp B-tree
+      (empirically confirmed: `EXPLAIN QUERY PLAN` on this exact query
+      shows `USE TEMP B-TREE FOR GROUP BY`), which visits groups in
+      ascending (tag, candidate_key) order -- so this group is GUARANTEED
+      to be classified (and appended to `flagged_groups`) before either
+      heal-eligible group below, regardless of their real candidate_key
+      values.
+    * two genuine duplicate groups, each with exactly one cancel target and
+      a REAL (non-overridden) candidate_key -- title_divergent's "verified
+      same" check applies to heal groups too, so (unlike the flagged group
+      above) neither can use an arbitrary override to pin its position. Their
+      relative order is unspecified (same caveat as
+      `..._later_failure_cannot_unwind_it` above), so the fail predicate
+      targets the 2nd-ever cancel UPDATE ordinally: whichever of the two is
+      visited first fully heals and commits, and the other raises before
+      writing anything -- exactly one heals, exactly one fails, regardless
+      of which is which.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        # Flagged (title_divergent) -- always classified first, see docstring.
+        (30, 'Ambiguous task', 'pending', ['x.py'], '!flagged_group_key'),
+        (31, 'Ambiguous task', 'pending', ['x.py'], '!flagged_group_key'),
+        # Two heal-eligible groups, real candidate_keys, one cancel target
+        # each -- see docstring for why the fail predicate is ordinal.
+        (10, 'Alpha task', 'pending', ['a.py']),
+        (11, 'Alpha task', 'pending', ['a.py']),
+        (20, 'Zeta task', 'pending', ['z.py']),
+        (21, 'Zeta task', 'pending', ['z.py']),
+    ])
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        proxy = _FailingExecuteConn(
+            conn,
+            lambda sql, p: "SET status = 'cancelled'" in sql and p.cancel_updates == 2,
+        )
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy),
+            project_root=project_root,
+            residual_dup_escalation_cb=recording_stub,
+        )
+
+        assert result['index_built'] is False, result
+        assert result['audit_complete'] is False, result
+        # Deterministic (see docstring): the flagged group always sorts --
+        # and is therefore classified -- first. RED without the hoisted
+        # `flagged_groups` reporting: today this comes back `[]`.
+        assert result['flagged'] == [
+            {
+                'tag': 'master', 'candidate_key': '!flagged_group_key',
+                'task_ids': ['30', '31'], 'count': 2, 'reason': 'title_divergent',
+            },
+        ], f'flagged reporting on the failure path must not be hard-coded []; got {result["flagged"]}'
+        assert len(result['healed']) == 1, (
+            f'exactly one of the two heal-eligible groups must be reported; got {result["healed"]}'
+        )
+
+        # Confirm the reported heal is durable and matches on-disk state --
+        # same invariant as `..._later_failure_cannot_unwind_it` above.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        cancelled_on_disk = {tid for tid, status in statuses.items() if status == 'cancelled'}
+        assert cancelled_on_disk == set(result['healed'][0]['cancelled_ids']), (
+            f"reported healed group {result['healed'][0]} does not match what is "
+            f'durably on disk: cancelled_on_disk={cancelled_on_disk}'
+        )
+        # The ambiguous group is untouched either way.
+        assert statuses[30] == 'pending' and statuses[31] == 'pending', statuses
+    finally:
+        await conn.close()
+
+    # Escalation is reserved for the completed-audit path -- a half-finished
+    # pass must never fire it, partial or otherwise.
+    assert recorded == [], (
+        f'residual_dup_escalation_cb must not be invoked on the failure path; got {recorded}'
+    )
 
 
 # ── rebuild-without-restart: live re-audit (task 2402) ──────────────────
@@ -5215,7 +5828,11 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         # (d) metadata_mode=None + append=None -> 'merge' (new default)
         (None, None,  'merge'),
         # (f) explicit metadata_mode wins over conflicting append (distinct combos)
-        ('merge',    True,  'merge'),
+        # NOTE: ('merge', True) is intentionally ABSENT — that pair used to
+        # resolve to 'merge' and SHALLOW-clobber nested metadata (the task-3581 /
+        # DF-3260 memory_hints clobber); it now RAISES. See
+        # test_resolve_metadata_mode_merge_plus_append_true_raises.
+        ('additive', True,  'additive'),
         ('additive', False, 'additive'),
         ('replace',  True,  'replace'),
     ],
@@ -5258,6 +5875,39 @@ def test_resolve_metadata_mode_bare_append_false_raises():
     # 'replace' escape hatch (asserted above). Incident traceability lives in the
     # source error message and the _resolve_metadata_mode docstring, not here, so
     # a future reword that keeps the guidance but drops the tag won't break this.
+
+
+def test_resolve_metadata_mode_merge_plus_append_true_raises():
+    """metadata_mode='merge' alongside append=True is a CONTRADICTION and is
+    REJECTED (task 3581). ``append=True`` means exactly one thing — 'additive',
+    the recursive union merge — while 'merge' is shallow last-write-wins, so the
+    pair asks for two incompatible resolutions of the same write. It used to
+    resolve silently to 'merge', shallow-clobbering nested metadata: the whole
+    ``memory_hints`` key (with its authored ``entities``/``queries``) was
+    overwritten wholesale by the incoming stub — the DF-3260 clobber."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode('merge', True)  # metadata_present defaults True
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    msg = exc.value.message
+    assert 'additive' in msg, (
+        f"message must point the caller at the 'additive' escape hatch; got: {msg!r}"
+    )
+    # NB: as with the task-2180 guard above, deliberately do NOT assert on the
+    # incident number or the full prose. The load-bearing contract is that the
+    # caller is told about the actionable 'additive' resolution; traceability
+    # lives in the source message and the _resolve_metadata_mode docstring.
+
+
+def test_resolve_metadata_mode_merge_plus_append_true_no_metadata_ok():
+    """metadata_mode='merge' + append=True with metadata_present=False (a
+    details-only write, no metadata) is NOT rejected — the task-3581 guard is
+    scoped to metadata-present writes exactly like the task-2180 one. With no
+    metadata there is nothing to clobber and ``append`` is independently driving
+    the details-append path, so the pair is not contradictory. Returns 'merge'
+    (unused by the caller since no metadata is written)."""
+    assert _resolve_metadata_mode('merge', True, metadata_present=False) == 'merge'
 
 
 def test_resolve_metadata_mode_append_false_cosignal_replace():
@@ -5492,6 +6142,196 @@ async def test_update_task_details_only_append_false_ok(backend, project_root):
     task = await backend.get_task('1', project_root=project_root)
     assert task['details'] == 'new', (
         f'details-only append=False should replace: {task["details"]!r}'
+    )
+
+
+# ── update_task end-to-end: merge+append=True clobber guard (task 3581) ──────
+#
+# These reproduce the exact live call shape observed from the Stage-2
+# reconciliation LLM against DF task 3857:
+#   update_task(id=3857, metadata={...}, metadata_mode='merge', append=True)
+# issued against a row that already carried authored memory_hints. The pair
+# used to resolve silently to 'merge' and overwrite the whole memory_hints key.
+
+_DF3857_SEED_METADATA = {
+    'memory_hints': {
+        'entities': [],
+        'queries': [
+            'resolution for: dashboard: stop leaking CLOSE-WAIT sockets '
+            'on the escalation poller',
+        ],
+    },
+    'files': ['dashboard/src/poller.py'],
+    '_causation_id': 'caus-df3857',
+}
+
+_DF3857_INCOMING_HINTS = {
+    'memory_hints': {
+        'queries': [
+            'CLOSE_WAIT socket leak httpx client lifecycle',
+            'dashboard escalation poller connection reuse',
+        ],
+    },
+}
+
+
+async def _raw_metadata_bytes(backend, project_root, task_id: int = 1) -> str:
+    """Read the stored metadata blob verbatim, bypassing get_task's parsing."""
+    conn = await backend._get_connection(project_root)
+    cursor = await conn.execute(
+        'SELECT metadata FROM tasks WHERE id = ?', (task_id,),
+    )
+    row = await cursor.fetchone()
+    return row['metadata']
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_plus_append_true_rejected_and_blob_untouched(
+    backend, project_root,
+):
+    """The contradictory metadata_mode='merge' + append=True pair is REJECTED
+    and the stored blob is left byte-for-byte intact (task 3581).
+
+    The load-bearing assertion is the second one: _resolve_metadata_mode is
+    called before ensure_connected() and before the write _txn, so a rejection
+    can never leave a half-applied write. Rejecting is therefore strictly safer
+    than the old silent 'merge', which clobbered memory_hints wholesale."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    before = await _raw_metadata_bytes(backend, project_root)
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps(_DF3857_INCOMING_HINTS),
+            metadata_mode='merge', append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+
+    after = await _raw_metadata_bytes(backend, project_root)
+    assert after == before, (
+        f'rejected write must leave stored bytes untouched.\n'
+        f'before={before!r}\nafter={after!r}'
+    )
+
+    # Belt and braces on the parsed view: the authored query survives, the
+    # siblings survive, and neither incoming query was written.
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+    assert hints['queries'] == _DF3857_SEED_METADATA['memory_hints']['queries'], (
+        f'authored memory_hints.queries must be untouched: {meta}'
+    )
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+    for q in _DF3857_INCOMING_HINTS['memory_hints']['queries']:
+        assert q not in hints['queries'], f'rejected write must not land: {meta}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        pytest.param({'append': True}, id='append-true-alone'),
+        pytest.param({'metadata_mode': 'additive'}, id='metadata_mode-additive'),
+    ],
+)
+async def test_update_task_append_true_unions_nested_memory_hints(
+    backend, project_root, kwargs,
+):
+    """The positive control: the CORRECT spellings of the same intent union the
+    nested memory_hints lists instead of replacing them (task 3581).
+
+    Both ``append=True`` alone and the explicit ``metadata_mode='additive'``
+    resolve to 'additive', which recursively unions list/dict values — so the
+    pre-existing authored query survives alongside both incoming ones and the
+    top-level siblings are preserved."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        **kwargs,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+
+    expected_queries = (
+        _DF3857_SEED_METADATA['memory_hints']['queries']
+        + _DF3857_INCOMING_HINTS['memory_hints']['queries']
+    )
+    assert set(hints['queries']) == set(expected_queries), (
+        f'memory_hints.queries must UNION, not replace: {meta}'
+    )
+    assert len(hints['queries']) == len(expected_queries), (
+        f'union must dedup-preserve exactly one copy of each query: {meta}'
+    )
+    # The sub-field the incoming payload omitted is preserved, not dropped.
+    assert hints.get('entities') == [], f'memory_hints.entities lost: {meta}'
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_explicit_merge_without_append_still_shallow(
+    backend, project_root,
+):
+    """The guard did NOT broaden: a bare metadata_mode='merge' (no append) still
+    resolves and performs the documented shallow last-write-wins.
+
+    Many production callers legitimately use this spelling (task_interceptor,
+    citation_verifier), so the task-3581 guard must fire only on the
+    contradictory PAIR — never on 'merge' on its own."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        metadata_mode='merge',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    # Shallow: the whole memory_hints key was overwritten wholesale...
+    assert meta['memory_hints'] == _DF3857_INCOMING_HINTS['memory_hints'], (
+        f"bare metadata_mode='merge' must stay shallow last-write-wins: {meta}"
+    )
+    # ...while untouched top-level siblings survive (that is what 'merge' means).
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_details_only_merge_plus_append_true_ok(backend, project_root):
+    """A details-only merge+append=True write (NO metadata) is NOT rejected —
+    the task-3581 guard is scoped to metadata-present writes, so the
+    details-append path stays green even when an inert metadata_mode='merge'
+    rides along. append=True appends to details rather than replacing it."""
+    await backend.add_task(
+        project_root=project_root, title='t', details='old',
+        metadata=json.dumps({'_causation_id': 'keep'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='new', metadata_mode='merge', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'new' in task['details'], (
+        f'details-only append=True should append: {task["details"]!r}'
+    )
+    assert 'old' in task['details'], (
+        f'details-only append=True must not replace: {task["details"]!r}'
+    )
+    assert task['metadata'].get('_causation_id') == 'keep', (
+        f'a details-only write must not disturb metadata: {task["metadata"]}'
     )
 
 

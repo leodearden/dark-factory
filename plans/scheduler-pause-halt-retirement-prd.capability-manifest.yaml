@@ -1,0 +1,406 @@
+# Machine-readable twin of scheduler-pause-halt-retirement-prd.capability-manifest.md
+# Path is strictly PRD-derived (decompose-mode.md Step 2.5); do NOT rename to match the .md.
+# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc).
+#
+# task_id values were stamped by commit_planning on 2026-08-24 (task 2578 machinery).
+# That stamp REWRITES the file through a YAML dumper and therefore STRIPS every comment;
+# this header was restored by hand afterwards. If you re-run commit_planning against this
+# batch, expect to restore it again.
+#
+# Note label η is task 3876, which pre-existed this batch: it was already filed as a
+# standalone task and was AMENDED into the batch rather than re-filed as a duplicate,
+# so its id is out of sequence with the 4686-4694 block.
+#
+# Every `expect: present` pattern below was verified ABSENT on main 4919b42b65, and every
+# `expect: absent` pattern verified PRESENT, so each check discriminates rather than
+# passing vacuously. Two traps found while doing that and worked around here:
+#   - a bare `watcher_guard` present-check is satisfied TODAY by the pre-existing
+#     `_check_watcher_guard` method (a neighbouring name), so alpha's check keys on the
+#     enum-member form `WATCHER_GUARD\s*=` instead;
+#   - the ewa_trip absent-check is scoped to harness.py, because config.py carries the
+#     same literal in prose that beta rewrites separately.
+#
+# Two legitimate kinds of mechanical check appear below, and they read differently:
+#   (1) DELIVERY checks, whose expected state differs from today's -- these flip when the
+#       task lands (e.g. alpha's `class PauseClass` present, beta's ewa_trip call absent);
+#   (2) RETENTION tripwires, already true today and expected to STAY true -- these catch a
+#       deletion-heavy task over-deleting (beta must keep 4559's `ewa_value` forensics;
+#       delta must not strand `cost_totals_in_window` or `scheduler_resumed`).
+# Checks that would be neither -- passing today and proving nothing about the task's own
+# deliverable -- were demoted to `manual` rather than left in as gate cost with no signal.
+prd: plans/scheduler-pause-halt-retirement-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 4686
+  title: Pause-class taxonomy + policy table + scheduler_state migration
+  capabilities:
+  - name: pause-class-enum-defined
+    binding: novel substrate produced by α; absent on main 4919b42b65
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class PauseClass
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: watcher-guard-class-enumerated
+    binding: ratified 2026-08-24 (PRD decision 9) after a census found 5 of 7 live
+      pause reasons enumerated
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: WATCHER_GUARD\s*=
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: scheduler-state-pause-class-column
+    binding: additive migration, _migrate_scheduler_state_ewa_value pattern (run_store.py,
+      wired from _ensure_schema)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pause_class
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: scheduler-state-hold-owner-column
+    binding: additive migration, same pattern
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: hold_owner
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: scheduler-state-expires-at-column
+    binding: additive migration, same pattern
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: expires_at
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: policy-table-single-home
+    binding: novel substrate produced by α; INV-5 requires one table consulted by
+      four sites
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: single-home is a structural judgment; a grep cannot distinguish one
+        table consulted four times from four copies
+  - name: structured-facts-subrecord-on-escalation
+    binding: novel substrate produced by α (added at decompose); house pattern TrainState
+      / IndexHealthState in escalation/src/escalation/models.py
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the sub-record's field set is designed by α; its name is not predictable
+        at authoring time, and a name guess would gate the batch on a fiction
+- label: β
+  task_id: 4687
+  title: EWA trip escalates, never halts
+  capabilities:
+  - name: ewa-trip-no-longer-halts
+    binding: the actuator exists to delete — harness.py:15455 on main 4919b42b65
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pause_scheduler\(f?['"]ewa_trip_
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: ewa-rate-escalation-category
+    binding: PRD §7 boundary row 1 names the literal; absent on main
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ewa_rate_exceeded
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: storm-escape-reuses-shared-stormcounter
+    binding: capability→producer (wired) — shared/src/shared/storm_counter.py, ALREADY
+      imported by harness.py and in live use; PRD open question 1 therefore resolves
+      to 'reuse', no local counter, no follow-up
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: StormCounter is already imported by harness.py for an unrelated counter,
+        so a present-check passes vacuously; the INV-4 escape is verified by boundary
+        row 2 instead
+  - name: forensics-retained
+    binding: 4559's persisted ewa_value + digest split kept — run_store.py ewa_value
+      column + refresh_scheduler_pause_ewa
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ewa_value
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+- label: γ
+  task_id: 4688
+  title: Park-stop trip escalates, never halts + cross-PRD correction pass
+  capabilities:
+  - name: park-stop-no-longer-halts
+    binding: the actuator exists to delete — harness.py:1556 on main 4919b42b65
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: on_park_stop_trip\s*=\s*self\.pause_scheduler
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: park-stop-escalation-category
+    binding: PRD §7 boundary row 3 names the literal; absent on main
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: park_stop_exceeded
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: api-error-prd-correction-landed
+    binding: decision 11 at plans/server-side-api-error-handling-prd.md:112, boundary
+      row 12 at :219 — this PRD owns the seam (ratified 2026-08-24)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: scheduler-pause-halt-retirement
+      paths:
+      - plans/server-side-api-error-handling-prd.md
+      expect: present
+  - name: stranding-prd-correction-landed
+    binding: §4 out-of-scope line at plans/stranding-remediation-scheduler-ergonomics-prd.md:88,
+      which this PRD reverses
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: scheduler-pause-halt-retirement
+      paths:
+      - plans/stranding-remediation-scheduler-ergonomics-prd.md
+      expect: present
+  - name: task-amendments-3328-2890-2892-4642
+    binding: 'all four live-read at decompose: 3328 pending (item 2), 2890 pending,
+      2892 pending, 4642 pending (mooted by β, no dependents)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: task-store amendments are not in the git tree; verified by re-reading
+        the tasks, not by grep
+- label: δ
+  task_id: 4689
+  title: Cost-ceiling self-clear
+  capabilities:
+  - name: cost-ceiling-early-return-removed
+    binding: '`if self.scheduler.is_paused: return` opens _enforce_cost_ceilings (harness.py:9417)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '`self.scheduler.is_paused` appears at several unrelated sites, so an
+        absent-check would over-match; the removal is verified by boundary rows 4-5'
+  - name: trailing-24h-spend-query
+    binding: capability→producer (wired) — CostStore.cost_totals_in_window at shared/src/shared/cost_store.py:217
+      (PRD cited harness.py; that is the call site)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: cost_totals_in_window
+      paths:
+      - shared/src/shared/cost_store.py
+      expect: present
+  - name: scheduler-resumed-event
+    binding: capability→producer (wired) — EventType.scheduler_resumed, event_store.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: scheduler_resumed
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: inv8-paused-path-rate-limited
+    binding: the cost check already runs per dispatch tick; δ reuses that cadence
+      and adds no unbounded scan (PRD §9 INV-8 resolution)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: occupancy bound is a design property; verified by review against INV-8's
+        checkable question, not a pattern
+- label: ε
+  task_id: 4690
+  title: Operator holds carry owner + expiry
+  capabilities:
+  - name: force-halt-takes-hold-owner-and-expiry
+    binding: 'force_halt_scheduler(self, reason: str) on main — no owner, no expiry'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: hold_owner
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: requirement-keyed-on-pause-class-not-the-entry-point
+    binding: anti-inversion, ratified 2026-08-24 — the no-landings breaker calls the
+      SAME force_halt_scheduler (harness.py:7471), so gating the function unconditionally
+      would reject an automatic breaker's halt; boundary row 12 tests it
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the discriminator is which argument the policy consults, not the presence
+        of a symbol; boundary row 12 is the mechanical test
+  - name: expiry-escalates-never-resumes
+    binding: capability→producer (wired) — _file_scheduler_pause_escalation, harness.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _file_scheduler_pause_escalation
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+- label: ζ
+  task_id: 4691
+  title: Class-scoped resume + active-hold set
+  capabilities:
+  - name: resume-is-class-scoped
+    binding: force_resume_scheduler (harness.py) calls resume_scheduler() unconditionally,
+      never consulting prior_reason — the reason-blind path decision 6 names
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: class-scoping is behavioural; boundary rows 8-9 are the mechanical test
+  - name: memory-disk-divergence-closed
+    binding: Scheduler.pause is first-wins in memory (scheduler.py, 'keeping original')
+      while save_scheduler_pause is last-write-wins on a project_id PRIMARY KEY row
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the divergence is between two stores' write policies; not expressible
+        as one pattern
+  - name: hold-set-columns
+    binding: producer:α upstream
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: covered by α's own column checks
+- label: η
+  task_id: 3876
+  title: Merge-halt rehydration re-tests its predicate (folds task 3876)
+  capabilities:
+  - name: blind-rehydration-exists-to-fix
+    binding: _rehydrate_merge_halt (harness.py) selects a pending L≥1 wip_conflict
+      record then halts, with no predicate re-test
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a present-check on _rehydrate_merge_halt passes today and would still
+        pass with the halt re-asserted blind, so it gates nothing about η's actual
+        deliverable; boundary rows 10-11 are the test
+  - name: clean-vs-dirty-project-root-is-testable
+    binding: git status --porcelain / --diff-filter=U; task 3876 records both measured
+      live 2026-08-08
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: boundary rows 10-11 construct both states; the capability is git's,
+        already proven
+  - name: independent-of-alpha
+    binding: DAG-direction — different subsystem (merge queue); needs no pause_class
+      column, so no inversion
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a dependency-graph property, not a code pattern
+- label: θ
+  task_id: 4692
+  title: INV-7 backstop for the classes that keep a halt
+  capabilities:
+  - name: hold-age-computable
+    binding: capability→producer (wired) — scheduler_state.pause_at, pre-existing
+      NOT NULL column
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pause_at
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: three-halting-classes-identifiable
+    binding: producer:α upstream — cost_ceiling, no_landings, watcher_guard (the third
+      added at decompose)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: covered by α's enum check
+  - name: exactly-one-escalation-per-aged-hold
+    binding: INV-4 — θ is itself a repeating detector, so it inherits β/γ's has_open_l1
+      dedup (escalation/src/escalation/queue.py, category-scoped)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '''exactly one'' is a runtime count; θ''s own signal is the test'
+  - name: green-tier-knob-for-the-bound
+    binding: capability→producer (wired) — RELOADABLE_FIELDS in config.py; 4559 green-tiered
+      the five digest_* fields by the same mechanism
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: RELOADABLE_FIELDS already exists, so a present-check passes vacuously;
+        θ's knob name is decided at implementation time (open question 2) and a name
+        guess would gate the batch on a fiction
+- label: ι
+  task_id: 4693
+  title: 'Config correction: the false cold-start claim (docs)'
+  note: RE-SCOPED at decompose 2026-08-24. The units-error half already landed via
+    task 4559 (config.py now documents the daily-vs-per-N mismatch, ~2.06x apart).
+    The 'no longer gates a halt' statement was re-homed to β, which owns that comment
+    block and is the task that makes it true — leaving it on ι would have been a producer-downstream
+    premise (G6 branch 3).
+  capabilities:
+  - name: false-cold-start-claim-corrected
+    binding: 'numeric premise re-derived at decompose: EWA(t+1)=α·ratio+(1−α)·EWA(t);
+      cold EWA=0, α=0.3 ⇒ a SINGLE step trips at ratio ≥ 24.6/0.3 = 82, so ''requires
+      sustained high ratios across multiple digest steps'' is false'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: sustained high ratios
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: no-overlap-with-task-4632
+    binding: 4632 documents the digest_* RELOAD TIER in OPERATIONS.md; ι corrects
+      the THRESHOLD'S DERIVATION in config.py — disjoint, verified by live read at
+      decompose
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: non-overlap between two task scopes is a triage judgment
+- label: κ
+  task_id: 4694
+  title: 'Integration gate: the §7 boundary suite, both sides of the seam'
+  capabilities:
+  - name: all-thirteen-boundary-rows-mechanised
+    binding: producer:β,γ,δ,ε,ζ,η,θ — ALL upstream of κ; no DAG inversion. Rows 12-13
+      added at decompose for the ε/no_landings and watcher_guard limbs
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the signal is the suite passing in one run; that is a test outcome,
+        not a pattern
+  - name: concurrent-holds-of-different-classes
+    binding: producer:ζ upstream — the hold set is what makes rows 8-9 expressible
+      at all
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: covered by ζ
+  - name: a-harness-able-to-run-all-rows
+    binding: capability→producer (wired) — orchestrator/tests/test_harness_park_stop.py,
+      test_harness_watcher_supervisor.py, test_halt_owner.py all exist on main
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the test files already exist; κ's deliverable is the §7 suite passing
+        in ONE run, which is a test outcome rather than a pattern

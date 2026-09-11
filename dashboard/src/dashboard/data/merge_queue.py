@@ -30,7 +30,7 @@ from dashboard.data.db import with_db
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 from dashboard.data.utils import parse_utc, resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
@@ -868,6 +868,17 @@ def enrich_merges_with_titles(
 # lookups.  Cache is in-process; multi-worker deployments will each pay
 # their own MCP roundtrip on first lookup.
 _TASK_TITLES_TTL_SECONDS = 10.0
+
+# Whole-operation bound for ``load_task_titles``, enforced with
+# ``asyncio.wait_for``. Bound to the shared default rather than restating the
+# literal, so the arithmetic lives in exactly one place; this site may later
+# TIGHTEN its own constant (the structural test enforces it can never widen
+# it). No whole-loop deadline is needed here as there is for
+# ``discover_orchestrators``: this is a single-root call whose fan-out happens
+# at the CALLER via ``asyncio.gather``, so the handler cost is max-of-N rather
+# than sum-of-N and one per-call budget already bounds the whole gather.
+_TASK_TITLES_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
+
 _task_titles_cache: TTLCache[dict[str, str] | None] = TTLCache(
     ttl_seconds=lambda: _TASK_TITLES_TTL_SECONDS
 )
@@ -892,6 +903,41 @@ async def load_task_titles(
     so the merge-queue tab still renders (titles fall back to empty strings).
     Concurrent cold callers for the same project_root collapse onto one
     in-flight fetch_tasks call (TTLCache single-flight).
+
+    **Bounded as a whole.** The whole operation is bounded by
+    ``_TASK_TITLES_BUDGET`` via ``asyncio.wait_for``. ``fetch_tasks``' own
+    *timeout* is a PER-HTTP-REQUEST budget — it bounds connect/read/write and
+    pool acquisition, never the operation as a whole — so without this layer a
+    hang that opens no socket (a connection-pool lock, say) is unbounded, and
+    that is exactly what wedged /merge-queue for 19.8 h. A timeout returns the
+    SAME ``{}``, so titles degrade to empty strings rather than the tab 500ing
+    or hanging, and nothing is written to the cache (the refresh never
+    completed), so the next poll re-attempts and pays at most the budget
+    again — a timeout can never pin an empty title map for the TTL window.
+
+    The ``wait_for`` deliberately encloses ``get_or_refresh`` rather than the
+    inner ``fetch_tasks``. ``TTLCache.get_or_refresh`` serializes cold callers
+    for one key behind a per-key lock and runs the refresh WHILE HOLDING it,
+    so an inner-only wrap would leave a QUEUED caller waiting unbounded for
+    the holder's full budget before paying its own: the pair costs 2x and N
+    waiters cost N x, and the dashboard's 3 s poll makes waiters routine.
+    Enclosing the outer call bounds the lock wait too, and is safe —
+    ``wait_for`` cancels the inner task, cancellation unwinds
+    ``async with lock``, and ``__aexit__`` releases it rather than leaking it.
+
+    The five-line ``wait_for``/``except TimeoutError``/warn/degrade construct
+    below, and the lock-placement rationale above, are duplicated verbatim at
+    the sibling call site (``app._load_task_cards``). That duplication is
+    KNOWN and deliberate for now: the mechanism is a property of
+    ``TTLCache`` — not of either call site — so the idiom belongs on
+    ``dashboard/src/dashboard/data/mcp_fanout.py::TTLCache`` as a
+    ``get_or_refresh_bounded`` that owns the timeout, the warning and the
+    degraded return. That file is outside this change's lock set, so the
+    extraction is left to the sibling TTLCache task referenced below.
+
+    This bounds THIS caller only. It does not fix the general TTLCache
+    queue-amplifier class across all of its call sites; that is the sibling
+    task filed in the same batch.
     """
 
     async def _refresh() -> dict[str, str] | None:
@@ -900,9 +946,27 @@ async def load_task_titles(
             return None
         return {str(t['id']): t['title'] for t in fetched if t.get('title')}
 
-    result = await _task_titles_cache.get_or_refresh(
-        project_root, _refresh, cache_ok=lambda v: v is not None,
-    )
+    try:
+        result = await asyncio.wait_for(
+            _task_titles_cache.get_or_refresh(
+                project_root, _refresh, cache_ok=lambda v: v is not None,
+            ),
+            timeout=_TASK_TITLES_BUDGET,
+        )
+    except TimeoutError:
+        # Broader than the ``wait_for`` expiry, deliberately. On 3.11+
+        # ``asyncio.TimeoutError`` IS the builtin, and ``socket.timeout`` is
+        # too, so a ``TimeoutError`` raised INSIDE the refresh is folded into
+        # this same budget path rather than 500ing the merge-queue tab. The
+        # message below is therefore authoritative about the OUTCOME — the
+        # titles are unknown for this poll — and not about the cause.
+        logger.warning(
+            'load_task_titles %s: exceeded the %.1fs whole-operation budget — '
+            'merge rows render with empty titles for this poll (titles are '
+            'UNKNOWN, not absent)',
+            project_root, _TASK_TITLES_BUDGET,
+        )
+        return {}
     return dict(result) if isinstance(result, dict) else {}
 
 
@@ -1031,10 +1095,17 @@ async def _probe_live_one(
     'error' key, meaning the orchestrator/worker is not running), returns
     {entries: [], reachable: False, error: <message>}.  An authoritative empty
     queue (entries=[], no error) returns {entries: [], reachable: True}.
+
+    *timeout* bounds the probe at two complementary layers: it is threaded
+    into ``mcp_tool_call`` so it reaches ``client.post`` (bounding
+    connect/read/write *and pool acquisition* on the shared client), while
+    the enclosing ``asyncio.wait_for`` still bounds the operation as a whole
+    — a cold session performs three posts, so the per-request layer alone
+    would permit roughly 3x *timeout*.
     """
     try:
         result = await asyncio.wait_for(
-            mcp_tool_call(client, base_url, 'get_merge_queue', {}),
+            mcp_tool_call(client, base_url, 'get_merge_queue', {}, timeout=timeout),
             timeout=timeout,
         )
     except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:

@@ -34,7 +34,9 @@ targets (task 2332-style routing-intent churn) and the dominant filing path
   the sibling registry): two of this guard's own markers
   (``do_not_implement``, ``escalate_instead_of_implementing``) contain the
   substring "implement" in their canonical phrasing, so including it would
-  make those markers permanently self-suppressing.
+  make those markers permanently self-suppressing. This scan reads the
+  field text with machine-injected provenance stamps STRIPPED — see the
+  "Provenance-stamp carve-out" section below.
 
   **Recall cost (deliberate, precision-over-recall):** unlike
   ``operational_ask_registry``, which scopes ``_CODE_CHANGE_TITLE_SIGNALS``
@@ -49,7 +51,11 @@ targets (task 2332-style routing-intent churn) and the dominant filing path
   observe how often it actually fires before flipping
   ``FUSED_ROUTING_INTENT_ENFORCE``, and reconsider narrowing the signal
   words or scoping the suppression to the title field if false negatives
-  prove too costly.
+  prove too costly. Note when reading that census that the
+  provenance-stamp carve-out recovers part of this recall: the flagged
+  rate can now RISE for tasks carrying appended annotation stamps, by
+  design, so a step up after task 4532 landed is the fix working, not a
+  regression.
 - None of the declarative markers match any field.
 
 This module is declaration-only: it never coerces ``task_kind`` or
@@ -57,6 +63,67 @@ This module is declaration-only: it never coerces ``task_kind`` or
 flags (see ``routing_intent_warning``) or, when
 :func:`routing_intent_enforced` is ``True``, rejects (see
 ``routing_intent_reject``).
+
+## Provenance-stamp carve-out (task 4532)
+
+THE ONE PLACE this carve-out is explained; the constant comments below
+carry only what is local to their own regex.
+
+A *provenance stamp* is an annotation block appended to a task AFTER
+filing (by a recon stage, the escalation-watcher, or a steward) that
+describes what was CORRECTED rather than what the task IS. Empirically, a
+Stage-2 ``task_knowledge_sync`` doc-drift annotation stamped
+``[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX (finding ...)``
+into a live task description permanently disarmed this guard for that
+task: the bare word "FIX" inside DF's OWN downstream annotation matched
+:data:`_CODE_CHANGE_SIGNALS_RE`, so the guard was blinded by an artifact
+of the system it guards. An appended annotation is post-filing PROVENANCE
+and is NOT evidence of the author's filing-era code intent, so
+:func:`_strip_provenance_stamps` removes it before the suppression scan.
+
+**Monotonicity invariant.** The strip feeds the suppression scan ONLY —
+the declarative-marker scan keeps reading the RAW field text — so this
+carve-out can only turn ``None`` into a finding, never a finding into
+``None``. No submission flagged today stops being flagged, which is what
+makes it safe to land while ``FUSED_ROUTING_INTENT_ENFORCE`` remains an
+available hard-reject mode.
+
+**Recognition** (:data:`_PROVENANCE_STAMP_RE`), two branches on a
+line-leading bracket: (1) a bracket carrying an ISO date — the strongest
+available tell that a block was written by a machine annotating an
+existing task rather than by the filing author; (2) an undated
+``[Stage <N> ...]`` — the reported writer's own prefix, which the agent
+does not always stamp with a date.
+
+**Observed corpus** these branches were derived from: Stage-2
+``task_knowledge_sync`` doc-drift stamps, ``[RECON CORRECTION <date>]``,
+``[Block resolved <date> by reconciliation stage N]``, ``[Scope
+correction by escalation-watcher-auto via esc-N-M, <date>]``,
+``[PHANTOM-PARTIAL FLAG <date>]``, ``[SCOPE NARROWED <date> - esc-N-M,
+...]``. All are agent-IMPROVISED: no code template emits them (outside
+this module and its tests the tree contains no "DOC-DRIFT" literal and no
+``[Stage <N>`` occurrence). The closest sanctioned convention is the
+prompt-side ``STALE_KNOWLEDGE_ANNOTATION_NORM`` instruction to "prefix a
+dated ``[SUPERSEDED: ...]`` marker"
+(``reconciliation/prompts/__init__.py``) — i.e. DF instructs the dated
+bracket-stamp convention but had no code recognizing it.
+
+**Directional safety**, which is why every constraint on the recognizer is
+deliberately narrow and new stamp shapes are added only against observed
+corpus evidence: UNDER-stripping degrades to the pre-4532 behaviour (the
+suppression stands, a finding is lost) — annoying but safe.
+OVER-stripping silently manufactures findings out of authored prose,
+which in enforce mode rejects an honest task.
+
+**Known cost of the paragraph bound.** A stamp's body runs to the end of
+its own paragraph, because observed stamps have multi-line bodies. So an
+authored line separated from a stamp by only a SINGLE newline is stripped
+with it (and its code-change signal lost). This is accepted: every
+observed annotator appends its stamp as its own blank-line-separated
+paragraph. Line-ending conventions do not change the bound: the
+terminator recognizes an LF and a CRLF blank line alike, so CRLF text
+(pasted from a Windows or browser client) is bounded exactly like LF text
+rather than stripping to the end of the field.
 """
 
 from __future__ import annotations
@@ -109,7 +176,48 @@ _EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
 # is silently suppressed (accepted even in enforce mode). Deliberate
 # precision-over-recall; watch the `routing_intent_lint.flagged` census
 # rate before flipping FUSED_ROUTING_INTENT_ENFORCE.
+#
+# Applied to text with machine-injected provenance stamps stripped: see the
+# module docstring's "Provenance-stamp carve-out" section (task 4532).
 _CODE_CHANGE_SIGNALS_RE = re.compile(r'\b(?:fix|bug|crash|refactor)\w*\b', re.IGNORECASE)
+
+# Recognizer for a machine-injected provenance stamp. WHAT a stamp is, WHY it
+# is stripped, the observed corpus behind the two branches, the monotonicity
+# invariant and the directional-safety rule all live in ONE place: the module
+# docstring's "Provenance-stamp carve-out" section (task 4532). Only the
+# constraints local to this pattern are noted here, each at the sub-pattern it
+# governs — they exist to keep the recognizer NARROW, since over-stripping is
+# the one direction that can manufacture a finding out of authored prose.
+_PROVENANCE_STAMP_RE = re.compile(
+    # An appended annotation block starts its own line. Without this anchor an
+    # inline "... [re-verified 2026-08-06] ..." swallows the rest of the
+    # sentence, losing the author's own code-change signal.
+    r'^[ \t]*'
+    r'\['
+    r'(?:'
+    r'[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,160}'  # any DATED annotation stamp
+    r'|'
+    r'stage\s+\d+[^\]\n]{0,160}'  # or an undated "[Stage N ...]" stamp
+    r')'
+    r'\]'
+    # Not a markdown link: DF task prose routinely opens a line with
+    # "[Stage 1 stall detector](fused-memory/.../stage1_stall_detector.py)",
+    # and treating that as a stamp strips a whole AUTHORED paragraph.
+    r'(?!\()'
+    # ... through the end of THIS paragraph only. Without the bound, an
+    # authored "fix" in a paragraph AFTER the stamp is stripped too, quietly
+    # widening the carve-out into the task-2408 precision case. The terminator
+    # is line-ending agnostic: matching only "\n[ \t]*\n" would miss a CRLF
+    # blank line ("\r\n\r\n", which "[ \t]*" cannot span), so a stamp in
+    # pasted Windows/browser text would strip to the END OF THE FIELD.
+    r'(?:(?!\r?\n[ \t\r]*\r?\n).)*',
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
+
+def _strip_provenance_stamps(text: str) -> str:
+    """Return *text* with machine-injected provenance-stamp spans removed."""
+    return _PROVENANCE_STAMP_RE.sub(' ', text)
 
 # (compiled regex, marker label, detail text) — each anchored to a
 # DECLARATIVE self-description (an imperative directive or an explicit
@@ -235,7 +343,12 @@ def routing_intent_finding(
         'details': details or '',
     }
 
-    combined = ' '.join(fields.values())
+    # Suppression scan only: strip machine-injected provenance stamps first,
+    # per field, so an appended annotation's own wording cannot arm the
+    # code-change signal (task 4532). The marker loop below deliberately
+    # scans the RAW `fields` values -- see the module docstring's
+    # monotonicity invariant.
+    combined = ' '.join(_strip_provenance_stamps(v) for v in fields.values())
     if _CODE_CHANGE_SIGNALS_RE.search(combined):
         return None
 

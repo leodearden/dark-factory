@@ -1,0 +1,401 @@
+prd: docs/prds/claimant-invariant-enforcement.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 4618
+  title: Shared claimant predicates + single heartbeat TTL, with the four existing
+    copies repointed
+  note: 'Intermediate; unlocks γ and ζ. α re-expresses, it must NOT retire: is_stranded
+    keeps a live consumer at dashboard/data/tasks.py:315 (whose docstring says "is_stranded
+    specifically, NOT its siblings") and is_stranded_blocked at scheduler.py:6365.'
+  capabilities:
+  - name: status-agnostic-liveness-core-already-factored-out
+    binding: capability→producer (wired) — shared/src/shared/task_claimant.py:63 _claimant_liveness_stranded
+      is already the shared body of is_stranded (:141), is_stranded_blocked (:184)
+      and has_live_claimant (:209); the new predicate is that core plus the infra_hold
+      carve-out, not a new algorithm
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def is_stranded_any_status
+      paths:
+      - shared/src/shared/task_claimant.py
+      expect: present
+  - name: c4-e1-ships-as-an-executable-predicate
+    binding: capability→producer — INV-1 contracts-machine-checked; consumed by β's
+      tests and ζ's census, and inherited by the detection PRD instead of a third
+      copy
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def violates_terminal_claimant_invariant
+      paths:
+      - shared/src/shared/task_claimant.py
+      expect: present
+  - name: hygiene-tier-predicate-named-for-the-tier-not-for-non-terminal
+    binding: capability→producer — the scope is the explicit allowlist {pending, deferred,
+      review, merge-deferred}; 'non-terminal' would be 7 statuses and would wrongly
+      flag in-progress (the task-2588 un-claim class D2 rejects) and infra-hold (audited
+      correct-to-keep)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def is_stale_hygiene_tier_claimant
+      paths:
+      - shared/src/shared/task_claimant.py
+      expect: present
+  - name: single-heartbeat-ttl-exported
+    binding: capability→producer — one definition replacing five hand-maintained copies;
+      measured 0 occurrences in any .py today (the 3 repo-wide hits are this PRD's
+      prose)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DEFAULT_CLAIMANT_HEARTBEAT_TTL
+      paths:
+      - shared/src/shared/task_claimant.py
+      expect: present
+  - name: the-four-existing-ttl-copies-are-repointed
+    binding: capability→producer — exporting a 6th definition while leaving the copies
+      standing is a net INV-5 REGRESSION. All four packages already depend on dark-factory-shared
+      (dashboard/pyproject.toml:21), so the 'dashboard cannot import' objection is
+      false. artifacts.py:1339's 600.0 is a plan.lock threshold on a different mechanism
+      and is annotated, not repointed.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DEFAULT_CLAIMANT_HEARTBEAT_TTL
+      paths:
+      - orchestrator/src/orchestrator/task_ground_truth.py
+      - orchestrator/src/orchestrator/harness.py
+      - dashboard/src/dashboard/data/tasks.py
+      - fused-memory/src/fused_memory/services/live_workflow_detector.py
+      expect: present
+  - name: infra-hold-carve-out-retained
+    binding: capability→producer — D4 requires it; the only genuine duplication is
+      the verbatim two-line block at task_claimant.py:137-139 / :180-182 that the
+      new predicate absorbs
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: retention of a carve-out is a function-body property; a grep cannot
+        distinguish a delegating predicate that kept it from one that dropped it.
+        Pinned by boundary case B9.
+- label: β
+  task_id: 4619
+  title: Clear the claimant columns on entry to TERMINAL at the fused-memory choke
+    point
+  note: 'Intermediate; unlocks ζ and η. The choke point genuinely covers the orchestrator:
+    Scheduler.mark_done -> set_task_status -> dispatch_tool -> mcp_call -> tools.py:7698
+    -> _apply_status_transition -> the SQL.'
+  capabilities:
+  - name: single-enforcing-funnel-reached-by-both-writers
+    binding: capability→producer (wired) — grep:fused-memory/src/fused_memory/middleware/task_interceptor.py:871
+      _apply_status_transition, reached from :833-848 (CSV loop, per id) and :857-867;
+      both backend writers are called only from inside it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant_run_id=None
+      paths:
+      - fused-memory/src/fused_memory/middleware/task_interceptor.py
+      expect: present
+  - name: unsupplied-vs-explicit-null-is-distinguishable
+    binding: capability→producer (wired) — grep:fused-memory/src/fused_memory/server/tools.py:953
+      _CLAIMANT_WIRE_UNSET, defaults at :7566-7567 and :7677-7678 (NOT :946/:7603-7604/:7714-7715,
+      which an earlier draft cited and two review passes wrongly blessed)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the sentinel already exists on main; honouring an explicitly-supplied
+        claimant (C4-E2) is a branch-behaviour property pinned by boundary case B3,
+        not a grep.
+  - name: terminal-set-reused-not-re-minted
+    binding: capability→producer (wired) — grep:shared/src/shared/task_statuses.py:61
+      TERMINAL = frozenset({DONE, CANCELLED}); D1 reuses it rather than minting CLAIMANT_CLEARED_ON_ENTRY
+      (INV-5)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: reuse-vs-duplication is judged by reading the import, and a grep for
+        TERMINAL in the interceptor is already satisfied today.
+  - name: no-op-short-circuit-precedes-the-coercion
+    binding: capability→producer (wired) — grep:fused-memory/src/fused_memory/middleware/task_interceptor.py:1008
+      same-status short-circuit returning at :1018; C4-E5 requires the coercion sit
+      AFTER it so an idempotent write stays a true no-op
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: ordering within a function is not greppable; pinned by boundary case
+        B4, whose precondition must also supply no done_provenance (task_interceptor.py:1009-1017
+        diverts such a write to _repair_done_provenance_same_status rather than returning
+        no_op).
+  - name: get-task-surfaces-both-columns
+    binding: capability→producer (wired) — grep:fused-memory/src/fused_memory/backends/sqlite_task_backend.py:1013-1014
+      _row_to_task emits claimant_run_id/heartbeat_at; no MCP-layer projection strips
+      them. Re-verified live through get_task(4028) on 2026-08-22.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: already true on main; this is the read path β's signal is observed through,
+        not something β delivers.
+  - name: columns-absent-fail-safe-inherited
+    binding: 'capability→producer (wired) — grep:fused-memory/src/fused_memory/backends/sqlite_task_backend.py:1970
+      tri-state block :1969-1981, pinned by tests/test_sqlite_task_backend.py:682.
+      C4-E4: enforcement must never make a status write fail.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: B5 cannot be asserted through get_task — absent columns surface as None,
+        indistinguishable from cleared. Assert on the warning log instead.
+  - name: falsified-infra-hold-comment-corrected
+    binding: rejection-mechanism (expect absent after) — the comment at tools.py:1328-1329
+      asserts "No current writer emits 'infra-hold', so this is inert today", falsified
+      on this HEAD by workflow.py:7385 and 15 journal writes. Measured present (1)
+      today, so the check is false-before / true-after.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: so this is inert today
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: absent
+  - name: falsified-freeform-claimant-comment-corrected
+    binding: rejection-mechanism (expect absent after) — tools.py:948-952 asserts
+      a claimant is 'never freeform text', falsified by reify task 5225 ('agent-esc-5053-2-docs-fix',
+      heartbeat_at NULL). Measured present (1) today.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: never freeform text
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: absent
+- label: γ
+  task_id: 4623
+  title: Repoint _resolve_live_claimant at the status-agnostic predicate; invert the
+    blocked-is-live pin
+  note: Leaf (DAG sink). Demonstrated against a seeded row — there are zero blocked
+    rows carrying a claimant fleet-wide today.
+  capabilities:
+  - name: status-agnostic-predicate-available-upstream
+    binding: producer:task-α upstream — α is γ's declared prereq and delivers is_stranded_any_status;
+      DAG direction correct, no inversion
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: is_stranded_any_status
+      paths:
+      - orchestrator/src/orchestrator/task_ground_truth.py
+      expect: present
+  - name: recovery-row-g-exists-and-is-unshadowable
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/task_ground_truth.py:838-839
+      row (g) RE_FILE_ESCALATION, keyed on the 5-tuple (BLOCKED, no-open-escalation,
+      GONE_NO_MARKER, False, None); _RECOVERY is a dict consumed by exact-key lookup
+      at :916, so no row can shadow another
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: reachability of a dict row is a behaviour property; pinned by boundary
+        case B7.
+  - name: re-file-branch-actually-files-a-stranded-blocked-record
+    binding: 'capability→producer (wired) — grep:orchestrator/src/orchestrator/harness.py:5847-5900;
+      gates measured: stranded_blocked_escalate_enabled default True (config.py:3813),
+      _escalation_queue not None, task_kind != ''deterministic'', deploy_phase None.
+      The _maybe_submit_stranded_verified_green short-circuit is STRUCTURALLY UNREACHABLE
+      for γ''s shape: it needs resolve_branch_sha to resolve the branch, and GONE_NO_MARKER
+      is reached precisely because that same call returned None.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the observable is a filed escalation record read via get_task_escalations,
+        demonstrated on a seeded row — not a grep.
+  - name: the-pin-to-invert-exists-and-is-the-only-one
+    binding: 'producer-extent (NOT extent-short) — grep:orchestrator/tests/test_task_ground_truth.py:783
+      test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design is the ONLY
+      executable pin on this behaviour; two prose assertions also need updating (task_ground_truth.py:547-560
+      and :831-837). Verified: no third or fourth pin.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: D4 requires the pin be INVERTED carrying the rationale for the reversal,
+        not deleted — a grep on the test name cannot tell an inverted pin from a surviving
+        one.
+- label: δ
+  task_id: 4621
+  title: Extract Scheduler.clear_claim_then_set_status and call it from both clear-then-flip
+    sites
+  note: 'Intermediate; unlocks ζ. Redesigned from "add a caller-side clear" after
+    G7: adding a third hand-written copy would reproduce the very convention-by-imitation
+    this PRD names as the defect''s root cause.'
+  capabilities:
+  - name: no-harness-scheduler-seam-to-cross
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/harness.py:1553
+      Harness.scheduler is a Scheduler, and δ's own site at harness.py:6174 already
+      calls self.scheduler.set_task_status; Scheduler.set_task_status (:2653) and
+      Scheduler.set_task_claimant (:2850) are both Scheduler methods
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def clear_claim_then_set_status
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: both-call-sites-repointed-at-the-helper
+    binding: capability→producer — the existing pair at scheduler.py:6430-6431 and
+      δ's site at harness.py:6174 both become one-line calls; this is what turns 3-going-on-4
+      copies into one site plus calls (INV-5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: clear_claim_then_set_status
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: revert-path-does-not-clear-today
+    binding: rejection-mechanism (observed) — harness.py:6174 is a bare `await self.scheduler.set_task_status(tid,
+      'pending')` with no claimant clear; confirmed there are exactly THREE set_task_claimant
+      call sites in orchestrator/src (scheduler.py:6430, harness.py:8873, workflow.py:2506)
+      and none is here
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the observable is a get_task read after a sweep tick; pinned by boundary
+        cases B11/B12.
+  - name: clear-before-flip-ordering-is-correct
+    binding: 'capability→producer (wired) — grep:orchestrator/src/orchestrator/scheduler.py:6421-6429
+      states the rationale in-source: clearing first means a concurrent orchestrator
+      that dispatches right after the row goes pending can never have its fresh stamp
+      clobbered by a late-landing clear. Does NOT violate INV-6 (δ is the crash backstop
+      INV-6 sanctions, acting on an already-dead claimant).'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: ordering is pinned by B12's fault injection, not by a pattern.
+- label: ζ
+  task_id: 4625
+  title: scripts/clear_leaked_claimants.py — corroborating, staleness-gated census
+    + repair
+  note: Leaf (DAG sink) now that detection is deferred. The script does not exist
+    today — that is ζ's deliverable, not a defect.
+  capabilities:
+  - name: shared-predicates-and-ttl-available-upstream
+    binding: producer:task-α upstream — ζ imports violates_terminal_claimant_invariant,
+      is_stale_hygiene_tier_claimant and DEFAULT_CLAIMANT_HEARTBEAT_TTL rather than
+      re-expressing them or minting a sixth TTL
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: violates_terminal_claimant_invariant
+      paths:
+      - scripts/
+      expect: present
+  - name: mint-paths-closed-upstream
+    binding: producer:task-β, task-δ upstream — both are ζ's declared prereqs; DAG
+      direction correct
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an upstream DAG edge is verified by the dependency wiring, not by a
+        pattern in ζ's own file.
+  - name: claimant-writer-that-does-not-bump-updated-at
+    binding: 'capability→producer (wired) — grep:fused-memory/src/fused_memory/backends/sqlite_task_backend.py:2266-2269
+      set_task_claimant''s UPDATE omits updated_at (contrast :2785-2787 where it always
+      advances). D6 requires this: a hand-rolled UPDATE would reset updatedAt-keyed
+      staleness detectors including consume_redispatch_requests.py:465.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: set_task_claimant
+      paths:
+      - scripts/
+      expect: present
+  - name: per-row-corroboration-before-each-write
+    binding: capability→producer — INV-3; the aggregate holder intersection is NOT
+      sufficient, because a done row can be reopened to in-progress with a fresh claimant
+      between census and apply, which would make ζ clear a LIVE claimant (the task-2588
+      class D2 rejects elsewhere in this PRD)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a re-read immediately before a write is a control-flow property; pinned
+        by boundary case B13.
+  - name: holder-set-is-readable-under-its-real-name
+    binding: capability→producer (wired) — grep:fused-memory/src/fused_memory/mcp_tools/scheduler_state.py:64
+      current_holders in data/orchestrator/scheduler_state.json, read via read_scheduler_state
+      / the live get_scheduler_state tool. NOTE there is no symbol named 'lane-holder'
+      anywhere; that spelling is prose only.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: which state source the pre-flight consults is a design property; naming
+        it here is the point of the binding.
+  - name: structured-census-output
+    binding: capability→producer — INV-2; --json emits {status, tier, task_id, claimant_run_id,
+      heartbeat_at, measured_at} per row plus totals, per the house pattern at scripts/repair_wiped_metadata_files.py:1120
+      and scripts/audit_combine_gate_marker_loss.py:1162
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: arrived_during_window
+      paths:
+      - scripts/
+      expect: present
+  - name: the-zero-has-a-named-positive-control
+    binding: floor:0, control named — a census that cannot read its corpus also prints
+      zero. Task 4028 (dark-factory, status=done, run-a1d3b5dba75a/4028-ba4c3e3e/pid=1807449,
+      heartbeat 2026-08-19T21:57:20Z) re-verified live through get_task on 2026-08-22
+      and is one of 29 terminal-tier violations fleet-wide — a tier that held at exactly
+      29 across a day in which the hygiene tier churned 104 -> 84.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the control must be re-verified live at run time, not asserted from
+        a stale line in a manifest.
+  - name: un-corroboratable-row-is-handled-not-skipped
+    binding: 'capability→producer — reify 5225 carries a freeform claimant with heartbeat_at
+      NULL: nothing to age, no pid to probe. _claimant_liveness_stranded already treats
+      a missing heartbeat as stranded, so routing through the shared predicate resolves
+      it — but ζ must say so explicitly or that row is never repaired.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pinned by boundary case B14.
+- label: η
+  task_id: 4626
+  title: 'Amend the origin contract: C4 pointer, D4''s mechanism sentence, and acceptance
+    test A5'
+  note: Leaf (DAG sink), genuinely non-code. Files with metadata.execution_class='operational'
+    so the routing-intent lint reads it as an honest declaration rather than a mismatch.
+  capabilities:
+  - name: all-three-target-sites-exist
+    binding: capability→producer (wired) — grep:plans/task-status-authority-prd.md:239
+      C4 'stamps at dispatch, refreshes, clears at release'; :158-159 D4 'set NULL
+      at release (scheduler.release / _run_slot finally)'; :285 acceptance row A5
+      'NULL after release'. All three verified verbatim on this HEAD.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant-invariant-enforcement
+      paths:
+      - plans/task-status-authority-prd.md
+      expect: present
+  - name: d4s-named-mechanism-is-itself-stale
+    binding: capability→producer — D4 names 'scheduler.release' as a clearing site,
+      and Scheduler.release clears NOTHING (only three set_task_claimant sites exist
+      orchestrator-wide, none in release). So η corrects a doubly-stale sentence,
+      which is why a one-line pointer near C4 was insufficient.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: prose accuracy is a reading judgement; the grep above proves the pointer
+        landed, not that the sentence was fixed.
+  - name: no-reciprocal-ownership-conflict
+    binding: capability→producer (wired) — grep:docs/legibility/design-invariants.md:133-136
+      INV-6's House pattern cites the claimant columns as task-status-authority D4's
+      mechanism and asserts no ownership of the clearing half; η's target file is
+      in plans/, INV-6's home is docs/legibility/ — disjoint, one owner each
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: G4 seam ownership is an authoring judgement, not a dispatch-time check.

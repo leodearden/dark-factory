@@ -333,6 +333,29 @@ class TestAssemblePayloadReconReportChannel:
         assert stage._recon_report_systemic_polled == 1
 
     @pytest.mark.asyncio
+    async def test_standing_decision_id_survives_into_rendered_payload(
+        self, mock_deps, watermark
+    ):
+        """Hook B (task 2897 δ): a polled systemic_pattern finding carrying a
+        standing_decision_id must survive the recon_report_systemic combined_flag
+        projection and render into the Stage 2 payload — so Stage 2 can see the
+        finding is already adjudicated. RED until the :2758 projection carries
+        the key (it renders verbatim via _format_flagged)."""
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        finding = self._systemic_finding()
+        finding['standing_decision_id'] = 'ENT-UUID:structural_size_conflation'
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Mem0 channel suppressed
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert 'standing_decision_id' in payload
+        assert 'ENT-UUID:structural_size_conflation' in payload
+        assert stage._recon_report_systemic_polled == 1
+
+    @pytest.mark.asyncio
     async def test_finding_already_in_stage1_report_not_double_rendered(
         self, mock_deps, watermark
     ):

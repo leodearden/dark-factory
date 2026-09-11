@@ -10,6 +10,14 @@ Exit codes
 1 — drift   (one or more required directives missing)
 2 — installed unit absent (no installed unit found at the given path)
 
+An exit status alone is not enough to read this script's verdict: 2 is also
+what `python3` returns for a script it cannot open and what argparse returns
+for a rejected flag. So EVERY line this script emits carries the
+``[fused_memory_unit_parity]`` tag, and setup-host.sh's parity gate believes a
+status only when that tag is present in the captured output. The tag's ABSENCE
+is therefore conclusive rather than heuristic, which only holds because every
+PHYSICAL line carries it — see ``_log``.
+
 Usage
 -----
   # verify only
@@ -33,17 +41,28 @@ Design notes
 - --fix only APPENDS missing directives; it never removes or reorders existing lines.
   This preserves intentionally host-specific lines (e.g. extra
   DASHBOARD_KNOWN_PROJECT_ROOTS entries) that live only in the installed unit.
+- All output goes through ``_log`` so the report is uniformly tagged; the
+  contract is pinned by test_main_every_emitted_line_carries_the_log_tag in
+  tests/scripts/test_check_fused_memory_unit_parity.py.
 """
 
 import argparse
 import pathlib
 import subprocess
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Prefixed onto every line this script prints, matching
+# [dashboard_unit_parity], [orchestrator_unit_parity] and [lms_unit_parity].
+# setup-host.sh routes operators to a detailed report BY TAG rather than by
+# position, so an untagged line in a long bring-up run has no reliable way to
+# point at its own output — and the gate's "no tag, so it did not run" test
+# would be answerable only by heuristic.
+LOG_TAG = "fused_memory_unit_parity"
 
 _DEFAULT_INSTALLED = pathlib.Path.home() / ".config" / "systemd" / "user" / "fused-memory.service"
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -51,16 +70,55 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
 # non-comment directives.  Extend this list to guard additional safety flags.
-# Restart=on-failure / RestartSec=5 / TimeoutStartSec=300 / TimeoutStopSec=90
-# are host-invariant literal strings (already present verbatim in
-# scripts/fused-memory.service.template) — exact membership matching both
-# detects a divergent value (e.g. a wrong TimeoutStopSec) and lets --fix
-# append the correct line.
+#
+# BUT NEVER ADD A NAME THAT scripts/render_dashboard_unit.py PRESERVES.
+# Concretely, today: never add `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=...`.
+# The two mechanisms are incompatible by construction, and the failure is silent
+# in the worst way — it lands on the unit that governs RECONCILIATION.
+#
+# Since task 4796, setup-host.sh installs this unit through that renderer, which
+# reads the host's DASHBOARD_KNOWN_PROJECT_ROOTS off the installed unit and puts
+# it back into the fresh render. A host that registered nine project roots keeps
+# nine. Now suppose the single-root committed line were added to the list below:
+#
+#   1. find_drift tests EXACT WHOLE-LINE membership, so on that nine-root host
+#      the required single-root line reads as MISSING;
+#   2. --fix appends it after the LAST [Service] line;
+#   3. systemd applies Environment= in file order with LAST-WINS, so the
+#      appended single-root line BEATS the preserved one;
+#   4. the checker then reports parity and exits 0.
+#
+# Eight projects silently stop being known to reconciliation
+# (fused_memory/models/scope.py reads this variable as KNOWN_PROJECT_ROOTS_ENV;
+# reconciliation/harness.py raises UnknownProjectError for a project outside the
+# set), and nothing reports it. The remedy for a host-local value is NOT this
+# list — it is the renderer's preserve set.
+#
+# Held by tests/scripts/test_check_fused_memory_unit_parity.py::
+# test_preserved_names_are_disjoint_from_required_service_directives, with the
+# clobber demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
+# No code in either module can prevent an edit to a constant in the other, which
+# is why the guard is a cross-module test and this is a comment.
+# Restart=on-failure / RestartSec=5 / RestartSteps=4 / TimeoutStartSec=300 /
+# TimeoutStopSec=90 are host-invariant literal strings (already present
+# verbatim in scripts/fused-memory.service.template) — exact membership
+# matching both detects a divergent value (e.g. a wrong TimeoutStopSec) and
+# lets --fix append the correct line.
+#
+# RestartSteps=4 is host-invariant for the same reason the others are, and is
+# listed here rather than left to the template alone because the template is
+# not what runs: the unit above RestartSteps in the template declares
+# RestartMaxDelaySec=60, and systemd DISCARDS that cap on any unit that does
+# not also declare RestartSteps= (it logs "Service has RestartMaxDelaySec= but
+# no RestartSteps= setting. Ignoring." at load and moves on). An installed unit
+# missing this line therefore has no growing backoff at all, silently, and the
+# only way that gets corrected on the host is for this checker to report it.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     "Environment=MEM0_TELEMETRY=false",
     "WatchdogSec=120",
     "Restart=on-failure",
     "RestartSec=5",
+    "RestartSteps=4",
     "TimeoutStartSec=300",
     "TimeoutStopSec=90",
 )
@@ -71,6 +129,27 @@ REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
 # host-specific paths (__REPO_ROOT__, /home/leo/bin) — only its presence can
 # be asserted.
 REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=",)
+
+
+def _log(message: str, *, stream=None) -> None:
+    """Print *message* with the log tag prefixed onto EVERY physical line.
+
+    Diverges from the three sibling checkers' single-prefix one-liner
+    (check_dashboard_unit_parity._log and friends), and deliberately: those
+    emit one line per call and never interpolate foreign text, so prefixing
+    once is the same thing as prefixing every line. This script does both —
+    the drift report joins a ``  - {directive}`` list into ONE print, and
+    daemon_reload interpolates a captured ``exc.stderr.decode()`` whose shape
+    and line count are not ours to know.
+
+    A single-line prefix would leave those continuations untagged, which
+    matters because setup-host.sh's gate reads tag ABSENCE as "the checker did
+    not run". That inference is only sound if presence is guaranteed per line.
+    """
+    out = stream if stream is not None else sys.stdout
+    for line in message.split("\n"):
+        print(f"[{LOG_TAG}] {line}", file=out)
+
 
 # ---------------------------------------------------------------------------
 # Unit parser
@@ -226,10 +305,10 @@ def daemon_reload() -> None:
         # systemctl not available (e.g. CI without systemd)
         pass
     except subprocess.CalledProcessError as exc:
-        print(
+        _log(
             f"[warn] systemctl --user daemon-reload failed (exit {exc.returncode}): "
             f"{exc.stderr.decode(errors='replace').strip()}",
-            file=sys.stderr,
+            stream=sys.stderr,
         )
 
 
@@ -273,10 +352,10 @@ def main(argv: Sequence[str]) -> int:
 
     # Exit code 2: installed unit absent
     if not installed_path.exists():
-        print(
+        _log(
             f"[skip] Installed unit not found at {installed_path} "
             "(unit may not be installed on this host)",
-            file=sys.stderr,
+            stream=sys.stderr,
         )
         return 2
 
@@ -287,18 +366,22 @@ def main(argv: Sequence[str]) -> int:
     if template_path.exists():
         template_drift = find_drift(template_path.read_text(encoding="utf-8"))
         if template_drift:
-            print(
+            _log(
                 f"[warn] Template {template_path} is itself missing: {template_drift}",
-                file=sys.stderr,
+                stream=sys.stderr,
             )
 
     if not drift:
-        print(f"[ok] {installed_path}: parity — all required directives present.")
+        _log(f"[ok] {installed_path}: parity — all required directives present.")
         return 0
 
-    print(
-        f"[drift] {installed_path}: missing required directives:\n"
-        + "".join(f"  - {d}\n" for d in drift)
+    # rstrip: the joined list ends in a newline, which under a per-line _log
+    # would render one final line holding nothing but the tag.
+    _log(
+        (
+            f"[drift] {installed_path}: missing required directives:\n"
+            + "".join(f"  - {d}\n" for d in drift)
+        ).rstrip("\n")
     )
 
     if args.fix:
@@ -310,7 +393,7 @@ def main(argv: Sequence[str]) -> int:
         appended = find_drift(unit_text, required_prefixes=())
         fixed_text = fix_unit_text(unit_text)
         installed_path.write_text(fixed_text, encoding="utf-8")
-        print(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")
+        _log(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")
         daemon_reload()
 
         # Re-check the written text with the default (prefix-aware) config. Any
@@ -319,19 +402,21 @@ def main(argv: Sequence[str]) -> int:
         # signalling parity with exit 0 — a follow-up plain verify would exit 1.
         residual = find_drift(fixed_text)
         if residual:
-            print(
-                f"[drift] {installed_path}: --fix cannot synthesize host-specific "
-                f"directive(s) (value carries host paths — add them by hand):\n"
-                + "".join(f"  - {d}\n" for d in residual),
-                file=sys.stderr,
+            _log(
+                (
+                    f"[drift] {installed_path}: --fix cannot synthesize host-specific "
+                    f"directive(s) (value carries host paths — add them by hand):\n"
+                    + "".join(f"  - {d}\n" for d in residual)
+                ).rstrip("\n"),
+                stream=sys.stderr,
             )
             return 1
         return 0
 
-    print(
+    _log(
         "Run with --fix to append missing directives without clobbering "
         "host-specific lines.",
-        file=sys.stderr,
+        stream=sys.stderr,
     )
     return 1
 

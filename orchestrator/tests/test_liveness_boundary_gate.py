@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -154,6 +155,10 @@ def _make_workflow(
     config.recycle_config_dir_on_zero_output = False
     config.judge_after_each_iteration = False
     config.inter_iteration_rebase = False
+    # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
+    # do not assert on sandbox wiring; disable the sandbox block so _invoke does
+    # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
+    config.sandbox.enabled = False
 
     scheduler = MagicMock()
     git_ops = MagicMock()
@@ -335,12 +340,24 @@ class TestB2PreTurn1Wedge:
       (b) Consumer: zero-output AgentResult → breaker trips → BLOCKED, no resume.
     """
 
-    async def test_zero_turn_wedge_killed_at_grace_not_ceiling(self, tmp_path: Path) -> None:
+    async def test_zero_turn_wedge_killed_at_grace_not_ceiling(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """(a) Watchdog: 0-turn real transcript → fast kill at startup_grace_secs, not ceiling.
 
         Uses REAL count_transcript_turns reading a real 0-assistant JSONL transcript.
-        grace=0.05s, ceiling=5.0s, assert wall<2.0s (killed at grace, not ceiling).
+        grace=0.05s, ceiling=5.0s; asserts the kill came from the startup-grace
+        branch and that the WATCHDOG'S OWN clock puts it well under the ceiling.
+
+        Deliberately NOT asserted on outer wall-clock: under a saturated parallel
+        (full-suite xdist) run the coroutine can be descheduled for seconds either
+        side of ``_run_subprocess``, so wall time is not a sound proxy for which
+        kill path fired — same class as done tasks 1836/1851/2320/2840/2921/2959/
+        3491. Observed under load: 6.98s wall for a kill the watchdog itself
+        measured at 0.1s — correct behaviour reported red by scheduling noise
+        outside the code under test.
         """
+        caplog.set_level(logging.WARNING, logger='shared.cli_invoke')
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
@@ -361,7 +378,6 @@ class TestB2PreTurn1Wedge:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
-            t0 = time.monotonic()
             result = await _run_subprocess(
                 ['fake'],
                 cwd=tmp_path,
@@ -372,16 +388,35 @@ class TestB2PreTurn1Wedge:
                 session_id=sid,
                 config_dir=cfg_dir,
             )
-            wall = time.monotonic() - t0
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         assert result.transcript_turns == 0, (
             f'Expected transcript_turns=0; got {result.transcript_turns!r}'
         )
         terminate_pg_mock.assert_called_once()
-        # Upper bound generous (2s) to avoid CI flakiness; key assertion: killed at grace.
-        assert wall < 2.0, (
-            f'Expected fast kill (<2s), got {wall:.3f}s — wedge not killed at grace bound'
+        # The kill came from the startup-grace branch, not the ceiling. This log
+        # line is emitted at exactly one place in cli_invoke (the
+        # `not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs`
+        # branch), so its presence discriminates the two kill paths
+        # deterministically — the ceiling path never emits it.
+        wedge_log = re.search(r'Startup wedge detected after ([\d.]+)s', caplog.text)
+        assert wedge_log is not None, (
+            'Expected the startup-grace kill path to fire and log the wedge; '
+            f'caplog.text snippet: {caplog.text[-500:]!r}'
+        )
+        # Quantitative half, measured inside the watchdog loop (cli_invoke.py's
+        # `elapsed = time.monotonic() - watchdog_start`), so it excludes
+        # descheduling OUTSIDE `_run_subprocess` (before t0 / after the await)
+        # — but NOT in-loop event-loop starvation, since `elapsed` is read
+        # from inside the same coroutine that can itself be starved. The 2.0s
+        # bound below is a load margin, not a tight assertion about the 0.05s
+        # grace; do not tighten it toward 0.05s on the assumption this
+        # measurement is starvation-free. Guards a regression that still takes
+        # the wedge branch but only after ignoring startup_grace_secs.
+        detected_after = float(wedge_log.group(1))
+        assert detected_after < 2.0, (
+            f'Expected fast kill (<2s on the watchdog clock), got {detected_after}s '
+            '— wedge not killed at grace bound'
         )
 
     async def test_zero_output_result_trips_breaker(self, tmp_path: Path) -> None:

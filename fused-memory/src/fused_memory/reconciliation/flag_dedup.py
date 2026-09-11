@@ -14,11 +14,19 @@ reaped each cycle by ``ReconLedgerStore.gc()``.
 mirror is unaffected and still writes on every suppression upsert; either
 way, Mem0 is never searched by this module.
 
-Note: this module does not suppress persistent flags before Stage 2 sees
-them at the LLM level; suppression logic also lives in Stage 2's prompt
-instructions, which direct the LLM to soft-handle annotated flags.  This
-module enforces the suppression contract in code (see "Suppression"
-below), making it authoritative over the prompt directive.
+Note: suppression logic also lives in Stage 2's prompt instructions, which
+direct the LLM to soft-handle annotated flags.  This module enforces the
+suppression contract in code (see "Suppression" below), making it
+authoritative over the prompt directive WHERE IT REACHES — and it reaches
+exactly ONE of Stage 2's two flag channels.  On the STRUCTURED-REPORT
+channel (``report.items_flagged``) a dropped flag never reaches Stage 2 at
+all, which since task 4381 includes a carried-forward flag whose
+``cited_tasks`` resolve to a live foreign fix task.  On the independent
+Mem0 channel (``task_knowledge_sync._query_stage2_flags`` re-queries
+``metadata.flag_for_stage2``) no code filter here can reach the flag, so
+the prompt directive is the only lever — which is why the Stage 2 prompt
+carries the matching "Persistent Flags" instruction and must be kept in
+agreement with this module rather than allowed to go stale.
 
 Ledger-backed marker UPSERT (task 2227)
 ----------------------------------------
@@ -36,6 +44,113 @@ falsy/absent stored value); the row is then ``upsert``-ed with a fresh
 payload and a self-refreshing 14-day ``expires_at`` TTL — every recurrence
 pushes the expiry back out, so a still-recurring marker never ages out;
 only a finding that stops recurring for 14 days is GC'd.
+
+The payload never carries the finding's ``cited_tasks`` (task 4712; it did,
+briefly, under task 4381 / esc-3841-1 — see the invariant below for why that
+was retired).  The cross-project fix-task suppression gate (see
+"Suppression") resolves against the CURRENT cycle's ``cited_tasks``,
+sanitized by :func:`_sanitize_cited_tasks` down to the three canonical keys
+``{project_id, task_id, title}`` with scalar values only, and — when those
+name no live foreign fix task — against a citation
+:func:`_discover_foreign_fix_task_citations` looks up deterministically for
+that cycle (task 4864).  Neither is persisted.  The sanitizing now serves
+the gate's input validation alone — an unserialisable or malformed
+LLM-authored citation must never reach the resolver — not a payload write.
+
+**Invariant (task 4712):** no INPUT to :func:`compute_flag_signature` may be
+persisted in the marker payload as durable cross-cycle state.
+:func:`compute_flag_signature` folds every ``cited_tasks`` entry's
+``task_id`` into the row's own key (see its "cited_tasks union" section
+below), so a value derived from citations is unconditionally stored in a row
+keyed by itself — reachable only when a LATER cycle happens to present the
+IDENTICAL citation set, in which case that cycle's own citation already
+resolves the gate and the anchor adds nothing.  A prior version of this
+module persisted the UNION of the prior row's anchor and the current cycle's
+citations (``_union_cited_tasks``, now deleted) specifically to survive
+citation-less cycles; measured evidence disproved it —
+``compute_flag_signature({'task_id': 598, 'flag_type': ft, 'cited_tasks':
+[{'project_id': 'dark_factory', 'task_id': '3839'}]})`` returns
+``('3839,598', ft)`` while the citation-less
+``compute_flag_signature({'task_id': 598, 'flag_type': ft})`` returns
+``('598', ft)`` — two different rows for one logical flag, so the anchor was
+unreachable exactly when it would have mattered.  ``task_id``/``flag_type``
+are the only signature inputs the payload may carry, and only because they
+are exact mirrors of the row's own key columns, trivially reproducible by
+any cycle that keys to this row at all.
+``tests/test_flag_dedup.py::TestMarkerPayloadKeyInvariant`` is the
+regression guard: it fails again if a future change re-adds a
+signature-derived field as durable payload state.
+
+**The Stage 1 producer gap, and how it was closed (task 4864 — the sibling
+task the paragraph below was originally addressed to).**  Task 4712 recorded
+that the cross-project fix-task gate had no producer and left three options
+for this task to choose between.  The outcome:
+
+* **Option (a) — Stage 2 enriches the Stage 1 marker row with cross-project
+  citations — is DEFINITIVELY defeated** by the keying property above, not
+  merely blocked: citations are folded into the row's KEY, so enriching a row
+  RELOCATES it to a different row rather than annotating the one already
+  written.  Confirmed on the live ledger, where the repro finding occupies
+  THREE rows (``know_live/598``, ``know_live/3833,3839,598``,
+  ``know_live/3833,3839``) — one logical finding, keyed by whichever
+  citations each cycle happened to emit.
+* **Option (c) — route this complaint class through
+  :func:`filter_already_tracked_systemic_patterns` — does NOT subsume the
+  need**, even though its stated blocker was removed when task 4711 widened
+  ``_NEVER_TRACKED_PHRASES`` to reach the "no fix task has been filed"
+  wording.  :func:`_is_systemic_pattern_candidate` is a CONJUNCTION and 4711
+  widened only its second conjunct; the first still requires
+  ``category``/``flag_type == 'systemic_pattern'``, which the repro flag's
+  ``remediation_payload_live_workflow_signals_gap`` is not.  Widening that
+  conjunct is rejected on the MERITS rather than on scope: that filter drops
+  on text coverage alone, with no citation, no HIT requirement (it would drop
+  a FIRST-cycle finding), no status-bounded ceiling on an already-``done``
+  fix task and no cross-cycle counter — so routing this class there would
+  bypass every bound Leo's 2026-08-17 ruling placed on task 4381 and leave
+  4381 itself permanently inert.
+* **Option (b) — a bounded deterministic cross-project lookup — was built**:
+  :func:`_discover_foreign_fix_task_citations`, consumed by ``dedup_flags``
+  (see "Suppression").  It reuses this module's own proven matcher against
+  each FOREIGN project's non-cancelled backlog and synthesizes the citation
+  the LLM cannot supply, because Stage 1's context is its own project's task
+  tree.  Crucially it HONOURS the invariant above instead of fighting it: the
+  discovered citation travels a separate in-memory channel, never reaching
+  ``flag['cited_tasks']`` or the payload, so a discovery-driven suppression
+  leaves the marker identity byte-identical to a citation-less cycle.  The
+  Stage 1 prompt was also taught to cite a foreign fix task when it has
+  grounds to — necessary but never sufficient on its own, so it complements
+  discovery rather than replacing it.
+
+**Residual cost this task does not fix:** a varying citation set still
+mints a distinct marker row per distinct citation set it has recently
+emitted (sprawl), each independently bounded by the ledger's
+self-refreshing 14-day TTL and reaped by ``ReconLedgerStore.gc()`` once it
+stops recurring — elevated row count within a rolling 14-day window, not
+unbounded growth.  The direction that would fix the sprawl itself is
+de-folding ``cited_tasks`` from :func:`compute_flag_signature` and replacing
+task-2432's collision protection (see that function's docstring) with some
+other discriminator; that is a fleet-wide re-key across ~40 call sites and
+was declined by task 4712 as disproportionate to a feature that had never
+once fired (provenance esc-3841-1, 2026-08-24 measurement).  That premise
+has since changed — task 4864 gave the gate a producer, so it CAN now fire —
+but the conclusion does not: the sprawl is driven by varying LLM-authored
+citation sets, and the DISCOVERY producer deliberately mints no new rows at
+all (its citation never reaches the signature), so it adds nothing to the
+row count it would have to justify.
+
+The PROMPT half of that task is the one exception, and it is stated here
+rather than left implicit (amendment).  Teaching Stage 1 to ``cite_task`` a
+foreign fix task means that for the findings it succeeds on, the citation set
+CHANGES — and a changed citation set relocates the marker row, so that cycle
+is a MISS under the HIT-only gate and mints one more row.  The trade is
+deliberate and bounded: one relocation per change in a finding's citation set,
+in exchange for reaching the gate on findings whose wording discovery's term
+match does not cover (an LLM citation is grounded in the model's judgment that
+the task FIXES the finding, which no term overlap can establish).  Suppression
+via an LLM citation is therefore only RELIABLE for a model that emits a stable
+citation set every cycle; discovery, which is stable by construction and
+relocates nothing, is the load-bearing path and the prompt strictly
+complements it.
 
 Because the identity excludes run_id, ``ON CONFLICT`` on the full primary
 key guarantees **exactly one row survives** per (task_id, flag_type)
@@ -67,6 +182,25 @@ task_id, family) for the process lifetime, on an observed family collision
 as a partial audit mitigation).  When both a wildcard and a scoped row
 exist for the same task_id, the wildcard wins (union semantics — a blanket
 suppression cannot be narrowed by a more specific record).
+A SECOND, independent suppression path runs inside the per-flag loop: the
+cross-project fix-task gate (task 4381 / esc-3841-1), which drops a
+CARRIED-FORWARD finding once a live, non-cancelled fix task for it exists in
+another known project.  It has TWO producers feeding one gate (task 4864):
+the flag's own ``cited_tasks`` are tried first, and only when they name no
+live foreign fix task does :func:`_discover_foreign_fix_task_citations`
+find one deterministically — matching the finding's key terms against each
+foreign project's non-cancelled backlog — after which the discovered
+citation re-enters the SAME resolver, so both producers inherit one status
+policy, one done-suppression ceiling and one set of ``stats`` counters
+rather than forking a second.  Discovery is HIT-only, FOREIGN-only, scoped
+to flags whose text actually ASSERTS nothing has been filed
+(:func:`_asserts_never_tracked` — the complaint class the gate answers, not
+every carried-forward flag), prefers an OPEN match over an already-``done``
+one, and is lazy (a cycle with no qualifying flag issues zero ``get_tasks``
+calls), and its citation is an in-memory gate input that never reaches the
+flag or the payload — see the invariant above and ``dedup_flags`` for the
+full policy.
+
 ``write_suppression_record`` upserts these rows: ``flag_types=None``
 writes a single blanket row; a non-empty list writes one scoped row per
 flag_type.  Suppression rows never expire (``expires_at=None``) — they are
@@ -80,6 +214,43 @@ Mem0-mirror-never-upserts companion-record sprawl (mem0 c3a1bdfd on task
 by family within the same call, so one call cannot mint its own
 multi-row companion sprawl either.  See ``filter_suppressed`` and
 ``write_suppression_record`` for full semantics.
+
+``dedup_flags`` has a SECOND way to drop a flag (task 4381 / esc-3841-1):
+the cross-project fix-task gate.  When the optional ``taskmaster`` /
+``known_projects`` kwargs are supplied and a flag's ledger lookup was a HIT,
+its ``cited_tasks`` are resolved via
+``_resolve_live_cross_project_fix_task``; a live, non-cancelled task in a
+DIFFERENT known project drops the flag rather than re-asserting it.  The
+gate is HIT-only (a first-cycle finding is never suppressed),
+foreign-project-only, and fail-open in every direction — omitting either
+kwarg restores the pre-4381 behaviour exactly.
+
+**Titles are COSMETIC for this gate (task 4864).**  A citation's ``title``
+is a snapshot ``server/recon_report.cite_task`` takes at cite time and never
+refreshes (first-cited title wins; it stores ``''`` outright for a record
+whose title it could not resolve), so requiring title equality let an
+ordinary retitle — or the producer's own empty-title write — silently
+disable suppression.  ``_cited_fix_task_live`` therefore admits on live
+PRESENCE plus a non-abandoned status, and reports title agreement as a
+strength signal, carried on ``_LiveFixTask.title_corroborated`` to the
+DECISION SITE: a suppression that actually happens on an uncorroborated title
+logs ``reconciliation.stage1_flag_cross_project_fix_task_suppressed_weakly_corroborated``
+at WARNING and counts ``stats['cross_project_fix_task_suppressed_weakly_corroborated']``,
+a strong one only INFO.  (The resolver notes the observation itself at INFO —
+resolving is not deciding: the done-exhausted branch resolves a fix task and
+then declines to suppress.)  The protection this gives up is replaced by
+gate-time re-verification (a LIVE ``get_task`` per citation on EVERY cycle)
+plus the gate's four bounds — HIT-only, foreign-only, non-cancelled, and
+done-bounded to ``_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES`` — so a wrong
+suppression here EXPIRES.  ``_cited_task_corroborated`` is deliberately
+NOT relaxed: ``filter_false_phantom_task_creation_flags`` has no such
+expiry, so a wrong drop there would be permanent, and it keeps requiring
+title equality.  Note this gate reaches only
+the Stage 1 STRUCTURED-REPORT channel (``report.items_flagged``); Stage 2
+independently re-surfaces flags from Mem0 via
+``task_knowledge_sync._query_stage2_flags``, where no code filter here can
+reach them — which is why the Stage 2 prompt carries the matching
+instruction (see the note at the top of this docstring).
 
 Completion-marker same-cycle self-delete (task-2312)
 -----------------------------------------------------
@@ -177,9 +348,12 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
+
+from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_TOKEN_FAMILIES,
@@ -262,6 +436,9 @@ def _decompose_suppression_task_id(tid: str) -> list[str]:
 
     Only the SUPPRESSION row's task_id is ever decomposed by this helper --
     a flag's own task_id is never split (see :func:`filter_suppressed`).
+    :func:`_cluster_growth_candidate_task_ids` (task 3476) is the separate
+    splitter that DOES decompose a flag's own composite task_id, for its own
+    task-resolution purposes; that claim above stays true of this helper.
 
     Pure, sync, no I/O.
     """
@@ -870,7 +1047,14 @@ async def maybe_escalate_suppression_storm(
             # failures are caught and logged rather than escaping.
             esc = Escalation(
                 id=escalation_queue.make_id(entity_uuid),
-                task_id='',
+                # INVARIANT: task_id carries the entity_uuid because it IS the
+                # dedup key — has_open_l1(entity_uuid, category=...) above reads
+                # it back via get_by_task's exact esc.task_id match.  Writing ''
+                # here (as an earlier revision did) makes the dedup guard a
+                # silent no-op: the lookup never matches, so an over-active
+                # decision re-files a duplicate storm escalation every cycle.
+                # Write key and read key must stay the same field.
+                task_id=entity_uuid,
                 agent_role='reconciliation-stage1',
                 severity='blocking',
                 category='reconciliation_standing_decision_storm',
@@ -975,6 +1159,152 @@ def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
     return sorted(collected)
 
 
+#: The only ``cited_tasks`` entry keys :func:`_sanitize_cited_tasks` keeps —
+#: the shape the cross-project fix-task suppression gate resolves against
+#: (task 4381).  No longer a payload key (task 4712 retired the marker's
+#: persisted ``cited_tasks``; see the module docstring's invariant).  Matches
+#: the shape ``server/recon_report.cite_task`` appends — ``{project_id,
+#: task_id, title}`` — which is also what :func:`_cited_task_corroborated`
+#: reads.
+_CITED_TASK_PAYLOAD_KEYS: tuple[str, ...] = ('project_id', 'task_id', 'title')
+
+#: Hard ceiling on the length of any STRING value in a sanitized
+#: ``cited_tasks`` entry (task 4381 amendment).  No longer bounds a persisted
+#: row (task 4712 retired that write); it now bounds only the in-memory
+#: value :func:`_resolve_live_cross_project_fix_task` compares on every
+#: cycle.  An LLM emitting a pathologically long ``title`` (a pasted stack
+#: trace, a whole task description) would otherwise hand
+#: :func:`_cited_task_corroborated` an unbounded string to normalise and
+#: compare.  200 characters comfortably exceeds every real task title in
+#: this factory (the longest are ~130), so truncation only ever fires on
+#: junk.
+#:
+#: **Truncation parity (task 4864).**  Truncation used to be a silent
+#: matching hazard: the citation was cut to this bound while the live record's
+#: ``title`` was compared at full length, so the gate's own sanitizer could
+#: mutate a perfectly good citation into one that could never corroborate the
+#: task it was copied from.  :func:`_titles_corroborate` now truncates BOTH
+#: sides to this bound before normalising, which makes the sanitizer's
+#: mutation provably lossless for MATCHING at any value of this constant —
+#: the invariant holds however the cap is later tuned, rather than depending
+#: on it exceeding every real title.  The documented consequence is that two
+#: titles differing ONLY past character 200 compare equal; that is the cap's
+#: intended semantics (it is a bound on how much title the gate reads at
+#: all), not a prefix match — a SHORT cited title is still compared in full
+#: against the truncated live title, so a long live title that merely begins
+#: with a short citation does NOT corroborate.
+_MAX_CITED_TASK_STR_CHARS: int = 200
+
+
+def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Project *flag*'s ``cited_tasks`` down to a gate-safe list, or ``None``.
+
+    Each surviving entry keeps ONLY the three canonical keys in
+    :data:`_CITED_TASK_PAYLOAD_KEYS`, and only when the value is a scalar
+    (``str``/``int``/``float``/``bool``) or ``None``.  Entries that are not
+    dicts are skipped entirely, and an entry that projects down to nothing is
+    dropped rather than kept as an empty dict.  Every ``str`` value is
+    additionally truncated to :data:`_MAX_CITED_TASK_STR_CHARS` characters
+    (task 4381 amendment) — see that constant for why.
+
+    Sanitizing is NOT decorative.  The result is handed to
+    :func:`_resolve_live_cross_project_fix_task` (via ``dedup_flags``), which
+    compares each entry's ``title`` against a live task record
+    (:func:`_titles_corroborate`); an unsanitized LLM-authored value (a
+    nested object, a datetime, a mock) could make that comparison raise
+    instead of failing open.  The truncation this applies is NOT lossy for
+    that comparison: :func:`_titles_corroborate` truncates the live title to
+    the same bound first (task 4864), so a citation this function shortened
+    still corroborates the record it was copied from.  This is now the sanitizer's ONLY job — task
+    4712 retired the marker-payload write it used to also protect (the
+    payload is never ``json.dumps``-ed with a ``cited_tasks`` key any more;
+    see the module docstring's invariant) — but it remains load-bearing for
+    the gate, which runs every cycle a carried-forward flag cites anything.
+
+    Returns ``None`` (rather than ``[]``) when ``cited_tasks`` is absent, not
+    a list, empty, or entirely junk.  :func:`_resolve_live_cross_project_fix_task`
+    degrades identically either way today (both fail its
+    ``isinstance(..., list)`` guard or resolve no entries), but the ``None``
+    signal is kept for "no citations at all" vs "an empty list", matching
+    this module's established idiom for optional derived values (e.g.
+    ``deduped_against``).
+
+    Input order is preserved.  Pure, sync, no I/O — never raises.
+    """
+    cited_tasks = flag.get('cited_tasks')
+    if not isinstance(cited_tasks, list) or not cited_tasks:
+        return None
+    sanitized: list[dict[str, Any]] = []
+    for entry in cited_tasks:
+        if not isinstance(entry, dict):
+            continue
+        projected: dict[str, Any] = {}
+        for key in _CITED_TASK_PAYLOAD_KEYS:
+            if key not in entry:
+                continue
+            value = entry[key]
+            if isinstance(value, str) and len(value) > _MAX_CITED_TASK_STR_CHARS:
+                logger.debug(
+                    'flag_dedup: cited_tasks %r truncated from %d to %d chars'
+                    ' for the cross-project fix-task gate',
+                    key, len(value), _MAX_CITED_TASK_STR_CHARS,
+                )
+                value = value[:_MAX_CITED_TASK_STR_CHARS]
+            if value is None or isinstance(value, (str, int, float, bool)):
+                projected[key] = value
+        if projected:
+            sanitized.append(projected)
+    return sanitized or None
+
+
+#: Payload key carrying the number of CONSECUTIVE cycles a ``stage1_flag_marker``
+#: has been suppressed by a cross-project fix task that is already ``done``
+#: (task 4381 amendment).  Written only while that count is non-zero, so a
+#: marker that has never been suppressed by a done fix task keeps the
+#: historical payload shape verbatim.
+_DONE_SUPPRESSIONS_PAYLOAD_KEY: str = 'cross_project_done_suppressions'
+
+#: How many consecutive cycles a ``done`` cross-project fix task may suppress a
+#: still-recurring finding before the suppression EXPIRES (task 4381
+#: amendment).
+#:
+#: A filed-but-unfinished fix task answers the complaint "no fix task has been
+#: filed" for as long as it stays unfinished, so it suppresses indefinitely.  A
+#: ``done`` one is different: the fix has supposedly LANDED, so a finding that
+#: Stage 1 keeps re-detecting afterwards is evidence the fix did not work — and
+#: because the ledger upsert refreshes the marker's 14-day TTL on every
+#: suppressing cycle, an unbounded rule would silence that finding FOREVER with
+#: no event left to revive it (the same argument the abandoned-status exclusion
+#: rests on).  Past this many cycles the gate stops suppressing and logs at
+#: WARNING, so a fix that demonstrably did not stop the recurrence surfaces
+#: loudly instead of degrading silently.
+#:
+#: Sized as a grace window, not a tripwire: a landed fix legitimately takes a
+#: few cycles to stop showing up in Stage 1's evidence, so the count must be
+#: comfortably above "one or two stale cycles".  The counter resets whenever the
+#: suppressing task is NOT done, and the whole marker ages out after its 14-day
+#: TTL if the finding stops recurring.
+_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES: int = 8
+
+
+def _prior_done_suppression_count(prior_payload: Any) -> int:
+    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload.
+
+    Returns 0 for anything that is not a positive ``int`` — an absent key (every
+    marker written before the task 4381 amendment), ``None``, a bool (``True``
+    is an ``int`` in Python and must not be read as the count 1), a string, or a
+    negative value.  Free-form JSON off a ledger row is never trusted for shape.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(prior_payload, dict):
+        return 0
+    value = prior_payload.get(_DONE_SUPPRESSIONS_PAYLOAD_KEY)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
     """Return True iff *flag* explicitly marks itself as ONE-TIME completed work.
 
@@ -1008,6 +1338,10 @@ async def dedup_flags(
     project_id: str,
     run_id: str,
     flags: list[dict[str, Any]],
+    *,
+    taskmaster: Any = None,
+    known_projects: dict[str, str] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Annotate Stage 1 flagged items against prior ``stage1_flag_marker`` ledger rows.
 
@@ -1069,6 +1403,110 @@ async def dedup_flags(
     omit it — they are already resolvable anchors and their payload is
     unchanged.
 
+    Cross-project fix-task suppression (task 4381 / esc-3841-1; cross-cycle
+    anchor retired task 4712): this is the SECOND way ``dedup_flags`` can
+    drop a flag, alongside ``filter_suppressed`` above.  When the OPTIONAL
+    keyword-only *taskmaster* and *known_projects* are both supplied and the
+    ledger read was a HIT (``persisted_from_run`` is set), the flag's
+    CURRENT-CYCLE ``cited_tasks`` — sanitized by :func:`_sanitize_cited_tasks`
+    to the three canonical keys with scalar values only, never persisted to
+    the payload (see the module docstring's invariant) — are passed to
+    :func:`_resolve_live_cross_project_fix_task`; if one of them names a
+    live, non-cancelled task in ANOTHER known project, the flag is dropped
+    instead of re-asserted.  Properties, each load-bearing:
+
+    * **HIT-only.** A first-cycle finding is never suppressed — the point is to
+      stop re-asserting a complaint that has already been converted into
+      tracked work, not to pre-empt the first report of it.
+    * **TWO producers, one gate (task 4864).** The flag's own
+      ``cited_tasks`` are tried FIRST; only when they name no live foreign fix
+      task does :func:`_discover_foreign_fix_task_citations` look one up
+      DETERMINISTICALLY — matching the finding's key terms against every
+      foreign project's non-cancelled backlog — and the discovered citation is
+      then fed back through the SAME
+      :func:`_resolve_live_cross_project_fix_task` call, so it inherits the
+      identical resolution and the identical policy below rather than forking
+      a second one.  This is what makes the gate reachable at all: Stage 1's
+      context is its own project's task tree, so the model has nothing to cite
+      a FOREIGN fix task from, and before this the gate was enabled but inert.
+      Discovery is a FALLBACK, not a second sweep: a flag whose own citation
+      resolves issues no lookup, a cycle with no qualifying flag issues ZERO
+      ``get_tasks`` calls, and every foreign project's backlog is fetched at
+      most once per ``dedup_flags`` call.
+    * **The discovered citation NEVER touches the flag or the payload.**
+      ``compute_flag_signature`` read ``cited_tasks`` at the top of the loop
+      and folds them into the marker row's KEY, so writing a discovered
+      citation back would RELOCATE the row instead of annotating it; under a
+      HIT-only gate the relocated cycle is a MISS, and because discovery
+      matches a live backlog that shifts between cycles the row would keep
+      relocating and never accumulate a HIT at all — strictly worse than the
+      inertness it fixes, and a violation of task 4712's payload invariant.
+      A discovery-driven suppression therefore leaves the marker identity
+      byte-identical to a citation-less cycle.
+    * **ONE anchor: the current cycle's citation.** The gate resolves ONLY
+      against the flag's OWN ``cited_tasks`` this cycle plus whatever
+      discovery finds for it — there is no cross-cycle citation anchor in the
+      marker payload (task 4712).  The accepted consequence for the CITATION
+      producer: a carried-forward finding whose LLM output re-emits NO
+      citation on a given cycle keys to a DIFFERENT row (see
+      :func:`compute_flag_signature`'s cited_tasks union), so that cycle is a
+      MISS and the finding is RE-ASSERTED rather than suppressed.  Citation-
+      driven suppression is reliable exactly when the LLM keeps re-citing the
+      same fix task — the common case for a still-open remediation.  The
+      discovery producer is not subject to that at all, because it never
+      changes the row a flag keys to.
+    * **Foreign-project-only.** See
+      :func:`_resolve_live_cross_project_fix_task` — a finding's own subject
+      task is routinely its own first citation.
+    * **Fail-open in every direction.** Omitting either kwarg degrades to the
+      pre-4381 behaviour exactly, which is why every existing positional call
+      site is unaffected.
+    * **The upsert still runs on a suppressed cycle.** The gate's DECISION is
+      computed between the ledger read and the ledger write (so the
+      done-suppression counter below can ride the same write), but the write
+      itself still happens for a suppressed flag: it keeps its row and
+      refreshes its 14-day TTL.  Skipping the write would let the marker age
+      out and lose the recurrence history the abandoned-fix-task path
+      depends on.
+    * **A ``done`` fix task suppresses for a BOUNDED number of cycles** (task
+      4381 amendment).  Each consecutive cycle suppressed by an already-``done``
+      fix task increments ``cross_project_done_suppressions`` in the payload;
+      past :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES` the gate stops
+      suppressing and logs
+      ``reconciliation.stage1_flag_cross_project_fix_task_suppression_exhausted``
+      at WARNING.  Without that bound, a fix task reaching ``done`` while the
+      finding keeps recurring — i.e. a fix that demonstrably did not work —
+      would silence the finding permanently, since the TTL is refreshed on every
+      suppressing cycle.  A fix task that is filed but NOT done suppresses
+      indefinitely and resets the counter: the complaint "no fix task has been
+      filed" is answered for as long as the work is outstanding.
+    * **Batch-wide lookup memo.** All flags in one call share a single
+      ``(project_id, task_id) -> get_task result`` cache, so a family of
+      findings citing the same remediation task costs ONE round trip, not one
+      per flag.
+
+    Args:
+        memory_service: Service exposing ``recon_ledger`` (may be absent/None).
+        project_id: The project this reconciliation run belongs to.
+        run_id: The current run's id.
+        flags: Stage 1 ``items_flagged``.
+        taskmaster: Optional object with an async ``get_task(task_id,
+            project_root)``, enabling the cross-project suppression gate.
+        known_projects: Optional ``project_id -> project_root`` map, enabling
+            the same gate.  Both must be truthy for it to run at all.
+        stats: Optional out-dict for per-call counters (task 4381 amendment).
+            When supplied, ``'cross_project_fix_task_suppressed'``,
+            ``'cross_project_fix_task_suppressed_weakly_corroborated'`` (the
+            subset of those suppressions whose citation title did NOT
+            corroborate — task 4864 amendment) and
+            ``'cross_project_fix_task_suppression_exhausted'`` are incremented
+            (creating the keys as needed) so the caller can publish them as
+            ``report.stats`` entries.  Without it, a cross-project drop is
+            indistinguishable from a ``filter_suppressed`` drop in a cycle
+            report — two very different operator signals — because this
+            function returns only a list.  Never read by this function; safe to
+            omit.
+
     Returns the (possibly annotated) flag list.
     """
     # --- Authoritative suppression gate (task-1186) ---
@@ -1078,6 +1516,21 @@ async def dedup_flags(
     flags = await filter_suppressed(memory_service, project_id, flags)
 
     result: list[dict[str, Any]] = []
+    # ONE cross-project get_task memo for the whole batch (task 4381
+    # amendment): the gate below runs per carried-forward flag, and findings in
+    # one family routinely cite the same remediation task.
+    fix_task_cache: dict[tuple[str, str], Any] = {}
+    # ONE per-project backlog memo for the whole batch (task 4864): discovery
+    # pulls each FOREIGN project's non-cancelled task list — multi-MB, and
+    # ~0.6s of blocking CPU per ~4.2k-task project to extract its key terms —
+    # so a family of carried-forward findings must pay for it once rather than
+    # once per flag.  It holds the EXTRACTED TERMS, not the raw task lists
+    # (amendment): extraction, not the fetch, is the expensive half, so a
+    # raw-payload memo would still re-extract every foreign task per qualifying
+    # flag while pinning tens of MB live for the whole call.  Populated LAZILY
+    # — a cycle with no qualifying flag never touches it, so it stays empty and
+    # no get_tasks call is issued at all.
+    discovery_tracked_terms: dict[str, list[_TrackedTask] | None] = {}
     for flag in flags:
         sig = compute_flag_signature(flag)
         # Content-fingerprint fallback (task-1654 Fix 2): for null-task_id flags
@@ -1116,6 +1569,12 @@ async def dedup_flags(
             if is_content_fingerprint_task_id(tid)
             else None
         )
+        # Cross-project anchor enrichment (task 4381 / esc-3841-1): unlike
+        # deduped_against above, this is NOT scoped to fp:-keyed markers —
+        # cited_tasks is meaningful for every marker shape, because it is the
+        # only project-qualified identity a marker carries and a fix task for
+        # the finding routinely lives in a DIFFERENT project.
+        cited_tasks = _sanitize_cited_tasks(flag)
         if deduped_against and not flag.get('deduped_against'):
             # Observability (task-2047 amendment): _DEDUPED_AGAINST_FLAG_FIELDS
             # unions several undocumented alias fields alongside the canonical
@@ -1197,6 +1656,9 @@ async def dedup_flags(
         ledger = getattr(memory_service, 'recon_ledger', None)
         flag = dict(flag)
         persisted_from_run: str | None = None
+        # Consecutive cycles this marker has already been suppressed by an
+        # already-``done`` cross-project fix task (task 4381 amendment).
+        prior_done_suppressions: int = 0
 
         payload: dict[str, Any] = {
             'source': 'stage1_flag_marker',
@@ -1216,18 +1678,129 @@ async def dedup_flags(
         # the whole dedup_flags batch (memory_consolidator.run() calls this
         # with no surrounding try/except, so an unguarded raise here would
         # fail the entire Stage-1 run over a single bad row).
+        # The read and the write are two separate best-effort blocks (task
+        # 4381 amendment) so the cross-project gate's DECISION can be computed
+        # between them and ride the same write.  A read failure still skips the
+        # write entirely, exactly as the single combined block did — otherwise a
+        # marker whose prior row could not be read would be overwritten as if it
+        # were a first sighting, destroying its recurrence history.
+        ledger_read_ok = False
         if ledger is not None:
             try:
                 prior = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
                 if prior is not None:
                     prior_payload = json.loads(prior.payload_json)
                     persisted_from_run = prior_payload.get('run_id') or 'unknown'
+                    prior_done_suppressions = _prior_done_suppression_count(prior_payload)
                     if persisted_from_run == 'unknown':
                         logger.debug(
                             'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
                             tid,
                             ftype,
                         )
+                ledger_read_ok = True
+            except Exception as e:
+                logger.warning(
+                    'flag_dedup: recon_ledger read/write failed for marker'
+                    ' task=%s flag_type=%s: %s (best-effort — flag still'
+                    ' returned, no ledger annotation/persistence this cycle)',
+                    tid,
+                    ftype,
+                    e,
+                    exc_info=True,
+                )
+
+        # --- Cross-project fix-task suppression DECISION (task 4381) ---
+        # HIT-only: persisted_from_run is not None means this signature was
+        # carried forward from a prior cycle. A first-cycle finding is never
+        # suppressed.  Computed BEFORE the write (but applied after it) so the
+        # done-suppression counter is persisted by the same upsert; the write
+        # still happens on the suppressing path, which is what keeps a
+        # suppressed-but-still-recurring marker from ageing out.
+        suppress_cross_project = False
+        done_suppressions = 0
+        fix_task: _LiveFixTask | None = None
+        if persisted_from_run is not None and taskmaster and known_projects:
+            fix_task = await _resolve_live_cross_project_fix_task(
+                taskmaster,
+                known_projects,
+                project_id,
+                cited_tasks,
+                cache=fix_task_cache,
+            )
+            if fix_task is None:
+                # --- Deterministic DISCOVERY fallback (task 4864) ---
+                # The flag's own citations named no live foreign fix task —
+                # usually because it cited nothing at all, which is the normal
+                # case: Stage 1 only sees its own project's task tree, so the
+                # gate above was never reachable in practice.  Look the fix
+                # task up deterministically instead, then re-enter the SAME
+                # resolver with the discovered citation so the discovered path
+                # inherits the identical resolution and the identical policy
+                # below — never a parallel branch.
+                #
+                # THE CITATION IS A LOCAL VALUE.  It must not be assigned to
+                # flag['cited_tasks'] and must not enter `payload`:
+                # compute_flag_signature already read cited_tasks at the top of
+                # this loop and folds them into the marker row KEY, so
+                # enriching the flag would RELOCATE the row; the gate is
+                # HIT-only, so the first relocated cycle would be a MISS, and
+                # since discovery matches a live backlog that shifts between
+                # cycles the row would keep relocating and never accumulate a
+                # HIT at all (task 4712's invariant / the anti-relocation
+                # design decision).
+                discovered = await _discover_foreign_fix_task_citations(
+                    taskmaster,
+                    known_projects,
+                    project_id,
+                    [flag],
+                    tracked_terms_cache=discovery_tracked_terms,
+                    get_task_cache=fix_task_cache,
+                )
+                discovered_cite = discovered.get(0)
+                if discovered_cite is not None:
+                    fix_task = await _resolve_live_cross_project_fix_task(
+                        taskmaster,
+                        known_projects,
+                        project_id,
+                        [discovered_cite],
+                        cache=fix_task_cache,
+                    )
+        if fix_task is not None:
+            if fix_task.status != TaskStatus.DONE.value:
+                # Filed and still outstanding — suppresses for as long as it
+                # stays that way, and resets any done-grace already burned (a
+                # reopened fix task earns a fresh window).
+                suppress_cross_project = True
+            elif prior_done_suppressions >= _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES:
+                # The fix landed and the finding STILL recurs — stop silencing
+                # it and say so loudly.  The count is frozen at the ceiling
+                # rather than incremented, so the finding stays surfaced for as
+                # long as this remains true instead of oscillating.
+                done_suppressions = prior_done_suppressions
+                logger.warning(
+                    'reconciliation.stage1_flag_cross_project_fix_task_suppression_exhausted '
+                    'task_id=%s flag_type=%s fix_project_id=%s fix_task_id=%s '
+                    'done_suppressions=%d max=%d — the cited fix task is done yet '
+                    'the finding keeps recurring; surfacing it again',
+                    tid, ftype, fix_task.cited.get('project_id'),
+                    fix_task.cited.get('task_id'), prior_done_suppressions,
+                    _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+                )
+                if stats is not None:
+                    stats['cross_project_fix_task_suppression_exhausted'] = (
+                        stats.get('cross_project_fix_task_suppression_exhausted', 0) + 1
+                    )
+            else:
+                suppress_cross_project = True
+                done_suppressions = prior_done_suppressions + 1
+
+        if ledger is not None and ledger_read_ok:
+            try:
+                if done_suppressions:
+                    # Same optional-key idiom: a marker never suppressed by a
+                    # done fix task keeps the historical payload shape.
+                    payload[_DONE_SUPPRESSIONS_PAYLOAD_KEY] = done_suppressions
                 now = datetime.now(UTC)
                 await ledger.upsert(ReconLedgerRecord(
                     project_id=project_id,
@@ -1254,6 +1827,51 @@ async def dedup_flags(
         if persisted_from_run is not None:
             flag['persisted_from_run'] = persisted_from_run
         flag['last_seen_run_id'] = run_id
+
+        if suppress_cross_project and fix_task is not None:
+            logger.info(
+                'reconciliation.stage1_flag_cross_project_fix_task_suppressed '
+                'task_id=%s flag_type=%s fix_project_id=%s fix_task_id=%s '
+                'fix_status=%s done_suppressions=%d title_corroborated=%s',
+                tid, ftype, fix_task.cited.get('project_id'),
+                fix_task.cited.get('task_id'), fix_task.status, done_suppressions,
+                fix_task.title_corroborated,
+            )
+            if not fix_task.title_corroborated:
+                # THE DECISION SITE owns this WARNING (task 4864 amendment).
+                # The resolver observes an uncorroborated title, but only this
+                # branch knows a suppression actually happened — the
+                # done-exhausted branch above resolves a fix task and then does
+                # NOT suppress, so warning from the resolver asserted an
+                # outcome that may never occur, and fired for every
+                # carried-forward flag whether or not anything was silenced.
+                # Here it fires exactly once per suppression that really
+                # happened, which is what the ruling's "still suppresses, but
+                # logs at WARNING" actually means.  Detail (both titles) is on
+                # the resolver's INFO line for the same citation.
+                logger.warning(
+                    'reconciliation.stage1_flag_cross_project_fix_task_suppressed_weakly_corroborated '
+                    'task_id=%s flag_type=%s cited_project_id=%s '
+                    'cited_task_id=%s cited_title=%r fix_status=%s — this '
+                    'finding was silenced on the cited task being live and '
+                    'non-abandoned ALONE; its title does not corroborate, so '
+                    'the citation may name a task that no longer (or never) '
+                    'fixed this finding',
+                    tid, ftype, fix_task.cited.get('project_id'),
+                    fix_task.cited.get('task_id'), fix_task.cited.get('title'),
+                    fix_task.status,
+                )
+            if stats is not None:
+                stats['cross_project_fix_task_suppressed'] = (
+                    stats.get('cross_project_fix_task_suppressed', 0) + 1
+                )
+                if not fix_task.title_corroborated:
+                    stats['cross_project_fix_task_suppressed_weakly_corroborated'] = (
+                        stats.get(
+                            'cross_project_fix_task_suppressed_weakly_corroborated', 0,
+                        ) + 1
+                    )
+            continue
 
         result.append(flag)
     return result
@@ -1681,6 +2299,20 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     deploy; this is self-healing (the very next cycle writes suppression
     under the new signature), so no marker migration or dual-key lookup is
     required.
+
+    **Payload-persistence hazard (task 4712):** because this union folds every
+    ``cited_tasks`` entry's ``task_id`` into the task component, any value
+    *derived from* ``cited_tasks`` is unconditionally stored in a row keyed by
+    itself, and so can never be persisted as durable CROSS-CYCLE state in that
+    row's own payload — a later cycle presenting a different citation set
+    keys to a *different* row and can never read it back.  Measured:
+    ``compute_flag_signature({'task_id': 598, 'flag_type': ft, 'cited_tasks':
+    [{'project_id': 'dark_factory', 'task_id': '3839'}]})`` returns
+    ``('3839,598', ft)`` while the citation-less ``compute_flag_signature({
+    'task_id': 598, 'flag_type': ft})`` returns ``('598', ft)`` — two
+    different rows for one logical flag.  This is why :func:`dedup_flags` no
+    longer persists ``cited_tasks`` in the marker payload; see the module
+    docstring's invariant for the general rule this instance falls out of.
 
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
@@ -2228,18 +2860,18 @@ async def filter_terminal_metadata_flags(
     if not check_positions:
         return list(flags)
 
-    async def _safe_get_task(task_id: Any) -> Any:
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            logger.debug(
-                'reconciliation.terminal_metadata_filter_get_task_error task_id=%s error=%s',
-                task_id, exc,
-            )
-            return None  # KEEP flag on error (fail-safe)
-
+    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
+    # this filter classifies a lookup by whether a task body came back.
     lookup_results: list[Any] = await asyncio.gather(
-        *[_safe_get_task(tid) for tid in check_task_ids]
+        *[
+            _safe_get_task_or_none(
+                taskmaster,
+                tid,
+                project_root,
+                log_event='reconciliation.terminal_metadata_filter_get_task_error',
+            )
+            for tid in check_task_ids
+        ]
     )
     results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results, strict=True))
 
@@ -2262,6 +2894,183 @@ async def filter_terminal_metadata_flags(
             # drop: task is terminal; metadata blobs have no execution-time consumer
         else:
             kept.append(flag)
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
+# Stale-bulk-get_statuses guard helpers (task-3007)
+# --------------------------------------------------------------------------- #
+
+#: Flag types asserting the SQLite backend's bulk ``get_statuses`` returned a
+#: census that is stale relative to a live/scoped read.  The canonical spelling
+#: the Stage-1/Stage-3 harness emits is ``stale_bulk_get_statuses_recurrence``;
+#: the recurrence-less ``stale_bulk_get_statuses`` is included to be robust
+#: against LLM naming drift.  Case / separator / word-order variants of either
+#: spelling are ALSO matched at filter time via
+#: :func:`canonical_flag_type_family`, so only genuinely-distinct token multisets
+#: need to be listed here.
+STALE_BULK_GET_STATUSES_FLAG_TYPES: frozenset[str] = frozenset({
+    'stale_bulk_get_statuses_recurrence',
+    'stale_bulk_get_statuses',
+})
+
+#: Precomputed canonical-family keys for :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES`
+#: so a reworded / reordered LLM spelling of the flag_type still matches (mirrors
+#: the family matching used by ``filter_suppressed`` / ``write_suppression_record``).
+_STALE_BULK_GET_STATUSES_FAMILIES: frozenset[str] = frozenset(
+    canonical_flag_type_family(ft) for ft in STALE_BULK_GET_STATUSES_FLAG_TYPES
+)
+
+
+async def filter_stale_bulk_get_statuses_flags(
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop ``stale_bulk_get_statuses_recurrence`` flags whose divergence does not reproduce live.
+
+    The recurring "stale bulk get_statuses" finding is a MISDIAGNOSIS of benign
+    capture-time-vs-live read-skew in the reconciliation harness: the cycle-start
+    UNSCOPED status census is captured once and frozen for the whole multi-minute
+    cycle, then compared against LIVE reads (a live ``get_task`` / scoped
+    ``get_statuses``) minutes later.  A task that transitions ``pending -> done``
+    after cycle-start capture but during the cycle therefore appears one way in
+    the frozen census and another in a live read — a capture-time artifact that
+    cannot persist.  The SQLite backend read path has no cache/TTL/materialized
+    view, and scoped and unscoped ``get_statuses`` run the identical unpinnable
+    autocommit-connection path, so within one process they cannot persistently
+    disagree (verified: tasks 2455/2651/2694 already hardened the connection
+    layer, and existing tests prove bulk+scoped reads observe committed writes).
+
+    For each flag whose ``flag_type`` FAMILY (:func:`canonical_flag_type_family`)
+    is in :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES` and that carries a
+    ``task_id``, this filter re-runs the flag's OWN A/B claim LIVE — a fresh
+    unscoped ``taskmaster.get_statuses(project_root)`` and a fresh scoped
+    ``taskmaster.get_statuses(project_root, ids=[tid])`` — and DROPS the flag iff
+    the two now AGREE on the cited task (both report the same non-None status),
+    proving the alleged divergence was a benign capture-time artifact that does
+    not reproduce.
+
+    **Fail-safe direction is KEEP**: this filter drops ONLY on positively-confirmed
+    live agreement.  A live-reproduced divergence, a cited status absent/None on
+    either read, a read error, a missing ``task_id``, or a falsy
+    ``taskmaster``/``project_root`` all KEEP the flag — so a hypothetical genuine
+    backend regression is surfaced, never silenced.  A transient read failure
+    costs at most one extra dedup cycle and self-heals next cycle.
+
+    Non-matching flag types, and matching flags without a ``task_id``, are passed
+    through unchanged without any ``get_statuses`` call.  Degrades to a no-op
+    pass-through when ``taskmaster`` or ``project_root`` is falsy (mirrors
+    :func:`filter_terminal_metadata_flags` / :func:`filter_false_absence_flags`).
+
+    Args:
+        taskmaster: Object with an async ``get_statuses(project_root, ids=None)``
+            method, typically ``self.taskmaster`` in MemoryConsolidator (a raw
+            ``SqliteTaskBackend``).
+        project_root: Project root path passed through to ``get_statuses``.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        Filtered list with non-reproducing stale-bulk-get_statuses flags removed.
+    """
+    if not taskmaster or not project_root:
+        return list(flags)
+
+    # Positions whose flag_type FAMILY matches STALE_BULK_GET_STATUSES_FLAG_TYPES
+    # and that carry a task_id — only these are re-verified.
+    check_positions: list[int] = []
+    for i, flag in enumerate(flags):
+        flag_type = flag.get('flag_type')
+        if (
+            isinstance(flag_type, str)
+            and canonical_flag_type_family(flag_type) in _STALE_BULK_GET_STATUSES_FAMILIES
+            and flag.get('task_id') is not None
+        ):
+            check_positions.append(i)
+
+    # Detect potential LLM naming drift: flag_type strings that mention 'statuses'
+    # but whose family is not in STALE_BULK_GET_STATUSES_FLAG_TYPES.  When the
+    # model emits an unrecognised spelling the filter silently becomes a no-op;
+    # this log makes that observable (mirrors filter_terminal_metadata_flags).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if (ft := flag.get('flag_type')) is not None
+        and isinstance(ft, str)
+        and 'statuses' in ft.lower()
+        and canonical_flag_type_family(ft) not in _STALE_BULK_GET_STATUSES_FAMILIES
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update STALE_BULK_GET_STATUSES_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(STALE_BULK_GET_STATUSES_FLAG_TYPES),
+        )
+
+    if not check_positions:
+        return list(flags)
+
+    # The UNSCOPED bulk census is identical for every flag within one filter
+    # invocation, so fetch it ONCE and share it across all per-task scoped
+    # re-checks — otherwise each matching flag would re-read the entire project
+    # census (N full-census reads for N flags).  Fail-safe: any error fetching
+    # the shared census KEEPS every flag (mirrors the per-flag KEEP-on-error).
+    try:
+        bulk = await taskmaster.get_statuses(project_root)
+    except Exception as exc:
+        logger.debug(
+            'reconciliation.stale_bulk_get_statuses_filter_bulk_read_error error=%s',
+            exc,
+        )
+        return list(flags)  # KEEP all flags on bulk-census read error (fail-safe)
+    bulk_map: dict[Any, Any] = bulk if isinstance(bulk, dict) else {}
+
+    async def _safe_ab_check(task_id: Any) -> tuple[bool, str | None]:
+        """Re-run the flag's own bulk-vs-scoped A/B check LIVE.
+
+        Returns ``(should_drop, agreed_status)``.  Compares the cited task's
+        status in the shared unscoped ``bulk_map`` against a fresh per-task
+        scoped read.  DROP only when both report a non-None status for the cited
+        task AND those statuses are equal.  Any exception on the scoped read, a
+        missing/None cited status on either read, or a live divergence => KEEP
+        (fail-closed).
+        """
+        tid = str(task_id)
+        try:
+            scoped = await taskmaster.get_statuses(project_root, ids=[tid])
+        except Exception as exc:
+            logger.debug(
+                'reconciliation.stale_bulk_get_statuses_filter_read_error task_id=%s error=%s',
+                tid, exc,
+            )
+            return False, None  # KEEP flag on error (fail-safe)
+        bulk_status = bulk_map.get(tid)
+        scoped_status = scoped.get(tid) if isinstance(scoped, dict) else None
+        if bulk_status is not None and bulk_status == scoped_status:
+            return True, bulk_status  # live reads AGREE → benign artifact → DROP
+        return False, None  # divergence / missing status → KEEP
+
+    check_task_ids = [flags[i].get('task_id') for i in check_positions]
+    lookup_results: list[tuple[bool, str | None]] = await asyncio.gather(
+        *[_safe_ab_check(tid) for tid in check_task_ids]
+    )
+    results_by_pos: dict[int, tuple[bool, str | None]] = dict(
+        zip(check_positions, lookup_results, strict=True)
+    )
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        decision = results_by_pos.get(i)
+        if decision is not None and decision[0]:
+            logger.info(
+                'reconciliation.stale_bulk_get_statuses_flag_dropped task_id=%s status=%s',
+                flag.get('task_id'), decision[1],
+            )
+            continue  # DROP: alleged divergence did not reproduce live
+        kept.append(flag)
 
     return kept
 
@@ -2329,28 +3138,18 @@ async def filter_false_absence_flags(
     if not taskmaster or not project_root:
         return list(flags)
 
-    async def _safe_get_task(task_id: Any) -> Any:
-        """Fetch task with normalised exception handling.
+    async def _safe_get_task_for_root(task_id: Any) -> Any:
+        """Fetch task with normalised exception handling, for THIS filter's root.
 
-        Returns the raw get_task result on success, or a normalised
-        ``{'error': ..., 'error_type': ...}`` dict on any exception so that
-        ``confirm_task_absent`` can classify both paths identically.
-
-        NOTE: this is structurally the same helper as
-        ``filter_false_phantom_task_creation_flags._safe_get_task``
-        (exception -> ``{'error', 'error_type'}`` normalisation). Keep the
-        two in sync if the normalised-exception shape ever changes — they
-        exist as separate closures (rather than one shared helper) only
-        because each closes over a different fixed positional argument
-        (the single ``project_root`` here vs. a per-call ``project_root``
-        there).
+        Delegates to the module-level :func:`_safe_get_task`, binding the
+        single fixed *project_root* this filter was called with (that binding
+        is the only reason it remains a closure — task 4381 amendment
+        superseded the former "keep the two in sync" NOTE by extracting the
+        shared body, so the normalised ``{'error', 'error_type'}`` shape
+        ``confirm_task_absent`` classifies can no longer drift between call
+        sites).
         """
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            # Normalise: same dict shape as the MCP-wrapper path so
-            # confirm_task_absent can classify the raised-exception path.
-            return {'error': str(exc), 'error_type': type(exc).__name__}
+        return await _safe_get_task(taskmaster, task_id, project_root)
 
     # Split flags into those requiring a get_task lookup and pass-throughs.
     # Track original position so the output list preserves input order.
@@ -2365,7 +3164,7 @@ async def filter_false_absence_flags(
 
     # Issue all get_task calls concurrently (typically only a handful per cycle).
     lookup_results: list[Any] = await asyncio.gather(
-        *[_safe_get_task(tid) for tid in check_task_ids]
+        *[_safe_get_task_for_root(tid) for tid in check_task_ids]
     )
     results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results, strict=True))
 
@@ -2476,6 +3275,47 @@ def confirm_task_present(get_task_result: object) -> bool:
     return any(key in get_task_result for key in _TASK_IDENTITY_KEYS)
 
 
+def _titles_corroborate(cited_title: object, live_title: object) -> bool:
+    """True iff a cited title and a live task title name the SAME task.
+
+    Both sides are truncated to :data:`_MAX_CITED_TASK_STR_CHARS` and then
+    normalised with :func:`_normalize_content_description` (casefold +
+    whitespace-collapse) before comparison.
+
+    **Truncating BOTH sides is the point** (task 4864).  ``_sanitize_cited_tasks``
+    already cut the citation to that bound, but the live record read back from
+    the backend is not cut, so comparing them at different lengths let the
+    gate's own sanitizer mutate a good citation into one that could never
+    match.  Truncating symmetrically makes that mutation lossless for matching
+    at ANY cap value, so the invariant survives future tuning of the constant
+    instead of resting on "200 exceeds every real title".
+
+    This is a symmetric truncated-equality test, NOT a prefix match: a short
+    cited title is compared in full against the truncated live title, so a long
+    live title that merely BEGINS with a short citation does not corroborate.
+    The one documented consequence is that two titles differing only PAST the
+    cap compare equal — that is what a cap on how much title the gate reads
+    means, and it is bounded by the cap rather than open-ended.
+
+    Fails safe (``False``) on a missing, blank or non-``str`` value on either
+    side, matching this module's suppress-only-on-positive-confirmation
+    posture.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(cited_title, str) or not isinstance(live_title, str):
+        return False
+    normalized_cited = _normalize_content_description(
+        cited_title[:_MAX_CITED_TASK_STR_CHARS]
+    )
+    normalized_live = _normalize_content_description(
+        live_title[:_MAX_CITED_TASK_STR_CHARS]
+    )
+    if not normalized_cited or not normalized_live:
+        return False
+    return normalized_cited == normalized_live
+
+
 def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> bool:
     """True iff *get_task_result* positively corroborates the *cited* candidate.
 
@@ -2489,10 +3329,11 @@ def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> 
     occupy the cited id (task-2525 amendment).
 
     This helper additionally requires the resolved record's ``title`` to
-    match the cited candidate's ``title`` — both normalised via
-    :func:`_normalize_content_description` (casefold + whitespace-collapse)
-    to tolerate incidental case/spacing differences — before treating the
-    lookup as positive corroboration of the SAME task the finding cited.
+    match the cited candidate's ``title`` via :func:`_titles_corroborate`
+    (symmetric truncation to :data:`_MAX_CITED_TASK_STR_CHARS`, then casefold
+    + whitespace-collapse, so incidental case/spacing differences and the
+    sanitizer's own truncation are both tolerated) before treating the lookup
+    as positive corroboration of the SAME task the finding cited.
 
     Fails safe (returns False = not corroborated) when:
     - :func:`confirm_task_present` returns False for *get_task_result*.
@@ -2512,15 +3353,382 @@ def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> 
     if not confirm_task_present(get_task_result):
         return False
     # confirm_task_present already proved get_task_result is a dict.
-    result_title = get_task_result.get('title')  # type: ignore[union-attr]
-    cited_title = cited.get('title')
-    if not isinstance(cited_title, str) or not isinstance(result_title, str):
+    return _titles_corroborate(
+        cited.get('title'),
+        get_task_result.get('title'),  # type: ignore[union-attr]
+    )
+
+
+#: Task statuses that mean the work was ABANDONED rather than merely filed
+#: (task 4381 amendment).  This is the NAMED SEAM the module's two
+#: cross-project guards share, and it exists because the semantics being
+#: encoded are "this status means the work was FILED and not abandoned" —
+#: which a "everything except CANCELLED" derivation gets backwards for any
+#: future abandonment-flavoured member (``rejected``, ``wontfix``,
+#: ``obsolete``).  Such a status would otherwise SILENTLY gain suppression
+#: power over a never-tracked finding, which is exactly the permanent-
+#: silencing failure mode the CANCELLED exclusion exists to prevent.  Adding
+#: one is now a one-line edit here rather than a behavioural change nobody
+#: reviewed.
+_ABANDONED_TASK_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.CANCELLED})
+
+#: The raw string values of :data:`_ABANDONED_TASK_STATUSES`, for comparing
+#: against a backend-supplied ``status`` string.  (``TaskStatus`` is a
+#: ``StrEnum``, so this is equality-compatible with the members themselves;
+#: the explicit projection keeps the intent legible at the call site.)
+_ABANDONED_TASK_STATUS_VALUES: frozenset[str] = frozenset(
+    s.value for s in _ABANDONED_TASK_STATUSES
+)
+
+
+async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
+    """Fetch ONE task with normalised exception handling.
+
+    Returns the raw ``taskmaster.get_task`` result on success, or a normalised
+    ``{'error': ..., 'error_type': ...}`` dict on ANY exception, so that
+    :func:`confirm_task_present` / :func:`_cited_task_corroborated` /
+    :func:`_cited_fix_task_live` classify the raised-exception path exactly as
+    they classify the MCP wrapper's own error-dict path.
+
+    That normalisation is also what lets every caller keep using a PLAIN
+    ``asyncio.gather`` (no ``return_exceptions=True``, which
+    ``tests/test_gather_convention_guard.py`` would otherwise require be routed
+    through ``utils/async_utils``).
+
+    Module-level as of the task 4381 amendment pass: the two cross-project call
+    sites — :func:`_resolve_live_cross_project_fix_task` and
+    :func:`filter_false_phantom_task_creation_flags` — previously carried
+    byte-identical private closures with a "keep the two in sync" NOTE.  Both
+    take a PER-CITATION ``project_root``, so neither was actually closing over
+    anything, and the note had already gone stale at three copies.
+
+    The fail-safe-to-``None`` variant is the SEPARATE module-level
+    :func:`_safe_get_task_or_none` (task 3476 amendment pass), extracted for
+    the same reason once it had reached two byte-identical copies, in
+    :func:`filter_terminal_metadata_flags` and
+    :func:`filter_accounted_cluster_growth_flags`.  Exactly ONE private closure
+    now survives — :func:`filter_false_absence_flags`' ``_safe_get_task_for_root``,
+    which binds one fixed ``project_root`` for a whole filter and delegates
+    here so the normalised shape cannot drift.
+    """
+    try:
+        return await taskmaster.get_task(task_id, project_root)
+    except Exception as exc:
+        return {'error': str(exc), 'error_type': type(exc).__name__}
+
+
+async def _safe_get_task_or_none(
+    taskmaster: Any,
+    task_id: Any,
+    project_root: str,
+    *,
+    log_event: str,
+) -> Any:
+    """Fetch ONE task, failing SAFE to ``None`` and WARNing under *log_event*.
+
+    The sibling of :func:`_safe_get_task` for the filters that classify a
+    lookup by PRESENCE of a task body rather than by an error dict: a caller
+    that cannot read a body cannot positively confirm anything, so it KEEPS the
+    flag.  ``None`` says exactly that, where an ``{'error', 'error_type'}``
+    dict would be one more shape each such caller has to recognise as "no
+    body".
+
+    *log_event* is the caller's own event name, so a WARNING still identifies
+    which filter degraded.  WARN, not debug: a swallowed lookup error is a real
+    degraded outcome and must be visible without raising the log level — a
+    broad handler returning an empty value with NO ``WARN+`` log is signature
+    (b) of ``shared/tests/test_silent_fallthrough_gate.py``.
+
+    ``CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit`` need no explicit
+    re-raise clause: all three are ``BaseException`` subclasses, which a bare
+    ``except Exception`` already lets propagate.
+    """
+    try:
+        return await taskmaster.get_task(task_id, project_root)
+    except Exception as exc:
+        logger.warning('%s task_id=%s error=%s', log_event, task_id, exc)
+        return None  # KEEP flag on error (fail-safe)
+
+
+def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool:
+    """True iff *cited* names a FILED, non-cancelled task confirmed by *get_task_result*.
+
+    Layers the ruled status policy on :func:`confirm_task_present`, giving
+    three guarantees:
+
+    1. **Presence, and presence only** — the citation's ``title`` is NOT part
+       of this test (task 4864).  This is the deliberate SPLIT from
+       :func:`_cited_task_corroborated`, which keeps requiring title equality
+       for the phantom guard.  ``recon_report.cite_task`` snapshots a title at
+       cite time and never refreshes it ("first-cited title wins"; it even
+       stores ``''`` for a record whose title it could not resolve), so title
+       equality is defeated by an ordinary retitle and by the producer's own
+       empty-title write — a cosmetic field silently vetoing the gate.
+
+       What replaces it is not nothing.  The concern a title check answered —
+       a hallucinated or stale citation suppressing a real complaint on a bare
+       id match — is met here by GATE-TIME RE-VERIFICATION plus four bounds
+       the phantom guard does not have:
+       :func:`_resolve_live_cross_project_fix_task` issues a LIVE ``get_task``
+       for every citation on EVERY cycle, and a suppression additionally
+       requires the flag to be carried-forward (HIT-only), the citation to be
+       FOREIGN, the task to be non-abandoned, and — when it is ``done`` —
+       to be within :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES`.  A wrong
+       suppression here therefore expires; a wrong drop in the phantom guard
+       would not, which is exactly why that one stays strict.
+
+       Title agreement is still computed, as a STRENGTH signal rather than a
+       gate: :func:`_resolve_live_cross_project_fix_task` records it on
+       :class:`_LiveFixTask` (via :func:`_titles_corroborate`) and ``dedup_flags``
+       — the only place that knows whether a suppression actually HAPPENED —
+       logs the weak case at WARNING and counts it in ``stats``, so the weaker
+       decision is distinguishable from the stronger one instead of being
+       indistinguishable from it.
+    2. **The status policy is "filed and not abandoned"** (Leo's ruling,
+       2026-08-17, task 4381 / esc-3841-1).  Any status outside
+       :data:`_ABANDONED_TASK_STATUS_VALUES` counts, INCLUDING ``pending`` and
+       ``blocked``: the complaint these findings raise is literally "no fix
+       task has been filed", which a filed-but-unstarted task already answers.
+       An ABANDONED (today: ``cancelled``) task must NOT count — treating it as
+       satisfying the complaint would silence the finding permanently, with no
+       event left to ever revive it.  The check reads the named abandonment set
+       rather than testing ``!= 'cancelled'`` so a future abandonment-flavoured
+       status cannot silently acquire suppression power (task 4381 amendment).
+       A ``done`` fix task DOES satisfy the complaint here — but only for a
+       bounded number of cycles; see
+       :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES` and ``dedup_flags``, which
+       own that policy because it needs the marker's cross-cycle counter.
+    3. **An absent or non-``str`` status is INCONCLUSIVE** and returns False,
+       matching this module's suppress-only-on-positive-confirmation posture
+       (:func:`confirm_task_present` / :func:`confirm_task_absent`).  In
+       practice ``sqlite_task_backend._row_to_task`` always emits ``status``,
+       so this costs nothing against a healthy backend and fails safe against
+       an unhealthy one.
+
+    Args:
+        cited: One ``cited_tasks`` entry ``{'project_id', 'task_id', 'title'}``.
+            No field of it is read as of task 4864 — the parameter is kept so
+            this stays call-site-interchangeable with
+            :func:`_cited_task_corroborated` (the strict sibling), which makes
+            the SPLIT between the two guards a one-symbol difference at the
+            call site rather than a shape difference, and keeps the citation
+            available to any future admission rule that is not cosmetic.
+
+        get_task_result: The raw (or normalised-exception) value returned by
+            ``taskmaster.get_task()`` for *cited*.
+
+    Returns:
+        True only when the record is positively present and its status is a
+        non-cancelled string.
+
+    Pure, sync, no I/O.
+    """
+    if not confirm_task_present(get_task_result):
         return False
-    normalized_cited = _normalize_content_description(cited_title)
-    normalized_result = _normalize_content_description(result_title)
-    if not normalized_cited or not normalized_result:
-        return False
-    return normalized_cited == normalized_result
+    # confirm_task_present already proved get_task_result is a dict.
+    status = get_task_result.get('status')  # type: ignore[union-attr]
+    return isinstance(status, str) and status not in _ABANDONED_TASK_STATUS_VALUES
+
+
+class _LiveFixTask(NamedTuple):
+    """A corroborated live FOREIGN fix task: the citation, and its live status.
+
+    Returned by :func:`_resolve_live_cross_project_fix_task`.  The *status* is
+    carried alongside the citation because the caller's suppression policy is
+    status-dependent: a ``done`` fix task suppresses only for a bounded number
+    of cycles (:data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES`), while a filed-
+    but-unfinished one suppresses for as long as it stays that way.  Resolution
+    lives here; the policy lives in ``dedup_flags``, which owns the marker
+    counter the bound is measured against.
+
+    *title_corroborated* records whether the citation's title agreed with the
+    live record's.  Since task 4864 that is a STRENGTH signal only — it does
+    not affect whether this value is returned at all.
+
+    *cited* may be EITHER an LLM-authored citation off the flag or one
+    synthesized by :func:`_discover_foreign_fix_task_citations` (task 4864).
+    Both arrive through the same :func:`_resolve_live_cross_project_fix_task`
+    call and are indistinguishable here BY DESIGN: the discovered citation
+    carries the same ``{project_id, task_id, title}`` shape read from the live
+    record, so ``dedup_flags``' suppression and exhaustion log lines name the
+    real foreign project/task either way, and the ruled status policy applies
+    to one producer's output exactly as it does to the other's.
+    """
+
+    cited: dict[str, Any]
+    status: str
+    #: Whether the citation's ``title`` agreed with the live record's
+    #: (:func:`_titles_corroborate`).  A STRENGTH signal, never an admission
+    #: test (task 4864).  The resolver notes the ``False`` case at INFO; this
+    #: field is what carries it to the DECISION SITE, which is the only place
+    #: that knows whether a suppression actually happened and therefore owns
+    #: the WARNING and the ``stats`` counter for it (task 4864 amendment).
+    title_corroborated: bool = False
+
+
+async def _resolve_live_cross_project_fix_task(
+    taskmaster: Any,
+    known_projects: dict[str, str] | None,
+    project_id: str,
+    cited_tasks: Any,
+    *,
+    cache: dict[tuple[str, str], Any] | None = None,
+) -> _LiveFixTask | None:
+    """Return the first *cited_tasks* entry naming a live FOREIGN fix task, else ``None``.
+
+    Deliberately shaped as a copy of
+    :func:`filter_false_phantom_task_creation_flags`' proven cross-project
+    resolution: resolve each citation's ``project_id`` through
+    *known_projects*, look the resolvable ones up concurrently in ONE flat
+    ``asyncio.gather``, and classify each result.  The returned value is the
+    corroborating cited entry itself (not a bool) so the caller can name the
+    specific task that drove its decision in a log line.
+
+    **FOREIGN-ONLY.** Citations whose ``project_id`` equals *project_id* (the
+    running project) are skipped and issue no lookup at all.  This is not an
+    optimisation — it is the correctness core of the helper.  A finding's own
+    SUBJECT task is routinely its own first citation: the live repro flag
+    e3527208 cites ``know_live:598`` — itself — alongside the real fix tasks
+    ``dark_factory:3833``/``3839``.  Consulting same-project citations would
+    resolve the finding's own subject task, which is trivially "live", and so
+    every flag with a live subject task would self-suppress on the very next
+    cycle.  Note this is the OPPOSITE scope from
+    :func:`filter_already_tracked_systemic_patterns`, which queries ALL known
+    projects — that filter matches on TEXT coverage, where a same-project
+    match is genuine evidence, whereas this one matches on citation IDENTITY.
+
+    **Fail-open in every direction**, matching this module's
+    suppress-only-on-positive-confirmation posture: a falsy *taskmaster* or
+    *known_projects*, a non-list *cited_tasks*, an entry missing
+    ``project_id``/``task_id``, a ``project_id`` absent from *known_projects*,
+    a lookup exception, a not-found result, an inconclusive status and a
+    cancelled task all resolve to ``None`` (no suppression).  A title mismatch
+    is NOT on that list any more (task 4864) — see
+    :func:`_cited_fix_task_live` guarantee 1.
+
+    A near-miss — a cited task that is positively PRESENT but not live per
+    :func:`_cited_fix_task_live` (a cancelled task, or one whose status is
+    absent/non-``str`` and therefore inconclusive) — is logged at INFO before
+    returning ``None``, so a non-suppression that *nearly* fired is observable
+    rather than silent.  A renamed or title-less citation is NO LONGER a near
+    miss (task 4864): it resolves, notes that at INFO via
+    ``reconciliation.cross_project_fix_task_title_uncorroborated``, and reports
+    it on ``_LiveFixTask.title_corroborated`` so the CALLER can log the weak
+    case at WARNING if it goes on to suppress — this function must not, because
+    it does not know whether it will (task 4864 amendment).
+
+    Args:
+        taskmaster: Object with an async ``get_task(task_id, project_root)``.
+        known_projects: Map of ``project_id -> project_root``.
+        project_id: The project the current reconciliation run belongs to;
+            citations naming it are skipped (see FOREIGN-ONLY above).
+        cited_tasks: The finding's ``cited_tasks`` value, in whatever shape an
+            LLM emitted it — validated here, never trusted.
+        cache: OPTIONAL ``(str(project_id), str(task_id)) -> get_task result``
+            memo, shared by the caller across every flag in one batch (task
+            4381 amendment).  Findings in one family routinely cite the SAME
+            remediation task, and this gate runs once per carried-forward flag,
+            so without it a batch re-issues the identical lookup per flag.  A
+            normalised error result is cached too: one failed round trip per
+            batch, not one per flag.  Omitting it degrades to a per-call memo
+            (duplicate citations WITHIN one flag are still looked up once).
+
+    Returns:
+        A :class:`_LiveFixTask` naming the first cited entry for which
+        :func:`_cited_fix_task_live` is True, its live status, and whether its
+        title corroborated; or ``None``.
+    """
+    if not taskmaster or not known_projects or not isinstance(cited_tasks, list):
+        return None
+
+    # (cited entry, cache key, task_id, project_root) for every resolvable citation.
+    resolvable: list[tuple[dict[str, Any], tuple[str, str], Any, str]] = []
+    for cited in cited_tasks:
+        if not isinstance(cited, dict):
+            continue
+        cited_task_id = cited.get('task_id')
+        cited_project_id = cited.get('project_id')
+        if cited_task_id is None or cited_project_id is None:
+            continue
+        if str(cited_project_id) == str(project_id):
+            continue  # FOREIGN-ONLY: never resolve the finding's own subject
+        root = known_projects.get(cited_project_id)
+        if not root:
+            continue  # unresolvable project -> not corroborated -> skip lookup
+        resolvable.append(
+            (cited, (str(cited_project_id), str(cited_task_id)), cited_task_id, root)
+        )
+
+    if not resolvable:
+        return None
+
+    if cache is None:
+        cache = {}
+    # Only the citations this batch has NOT already resolved are fetched, and
+    # each distinct identity at most once — insertion-ordered so the gather
+    # keeps the citation order the results are zipped back onto.
+    pending: dict[tuple[str, str], tuple[Any, str]] = {}
+    for _cited, key, cited_task_id, root in resolvable:
+        if key in cache or key in pending:
+            continue
+        pending[key] = (cited_task_id, root)
+
+    if pending:
+        # PLAIN gather — _safe_get_task normalises every exception to an error
+        # dict (see tests/test_gather_convention_guard.py).
+        fetched: list[Any] = await asyncio.gather(
+            *(
+                _safe_get_task(taskmaster, cited_task_id, root)
+                for cited_task_id, root in pending.values()
+            )
+        )
+        cache.update(zip(pending.keys(), fetched, strict=True))
+
+    near_misses: list[dict[str, Any]] = []
+    for cited, key, _cited_task_id, _root in resolvable:
+        result = cache[key]
+        if _cited_fix_task_live(cited, result):
+            live_title = result.get('title')
+            title_corroborated = _titles_corroborate(cited.get('title'), live_title)
+            if not title_corroborated:
+                # Titles are cosmetic for THIS gate (task 4864), so a missing,
+                # empty or stale title no longer vetoes the resolution — but a
+                # decision resting on presence alone is weaker than one an
+                # exact title also corroborates, and must not be
+                # indistinguishable from it in a log.  This line states only
+                # what was OBSERVED, at INFO, because resolving is not
+                # deciding: `dedup_flags` may still decline to suppress (the
+                # done-exhausted branch), and it owns the WARNING for the
+                # suppressions that do happen —
+                # `stage1_flag_cross_project_fix_task_suppressed_weakly_corroborated`
+                # (task 4864 amendment).
+                logger.info(
+                    'reconciliation.cross_project_fix_task_title_uncorroborated '
+                    'cited_project_id=%s cited_task_id=%s cited_title=%r '
+                    'live_title=%r — resolved on live presence + status alone; '
+                    'cite_task never refreshes a title, so this is expected '
+                    'for a renamed or title-less citation',
+                    cited.get('project_id'),
+                    cited.get('task_id'),
+                    cited.get('title'),
+                    live_title,
+                )
+            return _LiveFixTask(
+                cited=cited,
+                status=str(result.get('status')),
+                title_corroborated=title_corroborated,
+            )
+        if confirm_task_present(result):
+            near_misses.append(cited)
+
+    for cited in near_misses:
+        logger.info(
+            'reconciliation.cross_project_fix_task_present_but_uncorroborated '
+            'cited_project_id=%s cited_task_id=%s',
+            cited.get('project_id'),
+            cited.get('task_id'),
+        )
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -2594,27 +3802,6 @@ async def filter_false_phantom_task_creation_flags(
     if not taskmaster or not known_projects:
         return list(flags)
 
-    async def _safe_get_task(task_id: Any, project_root: str) -> Any:
-        """Fetch task with normalised exception handling.
-
-        Returns the raw get_task result on success, or a normalised
-        ``{'error': ..., 'error_type': ...}`` dict on any exception so that
-        ``confirm_task_present`` / ``_cited_task_corroborated`` can classify
-        both paths identically.
-
-        NOTE: this is structurally the same helper as
-        ``filter_false_absence_flags._safe_get_task`` (exception ->
-        ``{'error', 'error_type'}`` normalisation). Keep the two in sync if
-        the normalised-exception shape ever changes — they exist as separate
-        closures (rather than one shared helper) only because each closes
-        over a different fixed positional argument (``project_root`` here vs.
-        the absence gate's single ``project_root``).
-        """
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            return {'error': str(exc), 'error_type': type(exc).__name__}
-
     # Collect resolvable cited-task lookups, grouped by owning flag index.
     # Multiple cited_tasks entries (possibly across different flags) run
     # concurrently in a single flat asyncio.gather batch.
@@ -2640,7 +3827,7 @@ async def filter_false_phantom_task_creation_flags(
                 continue  # unresolvable project -> not corroborated -> skip lookup
             lookup_flag_indices.append(i)
             lookup_cited.append(cited)
-            lookup_coros.append(_safe_get_task(cited_task_id, root))
+            lookup_coros.append(_safe_get_task(taskmaster, cited_task_id, root))
 
     if not lookup_coros:
         return list(flags)
@@ -2680,15 +3867,95 @@ async def filter_false_phantom_task_creation_flags(
 # Already-tracked systemic-pattern guard (task-2416)
 # --------------------------------------------------------------------------- #
 
+#: Every task status EXCEPT ``cancelled`` — the "filed and not cancelled"
+#: vocabulary :func:`filter_already_tracked_systemic_patterns` queries with,
+#: superseding task 2416's original ``statuses=['done']`` pin under Leo's
+#: 2026-08-17 ruling (task 4381 / esc-3841-1): a task that has merely been
+#: FILED already answers a finding whose complaint is that no task was filed,
+#: while a CANCELLED one must never suppress or the complaint is silenced
+#: forever.
+#:
+#: DERIVED from ``shared.task_statuses.TaskStatus`` (the closed status
+#: vocabulary) minus the NAMED abandonment set
+#: :data:`_ABANDONED_TASK_STATUSES`, rather than hardcoded as a literal or
+#: spelled as an inline ``is not CANCELLED`` test.  A status added to the
+#: vocabulary later is therefore included here automatically, while a future
+#: ABANDONMENT status is excluded by a one-line edit at the named seam instead
+#: of silently gaining suppression power over never-tracked findings (task 4381
+#: amendment).  Sorted for a stable, assertable ordering.
+_NON_CANCELLED_TASK_STATUSES: list[str] = sorted(
+    s.value for s in TaskStatus if s not in _ABANDONED_TASK_STATUSES
+)
+
 #: Fixed lexicon of phrases that assert an idea/pattern was never converted
-#: into a tracked task.  Case-insensitive substring match, mirroring
+#: into a tracked task.  Case-insensitive substring match
+#: (:func:`_asserts_never_tracked`), mirroring
 #: _CORRECTION_LANGUAGE_SUBSTRINGS' fixed-lexicon approach.
+#:
+#: **Every entry MUST retain a negation token** ('no ', 'never', or 'not ').
+#: Because matching is plain case-insensitive substring containment, an
+#: entry that drops its negation matches the OPPOSITE claim: e.g. 'fix task
+#: has been filed' (no negation) matches 'A fix task has been filed for
+#: this recurring finding' — a finding announcing that a task DOES exist —
+#: which would let this filter DROP a real, unresolved complaint and
+#: silence it permanently. This is why 'has been filed', 'task has been
+#: filed' and 'fix task has been filed' are deliberately NOT entries here,
+#: even though they would otherwise widen coverage.
+#:
+#: The seven task-4711 entries below ('no task has been filed' ..
+#: 'task has not been filed') were added to reach the "no fix task has
+#: been filed" complaint class — the wording of Leo's 2026-08-17 ruling on
+#: gate 3841, from the originating know_live flag e3527208 / dark_factory
+#: task 598 — which the original five "never .../no tracked task" entries
+#: did not match. Two other candidates were considered and deliberately
+#: EXCLUDED as over-broad: 'untracked' (matches unrelated findings like
+#: 'The git working tree has untracked files ...' — cf. flag_types
+#: untracked_process_gap, git_working_tree_missing_operator_decision) and
+#: 'no task' (matches 'This flag has no task_id attached, so Stage 2
+#: cannot route it.'). See TestNeverTrackedLexiconWidening in
+#: test_flag_dedup.py for the reproduced counterexamples backing both
+#: exclusions.
+#:
+#: task-4711 REVIEW-AMENDMENT narrowing: the entries below are not the
+#: literal wording first landed. 'no fix task has been filed' was dropped
+#: — it is entirely subsumed by 'no fix task has been' (any text
+#: containing the former already contains the latter), so keeping both was
+#: dead weight in the frozenset. The bare 'no fix task', 'no follow-up
+#: task' and 'not been filed' entries were over-broad generics of exactly
+#: the kind excluded above, reproduced as false candidates: 'no fix task'
+#: matched 'The flag has no fix task id recorded in metadata.';
+#: 'no follow-up task' matched 'No follow-up task ordering is enforced by
+#: the scheduler.'; 'not been filed' matched 'The escalation record shows
+#: the decision has not been filed yet.' (subject is a decision, not a
+#: task). Anchoring each to '...has been'/'task has not been filed'
+#: preserves the originating wording (still reachable as a substring)
+#: while excluding all three counterexamples. An unhyphenated 'no follow
+#: up task has been' variant sits alongside the hyphenated one since
+#: matching is plain substring containment with no whitespace/punctuation
+#: normalisation.
+#:
+#: _STOPWORDS is deliberately NOT extended with 'fix' even though it is now
+#: boilerplate from the "no fix task has been filed" wrapper: stopwording a
+#: term shrinks the denominator of every candidate's coverage computation,
+#: which makes the filter strictly LOOSER (more false drops) for every
+#: caller of _significant_terms, not just this widened class.
 _NEVER_TRACKED_PHRASES: frozenset[str] = frozenset({
     'never converted to a tracked task',
     'was never converted to a task',
     'never tracked',
     'never filed as a task',
     'no tracked task',
+    # task 4711 additions, re-anchored by the review-amendment pass — see
+    # the docstring above for the negation-token invariant and the
+    # deliberately excluded/narrowed 'untracked', 'no task', bare 'no fix
+    # task', bare 'no follow-up task' and bare 'not been filed'.
+    'no task has been filed',
+    'no fix task has been',
+    'no follow-up task has been',
+    'no follow up task has been',
+    'no task exists',
+    'never been filed',
+    'task has not been filed',
 })
 
 #: Small English + domain stopword set for _significant_terms.  The domain
@@ -2717,6 +3984,213 @@ _STOPWORDS: frozenset[str] = frozenset({
 #: words, which is what lets them overlap with a done task's prose title/
 #: description.
 _TERM_SPLIT_RE: re.Pattern[str] = re.compile(r'[^a-z0-9]+')
+
+
+class _CoverageMatch(NamedTuple):
+    """The best already-tracked task covering one systemic-pattern candidate."""
+
+    project_id: str
+    task_id: Any
+    coverage: float
+    #: The matched task's ``status`` as the bulk listing reported it, or
+    #: ``None`` when it carried none (task 4864 amendment).  Read only by the
+    #: discovery path's non-``done`` preference — see
+    #: :func:`_match_extracted_tracked_tasks`' *prefer_non_done*.  Defaulted so
+    #: every pre-existing construction of this tuple is unaffected.
+    status: str | None = None
+
+
+class _TrackedTask(NamedTuple):
+    """One already-filed task, reduced to exactly what coverage matching needs.
+
+    :func:`_extract_tracked_task_terms` turns a fetched task dict into one of
+    these and drops the dict, so a project's multi-MB payload becomes
+    garbage-collectable as soon as its terms are extracted — including when a
+    caller RETAINS the result for a whole batch, as ``dedup_flags``' discovery
+    memo does.
+    """
+
+    project_id: str
+    task_id: Any
+    status: str | None
+    terms: set[str]
+
+
+def _extract_tracked_task_terms(
+    project_ids: list[str],
+    project_task_lists: list[list[Any] | None],
+) -> list[list[_TrackedTask] | None]:
+    """Extract each task's key terms, per project, aligned with *project_ids*.
+
+    The EXPENSIVE half of coverage matching, split out of
+    :func:`_match_already_tracked_candidates` so a caller matching MANY
+    candidates against the SAME backlog pays for it once rather than once per
+    candidate (task 4864 amendment).  Measured against the live dark_factory
+    backlog, term extraction alone is ~0.6s of blocking CPU for ~4.2k tasks /
+    ~8MB of description text, multiplied by the number of known projects
+    queried; memoising the raw task lists instead of these terms does NOT
+    avoid that cost, it only avoids the re-fetch.
+
+    A ``None`` entry in *project_task_lists* means that project's lookup
+    FAILED and is preserved as ``None`` in the result, so a caller can still
+    distinguish "every project errored" from "every project is empty" after
+    the raw lists are gone.  Tasks that are not dicts, that carry an ABANDONED
+    status (:data:`_ABANDONED_TASK_STATUS_VALUES` — belt-and-braces, since the
+    query already excludes them, so that a backend ignoring the ``statuses``
+    kwarg still cannot permanently silence a complaint), or whose title +
+    description yield no key terms at all cannot match and are dropped here.
+
+    Pure, sync, no I/O, no logging — safe to hand to :func:`asyncio.to_thread`
+    — and never raises.
+    """
+    extracted: list[list[_TrackedTask] | None] = []
+    for project_id, tasks in zip(project_ids, project_task_lists, strict=True):
+        if tasks is None:
+            extracted.append(None)
+            continue
+        tracked: list[_TrackedTask] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            status = task.get('status')
+            if isinstance(status, str) and status in _ABANDONED_TASK_STATUS_VALUES:
+                continue
+            task_terms = _significant_terms(
+                f"{task.get('title') or ''} {task.get('description') or ''}"
+            )
+            if not task_terms:
+                continue
+            tracked.append(_TrackedTask(
+                project_id,
+                task.get('id'),
+                status if isinstance(status, str) else None,
+                task_terms,
+            ))
+        extracted.append(tracked)
+    return extracted
+
+
+def _match_extracted_tracked_tasks(
+    tracked: list[_TrackedTask],
+    candidate_terms: list[set[str]],
+    min_key_terms: int,
+    match_coverage: float,
+    min_task_term_precision: float,
+    *,
+    prefer_non_done: bool = False,
+) -> dict[int, _CoverageMatch]:
+    """Return ``{candidate index -> best covering task}`` over pre-extracted *tracked*.
+
+    The CHEAP half of coverage matching: the O(candidates x tasks)
+    set-intersection sweep, with no term extraction at all (that is
+    :func:`_extract_tracked_task_terms`, whose result a batching caller
+    memoises).
+
+    A candidate with fewer than *min_key_terms* distinct terms (or none at all,
+    which would otherwise divide by zero) is never matched — too little signal
+    to trust a coverage match.  A task qualifies only when it covers at least
+    *match_coverage* of the candidate's terms AND at least
+    *min_task_term_precision* of the task's own terms come from that overlap.
+
+    Among qualifying tasks the highest coverage wins, ties going to the first
+    seen.  When *prefer_non_done* is set, a non-``done`` qualifying task
+    outranks a ``done`` one REGARDLESS of coverage (task 4864 amendment): the
+    discovery path feeds its single match to a gate whose ``done`` branch is
+    bounded to :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES` cycles, so letting
+    a marginally-better ``done`` task beat a still-open one would burn that
+    ceiling and re-assert the finding — logging "the cited fix task is done yet
+    the finding keeps recurring" — while an OPEN fix task for it sits in the
+    same backlog.  Off by default, so
+    :func:`filter_already_tracked_systemic_patterns`, which only asks whether
+    the idea is tracked AT ALL, keeps its pure highest-coverage semantics.
+
+    Pure, sync, no I/O, no logging (the caller owns the drop log so it stays on
+    the event loop) — never raises.
+    """
+    def _rank(match: _CoverageMatch) -> tuple[int, float]:
+        """Sort key ``(open_rank, coverage)``.
+
+        *open_rank* is constant unless *prefer_non_done*, in which case a
+        ``done`` task ranks below every non-``done`` one at any coverage.
+        """
+        open_rank = (
+            0 if (prefer_non_done and match.status == TaskStatus.DONE.value) else 1
+        )
+        return (open_rank, match.coverage)
+
+    matches: dict[int, _CoverageMatch] = {}
+    for index, finding_terms in enumerate(candidate_terms):
+        if not finding_terms or len(finding_terms) < min_key_terms:
+            continue
+        best: _CoverageMatch | None = None
+        for entry in tracked:
+            overlap = len(finding_terms & entry.terms)
+            coverage = overlap / len(finding_terms)
+            if coverage < match_coverage:
+                continue
+            # Precision floor: an overlap that clears match_coverage can still
+            # be incidental if the task's own description is large and generic
+            # (reviewer_comprehensive, task 2416 amendment) — a qualifying task
+            # must also derive a meaningful share of its own terms from the
+            # overlap, not just happen to contain it somewhere in a much
+            # larger, unrelated body of text.
+            if overlap / len(entry.terms) < min_task_term_precision:
+                continue
+            match = _CoverageMatch(
+                entry.project_id, entry.task_id, coverage, entry.status,
+            )
+            if best is None or _rank(match) > _rank(best):
+                best = match
+        if best is not None:
+            matches[index] = best
+    return matches
+
+
+def _match_already_tracked_candidates(
+    project_ids: list[str],
+    project_task_lists: list[list[Any] | None],
+    candidate_terms: list[set[str]],
+    min_key_terms: int,
+    match_coverage: float,
+    min_task_term_precision: float,
+) -> dict[int, _CoverageMatch]:
+    """Return ``{candidate index -> best covering task}`` for the drops to make.
+
+    The whole CPU-bound half of :func:`filter_already_tracked_systemic_patterns`
+    — key-term extraction over every fetched task's title+description, then the
+    O(candidates x tasks) set-intersection sweep — as ONE pure, synchronous
+    function the caller hands to :func:`asyncio.to_thread` (task 4381
+    amendment), because run inline it stalls the whole reconciliation event
+    loop for seconds on any cycle that has a never-tracked candidate.
+
+    Since task 4864 this is a thin composition of
+    :func:`_extract_tracked_task_terms` and
+    :func:`_match_extracted_tracked_tasks` — behaviour identical, but the two
+    halves are separately callable so ``dedup_flags``' discovery path can
+    memoise the expensive extraction across a batch instead of repeating it per
+    flag.  Those two docstrings carry the measurements and the full semantics.
+
+    *project_task_lists* is positionally aligned with *project_ids*; a ``None``
+    entry means that project's lookup FAILED and is skipped (its tasks cannot
+    contribute evidence).
+
+    Pure, sync, no I/O, no logging — never raises.
+    """
+    tracked = [
+        entry
+        for per_project in _extract_tracked_task_terms(
+            project_ids, project_task_lists,
+        )
+        if per_project is not None
+        for entry in per_project
+    ]
+    return _match_extracted_tracked_tasks(
+        tracked,
+        candidate_terms,
+        min_key_terms,
+        match_coverage,
+        min_task_term_precision,
+    )
 
 
 def _asserts_never_tracked(text: str) -> bool:
@@ -2771,14 +4245,14 @@ def _is_systemic_pattern_candidate(flag: dict[str, Any]) -> bool:
 
 async def filter_already_tracked_systemic_patterns(
     taskmaster: Any,
-    dark_factory_root: str | None,
+    known_projects: dict[str, str] | None,
     flags: list[dict[str, Any]],
     *,
     min_key_terms: int = 4,
     match_coverage: float = 0.75,
     min_task_term_precision: float = 0.2,
 ) -> list[dict[str, Any]]:
-    """Drop systemic_pattern 'never tracked' findings already implemented by a done task.
+    """Drop systemic_pattern 'never tracked' findings already covered by a filed task.
 
     Hardens against the e61b38f9/1938 false-positive incident: Stage 1 asserted
     an idea ("diff project_status_correction cache vs live get_statuses every
@@ -2794,69 +4268,98 @@ async def filter_already_tracked_systemic_patterns(
     A candidate whose :func:`_significant_terms` count is below
     ``min_key_terms`` is KEPT unconditionally, with no match attempted —
     too few distinctive terms to trust a coverage match.  Otherwise, fetches
-    done dark_factory tasks ONCE via ``taskmaster.get_tasks(dark_factory_root,
-    statuses=['done'])`` and precomputes each done task's key terms from
-    ``title`` + ``description`` (:func:`_significant_terms`).  A candidate is
-    DROPPED iff some done task's key terms cover at least ``match_coverage``
-    (fraction) of the candidate's own key terms (extracted from its
-    ``description``): ``|finding_terms ∩ task_terms| / |finding_terms|``,
-    AND that same task's own terms are not so broad that the overlap is
-    incidental — ``|finding_terms ∩ task_terms| / |task_terms|`` must also be
-    at least ``min_task_term_precision`` (default 0.2).  This precision floor
-    guards against a verbose, unrelated done task whose large title+
-    description happens to sweep up most of a narrow finding's key terms by
-    coincidence (reviewer_comprehensive, task 2416 amendment pass): such a
-    task's own term set is large relative to the overlap, so its precision is
-    low even when its coverage of the finding clears ``match_coverage``. Both
-    thresholds are evaluated per done task and maximised (by coverage) over
-    all *qualifying* done tasks.  Order-preserving: surviving flags keep their
-    original relative order.
+    each known project's non-cancelled tasks ONCE via ``taskmaster.get_tasks(
+    project_root, statuses=_NON_CANCELLED_TASK_STATUSES)`` and precomputes
+    each task's key terms from ``title`` + ``description``
+    (:func:`_significant_terms`).  A candidate is DROPPED iff some tracked
+    task's key terms cover at least ``match_coverage`` (fraction) of the
+    candidate's own key terms (extracted from its ``description``):
+    ``|finding_terms ∩ task_terms| / |finding_terms|``, AND that same task's
+    own terms are not so broad that the overlap is incidental —
+    ``|finding_terms ∩ task_terms| / |task_terms|`` must also be at least
+    ``min_task_term_precision`` (default 0.2).  This precision floor guards
+    against a verbose, unrelated task whose large title+description happens
+    to sweep up most of a narrow finding's key terms by coincidence
+    (reviewer_comprehensive, task 2416 amendment pass): such a task's own
+    term set is large relative to the overlap, so its precision is low even
+    when its coverage of the finding clears ``match_coverage``. Both
+    thresholds are evaluated per tracked task and maximised (by coverage)
+    over all *qualifying* tasks.  Order-preserving: surviving flags keep
+    their original relative order.
 
-    **Done-only** (task 2412 cannot self-suppress its own duplicate finding):
-    ``statuses=['done']`` is passed explicitly, so a PENDING duplicate task
-    can never suppress the finding that motivated filing it — only already
-    *merged* work counts as "already tracked".
+    **"Filed and not cancelled", NOT done-only (task 4381).**  This
+    SUPERSEDES task 2416's original ``statuses=['done']`` pin and its
+    "task 2412 cannot self-suppress its own duplicate finding" rationale.
+    Under Leo's 2026-08-17 ruling (esc-3841-1) a task that has merely been
+    FILED — pending, blocked, in-progress, review, deferred, infra-hold,
+    merge-deferred or done — now DOES suppress, because the finding's own
+    complaint is literally that no task was filed; answering it with "one is
+    filed but has not landed yet" is a correct answer.  The accepted
+    consequence, stated rather than discovered later: a finding that itself
+    spawned a still-pending task now self-suppresses on the next cycle.  The
+    live repro was exactly this shape — dark_factory 3833/3839 were
+    blocked/pending, which is why the observed flag survived the done-only
+    filter.  ``cancelled`` is the one excluded status: a cancelled task means
+    the work was explicitly abandoned, so letting it suppress would silence
+    the complaint forever.  The vocabulary is DERIVED from
+    :data:`_NON_CANCELLED_TASK_STATUSES` (itself derived from
+    ``shared.task_statuses.TaskStatus``), and a task whose ``status`` is
+    ``'cancelled'`` is ALSO skipped client-side, so a backend that ignores
+    the ``statuses`` kwarg still cannot cause a false suppression.
+
+    **All known projects are queried** — unlike :func:`dedup_flags`'
+    cross-project fix-task gate, which is deliberately FOREIGN-project-only.
+    The distinction matters: that gate matches on cited-task IDENTITY, where
+    a finding's own subject task is routinely its own first citation, so a
+    same-project match would make every such flag self-suppress.  This filter
+    matches on TEXT coverage, where a same-project match is genuine evidence
+    — the original 1938/2412 incident was entirely intra-dark_factory.
 
     **Fail-open** in every direction, mirroring
     :func:`filter_terminal_metadata_flags`'s drop-only-on-positive-
     confirmation posture (losing a genuine systemic-pattern signal is worse
     than one extra dedup cycle):
 
-    * A falsy ``taskmaster`` or ``dark_factory_root`` degrades to a no-op
+    * A falsy ``taskmaster`` or ``known_projects`` degrades to a no-op
       ``list(flags)`` pass-through with no ``get_tasks`` call — e.g. a
-      harness/test that never registers dark_factory in ``known_projects``.
+      harness/test that never populates the cross-project routing map.
     * A ``get_tasks`` exception (other than ``asyncio.CancelledError`` /
       ``KeyboardInterrupt`` / ``SystemExit``, which re-raise) is logged and
-      treated as KEEP-all for this cycle.
-    * A malformed result (not a dict, or missing/empty ``'tasks'``) is
-      treated as zero done tasks — every candidate survives the matching
-      loop with coverage 0.
+      that ONE project is skipped; the remaining projects still contribute,
+      so a single unreachable backend cannot blind the whole filter.  When
+      EVERY project errors the result is KEEP-all, which preserves the
+      original single-project contract exactly.
+    * A malformed result (not a dict, or missing/None/non-list ``'tasks'``)
+      is treated as zero tasks for that project — every candidate survives
+      the matching loop with coverage 0.
 
     A structured ``logger.info('reconciliation.systemic_pattern_already_tracked_dropped',
-    ...)`` is emitted per dropped flag with the matched done task id and the
-    finding's key terms, mirroring the sibling filters' drop observability.
+    ...)`` is emitted per dropped flag with the matched task's owning
+    project_id and id plus the finding's key terms, mirroring the sibling
+    filters' drop observability.
 
     Args:
         taskmaster: Object with an async ``get_tasks(project_root, *,
             statuses=[...])`` method, typically ``self.taskmaster`` in
             MemoryConsolidator.
-        dark_factory_root: dark_factory's project_root (resolved by the
-            caller from ``self.known_projects[DARK_FACTORY_PROJECT_ID]``).
+        known_projects: The harness cross-project routing map
+            ``{project_id: project_root}`` (``self.known_projects`` on any
+            stage), matching :func:`filter_false_phantom_task_creation_flags`'
+            parameter shape.
         flags: List of flag dicts from Stage 1 ``items_flagged``.
         min_key_terms: Minimum distinct key terms a candidate must have
             before a match is even attempted (default 4).
         match_coverage: Minimum key-term coverage fraction required to drop a
             candidate (default 0.75).
-        min_task_term_precision: Minimum fraction of a qualifying done task's
-            OWN key terms that must be part of the overlap (default 0.2) —
-            a precision floor that keeps a large, generic done-task
-            description from coincidentally outweighing a narrow finding's
-            coverage match.
+        min_task_term_precision: Minimum fraction of a qualifying task's OWN
+            key terms that must be part of the overlap (default 0.2) — a
+            precision floor that keeps a large, generic task description from
+            coincidentally outweighing a narrow finding's coverage match.
 
     Returns:
         Filtered list with already-tracked systemic_pattern flags removed.
     """
-    if not taskmaster or not dark_factory_root:
+    if not taskmaster or not known_projects:
         # Degrade to a no-op pass-through — mirrors filter_terminal_metadata_flags
         # / filter_false_absence_flags (task 2416 step-8).
         return list(flags)
@@ -2869,71 +4372,420 @@ async def filter_already_tracked_systemic_patterns(
             candidate_terms.append(_significant_terms(flag.get('description') or ''))
 
     if not candidate_positions:
-        # No candidates at all — skip the get_tasks call entirely, not just
-        # the matching loop below (scope guard, task 2416 step-6).
+        # No candidates at all — skip the get_tasks fan-out entirely, not just
+        # the matching loop below (scope guard, task 2416 step-6).  This guard
+        # is what bounds the added cost of querying N projects with 8 statuses
+        # instead of 1 project with 1: a batch with no never-tracked
+        # systemic_pattern candidate (the common case) issues no I/O at all.
         return list(flags)
 
-    try:
-        result = await taskmaster.get_tasks(dark_factory_root, statuses=['done'])
-    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-        raise
-    except Exception as exc:
-        logger.info(
-            'reconciliation.systemic_pattern_already_tracked_get_tasks_error error=%s',
-            exc,
-        )
-        return list(flags)  # fail-open: KEEP all on lookup error
-
-    # Tolerate a malformed result (not a dict, or missing/empty 'tasks') —
-    # degrades to "zero done tasks", so every candidate KEEPS below.
-    done_tasks = result.get('tasks') if isinstance(result, dict) else None
-    done_tasks = done_tasks or []
-    done_tasks_with_terms = [
-        (
-            task,
-            _significant_terms(f"{task.get('title') or ''} {task.get('description') or ''}"),
-        )
-        for task in done_tasks
+    lookup_projects = [
+        (project_id, root) for project_id, root in known_projects.items() if root
     ]
+    if not lookup_projects:
+        return list(flags)
+
+    async def _safe_get_tasks(project_root: str) -> list[Any] | None:
+        """Fetch one project's non-cancelled tasks; None iff the lookup FAILED.
+
+        Per-project fail-open (task 4381): one unreachable backend must not
+        blind the filter to every other known project.  A malformed-but-
+        successful result is normalised to ``[]`` (zero tasks) rather than
+        None, so it is not miscounted as an error by the all-projects-failed
+        KEEP-all check.
+        """
+        try:
+            result = await taskmaster.get_tasks(
+                project_root, statuses=_NON_CANCELLED_TASK_STATUSES,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            # WARN, not info: one project's backend being unreachable degrades
+            # this filter's coverage, and the silent-fallthrough gate requires
+            # a degraded empty/None return to be audible at WARN+.
+            logger.warning(
+                'reconciliation.systemic_pattern_already_tracked_get_tasks_error '
+                'project_root=%s error=%s',
+                project_root, exc,
+            )
+            return None
+        # Tolerate a malformed result (not a dict, or missing/None/non-list
+        # 'tasks') — degrades to "zero tasks", so every candidate KEEPS below.
+        tasks = result.get('tasks') if isinstance(result, dict) else None
+        return list(tasks) if isinstance(tasks, list) else []
+
+    # PLAIN gather (no return_exceptions) — _safe_get_tasks already normalises
+    # every failure to None, which is what tests/test_gather_convention_guard.py
+    # requires of any gather under src/fused_memory.
+    project_results = await asyncio.gather(
+        *(_safe_get_tasks(root) for _project_id, root in lookup_projects)
+    )
+
+    if all(result is None for result in project_results):
+        # EVERY known project errored — fail-open KEEP-all, preserving the
+        # single-project KEEP-all-on-error contract this filter shipped with.
+        return list(flags)
+
+    # Term extraction + the coverage sweep are pure CPU over every fetched
+    # task's title+description across every known project — seconds of blocking
+    # work on a big backlog — so they run OFF the event loop (task 4381
+    # amendment).  See _match_already_tracked_candidates for the measurements.
+    matches = await asyncio.to_thread(
+        _match_already_tracked_candidates,
+        [project_id for project_id, _root in lookup_projects],
+        project_results,
+        candidate_terms,
+        min_key_terms,
+        match_coverage,
+        min_task_term_precision,
+    )
+    # Release every project's task payload now that only the slim term sets
+    # inside the matcher were needed — these lists are multi-MB per project.
+    del project_results
 
     drop_positions: set[int] = set()
-    for pos, finding_terms in zip(candidate_positions, candidate_terms, strict=True):
-        if len(finding_terms) < min_key_terms:
-            # Too few distinctive terms to trust a coverage match — KEEP
-            # without attempting a match (task 2416 step-6 min-term floor).
-            continue
-        matched = False
-        best_coverage = 0.0
-        best_task_id: Any = None
-        for task, task_terms in done_tasks_with_terms:
-            if not task_terms:
-                continue
-            overlap = len(finding_terms & task_terms)
-            coverage = overlap / len(finding_terms)
-            if coverage < match_coverage:
-                continue
-            # Precision floor: an overlap that clears match_coverage can still
-            # be incidental if the done task's own description is large and
-            # generic (reviewer_comprehensive, task 2416 amendment pass) — a
-            # qualifying task must also derive a meaningful share of its own
-            # terms from the overlap, not just happen to contain it somewhere
-            # in a much larger, unrelated body of text.
-            precision = overlap / len(task_terms)
-            if precision < min_task_term_precision:
-                continue
-            if not matched or coverage > best_coverage:
-                matched = True
-                best_coverage = coverage
-                best_task_id = task.get('id')
-        if matched:
-            drop_positions.add(pos)
-            logger.info(
-                'reconciliation.systemic_pattern_already_tracked_dropped '
-                'matched_task_id=%s coverage=%.2f finding_terms=%s',
-                best_task_id, best_coverage, sorted(finding_terms),
-            )
+    for index, match in matches.items():
+        drop_positions.add(candidate_positions[index])
+        logger.info(
+            'reconciliation.systemic_pattern_already_tracked_dropped '
+            'matched_project_id=%s matched_task_id=%s coverage=%.2f '
+            'finding_terms=%s',
+            match.project_id, match.task_id, match.coverage,
+            sorted(candidate_terms[index]),
+        )
 
     return [flag for i, flag in enumerate(flags) if i not in drop_positions]
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic cross-project fix-task DISCOVERY (task 4864)
+# --------------------------------------------------------------------------- #
+
+#: Match thresholds for :func:`_discover_foreign_fix_task_citations`.
+#:
+#: Deliberately the SAME values :func:`filter_already_tracked_systemic_patterns`
+#: defaults to (min_key_terms=4, match_coverage=0.75,
+#: min_task_term_precision=0.2), named here so the reuse is a stated contract
+#: rather than a coincidence of two default arguments that could drift apart.
+#:
+#: REUSE RATIONALE (task 4864): these are already the tuned, reviewed numbers
+#: for this exact question — "does a filed task already cover this complaint?"
+#: — including the task-2416 amendment's precision floor, which keeps a
+#: verbose, generic task description from coincidentally sweeping up a narrow
+#: finding's key terms.  Inventing separate, unvalidated constants for the
+#: discovery path would mean two answers to one question.  Discovery is
+#: additionally STRICTER than that filter at the same numbers: its result must
+#: still survive the task-4381 gate's HIT-only, foreign-only, non-cancelled and
+#: done-bounded checks before anything is suppressed, whereas
+#: filter_already_tracked_systemic_patterns drops on text coverage alone.
+_DISCOVERY_MIN_KEY_TERMS: int = 4
+_DISCOVERY_MATCH_COVERAGE: float = 0.75
+_DISCOVERY_MIN_TASK_TERM_PRECISION: float = 0.2
+
+
+async def _discover_foreign_fix_task_citations(
+    taskmaster: Any,
+    known_projects: dict[str, str] | None,
+    project_id: str,
+    candidates: list[dict[str, Any]],
+    *,
+    tracked_terms_cache: dict[str, list[_TrackedTask] | None] | None = None,
+    get_task_cache: dict[tuple[str, str], Any] | None = None,
+    min_key_terms: int = _DISCOVERY_MIN_KEY_TERMS,
+    match_coverage: float = _DISCOVERY_MATCH_COVERAGE,
+    min_task_term_precision: float = _DISCOVERY_MIN_TASK_TERM_PRECISION,
+) -> dict[int, dict[str, Any]]:
+    """Return ``{candidate index -> synthesized citation}`` for *candidates*.
+
+    THE PRODUCER the task-4381 cross-project fix-task gate has never had
+    (task 4864, design option (b)).  That gate suppresses a carried-forward
+    finding whose ``cited_tasks`` names a live FOREIGN fix task — but nothing
+    ever emitted such a citation, so the gate landed, was enabled, and stayed
+    inert.  Stage 1's context is its own project's task tree, so the model has
+    nothing to cite from; and enriching the marker from Stage 2 (option (a))
+    is defeated outright, because :func:`compute_flag_signature` folds cited
+    task ids into the marker row's own KEY, so an enriched row RELOCATES
+    rather than annotates (task 4712's invariant).
+
+    This helper closes the gap deterministically instead: it matches each
+    candidate's description terms against every FOREIGN project's
+    non-cancelled backlog and synthesises a ``{project_id, task_id, title}``
+    citation — the exact shape ``recon_report.cite_task`` writes — from the
+    winning task.
+
+    **The returned citations are an in-memory GATE INPUT ONLY.**  They must be
+    passed straight to :func:`_resolve_live_cross_project_fix_task` and MUST
+    NEVER be written back onto the flag (``flag['cited_tasks']``) or into the
+    marker payload.  ``compute_flag_signature`` runs BEFORE the gate and reads
+    ``cited_tasks``, so mutating the flag would move the marker to a different
+    row; since the gate is HIT-only, the first enriched cycle would become a
+    MISS, and because discovery matches against a live backlog that changes
+    between cycles the row would relocate perpetually and never accumulate a
+    HIT at all — strictly worse than the inertness this fixes.  This function
+    therefore takes the flags read-only and never mutates them.
+
+    **Reused wholesale**: :func:`_significant_terms` for candidate terms and
+    :func:`_match_already_tracked_candidates` for the matching sweep — the
+    same pure, ``asyncio.to_thread``-safe matcher
+    :func:`filter_already_tracked_systemic_patterns` uses, called off the
+    event loop for the same reason (~0.6s of blocking CPU per project on a
+    real backlog), including its client-side
+    :data:`_ABANDONED_TASK_STATUS_VALUES` skip so a backend that ignores the
+    ``statuses`` kwarg still cannot let a CANCELLED task be discovered and
+    silence a complaint forever.
+
+    **CANDIDACY IS NARROWED TO THE COMPLAINT CLASS THE GATE ANSWERS**
+    (task 4864 amendment).  A candidate is only matched when its description
+    actually ASSERTS that nothing has been filed, per
+    :func:`_asserts_never_tracked` — the same lexicon
+    :func:`_is_systemic_pattern_candidate` uses, widened by task 4711 to reach
+    the "no fix task has been filed" wording.  Without that predicate this
+    would apply to EVERY carried-forward flag, replacing the citation path's
+    anchor (an LLM's judgment that the cited task FIXES the finding) with bare
+    term overlap for findings that never made the claim a fix task answers —
+    so a recurring stranded-work or metadata-drift flag whose wording happened
+    to be covered by any non-cancelled foreign task would be suppressed for as
+    long as that task stayed open.  It also keeps the cost bound below tied to
+    the flags that actually make the assertion.
+
+    **A ``done`` match NEVER beats an open one** (*prefer_non_done*, see
+    :func:`_match_extracted_tracked_tasks`).  Exactly one citation is
+    synthesised per candidate, and the gate bounds a ``done`` fix task to
+    :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES` cycles — so a marginally
+    better-covering ``done`` task winning over a still-open one would burn that
+    ceiling and re-assert the finding while a live fix task for it is open in
+    the same backlog.
+
+    **FOREIGN-ONLY**, mirroring :func:`_resolve_live_cross_project_fix_task`
+    rather than :func:`filter_already_tracked_systemic_patterns`: the running
+    *project_id* is never queried at all.  A finding's own subject task lives
+    in its own project and routinely covers the finding's own wording, so a
+    same-project match would make every such flag self-suppress.
+
+    **LAZY.** When *candidates* is empty, or NO candidate both asserts
+    never-tracked language and clears *min_key_terms*, this returns immediately
+    having issued ZERO ``get_tasks`` calls — the cost bound that keeps a cycle
+    with nothing to discover costing exactly what it cost before this landed.
+
+    **Fail-open in every direction** (no citation, never a raise), matching
+    this module's suppress-only-on-positive-confirmation posture: a falsy
+    *taskmaster* / *known_projects*, no resolvable foreign project, a
+    per-project ``get_tasks`` exception, a malformed result, a failed or
+    not-found live-title read, and a missing/blank/non-``str`` live title all
+    yield no citation for the affected candidate.
+
+    The live title is read back with :func:`_safe_get_task` rather than taken
+    from the bulk listing, and a citation is only synthesised when that read
+    positively confirms a titled record.  That is what makes a discovered
+    citation corroborate BY CONSTRUCTION under
+    :func:`_titles_corroborate`, so the discovered path takes the gate's
+    strongly-corroborated (INFO) branch and never its weakly-corroborated
+    (WARNING) one — the WARNING stays a signal about genuinely stale
+    LLM-authored citations.
+
+    Args:
+        taskmaster: Object with async ``get_tasks(project_root, *, statuses)``
+            and ``get_task(task_id, project_root)`` methods.
+        known_projects: The harness ``{project_id: project_root}`` routing map.
+        project_id: The project the current run belongs to — skipped entirely
+            (see FOREIGN-ONLY above).
+        candidates: Flags to find covering foreign tasks for, read-only.  The
+            sole production caller (``dedup_flags``) passes exactly ONE, since
+            candidacy depends on that flag's own per-flag ledger HIT; the
+            batch shape is kept because the reused matcher is batch-shaped and
+            a single ``to_thread`` hop can serve any number of candidates.
+        tracked_terms_cache: OPTIONAL ``project_id ->
+            list[_TrackedTask] | None`` memo shared by the caller across every
+            flag in one batch, so N qualifying flags fetch AND term-extract
+            each project's backlog ONCE, not N times.  It holds the EXTRACTED
+            TERMS rather than the raw ``get_tasks`` payloads deliberately
+            (task 4864 amendment): extraction — not the fetch — is the
+            expensive half (~0.6s of blocking CPU per ~4.2k-task project, see
+            :func:`_extract_tracked_task_terms`), so memoising the payloads
+            alone would still pay it once per flag while additionally pinning
+            tens of MB of task dicts live for the whole ``dedup_flags`` call.
+            A failed lookup caches ``None`` and is not retried within the
+            batch.
+        get_task_cache: OPTIONAL ``(str(project_id), str(task_id)) -> get_task
+            result`` memo — the SAME cache ``dedup_flags`` hands
+            :func:`_resolve_live_cross_project_fix_task`.  Sharing it means the
+            live-title read and the gate's own re-verification are one round
+            trip against one record, so the gate cannot see a different
+            snapshot than the one discovery matched.
+        min_key_terms: Minimum distinct key terms a candidate needs before a
+            match is attempted.
+        match_coverage: Minimum fraction of the candidate's key terms a task
+            must cover.
+        min_task_term_precision: Minimum fraction of the matched task's OWN
+            terms that must come from the overlap.
+
+    Returns:
+        ``{index into candidates -> {'project_id', 'task_id', 'title'}}``,
+        empty when nothing was discovered.
+    """
+    if not taskmaster or not known_projects or not candidates:
+        return {}
+
+    # A non-qualifying candidate is zeroed out here rather than filtered,
+    # so the returned keys stay indices into the caller's own list.  The
+    # never-tracked assertion is checked FIRST: it is a cheap substring scan,
+    # and a flag that never claims nothing was filed has no business being
+    # answered with "one is filed" however well its wording happens to overlap
+    # some foreign task (see CANDIDACY above).
+    candidate_terms: list[set[str]] = []
+    for flag in candidates:
+        description = (flag.get('description') or '') if isinstance(flag, dict) else ''
+        candidate_terms.append(
+            _significant_terms(description)
+            if _asserts_never_tracked(description)
+            else set()
+        )
+    if not any(len(terms) >= min_key_terms for terms in candidate_terms):
+        # LAZY cost bound: nothing here is the complaint class this answers, or
+        # nothing has enough signal to match — so skip the per-project fan-out
+        # entirely rather than just the matching sweep.
+        return {}
+
+    lookup_projects = [
+        (cited_project_id, root)
+        for cited_project_id, root in known_projects.items()
+        if root and str(cited_project_id) != str(project_id)  # FOREIGN-ONLY
+    ]
+    if not lookup_projects:
+        return {}
+
+    if tracked_terms_cache is None:
+        tracked_terms_cache = {}
+
+    async def _safe_get_tasks(project_root: str) -> list[Any] | None:
+        """Fetch one project's non-cancelled tasks; None iff the lookup FAILED.
+
+        Same per-project fail-open shape as
+        :func:`filter_already_tracked_systemic_patterns`' closure: one
+        unreachable backend must not blind discovery to every other project,
+        and a malformed-but-successful result normalises to ``[]`` rather than
+        None so it is not miscounted as an error.
+        """
+        try:
+            result = await taskmaster.get_tasks(
+                project_root, statuses=_NON_CANCELLED_TASK_STATUSES,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'reconciliation.cross_project_fix_task_discovery_get_tasks_error '
+                'project_root=%s error=%s',
+                project_root, exc,
+            )
+            return None
+        tasks = result.get('tasks') if isinstance(result, dict) else None
+        return list(tasks) if isinstance(tasks, list) else []
+
+    uncached = [
+        (cited_project_id, root)
+        for cited_project_id, root in lookup_projects
+        if cited_project_id not in tracked_terms_cache
+    ]
+    if uncached:
+        # PLAIN gather — _safe_get_tasks already normalises every failure to
+        # None (tests/test_gather_convention_guard.py).
+        fetched = await asyncio.gather(
+            *(_safe_get_tasks(root) for _cited_project_id, root in uncached)
+        )
+        # Extraction is the expensive half and is what the batch memo must
+        # hold, so it happens HERE — once per project per dedup_flags call —
+        # off the event loop, and the raw payloads are dropped immediately
+        # after.  Memoising `fetched` instead would re-extract every task of
+        # every foreign project for every qualifying flag.
+        extracted = await asyncio.to_thread(
+            _extract_tracked_task_terms,
+            [cited_project_id for cited_project_id, _root in uncached],
+            fetched,
+        )
+        del fetched
+        tracked_terms_cache.update(
+            zip(
+                (cited_project_id for cited_project_id, _root in uncached),
+                extracted,
+                strict=True,
+            )
+        )
+
+    project_ids = [cited_project_id for cited_project_id, _root in lookup_projects]
+    per_project = [tracked_terms_cache[pid] for pid in project_ids]
+    if all(tracked is None for tracked in per_project):
+        # EVERY foreign project errored — fail open to no discovery.
+        return {}
+
+    # The coverage sweep is still pure CPU over every extracted task; run it
+    # OFF the event loop exactly as the sibling filter does.  prefer_non_done
+    # keeps an already-`done` task from beating a still-open one — see
+    # _match_extracted_tracked_tasks.
+    matches = await asyncio.to_thread(
+        _match_extracted_tracked_tasks,
+        [entry for tracked in per_project if tracked is not None for entry in tracked],
+        candidate_terms,
+        min_key_terms,
+        match_coverage,
+        min_task_term_precision,
+        prefer_non_done=True,
+    )
+    del per_project
+
+    if not matches:
+        return {}
+
+    if get_task_cache is None:
+        get_task_cache = {}
+    citations: dict[int, dict[str, Any]] = {}
+    for index, match in matches.items():
+        root = known_projects.get(match.project_id)
+        if not root:
+            continue  # unresolvable project -> no citation (fail open)
+        key = (str(match.project_id), str(match.task_id))
+        if key not in get_task_cache:
+            get_task_cache[key] = await _safe_get_task(
+                taskmaster, match.task_id, root,
+            )
+        live = get_task_cache[key]
+        if not confirm_task_present(live):
+            # The bulk listing named a task the per-task read cannot confirm
+            # (deleted between calls, backend error, id the backend rejects).
+            logger.info(
+                'reconciliation.cross_project_fix_task_discovery_unconfirmed '
+                'matched_project_id=%s matched_task_id=%s coverage=%.2f',
+                match.project_id, match.task_id, match.coverage,
+            )
+            continue
+        # confirm_task_present already proved live is a dict.
+        title = live.get('title')  # type: ignore[union-attr]
+        if not isinstance(title, str) or not title.strip():
+            # Fail open rather than synthesise a title-less citation: the live
+            # title is what makes a discovered citation corroborate by
+            # construction, and cite_task's own title-less write is precisely
+            # the degraded shape task 4864 made audible elsewhere.
+            logger.warning(
+                'reconciliation.cross_project_fix_task_discovery_untitled '
+                'matched_project_id=%s matched_task_id=%s live_title=%r — '
+                'declining to synthesise a citation from an untitled record',
+                match.project_id, match.task_id, title,
+            )
+            continue
+        citations[index] = {
+            'project_id': match.project_id,
+            'task_id': match.task_id,
+            'title': title,
+        }
+        logger.info(
+            'reconciliation.cross_project_fix_task_discovered '
+            'matched_project_id=%s matched_task_id=%s coverage=%.2f '
+            'finding_terms=%s',
+            match.project_id, match.task_id, match.coverage,
+            sorted(candidate_terms[index]),
+        )
+    return citations
 
 
 # --------------------------------------------------------------------------- #
@@ -3355,4 +5207,659 @@ def filter_contamination_ceiling_findings(
         else:
             kept.append(flag)
 
+    return kept
+
+
+# --------------------------------------------------------------------------- #
+# Style-only authorship guard helpers (task 3138, PRD §9 leaf μ)
+# --------------------------------------------------------------------------- #
+
+#: Flag types asserting that an entry's content was injected, fabricated, or
+#: written by someone outside this deployment.  Several spellings are listed
+#: because the family has no committed schema entry — Stage 1 emits it as
+#: free-form LLM output, so the set is a best-effort census of the plausible
+#: spellings (the ``STALE_METADATA_FLAG_TYPES`` idiom).  An unrecognised
+#: spelling degrades to a visible drift log rather than a silent no-op.
+AUTHORSHIP_SUSPICION_FLAG_TYPES: frozenset[str] = frozenset({
+    'possible_injection',
+    'prompt_injection',
+    'injected_content',
+    'possible_fabrication',
+    'fabricated_content',
+    'foreign_authorship',
+    'suspicious_authorship',
+})
+
+
+def _classify_authorship(agent_id: Any) -> str:
+    """Classify one citation's stored ``agent_id``.
+
+    ``'internal'`` — a recognised house writer (the only value that can clear
+    a flag).  ``'missing'`` — no usable provenance at all (absent key, None,
+    empty, or a non-string).  ``'foreign'`` — a real agent_id that matches no
+    house writer family.  These are kept distinct because they read very
+    differently to an operator: a foreign id is a positive signal, a missing
+    one is a gap.  (A fourth value, ``'unresolved'``, is assigned by the
+    caller when the record could not be read at all — see
+    :func:`filter_style_only_authorship_flags`.)
+    """
+    if is_internal_writer(agent_id):
+        return 'internal'
+    if not isinstance(agent_id, str) or not agent_id:
+        return 'missing'
+    return 'foreign'
+
+
+def _authorship_keep_decision(checked: list[dict[str, Any]]) -> str:
+    """Summarise WHY a candidate flag survived, from its checked citations.
+
+    A positively-foreign author is the most informative outcome, and reads
+    differently depending on whether a house writer sits alongside it
+    (``kept_mixed_authors``) or not (``kept_foreign_author``).  Absent any
+    foreign author, the flag can only have survived because some citation
+    yielded no usable agent_id — absent, empty, or unreadable — which is
+    ``kept_missing_agent_id``.
+    """
+    if not checked:
+        return 'kept_no_resolvable_citations'
+    classifications = {c['classification'] for c in checked}
+    if 'foreign' in classifications:
+        return 'kept_mixed_authors' if 'internal' in classifications else 'kept_foreign_author'
+    # No positively-foreign author, yet the flag survived — so at least one
+    # citation yielded no usable agent_id (absent, empty, or unreadable).
+    return 'kept_missing_agent_id'
+
+
+async def filter_style_only_authorship_flags(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop injection/fabrication flags whose cited entries are house-authored.
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign to
+    it — it never read the stored ``agent_id``.  Writing style is not evidence
+    of authorship; provenance is.
+
+    A flag is a CANDIDATE iff its ``flag_type`` is in
+    :data:`AUTHORSHIP_SUSPICION_FLAG_TYPES`.  For each candidate, every mem0
+    citation in ``cited_memories`` is resolved via
+    ``memory_service.get_memory_by_id(project_id, memory_id)`` — whose
+    ``metadata`` is the raw Qdrant payload and therefore still carries the
+    top-level ``agent_id`` that mem0's ``AsyncMemory`` promotes out of metadata
+    on the search and ``get`` paths — and classified with
+    :func:`~fused_memory.reconciliation.internal_writers.is_internal_writer`.
+
+    **Fail-safe direction**: this filter DROPS a security-shaped signal, so it
+    drops ONLY on positively-confirmed wholly-internal authorship — at least
+    one agent_id resolved AND every resolved one is a recognised house writer.
+    Every other outcome KEEPS the flag: a foreign agent_id, a missing/empty
+    one, a mixed citation set (a partially-internal claim is not cleared), a
+    citation the backend could not resolve (a raised error or a not-found
+    record is ``'unresolved'`` — unknown, never internal — and is never
+    propagated to the caller), and a candidate with no resolvable citations at
+    all (an unattributable claim stays flaggable).  The asymmetry is
+    deliberate — wrongly keeping a flag costs one noisy finding the next cycle
+    clears, while wrongly dropping one silently disables the detection.
+
+    Degrades to an unchanged pass-through when ``memory_service`` or
+    ``project_id`` is falsy.
+
+    Every SURVIVING candidate is annotated with ``authorship_provenance``::
+
+        {'checked': [{'memory_id', 'agent_id', 'classification'}, ...],
+         'decision': 'kept_foreign_author' | 'kept_missing_agent_id'
+                     | 'kept_mixed_authors' | 'kept_no_resolvable_citations'}
+
+    — the structured fact at the decision point (INV-2), so Stage 2 and any
+    operator read the agent_ids this gate actually checked as a field instead
+    of re-deriving them from the description prose.  Non-candidate flags pass
+    through untouched: never looked up, never annotated.
+
+    Args:
+        memory_service: Object with an async ``get_memory_by_id(project_id,
+            memory_id)`` method, typically ``self.memory`` in
+            MemoryConsolidator.
+        project_id: Project scope for the lookup.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        A new list, in input order, with confirmed-house-authored authorship
+        flags removed.  The input LIST is never mutated; surviving candidate
+        dicts gain the ``authorship_provenance`` key described above.
+    """
+    if not memory_service or not project_id:
+        # Degrade to a no-op pass-through — mirrors filter_terminal_metadata_flags
+        # / filter_already_tracked_systemic_patterns.  Provenance is unreadable,
+        # so nothing can be positively confirmed internal.
+        return list(flags)
+
+    candidate_positions: list[int] = [
+        i for i, flag in enumerate(flags)
+        if flag.get('flag_type') in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+
+    # Detect potential LLM naming drift: flag_type strings that look like this
+    # family but are not in AUTHORSHIP_SUSPICION_FLAG_TYPES.  The family has no
+    # committed schema entry, so an unrecognised spelling would silently make
+    # the gate a no-op; this log makes that observable (the
+    # filter_terminal_metadata_flags drift-log precedent).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if isinstance(ft := flag.get('flag_type'), str)
+        and any(token in ft.lower() for token in ('inject', 'fabricat', 'foreign'))
+        and ft not in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update AUTHORSHIP_SUSPICION_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(AUTHORSHIP_SUSPICION_FLAG_TYPES),
+        )
+
+    if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
+        return list(flags)
+
+    async def _classify(flag: dict[str, Any]) -> list[dict[str, Any]]:
+        """Resolve every mem0 citation on *flag* to a provenance record."""
+        checked: list[dict[str, Any]] = []
+        for entry in flag.get('cited_memories') or []:
+            # Skip anything we cannot — or must not — resolve, without a lookup
+            # and without recording a verdict: a non-dict entry (malformed), an
+            # entry with no truthy memory_id, or a non-mem0 citation.
+            # get_memory_by_id is a Mem0/Qdrant point-id read, so resolving a
+            # graphiti edge uuid through it would return not-found for EVERY
+            # graph citation (citation_verifier's guard).  Such an entry
+            # therefore neither clears a flag nor blocks a clearance — a
+            # candidate citing only these ends up with an empty ``checked`` and
+            # is kept as unattributable.
+            if (
+                not isinstance(entry, dict)
+                or entry.get('store') != 'mem0'
+                or not entry.get('memory_id')
+            ):
+                continue
+            memory_id = entry.get('memory_id')
+            try:
+                record = await memory_service.get_memory_by_id(project_id, memory_id)
+            except Exception as exc:
+                # A raised backend error is 'unknown', not 'house-authored'.
+                # Record the uncertainty, KEEP the flag, and never propagate —
+                # a check error must not crash the stage.
+                logger.debug(
+                    'reconciliation.style_only_authorship_lookup_error '
+                    'memory_id=%s error=%s',
+                    memory_id, exc,
+                )
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
+            if not record:
+                # Not found — also unknown, never internal.
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
+            agent_id = (record.get('metadata') or {}).get('agent_id')
+            checked.append({
+                'memory_id': memory_id,
+                'agent_id': agent_id,
+                'classification': _classify_authorship(agent_id),
+            })
+        return checked
+
+    checked_by_pos: dict[int, list[dict[str, Any]]] = dict(
+        zip(
+            candidate_positions,
+            await asyncio.gather(*[_classify(flags[i]) for i in candidate_positions]),
+            strict=True,
+        ),
+    )
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        checked = checked_by_pos.get(i)
+        if checked is None:
+            # Not a candidate — never looked up, never annotated, byte-identical.
+            kept.append(flag)
+            continue
+        if checked and all(c['classification'] == 'internal' for c in checked):
+            logger.info(
+                'reconciliation.style_only_authorship_flag_dropped '
+                'flag_type=%s agent_ids=%s memory_ids=%s',
+                flag.get('flag_type'),
+                [c['agent_id'] for c in checked],
+                [c['memory_id'] for c in checked],
+            )
+            continue  # drop: every cited entry is provably house-authored
+        # Survives. Record the provenance actually read at the decision point
+        # (INV-2), so Stage 2 and any operator read the checked agent_ids as a
+        # field rather than re-deriving them from the description prose.
+        # ``setdefault`` mirrors citation_verifier's ``citation_failures``
+        # idiom: annotate the finding, never rewrite it.
+        flag.setdefault(
+            'authorship_provenance',
+            {'checked': checked, 'decision': _authorship_keep_decision(checked)},
+        )
+        kept.append(flag)
+
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Accounted duplicate-cluster-growth guard (task-3476)
+# ---------------------------------------------------------------------------
+
+#: ``flag_type`` spellings OBSERVED on Stage-1 duplicate-cluster-growth findings
+#: (task 3476).  Deliberately NOT a closed set: these two are the spellings the
+#: run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765 incident actually
+#: produced, and ``flag_type`` is LLM-authored with no committed schema entry
+#: (``grep -rn cluster_growth fused-memory/`` returned zero hits before this
+#: change).  Kept as documentation and as the drift log's reference point;
+#: :func:`_is_cluster_growth_flag_type` also accepts unlisted spellings that
+#: carry both the ``cluster`` and ``growth`` tokens.
+CLUSTER_GROWTH_FLAG_TYPES: frozenset[str] = frozenset({
+    'procedural_knowledge_cluster_growth',
+    'duplicate_procedural_knowledge_cluster_growth',
+})
+
+#: Precomputed canonical-family keys for :data:`CLUSTER_GROWTH_FLAG_TYPES` so a
+#: reworded / reordered / re-cased LLM spelling of a KNOWN flag_type still
+#: matches (mirrors :data:`_STALE_BULK_GET_STATUSES_FAMILIES`).
+_CLUSTER_GROWTH_FAMILIES: frozenset[str] = frozenset(
+    canonical_flag_type_family(ft) for ft in CLUSTER_GROWTH_FLAG_TYPES
+)
+
+
+def _is_cluster_growth_flag_type(flag_type: Any) -> bool:
+    """True iff *flag_type* names a duplicate-cluster-growth finding (task 3476).
+
+    Two independent arms:
+
+    1. :func:`canonical_flag_type_family` membership in
+       :data:`_CLUSTER_GROWTH_FAMILIES` -- catches case, separator, whitespace
+       and word-order variants of a spelling we have actually seen.
+    2. The TOKEN PAIR test: the casefolded flag_type, tokenized with
+       :data:`_FLAG_TYPE_TOKEN_SPLIT_RE`, contains BOTH ``'cluster'`` and
+       ``'growth'`` -- catches spellings we have not seen
+       (``'mem0_duplicate_cluster_growth'``, ``'memory_cluster_growth_detected'``).
+
+    Arm 2 is deliberately BROADER than the exact-family-set matching used by
+    the sibling filters (:func:`filter_terminal_metadata_flags`,
+    :func:`filter_stale_bulk_get_statuses_flags`,
+    :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
+    a way it is not for :func:`filter_suppressed`, whose family collisions can
+    hide a genuinely-recurring finding for cycles: this predicate only ever
+    admits a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS
+    solely after positively confirming that EVERY cited memory UUID is already
+    written into the referenced task's own description body.  A mis-classified
+    flag_type can therefore only ever reclassify a finding that is, by
+    construction, already accounted for -- never silence an unaccounted one.
+
+    Total over malformed LLM-authored input: a non-``str`` (``None``, an int, a
+    list) returns ``False`` rather than raising.
+
+    Pure, sync, no I/O.
+    """
+    if not isinstance(flag_type, str) or not flag_type:
+        return False
+    if canonical_flag_type_family(flag_type) in _CLUSTER_GROWTH_FAMILIES:
+        return True
+    tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
+    return 'cluster' in tokens and 'growth' in tokens
+
+
+def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
+    """Return the memory ids *flag* structurally cites, in citation order (task 3476).
+
+    Reads ONLY ``flag['cited_memories'][].memory_id`` -- the schema-required,
+    server-verified citation channel (``cli_stage_runner``'s finding schema
+    requires ``memory_id`` + ``store``; the ids are re-resolved by
+    ``verify_cited_memories``).  Deliberately NOT a UUID regex over the
+    finding's free text: Stage-1 prose routinely embeds NON-memory uuids (run
+    ids, finding ids, causation ids) that will never appear in a gate task's
+    cluster list, so a prose extractor would make the caller's all-present test
+    permanently unsatisfiable and the guard a silent no-op.
+
+    Entries whose ``store`` is not ``'mem0'`` are INCLUDED, conservatively: an
+    unmatched graph-edge uuid can only fail the all-present test and force a
+    KEEP, which is the fail-safe direction.  That holds because the caller
+    additionally requires every cited id to be DISCRIMINATING
+    (:func:`_is_discriminating_memory_id`) -- shape is NOT validated here,
+    since a caller that wants the raw citation list should get the raw list.
+
+    Total over malformed LLM-authored input -- a non-list ``cited_memories``, a
+    non-dict entry, or a missing/non-``str``/blank ``memory_id`` is skipped
+    rather than raised on.  Results are deduped, keeping first position.
+
+    Pure, sync, no I/O.
+    """
+    entries = flag.get('cited_memories')
+    if not isinstance(entries, list):
+        return []
+    seen: set[str] = set()
+    ids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        memory_id = entry.get('memory_id')
+        if not isinstance(memory_id, str):
+            continue
+        memory_id = memory_id.strip()
+        if not memory_id or memory_id in seen:
+            continue
+        seen.add(memory_id)
+        ids.append(memory_id)
+    return ids
+
+
+#: A cited memory id confirms a drop only if finding it inside a task body is
+#: EVIDENCE of tracking rather than coincidence.  The body test is a
+#: case-insensitive substring scan, and ``cited_memories[].memory_id`` reaches
+#: this module unvalidated -- ``verify_cited_memories`` never resolves a
+#: ``store != 'mem0'`` entry, and KEEPS a citation whose lookup ERRORS, so
+#: during a Qdrant outage unverified ids arrive too.  A degenerate id
+#: (``'mem0'``, ``'3'``) would then match almost any prose and turn the guard's
+#: positive confirmation into the false DROP it exists to exclude.  Mem0 point
+#: ids and Graphiti uuids are both UUID-shaped; the length arm keeps the guard
+#: working for any other store whose ids are simply long (task 3476 amendment).
+_UUID_SHAPED_MEMORY_ID_RE = re.compile(
+    r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z',
+    re.IGNORECASE,
+)
+
+#: Inclusive lower bound for the non-UUID arm of
+#: :func:`_is_discriminating_memory_id`.  Sixteen hex-ish characters is already
+#: far past anything that occurs in a task body by chance, while staying short
+#: enough to admit non-UUID store ids.
+_MIN_DISCRIMINATING_MEMORY_ID_LEN = 16
+
+
+def _is_discriminating_memory_id(memory_id: str) -> bool:
+    """True iff *memory_id* appearing in a task body is evidence, not coincidence.
+
+    UUID-shaped, or at least :data:`_MIN_DISCRIMINATING_MEMORY_ID_LEN`
+    characters long.  See that constant's note for why the guard needs this at
+    all.
+
+    Pure, sync, no I/O.
+    """
+    return (
+        _UUID_SHAPED_MEMORY_ID_RE.match(memory_id) is not None
+        or len(memory_id) >= _MIN_DISCRIMINATING_MEMORY_ID_LEN
+    )
+
+
+def _cluster_growth_unconfirmable_reason(
+    memory_ids: list[str],
+    task_ids: list[str],
+) -> str | None:
+    """Why a cluster-growth flag cannot be confirmed accounted-for, or ``None``.
+
+    ``None`` means the flag is a CANDIDATE: it cites something discriminating
+    to look for and somewhere to look.  Every other result names a reason the
+    guard must simply KEEP the flag, and exists to be LOGGED -- each is a way
+    :func:`filter_accounted_cluster_growth_flags` becomes a permanent silent
+    no-op that the drift log cannot see, because in all three the ``flag_type``
+    matched perfectly well.
+
+    Order matters only for the log's legibility: a flag citing nothing is
+    reported as citing nothing rather than as citing nothing discriminating.
+
+    Pure, sync, no I/O.
+    """
+    if not memory_ids:
+        return 'no_cited_memory_ids'
+    if not all(_is_discriminating_memory_id(m) for m in memory_ids):
+        return 'non_discriminating_memory_id'
+    if not task_ids:
+        return 'no_resolvable_task_id'
+    return None
+
+
+def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
+    """Return every task id *flag* points at, in resolution order (task 3476).
+
+    Two channels, top-level first:
+
+    1. ``flag['task_id']`` -- coerced to ``str`` (an int ``3417`` yields
+       ``'3417'``) and split on ``','`` to handle the composite shape
+       (``'3417,3468'``), each component stripped.
+    2. ``flag['cited_tasks'][].task_id`` -- coerced to ``str``, blanks and
+       non-dict entries skipped.  ``project_id`` is deliberately NOT filtered
+       on; see :func:`filter_accounted_cluster_growth_flags`' docstring.
+
+    NOT :func:`_decompose_suppression_task_id`: that helper's contract reserves
+    comma-decomposition for suppression LEDGER rows and states that a flag's
+    own task_id is never split by it.  This is the separate, task-3476-owned
+    splitter for a flag's own task_id.
+
+    Total over malformed LLM-authored input.  Results are deduped, keeping
+    first position; returns ``[]`` when nothing resolvable is present.
+
+    Pure, sync, no I/O.
+    """
+    seen: set[str] = set()
+    ids: list[str] = []
+
+    def _add(raw: Any) -> None:
+        if raw is None or isinstance(raw, bool):
+            return
+        if not isinstance(raw, (str, int)):
+            return
+        for part in str(raw).split(','):
+            part = part.strip()
+            if not part or part in seen:
+                continue
+            seen.add(part)
+            ids.append(part)
+
+    _add(flag.get('task_id'))
+    cited_tasks = flag.get('cited_tasks')
+    if isinstance(cited_tasks, list):
+        for entry in cited_tasks:
+            if isinstance(entry, dict):
+                _add(entry.get('task_id'))
+    return ids
+
+
+async def filter_accounted_cluster_growth_flags(
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop duplicate-cluster-growth flags already accounted for by their task.
+
+    Stage 1 emits a "cluster has grown beyond what gate task N tracks" finding
+    by diffing a newly-observed Mem0 cluster member against a title-derived /
+    REMEMBERED COUNT rather than against the gate task's CURRENT description
+    body -- so an addendum appended to the body since the title was written
+    reads as unaccounted growth.
+
+    In remediation run ``df364849-21e9-4f54-b802-a126a49eba97`` (finding
+    ``96a14765``; follow-up ``1ff1b00e``) 2 of 3 such flags were FALSE
+    POSITIVES.  Re-verified live 2026-09-06: task 3417's description still
+    lists ``03b783d5-dc00-441a-af9d-05b0e636b668`` verbatim as PRIMARY entry
+    #3 of 3, while its TITLE still reads "(3 primary + 3 secondary entries)";
+    task 3468's "Cluster UUIDs (mem0)" list has the same shape.  ``details``
+    also carries UUIDs the description does not, which is why the body under
+    test is ``description`` + ``details``.
+
+    **The drop rule.**  A flag is a CANDIDATE iff
+    :func:`_is_cluster_growth_flag_type` accepts its ``flag_type`` AND it cites
+    at least one memory id, EVERY one of them discriminating
+    (:func:`_is_discriminating_memory_id`), AND at least one task id resolves.
+    A candidate is DROPPED iff SOME single candidate task's current body
+    contains EVERY one of its cited memory UUIDs (case-insensitive
+    substring).  Bodies are never
+    UNIONED across tasks: "uuid-A is in 3417 and uuid-B is in 3468" does not
+    establish that the cluster is fully tracked anywhere -- only one task
+    listing the whole cited set does.  A candidate id that errors or resolves
+    to no body simply contributes nothing, so it can neither confirm a drop nor
+    veto a sibling id that does.
+
+    **Candidate task ids are used WITHOUT filtering on ``project_id``.**  Unlike
+    :func:`_cited_task_corroborated`, which must title-match because per-project
+    sequential task ids collide across projects constantly, the thing matched
+    here is a Mem0 point-id: a globally unique random UUID.  A task body that
+    literally contains one IS that memory's tracker whichever project owns the
+    task, so cross-project id collision cannot produce a false drop.
+
+    **Fail-safe direction is KEEP.**  This filter drops the only signal that an
+    un-gated duplicate cluster is growing, so it drops ONLY on positive
+    confirmation.  Every other outcome keeps the flag: partial presence (one
+    cited UUID absent -- that is GENUINE growth), a ``get_task`` error or
+    ``TaskNotFoundError``, a non-dict or body-less result, zero cited memories,
+    a cited id too short to discriminate (which would otherwise "confirm"
+    against ordinary prose), no resolvable task id, and a falsy
+    ``taskmaster``/``project_root``.  The asymmetry is deliberate -- a false
+    KEEP costs one redundant flag that dedup and suppression already handle and
+    that self-heals next cycle, whereas a false DROP silently loses the signal
+    entirely.
+
+    Non-candidate flags pass through with no ``get_task`` call at all, and a
+    batch with zero candidates returns before any I/O.
+
+    Args:
+        taskmaster: Object with an async ``get_task(task_id, project_root)``
+            method, typically ``self.taskmaster`` in MemoryConsolidator.
+        project_root: Project root path passed through to get_task.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        A new list, in input order, with accounted-for growth flags removed.
+        The input list is never mutated and surviving flags are unmodified.
+    """
+    if not taskmaster or not project_root:
+        # Degrade to a no-op pass-through -- mirrors filter_terminal_metadata_flags
+        # / filter_style_only_authorship_flags.  No body is readable, so nothing
+        # can be positively confirmed accounted for.
+        return list(flags)
+
+    candidate_positions: list[int] = []
+    cited_by_pos: dict[int, list[str]] = {}
+    task_ids_by_pos: dict[int, list[str]] = {}
+    unconfirmable: list[str] = []
+
+    for i, flag in enumerate(flags):
+        flag_type = flag.get('flag_type')
+        if not _is_cluster_growth_flag_type(flag_type):
+            continue
+        memory_ids = _cluster_growth_cited_memory_ids(flag)
+        task_ids = _cluster_growth_candidate_task_ids(flag)
+        reason = _cluster_growth_unconfirmable_reason(memory_ids, task_ids)
+        if reason is not None:
+            unconfirmable.append(
+                f'{reason} flag_type={flag_type} task_id={flag.get("task_id")}'
+            )
+            continue
+        candidate_positions.append(i)
+        cited_by_pos[i] = memory_ids
+        task_ids_by_pos[i] = task_ids
+
+    # Detect potential LLM naming drift: flag_type strings that look like this
+    # family (contain 'cluster') but that _is_cluster_growth_flag_type does not
+    # match.  flag_type has no committed schema entry, so an unrecognised
+    # spelling would silently make the guard a no-op; this log makes that
+    # observable (the filter_terminal_metadata_flags drift-log precedent).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if isinstance(ft := flag.get('flag_type'), str)
+        and 'cluster' in ft.casefold()
+        and not _is_cluster_growth_flag_type(ft)
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.accounted_cluster_growth_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update CLUSTER_GROWTH_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(CLUSTER_GROWTH_FLAG_TYPES),
+        )
+
+    # The drift log above sees only ONE of the ways this guard goes silently
+    # no-op.  A flag whose flag_type matched perfectly well but that cites
+    # nothing usable is invisible to it, and if the family ever settles into
+    # putting the UUID only in prose (which this module deliberately refuses to
+    # parse) the guard is permanently ineffective with nothing in the logs
+    # saying so.  Same aggregate-per-call shape as the drift log.
+    if unconfirmable:
+        logger.info(
+            'reconciliation.accounted_cluster_growth_filter_unconfirmable_candidates '
+            'skipped=%s — flag_type matched but the finding carries nothing to '
+            'confirm against; these flags are KEPT',
+            unconfirmable,
+        )
+
+    if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
+        return list(flags)
+
+    # Resolve each distinct task id exactly ONCE per call, however many flags
+    # in the batch cite it.
+    wanted_task_ids: list[str] = []
+    seen_task_ids: set[str] = set()
+    for i in candidate_positions:
+        for tid in task_ids_by_pos[i]:
+            if tid not in seen_task_ids:
+                seen_task_ids.add(tid)
+                wanted_task_ids.append(tid)
+
+    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
+    # a task whose body is unreadable can neither confirm a drop nor veto one.
+    lookup_results: list[Any] = await asyncio.gather(
+        *[
+            _safe_get_task_or_none(
+                taskmaster,
+                tid,
+                project_root,
+                log_event='reconciliation.accounted_cluster_growth_filter_get_task_error',
+            )
+            for tid in wanted_task_ids
+        ]
+    )
+    body_by_task: dict[str, str] = {}
+    for tid, result in zip(wanted_task_ids, lookup_results, strict=True):
+        if not isinstance(result, dict):
+            continue
+        body = f"{result.get('description') or ''}\n{result.get('details') or ''}"
+        body_by_task[tid] = body.casefold()
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        if i not in cited_by_pos:
+            kept.append(flag)
+            continue
+        memory_ids = [m.casefold() for m in cited_by_pos[i]]
+        matched_task_id = next(
+            (
+                tid
+                for tid in task_ids_by_pos[i]
+                if tid in body_by_task
+                and all(uid in body_by_task[tid] for uid in memory_ids)
+            ),
+            None,
+        )
+        if matched_task_id is None:
+            kept.append(flag)
+            continue
+        logger.info(
+            'reconciliation.accounted_cluster_growth_flag_dropped '
+            'task_id=%s matched_task_id=%s memory_ids=%s',
+            flag.get('task_id'), matched_task_id, cited_by_pos[i],
+        )
     return kept

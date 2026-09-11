@@ -30,16 +30,19 @@ __all__ = ['MUTATING_TASK_TOOLS', 'maybe_inject_client_op_id']
 # Mutating task tools that must carry a client-supplied idempotency key so a
 # transport-level retry (after an ambiguous timeout/reset) dedupes server-side
 # instead of double-applying (task 2712). Reads/initialize are untouched.
-MUTATING_TASK_TOOLS = frozenset({
-    'update_task',
-    'set_task_status',
-    'add_dependency',
-    'remove_dependency',
-})
+MUTATING_TASK_TOOLS = frozenset(
+    {
+        'update_task',
+        'set_task_status',
+        'add_dependency',
+        'remove_dependency',
+    }
+)
 
 
 def maybe_inject_client_op_id(
-    method: str, params: dict[str, Any] | None,
+    method: str,
+    params: dict[str, Any] | None,
 ) -> None:
     """Inject a fresh ``client_op_id`` into a mutating tool call's arguments.
 

@@ -3,6 +3,7 @@
 
 import asyncio
 import dataclasses
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -505,6 +506,108 @@ class TestGetTasksNormalizesMetadata:
         for task, expected in cases:
             Scheduler._normalize_task_metadata(task)
             assert task['metadata'] == expected, f'failed for input: {task}'
+
+
+# ---------------------------------------------------------------------------
+# TestNormalizeTaskMetadataLoudness (task 3121 — step-15 RED / step-16 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeTaskMetadataLoudness:
+    """The metadata→{} collapse must be LOUD, not silent.
+
+    Silence, not the coercion, is the hazard: a task whose metadata arrived as
+    an unparseable string reaches the dispatch-time cross-repo gate looking
+    marker-free and is waved through with no trace that anything was
+    discarded.  This is the loud-over-silent-degradation norm
+    (structured-facts-at-failure / no-silent-fail-soft).
+
+    Observability only — every assertion below also pins that the coercion
+    behaviour is UNCHANGED.
+    """
+
+    LOGGER = 'orchestrator.scheduler'
+
+    @staticmethod
+    def _warnings(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.parametrize('raw', [[1, 2], ['a'], 42, 3.5, True, False, object()])
+    def test_non_dict_non_string_warns(self, raw, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '7788', 'metadata': raw}
+
+        Scheduler._normalize_task_metadata(task)
+
+        warnings = self._warnings(caplog)
+        assert warnings, f'metadata={raw!r} must warn, not collapse silently'
+        message = ' '.join(warnings)
+        assert '7788' in message, f'warning must name the task id; got {message!r}'
+        assert type(raw).__name__ in message, (
+            f'warning must name the discarded type; got {message!r}'
+        )
+        assert task['metadata'] == {}, 'coercion behaviour must be unchanged'
+
+    @pytest.mark.parametrize('raw', ['not-json', '{unclosed', '[1,2,3]', '"just-a-string"',
+                                     '42', 'null', 'true'])
+    def test_unusable_string_warns(self, raw, caplog):
+        """Both the JSONDecodeError path and the decoded-non-dict path."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '9911', 'metadata': raw}
+
+        Scheduler._normalize_task_metadata(task)
+
+        warnings = self._warnings(caplog)
+        assert warnings, f'metadata={raw!r} must warn, not collapse silently'
+        message = ' '.join(warnings)
+        assert '9911' in message, f'warning must name the task id; got {message!r}'
+        assert 'str' in message, f'warning must name the discarded type; got {message!r}'
+        assert task['metadata'] == {}, 'coercion behaviour must be unchanged'
+
+    def test_dict_metadata_is_silent(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '1', 'metadata': {'foo': 1}}
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert not self._warnings(caplog), 'a dict is the normal shape'
+        assert task['metadata'] == {'foo': 1}
+
+    def test_valid_json_string_is_silent(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '2', 'metadata': '{"foo": 1}'}
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert not self._warnings(caplog), (
+            'a JSON string decoding to a dict is a supported wire format, not a defect'
+        )
+        assert task['metadata'] == {'foo': 1}
+
+    @pytest.mark.parametrize('task', [{'id': '3', 'metadata': None}, {'id': '4'}])
+    def test_absent_or_none_metadata_is_silent(self, task, caplog):
+        """Most tasks carry no metadata — warning here would be pure noise."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert not self._warnings(caplog), (
+            'absent/None metadata is the normal shape, not a discarded value'
+        )
+        assert task['metadata'] == {}
+
+    def test_warning_repr_is_truncated(self, caplog):
+        """A pathological value must not flood the log."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '5', 'metadata': ['x' * 5000]}
+
+        Scheduler._normalize_task_metadata(task)
+
+        message = ' '.join(self._warnings(caplog))
+        assert message, 'must still warn'
+        assert len(message) < 1000, (
+            f'the discarded repr must be truncated; got a {len(message)}-char message'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1552,15 +1655,135 @@ class TestUpdateTaskMetadataSerialization:
         )
         assert 'append' not in arguments
 
+    # NOTE: test_update_task_metadata_mode_wins_over_append used to live here.
+    # It asserted that metadata_mode='merge' + append=True forwards
+    # metadata_mode='merge' — i.e. it certified that the caller's additive
+    # intent was silently dropped on the wire (the nested-metadata clobber this
+    # task fixes).  That pair now RAISES; see
+    # test_update_task_merge_plus_append_true_raises immediately below.  The
+    # legitimate half of what it covered — that an explicit metadata_mode beats
+    # append — is re-established by the ('replace', True) and ('additive', True)
+    # non-regression cells further down, which pin the precedence rule on the
+    # cells where precedence is actually meaningful.
+
     @pytest.mark.asyncio
-    async def test_update_task_metadata_mode_wins_over_append(
+    async def test_update_task_merge_plus_append_true_raises(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """Explicit metadata_mode beats append=True (metadata_mode > append precedence).
+        """metadata_mode='merge' alongside append=True is a CONTRADICTION, and is REJECTED.
 
-        If both append=True and metadata_mode='merge' are supplied, the explicit
-        metadata_mode='merge' must win — mirroring the backend _resolve_metadata_mode
-        precedence: metadata_mode > append > default.
+        ``append=True`` means exactly one thing — 'additive', the recursive
+        union merge — while ``'merge'`` is shallow last-write-wins, so the pair
+        asks for two incompatible resolutions of the same write.  It used to
+        resolve silently to 'merge' and forward that on the wire, shallow-
+        clobbering nested metadata: a task's whole ``memory_hints`` key
+        (authored ``entities``/``queries`` and all) overwritten wholesale by the
+        incoming stub.
+
+        The guard must REFUSE the write, not merely complain about it — hence
+        the ``captured_args == []`` assertion.  A warn-and-proceed would destroy
+        the additive intent just as thoroughly, only with a log line about it.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        with pytest.raises(ValueError) as excinfo:
+            await scheduler.update_task(
+                '1', {'files': ['backend']}, append=True, metadata_mode='merge'
+            )
+
+        msg = str(excinfo.value)
+        assert 'additive' in msg, (
+            f"message must point the caller at the 'additive' escape hatch; got: {msg!r}"
+        )
+        # The unsafe write must NOT have reached the wire.  This is the
+        # load-bearing difference between raising and logging a WARNING.
+        assert captured_args == [], (
+            f'A rejected update_task must not reach the wire; got: {captured_args}'
+        )
+        # NB: as with the sibling backend guard, deliberately do NOT assert on
+        # the incident number or the full prose — the load-bearing contract is
+        # that the caller is told about the actionable 'additive' resolution.
+
+    @pytest.mark.asyncio
+    async def test_update_task_merge_plus_truthy_non_bool_append_raises(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A TRUTHY non-bool append is rejected alongside 'merge' too, not just ``True``.
+
+        The guard and the mode resolver it protects must agree on what counts
+        as additive intent.  The resolver reads ``'additive' if append`` —
+        plain truthiness — so an identity check (``append is True``) would let
+        ``append=1`` (a dict-splat, or a flag round-tripped through JSON) slip
+        past the guard while STILL reading as additive intent to the resolver,
+        which would then resolve to 'merge' and forward the exact shallow
+        clobber this rejection exists to prevent.  ``append`` is annotated
+        ``bool``, so this is a narrow hole rather than a live caller, but the
+        identity check bought nothing over truthiness: falsy ``append`` is
+        untouched either way, so the one-cell narrowness is preserved.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        with pytest.raises(ValueError) as excinfo:
+            await scheduler.update_task(
+                '1',
+                {'files': ['backend']},
+                append=1,  # type: ignore[arg-type]  # truthy non-bool, on purpose
+                metadata_mode='merge',
+            )
+
+        assert 'additive' in str(excinfo.value)
+        assert captured_args == [], (
+            f'A rejected update_task must not reach the wire; got: {captured_args}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_explicit_merge_without_append_forwards_merge(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """An explicit metadata_mode='merge' with append omitted is honored.
+
+        Non-regression cell pinning the guard's narrowness: it rejects only a
+        TRUTHY ``append``, so the default-safe explicit-merge path (the #4271
+        contract) — where ``append`` defaults to falsy — is untouched.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', {'files': ['backend']}, metadata_mode='merge')
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert arguments.get('metadata_mode') == 'merge', (
+            f"Explicit metadata_mode='merge' must be forwarded; got: {arguments}"
+        )
+        assert 'append' not in arguments
+
+    @pytest.mark.asyncio
+    async def test_update_task_replace_plus_append_true_forwards_replace(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """('replace', append=True) stays honored — explicit metadata_mode wins.
+
+        Non-regression cell: ``'replace'`` is the sanctioned destructive
+        co-signal, and the contradictory-pair guard is exactly one cell wide,
+        so this combination must keep resolving to 'replace'.
         """
         captured_args: list[dict] = []
 
@@ -1571,15 +1794,147 @@ class TestUpdateTaskMetadataSerialization:
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
 
         await scheduler.update_task(
-            '1', {'files': ['backend']}, append=True, metadata_mode='merge'
+            '1', {'files': ['backend']}, append=True, metadata_mode='replace'
         )
 
         assert len(captured_args) == 1
         arguments = captured_args[0]['arguments']
-        assert arguments.get('metadata_mode') == 'merge', (
-            f"Explicit metadata_mode='merge' must win over append=True; got: {arguments}"
+        assert arguments.get('metadata_mode') == 'replace', (
+            f"Explicit metadata_mode='replace' must win over append=True; got: {arguments}"
         )
         assert 'append' not in arguments
+
+    @pytest.mark.asyncio
+    async def test_update_task_additive_plus_append_true_forwards_additive(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """('additive', append=True) stays honored — the two signals agree.
+
+        Non-regression cell: this pair is not a contradiction at all (both mean
+        the recursive union merge), so the guard must not sweep it up.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task(
+            '1', {'files': ['backend']}, append=True, metadata_mode='additive'
+        )
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert arguments.get('metadata_mode') == 'additive', (
+            'append=True alongside metadata_mode=\'additive\' must forward '
+            f"'additive'; got: {arguments}"
+        )
+        assert 'append' not in arguments
+
+
+class TestFakeMetadataBackendMirrorsUpdateTaskRejection:
+    """The shared workflow test double must mirror Scheduler.update_task's rejection.
+
+    ``FakeMetadataBackend`` (tests/_workflow_helpers.py) advertises — in both
+    its class docstring and an inline comment — that it models
+    ``Scheduler.update_task``'s precedence exactly.  Left unfixed after the
+    contradictory-pair guard landed, that claim would be false for the
+    merge+append=True cell: the fake would still resolve it to 'merge' and
+    shallow-overwrite its blob, letting a future workflow test "prove" backend
+    state that production now refuses to produce.  These tests sit beside the
+    production contract in ``TestUpdateTaskMetadataSerialization`` above so the
+    two cannot drift apart again.
+
+    The fake no longer restates the condition — it calls production's own
+    ``_reject_contradictory_metadata_mode`` — so the drift is closed BY
+    CONSTRUCTION rather than by these tests happening to cover today's single
+    cell.  ``test_fake_metadata_backend_delegates_to_production_guard`` pins
+    that delegation; the behavioural tests below then confirm the fake calls it
+    at the right moment (before recording or mutating) and that its narrowness
+    carries through.
+    """
+
+    def test_fake_metadata_backend_delegates_to_production_guard(self):
+        """The fake's guard IS the production guard — not a hand-copied mirror.
+
+        Load-bearing: a copied condition drifts silently the moment production's
+        rule is narrowed or widened (say, to reject another contradictory pair),
+        leaving the double over-permissive again — the exact
+        test-infrastructure-lies-about-production failure class this guard
+        exists to close.  Binding the same function object means a future change
+        lands in both callers at once.
+        """
+        import _workflow_helpers
+
+        from orchestrator.scheduler import _reject_contradictory_metadata_mode
+
+        assert (
+            _workflow_helpers._reject_contradictory_metadata_mode
+            is _reject_contradictory_metadata_mode
+        ), (
+            'FakeMetadataBackend must call production\'s '
+            '_reject_contradictory_metadata_mode, not a local restatement of it'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fake_metadata_backend_merge_plus_append_true_raises(self):
+        """The fake rejects the contradictory pair, and refuses the write outright."""
+        from _workflow_helpers import FakeMetadataBackend
+
+        initial = {'memory_hints': {'entities': ['Scheduler'], 'queries': ['locking']}}
+        backend = FakeMetadataBackend(initial)
+
+        with pytest.raises(ValueError) as excinfo:
+            await backend.update_task(
+                '1', {'memory_hints': {'entities': ['stub']}},
+                append=True, metadata_mode='merge',
+            )
+
+        assert 'additive' in str(excinfo.value), (
+            "message must point the caller at the 'additive' escape hatch; "
+            f'got: {str(excinfo.value)!r}'
+        )
+        # A refused write must leave backend STATE untouched — the fake must not
+        # half-apply before refusing.  This is the fake's analogue of the
+        # production test's `captured_args == []`.
+        assert backend.blob == initial, (
+            f'A rejected update_task must not mutate the blob; got: {backend.blob}'
+        )
+        assert backend.update_task_calls == [], (
+            'A rejected update_task must not be recorded as a write; '
+            f'got: {backend.update_task_calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fake_metadata_backend_additive_plus_append_true_still_merges(self):
+        """('additive', append=True) still performs the additive union on the fake.
+
+        Non-regression cell pinning that the fake's guard is exactly as narrow
+        as the scheduler's — this pair is not a contradiction, both signals mean
+        the same recursive-union merge.
+        """
+        from _workflow_helpers import FakeMetadataBackend
+
+        backend = FakeMetadataBackend(
+            {'memory_hints': {'entities': ['Scheduler'], 'queries': ['locking']}}
+        )
+
+        result = await backend.update_task(
+            '1', {'memory_hints': {'entities': ['ModuleLockTable']}},
+            append=True, metadata_mode='additive',
+        )
+
+        assert result is True
+        # Recursive union: the incoming entity is added, the untouched
+        # sibling 'queries' key survives.
+        assert backend.blob == {
+            'memory_hints': {
+                'entities': ['Scheduler', 'ModuleLockTable'],
+                'queries': ['locking'],
+            }
+        }, f'Expected an additive union; got: {backend.blob}'
 
 
 class TestUpdateTaskStructuredRejection:
@@ -4835,6 +5190,258 @@ class TestBlastRadiusRefinement:
         assert result != [f'task-{tid}'], (
             f'_get_modules must NOT fall back to task-<id> when file-level '
             f'metadata is present; got {result!r}'
+        )
+
+
+class TestBlastRadiusRequeueEmitsRelease:
+    """The blast-radius acquire-failure requeue must free its locks through
+    ``Scheduler.release`` — the single writer, and the only path that emits a
+    full-release ``lock_released`` (contract C5, task 3818).
+
+    Why the bare ``self.lock_table.release(task_id)`` bypass this pins
+    against was a stuck-lock hazard rather than a merely-silent release is
+    written up once, in
+    orchestrator/tests/test_lock_release_single_writer_guard.py's module
+    docstring.  These tests pin its observable consequences.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        event_store = _RecordingEventStore()
+        sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        sched.finish_startup()
+        return sched
+
+    # Task '936' holds lib.rs while 'other' holds the conformance.rs it needs,
+    # so try_acquire_additional must fail and drive the requeue branch.
+    # Mirrors test_acquire_failure_persists_sanitized_files' contention recipe.
+    HELD = 'crates/reify-compiler/src/lib.rs'
+    NEEDED = 'crates/reify-compiler/src/conformance.rs'
+
+    @staticmethod
+    def _arrange_contention(scheduler: Scheduler) -> None:
+        lt = scheduler.lock_table
+        assert lt.try_acquire(
+            '936', [TestBlastRadiusRequeueEmitsRelease.HELD]
+        )
+        assert lt.try_acquire(
+            'other', [TestBlastRadiusRequeueEmitsRelease.NEEDED]
+        )
+        # Mocked for hermeticity (no network I/O), as the sibling class does.
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    @staticmethod
+    async def _requeue(scheduler: Scheduler) -> bool:
+        return await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=[TestBlastRadiusRequeueEmitsRelease.HELD],
+            needed=[TestBlastRadiusRequeueEmitsRelease.NEEDED],
+        )
+
+    @staticmethod
+    def _lock_released_events(scheduler: Scheduler) -> list[tuple[str, dict]]:
+        event_store = scheduler.event_store
+        assert event_store is not None
+        return [
+            e for e in event_store.events  # type: ignore[attr-defined]
+            if e[0] == str(EventType.lock_released)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_lock_released_payload_carries_held_modules(
+        self, scheduler: Scheduler
+    ):
+        """The requeue emits exactly one lock_released, naming the modules the
+        task actually held.
+
+        An empty/missing `modules` list is the stuck-lock artifact: a consumer
+        pairing lock_acquired with lock_released can never close the hold.
+        """
+        self._arrange_contention(scheduler)
+        depth = scheduler.config.lock_depth
+        expected = [normalize_lock(self.HELD, depth)]
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        released = self._lock_released_events(scheduler)
+        assert len(released) == 1, (
+            'the blast-radius requeue must emit exactly one lock_released '
+            f'(routing through Scheduler.release); got {released}'
+        )
+        assert released[0][1]['task_id'] == '936'
+        assert released[0][1]['data'].get('modules') == expected, (
+            'lock_released must carry the modules held at release time; got '
+            f'{released[0][1]["data"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_teardown_release_after_requeue_still_emits_exactly_once(
+        self, scheduler: Scheduler
+    ):
+        """Exactly one lock_released per acquire across requeue AND teardown.
+
+        The requeue returns False, and the workflow then runs its ordinary
+        slot-exit ``scheduler.release(task_id)``.  That second call must find
+        nothing held and stay silent, so a consumer pairing lock_acquired with
+        lock_released sees exactly one close — not two, and (the bypass's
+        actual failure mode, where the emptied _held made *both* releases
+        silent) not zero.
+        """
+        self._arrange_contention(scheduler)
+        depth = scheduler.config.lock_depth
+        expected = [normalize_lock(self.HELD, depth)]
+
+        ok = await self._requeue(scheduler)
+        assert ok is False
+
+        # The teardown release the workflow runs when the slot exits.
+        scheduler.release('936')
+
+        released = [
+            e for e in self._lock_released_events(scheduler)
+            if e[1]['task_id'] == '936'
+        ]
+        assert len(released) == 1, (
+            'requeue + teardown must close the hold exactly once; got '
+            f'{released}'
+        )
+        assert released[0][1]['data'].get('modules') == expected, (
+            'the single emit must be the requeue\'s, carrying the held '
+            f'modules; got {released[0][1]["data"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_write_failure_keeps_locks_held_and_silent(
+        self, scheduler: Scheduler
+    ):
+        """The complementary half of INV-6: a failed status write must NOT
+        release.
+
+        When ``set_task_status`` exhausts its retries the branch early-returns
+        with the locks deliberately still held, so the modules stay reserved
+        for a task that is still nominally in-progress and the next reconcile
+        can revert it.  Since the reroute this is the *only* path that leaves
+        the task dispatched-and-locked, so a refactor that hoisted the release
+        above the try/except — or added one inside the handler — would
+        silently free locks under a running task.
+        """
+        self._arrange_contention(scheduler)
+        scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('backend unreachable')
+        )
+        scheduler._dispatched.add('936')
+        scheduler._dispatched_priority['936'] = 'medium'
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        # Non-vacuity: the branch under test is only reached if the status
+        # write was actually attempted (and raised) — without this the
+        # still-held / still-dispatched assertions below would also pass if
+        # the requeue had bailed out earlier for an unrelated reason.
+        assert scheduler.set_task_status.await_count == 1, (  # type: ignore[attr-defined]
+            'the status write must have been attempted and raised; got '
+            f'{scheduler.set_task_status.await_count} awaits'  # type: ignore[attr-defined]
+        )
+        assert scheduler.lock_table.is_held('936'), (
+            'locks must stay held when the status write fails, else another '
+            'task claims the modules of a still-in-progress task'
+        )
+        assert self._lock_released_events(scheduler) == [], (
+            'no lock_released may be emitted on the status-write-failed path'
+        )
+        assert '936' in scheduler._dispatched, (
+            'the task stays dispatched for reconcile to recover'
+        )
+        assert '936' not in scheduler._requeue_until, (
+            'no requeue happened, so no cooldown may be armed'
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_write_precedes_lock_release(
+        self, scheduler: Scheduler
+    ):
+        """INV-6: the status write stays AHEAD of the release.
+
+        Recorded as one interleaved sequence rather than inferred from the
+        line's textual position, so a future refactor that hoists the release
+        above the status write fails here instead of silently letting an
+        observer see a freed lock on a still-in-progress task.
+        """
+        self._arrange_contention(scheduler)
+        order: list[str] = []
+
+        def _note_status(*_args, **_kwargs) -> None:
+            order.append('status')
+
+        scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_note_status
+        )
+
+        event_store = scheduler.event_store
+        assert event_store is not None
+        real_emit = event_store.emit
+
+        def _spy_emit(event_type, **kwargs) -> None:
+            if str(event_type) == str(EventType.lock_released):
+                order.append('release')
+            return real_emit(event_type, **kwargs)
+
+        event_store.emit = _spy_emit  # type: ignore[method-assign]
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        assert 'status' in order, f'set_task_status was never awaited; got {order}'
+        assert 'release' in order, (
+            f'no lock_released was emitted during the requeue; got {order}'
+        )
+        assert order.index('status') < order.index('release'), (
+            'the status write must precede the lock release so no observer '
+            f'sees a freed lock on a still-in-progress task; got {order}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_requeue_clears_dispatch_guard_and_arms_cooldown(self):
+        """The reroute also restores the dispatch-guard clear and arms the
+        existing anti-hot-loop requeue cooldown.
+
+        Built with an injected clock (test_harness_reblock_guard's idiom)
+        rather than the class fixture so the deadline is deterministic.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        clock = [1000.0]
+        scheduler = Scheduler(
+            config,
+            event_store=_RecordingEventStore(),  # type: ignore[arg-type]
+            time_source=lambda: clock[0],
+        )
+        scheduler.finish_startup()
+        self._arrange_contention(scheduler)
+        # Model a live dispatch that the requeue must retract.
+        scheduler._dispatched.add('936')
+        scheduler._dispatched_priority['936'] = 'medium'
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        assert '936' not in scheduler._dispatched, (
+            'the requeue must clear the dispatch guard, else _eligible_for_'
+            'dispatch refuses the task forever'
+        )
+        assert '936' not in scheduler._dispatched_priority
+        assert scheduler._requeue_until.get('936') == pytest.approx(
+            1000.0 + config.requeue_cooldown_secs
+        ), (
+            'the requeue must arm the cooldown so the scheduler cannot '
+            're-dispatch straight back into the same contention; got '
+            f'{scheduler._requeue_until.get("936")!r}'
         )
 
 

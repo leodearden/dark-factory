@@ -46,6 +46,11 @@ FIXED_RECON_SUMMARY = (
 pytestmark = [
     qdrant_skipif(),
     pytest.mark.timeout(60),
+    # Whole module is a real, isolated-Qdrant probe (never a merge-lane gate):
+    # belongs in the integration/offline lane per task 3019 / the
+    # integration-test-lane PRD. fused-memory's `-m 'not integration'`
+    # addopts then deselects it from the merge lane's post-merge sweep.
+    pytest.mark.integration,
 ]
 
 
@@ -195,7 +200,6 @@ async def test_identical_infer_false_writes_all_land_distinct(
         await backend.close()
 
 
-@pytest.mark.integration
 @pytest.mark.skipif(not os.environ.get('OPENAI_API_KEY'), reason='real embedder needs OPENAI_API_KEY')
 @pytest.mark.asyncio
 async def test_identical_writes_land_with_real_openai_embeddings(

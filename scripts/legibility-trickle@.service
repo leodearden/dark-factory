@@ -12,6 +12,19 @@ WorkingDirectory=/home/leo/src/dark-factory
 # "__main__"` guard), but PYTHONPATH is set explicitly too so `from legibility
 # import ...` resolves even if that self-bootstrap ever changes.
 Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
+# coder.py's _invoke_cli resolves the CLI as `claude_bin or
+# os.environ.get('LEGIBILITY_CLAUDE_BIN') or 'claude'`, so without this pin the
+# bare name is execvp-resolved against whatever PATH the `systemd --user`
+# manager happens to hold. On 2026-08-18 that manager started at boot
+# (08:58:30, linger) with NO ~/.local/bin on PATH -- the graphical login that
+# imports ~/.profile came 84 minutes later -- and the timer's Persistent=true
+# catch-up run fired into exactly that window, ENOENT'ing 6/6 selected digests
+# on reify and 38/38 on dark_factory in about one second. Mirrors this unit's
+# existing choice of an absolute /home/leo/.local/bin/uv in ExecStart. This
+# ALSO covers the census grandchild: nightly.py launches census.py via
+# `subprocess.run([...], check=False)` with no `env=` kwarg, so the child
+# inherits this Environment.
+Environment=LEGIBILITY_CLAUDE_BIN=/home/leo/.local/bin/claude
 ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal
 StandardError=journal

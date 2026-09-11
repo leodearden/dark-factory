@@ -446,3 +446,106 @@ def test_cancel_handler_not_found_does_not_fan_out(two_url_client):
     assert resp.json() == mcp_result
     assert mock_mcp.call_count == 1
     assert mock_mcp.call_args.args[1] == 'http://localhost:9000'
+
+
+# ---------------------------------------------------------------------------
+# Task 4133: the 502 detail must name the exception type exactly once
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('exc', 'type_name'),
+    [
+        pytest.param(httpx.ConnectError('refused'), 'ConnectError', id='ConnectError'),
+        pytest.param(
+            httpx.TimeoutException('timed out'), 'TimeoutException', id='TimeoutException'
+        ),
+        pytest.param(
+            httpx.HTTPStatusError(
+                'server error',
+                request=httpx.Request('POST', 'http://x'),
+                response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
+            ),
+            'HTTPStatusError',
+            id='HTTPStatusError',
+        ),
+    ],
+)
+def test_cancel_handler_502_detail_names_the_type_exactly_once(client, exc, type_name):
+    """The user-visible 502 detail must not carry a doubled type prefix.
+
+    _call hand-formats 'Type: message' and re-raises it; first_success then
+    renders THAT through describe_exc, which unconditionally prepends the
+    re-raised exception's own type name. A bare ValueError re-raise therefore
+    reached the operator (and the dashboard's offline pill) as
+    'http://...: ValueError: ConnectError: refused'.
+    """
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=exc)):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    assert resp.status_code == 502
+    detail = resp.json().get('detail', '')
+
+    assert detail.count(f'{type_name}:') == 1, (
+        f'the real cause must be named exactly once, got {detail!r}'
+    )
+    assert f'ValueError: {type_name}' not in detail, (
+        f'the type prefix must not be doubled, got {detail!r}'
+    )
+    assert str(exc) in detail, (
+        f'the underlying message must survive the fix, got {detail!r}'
+    )
+    # No '<Type>: <Type>:' doubling of any shape.
+    assert 'PreformattedFanoutError' not in detail, (
+        f'the marker type is an internal signal, not operator-facing text, got {detail!r}'
+    )
+
+
+def test_cancel_handler_call_site_warning_is_unaffected(client, caplog):
+    """The call-site WARNING still logs the raw exc, exactly once per failing URL.
+
+    log_failures=False keeps reporting solely at the call site; the single-prefix
+    fix must not add a second mcp_fanout report or alter the call-site text.
+
+    Both assertions filter to *cancel_ticket* records rather than counting the
+    whole caplog stream: the client fixture runs the full app lifespan, whose
+    _metrics_loop fans out list_tickets/get_status/get_queue_stats/
+    get_curator_state/fetch_statuses against the same unreachable URL in the
+    background, each emitting its own dashboard.data.mcp_fanout WARNING (and a
+    'dashboard.app' one on the outer except).  Whether those land before this
+    request returns is a timing accident, so an unfiltered count would be
+    flaky on a loaded box — the same reason test_invalid_ticket_id_returns_400
+    filters handler calls from background ones.
+    """
+    exc_msg = 'connection refused: port 8002'
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError(exc_msg))),
+        caplog.at_level(logging.DEBUG),
+    ):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    assert resp.status_code == 502
+
+    app_warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and r.name == 'dashboard.app'
+        and r.getMessage().startswith('cancel_ticket failed for')
+    ]
+    assert len(app_warnings) == 1, (
+        f'exactly one report per failing URL, from the call site, got {app_warnings}'
+    )
+    assert f'cancel_ticket failed for http://localhost:8002: {exc_msg}' == app_warnings[0], (
+        f'the call site still logs the RAW exc, untruncated and unprefixed, '
+        f'got {app_warnings[0]!r}'
+    )
+    assert not [
+        r for r in caplog.records
+        if r.name == 'dashboard.data.mcp_fanout' and 'cancel_ticket' in r.getMessage()
+    ], 'log_failures=False must still leave reporting entirely to the caller'

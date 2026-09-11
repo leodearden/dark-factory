@@ -45,31 +45,207 @@ DISALLOW_TASK_WRITES = [
 ]
 
 # Memory write tools (disallowed in Stage 3 — read-only integrity check)
+#
+# update_memory (task 3088, esc-3623-3) is an in-place SILENT-REWRITE primitive
+# — it changes what a Mem0 record says while preserving its point id and
+# created_at — and shipped unclassified: it was in NO disallow list at all, so
+# Stage 3 (the read-only integrity check) was neither denied it here nor
+# turned away by the mem0_update authz gate, whose shipped default
+# content_amend_allowed_agent_prefixes=['recon-stage-', 'curator-'] admits
+# every recon stage's f'recon-stage-{stage_id}' agent_id via its recon-stage-
+# entry (curator-, added for the interactive consolidation sitting per
+# esc-3524-1, matches no recon stage and does not move this reasoning).
+# Stage 1 and Stage 2 KEEP the
+# tool because neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED (below) folds
+# DISALLOW_MEMORY_WRITES — the very asymmetry the AMEND_AND_EPISODE_TOOLS_BLOCK
+# prompt addition (prompts/__init__.py) now advertises.
 DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_episode',
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__delete_memory',
+    'mcp__fused-memory__update_memory',
+    # consolidate_memories (task 3133) is classified in the SAME change that
+    # adds the tool, deliberately: it writes a canonical, patches N retained
+    # peers, re-homes their children and DELETES its supersedes, so shipping
+    # it unlisted would repeat the update_memory incident above with a larger
+    # blast radius. Stage 1's ADVERTISEMENT of the op is task 3134's — this
+    # is the safety classification, which belongs with the tool.
+    'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__delete_episode',
+    'mcp__fused-memory__redact_episode_content',
     'mcp__fused-memory__replay_to_graphiti',
     'mcp__fused-memory__replay_dead_letters',
     'mcp__fused-memory__refresh_entity_summary',
     'mcp__fused-memory__set_entity_summary',
     'mcp__fused-memory__rename_entity',
     'mcp__fused-memory__merge_entities',
+    'mcp__fused-memory__reassign_edge',
     'mcp__fused-memory__delete_entity',
     'mcp__fused-memory__rebuild_entity_summaries',
     'mcp__fused-memory__update_edge',
+    # ensure_entity_node (task 4932) is the identity-MINT primitive — strictly
+    # more CREATIVE than every sibling in this list, all of which only mutate or
+    # remove an ALREADY-EXISTING node. It is classified in the SAME change that
+    # adds the tool, deliberately, so it does not repeat the update_memory
+    # incident the block comment at the head of this list records.
+    #
+    # The tool-level denial here is LOAD-BEARING, not redundant with the tool's
+    # own authorization gate: the shipped
+    # entity_mint.allowed_agent_prefixes=['recon-stage-', 'curator-']
+    # (config/schema.py::EntityMintConfig) admits every reconciliation stage's
+    # canonical f'recon-stage-{stage_id}' agent_id (reconciliation/stages/base.py,
+    # reconciliation/stage_stats.py), so
+    # server/entity_mint_authz.py::resolve_entity_mint_authorization ALONE would
+    # NOT turn Stage 3 away — the same two-layer gap the update_memory incident
+    # describes, where a write primitive was in no disallow list AND was admitted
+    # by an allowlist whose default covers every recon stage.
+    #
+    # And nothing sweeps orphan minted nodes (as server/entity_mint_authz.py and
+    # the tool docstring both state), so a Stage 3 mint would leave a durable,
+    # un-reversed artifact — created by the stage that is read-only by contract
+    # and that is itself the DETECTOR of identity anomalies, collapsing
+    # detect-and-repair into one unaccountable actor. That is the same rationale
+    # the repair_memory_citation carve-out below records.
+    #
+    # Stage 1 and the curator are the sanctioned callers, so STAGE1_DISALLOWED
+    # and STAGE2_DISALLOWED are deliberately untouched (neither folds this list).
+    # Stage 1's ADVERTISEMENT of the op in the stage prompts is separate work —
+    # the same split the consolidate_memories entry above records for task 3134;
+    # this is the safety classification, which belongs with the tool.
+    'mcp__fused-memory__ensure_entity_node',
+]
+
+# Recon-report tools that perform DURABLE writes (disallowed outside Stage 2).
+# task 2895 β: write_entity_standing_decision is the first recon-report tool that
+# writes past in-process ReconReportState — it upserts a row into the durable
+# SQLite reconciliation ledger. It must be blocked in Stage 1 and Stage 3 but
+# remain callable in Stage 2 (where the entity standing decision is authored), so
+# it rides its own additive sublist rather than DISALLOW_MEMORY_WRITES (which
+# would miss Stage 1) or DISALLOW_TASK_WRITES (semantically wrong).
+DISALLOW_RECON_REPORT_LEDGER_WRITES = [
+    'mcp__recon-report__write_entity_standing_decision',
+]
+
+# Recon-report tools that write to the reconciliation JOURNAL (disallowed in
+# Stage 3 only).
+# task 3065: repair_memory_citation is the second recon-report tool that writes
+# past in-process ReconReportState — it rewrites the durable `runs.stage_reports`
+# blob of an ALREADY-COMPLETED run, to re-point or drop a cited memory id that no
+# longer resolves. It is a SEPARATE sublist from the ledger writes above because
+# the journal is not the ledger: same class of hazard, different store, and
+# keeping them distinct keeps each name honest and each stage's grant
+# independently adjustable.
+#
+# Denied in Stage 3 alone. Stage 3 (integrity_check) is read-only by contract AND
+# is the stage that DETECTS a dangling cross-run citation; letting it also repair
+# would break that contract and collapse detect-and-repair into one unaccountable
+# actor. Stage 1 keeps it because Stage 1 is where a supersession deletes the
+# predecessor memory — i.e. where cross-run citations become dangling in the
+# first place — and it is already citation_verifier's own caller, so repair-at-
+# source belongs there. Stage 2 keeps it because Stage 2 is the remediation stage
+# whose blocked repair attempt originated this task.
+DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
+    'mcp__recon-report__repair_memory_citation',
+]
+
+# Escalation READ tools (disallowed in every stage — task 3163,
+# plans/escalation-store-ambiguity-prd.md task α).
+#
+# A stage's `escalation` MCP server is wired to the RECONCILIATION escalation
+# queue, never to a project's queue: harness.py `_start_escalation_server`
+# builds it over `config.escalation_queue_dir` and publishes the resulting URL,
+# which stages/base.py injects as the stage's `escalation` server. So a stage
+# asking "was an escalation ever filed for task X?" gets [] CATEGORICALLY — the
+# per-task record it is looking for lives in a different store and was never in
+# this one. That is not a race, and three incidents read the empty result as
+# positive proof of absence. Denying the read tools removes the false answer at
+# the source; the boundary paragraph in the stage prompts
+# (prompts/__init__.py ESCALATION_BOUNDARY_NOTE) explains the absence.
+#
+# The escalation WRITE tool (escalate_blocker) is deliberately NOT denied: it is
+# the sole sanctioned recon escalation use — Stage 2's Stale Flag Escalation
+# (FIX D) — and it writes to the reconciliation store, which is the correct
+# destination for it. Over-denying here breaks FIX D.
+#
+# PRD open question 4 (reject-vs-omit) resolved during α: `--disallowed-tools`
+# OMITS a denied MCP tool from the agent's tool listing rather than surfacing it
+# and rejecting the call. Verified against five live recon-stage transcripts
+# whose `deferred_tools_delta` → `addedNames` payload excludes exactly each
+# stage's denied names (Stage 3: 80 tools, no builtins / delete_entity /
+# submit_task; Stage 1: 93, no submit_task; Stage 2: 100, builtins only). Because
+# it is omission and not rejection, the agent gets no explanation for the missing
+# tool — which is what makes ESCALATION_BOUNDARY_NOTE load-bearing rather than
+# decorative.
+# `get_task_escalations` (task 3023) is denied for the SAME reason and is the
+# sharpest case of it: `escalation.server.create_server` backs BOTH escalation
+# servers — the orchestrator queue (port 8102) and the reconciliation queue
+# (port 8103, started by reconciliation/harness.py `_start_escalation_server`)
+# — so registering an archive-inclusive per-task lookup there exposes it to
+# recon stages pointed at the WRONG store. Its own docstring says an empty
+# result IS evidence of absence (true for the queue that server is backed by),
+# so a stage calling it against the reconciliation queue would read a
+# categorical [] as proof that an orchestrator gate record was never written —
+# re-arming the 16-instance false positive this task exists to kill, with more
+# authority than the pending-only probe had. The gating here is a DENY list
+# only (there is no allow-list; `_run_stage(disallowed_tools=...)`), so a new
+# read tool on the shared server is exposed to every stage until it is named
+# here — see test_stages.py::test_every_escalation_server_tool_is_classified,
+# which fails on any unclassified addition.
+#
+# `get_task_escalation_history` (task 3164) is the first tool that guard
+# actually caught, and it is the same hazard intensified. It DELEGATES to
+# `get_task_escalations`, so it inherits the identical archive-inclusive
+# cross-store read — but it wraps the result in an envelope that echoes
+# `task_id` and `level_filter` back to the caller. Against the reconciliation
+# queue that turns a categorical `count: 0` into what reads as an attributable,
+# query-specific answer ("no record was ever filed for this task at this
+# level"), when it is only the artefact of asking the wrong store. A bare []
+# at least looks anonymous; a self-describing zero invites being believed. Both
+# per-task archive-inclusive reads therefore sit adjacent below, as one class.
+DISALLOW_ESCALATION_READS = [
+    'mcp__escalation__get_pending_escalations',
+    'mcp__escalation__get_escalation',
+    'mcp__escalation__get_task_escalations',
+    'mcp__escalation__get_task_escalation_history',
 ]
 
 # Per-stage disallowed lists
-STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_BUILTIN
-STAGE2_DISALLOWED = DISALLOW_BUILTIN  # Memory + task writes are allowed; only built-ins are blocked
-STAGE3_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES + DISALLOW_BUILTIN
-# NOTE: `mcp__recon-report__*` tools are intentionally NOT included in DISALLOW_MEMORY_WRITES
-# or DISALLOW_TASK_WRITES and therefore NOT in STAGE3_DISALLOWED.  These tools write only
-# to in-process ReconReportState (not Graphiti / Mem0 / Taskmaster) so they do not violate
-# Stage 3's read-only contract.  Do NOT add them to either disallow list.
+STAGE1_DISALLOWED = (
+    DISALLOW_TASK_WRITES
+    + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_ESCALATION_READS
+    + DISALLOW_BUILTIN
+)
+# Stage 2 keeps full memory + task write access; only built-ins and the
+# escalation reads are blocked.
+STAGE2_DISALLOWED = DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+STAGE3_DISALLOWED = (
+    DISALLOW_TASK_WRITES
+    + DISALLOW_MEMORY_WRITES
+    + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+    + DISALLOW_ESCALATION_READS
+    + DISALLOW_BUILTIN
+)
+# NOTE: the IN-PROCESS-STATE `mcp__recon-report__*` tools (start_report, add_finding,
+# set_stat, cite_*, complete, …) are intentionally NOT in any disallow list: they write
+# only to in-process ReconReportState (not Graphiti / Mem0 / Taskmaster / the ledger), so
+# they do not violate Stage 3's read-only contract. Do NOT add those to any disallow list.
 # See PRD §9.1 / §11 task γ for the rationale.
+# CARVE-OUT (task 2895 β): write_entity_standing_decision is the exception — the first
+# recon-report tool with a durable SQLite-ledger write. It IS blocked in Stage 1 and
+# Stage 3 (via DISALLOW_RECON_REPORT_LEDGER_WRITES above) and callable only in Stage 2.
+# CARVE-OUT (task 3065): repair_memory_citation is the SECOND such exception — the first
+# recon-report tool that writes to the reconciliation JOURNAL, rewriting the durable
+# `runs.stage_reports` blob of an already-completed run to re-point or drop a cited
+# memory id that no longer resolves. It is denied in Stage 3 ONLY (via
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES above), because Stage 3 is read-only by contract
+# and is the stage that DETECTS dangling citations — detect and repair must not be the
+# same actor. Stage 1 keeps it (Stage 1's supersessions are what strand the citation in
+# the first place, and it already calls citation_verifier); Stage 2 keeps it (it is the
+# remediation stage whose blocked attempt originated the task). The two carve-outs stay
+# on separate sublists on purpose: the ledger and the journal are different stores, and a
+# single list named for one of them would lie about the other.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {
@@ -317,6 +493,12 @@ async def run_stage_via_cli(
     call sites keep today's behavior. BaseStage.run mints/persists the session
     before calling here (mint-before-spawn); this runner stays generic.
 
+    ``config_dir`` is ALSO the sandbox grant (task 4003), not merely a CLI env
+    var: when confinement is on, ``config_dir.path`` is appended to the writable
+    extras so the CLI can actually write the transcript inside it. Setting
+    ``config_dir`` without that grant is the 2026-07-18 defect — the CLI is told
+    where to write and then denied the write, silently.
+
     ``resume_session_id`` / ``resume_delivers_prompt`` (task 2717 σ) are likewise
     forwarded straight to ``invoke_with_cap_retry`` for the startup
     adopt-and-resume path: when set, the stage subprocess ``--resume``s an
@@ -342,12 +524,63 @@ async def run_stage_via_cli(
     # Fail-CLOSED: if confinement is requested but no backend is available,
     # return an error StageResult WITHOUT calling invoke_with_cap_retry (never
     # run an unconfined agent when confinement is explicitly enabled).
+    #
+    # The PER-RUN config dir is granted as a computed writable extra (task 4003).
+    # Without it the CLI cannot write its session JSONL: from task 2744
+    # (2026-07-18) until 2026-08-11 the recon config dir lived under
+    # `recon_config_base_dir(data_dir)` — neither /tmp nor <cwd>/.task, i.e.
+    # outside every writable root either backend grants — so every recon stage
+    # silently produced zero transcripts, the liveness watchdog went inert
+    # (count_transcript_turns returned None) and every cap-retry force-freshed
+    # instead of resuming.
+    #
+    # It is the PER-RUN dir that is granted, NEVER `recon_config_base_dir(...)`:
+    # the base is the root under which EVERY run's `claude-config-<run_id>` (and
+    # its `.credentials.json`) lives, so granting it would hand every recon stage
+    # write access to every other run's OAuth credentials — a capability that
+    # does not exist today. (PRD open question 5 / D7, decided under task 4003's
+    # Amendment finding 1.) The append is deliberate: operator-configured
+    # `sandbox_recon_writable_extras` must survive, never be replaced.
+    #
+    # `TaskConfigDir.__init__` has already mkdir'ed the path by the time
+    # `BaseStage.run` reaches here, which is load-bearing: `landlock_exec._add_path`
+    # returns SILENTLY for a non-existent dir, so a grant issued before creation
+    # would be vacuous.
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None
     if config.sandbox_recon_agents:
+        writable_extras = list(config.sandbox_recon_writable_extras)
+        if config_dir is not None:
+            writable_extras.append(str(config_dir.path))
+        else:
+            # The ONE configuration that bypasses the containment guard, so it
+            # must not be silent. With no config_dir there is nothing to grant
+            # and nothing to verify, and the CLI falls back to the process
+            # default ~/.claude — which NEITHER backend makes writable. That is
+            # the identical silent-transcript-loss shape this grant exists to
+            # end, merely arrived at from the other direction. Unreachable in
+            # production today (BaseStage.run always mints a TaskConfigDir), but
+            # nothing in this runner enforces that and the module's docstrings
+            # now advertise the invariant as machine-checked — so say so rather
+            # than let a future caller rediscover it by three weeks of silence.
+            logger.warning(
+                'Reconciliation sandboxing is ON but this stage was given no '
+                'config_dir: the CLI will fall back to the process-default '
+                '~/.claude, which is NOT in the sandbox writable set, so it can '
+                'write no session transcript (count_transcript_turns -> None, '
+                'liveness watchdog inert, every cap-retry force-freshes). The '
+                'containment check is skipped for this invocation because there '
+                'is no path to check. Pass a TaskConfigDir (BaseStage.run does) '
+                'or set reconciliation.sandbox_recon_agents=false.',
+            )
         try:
             sandbox_wrap = resolve_recon_sandbox_wrap(
                 effective_cwd,
-                list(config.sandbox_recon_writable_extras),
+                writable_extras,
+                # Hand the dir back to the guard so the grant above is VERIFIED,
+                # not merely intended: if a future edit drops the append, the
+                # guard fails closed instead of launching a stage that can never
+                # write a transcript. Policy here, verification there.
+                config_dir=config_dir.path if config_dir is not None else None,
             )
         except RemediationSandboxUnavailable as exc:
             logger.error(

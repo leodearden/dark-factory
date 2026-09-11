@@ -39,6 +39,7 @@ from orchestrator.evals.task_sampler import (
     materialize_reference_diff,
     pin_eval_branch,
     repo_of,
+    repo_of_project,
     resolve_task_commits_from_merge,
     sample_stratified,
     stratification_counts,
@@ -125,11 +126,50 @@ class TestRepoOf:
     def test_reify_project_maps_to_reify(self) -> None:
         assert repo_of(_cand(project='reify')) == 'reify'
 
+    def test_know_live_project_id_maps_to_kl(self) -> None:
+        # Third repo axis (task 3631): know-live task 543 is one of the
+        # fable-trial-v2 hard-pool census candidates, so it must classify.
+        assert repo_of(_cand(project='know_live')) == 'kl'
+
+    def test_know_live_hyphenated_fixture_spelling_maps_to_kl(self) -> None:
+        # Same dual-spelling normalisation as df: fused-memory's project_id
+        # 'know_live' and the fixture-JSON project string 'know-live'.
+        assert repo_of(_cand(project='know-live')) == 'kl'
+
     def test_unknown_project_raises_loudly(self) -> None:
         # Loud-over-silent: repo is a hard stratification axis; an
         # unrecognised project is an error, not a silent default.
         with pytest.raises(ValueError):
             repo_of(_cand(project='some-other-project'))
+
+    def test_still_raises_on_unknown_after_third_axis_added(self) -> None:
+        # Adding kl must not soften the ValueError branch into a default.
+        with pytest.raises(ValueError):
+            repo_of(_cand(project='graphify'))
+
+
+class TestRepoOfProject:
+    """The project → stratum mapping, exposed for callers holding a bare
+    project string (the β1 minting driver builds ids as ``<repo>_task_<id>``).
+    Re-declaring that mapping as a literal is exactly what this exists to
+    prevent, so the two entry points must agree by construction."""
+
+    def test_agrees_with_repo_of_on_every_spelling(self) -> None:
+        for project, expected in (
+            ('dark_factory', 'df'), ('dark-factory', 'df'),
+            ('reify', 'reify'),
+            ('know_live', 'kl'), ('know-live', 'kl'),
+        ):
+            assert repo_of_project(project) == expected, project
+            assert repo_of(_cand(project=project)) == expected, project
+
+    def test_unknown_project_raises_loudly(self) -> None:
+        with pytest.raises(ValueError):
+            repo_of_project('graphify')
+
+    def test_empty_project_raises_rather_than_defaulting(self) -> None:
+        with pytest.raises(ValueError):
+            repo_of_project('')
 
 
 # ---------------------------------------------------------------------------
@@ -290,15 +330,18 @@ class TestSampleStratified:
         assert any('shortfall' in n.lower() for n in result.notes), result.notes
 
     def test_thin_corpus_notes_empty_cells(self) -> None:
-        # The single-cell thin corpus leaves 11 of the 12 axis cells empty;
-        # each empty cell is surfaced (loud-over-silent thin coverage).
+        # The single-cell thin corpus leaves every OTHER axis cell empty, and
+        # each is surfaced (loud-over-silent thin coverage). Derived from the
+        # axis product rather than hardcoded: adding a repo stratum (`kl`,
+        # task 3631) must widen the expectation, not fail a stale count.
+        from orchestrator.evals.task_sampler import _ALL_CELLS
         cands = [
             make_candidate(f't{i}', repo='df', kind='bugfix', path='full')
             for i in range(5)
         ]
         result = sample_stratified(cands, seed=1)
         empty_notes = [n for n in result.notes if 'empty cell' in n.lower()]
-        assert len(empty_notes) == 11, result.notes
+        assert len(empty_notes) == len(_ALL_CELLS) - 1, result.notes
 
     def test_reproducible_for_a_fixed_seed(self) -> None:
         cands = rich_corpus()
@@ -343,6 +386,23 @@ class TestDefaultVerifyCommands:
         cmds = default_verify_commands('reify')
         assert 'cargo test' in cmds['test']
         assert 'clippy' in cmds['lint']
+
+    def test_kl_uses_know_lives_real_gate_commands(self) -> None:
+        # Read from /home/leo/src/know-live/dark-factory-orchestrator.yaml —
+        # test_command / lint_command / type_check_command. know-live is a
+        # Python repo; its lint gate also runs the import-linter.
+        cmds = default_verify_commands('kl')
+        assert set(cmds) == {'test', 'lint', 'typecheck'}
+        assert cmds['test'] == 'uv run pytest -q'
+        assert cmds['lint'] == 'uv run ruff check src/ tests/ && uv run lint-imports'
+        assert cmds['typecheck'] == 'uv run mypy src/'
+
+    def test_kl_returns_a_fresh_copy(self) -> None:
+        # Fresh-copy contract: mutating the returned dict must not poison the
+        # module-level template for the next caller.
+        cmds = default_verify_commands('kl')
+        cmds['test'] = 'mutated'
+        assert default_verify_commands('kl')['test'] == 'uv run pytest -q'
 
     def test_unknown_repo_raises_loudly(self) -> None:
         with pytest.raises(ValueError):
@@ -426,6 +486,23 @@ class TestBuildFixtureRecord:
         assert rec['provenance']['plan_source'] == 'unavailable'
         assert rec['id'] == 'reify_task_99'
         assert rec['project'] == 'reify'
+
+    def test_know_live_candidate_builds_kl_record(self) -> None:
+        # The third repo axis end-to-end: know-live task 543 is a
+        # fable-trial-v2 hard-pool candidate, so _CANONICAL_PROJECT must
+        # resolve 'kl' or build_fixture_record raises KeyError.
+        cand = _cand(
+            task_id='543', project='know_live',
+            project_root='/home/leo/src/know-live',
+            title='know-live 543', description='a brief',
+        )
+        rec = build_fixture_record(
+            cand, _ref(), default_verify_commands('kl'),
+            plan=None, cohort='fable-trial-v2-hard', sampled_at='t',
+        )
+        assert rec['id'] == 'kl_task_543'
+        assert rec['project'] == 'know-live'
+        assert rec['verify_commands'] == default_verify_commands('kl')
 
     def test_record_is_json_serializable(self) -> None:
         # No dataclass / non-JSON types must leak into the emitted fixture.
@@ -540,6 +617,58 @@ def _fixture(
     return rec
 
 
+def _kl_fixture(task_id: str = '543') -> dict:
+    """A know-live fixture, built without ``make_candidate``.
+
+    ``_eval_sampler_fixtures.make_candidate`` only knows the df / reify
+    project spellings, so the third stratum is assembled here through the same
+    real ``build_fixture_record`` path the sampler uses.
+    """
+    cand = CompletedTaskCandidate(
+        task_id=task_id,
+        project='know-live',
+        project_root='/home/leo/src/know-live',
+        title='Add capability to the module',
+        description='',
+        complexity='high',
+        modules=[],
+        pre_commit=f'pre{task_id}',
+        post_commit=f'post{task_id}',
+        merge_sha=f'merge{task_id}',
+    )
+    assert repo_of(cand) == 'kl'
+    return build_fixture_record(
+        cand,
+        ReferenceCapture(
+            post_task_commit=f'post{task_id}', files=1, insertions=2, deletions=0,
+        ),
+        default_verify_commands('kl'),
+        plan=None, cohort='revival-zeta', sampled_at='t', seed=0,
+    )
+
+
+def _table_rows(table: str) -> list[tuple[str, str, str, int]]:
+    """Parse ``format_stratification_table``'s per-cell rows.
+
+    The rows live between the two rule lines; the header above and the TOTAL
+    footer below are excluded, so summing the parsed counts is a real check
+    that the rows account for the footer rather than a restatement of it.
+    """
+    rows: list[tuple[str, str, str, int]] = []
+    seen_rule = False
+    for line in table.splitlines():
+        stripped = line.strip()
+        if stripped and set(stripped) <= {'-', ' '}:
+            if seen_rule:
+                break
+            seen_rule = True
+            continue
+        if seen_rule:
+            repo, kind, path, count = line.split()
+            rows.append((repo, kind, path, int(count)))
+    return rows
+
+
 # Six populated cells the healthy-corpus builder cycles through (matching the
 # cells make_candidate can deterministically synthesise).
 _HEALTHY_CELLS = [
@@ -632,6 +761,24 @@ class TestFormatStratificationTable:
         # Grand total and the plan-captured tally both surface in the table.
         assert '3' in table
         assert 'plan' in table.lower()
+
+    def test_rendered_rows_account_for_every_fixture(self) -> None:
+        # The rows must SUM to the total. `_ALL_CELLS` is built from `_REPOS`,
+        # so a stratum `repo_of` can return but `_REPOS` omits would render no
+        # row while still counting in TOTAL — the fixture would vanish from
+        # the table with the footer silently disagreeing with the rows. That
+        # is the failure this pins, so the corpus deliberately includes a `kl`
+        # fixture (the third stratum, added for the fable-trial-v2 hard pool).
+        fixtures = [
+            _fixture('1', repo='df', kind='bugfix', path='full'),
+            _fixture('2', repo='reify', kind='feature', path='simple'),
+            _kl_fixture('543'),
+        ]
+        counts = stratification_counts(fixtures)
+        assert counts.total == 3
+        rows = _table_rows(format_stratification_table(counts))
+        assert sum(n for *_cell, n in rows) == counts.total, rows
+        assert any(cell[0] == 'kl' for *cell, _n in rows), rows
 
 
 class TestAuditFixtureCorpus:

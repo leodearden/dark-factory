@@ -17,6 +17,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.throughput import utc_hour_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,32 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     attempt_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
+
+-- Task 3049: durable hourly inflow record.  event_buffer rows are DELETEd by
+-- cleanup_drained once they are drained and older than max_age_seconds
+-- (default 3600s), so arrival history otherwise survives ~1 hour, not a week.
+-- cleanup_drained rolls the rows it is about to delete into this aggregate in
+-- the SAME transaction as the DELETE, which is what makes the count exact:
+-- an event is either still live in event_buffer or already counted here,
+-- never both and never neither.  Idempotent DDL, so existing DBs pick the
+-- table up on their next initialize().
+CREATE TABLE IF NOT EXISTS event_arrival_hourly (
+    project_id TEXT NOT NULL,
+    hour_bucket TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, hour_bucket, event_type)
+);
 """
 
 # Maximum number of replay attempts before a deferred write is treated as a poison-pill
 # and permanently dropped (logged at ERROR).
 _MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
+
+# Rows fetched per fetchmany() call when draining cleanup_drained's
+# DELETE ... RETURNING cursor.  Bounds peak memory at O(chunk) instead of
+# O(rows deleted) — see cleanup_drained's docstring for the measurement.
+_CLEANUP_FETCH_CHUNK: int = 10_000
 
 
 class EventBuffer:
@@ -1096,23 +1118,159 @@ class EventBuffer:
     # ── Maintenance ────────────────────────────────────────────────────
 
     async def cleanup_drained(self, max_age_seconds: float = 3600.0) -> int:
-        """Delete drained events older than cutoff, skipping locked projects."""
+        """Delete drained events older than cutoff, skipping locked projects.
+
+        Task 3049: before deleting, roll the very same rows up into
+        ``event_arrival_hourly`` so the project's arrival history survives the
+        DELETE.  This is the only ``DELETE FROM event_buffer`` in the codebase
+        — the single chokepoint where inflow history is destroyed — so rolling
+        up here captures 100% of events regardless of which drain path
+        (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked them.
+
+        The rollup runs inside the SAME ``_txn()`` as the DELETE, and takes its
+        rows FROM that delete via ``DELETE ... RETURNING`` (SQLite >= 3.35,
+        already relied on by ``services/durable_queue.py``).  That is the
+        correctness property: each row is counted exactly once, because it is
+        either still live in ``event_buffer`` (countable directly) or in the
+        aggregate (countable there), never both and never neither.  Deriving
+        the aggregated set from the deletion itself — rather than re-evaluating
+        the same predicate in a separate SELECT — is what makes the two halves
+        structurally incapable of disagreeing, and it halves the scan cost of a
+        sweep that runs every 50s against a table that can hold six-figure row
+        counts after a deep backlog drain.  In particular the lock exclusion is
+        honoured by construction: a locked project's rows are not deleted, so
+        they are not returned, so they are not rolled up — they simply roll up
+        on the later sweep that does delete them.
+
+        This "never both and never neither" guarantee, and the atomicity a
+        mid-sweep fault rolls back to, both assume no *other* ``_txn()``
+        commit lands on the shared connection while this sweep is in
+        flight — ``_txn()`` takes no lock of its own, and ``EventBuffer``'s
+        one aiosqlite connection is shared with the harness's concurrently
+        running per-project tasks, which commit their own ``push``/``drain``
+        transactions independently.  That assumption pre-dates this method,
+        but draining the RETURNING cursor via chunked ``fetchmany`` (below)
+        widens the window it must hold across: the fold now suspends once per
+        chunk (~101 times at N=1,000,000) rather than once after a single
+        ``fetchall()``.  Documented here as an assumption, not claimed as an
+        unconditional invariant.
+
+        A row whose timestamp cannot be parsed is still DELETED; it is only
+        left out of the rollup, with a structured warning naming it.  Bucketing
+        raises ``ValueError`` on a malformed timestamp and this transaction is
+        the ONLY path that prunes the buffer, so letting one poison row abort
+        it would wedge cleanup permanently (the caller logs a WARNING and
+        retries every 50s forever) and grow ``event_buffer`` without bound.
+        Losing one row from an inflow aggregate is a rounding error; losing the
+        only pruning path is an outage.
+
+        The RETURNING cursor is drained through a bounded
+        ``fetchmany(_CLEANUP_FETCH_CHUNK)`` loop rather than a single
+        ``fetchall()``, which keeps peak memory at O(chunk + distinct hour
+        buckets) instead of O(rows deleted).  Measured on CPython 3.13 /
+        aiosqlite 0.22.1 / SQLite 3.50.4 with N = 1,000,000 drained rows
+        folding into 3,336 hour buckets: ``fetchall()`` (the prior shape)
+        took 1 round-trip for a 281 MB tracemalloc peak and +505 MB max RSS
+        over baseline; ``async for`` at aiosqlite's driver-default
+        ``iter_chunk_size=64`` took 15,626 round-trips for a 1.0 MB peak and
+        flat RSS; ``fetchmany(10_000)`` (this method) takes 101 round-trips
+        for a 6.5 MB peak and flat RSS.  ``fetchmany(10_000)`` wins on
+        memory — eliminating the 505 MB spike a single ``fetchall()`` holds
+        under the writer lock — and on round-trips (155x fewer than
+        ``async for``'s default), and is never slower than ``fetchall()``.
+        It is NOT a speedup: run-to-run wall clock spread was 7.5-15.0s
+        across all three shapes, swamping any between-shape difference,
+        because per-row ``sqlite3.Row`` construction and the dict fold
+        dominate, not driver round-trips.  10_000 is the knee of a
+        chunk-size sweep at N=200,000 (1_000 -> 0.7 MB / 201 round-trips,
+        10_000 -> 5.7 MB / 21, 50_000 -> 27.8 MB / 5): each step past it
+        buys back progressively less memory per extra round-trip.  These
+        numbers are host- and version-pinned — re-measure rather than trust
+        them if the driver, SQLite version, or row shape changes materially.
+
+        A connection-wide ``iter_chunk_size`` on ``connect_daemon`` plus
+        ``async for`` was considered and rejected: it is a shared knob that
+        would silently affect every ``async for row in cursor`` on that
+        connection (``_migrate`` has two today), and the bound would live
+        hundreds of lines from the code whose comment explains it.
+
+        Correction to the assumption this method was originally written
+        under: abandoning a ``DELETE ... RETURNING`` cursor early does NOT
+        leave the delete unmodified.  Measured on SQLite 3.50.4: consuming
+        100 of 1,000 RETURNING rows, exiting the cursor, and committing
+        still deleted all 1,000 rows — SQLite runs the DML to completion and
+        stages RETURNING output before emitting the first row.  So the
+        reason to consume the cursor to completion is NOT that the DELETE
+        would otherwise be left half-done; it is that an early exit silently
+        under-counts and under-rolls-up while the rows are already gone,
+        permanently breaking the "never both and never neither" guarantee
+        above with unrecoverable inflow loss.  This is a SQLite
+        implementation detail, not a documented guarantee — re-verify it if
+        the pinned version ever moves.
+
+        Returns:
+            The number of rows deleted — counted from the RETURNING output, so
+            it stays exact regardless of how the driver reports ``rowcount``
+            for a returning statement.
+        """
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
         ).isoformat()
+        counts: dict[tuple[str, str, str], int] = {}
+        deleted_count = 0
         async with self._txn() as db:
-            cursor = await db.execute(
+            async with db.execute(
                 """DELETE FROM event_buffer
                    WHERE status = 'drained'
                      AND timestamp < ?
                      AND project_id NOT IN (
                          SELECT project_id FROM reconciliation_locks
-                     )""",
+                     )
+                   RETURNING project_id, timestamp, event_type""",
                 (cutoff,),
-            )
-            rowcount = cursor.rowcount
-        return rowcount
+            ) as cursor:
+                while True:
+                    # list() bounds at _CLEANUP_FETCH_CHUNK: fetchmany() is
+                    # typed Iterable[Row] like fetchall(), so len() needs a
+                    # Sized (61ae0ee799).
+                    chunk = list(await cursor.fetchmany(_CLEANUP_FETCH_CHUNK))
+                    if not chunk:
+                        break
+                    deleted_count += len(chunk)
+                    for row in chunk:
+                        # Bucket by PARSING, never by a SQL comparison against a
+                        # datetime('now') literal — see throughput's METHOD NOTE:
+                        # event_buffer.timestamp carries an offset and is
+                        # 'T'-separated, so string-comparing it against SQLite's
+                        # space-separated render collapses a whole day into one bucket.
+                        try:
+                            bucket = utc_hour_bucket(row['timestamp'])
+                        except ValueError as exc:
+                            logger.warning(
+                                'event_buffer.rollup_unparseable_timestamp',
+                                extra={
+                                    'project_id': row['project_id'],
+                                    'event_type': row['event_type'],
+                                    'timestamp': row['timestamp'],
+                                    'error': str(exc),
+                                },
+                            )
+                            continue
+                        key = (row['project_id'], bucket, row['event_type'])
+                        counts[key] = counts.get(key, 0) + 1
+
+            if counts:
+                await db.executemany(
+                    """INSERT INTO event_arrival_hourly
+                           (project_id, hour_bucket, event_type, event_count)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(project_id, hour_bucket, event_type)
+                       DO UPDATE SET event_count = event_count + excluded.event_count""",
+                    [(pid, bucket, etype, n) for (pid, bucket, etype), n in counts.items()],
+                )
+
+        return deleted_count
 
     async def request_trigger(self, project_id: str) -> None:
         """Manually request a reconciliation trigger for a project.

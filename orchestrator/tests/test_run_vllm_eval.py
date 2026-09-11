@@ -12,9 +12,11 @@ import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
+import yaml
 
 # Stub out runpod_toolkit BEFORE importing the launcher. The real package has
 # a transitive paramiko dependency that's not installed in the orchestrator
@@ -929,8 +931,8 @@ class TestPerTaskLogFiles:
 # ---------------------------------------------------------------------------
 
 # Bind real time.sleep BEFORE _patch_pod_infra monkeypatches launcher.time.sleep,
-# so helpers that call _REAL_SLEEP directly (test_concurrent_no_result_collision,
-# test_concurrent_stop_on_first_failure_drains, etc.) actually block.
+# so helpers that call _REAL_SLEEP directly (test_concurrent_no_result_collision
+# and other concurrency tests below) actually block.
 _REAL_SLEEP = time.sleep
 
 
@@ -1005,6 +1007,37 @@ def _patch_subprocess_concurrency_probe(
     return state
 
 
+def _release_on_summary(monkeypatch, task_id: str) -> threading.Event:
+    """Return an Event set once the main loop has processed ``task_id``'s
+    summary — a genuine happens-before, not a timing margin.
+
+    ``launcher.log_one_summary`` is called from the refill-at-top /
+    drain-in-body ``while`` loop in the concurrent branch of ``main()``
+    (scripts/run_vllm_eval.py), immediately before the --stop-on-first-failure
+    drain (``remaining = []``), in the same ``for fut in done`` iteration.
+    The submission window can only refill at the top of the NEXT ``while``
+    iteration, which cannot run until this iteration — including the drain —
+    has finished on the main thread. So a worker thread that blocks on the
+    returned Event, and only proceeds once it fires, can never be scheduled
+    ahead of the drain, no matter how CPU scheduling delays thread start.
+
+    Do NOT replace this with a sleep: two prior fixes (b94ae82154,
+    ca05d20ffa) tuned a duration margin against unbounded thread-start
+    latency, and both re-flaked, because completion order here is governed
+    by when a thread starts, not how long its body runs.
+    """
+    event = threading.Event()
+    real = launcher.log_one_summary
+
+    def spy(s):
+        if s.task_id == task_id:
+            event.set()
+        return real(s)
+
+    monkeypatch.setattr(launcher, "log_one_summary", spy)
+    return event
+
+
 def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
     fake_tasks.mkdir(parents=True, exist_ok=True)
     for tid in task_ids:
@@ -1017,6 +1050,105 @@ def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
                 }
             )
         )
+
+
+def _setup_concurrent_fixture(
+    monkeypatch, tmp_path: Path, task_ids: list[str]
+) -> tuple[Path, _FakeClient]:
+    """Shared RESULTS_DIR / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
+    the ordering-sensitive TestConcurrentLoop tests below.
+
+    Returns ``(results_dir, fake_client)``.
+    """
+    results = tmp_path / "results"
+    monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+    monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+    fake_tasks = tmp_path / "tasks"
+    _write_n_task_specs(fake_tasks, task_ids)
+    monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+    fake_client = _patch_pod_infra(monkeypatch)
+    return results, fake_client
+
+
+def _capture_summaries(monkeypatch) -> dict:
+    """Patch launcher.print_summary_table to record the final summaries
+    list under ``captured["summaries"]`` while still calling through."""
+    captured: dict = {}
+    real_print = launcher.print_summary_table
+
+    def capture_print(summaries):
+        captured["summaries"] = summaries
+        return real_print(summaries)
+
+    monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+    return captured
+
+
+def _patch_subprocess_gated(
+    monkeypatch,
+    results: Path,
+    *,
+    fail_task: str,
+    gates: dict,
+) -> tuple[list, list]:
+    """Patch launcher.subprocess.run for the ordering-sensitive drain tests
+    below. Returns ``(attempted, gate_timeouts)``.
+
+    Every fake eval invocation appends its task_id to ``attempted``. If
+    ``task_id`` has an entry in ``gates`` (a ``{task_id: threading.Event}``
+    map, typically built with ``_release_on_summary``), the invocation
+    blocks on that Event before completing — this is how the tests below
+    pin adverse completion order deterministically instead of sleeping.
+    The task matching ``fail_task`` completes as a "blocked" outcome with
+    rc=1; every other task completes as a normal "done" outcome with rc=0.
+
+    Gate waits use a 10 s deadlock backstop, but a failed wait is
+    deliberately NOT asserted here. This closure runs on a
+    ThreadPoolExecutor worker thread, and the production loop wraps
+    ``fut.result()`` in ``except Exception``, converting a raised
+    AssertionError into an ``EvalSummary.crashed(...)`` instead of letting
+    it fail the test — so an assert here would be silently swallowed.
+    Instead, a timed-out task_id is appended to the returned
+    ``gate_timeouts`` list; callers MUST assert ``gate_timeouts == []`` on
+    the main thread, after ``launcher.main(...)`` returns, to actually
+    observe a stuck gate.
+    """
+    attempted: list = []
+    gate_timeouts: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if (
+            isinstance(cmd, list)
+            and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+        ):
+            task_arg = cmd[cmd.index("--task") + 1]
+            config_name = cmd[cmd.index("--config-name") + 1]
+            task_id = Path(task_arg).stem
+            attempted.append(task_id)
+
+            gate = gates.get(task_id)
+            if gate is not None and not gate.wait(timeout=10.0):
+                gate_timeouts.append(task_id)
+
+            results.mkdir(parents=True, exist_ok=True)
+            if task_id == fail_task:
+                _write_result(
+                    results,
+                    task_id,
+                    config_name,
+                    "fail00001",
+                    outcome="blocked",
+                    metrics={"cost_usd": 5.0},
+                )
+                return SimpleNamespace(returncode=1)
+            _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
+            return SimpleNamespace(returncode=0)
+        return subprocess.run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    return attempted, gate_timeouts
 
 
 class TestConcurrentLoop:
@@ -1178,60 +1310,104 @@ class TestConcurrentLoop:
                 f"belonging to a different task"
             )
 
-    def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
-        """Failing task stops the queue but in-flight tasks finish."""
-        results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
-        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
-
+    def test_concurrent_no_stop_flag_attempts_all_tasks_under_adverse_order(
+        self, monkeypatch, tmp_path
+    ):
+        """Discrimination baseline for the --stop-on-first-failure drain
+        tests below: the SAME adverse completion order (df_task_10's summary
+        is processed by the main loop before df_task_11 even starts its
+        body), but WITHOUT --stop-on-first-failure, must attempt all five
+        tasks. This is what proves the narrower attempted sets asserted by
+        the drain tests actually come from the drain, not from some
+        incidental effect of the ordering fixture itself.
+        """
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        fake_tasks = tmp_path / "tasks"
-        _write_n_task_specs(fake_tasks, task_ids)
-        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        captured = _capture_summaries(monkeypatch)
 
-        fake_client = _patch_pod_infra(monkeypatch)
+        # Force the adverse order: df_task_11 cannot even start its body
+        # until the main loop has processed df_task_10's summary. No sleeps
+        # anywhere below — ordering is pinned by the Event, not by duration.
+        released = _release_on_summary(monkeypatch, "df_task_10")
+        attempted, gate_timeouts = _patch_subprocess_gated(
+            monkeypatch,
+            results,
+            fail_task="df_task_11",
+            gates={"df_task_11": released},
+        )
 
-        attempted: list[str] = []
-        attempted_lock_marker: list[str] = []  # for assertion ordering
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+            ]
+        )
 
-        def fake_run(cmd, *args, **kwargs):
-            if (
-                isinstance(cmd, list)
-                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
-            ):
-                task_arg = cmd[cmd.index("--task") + 1]
-                config_name = cmd[cmd.index("--config-name") + 1]
-                task_id = Path(task_arg).stem
-                attempted.append(task_id)
-                attempted_lock_marker.append(task_id)
-                _REAL_SLEEP(0.1)
-                if task_id == "df_task_11":
-                    # Simulate failure: write a "blocked" outcome.
-                    results.mkdir(parents=True, exist_ok=True)
-                    _write_result(
-                        results,
-                        task_id,
-                        config_name,
-                        "fail00001",
-                        outcome="blocked",
-                        metrics={"cost_usd": 5.0},
-                    )
-                    return SimpleNamespace(returncode=1)
-                results.mkdir(parents=True, exist_ok=True)
-                _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
-                return SimpleNamespace(returncode=0)
-            return subprocess.run(cmd, *args, **kwargs)
+        # A stuck gate raises on a worker thread, where the production
+        # loop's `except Exception` around fut.result() would swallow it
+        # into a "crashed" summary instead of failing this test outright
+        # (see _patch_subprocess_gated's docstring) — so both the gate
+        # outcome and the absence of any crashed summary are checked
+        # explicitly here, on the main thread.
+        assert gate_timeouts == [], f"gate(s) never fired: {gate_timeouts}"
+        assert {s.status for s in captured["summaries"]} <= {"done", "blocked"}
+        assert rc == 1  # df_task_11 blocked → non-zero exit
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        assert set(attempted) == set(task_ids)
 
-        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    def test_concurrent_stop_on_first_failure_drains_after_sibling_completion(
+        self, monkeypatch, tmp_path
+    ):
+        """Permanent, deterministic reproduction of the 2026-08-06 /
+        2026-08-07 field failures, which no test previously covered: a
+        non-failing sibling's summary is processed by the main loop before
+        the failing task even starts, so the loop refills EXACTLY once
+        before it observes the failure and drains.
 
-        captured: dict = {}
-        real_print = launcher.print_summary_table
+        Contrast with test_concurrent_no_stop_flag_attempts_all_tasks_under_adverse_order
+        above is the point: it shares this test's df_task_10-before-df_task_11
+        ordering gate and the rest of the fixture, and differs only in the
+        --stop-on-first-failure flag plus the absence of this test's second,
+        drain-specific gate (see ``released_11`` below). No bound-style
+        assertion (<=3, <=4, "the tail is never attempted") could
+        distinguish this outcome from a regression that deleted the drain
+        entirely — see the baseline above, which shows the undrained trace
+        under the shared ordering gate is the full {10..14}. This test is
+        green on arrival: it characterizes already-correct production code
+        (main()'s refill-at-top / drain-in-body loop), it does not fix a
+        bug.
+        """
+        task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
+        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        captured = _capture_summaries(monkeypatch)
 
-        def capture_print(summaries):
-            captured["summaries"] = summaries
-            return real_print(summaries)
-
-        monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+        # Two chained gates, not one. df_task_11 waits for df_task_10's
+        # summary (forces the one-sibling-first order). That alone is NOT
+        # enough to pin the refill count: once df_task_12 is submitted, if
+        # ITS completion were left unguarded it could race ahead of
+        # df_task_11's failure and trigger a SECOND cascading refill
+        # (df_task_13) — this was caught empirically (an earlier version of
+        # this test flaked exactly that way under xdist scheduling delay).
+        # So df_task_12 (and any further refill) additionally waits for
+        # df_task_11's summary before it is allowed to *complete* (it can
+        # still be *submitted* earlier — only its completion is gated),
+        # which pins the drain to have already run before df_task_12
+        # finishes, closing that window.
+        released_10 = _release_on_summary(monkeypatch, "df_task_10")
+        released_11 = _release_on_summary(monkeypatch, "df_task_11")
+        gates = {"df_task_11": released_10}
+        gates.update(
+            {tid: released_11 for tid in ("df_task_12", "df_task_13", "df_task_14")}
+        )
+        attempted, gate_timeouts = _patch_subprocess_gated(
+            monkeypatch, results, fail_task="df_task_11", gates=gates
+        )
 
         rc = launcher.main(
             [
@@ -1247,15 +1423,68 @@ class TestConcurrentLoop:
             ]
         )
 
+        assert gate_timeouts == [], f"gate(s) never fired: {gate_timeouts}"
+        assert {s.status for s in captured["summaries"]} <= {"done", "blocked"}
+        assert rc == 1
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        # One initial wave of 2 (df_task_10, df_task_11) plus exactly one
+        # refill (df_task_12) — derived from the loop's refill-at-top /
+        # drain-in-body structure (see _release_on_summary's docstring), not
+        # fitted to observed output. This is the set a bound-style assertion
+        # cannot tell apart from a no-drain regression.
+        assert set(attempted) == {"df_task_10", "df_task_11", "df_task_12"}
+        summary_ids = {s.task_id for s in captured["summaries"]}
+        assert summary_ids == set(attempted)
+        blocked = [s for s in captured["summaries"] if s.task_id == "df_task_11"]
+        assert blocked and blocked[0].status == "blocked"
+
+    def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
+        """Failing task stops the queue but in-flight tasks finish."""
+        task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
+        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        captured = _capture_summaries(monkeypatch)
+
+        # Load-bearing happens-before (task 3805): see _release_on_summary's
+        # docstring for why this is a genuine happens-before rather than a
+        # timing margin, and why it must not be replaced with a sleep — two
+        # prior fixes (b94ae82154, ca05d20ffa) tried that and both re-flaked.
+        released = _release_on_summary(monkeypatch, "df_task_11")
+        gates = {tid: released for tid in task_ids if tid != "df_task_11"}
+        attempted, gate_timeouts = _patch_subprocess_gated(
+            monkeypatch, results, fail_task="df_task_11", gates=gates
+        )
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+                "--stop-on-first-failure",
+            ]
+        )
+
+        assert gate_timeouts == [], f"gate(s) never fired: {gate_timeouts}"
+        assert {s.status for s in captured["summaries"]} <= {"done", "blocked"}
         assert rc == 1  # one task blocked → non-zero exit
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # Tasks 10 and 11 were the initial wave; 11 failed. Task 12 may or
-        # may not have been picked up depending on scheduling, but 13 and 14
-        # must NOT have been submitted.
-        assert "df_task_10" in attempted
-        assert "df_task_11" in attempted
-        assert "df_task_13" not in attempted
-        assert "df_task_14" not in attempted
+        # Still holds: the loop drains `remaining` on the first observed
+        # failure while in-flight work finishes naturally, so the attempted
+        # set is exactly the initial wave.
+        # Falsified (ca05d20ffa): the old wording here claimed df_task_11
+        # "always wins the FIRST_COMPLETED race against df_task_10 by a wide
+        # margin ... deterministic, with no race window left to tolerate" —
+        # disproven in the field on 2026-08-06 and again on 2026-08-07 under
+        # ~24-way xdist load. See _release_on_summary's docstring for why a
+        # duration margin can't fix this and what replaces it here; see
+        # test_concurrent_stop_on_first_failure_drains_after_sibling_completion
+        # for the deterministic reproduction of the inverted order this test
+        # used to be vulnerable to.
+        assert set(attempted) == {"df_task_10", "df_task_11"}
         # Summaries cover whatever was attempted.
         summary_ids = {s.task_id for s in captured["summaries"]}
         assert summary_ids == set(attempted)
@@ -1516,6 +1745,16 @@ class TestPreflightBaseline:
         monkeypatch.setattr(launcher, "PROJECT_ROOT", repo)
         # See test_strict_policy_aborts_before_pod for why this env var is set.
         monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+        # Unlike the strict case, warn PROCEEDS — so this test runs on past
+        # preflight into `build_eval_env`, which rosters
+        # `PROJECT_ROOT/config/usage-accounts.yaml` and aborts when that
+        # roster resolves no credential (task 4945). PROJECT_ROOT is redirected
+        # to a bare tmp repo above, so the roster and its token have to be
+        # seeded here; without them the run dies on the account precondition
+        # before it can demonstrate anything about the warn policy.
+        (repo / "config").mkdir()
+        (repo / "config" / "usage-accounts.yaml").write_text(_SHARED_POOL_YAML)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "SENTINEL-POOL-B")
 
         fake_client = _patch_pod_infra(monkeypatch)
         _patch_subprocess_run_success(monkeypatch, results)
@@ -1583,7 +1822,13 @@ class TestPreflightBaseline:
 
 
 def _make_summary(status: str, **overrides) -> EvalSummary:
-    defaults = dict(
+    # dict[str, Any]: the literal below is heterogeneous (str/float/bool/Path),
+    # so an inferred `dict[str, str | float | Path]` value type cannot be
+    # distributed across EvalSummary's per-field parameter types under
+    # `EvalSummary(**defaults)` — pyright reports one reportArgumentType error
+    # per field. The annotation is the narrowest fix that keeps `**overrides`
+    # ergonomic; EvalSummary itself stays strictly typed.
+    defaults: dict[str, Any] = dict(
         task_id="df_task_12",
         config_name="cfg",
         status=status,
@@ -1677,7 +1922,11 @@ class TestTearDownPod:
         )
         handle = PodHandle(
             pod=None,
-            tunnel_proc=fake_tunnel,
+            # fake_tunnel is a duck-typed SimpleNamespace stand-in exposing only
+            # the terminate/wait/kill surface tear_down_pod actually uses; it is
+            # deliberately not a real subprocess.Popen, which is what
+            # PodHandle.tunnel_proc declares.
+            tunnel_proc=fake_tunnel,  # type: ignore[arg-type]
             client=_FakeClient(),
             vllm_url="http://localhost:8100",
             local_port=8100,
@@ -1833,3 +2082,331 @@ class TestWaitForVllmModelCheck:
         # Speed this up: patch time.sleep so the 1-second timeout trips fast.
         monkeypatch.setattr(launcher.time, "sleep", lambda _s: None)
         assert not wait_for_vllm(port, expected_model=expected, timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# Pyright scope parity (task 3931 / esc-3805-1, esc-3805-6)
+# ---------------------------------------------------------------------------
+
+
+class TestPyrightScopeParity:
+    """``orchestrator``'s pyright config must resolve repo-root ``scripts/``.
+
+    Task 3931 — the guard for the ROOT-vs-PACKAGE invocation-scope gap that
+    produced esc-3805-1 (2026-08-09) and esc-3805-6 (2026-08-12), closed by
+    break-glass hotfix 27ac22a6a6.
+
+    THIS module's ``import run_vllm_eval`` (line 57, carrying a
+    ``# type: ignore[import-not-found]``) resolves for pyright only when
+    repo-root ``scripts/`` is on pyright's search path. The root
+    ``pyproject.toml``'s ``[tool.pyright] extraPaths`` lists ``scripts``, so
+    ROOT-scoped pyright resolves it and ``EvalSummary``/``PodHandle`` become
+    real types; ``orchestrator/pyproject.toml``'s list did NOT, so
+    PACKAGE-scoped pyright saw ``Unknown`` and reported nothing.
+
+    MEASURED on this branch at pyright 1.1.408, with the hotfix
+    reverse-applied so the defect is present:
+
+      * ``npx pyright orchestrator/tests/test_run_vllm_eval.py`` from the
+        worktree ROOT               -> 14 reportArgumentType errors (first at
+                                       :1827)
+      * ``cd orchestrator && npx pyright tests/test_run_vllm_eval.py``
+                                    -> 0 errors
+
+    That 14-vs-0 divergence is the escalation: verify's FILE_SCOPED fallback
+    path runs pyright from the worktree ROOT, while pre-commit
+    (``hooks/project-checks``) and the fleet chain both run it PACKAGE-scoped,
+    so a defect one gate reports the other cannot see. This test pins the
+    entry that keeps the two scopes in agreement.
+
+    Asserted by RESOLUTION, not by string equality, so ``../scripts`` and any
+    other spelling that lands on the same directory both pass.
+    """
+
+    def test_orchestrator_pyright_extrapaths_resolves_repo_root_scripts(self) -> None:
+        import tomllib
+
+        repo_root = Path(__file__).parents[2]
+        orch_dir = repo_root / "orchestrator"
+        pyproject = tomllib.loads(
+            (orch_dir / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        pyright = pyproject.get("tool", {}).get("pyright")
+        assert pyright is not None, (
+            "orchestrator/pyproject.toml declares no [tool.pyright] table "
+            "(task 3931) — the scope-parity invariant cannot be evaluated"
+        )
+        extra_paths = pyright.get("extraPaths")
+        assert extra_paths, (
+            "orchestrator/pyproject.toml [tool.pyright] declares no extraPaths "
+            "(task 3931) — this invariant would pass vacuously"
+        )
+
+        scripts_dir = (repo_root / "scripts").resolve()
+        resolved = [(orch_dir / entry).resolve() for entry in extra_paths]
+        assert scripts_dir in resolved, (
+            "orchestrator/pyproject.toml [tool.pyright] extraPaths "
+            f"{list(extra_paths)!r} contains no entry resolving to "
+            f"{scripts_dir} (task 3931, esc-3805-1/esc-3805-6). This module's "
+            "`import run_vllm_eval` (line 57) then stays UNRESOLVED for "
+            "package-scoped pyright, so EvalSummary/PodHandle degrade to "
+            "Unknown and every argument-type defect in this 2000-line module "
+            "goes unreported — while the ROOT-scoped verify gate, whose config "
+            "DOES list scripts/, reports them. MEASURED at 1.1.408 with hotfix "
+            "27ac22a6a6 reverse-applied: 14 reportArgumentType errors "
+            "root-scoped, 0 package-scoped. Restore the entry rather than "
+            "narrowing the root config — removing `scripts` from root would "
+            "achieve parity by deleting all type checking of this module "
+            f"instead; resolved: {[str(p) for p in resolved]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# build_eval_env: the eval account roster
+# ---------------------------------------------------------------------------
+
+
+_SHARED_POOL_YAML = """\
+accounts:
+  - name: max-b
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+  - name: max-g
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_G
+"""
+
+
+class TestBuildEvalEnvSharedPool:
+    """``build_eval_env`` must roster the SHARED fleet pool, unmodified.
+
+    Task 4945, discharging the follow-up filed from the 2026-08-30 ruling
+    (task 4741). Account A is Leo's INTERACTIVE account, not an eval
+    reserve: his own sessions exhaust its weekly cap most weeks, so it
+    cannot double as a private eval reserve. Evals have no dedicated
+    account — they draw on the same pool as the rest of the fleet and
+    tolerate cap/429 events via ``invoke_with_cap_retry``'s 48h patience
+    (``orchestrator.evals.runner``) instead.
+
+    The ``USAGE_ACCOUNTS_FILE`` override itself is NOT the defect and is
+    deliberately kept (see the plan's design decision): it is the
+    established cross-project seam for "which roster does this run use",
+    read by ``shared.config_models.UsageCapConfig`` and by reify's own
+    orchestrator config. What is retired is APPENDING max-a to the roster
+    it points at.
+    """
+
+    @staticmethod
+    def _fake_project_root(
+        monkeypatch,
+        tmp_path: Path,
+        dotenv: str = "RUNPOD_API_KEY=rpa_test_fake_key\n",
+        roster: str = _SHARED_POOL_YAML,
+    ) -> Path:
+        """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``.
+
+        THE ``PROJECT_ROOT`` MONKEYPATCH IS HERMETICITY, NOT EVIDENCE OF
+        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant hardcoded
+        to the main checkout; it is redirected here only so a test reads a
+        roster and a ``.env`` it owns instead of the real ones. Nothing in
+        this class should be read as a claim that the launcher resolves its
+        root at runtime — it does not, and ``build_eval_env``'s docstring
+        says so.
+
+        A pool credential is seeded by default because ``build_eval_env``
+        now ABORTS when the roster resolves none (see
+        ``test_a_missing_pool_credential_aborts_the_run``); tests that want
+        a different arrangement re-clear and set their own.
+        """
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "usage-accounts.yaml").write_text(roster)
+        # Exercise the dotenv branch. It overwrites os.environ values into
+        # the returned dict, so the fixture must control its content to keep
+        # the token assertions deterministic; the default body deliberately
+        # sets no CLAUDE_OAUTH_TOKEN_*, leaving monkeypatch.setenv in charge.
+        (tmp_path / ".env").write_text(dotenv)
+        monkeypatch.setattr(launcher, "PROJECT_ROOT", tmp_path)
+        TestBuildEvalEnvSharedPool._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+        return tmp_path
+
+    @staticmethod
+    def _clear_oauth_tokens(monkeypatch) -> None:
+        """Drop every ambient ``CLAUDE_OAUTH_TOKEN_*`` so a case is closed."""
+        for letter in "ABCDEFGH":
+            monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    def test_usage_accounts_file_points_at_the_shared_config(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        root = self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+
+        shared = root / "config" / "usage-accounts.yaml"
+        assert env["USAGE_ACCOUNTS_FILE"] == str(shared), (
+            "build_eval_env must point USAGE_ACCOUNTS_FILE at the repo's own "
+            "shared config/usage-accounts.yaml, not at a generated tempfile "
+            f"(got {env['USAGE_ACCOUNTS_FILE']!r}). Task 4945: the temp-file "
+            "generator existed only to append account A to the roster, which "
+            "the 2026-08-30 ruling retires."
+        )
+
+    def test_roster_contains_no_interactive_account(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+        rostered = yaml.safe_load(
+            Path(env["USAGE_ACCOUNTS_FILE"]).read_text()
+        )["accounts"]
+
+        assert [a.get("name") for a in rostered] == ["max-b", "max-g"], (
+            "the eval roster must be the shared pool verbatim; got "
+            f"{[a.get('name') for a in rostered]!r}"
+        )
+        assert not any(a.get("name") == "max-a" for a in rostered), (
+            "account max-a is reserved for INTERACTIVE use and must never be "
+            f"rostered for an eval run (ruling 2026-08-30, task 4741): {rostered!r}"
+        )
+        assert not any(
+            a.get("oauth_token_env") == "CLAUDE_OAUTH_TOKEN_A" for a in rostered
+        ), (
+            "no eval-rostered account may reference the interactive account's "
+            f"token env var CLAUDE_OAUTH_TOKEN_A: {rostered!r}"
+        )
+
+    def test_shared_roster_file_is_passed_through_byte_identical(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        root = self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+
+        assert Path(env["USAGE_ACCOUNTS_FILE"]).read_bytes() == (
+            root / "config" / "usage-accounts.yaml"
+        ).read_bytes(), (
+            "the launcher must not rewrite, reorder or append to the shared "
+            "roster — pointing at it is the whole mechanism. Order matters: "
+            "UsageGate tries accounts in list order during failover."
+        )
+
+    def test_seed_oauth_token_does_not_prefer_the_interactive_account(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The bootstrap seed must be a POOL credential, never account A.
+
+        ``CLAUDE_CODE_OAUTH_TOKEN`` is only the BOOTSTRAP credential — per
+        invocation account selection is UsageGate's job, driven by the
+        roster in ``USAGE_ACCOUNTS_FILE``. But seeding it from A still
+        spends A on an eval, which is exactly what the 2026-08-30 ruling
+        forbids: A is interactive-only.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_A", "SENTINEL-INTERACTIVE-A")
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+
+        env = launcher.build_eval_env()
+
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "SENTINEL-POOL-G", (
+            "an eval run must bootstrap from a shared-pool credential; got "
+            f"{env['CLAUDE_CODE_OAUTH_TOKEN']!r}. Account A is reserved for "
+            "INTERACTIVE use only (ruling 2026-08-30, task 4741) — Leo's own "
+            "sessions exhaust its weekly cap most weeks, so spending it on an "
+            "eval costs him the account it was held back for."
+        )
+
+    def test_a_missing_pool_credential_aborts_the_run(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """With no pool token, ABORT — a print-and-continue is not loud.
+
+        The first version of this test pinned a warning plus an empty seed.
+        That is not failing loud: nothing stopped, and ``env[...] = ""``
+        additionally clobbered any valid ``CLAUDE_CODE_OAUTH_TOKEN``
+        inherited from the ambient environment, so the campaign launched a
+        pod and only then failed, at an invocation boundary, with a much
+        less legible error. An eval run with no credential cannot succeed;
+        continuing only defers and disguises the failure.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_A", "SENTINEL-INTERACTIVE-A")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "SENTINEL-AMBIENT-SEED")
+
+        with pytest.raises(SystemExit) as excinfo:
+            launcher.build_eval_env()
+
+        message = str(excinfo.value)
+        assert "CLAUDE_OAUTH_TOKEN_B" in message and "CLAUDE_OAUTH_TOKEN_G" in message, (
+            "the abort must name the pool credentials it tried, or an "
+            f"operator cannot tell which one to set: {message!r}"
+        )
+        assert "SENTINEL-INTERACTIVE-A" not in message, (
+            "the interactive account's token must never be adopted OR echoed; "
+            f"it is not rostered, so it is not a candidate at all: {message!r}"
+        )
+
+    def test_the_seed_is_drawn_from_the_roster_in_failover_order(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Any POOL credential will do — take the first the roster names.
+
+        The seed used to be hardcoded to one account, which contradicted
+        the stated contract ("it only needs to be a valid pool credential,
+        not a specific one") and stranded a whole campaign the day that one
+        token was rotated or absent. Deriving it from the roster honours
+        the contract, keeps UsageGate's failover order as the tie-break,
+        and excludes account A structurally rather than by name.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "SENTINEL-POOL-B")
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+
+        first = launcher.build_eval_env()["CLAUDE_CODE_OAUTH_TOKEN"]
+
+        assert first == "SENTINEL-POOL-B", (
+            "with both rostered credentials present the seed must be the "
+            "roster's FIRST entry, matching the order UsageGate fails over "
+            f"in: {first!r}"
+        )
+
+        # ...and the roster's later entries are real fallbacks, not decoration.
+        monkeypatch.delenv("CLAUDE_OAUTH_TOKEN_B")
+        fallback = launcher.build_eval_env()["CLAUDE_CODE_OAUTH_TOKEN"]
+
+        assert fallback == "SENTINEL-POOL-G", (
+            "with the roster's first credential absent the seed must fall "
+            "through to the next rostered one; pinning a single hardcoded "
+            f"env var strands the campaign on a rotation: {fallback!r}"
+        )
+
+    def test_an_ambient_usage_accounts_file_is_overridden(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Setting the var is what stops a stale roster choosing the accounts.
+
+        This is the load-bearing half of "why set it rather than leave it
+        unset": ``env`` starts as ``os.environ.copy()`` and the ``.env``
+        loader writes into it too, so a shell still pointing at a retired
+        campaign's roster — exactly the kind that carried the injected
+        account this task removed — would otherwise silently win.
+        """
+        root = self._fake_project_root(monkeypatch, tmp_path)
+        stale = tmp_path / "retired-campaign-accounts.yaml"
+        stale.write_text(
+            "accounts:\n  - name: max-a\n    oauth_token_env: CLAUDE_OAUTH_TOKEN_A\n"
+        )
+        monkeypatch.setenv("USAGE_ACCOUNTS_FILE", str(stale))
+
+        env = launcher.build_eval_env()
+
+        assert env["USAGE_ACCOUNTS_FILE"] == str(
+            root / "config" / "usage-accounts.yaml"
+        ), (
+            "an ambient USAGE_ACCOUNTS_FILE must not survive: the launcher "
+            "states the roster for the run it is launching, and the ambient "
+            f"value here rosters the retired interactive account: {env['USAGE_ACCOUNTS_FILE']!r}"
+        )

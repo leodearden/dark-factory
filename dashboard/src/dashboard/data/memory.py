@@ -14,7 +14,13 @@ import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
 
 from dashboard.config import DashboardConfig
-from dashboard.data.mcp_fanout import first_success
+from dashboard.data.mcp_fanout import (
+    describe_exc,
+    first_success,
+    log_fanout_failure,
+    note_fanout_success,
+    reset_failure_streaks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,15 +102,23 @@ class McpSession:
         self._request_id += 1
         return self._request_id
 
-    async def _ensure_initialized(self, client: httpx.AsyncClient) -> None:
+    async def _ensure_initialized(
+        self, client: httpx.AsyncClient, timeout: float = 10,
+    ) -> None:
+        """Perform the initialize handshake once, under the caller's budget.
+
+        *timeout* is threaded into both handshake posts so a caller working
+        to a tight budget is not silently held to the 10s default while the
+        session warms up.
+        """
         if self._initialized:
             return
         await self._raw_call(client, 'initialize', {
             'protocolVersion': '2025-03-26',
             'capabilities': {},
             'clientInfo': {'name': 'dashboard', 'version': '0.1'},
-        })
-        await self._raw_notify(client, 'notifications/initialized')
+        }, timeout=timeout)
+        await self._raw_notify(client, 'notifications/initialized', timeout=timeout)
         self._initialized = True
 
     async def call_tool(
@@ -114,8 +128,12 @@ class McpSession:
         arguments: dict,
         timeout: float = 10,
     ) -> dict:
-        """Initialize (if needed), call a tool, return the inner result dict."""
-        await self._ensure_initialized(client)
+        """Initialize (if needed), call a tool, return the inner result dict.
+
+        *timeout* is a PER-HTTP-REQUEST budget applied to every post this
+        performs — up to three on a cold session (see :func:`mcp_tool_call`).
+        """
+        await self._ensure_initialized(client, timeout=timeout)
         rpc = await self._raw_call(
             client, 'tools/call',
             {'name': tool_name, 'arguments': arguments},
@@ -154,13 +172,14 @@ class McpSession:
         self,
         client: httpx.AsyncClient,
         method: str,
+        timeout: float = 10,
     ) -> None:
         payload: dict = {'jsonrpc': '2.0', 'method': method}
         headers = dict(MCP_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
         resp = await client.post(
-            self.mcp_endpoint, json=payload, headers=headers, timeout=10,
+            self.mcp_endpoint, json=payload, headers=headers, timeout=timeout,
         )
         if resp.status_code not in (200, 202, 204):
             logger.warning('MCP notify %s returned %s', method, resp.status_code)
@@ -178,8 +197,16 @@ def _get_session(base_url: str) -> McpSession:
 
 
 def reset_sessions() -> None:
-    """Clear cached sessions (useful in tests)."""
+    """Clear cached sessions and fan-out failure streaks (useful in tests).
+
+    The streak state behind mcp_fanout's transition-only WARNING policy is
+    cleared here too: it is the one hook every session-touching test module
+    already calls, and a leftover streak would silently demote the next test's
+    first WARNING to DEBUG. Note that the per-failure ``invalidate_session``
+    deliberately does NOT clear it — that would defeat the throttling.
+    """
     _sessions.clear()
+    reset_failure_streaks()
 
 
 def invalidate_session(url: str) -> None:
@@ -199,13 +226,28 @@ async def mcp_tool_call(
     base_url: str,
     tool_name: str,
     arguments: dict,
+    timeout: float = 10,
 ) -> dict:
     """Make a JSON-RPC tools/call request via a cached MCP session.
 
     Raises on HTTP or connection errors (caller is expected to catch).
+
+    *timeout* is a **per-HTTP-request** budget, not a whole-operation one. It
+    is handed to ``client.post``, so it bounds connect/read/write **and pool
+    acquisition** — the last of which is why threading it matters: a caller
+    working to a 2.0s budget would otherwise still block up to httpx's 10s
+    default waiting for a free connection slot.
+
+    Because it is per-request, it does **not** bound this call as a whole: a
+    *cold* session performs three posts (``initialize``,
+    ``notifications/initialized``, then ``tools/call``), so the worst case is
+    roughly ``3 * timeout`` plus the server's own think time. Callers needing
+    a hard whole-operation bound must still wrap this in
+    ``asyncio.wait_for`` — every existing probe caller does, deliberately, and
+    the two layers are complementary rather than redundant.
     """
     session = _get_session(base_url)
-    return await session.call_tool(client, tool_name, arguments)
+    return await session.call_tool(client, tool_name, arguments, timeout=timeout)
 
 
 async def _first_success(
@@ -214,6 +256,7 @@ async def _first_success(
     tool_name: str,
     args: dict,
     log_label: str,
+    timeout: float = 10,
 ) -> dict:
     """Call an MCP tool on each configured URL; return the first success.
 
@@ -221,29 +264,51 @@ async def _first_success(
     This is correct for singleton-per-instance tools (e.g. ``get_status``,
     ``get_curator_state``); aggregating helpers (``get_queue_stats``,
     ``get_wal_status``) handle their own per-URL loops.
+
+    *timeout* is the per-HTTP-request budget forwarded to each URL's
+    ``mcp_tool_call``. ``first_success`` itself stays timeout-agnostic (it
+    also serves tasks.py and metrics.py, which carry their own budgets) —
+    the budget rides along on the ``call`` closure below.
     """
     return await first_success(
         config.fused_memory_urls,
-        lambda url: mcp_tool_call(client, url, tool_name, args),
+        lambda url: mcp_tool_call(client, url, tool_name, args, timeout=timeout),
         log_label=log_label,
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
 
-async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_memory_status(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch memory subsystem status, trying each configured URL.
 
     Returns the first successful status dict, or {offline: True, error: ...}.
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: the failover walks up to N URLs, each of which may
+    perform a three-post cold-session handshake. Callers needing a hard bound
+    must still wrap this in ``asyncio.wait_for`` — ``metrics.py`` does.
     """
-    return await _first_success(client, config, 'get_status', {}, 'get_status')
+    return await _first_success(
+        client, config, 'get_status', {}, 'get_status', timeout=timeout,
+    )
 
 
 # Intentionally NOT converted to first_success: sums/collects across ALL
 # configured URLs rather than short-circuiting on the first success.
-async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_queue_stats(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch and aggregate write-queue stats from all configured servers.
 
     Counts are summed; oldest_pending_age_seconds is the max across servers.
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: unlike a first-success failover this visits ALL N
+    configured URLs, so the aggregate cost scales with N. Callers needing a
+    hard bound must still wrap this in ``asyncio.wait_for`` — ``metrics.py``
+    does.
     """
     merged_counts: dict[str, int] = {}
     oldest_age: float | None = None
@@ -251,13 +316,19 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
 
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(client, url, 'get_queue_stats', {})
+            result = await mcp_tool_call(
+                client, url, 'get_queue_stats', {}, timeout=timeout,
+            )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
-            logger.debug('get_queue_stats failed for %s: %s', url, e)
+            # Same transition-only WARNING policy as first_success (task 3871):
+            # this loop visits ALL N urls, so a partial outage used to
+            # under-report queue counts at DEBUG with no journal trace at all.
+            log_fanout_failure('get_queue_stats', url, e)
             invalidate_session(url)
             continue
 
+        note_fanout_success('get_queue_stats', url)
         any_success = True
         for key, val in result.get('counts', {}).items():
             merged_counts[key] = merged_counts.get(key, 0) + (val or 0)
@@ -273,7 +344,9 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
 
 # Intentionally NOT converted to first_success: collects a per-URL entry from
 # ALL configured URLs rather than short-circuiting on the first success.
-async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_wal_status(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch per-store WAL checkpoint status from each fused-memory server.
 
     Returns ``{'stores': {server_url: {store_name: row, ...}}}`` — one
@@ -284,18 +357,28 @@ async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> 
     Returns ``{'offline': True, 'error': ...}`` if all configured servers
     are unreachable. Added 2026-05-14 in response to the 2026-05-13
     task-DB-loss incident — see ``docs/task-recovery-2026-05-13/``.
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: like ``get_queue_stats`` this visits ALL N configured
+    URLs, so the aggregate cost scales with N. Callers needing a hard bound
+    must still wrap this in ``asyncio.wait_for``.
     """
     per_server: dict[str, dict] = {}
     errors: list[str] = []
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(client, url, 'get_wal_status', {})
+            result = await mcp_tool_call(
+                client, url, 'get_wal_status', {}, timeout=timeout,
+            )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
-            logger.debug('get_wal_status failed for %s: %s', url, e)
+            # Transition-only WARNING, as above — a per-server WAL column can
+            # vanish from the UI badge and, at DEBUG, leave nothing behind.
+            log_fanout_failure('get_wal_status', url, e)
             invalidate_session(url)
-            errors.append(f'{url}: {e}')
+            errors.append(f'{url}: {describe_exc(e)}')
             continue
+        note_fanout_success('get_wal_status', url)
         per_server[url] = result.get('stores') or {}
 
     if not per_server:
@@ -303,7 +386,9 @@ async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> 
     return {'stores': per_server}
 
 
-async def get_curator_state(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_curator_state(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch the curator UsageGate state from the fused-memory server.
 
     Returns the first successful result from any configured URL; on all-fail
@@ -314,7 +399,13 @@ async def get_curator_state(client: httpx.AsyncClient, config: DashboardConfig) 
     Result shape (on success):
       ``{'paused': bool, 'paused_reason': str | None,
          'soonest_open_at': str | None, 'account_count': int}``
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: the failover walks up to N URLs, each of which may
+    perform a three-post cold-session handshake. ``api_curator`` wraps it in
+    ``asyncio.wait_for`` for the whole-operation bound.
     """
     return await _first_success(
-        client, config, 'get_curator_state', {}, 'get_curator_state'
+        client, config, 'get_curator_state', {}, 'get_curator_state',
+        timeout=timeout,
     )

@@ -226,6 +226,55 @@ class TestMaybeFlagUnverifiedClaims:
         assert len(result) == 1
         assert result[0].token == "done_provenance_invalidated"
 
+    async def test_probe_construction_runs_off_event_loop(self, tmp_path):
+        """RED counterpart to test_probe_runs_off_event_loop, but for probe
+        CONSTRUCTION rather than probe INVOCATION.
+
+        This is the single-candidate counterpart to curate_batch_prepared's
+        already-offloaded claim_probe construction (its claim-verification
+        block's ``claim_probe = await
+        asyncio.to_thread(make_source_and_history_probe, self._cwd)`` line).
+        make_source_and_history_probe resolves the git top
+        level via _resolve_git_toplevel, a blocking `git rev-parse
+        --show-toplevel` subprocess bounded only by a 10s timeout — a
+        fork/exec that must not run on the event-loop thread curate() shares
+        with every other coroutine.
+
+        Asserts thread identity rather than wall-clock timing: identity is
+        exact and cannot flake under CI/CPU contention, whereas a timing
+        threshold would need a numeric bound with no achievability basis —
+        the same rationale test_probe_runs_off_event_loop above already
+        records for probe invocation.
+        """
+        import threading
+        from unittest.mock import patch
+
+        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+
+        loop_thread_id = threading.get_ident()
+        build_threads: list[int] = []
+        build_roots: list[object] = []
+
+        def recording_make_probe(repo_root):
+            build_threads.append(threading.get_ident())
+            build_roots.append(repo_root)
+            return lambda token: False
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        candidate = CandidateTask(title="T", description=_INCIDENT_DESCRIPTION)
+
+        with patch(
+            "fused_memory.middleware.recon_claim_verification_guard."
+            "make_source_and_history_probe",
+            side_effect=recording_make_probe,
+        ):
+            result = await curator._maybe_flag_unverified_claims(candidate)
+
+        assert build_roots == [tmp_path]
+        assert build_threads and all(tid != loop_thread_id for tid in build_threads)
+        assert [c.token for c in result] == ["done_provenance_invalidated"]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Amendment: TestCurateBatchPreparedClaimVerificationPerformance
@@ -385,3 +434,170 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
         # concurrently, not serially awaited one at a time (which would
         # have raised TimeoutError out of the gather above instead).
         assert start_count == n
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Amendment: TestClaimExtractionSkipsUnneededProbeWork
+#
+# Regression tests for a second reviewer round's performance finding: probe
+# construction ran unconditionally BEFORE claim extraction, so every
+# candidate — including the overwhelmingly common case of one with no
+# attributed claim at all — paid for a thread-pool hop plus (on the
+# single-candidate path) a `git rev-parse --show-toplevel` fork/exec that was
+# then discarded unused. Claim extraction (pure/sync/cheap — a regex scan, no
+# I/O) now runs FIRST and short-circuits before any probe is built, on both
+# the single-candidate path and curate_batch_prepared's batch-level
+# "does any candidate carry a claim" precheck.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestClaimExtractionSkipsUnneededProbeWork:
+    """Tests that no probe is ever constructed when there is no attributed
+    claim to verify — single-candidate path and its batch-level mirror."""
+
+    async def test_probe_not_built_when_candidate_has_no_claims(self, tmp_path):
+        """Single-candidate path: the probe factory is never invoked for a
+        plain-prose candidate carrying no attributed claim."""
+        from unittest.mock import patch
+
+        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        candidate = CandidateTask(title="T", description="plain description, no claims")
+
+        with patch(
+            "fused_memory.middleware.recon_claim_verification_guard."
+            "make_source_and_history_probe",
+        ) as mock_make_probe:
+            result = await curator._maybe_flag_unverified_claims(candidate)
+
+        mock_make_probe.assert_not_called()
+        assert result == []
+
+    async def test_batch_probe_not_built_when_no_candidate_has_claims(self, tmp_path):
+        """Batch path: curate_batch_prepared's claim_probe precheck builds no
+        probe at all when NO candidate in the batch carries an attributed
+        claim — mirrors the single-candidate fix above (task_curator.py's
+        ``any_claims`` precheck in curate_batch_prepared's claim-verification
+        block)."""
+        from unittest.mock import patch
+
+        from fused_memory.middleware.task_curator import (
+            CandidateTask,
+            CuratorDecision,
+            PreparedCandidate,
+            TaskCurator,
+        )
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidates = [
+            CandidateTask(title=f"T{i}", description=f"plain description {i}")
+            for i in range(3)
+        ]
+        prepared = [
+            PreparedCandidate(
+                candidate=c, pool=[], pool_sizes=_EMPTY_POOL_SIZES, prompt_tokens=10,
+            )
+            for c in candidates
+        ]
+
+        llm_decisions = [
+            CuratorDecision(
+                action="create", justification=f"c{n}",
+                pool_sizes=_EMPTY_POOL_SIZES, latency_ms=0,
+            )
+            for n in range(3)
+        ]
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            return llm_decisions
+
+        with (
+            patch(
+                "fused_memory.middleware.recon_claim_verification_guard."
+                "make_source_and_history_probe",
+            ) as mock_make_probe,
+            patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
+        ):
+            await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root=str(tmp_path),
+            )
+
+        mock_make_probe.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Amendment: TestClaimVerificationGuardFailsOpen
+#
+# Regression tests for the reviewer's robustness finding: _maybe_flag_
+# unverified_claims documents "Never raises", but neither the probe
+# construction nor the verification call was guarded by a try/except — an
+# unexpected failure in either (outside the guard module's own narrow
+# OSError/SubprocessError handling) would propagate out of what is meant to
+# be a purely advisory check and fail the entire task submission. Both
+# awaited off-loop calls are now wrapped so the guard fails open.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestClaimVerificationGuardFailsOpen:
+    """Tests that a raising probe (construction OR verification) is caught,
+    logged, and turned into a [] result rather than propagating."""
+
+    async def test_probe_construction_failure_fails_open(self, tmp_path, caplog):
+        """Probe CONSTRUCTION raising (the probe=None / not-injected branch)
+        is caught, logged at WARNING, and returns [] rather than
+        propagating out of the advisory check."""
+        from unittest.mock import patch
+
+        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        candidate = CandidateTask(title="T", description=_INCIDENT_DESCRIPTION)
+
+        with (
+            patch(
+                "fused_memory.middleware.recon_claim_verification_guard."
+                "make_source_and_history_probe",
+                side_effect=RuntimeError("boom"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await curator._maybe_flag_unverified_claims(candidate)
+
+        assert result == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "recon_claim_verification" in r.getMessage() and "boom" in r.getMessage()
+            for r in warnings
+        )
+
+    async def test_probe_verification_failure_fails_open(self, tmp_path, caplog):
+        """Probe VERIFICATION raising (the injected-probe branch — e.g.
+        curate_batch_prepared's shared batch probe, or a test double) is
+        caught, logged at WARNING, and returns [] rather than propagating."""
+        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+
+        def exploding_probe(token: str) -> bool:
+            raise RuntimeError("probe boom")
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        candidate = CandidateTask(title="T", description=_INCIDENT_DESCRIPTION)
+
+        with caplog.at_level(logging.WARNING):
+            result = await curator._maybe_flag_unverified_claims(
+                candidate, probe=exploding_probe,
+            )
+
+        assert result == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "recon_claim_verification" in r.getMessage() and "probe boom" in r.getMessage()
+            for r in warnings
+        )

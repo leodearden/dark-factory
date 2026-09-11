@@ -18,8 +18,9 @@ decisions for the point-by-point mirror rationale.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
@@ -28,7 +29,9 @@ from pydantic import ValidationError
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
     DeliveredCheckResult,
+    DeliveredChecksBlock,
     DeliveredChecksVerdict,
+    gate_mark_done_on_delivered_checks,
     run_delivered_check,
     verify_delivered_checks_on_main,
 )
@@ -39,6 +42,7 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     TickContext,
     _build_delivered_check_escalation,
+    _delivered_checks_descriptor_digest,
 )
 
 # ---------------------------------------------------------------------------
@@ -864,6 +868,135 @@ class TestPhaseBackfillTerminalDepRecords:
         assert scheduler.get_task.await_count == 2
         assert ctx.terminal_dep_records == records
 
+    # --- (h) warmed record carrying delivered_checks -> re-fetched, not stale --
+
+    @pytest.mark.asyncio
+    async def test_warmed_record_carrying_delivered_checks_is_refetched_not_served_stale(
+        self, scheduler: Scheduler
+    ):
+        """Task 2977: a cached TERMINAL dep record that carries a non-empty
+        ``metadata.delivered_checks`` must be treated as a cache MISS (and
+        re-fetched) every sweep, not served straight from
+        ``_terminal_dep_record_cache`` — otherwise an operator's in-place
+        correction of a DONE dep's check descriptor at a fixed main SHA is
+        never observed, and task 2975's descriptor-digest self-heal (which
+        is computed from whatever this phase serves into
+        ``ctx.terminal_dep_records``) can never fire."""
+        stale_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [
+                    {'kind': 'grep', 'name': 'c', 'pattern': 'OLD_BAD_PATTERN'}
+                ]
+            },
+        }
+        scheduler._terminal_dep_record_cache['20'] = stale_record
+        corrected_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [
+                    {'kind': 'grep', 'name': 'c', 'pattern': 'FIXED_PATTERN'}
+                ]
+            },
+        }
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},  # dep '20' genuinely absent
+        )
+        scheduler.get_task = AsyncMock(return_value=corrected_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records['20'] == corrected_record
+        assert scheduler._terminal_dep_record_cache['20'] == corrected_record
+
+    # --- (i) warmed CHECKLESS record -> still served from cache, no re-fetch --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cached_metadata',
+        [
+            {'delivered_checks': []},
+            {},  # no 'delivered_checks' key at all
+        ],
+        ids=['empty-list', 'key-absent'],
+    )
+    async def test_warmed_record_without_delivered_checks_still_served_from_cache_no_refetch(
+        self, scheduler: Scheduler, cached_metadata: dict
+    ):
+        """Boundary/regression guard pinning the cache's entire performance
+        rationale: a warmed record that carries NO delivered_checks (the
+        overwhelming common case) must still be served for free, with no
+        get_task call — this must keep passing after the task 2977 fix, or
+        that fix has become an over-broad 'always re-fetch'."""
+        cached_record = {'id': '20', 'status': 'done', 'metadata': cached_metadata}
+        scheduler._terminal_dep_record_cache['20'] = cached_record
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},  # dep '20' genuinely absent
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20', 'should': 'not-be-used'})
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_not_awaited()
+        assert ctx.terminal_dep_records['20'] is cached_record
+
+    # --- (j) budget contention: new dep_ids win over re-validation churn ---
+
+    @pytest.mark.asyncio
+    async def test_budget_prioritizes_new_dep_over_revalidation_dep(
+        self, scheduler: Scheduler
+    ):
+        """Task 2977 (reviewer_comprehensive performance amendment): when
+        the per-tick fetch budget can't cover both a genuinely-NEW dep_id
+        (never cached) and an already-warmed checks-carrying dep_id up for
+        re-validation, the new dep_id must win the budget — otherwise
+        steady-state re-validation churn of already-known checks-carrying
+        deps could chronically starve a brand-new dep out of the budget
+        tick after tick. Dep ids are chosen so plain alphabetical sort
+        ('21' < '29') would pick the WRONG (re-validation) dep first
+        without the fix, proving this isn't an accident of sort order."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        stale_record = {
+            'id': '21',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'OLD'}]
+            },
+        }
+        scheduler._terminal_dep_record_cache['21'] = stale_record
+        task_a = self._dependent(task_id='10', dep_id='21')  # re-validation candidate
+        task_b = self._dependent(task_id='11', dep_id='29')  # genuinely new candidate
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'21': 'done', '29': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},  # both deps absent
+        )
+        new_record = {'id': '29', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=new_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('29')
+        assert ctx.terminal_dep_records == {'29': new_record}
+        assert '21' not in ctx.terminal_dep_records, (
+            'the deferred re-validation dep is not served this tick — '
+            'unchanged fail-open-on-deferral semantics, same as before task 2977'
+        )
+        # the stale cache entry is untouched (not overwritten, not evicted)
+        assert scheduler._terminal_dep_record_cache['21'] == stale_record
+
 
 # ---------------------------------------------------------------------------
 # TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
@@ -1187,6 +1320,114 @@ class TestNoteDeliveredHold:
 
 
 # ---------------------------------------------------------------------------
+# TestDeliveredChecksDescriptorDigest (task 2975 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveredChecksDescriptorDigest:
+    """``_delivered_checks_descriptor_digest`` — the pure canonical-JSON
+    sha256 helper that lets :meth:`Scheduler._compute_delivered_check_cache`
+    fold a descriptor digest into its cache key (task 2975), so correcting a
+    dep's ``metadata.delivered_checks`` at a FIXED main SHA is a cache MISS
+    (re-evaluate) instead of continuing to serve a stale cached verdict.
+    Pure function: no scheduler state, no side effects.
+    """
+
+    _ONE_CHECK = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    # --- (a) determinism: identical input -> identical, stable digest ------
+
+    def test_identical_lists_produce_same_digest_deterministically(self):
+        checks = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        other = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+        digest1 = _delivered_checks_descriptor_digest(checks)
+        digest2 = _delivered_checks_descriptor_digest(other)
+        digest3 = _delivered_checks_descriptor_digest(checks)
+
+        assert isinstance(digest1, str)
+        assert len(digest1) == 64, 'expected a sha256 hex digest (64 hex chars)'
+        assert all(c in '0123456789abcdef' for c in digest1)
+        assert digest1 == digest2 == digest3, 'same descriptor content must hash identically'
+
+    # --- (b) any descriptor field change -> a DIFFERENT digest -------------
+
+    def test_changed_grep_pattern_produces_different_digest(self):
+        original = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        changed = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'bar', 'expect': 'present'}]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_paths_produces_different_digest(self):
+        original = [{
+            'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo',
+            'paths': ['src/'], 'expect': 'present',
+        }]
+        changed = [{
+            'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo',
+            'paths': ['src/', 'lib/'], 'expect': 'present',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_script_args_produces_different_digest(self):
+        original = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'bar'], 'expect': 'exit_zero',
+        }]
+        changed = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'baz'], 'expect': 'exit_zero',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_script_name_produces_different_digest(self):
+        original = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': [], 'expect': 'exit_zero',
+        }]
+        changed = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_other.sh',
+            'args': [], 'expect': 'exit_zero',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    # --- (c) key reordering within a check dict -> the SAME digest ---------
+
+    def test_key_reorder_within_check_dict_produces_same_digest(self):
+        forward = [{'name': 'cap-one', 'pattern': 'foo', 'expect': 'present'}]
+        reordered = [{'expect': 'present', 'pattern': 'foo', 'name': 'cap-one'}]
+
+        assert _delivered_checks_descriptor_digest(forward) == (
+            _delivered_checks_descriptor_digest(reordered)
+        )
+
+    # --- (d) empty list and None both hash the same, distinct from 1 check -
+
+    def test_empty_list_and_none_produce_same_stable_digest_distinct_from_one_check(self):
+        empty_digest1 = _delivered_checks_descriptor_digest([])
+        empty_digest2 = _delivered_checks_descriptor_digest([])
+        none_digest1 = _delivered_checks_descriptor_digest(None)
+        none_digest2 = _delivered_checks_descriptor_digest(None)
+        one_check_digest = _delivered_checks_descriptor_digest(self._ONE_CHECK)
+
+        assert empty_digest1 == empty_digest2, 'empty-list digest must be stable'
+        assert none_digest1 == none_digest2, 'None digest must be stable'
+        assert empty_digest1 == none_digest1, '[] and None must normalize to the same digest'
+        assert empty_digest1 != one_check_digest
+
+
+# ---------------------------------------------------------------------------
 # TestComputeDeliveredCheckCache (task 2580 — step-13 RED / step-14 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -1265,6 +1506,12 @@ class TestComputeDeliveredCheckCache:
             for evt, data in _event_store.events  # type: ignore[attr-defined]
             if evt == str(EventType.delivered_check_gate_held)
         ]
+
+    def _dcc_key(self, dep_id: str, sha: str, checks: list | None) -> tuple[str, str, str]:
+        """Build the 3-tuple ``_delivered_check_cache`` key (task 2975),
+        using the same digest helper the scheduler uses, for assertions
+        that need to name a specific cache entry below."""
+        return (dep_id, sha, _delivered_checks_descriptor_digest(checks))
 
     # --- (a) no checked deps -> {} and the SHA resolver is NEVER called ----
 
@@ -1348,7 +1595,9 @@ class TestComputeDeliveredCheckCache:
         result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert result == {}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'ERRORED must not leave ANY digest-variant cache entry for this dep/sha'
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert self._held_events(scheduler) == []
 
@@ -1390,8 +1639,9 @@ class TestComputeDeliveredCheckCache:
             'the first (and only) dep this sweep must fully resolve despite exceeding budget'
         )
         assert calls == ['cap-a', 'cap-b'], 'both checks must run — forward progress is guaranteed'
-        assert ('20', 'sha1') in scheduler._delivered_check_cache
-        assert scheduler._delivered_check_cache[('20', 'sha1')] is True
+        key = self._dcc_key('20', 'sha1', self._TWO_CHECKS)
+        assert key in scheduler._delivered_check_cache
+        assert scheduler._delivered_check_cache[key] is True
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'exceeding the per-tick budget for the guaranteed-progress dep must log a WARNING'
         )
@@ -1429,7 +1679,9 @@ class TestComputeDeliveredCheckCache:
 
         assert result == {'20': True}
         assert calls == ['cap-a'], 'the second dep must NOT be evaluated once the budget is spent'
-        assert ('21', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '21' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'the deferred dep must not leave ANY digest-variant cache entry'
 
     # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
 
@@ -1484,8 +1736,10 @@ class TestComputeDeliveredCheckCache:
         assert second == {'20': True}
         assert calls2 == ['cap-one'], 'stale-sha cache entry must be pruned, forcing re-invoke'
         assert scheduler._streak_delivered_hold.value('10') == 0
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
-        assert ('20', 'sha2') in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'every sha1-keyed digest variant must be pruned once main advances'
+        assert self._dcc_key('20', 'sha2', self._ONE_CHECK) in scheduler._delivered_check_cache
 
     # --- (h) cached-False dep still holds + emits detail on every sweep ----
 
@@ -1611,9 +1865,9 @@ class TestComputeDeliveredCheckCache:
 
         first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
         assert first == {'20': False}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache, (
-            'a FAILED result must NOT be cached sticky'
-        )
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'a FAILED result must NOT be cached sticky (any digest variant)'
 
         second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
@@ -1623,7 +1877,8 @@ class TestComputeDeliveredCheckCache:
         assert calls == ['cap-one', 'cap-one'], (
             'the check must re-run on sweep 2 — it must NOT be served from a sticky-False cache'
         )
-        assert scheduler._delivered_check_cache[('20', 'sha1')] is True, (
+        key = self._dcc_key('20', 'sha1', self._ONE_CHECK)
+        assert scheduler._delivered_check_cache[key] is True, (
             'the monotone-safe DELIVERED result IS now cached'
         )
         assert scheduler._streak_delivered_hold.value('10') == 0, (
@@ -1705,7 +1960,9 @@ class TestComputeDeliveredCheckCache:
         result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert result == {}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'a timed-out (ERRORED) check must not leave ANY digest-variant cache entry'
         assert self._held_events(scheduler) == []
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
@@ -1776,6 +2033,232 @@ class TestComputeDeliveredCheckCache:
 
         assert result == {}
         assert sha_calls['n'] == 0
+
+    # --- (l) descriptor change at a FIXED sha invalidates a cached
+    #     DELIVERED result and forces re-evaluation (task 2975 — the
+    #     esc-2911-1/2 recurrence: a corrected descriptor must self-heal
+    #     WITHOUT waiting for main to advance) --------------------------
+
+    @pytest.mark.asyncio
+    async def test_descriptor_change_same_sha_invalidates_cached_delivered_and_reevaluates(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """esc-2911-1/2: an operator correcting a dep's
+        ``metadata.delivered_checks`` descriptor (pattern/paths/script) at a
+        FIXED main SHA must be picked up on the very next sweep — NOT
+        wedged behind a stale cached DELIVERED verdict until an unrelated
+        commit advances main and prunes it. Before this fix, the cache was
+        keyed ``(dep_id, main_sha)`` only, so a descriptor change at a fixed
+        SHA was entirely invisible to it.
+
+        Sweeps 3-4 additionally fold in the *unchanged*-descriptor
+        efficiency guarantee (mirrors (f)
+        ``test_cache_hit_does_not_reinvoke_runner``): a cache hit is only
+        possible once a descriptor has actually resolved DELIVERED, since
+        FAILED is (by design — REFILE of task 2782/2783, see (i2)
+        ``test_failed_then_delivered_same_sha_flips_and_unwedges``) never
+        cached. So sweep 3 mirrors that same transient-FAILED-then-
+        DELIVERED flip for the CHANGED descriptor (still unchanged from
+        sweep 2) before sweep 4 observes a genuine cache hit — the runner
+        is not re-invoked a further time once the changed descriptor
+        itself has stabilized DELIVERED and been cached.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+        ])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        assert calls == ['cap-one']
+
+        # Operator edits the descriptor at the SAME sha (pattern 'foo' ->
+        # 'bar', same check name) — a fresh runner now resolves it FAILED.
+        dep['metadata'] = {'delivered_checks': [
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'bar', 'expect': 'present'},
+        ]}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': False}, (
+            'the changed descriptor must be RE-EVALUATED, not served from the '
+            'stale cached True left over from the OLD descriptor'
+        )
+        assert calls2 == ['cap-one'], (
+            'the changed descriptor must MISS the cache and invoke the runner exactly once'
+        )
+
+        # SAME (still-changed) descriptor observed again: like (i2), a
+        # FAILED result is never cached, so it can flip to DELIVERED on a
+        # later sweep at the identical descriptor/SHA instead of staying
+        # wedged.
+        fake_runner3, calls3 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner3)
+
+        third = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert third == {'20': True}
+        assert calls3 == ['cap-one'], 'FAILED is never cached, so this must be a fresh invocation'
+
+        # A FOURTH sweep at the SAME (now-DELIVERED, still-unchanged)
+        # descriptor is a genuine cache hit — the unchanged-descriptor
+        # efficiency guarantee also holds for a descriptor that changed
+        # mid-flight, not just one that was stable from the first sweep.
+        fourth = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert fourth == {'20': True}
+        assert calls3 == ['cap-one'], (
+            'the runner must NOT be re-invoked once the changed descriptor is cached'
+        )
+
+    # --- (m) FAILED descriptor corrected at the SAME sha -> DELIVERED next
+    #     sweep (task's literal acceptance criterion). Already-green
+    #     regression lock, NOT the RED driver — FAILED was never cached to
+    #     begin with (REFILE of task 2782/2783), so this already worked
+    #     before this task's fix; see (l) above for the genuinely-RED
+    #     scenario (a cached DELIVERED must be INVALIDATED when the
+    #     descriptor changes). ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_descriptor_corrected_same_sha_reevaluates_to_delivered(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """The task's literal acceptance criterion: a broken delivered-check
+        pattern that FAILS, corrected in ``metadata.delivered_checks`` at
+        the SAME main sha, must resolve DELIVERED on the very next sweep.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'fooo', 'expect': 'present'},
+        ])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': False}
+        assert calls == ['cap-one']
+
+        # Operator corrects the broken pattern at the SAME sha.
+        dep['metadata'] = {'delivered_checks': [
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+        ]}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+
+    # --- (n) descriptor-variant pruning bounds cache growth to ONE entry
+    #     per (dep, sha) — without this, repeated descriptor edits at a
+    #     fixed SHA would accumulate one stale variant per edit until main
+    #     advances ------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_descriptor_change_prunes_stale_digest_variant_same_sha(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A descriptor change at a fixed main SHA must not just MISS the
+        cache (see (l) above) — the STALE ``(dep, sha, old-digest)`` entry
+        left behind by the prior descriptor must be actively PRUNED, so
+        cache growth stays bounded to one variant per ``(dep, sha)`` rather
+        than accumulating one entry per historical descriptor edit.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        checks_d1 = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        dep = self._dep(checks=checks_d1)
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        key_d1 = self._dcc_key('20', 'sha1', checks_d1)
+        assert key_d1 in scheduler._delivered_check_cache
+
+        # Operator edits the descriptor at the SAME sha; the new descriptor
+        # also resolves DELIVERED (so its own variant gets cached, letting
+        # us assert exactly one variant survives).
+        checks_d2 = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'baz', 'expect': 'present'}]
+        dep['metadata'] = {'delivered_checks': checks_d2}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+        key_d2 = self._dcc_key('20', 'sha1', checks_d2)
+        assert key_d1 not in scheduler._delivered_check_cache, (
+            'the stale (dep, sha, old-digest) variant must be pruned once the '
+            'descriptor changes, not left to linger alongside the new variant'
+        )
+        same_dep_sha_keys = [
+            k for k in scheduler._delivered_check_cache if k[0] == '20' and k[1] == 'sha1'
+        ]
+        assert same_dep_sha_keys == [key_d2], (
+            f'cache growth must stay bounded to ONE variant per (dep, sha); '
+            f'got {same_dep_sha_keys!r}'
+        )
+
+    # --- (o) regression: SHA advance still prunes EVERY digest variant, not
+    #     just the one matching the current descriptor — the digest-variant
+    #     prune above is ADDITIVE to, not a replacement for, the existing
+    #     SHA-based prune ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sha_advance_prunes_across_digest_variants(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Regression lock for the retained SHA-prune (~3098): once a
+        ``(dep, sha, digest)`` entry is cached, advancing main to a new SHA
+        must still prune EVERY sha1-keyed variant (regardless of its
+        digest), not just whichever digest happens to match the current
+        descriptor. Guards against a future digest-variant-scoped prune
+        accidentally narrowing the existing whole-SHA prune.
+        """
+        sha_box = {'value': 'sha1'}
+
+        async def _resolve():
+            return sha_box['value']
+
+        scheduler._resolve_main_sha = _resolve
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        assert self._dcc_key('20', 'sha1', self._ONE_CHECK) in scheduler._delivered_check_cache
+
+        sha_box['value'] = 'sha2'
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+        assert not any(
+            k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'every sha1-keyed variant must be pruned once main advances, regardless of digest'
+        assert self._dcc_key('20', 'sha2', self._ONE_CHECK) in scheduler._delivered_check_cache
 
 
 # ---------------------------------------------------------------------------
@@ -2580,3 +3063,387 @@ class TestVerifyDeliveredChecksOnMain:
         )
 
         assert verdict.outcome == 'errored'
+
+
+# ---------------------------------------------------------------------------
+# TestGateMarkDoneOnDeliveredChecks (task 3057 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+#: The caller-supplied logger every row below passes as ``log=``. The helper
+#: MUST log on THIS logger (not ``orchestrator.delivered_checks``) so each
+#: adopting seam keeps its own module logger and its existing
+#: caplog-addressable name — that is the contract task 2794's stranded-arm
+#: caplog assertions (logger='orchestrator.harness') depend on surviving the
+#: step-20 refactor onto this helper.
+_SEAM_LOGGER = logging.getLogger('test.orchestrator.gate_seam')
+
+_VERIFY_TARGET = 'orchestrator.delivered_checks.verify_delivered_checks_on_main'
+
+
+class TestGateMarkDoneOnDeliveredChecks:
+    """``gate_mark_done_on_delivered_checks`` — the ONE shared mark-done
+    decision routed through by all eleven attribution-shaped stamp seams
+    (task 3057).
+
+    ``None`` <=> "mark-done may proceed"; a :class:`DeliveredChecksBlock`
+    <=> "do NOT stamp done here". Pins task 2794's six-row acceptance matrix
+    AT SOURCE, so the ten adopting seams only have to pin their own
+    delegation + recovery rather than re-deriving the decision.
+
+    ``verify_delivered_checks_on_main`` is patched throughout: this class
+    pins the DECISION layer. The check-runner semantics it delegates to are
+    pinned by ``TestVerifyDeliveredChecksOnMain`` above — the helper must
+    reuse that function VERBATIM and never fork a second check runner.
+    """
+
+    _SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
+    _SITE = 'unit-test-seam'
+
+    # -- fixtures ----------------------------------------------------------
+
+    def _grep_check(self, name: str = 'cap-x', pattern: str = 'SomePattern') -> dict:
+        return {'name': name, 'kind': 'grep', 'pattern': pattern, 'expect': 'present'}
+
+    def _script_check(
+        self, name: str = 'cap-s', script: str = 'scripts/verify_cap.sh'
+    ) -> dict:
+        return {'name': name, 'kind': 'script', 'script': script, 'timeout_secs': 5.0}
+
+    def _meta(self, checks: list[dict] | None = None) -> dict:
+        return {'delivered_checks': checks if checks is not None else [self._grep_check()]}
+
+    def _git_ops(self, sha: str | None = None, raises: bool = False):
+        """Stub git_ops exposing ONLY ``get_main_sha`` (the sole attribute the
+        helper is permitted to touch — a wider stub would let an accidental
+        second git call pass unnoticed)."""
+        stub = AsyncMock()
+        if raises:
+            stub.get_main_sha = AsyncMock(side_effect=RuntimeError('git exploded'))
+        else:
+            stub.get_main_sha = AsyncMock(
+                return_value=self._SHA if sha is None else sha
+            )
+        return stub
+
+    def _warnings(self, caplog) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == _SEAM_LOGGER.name
+        ]
+
+    async def _call(self, metadata, *, verify_mock, **kwargs):
+        """Invoke the helper with ``verify_delivered_checks_on_main`` patched."""
+        kwargs.setdefault('project_root', '/proj')
+        kwargs.setdefault('check_timeout_secs', 5.0)
+        kwargs.setdefault('site', self._SITE)
+        kwargs.setdefault('log', _SEAM_LOGGER)
+        with patch(_VERIFY_TARGET, verify_mock):
+            return await gate_mark_done_on_delivered_checks('t-1', metadata, **kwargs)
+
+    # -- Row 1: hollow-done regression / FAILED ----------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_verdict_blocks_and_warns(self, caplog):
+        """Row 1 — the hollow-done regression this task exists to close.
+
+        A FAILED verdict must yield a ``reason='failed'`` block carrying the
+        SHA and the offending descriptor, and emit exactly ONE WARNING on the
+        CALLER's logger naming task id / check name / pattern / main SHA /
+        site — everything an operator needs to see WHY a done was withheld.
+        """
+        failed_check = self._grep_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+        git_ops = self._git_ops()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=git_ops,
+            )
+
+        assert isinstance(block, DeliveredChecksBlock)
+        assert block.reason == 'failed'
+        assert block.main_sha == self._SHA
+        assert block.failed_check == failed_check
+
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+        text = warnings[0].getMessage()
+        assert 't-1' in text
+        assert 'cap-x' in text
+        assert 'SomePattern' in text
+        assert self._SHA in text
+        assert self._SITE in text
+
+    # -- Row 2: FAILED, script kind ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_script_check_warning_names_the_script(self, caplog):
+        """Row 2 — pins the is_grep branch of the WARNING: a script-kind
+        descriptor has no ``pattern``, so the message must name the SCRIPT
+        (naming a ``None`` pattern would be useless to an operator)."""
+        failed_check = self._script_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta([failed_check]),
+                verify_mock=verify,
+                git_ops=self._git_ops(),
+            )
+
+        assert block is not None and block.reason == 'failed'
+        text = self._warnings(caplog)[0].getMessage()
+        assert 'scripts/verify_cap.sh' in text
+        assert 'cap-s' in text
+
+    # -- Row 3: all_delivered ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_all_delivered_returns_none_and_is_silent(self, caplog):
+        """Row 3 — the capability IS on main: mark-done proceeds (``None``),
+        and nothing is logged at WARNING (a verified done is not an event
+        worth warning about)."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is None
+        assert self._warnings(caplog) == []
+
+    # -- Row 4: no delivered_checks (inertness) ----------------------------
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param({}, id='empty-metadata'),
+            pytest.param(None, id='none-metadata'),
+            pytest.param({'delivered_checks': []}, id='empty-checks-list'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_no_delivered_checks_is_inert_with_zero_io(self, metadata):
+        """Row 4 — check-less tasks (the overwhelmingly common case) keep
+        their exact pre-guard behavior with ZERO I/O: no git call, no check
+        run. This inertness lives HERE, in one place, which is why every
+        adopting seam is allowed to delegate unconditionally."""
+        verify = AsyncMock()
+        git_ops = self._git_ops()
+
+        block = await self._call(metadata, verify_mock=verify, git_ops=git_ops)
+
+        assert block is None
+        verify.assert_not_awaited()
+        git_ops.get_main_sha.assert_not_awaited()
+
+    # -- Row 5: check-runner ERROR/timeout ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_errored_verdict_blocks_fail_safe(self, caplog):
+        """Row 5 — the checks could not be evaluated: make no claim either
+        way. Still a BLOCK (never stamp on unknown capability state), but
+        ``reason='errored'`` so callers can tell it apart from a definitive
+        absence."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='errored', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is not None
+        assert block.reason == 'errored'
+        assert block.main_sha == self._SHA
+        assert block.failed_check is None
+
+        text = self._warnings(caplog)[0].getMessage()
+        assert 't-1' in text
+        assert self._SHA in text
+        assert self._SITE in text
+
+    # -- Row 6: kill switch ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_enabled_false_is_the_single_kill_switch(self):
+        """Row 6 — ``enabled=False`` disarms the guard even with a FAILED
+        verdict staged, and costs ZERO I/O. Every seam FORWARDS the config
+        flag here rather than short-circuiting locally, so one hot-reload of
+        ``delivered_checks.enabled`` disarms all eleven guards at once."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=self._grep_check(),
+        ))
+        git_ops = self._git_ops()
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=git_ops, enabled=False,
+        )
+
+        assert block is None
+        verify.assert_not_awaited()
+        git_ops.get_main_sha.assert_not_awaited()
+
+    # -- main-SHA resolution fail-safe arms (kept DISTINCT) ----------------
+
+    @pytest.mark.asyncio
+    async def test_get_main_sha_raising_is_fail_safe(self, caplog):
+        """``get_main_sha()`` raising (git error) -> ``main_sha_unresolved``
+        with a ``None`` SHA, and the checks are NEVER run (there is no ref to
+        run them against)."""
+        verify = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(raises=True),
+            )
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        assert block.main_sha is None
+        verify.assert_not_awaited()
+        assert 't-1' in self._warnings(caplog)[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_get_main_sha_empty_is_fail_safe_with_distinct_warning(self, caplog):
+        """``get_main_sha()`` returning ``''`` -> the same block class, but a
+        DISTINCT warning text. Kept separate from the raising arm so a
+        regression that drops either one is caught: an empty SHA is a silent
+        git-state anomaly, not an exception."""
+        verify = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(sha=''),
+            )
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        assert block.main_sha is None
+        verify.assert_not_awaited()
+
+        empty_text = self._warnings(caplog)[0].getMessage()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            await self._call(
+                self._meta(), verify_mock=AsyncMock(),
+                git_ops=self._git_ops(raises=True),
+            )
+        raising_text = self._warnings(caplog)[0].getMessage()
+        assert empty_text != raising_text
+
+    # -- never-raises -------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_verify_raising_degrades_to_errored_block(self, caplog):
+        """Defence in depth: ``verify_delivered_checks_on_main`` documents
+        "Never raises", but if that contract is ever broken the guard must
+        still not be able to CRASH a mark-done path. It degrades to a
+        fail-safe ``errored`` block instead of propagating."""
+        verify = AsyncMock(side_effect=RuntimeError('verify exploded'))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is not None
+        assert block.reason == 'errored'
+        assert block.main_sha == self._SHA
+
+    # -- pre-resolved main_sha mode ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_supplied_main_sha_short_circuits_git(self):
+        """The two seams that already hold a main SHA (``reconcile_landed_row``
+        RC-2 and ``_handle_already_done_report``) pass it through.
+
+        Not merely an optimization — a CORRECTNESS requirement: both have
+        already made an ancestry decision against that exact SHA, and
+        re-resolving could audit a DIFFERENT (newer) main than the decision
+        being gated.
+        """
+        supplied = 'f' * 40
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=supplied,
+        ))
+        git_ops = self._git_ops()
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=git_ops, main_sha=supplied,
+        )
+
+        assert block is None
+        git_ops.get_main_sha.assert_not_awaited()
+        assert verify.await_args is not None
+        assert verify.await_args.kwargs['main_sha'] == supplied
+
+    @pytest.mark.asyncio
+    async def test_supplied_main_sha_permits_no_git_ops(self):
+        """In pre-resolved mode ``git_ops=None`` is acceptable — merge_queue's
+        module-level ``reconcile_landed_row`` has no git_ops handle at all."""
+        supplied = 'e' * 40
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=supplied,
+        ))
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=None, main_sha=supplied,
+        )
+
+        assert block is None
+        assert verify.await_args is not None
+        assert verify.await_args.kwargs['main_sha'] == supplied
+
+    @pytest.mark.asyncio
+    async def test_no_git_ops_and_no_main_sha_is_fail_safe(self):
+        """Conversely: no git_ops AND no pre-resolved SHA means the guard
+        cannot resolve a ref at all -> fail-safe block, never a silent pass."""
+        verify = AsyncMock()
+
+        block = await self._call(self._meta(), verify_mock=verify, git_ops=None)
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        verify.assert_not_awaited()
+
+    # -- delegation contract ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_forwards_project_root_timeout_and_runner_verbatim(self):
+        """The helper is a DECISION layer, not a second check runner: the
+        checks list, project_root, check_timeout_secs and the injected runner
+        all reach ``verify_delivered_checks_on_main`` verbatim."""
+        checks = [self._grep_check('a', 'PatA'), self._grep_check('b', 'PatB')]
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        async def _custom_runner(argv, **kwargs):
+            return (0, '', '')
+
+        block = await self._call(
+            self._meta(checks),
+            verify_mock=verify,
+            git_ops=self._git_ops(),
+            project_root='/some/main/checkout',
+            check_timeout_secs=17.5,
+            runner=_custom_runner,
+        )
+
+        assert block is None
+        verify.assert_awaited_once()
+        assert verify.await_args is not None
+        assert verify.await_args.args[0] == checks
+        assert verify.await_args.kwargs['project_root'] == '/some/main/checkout'
+        assert verify.await_args.kwargs['check_timeout_secs'] == 17.5
+        assert verify.await_args.kwargs['main_sha'] == self._SHA
+        assert verify.await_args.kwargs['runner'] is _custom_runner

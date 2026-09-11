@@ -339,3 +339,66 @@ resume machinery.
    were written by old code — v1, no task_id; plan-bearing lanes still adopt
    via the plan.json fallback, B11). No action needed; noted so the deploy
    verifier doesn't misread partial resume coverage on the first cycle.
+
+## 12. Amendment 2026-08-03 — the reseeded-lane fallback is EXPECTED (task 3256)
+
+Recorded after the fact; the sections above are left as authored.
+
+**Ruling (2026-07-30, reify escalation `esc-__session_resume_storm__-4`).**
+Option A — suppress at the classification seam — was chosen. Option C —
+change warm-lane acquire semantics to preserve `.task/` across a reseed —
+was REJECTED: always-reseed-from-base is load-bearing per
+`docs/prds/warm-lane-pool-cow-seeding.md` §9.3/§9.5, so the transcript
+store's destruction is a consequence of a deliberate invariant, not a bug
+to fix in acquire.
+
+**Mechanism.** Transcripts live INSIDE the lane
+(`<lane>/.task/claude-config-*/projects/<slug>/<sid>.jsonl`). A session
+adopted at boot has its config dir stashed; the lane is then released and
+the next `acquire_lane` re-seeds it, destroying `.task/` — `git clean -xfd`
+on the RECYCLE route (`.task/` is gitignored and not in
+`reap_build_artifact_dirs`), `rmtree(lane/'.task')` on
+RESET_IN_PLACE_REATTACH, `rmtree(lane)` on CREATE_ONCE_FRESH. The
+dispatch-time re-glob then legitimately fails. That is INV-3 working
+correctly against a by-design wipe, not a corroboration failure.
+
+**New reason: `reseeded`.** `_session_resume_eligible` splits a failed
+corroboration on whether the stashed config dir still exists on disk. Gone
+⇒ `reseeded` (the whole store was wiped); survives with only this session's
+transcript missing ⇒ `no_transcript`. A never-stashed config dir also stays
+`no_transcript`: a reseed clears the out-of-lane meta root together with the
+lane (I2), so it destroys the sidecar WITH the transcript and yields no
+adoption at all — an adopted sidecar without a config dir is pathological
+and stays loud.
+
+- **B4 (§8)** splits. Its existing row is the never-stashed shape
+  (`with_transcript=False`) and keeps `reason='no_transcript'`. A new B4'
+  covers the dominant case: the transcript DID corroborate at boot, the lane
+  was then reseeded, and the postcondition is `reason='reseeded'` + fresh
+  dispatch with the recovered plan + **no escalation**.
+- **INV-4** is narrowed and made rolling. The streak counts only UNEXPLAINED
+  fallbacks (`reason ∈ {stale, no_transcript}`; `reseeded` is excluded by
+  construction, as `capped` already was), and a run must now be CHAINED —
+  each fallback within `session_resume.storm_window_secs` (new knob, default
+  3600s) of the previous, else the streak decays to 0 first. Without the
+  decay the counter was cumulative-per-boot, not consecutive: its only reset
+  was an eligible resume, so a slow drip of isolated `stale` events would
+  have accumulated into a false storm. The window is measured on the
+  MONOTONIC clock because `stale` is itself produced by clock skew. A
+  per-dispatch reset was rejected — with several concurrent slots an ordinary
+  dispatch interleaves between virtually any two recovered-session
+  dispatches, which would have made the threshold unreachable and INV-4 dead
+  code.
+
+**Measured impact.** 149 `session_resume*` events since 2026-07-19: 142
+`no_transcript`, 7 `stale`, exactly 1 eligible resume. ~14/day and bursty
+(17 inside one hour = one boot's worth of recovered tasks re-dispatched onto
+reseeded lanes), spread thin across many tasks. The cost was escalation
+noise — an L1 every ~5 unlucky dispatches — not a throughput loss; every
+fallback still dispatched fresh WITH its recovered plan (I3).
+
+**Out of scope here.** Making resume actually SUCCEED (1/149) is the sibling
+transcript-rehydration task, not this one. This amendment only reclassifies
+the outcome so the escalation channel stops firing on a by-design event; it
+changes no acquire semantics and no eligibility outcome — only the reason a
+fallback reports and whether that reason feeds the storm streak.

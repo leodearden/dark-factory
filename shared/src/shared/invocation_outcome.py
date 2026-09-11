@@ -10,6 +10,13 @@ This module is additive only — it does not modify ``usage_gate.py`` or
 ``cli_invoke.py``. Rewiring those consumers to call ``classify_invocation``
 is a follow-up task; until then the string tables are intentionally
 duplicated between the old and new homes.
+
+Provenance note: consolidating the auth-failure path here originally LOST the
+401/403 response-body snippet — b68eea415b (task 2134 step-4) replaced
+``_handle_auth_failure(f'HTTP {status}: {output[:120]}')`` with
+``slot.report(outcome)``, and ``AuthFailed`` carried only the numeric status.
+Task 4042 restored it as :attr:`AuthFailed.body`, rendered into the gate's
+reason string by :func:`auth_failure_reason`.
 """
 
 from __future__ import annotations
@@ -19,13 +26,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-# Real (non-TYPE_CHECKING) import: is_zero_output_timeout is CALLED by the
-# ZeroOutputWedge tier below, not just referenced as a type annotation. This
-# keeps the transcript-authoritative + legacy-fallback wedge definition
-# single-sourced (cli_invoke.py:357) so it cannot drift from this module's
-# copy. Safe: shared.cli_invoke does not import shared.invocation_outcome, so
+# Real (non-TYPE_CHECKING) imports: BOTH predicates are CALLED by tiers below,
+# not just referenced as type annotations, and both stay single-sourced in
+# cli_invoke.py so this module's tiers cannot drift from the definitions their
+# other consumers use — is_zero_output_timeout keeps the
+# transcript-authoritative + legacy-fallback wedge definition, and
+# is_server_error_status keeps the 5xx band (task 3314 / INV-5: the ServerError
+# tier, classify_agent_failure's 5xx rule and the orchestrator consumers all
+# call the same function). Safe: shared.cli_invoke does not import
+# shared.invocation_outcome at module top (only lazily inside functions), so
 # this introduces no import cycle.
-from shared.cli_invoke import is_zero_output_timeout
+from shared.cli_invoke import is_server_error_status, is_zero_output_timeout
 
 if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
@@ -38,8 +49,10 @@ __all__ = [
     'AuthFailed',
     'CliLocalError',
     'ModelNotFound',
+    'ServerError',
     'ZeroOutputWedge',
     'Failure',
+    'auth_failure_reason',
     'classify_invocation',
 ]
 
@@ -78,6 +91,76 @@ class AuthFailed(InvocationOutcome):
 
     status: int
 
+    # The first <=120 characters of the 401/403 response body (``result.output``,
+    # falling back to ``result.stderr``), whitespace-collapsed to a SINGLE line
+    # and credential-scrubbed by ``_sanitise_auth_body`` below; ``''`` when
+    # neither stream carried text. It exists because the numeric status ALONE
+    # cannot distinguish OAuth *revocation* from *expiry* from an *org-policy
+    # block* in the multi-account rotation — the distinction the task-2134
+    # refactor (b68eea415b) dropped when it replaced
+    # ``_handle_auth_failure(f'HTTP {status}: {output[:120]}')`` with
+    # ``slot.report(outcome)``. Optional-with-a-default on purpose: every existing
+    # bare ``AuthFailed(status=...)`` construction site keeps working.
+    body: str = ''
+
+
+# Credential shapes masked out of an AuthFailed body snippet. The snippet is no
+# longer log-only: ``_handle_auth_failure`` persists it into the ``auth_failed``
+# cost-event JSON and surfaces it through ``gate.paused_reason`` to the
+# dashboard, so a backend CLI that echoes key material in its 401/403 stderr
+# would park that material on an operator-visible, durable surface. Deliberately
+# narrow — two shapes, each anchored so ordinary diagnostic prose survives:
+#   * ``sk-...`` secret keys (``sk-ant-api03-``, ``sk-ant-oat01-``, ``sk-proj-``).
+#     The lookbehind stops it eating the tail of an innocent word — without it
+#     ``risk-assessment-failure`` redacts to ``ri[REDACTED]``.
+#   * an Authorization-header dump. The ``{16,}`` floor is what keeps prose like
+#     ``Error: invalid bearer token`` intact (``token`` is 5 chars, and the
+#     longest plausible English follower, ``authentication``, is 14); a real
+#     JWT/OAuth bearer is far longer. The label is preserved via the capture
+#     group so an operator can still see WHICH field was masked.
+_CREDENTIAL_SCRUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r'(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{12,}'), '[REDACTED]'),
+    (re.compile(r'(bearer\s+)\S{16,}', re.IGNORECASE), r'\1[REDACTED]'),
+)
+
+
+def _sanitise_auth_body(text: str, *, limit: int = 120) -> str:
+    """Collapse ``text`` to one scrubbed line of at most ``limit`` characters.
+
+    Whitespace collapse (not a bare ``.strip()``) because the snippet's stderr
+    fallback stream is commonly MULTI-line, and the result is rendered as a
+    single WARNING log record (``Account {name} AUTH-FAILED: {reason}``), a
+    ``paused_reason`` cell in the dashboard, and one JSON string in the
+    ``auth_failed`` cost event. An embedded newline breaks the first and
+    renders as a blob in the second. Collapsing also spends the ``limit``
+    budget on content rather than on a CLI's indentation.
+
+    Scrub BEFORE truncating, never after: truncation can slice a key below the
+    ``{12,}`` match floor (``sk-ant-api03-abc`` cut to ``sk-ant-a``), which
+    would silently leak the surviving prefix past a scrub applied afterwards.
+    """
+    snippet = ' '.join(text.split())
+    for pattern, replacement in _CREDENTIAL_SCRUBS:
+        snippet = pattern.sub(replacement, snippet)
+    return snippet[:limit]
+
+
+def auth_failure_reason(outcome: AuthFailed) -> str:
+    """Render the reason string handed to ``UsageGate._handle_auth_failure``.
+
+    SINGLE definition site on purpose: this string has two callers —
+    production ``usage_gate.InvokeSlot.report`` and the shipped mock-gate
+    mirror ``shared.testing.make_gate_mock`` — whose own docstring requires
+    them to stay byte-for-byte in step. It was a trivial f-string until the
+    body snippet made it conditional, and two hand-maintained copies of a
+    conditional is exactly the drift this module's single-source ethos
+    (``TestSingleSourceOwnership``) exists to prevent.
+
+    An empty ``body`` yields the bare ``HTTP {status}`` produced before the
+    snippet was restored — no trailing separator.
+    """
+    return f'HTTP {outcome.status}: {outcome.body}' if outcome.body else f'HTTP {outcome.status}'
+
 
 @dataclass(frozen=True)
 class CliLocalError(InvocationOutcome):
@@ -101,6 +184,26 @@ class ModelNotFound(InvocationOutcome):
 
 
 @dataclass(frozen=True)
+class ServerError(InvocationOutcome):
+    """A server-side (HTTP 5xx, including 529 Overloaded) API failure
+    (task 3314, plans/server-side-api-error-handling-prd.md).
+
+    NOT account-scoped (PRD decision 4): the 2026-07-29 incident data showed
+    the FRESHEST account carrying the highest failure rate, i.e. the provider
+    was degraded, not any one account's quota.  So ``invoke_with_cap_retry``
+    must neither fail over to another account nor mutate account state on
+    this outcome — failing over only multiplies load on an already-degraded
+    provider.  It is transient: the caller (workflow/scheduler) owns the
+    requeue, with pacing.
+
+    Declared between ``ModelNotFound`` and ``ZeroOutputWedge`` so declaration
+    order tracks classification precedence.
+    """
+
+    status: int
+
+
+@dataclass(frozen=True)
 class ZeroOutputWedge(InvocationOutcome):
     """The invocation timed out having produced no transcript turns (a wedge)."""
 
@@ -113,15 +216,26 @@ class Failure(InvocationOutcome):
 
 
 _MONTH_ABBR = {
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    'jan': 1,
+    'feb': 2,
+    'mar': 3,
+    'apr': 4,
+    'may': 5,
+    'jun': 6,
+    'jul': 7,
+    'aug': 8,
+    'sep': 9,
+    'oct': 10,
+    'nov': 11,
+    'dec': 12,
 }
 
 # NOTE — fork, not drift-guarded: _parse_resets_at and _extract_cap_message
 # below are ported from usage_gate.py (their regex/parsing logic originated
 # there), but unlike CAP_HIT_PREFIXES/CAP_CONFIRM_KEYWORDS/NEAR_CAP_PREFIXES/
-# CODEX_CAP_PATTERNS/GEMINI_CAP_PATTERNS/NON_CAP_CLI_ERROR_MARKERS (pinned by
-# TestStringTableDriftGuard in test_invocation_outcome.py), these two
+# CODEX_CAP_PATTERNS/GEMINI_CAP_PATTERNS/NON_CAP_CLI_ERROR_MARKERS (single-
+# sourced here with no mirrored copies elsewhere, guarded by
+# TestSingleSourceOwnership in test_invocation_outcome.py), these two
 # functions have NO automated guard keeping them in sync with their
 # usage_gate.py originals — and have already intentionally diverged: this
 # copy of _parse_resets_at returns None on parse failure and accepts an
@@ -132,8 +246,15 @@ _MONTH_ABBR = {
 # copies are pure and forked deliberately (this task is additive-only; see
 # the module docstring), so a future edit to one is not expected to be
 # mirrored in the other — but it also won't be caught if it should have
-# been. Resolved by the beta consumer-rewire, which is expected to delete
-# usage_gate.py's copies in favour of these once callers are repointed here.
+# been. The beta consumer-rewire collapsed the string tables but
+# deliberately left these two functions forked. Task 4042 then moved
+# usage_gate.py's ONE live _parse_resets_at call site (_handle_auth_failure)
+# onto THIS copy, imported there as _parse_resets_at_strict — so the
+# usage_gate.py fork of _parse_resets_at now has no production callers and
+# survives only as the re-export consumed by
+# orchestrator/src/orchestrator/usage_gate.py and its tests (see the note at
+# its definition). usage_gate.py's _extract_cap_message fork remains a live
+# copy with the divergent semantics described above.
 
 
 def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | None:
@@ -181,11 +302,13 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     m = re.search(
         r'resets\s+(?:on\s+)?([A-Za-z]{3,9})\s+(\d{1,2}),?\s+'
         r'(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         try:
             import zoneinfo
+
             month_str = m.group(1).lower()[:3]
             day = int(m.group(2))
             time_str = m.group(3).strip()
@@ -205,9 +328,13 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             now_in_tz = now.astimezone(tz)
             year = now_in_tz.year
             target = now_in_tz.replace(
-                year=year, month=month, day=day,
-                hour=parsed_time.hour, minute=parsed_time.minute,
-                second=0, microsecond=0,
+                year=year,
+                month=month,
+                day=day,
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                second=0,
+                microsecond=0,
             )
             # If target is in the past, assume next year
             if target <= now_in_tz:
@@ -219,11 +346,13 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     # Absolute: "resets Xpm (TZ)" or "resets X:XX AM (TZ)"
     m = re.search(
         r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         try:
             import zoneinfo
+
             time_str = m.group(1).strip()
             tz_str = m.group(2).strip()
             tz = zoneinfo.ZoneInfo(tz_str)
@@ -240,7 +369,8 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             target = now_in_tz.replace(
                 hour=parsed_time.hour,
                 minute=parsed_time.minute,
-                second=0, microsecond=0,
+                second=0,
+                microsecond=0,
             )
             if target <= now_in_tz:
                 target += timedelta(days=1)
@@ -253,20 +383,66 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     return None
 
 
+# The CLI rejected the invocation because no prompt ever reached it
+# (esc-3118-1, 2026-07-28 ~16:31Z).  The claude backend is 100%
+# stdin-dependent — ``build_claude_argv`` emits no positional prompt and no
+# ``-`` stdin marker — so when the prompt never lands on the child's stdin the
+# CLI exits on ARGUMENT VALIDATION, *before contacting the API*.  A cap message
+# therefore can never coexist with this text.  Matched case-insensitively.
+# Shared with
+# ``shared.cli_invoke.is_cli_invocation_rejected``, which imports this table
+# lazily (this module imports cli_invoke at module top, so the reverse must
+# stay function-local).
+#
+# Defined ABOVE NON_CAP_CLI_ERROR_MARKERS because it is spliced into it.
+CLI_INPUT_REQUIRED_MARKERS = [
+    'input must be provided either through stdin or as a prompt argument',
+]
+
 # Concrete CLI/usage errors that exit instantly with no output but are NOT
 # usage caps. Matched case-insensitively against stderr/output so the
 # zero-cost cap heuristic doesn't misfire (and loop forever) on a local CLI
-# failure. Copied from cli_invoke.py:120 (NON_CAP_CLI_ERROR_MARKERS) — this
-# module owns the classification decision now, but that module's copy stays
-# in place until the beta (consumer-rewire) task removes it.
+# failure. This module is the SINGLE definition site (the mirrored copies in
+# cli_invoke.py / usage_gate.py were deleted in the single-source collapse;
+# shared/tests/test_invocation_outcome.py::TestSingleSourceOwnership asserts
+# they stay gone).
+#
+# CLI_INPUT_REQUIRED_MARKERS is spliced in (task 3143 / esc-3118-1) rather
+# than listed inline so the "prompt never reached stdin" strings have exactly
+# ONE definition, shared with cli_invoke's subtype minting and predicate.
+# They belong here for the same reason as every other entry: the CLI exits on
+# argument validation BEFORE contacting the API, so a usage cap cannot be the
+# cause — and without a positive non-cap attribution, invoke_with_cap_retry's
+# zero-cost/instant heuristic net reports a SYNTHETIC cap hit and churns the
+# whole account pool through compounding cooldowns for a local error the API
+# never saw.
 NON_CAP_CLI_ERROR_MARKERS = [
-    'is already in use',        # --session-id collision (reify-3604)
+    'is already in use',  # --session-id collision (reify-3604)
     'unrecognized arguments',
     'unknown option',
     'invalid value',
     'no such file or directory',
     'permission denied',
-]
+    # An unresolvable `--resume` (task 3578). Like the --session-id collision
+    # above, the CLI resolves the session id against the on-disk transcript
+    # store and exits BEFORE contacting the API, so a usage cap can never be the
+    # cause. Without this positive non-cap attribution the zero-cost/instant
+    # heuristic in invoke_with_cap_retry reports a SYNTHETIC cap hit and churns
+    # a HEALTHY account through compounding cooldowns for a local error the API
+    # never saw.
+    #
+    # LATENT-FRAGILITY hardening, zero live occurrences: real resume failures
+    # currently exceed the net's 5000 ms floor, so nothing is being fixed here —
+    # the fragility is that the floor is the only thing standing in the way.
+    # Third instance of this class, after reify-3604 (--session-id collision)
+    # and the 2026-07-29 ServerError escape.
+    #
+    # Text and its STDERR placement MEASURED against Claude Code CLI 2.1.236 on
+    # 2026-08-19, not guessed: the CLI prints
+    # `No conversation found with session ID: <uuid>` on stderr and exits 1.
+    # classify scans `combined = f'{stderr}\n{output}'`, so stderr is seen.
+    'no conversation found with session id',
+] + CLI_INPUT_REQUIRED_MARKERS
 
 # Substrings (case-insensitive) indicating the requested model does not
 # exist / is not available (task beta, plans/adaptive-model-routing-prd.md).
@@ -295,7 +471,7 @@ CAP_HIT_PREFIXES = [
 # cap-message phrases unlikely to appear in non-cap contexts.  The primary
 # defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
 # Copied from usage_gate.py:78 (CAP_CONFIRM_KEYWORDS).
-CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan", "upgrade your subscription"]
+CAP_CONFIRM_KEYWORDS = ['resets', 'usage limit', 'upgrade your plan', 'upgrade your subscription']
 
 # Patterns for near-cap warnings (pause proactively). Copied from
 # usage_gate.py:81 (NEAR_CAP_PREFIXES).
@@ -304,12 +480,22 @@ NEAR_CAP_PREFIXES = [
 ]
 
 # Codex (OpenAI) cap-hit patterns. Copied from usage_gate.py:86 (CODEX_CAP_PATTERNS).
-CODEX_CAP_PATTERNS = ['usage limit reached', 'rate limit', 'quota exceeded',
-                      'insufficient_quota', 'rate_limit_exceeded']
+CODEX_CAP_PATTERNS = [
+    'usage limit reached',
+    'rate limit',
+    'quota exceeded',
+    'insufficient_quota',
+    'rate_limit_exceeded',
+]
 
 # Gemini (Google) cap-hit patterns. Copied from usage_gate.py:90 (GEMINI_CAP_PATTERNS).
-GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
-                       'RESOURCE_EXHAUSTED', 'quota_exceeded']
+GEMINI_CAP_PATTERNS = [
+    'quota exceeded',
+    'rate limit',
+    'resource exhausted',
+    'RESOURCE_EXHAUSTED',
+    'quota_exceeded',
+]
 
 
 def _extract_cap_message(text: str, prefix: str) -> str:
@@ -317,8 +503,8 @@ def _extract_cap_message(text: str, prefix: str) -> str:
 
     Forked from usage_gate.py, same as ``_parse_resets_at`` above — see the
     fork/no-drift-guard note by that function's definition. Not covered by
-    TestStringTableDriftGuard, which pins only the plain string-table
-    constants.
+    TestSingleSourceOwnership, which only asserts the plain string-table
+    constants are single-sourced here with no mirrored copies elsewhere.
     """
     lower = text.lower()
     idx = lower.find(prefix.lower())
@@ -341,7 +527,8 @@ def classify_invocation(
 
     Total and pure: every ``AgentResult`` maps to exactly one variant, in
     precedence order AuthFailed > ModelNotFound (404) > OK > ModelNotFound
-    (marker) > CliLocalError > CapHit/NearCap > ZeroOutputWedge > Failure.
+    (marker) > CliLocalError > CapHit/NearCap > ServerError > ZeroOutputWedge
+    > Failure.
     Reads only ``result`` (and ``backend`` / ``strict_confirm``) — no I/O,
     no gate mutation.
     """
@@ -351,7 +538,19 @@ def classify_invocation(
     # cap detection entirely and never trip AllAccountsCappedException
     # (mirrors cli_invoke.py:799-805).
     if result.api_error_status in (401, 403):
-        return AuthFailed(status=result.api_error_status)
+        # Capture the response-body snippet: the numeric status alone cannot
+        # distinguish OAuth revocation from expiry from an org-policy block.
+        # Restores the text dropped by b68eea415b (task 2134 step-4), which
+        # replaced `_handle_auth_failure(f'HTTP {status}: {output[:120]}')`
+        # with `slot.report(outcome)`. Cannot reuse the `combined` string
+        # built below (it is assembled AFTER this tier and interleaves
+        # stderr+output with a newline); output-preferred with a stderr
+        # fallback matches the pre-refactor `result.output[:120]`. Sanitising
+        # AFTER the fallback choice spends the 120-char budget on whichever
+        # stream actually carried text. `_sanitise_auth_body` owns the
+        # one-line-ness, the credential scrub and the truncation — see there.
+        raw = (result.output or '').strip() or (result.stderr or '').strip()
+        return AuthFailed(status=result.api_error_status, body=_sanitise_auth_body(raw))
 
     combined = f'{result.stderr or ""}\n{result.output or ""}'
     combined_lower = combined.lower()
@@ -448,6 +647,25 @@ def classify_invocation(
             if prefix.lower() in combined_lower:
                 reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
                 return NearCap(reason=reason)
+
+    # ServerError — a server-side (HTTP 5xx, incl. 529 Overloaded) API failure.
+    # Both sides of this placement are load-bearing (task 3314):
+    #
+    # BELOW CapHit/NearCap, because a 5xx body never carries cap prefixes of
+    # its own, and 429-body semantics must not move: a 429 is not in the 5xx
+    # band, so it still reaches the cap tier above and keeps driving cap
+    # accounting / AllAccountsCappedException exactly as before. A 5xx that
+    # DOES carry a real cap body is a cap (corpus row
+    # server_error_5xx_with_cap_body_is_cap).
+    #
+    # ABOVE ZeroOutputWedge, because a SIGTERM-flushed 529 on a
+    # watchdog-killed CLI is a PROVIDER outage, not a local wedge — that is
+    # the 2026-07-29 incident this tier exists for. Ranking the wedge first
+    # discarded the 5xx evidence and sent a provider outage down the
+    # local-recovery path instead of the transient-requeue lane. That
+    # ordering is the whole point of the tier.
+    if is_server_error_status(result.api_error_status):
+        return ServerError(status=result.api_error_status)
 
     # ZeroOutputWedge — a full-timeout invocation that produced no transcript
     # progress. Delegates to is_zero_output_timeout (cli_invoke.py:357) so the

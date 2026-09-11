@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from typing import Any
 
 import pytest
 
@@ -233,6 +235,504 @@ class TestEscalationEnabled:
     not sve_mod.HAS_ESCALATION,
     reason='escalation package not installed in this environment',
 )
+class TestAdvisoryVsRejectionWording:
+    """Task 3119: ``report_rejection`` serves BOTH path-guard outcomes, so its
+    wording must say which one actually happened.
+
+    The path guard has two outcomes since task 2206: a FILES-certain hard
+    reject (no task created, error dict returned) and a PROSE-only advisory
+    (nothing blocked; the submission carries
+    ``metadata.possible_scope_mismatch``).  Both funnel through
+    ``report_rejection``, which used to hardcode rejection wording — so every
+    advisory told the operator (and the agent reading it in a briefing) that a
+    task had been rejected when nothing had been blocked.  These tests pin the
+    PAIR: the advisory says nothing was blocked, the rejection wording is
+    unchanged.
+
+    Task 4159 pins the other half of the same honesty property: the advisory
+    fires from the ``submit_task`` PHASE-1 guard, before ``tm.add_task`` and
+    before the submission has been resolved (it may yield a new task, be
+    folded into an existing one, or be dropped), so it may not claim a task
+    EXISTS either.  Overcorrecting from 'rejected' to 'created' just moved
+    the false claim.
+    """
+
+    @staticmethod
+    def _payloads(root):
+        """Return the escalation payloads written under *root* (sorted by id)."""
+        files = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+        return [json.loads(f.read_text()) for f in files]
+
+    def _one_payload(self, root):
+        payloads = self._payloads(root)
+        assert len(payloads) == 1, f'expected exactly one escalation, found: {payloads}'
+        return payloads[0]
+
+    # The canonical submit for each outcome mode, so a wording test reads as
+    # "file one advisory, assert on it" rather than five copies of the same
+    # four-argument call.  Per-test deltas stay visible as **overrides at the
+    # call site; tests that deliberately drive BOTH modes over one IDENTICAL
+    # shape (the cross-fold/fingerprint pins) build their own dict instead,
+    # since that shared shape is the property under test.
+    _ADVISORY_SHAPE = {
+        'project_id': 'reify',
+        'candidate_title': 'Rework the gui panel',
+        'matched_paths': ('gui/',),
+        'suggested_project': 'reify_gui',
+    }
+    _REJECTION_SHAPE = {
+        'project_id': 'reify',
+        'candidate_title': 'Edit fused-memory/X',
+        'matched_paths': ('fused-memory/',),
+        'suggested_project': 'dark_factory',
+    }
+
+    @classmethod
+    def _advisory(cls, esc, root, **overrides):
+        """File one PROSE-only advisory against *root*; returns the escalation id."""
+        return esc.report_rejection(
+            project_root=str(root),
+            advisory=True,
+            **{**cls._ADVISORY_SHAPE, **overrides},
+        )
+
+    @classmethod
+    def _rejection(cls, esc, root, **overrides):
+        """File one FILES-certain rejection against *root*; returns the escalation id."""
+        return esc.report_rejection(
+            project_root=str(root),
+            **{**cls._REJECTION_SHAPE, **overrides},
+        )
+
+    def test_advisory_record_never_claims_a_rejection(self, tmp_path):
+        """The advisory record must not label a created task as rejected.
+
+        Pins the STABLE contracts only, so a harmless rewording of the same
+        correct message doesn't break the suite: the ``ADVISORY`` marker, the
+        absence of 'reject' anywhere in the summary, the ``suggested_action``
+        value (rendered verbatim into agent briefings by
+        ``orchestrator/agents/briefing.py``, where ``resubmit_to_<project>``
+        would tell an agent to redo work that already landed), and the
+        ``possible_scope_mismatch`` stamp name an operator greps for.
+        """
+        esc = ScopeViolationEscalator()
+        esc_id = self._advisory(esc, tmp_path)
+        assert esc_id is not None
+        payload = self._one_payload(tmp_path)
+        summary = payload['summary']
+        assert 'ADVISORY' in summary, summary
+        # THE mislabel this task exists to kill: an advisory that says the
+        # submission was rejected, when in fact the task was created.
+        assert 'reject' not in summary.lower(), (
+            f'advisory summary must not claim a rejection: {summary!r}'
+        )
+        assert payload['suggested_action'] == 'no_action_advisory_only', payload
+
+        detail = payload['detail']
+        # Named verbatim so the operator can grep the created task's metadata.
+        assert 'possible_scope_mismatch' in detail, detail
+        assert 'was rejected' not in detail, (
+            f'advisory detail must not claim a rejection: {detail!r}'
+        )
+        # The structured routing context survives the advisory branch, under
+        # outcome-NEUTRAL labels: a 'rejecting_project_id=' line would
+        # re-introduce the mislabel in the very field an operator (or a briefed
+        # agent) reads right next to the corrected suggested_action.
+        for field in (
+            'candidate_title=',
+            'filing_project_id=',
+            'filing_project_root=',
+            'matched_paths=',
+            'suggested_project=',
+        ):
+            assert field in detail, f'advisory detail dropped {field!r}: {detail!r}'
+        assert 'rejecting_project' not in detail, detail
+
+    def test_advisory_detail_does_not_assert_a_task_was_created(self, tmp_path):
+        """Task 4159: the advisory detail must not claim a task exists.
+
+        WHY the old wording was unverified: this record is filed from
+        ``_path_guard_or_skip``, which runs inside ``submit_task`` PHASE-1 —
+        the phase that persists a ticket and returns its id, explicitly
+        *before* ``tm.add_task`` is ever called.  Only an outcome that
+        actually CREATES a task yields one carrying the stamp; a submission
+        that is dropped yields no task at all, and one folded into an
+        existing task leaves that target without this candidate's stamp
+        (``_execute_combine`` propagates only the ``curator_*`` keys).  So
+        at the moment this escalation is written, "the task WAS created" is
+        a claim the escalator cannot possibly have verified, and on a
+        drop/combine it is simply false — the operator (and any agent handed
+        this text by ``briefing.py``) is told to go review a task that does
+        not exist.
+
+        Pins the STABLE contracts, per this class's convention: the absence
+        of the specific false clauses, the presence of the no-task outcome
+        vocabulary, and the one conditional clause the prose commits to.
+        """
+        esc = ScopeViolationEscalator()
+        esc_id = self._advisory(esc, tmp_path)
+        assert esc_id is not None
+        detail = self._one_payload(tmp_path)['detail']
+        lowered = detail.lower()
+
+        # (a) The two clauses the bug shipped, banned case-INSENSITIVELY (as
+        # the sibling summary test does) so a recapitalised regression can't
+        # slip back in.  Deliberately not a blanket 'created' ban: the
+        # corrected prose must still be free to describe the create OUTCOME,
+        # conditionally.
+        assert 'task was created' not in lowered, (
+            f'advisory detail asserts an unverified creation: {detail!r}'
+        )
+        assert 'nothing was lost' not in lowered, (
+            f'advisory detail claims an outcome it cannot know: {detail!r}'
+        )
+
+        # (b) The deferred disposition is actually stated — the reader is told
+        # the submission may yet be dropped or folded into an existing task,
+        # not just that it was created.
+        assert 'possible_scope_mismatch' in detail, detail
+        assert 'drop' in lowered, (
+            f'advisory detail must name the drop outcome: {detail!r}'
+        )
+        assert 'combine' in lowered or 'fold' in lowered, (
+            f'advisory detail must name the fold-into-existing outcome: {detail!r}'
+        )
+
+        # (c) The stamp claim is CONDITIONAL, pinned as the one stable clause
+        # the prose commits to rather than as a shape-of-the-sentence regex:
+        # an unconditional "the task carries metadata.possible_scope_mismatch"
+        # would re-introduce the same false claim in a new phrasing, and would
+        # be false twice over, since a combine target never receives the
+        # candidate's stamp at all.
+        assert 'Only a task' in detail, (
+            'the stamp claim must stay conditional on a task actually being '
+            f'created: {detail!r}'
+        )
+
+        # Invariants the rest of the suite already relies on, re-asserted here
+        # so one careless rewrite is caught in one place.
+        assert 'was rejected' not in detail, detail
+        for field in (
+            'candidate_title=',
+            'filing_project_id=',
+            'filing_project_root=',
+            'matched_paths=',
+            'suggested_project=',
+        ):
+            assert field in detail, f'advisory detail dropped {field!r}: {detail!r}'
+
+    def test_advisory_summary_does_not_assert_a_task_was_created(self, tmp_path):
+        """Task 4159: the SUMMARY carries the same unverified claim as the detail.
+
+        The summary is not a lesser field:
+        ``orchestrator/src/orchestrator/agents/briefing.py::_format_escalation``
+        renders ``summary`` AND ``detail`` verbatim into an agent's briefing,
+        and the summary is the line an operator reads first in the queue.
+        Correcting only the detail would leave 'task CREATED and stamped' —
+        the identical phase-1 claim the detail test rejects — sitting in the
+        more prominent of the two rendered fields.
+
+        Both fields are dedup-neutral (``compute_content_fingerprint`` takes
+        only category/kind/affected_ids), so correcting both is equally safe.
+        """
+        esc = ScopeViolationEscalator()
+        esc_id = self._advisory(esc, tmp_path)
+        assert esc_id is not None
+        summary = self._one_payload(tmp_path)['summary']
+
+        # The shipped token, then the general ban: unlike the detail (which
+        # must describe the curator's create OUTCOME to be useful), the
+        # summary has no room to qualify a creation claim, so it makes none.
+        assert 'CREATED' not in summary, (
+            f'advisory summary asserts an unverified creation: {summary!r}'
+        )
+        assert 'created' not in summary.lower(), (
+            f'advisory summary asserts an unverified creation: {summary!r}'
+        )
+
+        # The contracts that must survive the rewording.
+        assert 'ADVISORY' in summary, summary
+        assert 'reject' not in summary.lower(), (
+            f'advisory summary must not claim a rejection: {summary!r}'
+        )
+        assert 'gui/' in summary, summary
+        assert 'reify_gui' in summary, summary
+
+    def test_advisory_without_suggested_project_is_still_advisory_only(self, tmp_path):
+        """advisory + no resolvable owner must not fall through to manual_route.
+
+        Reachable in production: a prose scan can hit several projects, leaving
+        the guard with no single suggested owner.  If the advisory check were
+        ordered after the ``manual_route`` fallback, this shape would hand a
+        briefed agent a routing directive for a submission that was never
+        blocked — the same class of false instruction as ``resubmit_to_*``.
+        """
+        esc = ScopeViolationEscalator()
+        esc_id = self._advisory(
+            esc,
+            tmp_path,
+            candidate_title='ambiguous prose hit',
+            matched_paths=('fused-memory/', 'crates_other/'),
+            suggested_project=None,
+        )
+        assert esc_id is not None
+        payload = self._one_payload(tmp_path)
+        assert payload['suggested_action'] == 'no_action_advisory_only', payload
+        # The unknown-owner placeholder still renders, still without 'reject'.
+        assert '<unknown' in payload['summary'], payload
+        assert 'reject' not in payload['summary'].lower(), payload
+
+    def test_rejection_wording_and_action_unchanged(self, tmp_path):
+        """The other half of the pair: the FILES-certain path is untouched.
+
+        Regression anchor — passes before the change and must keep passing
+        after it.  The rejection wording is CORRECT today (a task really was
+        rejected), so this change must not touch it.
+        """
+        esc = ScopeViolationEscalator()
+        self._rejection(esc, tmp_path)
+        payload = self._one_payload(tmp_path)
+        assert payload['summary'].startswith('Misrouted task rejected: cites '), payload
+        assert 'was rejected' in payload['detail'], payload
+        assert payload['suggested_action'] == 'resubmit_to_dark_factory', payload
+        # The structured context labels are outcome-neutral on BOTH modes — the
+        # rejecting/filing project is the same project either way.
+        assert 'filing_project_id=' in payload['detail'], payload
+        assert 'rejecting_project' not in payload['detail'], payload
+
+    def test_both_modes_are_severity_info(self, tmp_path):
+        """Both modes stay severity='info' — there is no tier below it.
+
+        ``escalation.models`` defines the severity vocabulary as
+        ``blocking | info | critical | urgent``, so 'info' is already the floor
+        and the advisory cannot drop lower.  The wording (above) is the
+        load-bearing correction, not the severity.
+        """
+        # Separate roots so the two modes cannot interact through dedup.
+        rejection_root = tmp_path / 'rejection'
+        advisory_root = tmp_path / 'advisory'
+        esc = ScopeViolationEscalator()
+        self._rejection(esc, rejection_root)
+        self._advisory(esc, advisory_root)
+        for root in (rejection_root, advisory_root):
+            payload = self._one_payload(root)
+            assert payload['severity'] == 'info', (root, payload)
+            assert payload['category'] == 'scope_violation', (root, payload)
+            assert payload['agent_role'] == 'fused-memory/path-guard', (root, payload)
+
+    def test_advisory_and_rejection_do_not_cross_fold(self, tmp_path):
+        """The mode must be part of the dedup fingerprint.
+
+        report_rejection folds on a content fingerprint over the misroute
+        SHAPE (project_id + sorted matched_paths + suggested_project) with an
+        UNBOUNDED window.  Branching only the strings would leave the two modes
+        sharing a fingerprint, so an advisory and a FILES-certain rejection over
+        the same paths fold into ONE parent — whichever arrives first sets the
+        wording and the second event is then reported with the other's outcome.
+        That is this same mislabel bug in the opposite direction.
+        """
+        esc = ScopeViolationEscalator()
+        shape = {
+            'project_root': str(tmp_path),
+            'project_id': 'reify',
+            'candidate_title': 'Human gate: consolidate tree-sitter cluster',
+            'matched_paths': ('corpus/',),
+            'suggested_project': 'know_live',
+        }
+
+        rejection_id = esc.report_rejection(**shape)
+        advisory_id = esc.report_rejection(**shape, advisory=True)
+
+        assert rejection_id is not None
+        assert advisory_id is not None
+        assert advisory_id != rejection_id, (
+            'an advisory must not fold into a rejection parent (or vice versa) — '
+            'the surviving wording would mislabel the other outcome'
+        )
+
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 2, f'expected two escalations, found: {payloads}'
+        # Assert on the PAIR, not just the count: a count-only assertion would
+        # also pass if both records carried rejection wording.
+        summaries = sorted(p['summary'] for p in payloads)
+        assert any(s.startswith('Misrouted task rejected: cites ') for s in summaries), (
+            summaries
+        )
+        # 'ADVISORY' is the discriminator, not any particular outcome word:
+        # since task 4159 the advisory summary deliberately makes no creation
+        # claim (it fires before the curator resolves the submission).  The
+        # rejection summary carries no 'ADVISORY' marker and the advisory
+        # carries no 'reject', so this still fails if the fold collapsed both
+        # records onto one wording.
+        assert any('ADVISORY' in s and 'reject' not in s.lower() for s in summaries), (
+            summaries
+        )
+
+    def test_two_identical_advisories_still_fold(self, tmp_path):
+        """Advisories keep the anti-flood property that motivated task 2946.
+
+        Separating the modes must not separate advisories from each OTHER — a
+        recurring prose hit (e.g. the same reconciliation candidate re-proposed
+        every round) must still fold into one pending parent.
+        """
+        esc = ScopeViolationEscalator()
+        shape = {
+            'project_root': str(tmp_path),
+            'project_id': 'reify',
+            'candidate_title': 'Human gate: consolidate tree-sitter cluster',
+            'matched_paths': ('corpus/',),
+            'suggested_project': 'know_live',
+            'advisory': True,
+        }
+
+        first = esc.report_rejection(**shape)
+        second = esc.report_rejection(**shape)
+
+        assert first is not None
+        assert second == first, 'a repeated identical advisory must fold into the first'
+        payload = self._one_payload(tmp_path)
+        assert payload['id'] == first
+        assert payload['dedupe_count'] == 1
+        assert len(payload['dedupe_children']) == 1
+
+    def test_terminal_log_line_distinguishes_advisory_from_rejection(self, tmp_path, caplog):
+        """Task 4159: the queued-escalation log line must name the outcome mode.
+
+        The escalation payloads distinguish the two outcomes, but the terminal
+        ``logger.warning`` is byte-identical for both — an operator tailing
+        logs sees 'queued esc-... for project ...' and cannot tell a hard
+        reject (no task, caller got an error dict) from an advisory (nothing
+        blocked) without opening the queue file.  Adding the mode is strictly
+        additive: nothing pins this line today.
+        """
+        caplog.set_level(
+            logging.WARNING, logger='fused_memory.middleware.scope_violation_escalator',
+        )
+        # Separate roots so the two modes cannot fold into one submit — and
+        # therefore one log line (mirrors test_both_modes_are_severity_info).
+        rejection_root = tmp_path / 'rejection'
+        advisory_root = tmp_path / 'advisory'
+        esc = ScopeViolationEscalator()
+        rejection_id = self._rejection(esc, rejection_root)
+        advisory_id = self._advisory(esc, advisory_root)
+        assert rejection_id is not None
+        assert advisory_id is not None
+
+        queued = [
+            r.getMessage() for r in caplog.records
+            if 'scope_violation_escalator: queued' in r.getMessage()
+        ]
+        assert len(queued) == 2, f'expected one queued line per submit: {queued}'
+        assert queued[0] != queued[1], (
+            f'the two outcome modes log an identical line: {queued[0]!r}'
+        )
+
+        # Identify each line by its candidate title, then pin the mode token.
+        rejection_msgs = [m for m in queued if 'Edit fused-memory/X' in m]
+        advisory_msgs = [m for m in queued if 'Rework the gui panel' in m]
+        assert len(rejection_msgs) == 1, queued
+        assert len(advisory_msgs) == 1, queued
+        rejection_msg, advisory_msg = rejection_msgs[0], advisory_msgs[0]
+
+        assert 'advisory' in advisory_msg.lower(), (
+            f'advisory log line does not name its mode: {advisory_msg!r}'
+        )
+        assert 'rejection' in rejection_msg.lower(), (
+            f'rejection log line does not name its mode: {rejection_msg!r}'
+        )
+        # Unambiguous, not merely different: a line carrying BOTH tokens would
+        # leave the operator exactly where they started.
+        assert 'rejection' not in advisory_msg.lower(), advisory_msg
+        assert 'advisory' not in rejection_msg.lower(), rejection_msg
+
+        # The shared greppable anchor and the ids survive — this prefix is
+        # common to the sibling escalators, so operator greps depend on it.
+        for msg in (rejection_msg, advisory_msg):
+            assert msg.startswith('scope_violation_escalator: queued'), msg
+        assert rejection_id in rejection_msg, rejection_msg
+        assert advisory_id in advisory_msg, advisory_msg
+
+    def test_unavailable_queue_debug_line_carries_the_same_mode_token(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        """The OTHER mode-labelled line agrees with the queued one.
+
+        ``_ADVISORY_MODE_LABEL`` / ``_REJECTION_MODE_LABEL`` are named
+        constants precisely so this module's two operator-facing lines emit
+        the SAME token and one grep finds both.  The queued WARNING is
+        pinned above; without this, the other half of that rationale — the
+        DEBUG line taken when ``_queue_for`` returns None because the
+        escalation package is unavailable — would be an unchecked comment.
+        """
+        caplog.set_level(
+            logging.DEBUG, logger='fused_memory.middleware.scope_violation_escalator',
+        )
+        esc = ScopeViolationEscalator()
+        # Force the package-unavailable branch: no queue, so no escalation is
+        # filed and the method returns None after logging the mode.
+        monkeypatch.setattr(esc, '_queue_for', lambda project_root: None)
+        assert self._advisory(esc, tmp_path) is None
+        assert self._rejection(esc, tmp_path) is None
+        assert not (tmp_path / 'data' / 'escalations').exists()
+
+        unavailable = [
+            r.getMessage() for r in caplog.records
+            if 'escalation package unavailable' in r.getMessage()
+        ]
+        assert len(unavailable) == 2, f'expected one line per submit: {unavailable}'
+        advisory_msgs = [m for m in unavailable if sve_mod._ADVISORY_MODE_LABEL in m]
+        rejection_msgs = [m for m in unavailable if sve_mod._REJECTION_MODE_LABEL in m]
+        assert len(advisory_msgs) == 1, unavailable
+        assert len(rejection_msgs) == 1, unavailable
+        # Same constants the queued WARNING interpolates, so the two lines
+        # cannot drift apart into two spellings of one mode.
+        assert advisory_msgs[0] != rejection_msgs[0], unavailable
+
+    def test_rejection_fingerprint_is_byte_identical_to_legacy(self, tmp_path):
+        """Load-bearing back-compat pin: the rejection digest must not change.
+
+        Any live PENDING rejection parent already on disk folds only if the new
+        code computes the SAME fingerprint.  Adding a mode token to BOTH
+        branches would change the rejection digest, orphan those parents, and
+        silently re-flood the operator queue that task 2946 quieted — so the
+        discriminator must be advisory-only.  Recomputed here from the
+        pre-change composition, independently of the production code path.
+        """
+        from escalation.dedupe import (  # type: ignore[import-untyped]
+            compute_content_fingerprint,
+        )
+
+        project_id = 'reify'
+        matched_paths = ('corpus/',)
+        suggested_project = 'know_live'
+        expected = compute_content_fingerprint(
+            'scope_violation',
+            'path_guard_misroute',
+            affected_ids=sorted([
+                *matched_paths,
+                f'suggested:{suggested_project}',
+                f'project:{project_id}',
+            ]),
+        )
+
+        esc = ScopeViolationEscalator()
+        esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id=project_id,
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+        payload = self._one_payload(tmp_path)
+        assert payload['dedupe_fingerprint'] == expected, (
+            'the non-advisory fingerprint composition must stay byte-identical'
+        )
+
+
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
 class TestBudgetMisconfigEscalation:
     """ScopeViolationEscalator.report_budget_misconfig() — loud config-defect signal."""
 
@@ -361,6 +861,346 @@ class TestBudgetMisconfigEscalation:
         )
 
 
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestRoutingOverrideEscalation:
+    """Task 3123: ``routing_override_reason`` is an AUDITED bypass.
+
+    When a caller supplies ``routing_override_reason`` to ``submit_task``, the
+    path-scope guards are skipped entirely — the task is created no matter what
+    paths it cites.  Before this task the ONLY record of that was a
+    ``logger.warning``, so a bypass was operationally indistinguishable from no
+    bypass at all.  ``report_routing_override`` files a ``scope_violation``
+    record on the BYPASS path (nothing was blocked) so the operator queue shows
+    the override, the caller's stated reason, and the paths the guard WOULD
+    have flagged.
+    """
+
+    @staticmethod
+    def _payloads(root):
+        """Return the escalation payloads written under *root* (sorted by id)."""
+        files = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+        return [json.loads(f.read_text()) for f in files]
+
+    def test_writes_override_escalation_under_project_root(self, tmp_path):
+        esc = ScopeViolationEscalator()
+        reason = 'self-referential: this task quotes the tokens the guard matches'
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='Task about the path guard itself',
+            reason=reason,
+            matched_paths=('crates/widget.rs',),
+            suggested_project='reify',
+        )
+        assert esc_id is not None
+
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('*.json'))
+        assert len(files) == 1, f'expected one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+
+        assert payload['id'] == esc_id
+        assert payload['category'] == 'scope_violation'
+        assert payload['severity'] == 'info'
+        assert payload['level'] == 1
+        assert payload['agent_role'] == 'fused-memory/path-guard'
+
+        # Distinct anchor so override records are independently greppable from
+        # the rejection/advisory records that share the scope_violation category.
+        assert payload['task_id'] != 'task-path-guard'
+        assert payload['id'].startswith('esc-task-path-guard-override'), payload['id']
+
+        # suggested_action is rendered VERBATIM into agent briefings (task 3119).
+        # Nothing was blocked here, so it must never read as a resubmit order.
+        assert payload['suggested_action'] == 'review_override_justification'
+        assert not payload['suggested_action'].startswith('resubmit_')
+
+        assert 'ROUTING OVERRIDE' in payload['summary']
+        assert 'dark_factory' in payload['summary']
+
+        detail = payload['detail']
+        assert reason in detail, 'the caller-supplied reason must be recorded verbatim'
+        assert "filing_project_id='dark_factory'" in detail
+        assert str(tmp_path) in detail
+        assert 'crates/widget.rs' in detail
+        assert 'reify' in detail
+        # Prose must state plainly that nothing was blocked...
+        assert 'did NOT block' in detail
+        assert 'AUDIT TRAIL, not a rejection' in detail
+        assert 'nothing here asks for a resubmission' in detail.lower()
+        # ...but must NOT assert the outcome of a stage it never observes.
+        # This record is filed from _path_guard_or_skip, which runs BEFORE
+        # task creation: submit_task can still fail validation, the ticket
+        # write can fail, and the curator can later merge or discard the
+        # candidate.  A briefing-rendered claim that "the task WAS created"
+        # would be flatly false in each of those cases.
+        assert 'WAS created' not in detail, (
+            f'the guard must not claim an outcome it cannot see: {detail!r}'
+        )
+
+    # --- fold behaviour ---------------------------------------------------
+    # The record fires on EVERY override, so an automated filer looping on one
+    # justification would flood the operator queue without a fold.
+
+    def _override(self, esc, tmp_path, *, reason, paths=('corpus/',), suggested='know_live'):
+        return esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            reason=reason,
+            matched_paths=paths,
+            suggested_project=suggested,
+        )
+
+    def test_identical_override_folds_into_one_parent(self, tmp_path):
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second == first, 'an identical repeated override must fold into the first'
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected one surviving escalation, found: {payloads}'
+        assert payloads[0]['dedupe_count'] == 1
+
+    def test_distinct_reason_files_a_new_escalation(self, tmp_path):
+        """A genuinely new justification is a new auditable claim."""
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='self-referential: task is about the guard')
+
+        assert first is not None
+        assert second is not None
+        assert second != first
+        assert len(self._payloads(tmp_path)) == 2
+
+    def test_reason_folding_is_whitespace_insensitive(self, tmp_path):
+        """The fingerprint uses the STRIPPED reason, so entry point can't change the fold."""
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='  incidental mention only  ')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second == first
+        assert len(self._payloads(tmp_path)) == 1
+
+    def test_override_never_folds_with_rejection_or_advisory(self, tmp_path):
+        """The three modes fold INDEPENDENTLY.
+
+        A pending record of one mode must never absorb another and describe it
+        with the wrong outcome — the task-3119 failure shape, now three-way.
+        """
+        esc = ScopeViolationEscalator()
+        # dict[str, Any]: a heterogeneous kwargs bundle unpacked into three
+        # differently-typed signatures — without the annotation pyright widens
+        # every value to the union and rejects each `**common` parameter.
+        common: dict[str, Any] = dict(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        rejection = esc.report_rejection(**common, advisory=False)
+        advisory = esc.report_rejection(**common, advisory=True)
+        override = esc.report_routing_override(**common, reason='incidental mention only')
+
+        ids = {rejection, advisory, override}
+        assert None not in ids
+        assert len(ids) == 3, f'the three modes must not fold together: {ids}'
+        assert len(self._payloads(tmp_path)) == 3
+
+    def test_empty_matched_paths_still_files(self, tmp_path):
+        """The census case: an override that turned out unnecessary is the
+        evidence any later tightening of the parameter has to be based on."""
+        esc = ScopeViolationEscalator()
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='A task citing nothing foreign',
+            reason='belt and braces',
+            matched_paths=(),
+            suggested_project=None,
+        )
+        assert esc_id is not None
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1
+        assert '<nothing>' in payloads[0]['summary']
+        assert 'would_have_matched_paths=[]' in payloads[0]['detail']
+
+    def test_reason_under_the_detail_cap_survives_verbatim(self, tmp_path):
+        """``detail`` is the field the audit actually needs, so any reason of
+        a plausible human length reaches it byte-for-byte — the cap below is a
+        backstop against abuse, not a routine clip.
+        """
+        esc = ScopeViolationEscalator()
+        # .strip()ed in the fixture: the escalator strips the reason itself
+        # (see test_reason_normalisation_is_identical_across_entry_points), so
+        # a trailing-space fixture would fail for the wrong reason.
+        reason = ('self-referential: ' + 'the guard matches its own tokens. ' * 50).strip()
+        assert len(reason) < 4000, 'fixture must sit under the detail cap'
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='long but honest reason',
+            reason=reason,
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert reason in payload['detail'], 'detail must keep the full reason verbatim'
+        assert 'truncated' not in payload['detail']
+
+    def test_unbounded_reason_is_capped_in_both_summary_and_detail(self, tmp_path):
+        """``reason`` is unbounded caller-supplied free text arriving over a
+        public MCP surface, and BOTH rendered fields are bounded because BOTH
+        are rendered verbatim into operator views and agent briefings
+        (``orchestrator/agents/briefing.py``).  ``summary`` is the one-line
+        field, so it clips hard; ``detail`` clips generously — and says so,
+        naming the length it dropped, so the audit never quietly
+        misrepresents the very text it exists to audit.
+        """
+        esc = ScopeViolationEscalator()
+        reason = 'x' * 50_000
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='huge reason',
+            reason=reason,
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        # The summary still SHOWS the justification (an operator scanning the
+        # queue needs it) — just a bounded prefix of it.
+        assert 'x' * 100 in payload['summary']
+
+        detail = payload['detail']
+        assert reason not in detail, 'detail must not carry 50k chars of caller text'
+        assert len(detail) < 6000, (
+            f'detail must stay bounded too, got {len(detail)} chars'
+        )
+        # LOUD, not silent: the record names what it dropped.
+        assert 'truncated' in detail
+        assert '50000' in detail, 'the truncation marker must name the original length'
+        # Still enough of the claim to judge it by.
+        assert 'x' * 1000 in detail
+
+    def test_many_matched_paths_stay_bounded_in_summary_and_whole_in_detail(self, tmp_path):
+        """``matched_paths`` is caller-supplied too — on the FILES-certain side
+        it comes straight from ``metadata.files`` — so the same one-line-field
+        rationale that bounds the reason has to bound the path list.  A
+        submission declaring 500 foreign files must not render a
+        multi-kilobyte summary; ``detail`` still carries every path.
+        """
+        esc = ScopeViolationEscalator()
+        paths = tuple(f'other-project/src/module_{i}.py' for i in range(500))
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='500 declared files',
+            reason='cross-cutting by design',
+            matched_paths=paths,
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        # Elided LOUDLY — the summary says what it dropped rather than
+        # reading as a complete list.
+        assert 'other-project/src/module_0.py' in payload['summary']
+        assert '+495 more' in payload['summary']
+        # detail is the field the audit needs: nothing is dropped there.
+        assert 'other-project/src/module_499.py' in payload['detail']
+
+    def test_many_matched_paths_stay_bounded_in_rejection_summary(self, tmp_path):
+        """Same bound on the rejection/advisory summaries — same rationale,
+        and this is the mode whose paths come from ``metadata.files``.
+        """
+        esc = ScopeViolationEscalator()
+        paths = tuple(f'other-project/src/module_{i}.py' for i in range(500))
+        esc_id = esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='500 declared files',
+            matched_paths=paths,
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        assert '+495 more' in payload['summary']
+        assert 'other-project/src/module_499.py' in payload['detail']
+
+    def test_summary_path_cap_does_not_change_the_fold(self, tmp_path):
+        """The fingerprint hashes ``matched_paths`` directly, not the elided
+        rendering, so two over-cap path lists that differ only PAST the cap
+        must still fold apart.  Capping a rendered field must never collapse
+        two distinct events into one record.
+        """
+        esc = ScopeViolationEscalator()
+        head = tuple(
+            f'other/src/module_{i}.py'
+            for i in range(sve_mod._SUMMARY_PATHS_MAX + 2)
+        )
+        first = esc.report_routing_override(
+            project_root=str(tmp_path), project_id='reify',
+            candidate_title='t', reason='same reason',
+            matched_paths=head, suggested_project='know_live',
+        )
+        second = esc.report_routing_override(
+            project_root=str(tmp_path), project_id='reify',
+            candidate_title='t', reason='same reason',
+            matched_paths=(*head[:-1], 'other/src/DIFFERENT.py'),
+            suggested_project='know_live',
+        )
+        assert first is not None
+        assert second is not None
+        assert second != first, (
+            'lists differing only past the summary cap must not fold together'
+        )
+
+    def test_reason_normalisation_is_identical_across_entry_points(self, tmp_path):
+        """``submit_task`` strips the reason before the guard sees it, but
+        ``_path_guard_or_skip`` is also callable directly with an unstripped
+        one.  The escalator strips it itself, so which entry point supplied it
+        cannot change whether two otherwise-identical overrides fold — a
+        reproducibility bug that would only show up across entry points.
+        """
+        esc = ScopeViolationEscalator()
+        stripped = self._override(esc, tmp_path, reason='incidental mention only')
+        unstripped = self._override(esc, tmp_path, reason='\n  incidental mention only \t')
+
+        assert stripped is not None
+        assert unstripped == stripped
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1
+        assert "routing_override_reason='incidental mention only'" in payloads[0]['detail']
+
+    def test_dedupe_disabled_escape_hatch(self, tmp_path):
+        """Reuses report_rejection's existing knob — no second flag."""
+        esc = ScopeViolationEscalator(scope_violation_dedupe_enabled=False)
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second is not None
+        assert second != first, 'dedup disabled: each call must file its own escalation'
+        assert len(self._payloads(tmp_path)) == 2
+
+
 class TestEscalationDisabled:
     def test_no_op_when_escalation_pkg_unavailable(self, tmp_path, monkeypatch):
         """When HAS_ESCALATION is False the escalator silently no-ops."""
@@ -375,5 +1215,27 @@ class TestEscalationDisabled:
         )
         assert result is None
         # No file is written.
+        queue_dir = tmp_path / 'data' / 'escalations'
+        assert not queue_dir.exists() or not list(queue_dir.glob('*.json'))
+
+    def test_routing_override_no_ops_when_escalation_pkg_unavailable(
+        self, tmp_path, monkeypatch,
+    ):
+        """Same contract for the override audit record, and it matters MORE
+        here: the submission it describes has ALREADY been allowed, so a
+        minimal env without the escalation package must degrade to "no audit
+        record", never to an exception out of an allowed submit_task.
+        """
+        monkeypatch.setattr(sve_mod, 'HAS_ESCALATION', False)
+        esc = ScopeViolationEscalator()
+        result = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='whatever',
+            reason='incidental mention only',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        assert result is None
         queue_dir = tmp_path / 'data' / 'escalations'
         assert not queue_dir.exists() or not list(queue_dir.glob('*.json'))

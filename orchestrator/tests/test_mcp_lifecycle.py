@@ -4,7 +4,8 @@ TestApplyMcpStartupEnv — MCP_STARTUP_TIMEOUT_MS constant and
 apply_mcp_startup_env() helper (step-1/step-2).
 
 TestJcodemunchLaunchPinned — JCODEMUNCH_COMMAND/JCODEMUNCH_ENV constants and
-mcp_config_json() regression guard (step-3/step-4).
+mcp_config_json() regression guard (step-3/step-4), including the
+JCODEMUNCH_GIT_ROOT_IDENTITY identity lever (task 4562 step-1/step-2).
 
 TestInvokeInjectsMcpStartupTimeout — _invoke_claude_with_sandbox injects
 MCP_TIMEOUT into env_overrides (step-5/step-6).
@@ -114,6 +115,42 @@ class TestJcodemunchLaunchPinned:
         assert 'uvx' not in jc.get('command', '')
         args = jc.get('args', [])
         assert not any('uvx' in str(a) for a in args)
+
+    def test_env_sets_git_root_identity_lever(self):
+        """JCODEMUNCH_ENV pins the identity lever to the exact literal '0'.
+
+        jcodemunch's bool env parser treats '0' as False (lever ON, selecting
+        per-worktree local identity) but '1'/'true' as True (lever OFF,
+        silently reverting to the worktree-collapsing git-root default) — so
+        this must assert the literal value, not just key presence.
+        """
+        from orchestrator.mcp_lifecycle import JCODEMUNCH_ENV
+
+        assert 'JCODEMUNCH_GIT_ROOT_IDENTITY' in JCODEMUNCH_ENV
+        assert JCODEMUNCH_ENV['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
+
+    def test_mcp_config_json_carries_git_root_identity_lever(self, mock_orch_config):
+        """The identity lever reaches the generated per-agent mcp_config_json.
+
+        Asserted against a literal, not against JCODEMUNCH_ENV — but this is
+        defense-in-depth, not a coverage gap this test alone closes. The
+        neighbouring pair already fails if the lever is dropped from either
+        side: test_env_sets_git_root_identity_lever pins the literal on the
+        constant, and test_mcp_config_json_uses_constants asserts
+        jc['env'] == JCODEMUNCH_ENV (full dict equality), which breaks if the
+        constant and the generated config ever diverge. This test instead
+        guards against that equality assert being loosened to a subset check
+        later, by pinning the user-observable value directly on the
+        generated config, independent of how it got there.
+        """
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
+        out = lifecycle.mcp_config_json()
+
+        jc = out['mcpServers']['jcodemunch']
+        assert jc['env']['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +624,78 @@ class TestVerdictToolsLaunchMetaRoot:
             python_executable='/venv/bin/python',
         )
         assert '--meta-root' not in cfg['args']
+
+
+# ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 2942): _stdio_mcp_server launch dicts carry the FastMCP
+# banner/update-check quiet-env
+# ---------------------------------------------------------------------------
+
+
+class TestStdioMcpQuietEnv:
+    """Both plan_tools_mcp_server() and verdict_tools_mcp_server() return a
+    launch dict whose 'env' disables FastMCP 3.x's startup banner AND its
+    synchronous PyPI update-check, so the stdio MCP server makes NO network
+    call before it begins serving (task 2942).
+
+    The update-check (log_server_banner -> check_for_newer_version ->
+    httpx.get(pypi), 2s timeout) runs on the startup hot path BEFORE the MCP
+    initialize handshake; under a cold/unwritable version cache or network
+    pressure it can delay startup past the CLI's MCP_TIMEOUT and get the
+    server silently dropped. The env is set on BOTH the no-uv hot path and
+    the uv fallback, for both servers, via the shared _stdio_mcp_server
+    helper.
+    """
+
+    def test_plan_tools_direct_interpreter_env_disables_banner_and_update_check(self):
+        """no-uv hot path (python_executable set): env carries both quiet keys."""
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_plan_tools_uv_fallback_env_disables_banner_and_update_check(self):
+        """uv fallback (python_executable None): env carries both quiet keys."""
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_verdict_tools_direct_interpreter_env_disables_banner_and_update_check(self):
+        """verdict-tools no-uv hot path: env carries both quiet keys (shared helper)."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            role='judge',
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_verdict_tools_uv_fallback_env_disables_banner_and_update_check(self):
+        """verdict-tools uv fallback: env carries both quiet keys (shared helper)."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge',
+        )
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_env_dict_is_fresh_per_call_not_shared_reference(self):
+        """Mutating one launch dict's env must NOT bleed into another's — guards
+        against handing out a shared module-constant dict reference."""
+        cfg1 = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        cfg2 = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        cfg3 = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge',
+        )
+        # A shared reference would leak this mutation into every other dict.
+        cfg1['env']['FASTMCP_SHOW_SERVER_BANNER'] = 'MUTATED'
+        cfg1['env']['EXTRA_KEY'] = 'x'
+        for other in (cfg2, cfg3):
+            assert other['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+            assert 'EXTRA_KEY' not in other['env']
 
 
 # ---------------------------------------------------------------------------

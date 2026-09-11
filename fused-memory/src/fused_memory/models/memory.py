@@ -41,6 +41,12 @@ class MemoryResult(BaseModel):
     # UTC offset is not guaranteed — Mem0 may stamp in any offset or return a non-UTC value.
     # None when the key is absent in the Mem0 response or for Graphiti-sourced results.
     created_at: str | None = None
+    # COMPUTED RETRIEVAL STATE, not stored metadata: never round-trips to a store, and is
+    # never read back off a payload. True means this result was PROMOTED into the returned
+    # window by the topic pin (services/topic_anchor.py, task 3111) rather than by its own
+    # rank, so `relevance_score` is not meaningful for it. Always present in model_dump()
+    # so consumers can read it unconditionally.
+    topic_anchored: bool = False
 
 
 class AddEpisodeResponse(BaseModel):

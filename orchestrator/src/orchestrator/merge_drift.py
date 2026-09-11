@@ -12,8 +12,8 @@ sibling stays permanently (``_run_unscoped_typechecks``, the module-level
 ``_build_remote_runners`` legacy-pool builder) or is monkeypatched by the
 existing test suite via the string path ``orchestrator.merge_queue.<name>``
 (``run_scoped_verification``, ``build_merge_verify_spec``, ``LocalRunner``,
-``VerifyRunnerPool``, ``_derive_task_files_from_git``, ``_run_drift_check``)
-— resolves it through a function-local (deferred) import from
+``VerifyRunnerPool``, ``_run_drift_check``) — resolves it through a
+function-local (deferred) import from
 :mod:`orchestrator.merge_queue` rather than a direct intra-module reference.
 This mirrors the ``_main_health_fingerprint`` convention in
 ``merge_queue.py`` and keeps this module free of any top-level import of
@@ -30,7 +30,11 @@ independent sibling detectives, not caller/callee.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orchestrator.event_store import EventStore
@@ -42,9 +46,9 @@ from orchestrator.merge_types import MergeRequest
 # resident binding (see its body).  Imported here only so TestReachBackRouting
 # has a "naive" orchestrator.merge_drift.run_scoped_verification patch target
 # to assert is NOT what governs.  _derive_task_files_from_git is deliberately
-# NOT imported here: unlike run_scoped_verification, nothing needs to prove a
-# merge_drift-local patch is inert for it, and _run_drift_check reaches back
-# to orchestrator.merge_queue for it exclusively (see its body).
+# NOT imported here and (as of task 2886 fix 1b) is no longer referenced by
+# _run_drift_check at all: the drift spec is now full-gate (task_files=None),
+# so the drift path performs no dispatching-host scope derivation.
 from orchestrator.verify import run_scoped_verification  # noqa: F401
 
 # LocalRunner / VerifyRunnerPool / build_merge_verify_spec: same reasoning —
@@ -62,6 +66,79 @@ if TYPE_CHECKING:
     from orchestrator.merge_queue import SpeculativeMergeWorker
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+# ---------------------------------------------------------------------------
+# Lever-C drift-check cadence persistence (task 2886 fix 1a)
+#
+# EXACT mirror of merge_shadow's ShadowCompareState +
+# _load_shadow_compare_state / _save_shadow_compare_state.  The drift-check
+# land counter was a worker-level in-memory int (``worker._drift_land_count``)
+# that the ~8h fleet redeploy resets to 0 before it ever reaches
+# ``verify_drift_check_every_n_lands`` (default 20) — which is exactly why the
+# drift check has NEVER fired in any runs.db.  Persisting the counter to
+# ``project_root/data/orchestrator/drift_check_state.json`` makes the cadence
+# survive restarts.  The runner quarantine set is deliberately NOT persisted:
+# the dedup'd open L1 verify_drift_divergence escalation is the cross-restart
+# guard (see merge_queue.py SpeculativeMergeWorker.__init__ RESTART RE-TRUST
+# WINDOW note).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DriftCheckState:
+    """Persisted cadence state for the Lever-C drift check.
+
+    Stored as JSON at
+    ``config.project_root/data/orchestrator/drift_check_state.json`` so the
+    drift-check cadence survives orchestrator restarts (the ~8h fleet redeploy
+    otherwise resets the in-memory ``worker._drift_land_count`` before it ever
+    reaches ``verify_drift_check_every_n_lands``).
+
+    Fields:
+        land_count: Count of successful ('done') lands observed so far.  The
+            drift check fires when
+            ``land_count % verify_drift_check_every_n_lands == 0``.  Additive
+            across the worker lifetime (never reset), mirroring the in-memory
+            ``worker._drift_land_count`` it supersedes.
+    """
+
+    land_count: int = 0
+
+
+def _load_drift_check_state(path: Path) -> DriftCheckState:
+    """Load the drift-check cadence state from a JSON file.
+
+    Fail-safe: returns a default ``DriftCheckState()`` on any error (file not
+    found, unreadable, unparseable JSON, or missing/wrong-typed keys) so the
+    orchestrator never fails to start due to a corrupt state file.  Exact
+    mirror of :func:`orchestrator.merge_shadow._load_shadow_compare_state`.
+
+    Args:
+        path: Path to the JSON state file (typically
+            ``config.project_root/data/orchestrator/drift_check_state.json``).
+
+    Returns:
+        The persisted state, or ``DriftCheckState(0)`` on any failure.
+    """
+    try:
+        data = json.loads(path.read_text())
+        return DriftCheckState(land_count=int(data['land_count']))
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return DriftCheckState()
+
+
+def _save_drift_check_state(path: Path, state: DriftCheckState) -> None:
+    """Persist the drift-check cadence state to a JSON file.
+
+    Creates parent directories as needed.  Exact mirror of
+    :func:`orchestrator.merge_shadow._save_shadow_compare_state`.
+
+    Args:
+        path: Destination path for the JSON state file.
+        state: The :class:`DriftCheckState` to serialise.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dataclasses.asdict(state)))
 
 
 async def _run_drift_check(
@@ -87,6 +164,12 @@ async def _run_drift_check(
     worker.  ``cleanup_merge_worktree`` and allocator slot releases are always
     called in the ``finally`` block.
 
+    The verify body runs under ``merge_verify_lease(lane_dir=wt)`` so a
+    concurrent periodic worktree reap (task 3018) cannot delete the checkout
+    mid-verify; the lease is released before the ``finally`` cleanup — see the
+    inline comment for why that scope is load-bearing.  It is distinct from,
+    and orthogonal to, the allocator's host-slot leases.
+
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
         req: The :class:`MergeRequest` that just landed (config, task_files, …).
@@ -110,14 +193,12 @@ async def _run_drift_check(
     # LocalRunner / run_scoped_verification also have a module-level "naive"
     # import above (kept solely as a TestReachBackRouting patch target); a
     # `from ... import` reach-back would shadow-and-thus-dead-code that
-    # naive import, which ruff flags (F811).  _derive_task_files_from_git has
-    # no merge_drift-local "naive" import at all (there is nothing to prove
-    # inert) but is reached back to for the same reason as the others:
-    # merge_queue.py imports it at module level from orchestrator.verify and
-    # the test suite patches it on that namespace.  _run_unscoped_typechecks
-    # and _build_remote_runners have no merge_drift-local copy at all (both
-    # stay permanently in merge_queue.py) but are accessed the same way for
-    # consistency.
+    # naive import, which ruff flags (F811).  _run_unscoped_typechecks and
+    # _build_remote_runners have no merge_drift-local copy at all (both stay
+    # permanently in merge_queue.py) but are accessed the same way for
+    # consistency.  (Task 2886 fix 1b dropped the _derive_task_files_from_git
+    # reach-back: the drift spec is now full-gate, task_files=None, so no
+    # dispatching-host scope derivation happens on this path.)
     import orchestrator.merge_queue as _mq
 
     # wt is initialised before the try so the finally guard (`if wt is not None`)
@@ -129,78 +210,125 @@ async def _run_drift_check(
     remote_lease = None
     try:
         wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
-        task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
-        # Derive task_files on the dispatching host (fresh main) when not supplied
-        # and Lever C is on — mirrors the same gate in _run_post_merge_verify.
-        if task_files_tuple is None and req.config.enabled_verify_runners:
-            derived = await _mq._derive_task_files_from_git(wt, req.config)
-            if derived:
-                task_files_tuple = tuple(derived)
-        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        # Hold THIS throwaway lane's flock for the duration of the drift
+        # verify (task 3018).  Three things to know:
+        #
+        # (i) WHY IT IS NEEDED.  Task 3018 promoted
+        #     `reap_orphaned_merge_worktrees` from a startup-only sweep to a
+        #     steady-state one fired from the merge worker's heartbeat, which
+        #     turned RESOURCE_AUDIT_WORKTREE_GRACE_SECS from a *detection*
+        #     threshold into a *destruction* deadline.  This throwaway tree is
+        #     neither registered in `_owned_merge_worktrees` (so the reap's
+        #     owned-ledger skip misses it) nor touched by
+        #     `_touch_owned_merge_worktrees` (so its measured age is real
+        #     elapsed time) — the lane flock consulted by
+        #     `remove_merge_worktree_guarded` is its ONLY liveness protection.
+        #     Holding it makes that protection independent of how long the
+        #     drift verify runs, rather than resting on an age heuristic: a
+        #     concurrent sweep gets 'skipped_lease_held' instead of deleting
+        #     the checkout out from under a running verify.
+        #
+        # (ii) PRECEDENT.  Passing `lane_dir=` an ephemeral `_merge-*`
+        #     worktree (rather than the persistent lane) is established — the
+        #     DF-2822 per-land REMOTE-green cross-check does exactly this
+        #     (merge_queue.py, `lane_dir=merge_wt`).
+        #
+        # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
+        #     MergeVerifyLeaseContended fail-safe branch is warranted: the
+        #     `_merge-<uuid>` path was just minted by
+        #     create_throwaway_verify_worktree and is uncontended by
+        #     construction — nobody else knows it.  (Were one ever raised it
+        #     would land in the except-Exception fail-open below, the same
+        #     detective-control degradation as any other drift-check error.)
+        #
+        # Entered only AFTER the assignment above succeeds — `wt` is still
+        # None if creation raises, and the finally's `if wt is not None` guard
+        # depends on that.  SCOPE IS LOAD-BEARING: the lease wraps only the
+        # verify body and closes before the finally.  If cleanup ran while we
+        # still held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING
+        # acquire would fail against OURSELVES, return 'skipped_lease_held',
+        # and leak the very tree the finally exists to remove.  The allocator
+        # local_lease/remote_lease releases stay in the finally untouched:
+        # those are host-SLOT leases, orthogonal to this lane flock.
+        async with git_ops.merge_verify_lease(lane_dir=wt):
+            # FULL-GATE drift spec (task 2886 fix 1b, PRD §8δ): the drift check
+            # re-dispatches this spec to BOTH the local trust-anchor and the
+            # eligible remote and alarms on divergence.  Re-dispatching the SAME
+            # scoped/no-source spec that produced a trivial pass would trivially
+            # pass on both hosts and structurally cannot catch the trivial-pass
+            # divergence class.  Forcing task_files=None runs the complete
+            # workspace gate (verify.py task_files=None path) on both hosts so a
+            # genuine divergence is observable.  This deliberately does NOT
+            # derive/scope task_files (unlike _run_post_merge_verify's serial-lane
+            # dispatching-host derivation) — the derivation gate is intentionally
+            # dropped here.  task_files_tuple stays None so BOTH the spec and the
+            # LocalRunner below run the whole suite.
+            task_files_tuple = None
+            spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
-        if allocator is not None:
-            # β decision 5: acquire both hosts through the allocator so slot
-            # accounting is respected (≤1 verify-merge per host at any time).
-            # The throwaway worktree (wt) was created unconditionally above; only
-            # the LocalRunner *object* is deferred to the factory so it is not
-            # constructed if the local slot is unavailable.
-            _ttf = task_files_tuple  # capture for closure
+            if allocator is not None:
+                # β decision 5: acquire both hosts through the allocator so slot
+                # accounting is respected (≤1 verify-merge per host at any time).
+                # The throwaway worktree (wt) was created unconditionally above; only
+                # the LocalRunner *object* is deferred to the factory so it is not
+                # constructed if the local slot is unavailable.
+                _ttf = task_files_tuple  # capture for closure
 
-            def _local_factory() -> _mq.LocalRunner:
-                return _mq.LocalRunner(
-                    wt, req.config, req.module_configs, _ttf,
-                    run_scoped=_mq.run_scoped_verification,
-                    run_unscoped=_mq._run_unscoped_typechecks,
+                def _local_factory() -> _mq.LocalRunner:
+                    return _mq.LocalRunner(
+                        wt, req.config, req.module_configs, _ttf,
+                        run_scoped=_mq.run_scoped_verification,
+                        run_unscoped=_mq._run_unscoped_typechecks,
+                        task_id=req.task_id,
+                    )
+
+                local_lease = allocator.acquire_local(_local_factory)
+                remote_lease = allocator.acquire_remote()
+                if local_lease is None or remote_lease is None:
+                    logger.debug(
+                        'Drift check skipped for task %s: host slots unavailable '
+                        '(local_free=%s, remote_free=%s)',
+                        req.task_id,
+                        local_lease is not None,
+                        remote_lease is not None,
+                    )
+                    return
+                pool = _mq.VerifyRunnerPool(
+                    [local_lease.runner, remote_lease.runner],
+                    event_store=event_store,
+                    task_id=req.task_id,
+                )
+            else:
+                # Legacy fallback: build fresh pool via _build_remote_runners (no
+                # slot accounting — used when allocator is not threaded in yet).
+                pool = _mq.VerifyRunnerPool(
+                    [_mq.LocalRunner(
+                        wt, req.config, req.module_configs, task_files_tuple,
+                        run_scoped=_mq.run_scoped_verification,
+                        run_unscoped=_mq._run_unscoped_typechecks,
+                        task_id=req.task_id,
+                    ), *_mq._build_remote_runners(req.config, wt, quarantine=quarantine_set)],
+                    event_store=event_store,
                     task_id=req.task_id,
                 )
 
-            local_lease = allocator.acquire_local(_local_factory)
-            remote_lease = allocator.acquire_remote()
-            if local_lease is None or remote_lease is None:
-                logger.debug(
-                    'Drift check skipped for task %s: host slots unavailable '
-                    '(local_free=%s, remote_free=%s)',
-                    req.task_id,
-                    local_lease is not None,
-                    remote_lease is not None,
-                )
-                return
-            pool = _mq.VerifyRunnerPool(
-                [local_lease.runner, remote_lease.runner],
+            # Cadence is already enforced upstream in _maybe_run_drift_check
+            # (_drift_land_count % every_n gate).  DriftDetector.should_sample is
+            # never called on this path, so omitting every_n_lands here keeps a
+            # single source of truth and avoids a dead duplicate cadence value.
+            detector = DriftDetector(
+                pool,
                 event_store=event_store,
+                escalation_queue=escalation_queue,
                 task_id=req.task_id,
             )
-        else:
-            # Legacy fallback: build fresh pool via _build_remote_runners (no
-            # slot accounting — used when allocator is not threaded in yet).
-            pool = _mq.VerifyRunnerPool(
-                [_mq.LocalRunner(
-                    wt, req.config, req.module_configs, task_files_tuple,
-                    run_scoped=_mq.run_scoped_verification,
-                    run_unscoped=_mq._run_unscoped_typechecks,
-                    task_id=req.task_id,
-                ), *_mq._build_remote_runners(req.config, wt, quarantine=quarantine_set)],
-                event_store=event_store,
-                task_id=req.task_id,
-            )
-
-        # Cadence is already enforced upstream in _maybe_run_drift_check
-        # (_drift_land_count % every_n gate).  DriftDetector.should_sample is
-        # never called on this path, so omitting every_n_lands here keeps a
-        # single source of truth and avoids a dead duplicate cadence value.
-        detector = DriftDetector(
-            pool,
-            event_store=event_store,
-            escalation_queue=escalation_queue,
-            task_id=req.task_id,
-        )
-        # Capture the eligible remote BEFORE check() so we can propagate its
-        # name even after the pool quarantines it (eligible_remote() returns
-        # None after quarantine).
-        eligible_before = pool.eligible_remote()
-        result = await detector.check(merge_commit, spec)
-        if result.quarantined and eligible_before is not None:
-            quarantine_set.add(eligible_before.name)
+            # Capture the eligible remote BEFORE check() so we can propagate its
+            # name even after the pool quarantines it (eligible_remote() returns
+            # None after quarantine).
+            eligible_before = pool.eligible_remote()
+            result = await detector.check(merge_commit, spec)
+            if result.quarantined and eligible_before is not None:
+                quarantine_set.add(eligible_before.name)
     except Exception:
         logger.warning(
             'Drift check failed for task %s / commit %s; ignoring (detective control)',
@@ -264,8 +392,34 @@ async def _maybe_run_drift_check(
         # instead of raising ZeroDivisionError on every land.  Mirrors the
         # every_n > 0 guard in _safety_valve_due (merge_liveness.py).
         return
-    worker._drift_land_count += 1
-    if worker._drift_land_count % every_n == 0:
+
+    # Cadence counter (task 2886 fix 1a): use the PERSISTED DriftCheckState when
+    # worker._drift_state_path is wired so the count survives the ~8h fleet
+    # redeploy (the in-memory counter reset before ever reaching every_n is why
+    # the drift check had NEVER fired).  Fall back to the in-memory
+    # worker._drift_land_count on bare-harness workers where _drift_state_path
+    # is None — mirrors _maybe_schedule_shadow_compare's _shadow_state_path
+    # None-safety.  DriftCheckState / _load / _save are referenced module-local
+    # (not reached back) exactly like _maybe_schedule_shadow_compare references
+    # ShadowCompareState / _load / _save; only the spawned _run_drift_check
+    # coroutine is monkeypatched by tests and therefore reached back below.
+    if worker._drift_state_path is None:
+        worker._drift_land_count += 1
+        count = worker._drift_land_count
+    else:
+        state = _load_drift_check_state(worker._drift_state_path)
+        count = state.land_count + 1
+        # Persist on BOTH the fire and no-fire paths so every land is counted
+        # (the counter is additive across the worker lifetime — never reset —
+        # mirroring the in-memory _drift_land_count it supersedes).
+        _save_drift_check_state(
+            worker._drift_state_path, DriftCheckState(land_count=count)
+        )
+        # Keep the in-memory mirror in lockstep for observability / back-compat
+        # (existing tests and log lines still read worker._drift_land_count).
+        worker._drift_land_count = count
+
+    if count % every_n == 0:
         _coro = _run_drift_check(
             git_ops, req, merge_commit,
             worker._escalation_queue, worker._event_store,

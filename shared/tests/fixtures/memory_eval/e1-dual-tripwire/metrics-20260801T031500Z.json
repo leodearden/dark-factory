@@ -1,0 +1,49 @@
+{
+  "corpus": {
+    "counts": {
+      "entities_and_relations": 1204
+    },
+    "project_id": "dark_factory"
+  },
+  "eval_id": "e1-dual-tripwire",
+  "metrics": [
+    {
+      "items": [
+        {
+          "item_key": "t-alpha",
+          "passed": true
+        },
+        {
+          "item_key": "t-shared",
+          "passed": false
+        },
+        {
+          "item_key": "t-recon-watcher-triage",
+          "passed": false
+        }
+      ],
+      "kind": "tripwire",
+      "metric_id": "topic-canonical-present",
+      "n": 3,
+      "value": 2.0
+    },
+    {
+      "items": [
+        {
+          "item_key": "t-shared",
+          "passed": true
+        },
+        {
+          "item_key": "t-beta",
+          "passed": false
+        }
+      ],
+      "kind": "tripwire",
+      "metric_id": "successor-pointer-present",
+      "n": 2,
+      "value": 1.0
+    }
+  ],
+  "run_stamp": "20260801T031500Z",
+  "schema_version": 1
+}

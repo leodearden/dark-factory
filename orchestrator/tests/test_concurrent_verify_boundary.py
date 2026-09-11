@@ -27,10 +27,11 @@ from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 
 # Reuse the γ harness fakes/fixtures (established cross-test-module import pattern).
 from test_merge_queue_concurrent_verify import (
+    HEAVY_BARRIER_TEST_TIMEOUT,
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
@@ -763,6 +764,21 @@ class TestB4CancelBehavior:
 
 
 @pytest.mark.asyncio
+# COUPLED OBLIGATION of the `wait_responsive` migration below (task 3980):
+# a stretched wait without an adequate mark is strictly worse than the flake it
+# fixes.  orchestrator/pyproject.toml sets `timeout = 60` with
+# `timeout_method = "thread"` and `--max-worker-restart=0`, so exceeding the
+# per-test timeout does not FAIL the test — it os._exit()s the xdist worker,
+# degrading a clean per-test failure into a worker death.
+#
+# Budget arithmetic (checkable, not a guessed number): 2 gate barriers at 15s
+# + 2 `wait_responsive` result waits billed at their hard wall cap
+# `min(RESPONSIVE_WAIT_STRETCH * 30, RESPONSIVE_WAIT_WALL_CAP)` = 60s each
+# + the 5s worker_task teardown = 155s worst case.  HEAVY_BARRIER_TEST_TIMEOUT
+# (300s) clears it.  Note this class was ALREADY under-marked before the
+# migration — 15+15+30+30+5 = 95s against the bare 60s default — so the mark
+# also closes a pre-existing worker-death hazard.
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestB5OperatorHalt:
     """B5: operator_halt aborts both in-flight verifies, requeues both; unhalt drains."""
 
@@ -850,8 +866,36 @@ class TestB5OperatorHalt:
             # Unhalt: items re-merge and drain
             worker.unhalt_all_lanes('b5-test')
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=30.0)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=30.0)
+            # Charge the post-unhalt drain in EVENT-LOOP-RESPONSIVE time, not
+            # wall clock (task 3980's `wait_responsive`).  Observed failure:
+            # this pair timed out at 30s during a full-suite run while the
+            # captured log showed the pipeline running CORRECTLY throughout —
+            # the halt aborted both in-flight verifies, both re-queued, and
+            # both re-verified and passed.  The logic ran; only the deadline
+            # expired.  Measured green drain on this branch is 1.72s / 2.87s /
+            # 3.83s / 5.68s at load avg 110-157 on 32 cores, i.e. the failing
+            # run carried a >=5x wall-clock tail — the same whole-host
+            # oversubscription signature as the three archived result-wait
+            # failures `wait_responsive` was built for.
+            #
+            # NOMINAL DELIBERATELY UNCHANGED AT 30.0 — do NOT "tidy" it up to
+            # MERGE_RESULT_TIMEOUT to match the rest of this file.  Widening a
+            # deadline is forbidden here as a flake fix
+            # (plans/flake-ledger-prd.md §5.5, citing task 1836 where a
+            # 10s->30s widening MASKED a real SIGHUP bug for a day), and the
+            # widening would buy nothing anyway: the archived failures came at
+            # 45s.  Only the ACCOUNTING changes.  A real hang on a responsive
+            # loop still reports at 30s exactly as before, while a starved
+            # worker is handed back the time it was denied (up to a 60s hard
+            # wall cap), and the give-up message states which regime ended the
+            # wait — so the next occurrence is self-diagnosing rather than an
+            # opaque timeout.
+            outcome_a = await wait_responsive(
+                req_a.result, timeout=30.0, label='b5-a: MergeOutcome after unhalt',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result, timeout=30.0, label='b5-b: MergeOutcome after unhalt',
+            )
             await worker.stop()
 
         with contextlib.suppress(Exception):

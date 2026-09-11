@@ -63,6 +63,7 @@ __all__ = [
     'materialize_reference_diff',
     'pin_eval_branch',
     'repo_of',
+    'repo_of_project',
     'resolve_task_commits_from_merge',
     'sample_stratified',
     'stratification_counts',
@@ -80,7 +81,13 @@ Cell = tuple[str, str, str]
 # The full axis product — every possible (repo, kind, path) cell. Used to
 # surface EMPTY cells loudly (a cell the corpus offers nothing for) rather
 # than letting thin coverage pass silently.
-_REPOS = ('df', 'reify')
+#
+# `_REPOS` must list EVERY stratum `repo_of` can return. `_ALL_CELLS` is what
+# `format_stratification_table` and `_coverage_notes` iterate, so a stratum
+# missing here is silently dropped from the table (its fixtures vanish from the
+# rows while still counting in TOTAL) and can never be reported as an empty
+# cell — the exact silent under-report the loud-over-silent norm forbids.
+_REPOS = ('df', 'reify', 'kl')
 _KINDS = ('bugfix', 'feature', 'refactor')
 _PATHS = ('simple', 'full')
 _ALL_CELLS: tuple[Cell, ...] = tuple(
@@ -117,26 +124,57 @@ class CompletedTaskCandidate:
 # repo_of — the repo axis (df / reify)
 # ---------------------------------------------------------------------------
 
-def repo_of(candidate: CompletedTaskCandidate) -> str:
-    """Return the repo stratum (``'df'`` or ``'reify'``) for *candidate*.
+def repo_of_project(project: str) -> str:
+    """Return the repo stratum (``'df'``, ``'reify'`` or ``'kl'``) for a raw
+    *project* string.
 
-    Normalises across the two spellings in play: fused-memory's project_id
+    The project → stratum mapping itself, exposed separately from
+    :func:`repo_of` so a caller holding only a project string (the β1 minting
+    driver and its tests, which build fixture ids as ``<repo>_task_<id>``)
+    reuses THIS table instead of re-declaring a literal copy that can silently
+    drift from it.
+
+    Raises ``ValueError`` on an unrecognised project — see :func:`repo_of`.
+    """
+    normalised = (project or '').strip().lower()
+    if 'reify' in normalised:
+        return 'reify'
+    if 'dark' in normalised and 'factory' in normalised:
+        return 'df'
+    if 'know' in normalised and 'live' in normalised:
+        return 'kl'
+    raise ValueError(
+        f'repo_of_project: unrecognised project {project!r} (expected a '
+        f'dark_factory/dark-factory, reify or know_live/know-live project)'
+    )
+
+
+def repo_of(candidate: CompletedTaskCandidate) -> str:
+    """Return the repo stratum (``'df'``, ``'reify'`` or ``'kl'``) for *candidate*.
+
+    Normalises across the spellings in play: fused-memory's project_id
     ``'dark_factory'`` and the fixture-JSON project string ``'dark-factory'``
-    both map to ``'df'``; ``'reify'`` maps to ``'reify'``.
+    both map to ``'df'``; ``'reify'`` maps to ``'reify'``; ``'know_live'`` /
+    ``'know-live'`` map to ``'kl'``.
+
+    ``kl`` was added for the fable-trial-v2 hard pool (task 3631), whose census
+    includes know-live task 543. No fixture in the standing ``evals/tasks/``
+    corpus carries a know-live project, so the axis is purely additive there.
 
     Raises ``ValueError`` on an unrecognised project — repo is a hard
     stratification axis, so an unknown value is a loud error rather than a
-    silent default (honours the loud-over-silent-degradation norm).
+    silent default (honours the loud-over-silent-degradation norm). The
+    mapping lives in :func:`repo_of_project`; this wrapper only names the
+    offending task in the error.
     """
-    project = (candidate.project or '').strip().lower()
-    if 'reify' in project:
-        return 'reify'
-    if 'dark' in project and 'factory' in project:
-        return 'df'
-    raise ValueError(
-        f'repo_of: unrecognised project {candidate.project!r} for task '
-        f'{candidate.task_id!r} (expected a dark_factory/dark-factory or reify project)'
-    )
+    try:
+        return repo_of_project(candidate.project)
+    except ValueError:
+        raise ValueError(
+            f'repo_of: unrecognised project {candidate.project!r} for task '
+            f'{candidate.task_id!r} (expected a dark_factory/dark-factory, '
+            f'reify or know_live/know-live project)'
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +394,7 @@ def sample_stratified(
 # evals/tasks/*.json fixtures (df fixtures spell it 'dark-factory'). The field
 # is provenance only: runner.load_task consumes project_root / verify_commands
 # / task_definition / modules / plan, never `project` itself.
-_CANONICAL_PROJECT = {'df': 'dark-factory', 'reify': 'reify'}
+_CANONICAL_PROJECT = {'df': 'dark-factory', 'reify': 'reify', 'kl': 'know-live'}
 
 # Per-repo standard gate command sets — byte-for-byte the commands the existing
 # fixtures already hardcode (df_task_12 / reify_task_27), so a landed task's
@@ -371,6 +409,15 @@ _DEFAULT_VERIFY_COMMANDS: dict[str, dict[str, str]] = {
         'test': 'cargo test --workspace',
         'lint': 'cargo clippy --workspace',
         'typecheck': '',
+    },
+    # know-live's own gates, read from its
+    # /home/leo/src/know-live/dark-factory-orchestrator.yaml
+    # (test_command / lint_command / type_check_command). A Python repo, so
+    # pytest/ruff/mypy — its lint gate also runs the import-linter.
+    'kl': {
+        'test': 'uv run pytest -q',
+        'lint': 'uv run ruff check src/ tests/ && uv run lint-imports',
+        'typecheck': 'uv run mypy src/',
     },
 }
 
@@ -395,15 +442,17 @@ class ReferenceCapture:
 def default_verify_commands(repo: str) -> dict[str, str]:
     """Return the per-repo standard gate command set (``{test,lint,typecheck}``).
 
-    ``df`` → pytest / ruff / pyright; ``reify`` → cargo test / clippy. Raises
-    ``ValueError`` on an unknown repo (loud-over-silent). Returns a fresh copy
-    so callers can't mutate the module-level template.
+    ``df`` → pytest / ruff / pyright; ``reify`` → cargo test / clippy;
+    ``kl`` → pytest / ruff + lint-imports / mypy. Raises ``ValueError`` on an
+    unknown repo (loud-over-silent). Returns a fresh copy so callers can't
+    mutate the module-level template.
     """
     try:
         return dict(_DEFAULT_VERIFY_COMMANDS[repo])
     except KeyError:
         raise ValueError(
-            f'default_verify_commands: unknown repo {repo!r} (expected df or reify)'
+            f'default_verify_commands: unknown repo {repo!r} '
+            f'(expected df, reify or kl)'
         ) from None
 
 

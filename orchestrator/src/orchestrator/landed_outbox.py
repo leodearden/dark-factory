@@ -13,12 +13,11 @@ Design highlights
 * Keyed by ``task_id`` — last-write-wins (WA-2), mirroring
   ``MergeQueueStore``'s ``{request_id: value}`` shape.
 * Every mutation (``record``/``consume``) flushes through a single
-  ``_save_raw`` chokepoint that fsyncs the temp file BEFORE ``os.replace``
-  and the parent directory AFTER (WA-1) — durable across a crash immediately
-  following ``record()``. No prior ``os.fsync``-on-file precedent exists in
-  this repo (only SQLite ``PRAGMA synchronous=FULL``), so this mirrors
-  ``merge_queue_store._save_raw``'s atomic tmp+``os.replace`` and adds the
-  two fsyncs.
+  ``_save_raw`` chokepoint which calls ``shared.safe_io.atomic_write_text``
+  with ``fsync=True`` — the temp file is fsynced BEFORE ``os.replace`` and the
+  parent directory AFTER (WA-1), so a row is durable across a crash
+  immediately following ``record()``. This is the only site in the repo that
+  asks for the fsyncs, which is why they are opt-in there.
 * Fail-open reads via ``shared.safe_io.load_json_or_warn`` (same as
   ``MergeQueueStore``): a missing file is a silent empty store; a corrupt
   file is a warned empty store.
@@ -35,14 +34,13 @@ in-batch task (β).
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shared import safe_io
 from shared.safe_io import load_json_or_warn
 
 logger = logging.getLogger(__name__)
@@ -165,40 +163,38 @@ class LandedOutbox:
     def _save_raw(self, state: dict[str, Any]) -> None:
         """Atomically AND durably write *state* to disk (WA-1).
 
-        fsyncs the temp file's fd BEFORE ``os.replace``, then fsyncs the
-        parent directory's fd AFTER — a rename without a directory fsync can
-        be lost on crash (the directory-entry update is a separate
-        durability domain from the file's own contents on most
-        filesystems). Fail-open: any OSError is logged at ERROR (this is a
+        ``fsync=True`` is what makes this durable rather than merely atomic:
+        :func:`shared.safe_io.atomic_write_text` fsyncs the temp file's fd
+        BEFORE ``os.replace`` and the parent directory's fd AFTER — a rename
+        without a directory fsync can be lost on crash (the directory-entry
+        update is a separate durability domain from the file's own contents on
+        most filesystems). This is the only site in the repo that needs it,
+        which is why the helper's default is off.
+
+        ``mode`` is deliberately left at the helper's umask default rather than
+        narrowed: this file is read by other processes.
+
+        Fail-open, and that policy stays HERE rather than in the helper (which
+        always propagates): any OSError is logged at ERROR (this is a
         lost-durability event, not a benign condition) and counted in
         ``self.save_failures``, but never raised — a transient disk failure
-        must never block the merge pipeline. On failure, best-effort cleans
-        up the sibling ``.json.tmp`` so a partial-write failure doesn't
-        leave an orphan file behind (the tmp is otherwise consumed by
-        ``os.replace`` on the success path).
+        must never block the merge pipeline. Temp cleanup on failure is now the
+        helper's own guarantee, so this block no longer does it.
         """
-        tmp = self._path.with_suffix('.json.tmp')
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write(json.dumps(state))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(tmp), str(self._path))
-            dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            safe_io.atomic_write_text(
+                self._path,
+                json.dumps(state),
+                encoding='utf-8',
+                fsync=True,
+                mkdir=True,
+            )
         except OSError as exc:
             self.save_failures += 1
             logger.error(
                 'landed_outbox: failed to durably save outbox (row may only'
                 ' be held in memory): %s', exc,
             )
-            # Best-effort cleanup; the save failure is already reported above.
-            with contextlib.suppress(OSError):
-                tmp.unlink(missing_ok=True)
 
 
 class MergeProvenance:

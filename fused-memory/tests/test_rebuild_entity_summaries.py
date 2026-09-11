@@ -12,12 +12,10 @@ Covers:
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import inspect
 import logging
-import textwrap
 from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -272,7 +270,11 @@ class TestListEntityNodes:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.list_entity_nodes(group_id='test')
-        graph.ro_query.assert_awaited_once()
+        # Paginated (task 4340): a census probe plus N pages, so "exactly one
+        # query" no longer describes the shape. The load-bearing half of the
+        # original assertion — every query stays on the read-only path — is
+        # what this test is named for and is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2355,70 +2357,6 @@ class TestRebuildEntitySummariesCancellation:
 
 
 # ---------------------------------------------------------------------------
-# Task-716: regression guard — cross-reference accuracy between
-#           test_runtime_error_still_accumulates_in_errors and
-#           test_partial_failure_continues
-# ---------------------------------------------------------------------------
-
-class TestDocstringCrossReferenceAccuracy716:
-    """Regression guard: pin both sides of the cross-reference.
-
-    test_runtime_error_still_accumulates_in_errors (TestRebuildEntitySummariesCancellation)
-    references test_partial_failure_continues (TestRebuildEntitySummaries) in its docstring.
-    These tests pin (a) the exception type raised in the target test and (b) the key phrases
-    in the source docstring so that future drift on either side triggers a failure.
-    """
-
-    def test_partial_failure_continues_still_raises_runtime_error_not_value_error(self):
-        """Pin the exception type in the cross-reference target via structural AST analysis.
-
-        Uses ast.parse + ast.walk rather than substring matching so that trivial
-        reformatting (multi-line raise, whitespace changes) cannot produce a false
-        negative.  Checks only the positive invariant — that RuntimeError is referenced —
-        without the overly-broad negative assertion that no ValueError appears anywhere
-        in the test body (which would break if a legitimate second scenario were added).
-
-        RuntimeError may be referenced as a direct raise statement OR as an exception
-        instance passed to _uuid_dispatch() — both patterns exercise the same production
-        code path.
-        """
-        src = inspect.getsource(TestRebuildEntitySummaries.test_partial_failure_continues)
-        tree = ast.parse(textwrap.dedent(src))
-        # Detect RuntimeError as a raised exception or as an instantiated Call node
-        # (e.g. passed to _uuid_dispatch as a mapping value).
-        error_names = {
-            node.func.id
-            for node in ast.walk(tree)
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-            )
-        }
-        assert 'RuntimeError' in error_names, (
-            "test_partial_failure_continues must reference RuntimeError — "
-            "the cross-reference in test_runtime_error_still_accumulates_in_errors "
-            "docstring claims it 'exercises RuntimeError'"
-        )
-
-    def test_runtime_error_docstring_describes_runtime_error_cross_reference(self):
-        """Pin only the critical cross-reference invariants in the source docstring.
-
-        Checks that the stale ValueError claim cannot silently reappear and that the
-        cross-reference to test_partial_failure_continues remains explicit.  Exact
-        phrasing of the surrounding explanation is intentionally not asserted — ordinary
-        rewording of the docstring should not break this guard.
-        """
-        doc = TestRebuildEntitySummariesCancellation.test_runtime_error_still_accumulates_in_errors.__doc__
-        assert doc is not None, "docstring must be present"
-        assert 'ValueError accumulation is already covered by test_partial_failure_continues' not in doc, (
-            "stale ValueError claim must not appear in docstring"
-        )
-        assert 'test_partial_failure_continues' in doc, (
-            "cross-reference to test_partial_failure_continues must still be explicit"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Task-511: replace bare assert isinstance(r, dict) with explicit TypeError guard
 # ---------------------------------------------------------------------------
 
@@ -2970,3 +2908,148 @@ class TestRebuildSummariesManagerWithService:
         # Service-level method must have been called (not backend-level)
         mock_service.rebuild_entity_summaries.assert_awaited_once()
         assert result.total_entities == 3
+
+
+# ---------------------------------------------------------------------------
+# step-20 (task 4340): a structural non-enumeration must not BLANK summaries
+# ---------------------------------------------------------------------------
+#
+# The sharpest vector, and the one that does NOT go through
+# detect_stale_with_edges at all: the force=True path takes `targets` = every
+# entity from list_entity_nodes, then _rebuild_one does
+# all_edges.get(uuid, []) -> rebuild_entity_from_edges ->
+# '\n'.join([]) == '' -> update_node_summary. It never consults staleness, so
+# a fabricated-empty edge read blanks EVERY entity in the graph.
+#
+# The node read is deliberately kept HEALTHY while only the edge read is made
+# structurally incomplete. Both shims default to the same page size, so a
+# refusal would otherwise fire on both reads in lockstep, leaving `targets`
+# empty and the rebuild loop unentered — a test written that way would pass
+# without the fix and prove nothing. That lockstep is an accident of two
+# equal defaults, and it does not hold for INCOMPLETE_PAGE_CAP at all.
+
+
+class _DualCorpusGraph:
+    """Answers node reads and edge reads from separate corpora.
+
+    Needed because "the node read succeeded and the edge read did not" is the
+    only shape in which this defect is visible.
+    """
+
+    def __init__(self, node_rows: list[list], edge_rows: list[list]):
+        self.node_rows = node_rows
+        self.edge_rows = edge_rows
+        self.queries: list[str] = []
+
+    async def ro_query(self, cypher: str, params: dict | None = None):
+        self.queries.append(cypher)
+        rows = self.edge_rows if 'RELATES_TO' in cypher else self.node_rows
+        result = MagicMock()
+        result.header = []
+        if 'count(' in cypher:
+            result.result_set = [[len(rows)]]
+            return result
+        match = __import__('re').search(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', cypher)
+        if match:
+            skip, limit = int(match.group(1)), int(match.group(2))
+            result.result_set = rows[skip: skip + limit]
+        else:
+            result.result_set = list(rows)
+        return result
+
+    async def query(self, cypher: str, params: dict | None = None):  # pragma: no cover
+        raise AssertionError('read paths must use ro_query, never query')
+
+
+def _force_edge_read_structural(monkeypatch, **forced):
+    """Force _paged_ro_query kwargs for the EDGE read only (dispatch on the template)."""
+    from fused_memory.backends import graphiti_client
+
+    real = graphiti_client._paged_ro_query
+
+    async def dispatching(*args, **kwargs):
+        page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
+        if 'RELATES_TO' in page_template:
+            kwargs = {**kwargs, **forced}
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+
+
+_STRUCTURAL_CASES = [
+    pytest.param({'page_size': 10000, 'resultset_size': 10000}, id='refusal'),
+    pytest.param({'page_size': 2, 'max_pages': 1}, id='page-cap'),
+]
+
+
+class TestStructuralRefusalNeverBlanksSummaries:
+    """force=True must not write '' over real summaries from a non-enumeration."""
+
+    ENTITY_COUNT = 5
+
+    def _svc_with_real_backend(self, mock_config, make_backend):
+        from fused_memory.services.memory_service import MemoryService
+
+        node_rows = [
+            [f'u{i}', f'name-{i}', f'a real summary for {i}']
+            for i in range(self.ENTITY_COUNT)
+        ]
+        edge_rows = [
+            [f'u{i}', f'e{i}', f'a real summary for {i}', f'edge-{i}']
+            for i in range(self.ENTITY_COUNT)
+        ]
+        backend = make_backend(mock_config)
+        backend._driver._get_graph = MagicMock(
+            return_value=_DualCorpusGraph(node_rows, edge_rows)
+        )
+        # THE SPY: the write we are pinning the ABSENCE of.
+        backend.update_node_summary = AsyncMock(return_value=None)
+
+        svc = MemoryService(mock_config)
+        svc.graphiti = backend
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        return svc, backend
+
+    @pytest.mark.asyncio
+    async def test_control_a_healthy_force_rebuild_does_write(
+        self, mock_config, make_backend
+    ):
+        """CONTROL: with both reads intact the write path really is reached.
+
+        Without this, "update_node_summary was never awaited" below is
+        satisfied by any wiring that simply never gets that far, and proves
+        nothing about the fix.
+        """
+        svc, backend = self._svc_with_real_backend(mock_config, make_backend)
+        result = await svc.rebuild_entity_summaries(
+            project_id='test', force=True, dry_run=False
+        )
+        assert result['total_entities'] == self.ENTITY_COUNT
+        assert backend.update_node_summary.await_count > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('forced', _STRUCTURAL_CASES)
+    async def test_structural_edge_read_raises_and_writes_nothing(
+        self, forced, mock_config, make_backend, monkeypatch
+    ):
+        """The whole point: pins the ABSENCE OF A WRITE, not just an exception.
+
+        Asserting only that the exception propagates would keep passing under
+        a future change that swallows it somewhere up the stack while the
+        blanking write still happened.  Zero awaits on update_node_summary is
+        what actually holds.
+        """
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        svc, backend = self._svc_with_real_backend(mock_config, make_backend)
+        _force_edge_read_structural(monkeypatch, **forced)
+
+        with pytest.raises(IncompleteEnumerationError):
+            await svc.rebuild_entity_summaries(
+                project_id='test', force=True, dry_run=False
+            )
+
+        backend.update_node_summary.assert_not_awaited()
+        assert backend.update_node_summary.await_count == 0

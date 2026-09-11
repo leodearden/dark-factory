@@ -15,16 +15,15 @@ mixing those in would break the pool's purity and its existing 2-value
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
-import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared import safe_io
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -77,6 +76,10 @@ LEGAL_TRANSITIONS: frozenset[tuple[LaneState | None, LaneState]] = frozenset(
         (LaneState.ASSIGNED, LaneState.IN_USE),
         (LaneState.IN_USE, LaneState.RELEASED),
         (LaneState.ASSIGNED, LaneState.RELEASED),
+        # recycle a quarantined slot back into service after its bad worktree
+        # is relocated to quarantine_base — the ONE sanctioned exit from
+        # QUARANTINED; every other QUARANTINED->X stays illegal.
+        (LaneState.QUARANTINED, LaneState.RELEASED),
     }
     | {(origin, LaneState.QUARANTINED) for origin in [*list(LaneState), None]}
 )
@@ -272,7 +275,7 @@ class LaneLifecycle:
         if not path.is_file():
             return None
         try:
-            return LaneRecord.from_json(path.read_text())
+            return LaneRecord.from_json(path.read_text(encoding='utf-8'))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise CorruptLaneRecord(f'unparseable lane record at {path}') from exc
 
@@ -296,23 +299,45 @@ class LaneLifecycle:
     def _write(self, lane: Path | str, record: LaneRecord) -> None:
         """Atomically write *record* for *lane* (tmp file + os.replace).
 
-        Mirrors ``escalation.queue.EscalationQueue._atomic_write_path``: the
-        tmp file is created in the target's own parent dir so the replace
-        stays within one filesystem, and is cleaned up on failure.
+        Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+        consolidated this repo's copies of the tmp+rename writer). The
+        arguments reproduce exactly what the previously-inlined body produced:
+        ``mkdir=True`` for the parent-dir create, ``mode=0o600`` matching the
+        :func:`tempfile.mkstemp` create, and no fsync.
+
+        Task 3223 reproduced the old inlined body's behaviour verbatim: a bare
+        ``os.fdopen(fd, 'w')``, which is locale-dependent, was preserved rather
+        than silently upgraded (that consolidation explicitly forbade changing
+        per-site encoding). Task 3387 fixed the resulting latent bug: this
+        payload is JSON (``record.to_json()``), and RFC 8259 requires JSON on
+        disk to be UTF-8 — under a non-UTF-8 locale this wrote bytes that THIS
+        CLASS'S OWN READER then rejects. Name it precisely, so the next
+        investigator does not go looking in the wrong module:
+        ``_read_or_raise`` raises ``CorruptLaneRecord`` (the decode error is a
+        ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+        method's ``except`` clause), which ``read()`` logs and maps to
+        ``None``, so ``all_records()`` then silently omits the lane. (An
+        earlier version of this paragraph cited
+        ``shared.safe_io.load_json_or_warn``; that helper never reads lane
+        records — its callers are ``b3_gate``, ``chronic_flake``,
+        ``landed_outbox`` and ``merge_queue_store``.)
+
+        ``encoding`` is now pinned ``'utf-8'`` at both halves of the
+        round-trip — here on write, and on ``_read_or_raise``'s ``read_text``
+        — regardless of the ambient locale.
+
+        Tracked as ticket ``tkt_0RRXRPD1EW9KP7JE2RDB0YXFWX``. That is a TICKET
+        id, not a task id — the curator resolves tickets to tasks
+        asynchronously, so do not search ``tasks.json`` for it and conclude it
+        is fake.
         """
-        path = self._record_path(lane)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp', prefix=path.stem, dir=str(path.parent),
+        safe_io.atomic_write_text(
+            self._record_path(lane),
+            record.to_json(),
+            encoding='utf-8',
+            mode=0o600,
+            mkdir=True,
         )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(record.to_json())
-            os.replace(tmp_path_str, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
 
     def transition(self, lane: Path | str, to: LaneState, **fields: object) -> LaneRecord:
         """The one mutator: validate (from, to), persist, return the new record.
@@ -496,12 +521,36 @@ class LaneLifecycle:
           returns the existing record UNCHANGED, with no write at all
           (idempotent).
         * Already ``ASSIGNED``/``IN_USE`` for a DIFFERENT ``task_id`` (or any
-          other state with no legal edge to ``ASSIGNED``, e.g.
-          ``QUARANTINED``): never steals, never mutates — the final
-          ``transition()`` call below raises ``IllegalLaneTransition``
-          (propagated to the caller, NOT swallowed — unlike the best-effort
-          ``GitOps`` writer methods this mirrors) and the durable record is
-          left untouched.
+          other state with no legal edge to ``ASSIGNED``): never steals,
+          never mutates — the final ``transition()`` call below raises
+          ``IllegalLaneTransition`` (propagated to the caller, NOT swallowed
+          — unlike the best-effort ``GitOps`` writer methods this mirrors)
+          and the durable record is left untouched.
+        * Current state ``QUARANTINED``: RECYCLED, not refused. Emits a LOUD
+          ``WARNING`` (never silent-heal, PRD W11 I2), routes the ONE
+          sanctioned ``QUARANTINED -> RELEASED`` recycle edge (which clears the
+          stale ``task_id``/``title``), then falls through to the terminal
+          ``RELEASED -> ASSIGNED`` below. The relocated worktree stays
+          preserved in ``quarantine_base`` for forensics; only the per-slot
+          durable record is recycled. Distinct from the different-task
+          ASSIGNED/IN_USE conflict above, which still raises/never-steals.
+
+          The recycle fires for ANY caller that presents a QUARANTINED record,
+          NOT only the fresh-acquire path: this method cannot itself verify
+          that GitOps has re-prepared a worktree, so it treats the durable
+          record as the subordinate mirror it is (PRD I1) and brings it into
+          line with the authoritative in-memory assignment the caller already
+          committed to. In a coherent pool only the genuine fresh dispatch
+          (``WarmLanePool.acquire_for`` onto a slot whose bad worktree was
+          already relocated to ``quarantine_base``, GitOps having prepared a
+          new worktree) actually presents a QUARANTINED record here — the pool's
+          other assignment callers (``reclaim_victim``, ``note_assignment``)
+          re-key a lane that is already in-memory ASSIGNED, whose durable
+          record was therefore already recycled off QUARANTINED by the acquire
+          that assigned it, while ``restore_assignment`` runs only from crash
+          recovery, which provably SKIPS QUARANTINED lanes before it ever
+          restores one (``Harness._recover_crashed_tasks``). The LOUD warning
+          surfaces every recycle, so an unexpected caller is never silent.
         * Otherwise walks the legal seed-up ladder (mirrors
           ``GitOps._note_assigned_via_route``): ``None -> SEED ->
           REGISTERED(branch=branch) -> ASSIGNED``; ``SEED -> REGISTERED ->
@@ -531,10 +580,28 @@ class LaneLifecycle:
             self.transition(lane, LaneState.REGISTERED, **registered_fields)
         elif state is LaneState.SEED:
             self.transition(lane, LaneState.REGISTERED, **registered_fields)
-        # REGISTERED/RELEASED (and any other, e.g. QUARANTINED or a
-        # different-task ASSIGNED/IN_USE conflict) fall straight through to
-        # the terminal edge below — transition() itself is the single
-        # legality gate, so a conflicting/illegal origin raises there.
+        elif state is LaneState.QUARANTINED:
+            # Recycle a genuinely-reborn slot: its bad worktree was already
+            # relocated to quarantine_base and GitOps has prepared a fresh
+            # worktree for this new task, but the durable record is still
+            # QUARANTINED. Route it back via the ONE sanctioned
+            # QUARANTINED -> RELEASED recycle edge (which clears the stale
+            # task_id/title), then fall through to the terminal
+            # RELEASED -> ASSIGNED below. LOUD, never silent-heal (PRD W11 I2):
+            # the relocated worktree stays preserved in quarantine_base for
+            # forensics — only the per-slot durable record is recycled.
+            logger.warning(
+                'lane_lifecycle: recycling QUARANTINED lane %s for fresh '
+                'assignment task_id=%s — prior quarantine record superseded '
+                '(the relocated worktree remains preserved in quarantine_base)',
+                Path(lane).name, task_id,
+            )
+            self.transition(lane, LaneState.RELEASED)
+            state = LaneState.RELEASED
+        # REGISTERED/RELEASED (and a different-task ASSIGNED/IN_USE conflict)
+        # fall straight through to the terminal edge below — transition()
+        # itself is the single legality gate, so a conflicting/illegal origin
+        # raises there.
 
         assigned_fields: dict[str, object] = {'task_id': task_id}
         if title is not None:

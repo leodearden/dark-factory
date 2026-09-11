@@ -147,6 +147,11 @@ class TestHarnessReloadConfigSuccess:
             'restart_required': {},
             'unchanged': expected_diff.unchanged,
             'error': None,
+            # Unknown-config-key census (task 2989): always present so callers
+            # can read them unconditionally.  Empty here — this fresh config was
+            # built directly, so the census sentinel normalizes to [].
+            'unknown_config_keys': [],
+            'ignored_config_keys': [],
         }
         assert report == expected_report
 
@@ -381,7 +386,15 @@ class TestHarnessReloadConfigHybridRollback:
             report = await harness.reload_config()
 
         mock_apply_reload.assert_called_once_with(harness.config, fresh)
-        assert report == {**rollback_report, 'config_path': str(config_path)}
+        # reload_config injects config_path plus the two census views (task 2989)
+        # on top of whatever apply_reload returned — including on this
+        # rollback/fail-closed path.
+        assert report == {
+            **rollback_report,
+            'config_path': str(config_path),
+            'unknown_config_keys': [],
+            'ignored_config_keys': [],
+        }
 
         assert harness.config.model_dump_json() == before, (
             'reload_config itself must not mutate live config beyond whatever '

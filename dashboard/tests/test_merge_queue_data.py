@@ -14,6 +14,12 @@ from unittest.mock import patch
 import aiosqlite
 import httpx
 import pytest
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 import dashboard.data.merge_queue as _mqmod
 
@@ -1592,6 +1598,161 @@ class TestLoadTaskTitles:
         assert call_count == 1, f'expected a single fetch_tasks call, got {call_count}'
         assert all(r == {'1': 'A'} for r in results)
 
+    # --- Whole-operation budget -------------------------------------------
+    #
+    # ``fetch_tasks``' own *timeout* is a PER-HTTP-REQUEST budget: it bounds
+    # connect/read/write and pool acquisition and nothing else. The incident
+    # that motivated these two tests hung inside httpcore's connection lock,
+    # where no outbound socket is ever opened and that timeout never fires —
+    # so /merge-queue wedged for 19.8 h with the per-request budget fully in
+    # place. Only an enclosing ``asyncio.wait_for`` cancels that wait.
+    #
+    # Both hang stubs are ``await asyncio.Event().wait()`` on an event nothing
+    # ever sets, deliberately NOT a sleep: a sleep shorter than the budget
+    # passes against the pre-fix code too and would prove nothing. Since that
+    # would otherwise hang pytest forever, each call is wrapped in a TEST-SIDE
+    # ``wait_for(2.0)`` — 40x the monkeypatched 0.05 s budget, so it can only
+    # trip on a real regression, never on scheduling jitter.
+
+    async def test_a_hanging_fetch_tasks_does_not_hang_load_task_titles(
+        self, monkeypatch, dummy_client, dummy_config, caplog
+    ):
+        """A fetch that never returns degrades to {} — loudly, and uncached.
+
+        The WARNING is asserted, not incidental: ``{}`` is exactly what an
+        ordinary title-less result looks like, so the log line is the ONLY
+        thing that distinguishes "this project has no titles" from "we ran out
+        of budget and never found out". Without it a timeout is invisible to
+        an operator, which is the 19.8 h failure mode in miniature.
+        """
+        import asyncio
+        import logging
+
+        import dashboard.data.merge_queue as _mq
+
+        # A warm entry would be served without ever reaching the hang.
+        _mq._task_titles_cache_clear()
+
+        call_count = 0
+
+        async def hang_fetch_tasks(client, config, project_root):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.Event().wait()  # nothing ever sets it
+
+        monkeypatch.setattr(_mq, '_TASK_TITLES_BUDGET', 0.05)
+
+        with (
+            patch('dashboard.data.merge_queue.fetch_tasks', new=hang_fetch_tasks),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'),
+        ):
+            result = await asyncio.wait_for(
+                _mq.load_task_titles(
+                    client=dummy_client, config=dummy_config,
+                    project_root='/proj/HANG',
+                ),
+                timeout=2.0,
+            )
+            assert result == {}, (
+                'the shape load_task_titles already promises for an MCP '
+                'failure — the merge-queue tab still renders, with titles '
+                'falling back to empty strings'
+            )
+            assert call_count == 1
+
+            # A timeout must not pin an empty title map for the TTL window:
+            # nothing was written to the cache, so the next poll re-attempts.
+            await asyncio.wait_for(
+                _mq.load_task_titles(
+                    client=dummy_client, config=dummy_config,
+                    project_root='/proj/HANG',
+                ),
+                timeout=2.0,
+            )
+        assert call_count == 2, (
+            'the second call must re-enter the stub — a timeout that cached '
+            'its {} would blank the tab for the whole TTL window'
+        )
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and r.name == 'dashboard.data.merge_queue'
+        ]
+        assert any('whole-operation budget' in m for m in warnings), (
+            f'no timeout WARNING was logged (records: {warnings}) — the '
+            'returned {} is indistinguishable from an ordinary title-less '
+            'result, so the log line is the only operator-visible trace that '
+            'the budget expired'
+        )
+        assert any('/proj/HANG' in m for m in warnings), (
+            f'the WARNING must name the project root that degraded: {warnings}'
+        )
+
+    async def test_a_concurrent_caller_on_the_same_root_is_bounded_too(
+        self, monkeypatch, dummy_client, dummy_config
+    ):
+        """Both callers are bounded, not just the one that wins the lock.
+
+        This pins the wrap PLACEMENT. ``TTLCache.get_or_refresh`` serializes
+        cold callers for one key behind a per-key lock and runs the refresh
+        WHILE HOLDING it. If the ``wait_for`` enclosed the inner
+        ``fetch_tasks`` instead of the outer ``get_or_refresh``, caller B
+        would queue on that lock UNBOUNDED for caller A's whole budget and
+        then run its own full-budget refresh — the pair costs 2x the budget
+        and N waiters cost N x. The dashboard polls every 3 s, so waiters are
+        the routine case, not a corner.
+        """
+        import asyncio
+
+        import dashboard.data.merge_queue as _mq
+
+        _mq._task_titles_cache_clear()
+
+        async def hang_fetch_tasks(client, config, project_root):
+            await asyncio.Event().wait()
+
+        budget = 0.5
+        monkeypatch.setattr(_mq, '_TASK_TITLES_BUDGET', budget)
+        loop = asyncio.get_running_loop()
+
+        with patch('dashboard.data.merge_queue.fetch_tasks', new=hang_fetch_tasks):
+            started = loop.time()
+            results = await asyncio.wait_for(
+                asyncio.gather(*[
+                    _mq.load_task_titles(
+                        client=dummy_client, config=dummy_config,
+                        project_root='/proj/SHARED',
+                    )
+                    for _ in range(2)
+                ]),
+                timeout=2.0,
+            )
+            elapsed = loop.time() - started
+
+        assert results == [{}, {}]
+        # The assertion is about SERIALIZATION, not merely about returning:
+        # an inner-only wrap costs 2 x budget here and scales with waiters.
+        #
+        # The budget is deliberately LARGE for a test whose subject is a
+        # timeout. It is not scaled because the operation needs 0.5 s — it is
+        # scaled so the assertion's ABSOLUTE jitter margin exceeds real-world
+        # event-loop scheduling, GC and pytest overhead. Correct behaviour
+        # (outer wrap) costs ~1x budget; the inner-only-wrap regression costs
+        # ~2x; 1.5x sits exactly midway, giving 0.25 s of slack on BOTH sides.
+        # At the original 0.05 s the discrimination was sound in ratio and
+        # worthless in absolute terms (50 ms of slack), and it flaked at ~4%
+        # per run. Do NOT shrink the budget back to "speed up the suite" —
+        # that silently reintroduces the flake.
+        assert elapsed < 1.5 * budget, (
+            f'two concurrent callers took {elapsed:.3f}s against a '
+            f'{1.5 * budget}s threshold (1.5 x the {budget}s per-call '
+            f'budget); the inner-only-wrap regression costs ~{2 * budget}s — '
+            'that is the serialized cost of an inner-only wrap; the wait_for '
+            'must enclose get_or_refresh so a caller QUEUED on the per-key '
+            'lock is bounded too'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestBuildPerProjectMergeQueue (step-9)
@@ -2707,36 +2868,8 @@ class TestNormalizeLiveEntry:
 # TestFetchLiveMergeQueues — success path (task-1606 step-3)
 # ---------------------------------------------------------------------------
 
-# Shared MCP mock helpers (mirrored from test_merge_halt.py)
-
-def _mcp_response(inner: dict, request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _init_response(request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'protocolVersion': '2025-03-26',
-                'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'test', 'version': '0.1'},
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
+# MCP mock envelopes come from _dashboard_helpers (task 3952) — see the
+# imports at the top of this module.
 
 
 class _PerPortHandler:
@@ -2769,12 +2902,12 @@ class _PerPortHandler:
         method = body.get('method', '')
         request_id = body.get('id', 1)
         if method == 'initialize':
-            return _init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+            return mcp_notify_response()
         # tools/call → return snapshot
         inner = self.snapshot_responses.get(port, {'entries': [], 'depth': 0})
-        return _mcp_response(inner, request_id)
+        return mcp_tool_response(inner, request_id)
 
 
 @pytest.fixture(autouse=False)
@@ -3473,3 +3606,37 @@ class TestProbeLiveOneMetrics:
         assert 'metrics' in proj
         assert proj['metrics']['retries_per_landing'] == 1.5
         assert proj['metrics']['drift_at_detection']['last'] == 3
+
+
+class TestProbeLiveOneTimeoutBudget:
+    """The live-queue probe's budget must reach client.post, not just wait_for.
+
+    Twin of ``test_merge_halt.TestProbeOneTimeoutBudget``. ``timeout=`` on
+    ``client.post`` also governs **pool acquisition** on the shared client,
+    so without threading, a probe on a 2.0s budget could still block for
+    httpx's 10s default waiting on a free connection slot.
+
+    AsyncMock rather than MockTransport deliberately: MockTransport never
+    surfaces the ``timeout`` kwarg to its handler.
+    """
+
+    @pytest.mark.asyncio
+    async def test_budget_reaches_every_post(self, _clean_live_sessions):
+        from unittest.mock import AsyncMock
+
+        from dashboard.data.merge_queue import _probe_live_one
+
+        url = 'http://127.0.0.1:8200'
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cold_session_responses(
+            _snapshot([]), url,
+        )
+
+        result = await _probe_live_one(mock_client, url, 0.05)
+
+        assert result['reachable'] is True, f'probe should have succeeded: {result}'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [0.05, 0.05, 0.05], (
+            f"the probe budget must reach every post, not httpx's 10s "
+            f'default, got {timeouts}'
+        )

@@ -92,8 +92,17 @@ def _leg_for_cmd(cmd: str) -> str:
     active admission gate nice-wraps the test leg (``<nice argv> /bin/bash -c
     <shlex.quote(cmd)>``), so its captured cmd still CONTAINS ``_TEST_CMD``
     but is no longer equal to it. lint/type are never wrapped either way.
+
+    Checks ``'pytest'``/``'tests/'`` as two SEPARATE substrings rather than the
+    joined ``_TEST_CMD``: a ``verify_admission_pytest_n`` cap splices new flags
+    BETWEEN them (``pytest tests/`` -> ``pytest -n 8 tests/``), breaking
+    containment of the joined string. That is worse here than a failed
+    assertion: ``_RunCmdSpy`` keys its gates on ``(leg, occurrence)``, so a
+    mislabelled test leg means the gate never fires, the holder never holds the
+    slot, and ``max_seen``/``len(calls)`` silently go wrong too
+    (task 4456; same rationale as test_verify_admission_pytest_n.py:56-66).
     """
-    if _TEST_CMD in cmd:
+    if 'pytest' in cmd and 'tests/' in cmd:
         return 'test'
     if _LINT_CMD in cmd:
         return 'lint'
@@ -318,6 +327,7 @@ def _wait_for_marker(marker_path: Path, timeout: float = 5.0) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestGlobalCap:
     """PRD Boundary-test sketch scenario 1: dispatching M concurrent
     task-role verifies against a single N=1 slot never lets more than one
@@ -469,6 +479,7 @@ class TestMergeNeverBlocks:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestSweepYieldsAndInterleaves:
     """PRD Boundary-test sketch scenario 3: a background-role sweep
     (``run_full_verification`` fanning out over ``config._module_configs``)
@@ -618,6 +629,7 @@ class TestSweepYieldsAndInterleaves:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestUntimedWaitNoRequeue:
     """PRD Boundary-test sketch scenario 4: slot-wait time is excluded from
     ``verify_command_timeout_secs`` by construction — ``_run_or_skip_timed``
@@ -735,6 +747,7 @@ class TestUntimedWaitNoRequeue:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestSelfHeal:
     """PRD Boundary-test sketch scenario 5: a SIGKILLed slot holder's flock
     is freed immediately by the kernel on process death — no canary/daemon
@@ -872,6 +885,7 @@ class TestFailOpen:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_unmkdirable_slots_dir_fails_open_and_verify_still_passes(self, tmp_path):
         # slots_dir's PARENT path component is a regular file, not a missing
         # directory — `slots_dir.mkdir(parents=True, exist_ok=True)` inside

@@ -9,11 +9,21 @@ silently.
 
 Behaviour-preserving mapping (D2): the five ``TaskEffect`` values below are
 transcribed verbatim from the current source of truth,
-``orchestrator/src/orchestrator/harness.py:8259-8325``
-(``_ACTION_TARGETS`` / ``_on_escalation_resolved``):
+``orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved``
+(originally its ``_ACTION_TARGETS`` map):
 ``restart`` -> ``pending``, ``park`` -> ``blocked`` (version-a: keeps the L2
 escalation OPEN; NOT ``deferred``), ``abandon`` -> ``cancelled``, ``resume``
 -> ``pending`` (orphan/cascade re-pend), ``close_only`` -> no status change.
+
+WHO the ``resume`` row applies to changed in task 3540 (PRD
+``plans/task-escalation-state-graph-prd.md`` D8, spec E9), while the table
+content did not. The harness's consumption of the ``resume`` effect is now
+keyed on CLAIMANT LIVENESS rather than on ``status == 'blocked'`` or
+``escalation.level >= 1``: a task with NO live claimant re-pends to this
+row's ``target_status`` whether it was ``blocked`` or ``in-progress`` and at
+any level, while a task WITH a live claimant is skipped here because the
+running workflow was already woken synchronously and owns its own re-pend.
+See ``orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member``.
 
 G6 archive verification: a scan of the live ``data/escalations`` archive (636
 records, 632 resolved/dismissed) found ``resolution_action`` values of

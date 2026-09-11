@@ -7,7 +7,11 @@ live source/test re-verification (verify_premise_refuted).
 
 from __future__ import annotations
 
+import dataclasses
+import types
 from pathlib import Path
+
+import pytest
 
 from fused_memory.middleware.task_curator import CandidateTask
 
@@ -86,6 +90,22 @@ class TestLoadPremiseRegistry:
         assert entries == []
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
+
+    # task-4483 step-01 RED: undecodable-encoding registry
+    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
+        """(c2) File with bytes that are not valid UTF-8 returns [] and emits exactly one WARNING."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
+
+        bad_encoding = tmp_path / "bad_encoding.yaml"
+        bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
+
+        with caplog.at_level("WARNING"):
+            entries = load_premise_registry(bad_encoding)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert str(bad_encoding) in warnings[0].message
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
@@ -605,7 +625,7 @@ class TestPremiseRefutedEntry:
 
 class TestSeedRegistryRealSource:
     """Loads the SHIPPED fused-memory/config/recon_code_fix_premise_registry.yaml
-    and re-verifies its three seed entries against the REAL fused-memory source
+    and re-verifies its four seed entries against the REAL fused-memory source
     root — not a tmp_path fixture.
 
     Confirmed base-branch facts (see task-1972 analysis):
@@ -613,6 +633,21 @@ class TestSeedRegistryRealSource:
     - tests/test_stages.py contains
       "test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2".
     - src/fused_memory/server/recon_report.py does NOT contain "max_length".
+
+    Confirmed facts for the fourth entry (task 3023):
+    - ../escalation/src/escalation/queue.py contains "def get_by_task" and
+      "_iter_archive_paths" — the archive-inclusive scan that refutes the
+      "escalation record was never written" premise.
+    - src/fused_memory/reconciliation/prompts/__init__.py contains
+      "_GATE_CLOSURE_ARCHIVE_GUIDANCE" and "get_task_escalations" — the shared
+      guidance prose naming the disconfirming tool. The literal tool name lives
+      HERE, not in the stage modules, because the guidance is a constant
+      interpolated into each stage's f-string.
+    - src/fused_memory/reconciliation/prompts/stage2.py contains
+      "render_escalation_boundary_note(can_escalate=True)" — the guidance is
+      wired into the stage that files remediation tasks. It rides along with
+      the shared escalation-store boundary note (rendered as a subsection of
+      it), so that render call is the wiring token, not the constant name.
     """
 
     # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/
@@ -623,15 +658,16 @@ class TestSeedRegistryRealSource:
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
         return load_premise_registry(self.REGISTRY_PATH)
 
-    def test_shipped_registry_has_three_entries(self):
-        """The seed registry ships exactly the three confirmed incidents."""
+    def test_shipped_registry_has_four_entries(self):
+        """The seed registry ships exactly the four confirmed incidents."""
         entries = self._load_entries()
         names = {e.name for e in entries}
-        assert len(entries) == 3
+        assert len(entries) == 4
         assert names == {
             "entity_summary_rebuild_invalid_at_filter_already_present",
             "stage2_flag_query_stage1_flag_marker_forbidden_regression",
             "add_finding_suggested_action_no_max_length_field",
+            "deterministic_gate_escalation_record_archived_not_missing",
         }
 
     def test_esc_1946_15_entity_summary_rebuild_matches_and_is_refuted(self):
@@ -702,8 +738,136 @@ class TestSeedRegistryRealSource:
         assert entry.name == "add_finding_suggested_action_no_max_length_field"
         assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
 
-    def test_all_three_incidents_via_premise_refuted_entry(self):
-        """premise_refuted_entry composes match + verify for all three incidents
+    def test_deterministic_gate_escalation_absence_claim_matches_and_is_refuted(self):
+        """task 3023: "gate task stamped gate_escalated_at but no escalation record
+        exists" — refuted because the record IS written, then ARCHIVED on human
+        resolve; the claim comes from a root-only get_pending_escalations probe
+        against an archive-inclusive fact.
+
+        This is the recurring false positive filed 16 times across dark_factory
+        (2841/2842/2844/2846/2919/2954/2955/2958/2999/3005/3006) and reify
+        (5330/5341/5349/5352/5353).
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+            verify_premise_refuted,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=(
+                "Fix DeterministicRunner escalation-write/closure gap for "
+                "deterministic gate tasks"
+            ),
+            description=(
+                "Task was marked done and stamped metadata.gate_escalated_at but no "
+                "escalation record exists — get_pending_escalations(task_id) returns []."
+            ),
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None
+        assert entry.name == "deterministic_gate_escalation_record_archived_not_missing"
+        assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is not None
+
+    # Candidate shared by the over-broad-anchoring guard and its inverse control.
+    # The title carries BOTH anchor tokens ("deterministic", "escalation") BY
+    # CONSTRUCTION — match_candidate requires ALL title_substrings, so without
+    # both tokens the candidate would die at the TITLE gate and the description
+    # anchor these tests exist to pin would never be exercised.
+    _LEGITIMATE_PROPOSAL_TITLE = (
+        "Expose an archive-inclusive escalation lookup for deterministic gate tasks"
+    )
+
+    def test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped(self):
+        """Over-broad-anchoring guard: task 3023's OWN framing must still reach
+        the architect.
+
+        The title carries both anchor tokens by construction (see
+        _LEGITIMATE_PROPOSAL_TITLE) — that is precisely what makes the
+        DESCRIPTION anchor reachable, so this test rejects on the anchor it
+        claims to pin rather than on the title gate. The description mentions
+        get_task_escalations and gate_escalated_at but asserts no absence.
+
+        The executable guards are (c) the dataclasses.replace mutation control
+        below and (d) test_absence_phrasing_with_same_title_does_match — not
+        this docstring. Widening description_substrings to a bare
+        "gate_escalated_at" token now FAILS (c) instead of sliding through
+        green, which is the regression that let the shipped bug through.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._LEGITIMATE_PROPOSAL_TITLE,
+            description=(
+                "Add get_task_escalations to the escalation MCP server so an auditor "
+                "of a deterministic gate task stamped metadata.gate_escalated_at can "
+                "see resolved records that were archived, and point Stage 1 / Stage 2 "
+                "at it."
+            ),
+        )
+
+        # (b) match_candidate localises the rejection to the DESCRIPTION anchor;
+        # premise_refuted_entry alone would also be satisfied by a title-gate
+        # rejection, which is how the shipped version of this test passed
+        # vacuously.
+        assert match_candidate(candidate, entries) is None, (
+            "A legitimate proposal to ADD the archive-inclusive lookup must not "
+            "match any registry entry — only assertion-of-absence claims are refuted."
+        )
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None, (
+            "A legitimate proposal to ADD the archive-inclusive lookup must not be "
+            "dropped by the guard — only assertion-of-absence claims are refuted."
+        )
+
+        # (c) MUTATION CONTROL — the assertion whose absence let the shipped bug
+        # through. PremiseEntry is a frozen dataclass, so widen ONLY the
+        # description anchor in memory and prove the candidate then DOES match.
+        # That proves the title gate PASSES for this candidate, i.e. the narrow
+        # description anchor is the only thing protecting it.
+        entry = next(
+            e for e in entries
+            if e.name == "deterministic_gate_escalation_record_archived_not_missing"
+        )
+        widened = dataclasses.replace(entry, description_substrings=["gate_escalated_at"])
+        assert match_candidate(candidate, [widened]) is not None, (
+            "The candidate must pass the TITLE gate — otherwise this test rejects "
+            "on the title, not the description anchor, and the over-broad-anchoring "
+            "property it claims to guard is untested."
+        )
+
+    def test_absence_phrasing_with_same_title_does_match(self):
+        """INVERSE CONTROL — same title, only the absence phrasing flips the outcome.
+
+        Pins the description anchor from the other side: with an identical
+        title to the legitimate-proposal case above, adding
+        "no escalation record exists" is sufficient to match the entry. The
+        pair together CHARACTERISES the anchor instead of sampling one side.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._LEGITIMATE_PROPOSAL_TITLE,
+            description="task stamped gate_escalated_at but no escalation record exists",
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None, (
+            "An assertion-of-absence claim must match even when the title is the "
+            "same as a legitimate proposal — the description anchor is what separates "
+            "them."
+        )
+        assert entry.name == "deterministic_gate_escalation_record_archived_not_missing"
+
+    def test_all_four_incidents_via_premise_refuted_entry(self):
+        """premise_refuted_entry composes match + verify for all four incidents
         at once against the real source root — the end-to-end shape the curator
         actually calls.
         """
@@ -743,9 +907,123 @@ class TestSeedRegistryRealSource:
                 ),
                 "add_finding_suggested_action_no_max_length_field",
             ),
+            (
+                CandidateTask(
+                    title=(
+                        "Fix DeterministicRunner escalation-write/closure gap for "
+                        "deterministic gate tasks"
+                    ),
+                    description=(
+                        "Task was marked done and stamped metadata.gate_escalated_at but "
+                        "no escalation record exists — get_pending_escalations(task_id) "
+                        "returns []."
+                    ),
+                ),
+                "deterministic_gate_escalation_record_archived_not_missing",
+            ),
         ]
 
         for candidate, expected_name in cases:
             result = premise_refuted_entry(candidate, entries, self.SOURCE_ROOT)
             assert result is not None, f"expected a premise-refuted drop for {expected_name!r}"
             assert result.name == expected_name
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-4483 step-03 RED: TestYamlLoaderSelection
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestYamlLoaderSelection:
+    """Pins the fast YAML loader selection in
+    fused_memory.middleware.recon_code_fix_premise_guard: the module resolves
+    to the libyaml-backed CSafeLoader when available (the ~8x speedup this
+    guards against silently regressing), falls back to the pure-Python
+    SafeLoader when it is not, and parse behavior (parity + the
+    yaml.YAMLError contract) is unaffected by the loader swap.
+    """
+
+    def test_module_uses_c_loader_when_available(self):
+        """Anti-regression pin: the module must resolve to CSafeLoader, not SafeLoader."""
+        import yaml
+
+        if not hasattr(yaml, "CSafeLoader"):
+            pytest.skip("libyaml not available in this environment")
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import _YAML_LOADER
+
+        assert _YAML_LOADER is yaml.CSafeLoader
+
+    def test_resolve_yaml_loader_falls_back_when_c_loader_absent(self):
+        """Fallback branch (otherwise unreachable with libyaml present): a
+        yaml-like module exposing SafeLoader but no CSafeLoader resolves to
+        SafeLoader.
+        """
+        import yaml
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import _resolve_yaml_loader
+
+        stub = types.SimpleNamespace(SafeLoader=yaml.SafeLoader)
+        assert _resolve_yaml_loader(stub) is yaml.SafeLoader
+
+    def test_shipped_registry_parses_under_active_loader(self):
+        """Parity/smoke guard on real data: the shipped registry still parses
+        to well-formed entries under whichever loader is active, and the
+        active loader's parse output is identical to the pure-Python
+        SafeLoader's output on that same registry.
+        """
+        import yaml
+
+        if not hasattr(yaml, "CSafeLoader"):
+            pytest.skip("libyaml not available in this environment")
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            _YAML_LOADER,
+            PremiseEntry,
+            SourceAssertion,
+            load_premise_registry,
+        )
+
+        registry_path = (
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "recon_code_fix_premise_registry.yaml"
+        )
+        assert registry_path.exists(), f"shipped registry missing at {registry_path}"
+
+        entries = load_premise_registry(registry_path)
+
+        assert len(entries) > 0
+        for entry in entries:
+            assert isinstance(entry, PremiseEntry)
+            for sa in entry.source_assertions:
+                assert isinstance(sa, SourceAssertion)
+
+        text = registry_path.read_text(encoding="utf-8")
+        assert yaml.load(text, Loader=yaml.SafeLoader) == yaml.load(text, Loader=_YAML_LOADER)
+
+    def test_malformed_yaml_still_degrades_under_active_loader(self, tmp_path, caplog):
+        """A malformed-structure parse error survives the loader swap:
+        CSafeLoader's ParserError on this unclosed-flow-sequence input is
+        still a yaml.YAMLError, so the existing handler catches it without
+        modification.
+
+        Not a full error-type equivalence claim between the two loaders —
+        e.g. for a scalar containing a lone surrogate, CSafeLoader raises
+        UnicodeEncodeError (a ValueError, NOT a yaml.YAMLError) where
+        SafeLoader raises yaml.reader.ReaderError (which IS a YAMLError).
+        That divergence is unreachable via load_premise_registry today only
+        because its input is always strict-UTF-8-decoded text first, which
+        rejects lone surrogates before the parser ever sees them.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_premise_registry(bad_yaml)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1

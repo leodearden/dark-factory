@@ -1,0 +1,262 @@
+prd: docs/prds/falkordb-index-provisioning.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3706
+  title: Expected-index-set derivation + list_indices normalizer
+  capabilities:
+  - name: expected-set-parsed-from-upstream-not-restated
+    binding: capability→producer (wired) — INV-5 single home; parses graphiti_core.graph_queries.get_range_indices/get_fulltext_indices
+      rather than hand-copying the statement set
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: get_range_indices|get_fulltext_indices
+      paths:
+      - fused-memory/src/fused_memory/backends/
+      expect: present
+  - name: provider-passed-as-enum-not-bare-string
+    binding: hazard bound (measured at decompose) — GraphProvider is a plain Enum,
+      so get_range_indices('falkordb') silently returns the 27-statement NEO4J set
+      with no error; only GraphProvider.FALKORDB yields the 9+4 falkordb set
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: GraphProvider\.FALKORDB
+      paths:
+      - fused-memory/src/fused_memory/backends/
+      expect: present
+  - name: multi-property-field-fanned-out-per-property
+    binding: capability→producer (wired) — list_indices (graphiti_client.py:2918)
+      binds field to row[1], a LIST for a composite index; the normalizer emits one
+      (label, entity_type, field, index_type) tuple per property
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: fan-out correctness is a property of the parser's unit fixtures (boundary
+        test 4), not a greppable token
+  - name: unparsed-statement-fails-loudly
+    binding: rejection-mechanism — Open Question 1 closed as "fail"; a skip-and-warn
+      parser would be an un-escaped fail-soft (INV-4) and reproduces this PRD's own
+      failure mode
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the assertion is "the test fails on an unrecognized statement" — a test
+        property, expressible only as a fixture, not a grep
+- label: β
+  task_id: 3707
+  title: ensure_indices provisioning function (diff-then-create, per-property range)
+  capabilities:
+  - name: false-positive-ensured-indices-log-deleted
+    binding: rejection-style (D7, INV-2) — logger.debug('Ensured indices on graph
+      %r') at graphiti_client.py:481 fires unconditionally after a no-op
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: Ensured indices on graph
+      paths:
+      - fused-memory/src/fused_memory/backends/
+      expect: absent
+  - name: structured-provision-result-returned
+    binding: capability→producer (wired) — IndexProvisionResult with created/already_present/failed/expected_total
+      replaces the bare log claim
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: IndexProvisionResult
+      paths:
+      - fused-memory/src/fused_memory/backends/
+      expect: present
+  - name: pass-override-retained
+    binding: 'capability→producer (wired, D4) — the build_indices_and_constraints
+      override at graphiti_client.py:291 still suppresses the implicit __init__ fire-and-forget
+      that caused the 723ec915c3 clone storm. RETENTION guard, deliberately already-true
+      on main: it flips to failing only if β wrongly deletes the override along with
+      the stub''s call site'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def build_indices_and_constraints
+      paths:
+      - fused-memory/src/fused_memory/backends/graphiti_client.py
+      expect: present
+  - name: no-composite-range-statement-issued
+    binding: rejection-style (D1) — a composite CREATE INDEX is rejected wholesale
+      against production's trap state and the rejection is swallowed; β issues one
+      property per statement
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by boundary test 1 over β's issued-statement log; the absence
+        of a multi-property ON (...) clause is not reliably greppable
+- label: γ
+  task_id: 3708
+  title: 'Wiring: registry-filtered startup enumeration + first-write provisioning'
+  capabilities:
+  - name: registry-derived-graph-filter
+    binding: capability→producer (wired, D5) — the project registry (taskmaster.project_root
+      + DASHBOARD_KNOWN_PROJECT_ROOTS) replaces the default_db/_db-suffix filter,
+      which would otherwise provision all 35 probe/test/scratch graphs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DASHBOARD_KNOWN_PROJECT_ROOTS|known_project_roots
+      paths:
+      - fused-memory/src/fused_memory/backends/
+      expect: present
+  - name: first-write-choke-point-provisions
+    binding: capability→producer (wired, D6) — _driver_for (:366) / _client_for (:379)
+      cache miss, so a graph created after startup is provisioned without a restart
+      (autotrade and mission_control are registered with no graph yet)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: no non-vacuous grep exists — _identity_lock_for already matches on main
+        (graphiti_client.py:438, the definition), so a presence check would be a no-op
+        gate. The property is "provisioning happens at the choke point under the per-group
+        lock, and the lock is NOT held across the OPERATIONAL barrier", asserted by
+        boundary test 7
+  - name: stub-call-no-longer-on-the-explicit-path
+    binding: rejection-style (D4) — _ensure_indices stops calling driver.build_indices_and_constraints()
+      (both the stub and the composite trap) and calls ensure_indices instead
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: await driver\.build_indices_and_constraints\(\)
+      paths:
+      - fused-memory/src/fused_memory/backends/
+      expect: absent
+  - name: retrieval-surface-settled-before-live-graphs-change
+    binding: capability→producer (upstream, D10) — tasks 3658 (RRF merge), 3659 (briefing
+      rescope) and 3660 (E1 re-key) are wired as dependencies of γ, the point at which
+      live graphs actually change
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG-direction is enforced by the wired dependency edges, not by a grep
+- label: δ
+  task_id: 3709
+  title: Index-health summarizer + recon drift detector (recon_missing_index)
+  capabilities:
+  - name: pure-summarizer-no-io
+    binding: capability→producer (wired) — mirrors reconciliation/queue_health.py:27
+      summarize_graphiti_queue_health, which harness.py:52 imports and threads into
+      memory_consolidator
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def summarize_index_health
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+  - name: drift-escalation-deduped-per-graph
+    binding: capability→producer (wired, D11 + INV-4) — has_open_l1 (escalation/queue.py:489)
+      takes task_id as a required positional; the per-graph key f'graph:{group_id}'
+      is a deliberate reuse of that slot
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recon_missing_index
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+  - name: group-id-and-missing-as-first-class-payload-fields
+    binding: structured-facts (INV-2, D11) — group_id and the missing-index list ride
+      as fields on the escalation payload, never only encoded in the dedup key or
+      in prose
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: payload shape is asserted by boundary test 5 against the filed escalation;
+        the field names alone would grep-match the prose too
+- label: ε
+  task_id: 3710
+  title: BM25 serving canary + production-expected-set integration test
+  capabilities:
+  - name: canary-asserts-serving-not-presence
+    binding: capability→producer (wired, D9 + INV-6) — uses the await_index_operational
+      barrier at fused-memory/tests/_fm_helpers.py:883 (re-homed by task 3377) and
+      asserts a known-token fulltext query returns >=1 row
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: no non-vacuous grep exists — await_index_operational already matches
+        5 files on main (task 3377 landed it), so a presence check would be a no-op
+        gate. The property is "the canary reports not-serving before OPERATIONAL and
+        serving after", asserted by boundary test 6
+  - name: production-expected-set-asserted
+    binding: 'capability→producer (upstream: γ) — distinct from test_falkor_fulltext_integration.py,
+      which builds its own single-field one-node index in-fixture and structurally
+      cannot catch this class'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the assertion is "this test fails on a graph missing any expected index"
+        — a test property established by its own red/green run
+- label: ζ
+  task_id: 3711
+  title: Activation verification + measured retrieval improvement
+  capabilities:
+  - name: briefing-recall-floor-above-measured-baseline
+    binding: 'numeric floor — measured baseline 0/24 across five briefing queries
+      (2026-08-05); corpus provably holds 2-10 matching edges per query. Asserted
+      bound >=1 matching edge on >=4 of 5 queries: floor 0/5, ceiling 5/5, so bound
+      > floor and strictly inside what the corpus can supply'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live retrieval measurement against the running service, not a repo-state
+        check
+  - name: expected-set-operational-on-every-registered-graph
+    binding: 'capability→producer (upstream: γ, δ, ε) — CALL db.indexes() is readable
+      on the RO path (graphiti_client.py:2918, pinned by test_list_indices_integration.py)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live graph-state assertion, performed at activation time
+  - name: e1-comparison-recorded-not-asserted
+    binding: G6 branch 1 avoided by design — 3660's post-rescope baseline does not
+      exist yet, so any threshold here would be a guess; the before/after pair is
+      the deliverable and a null result is a finding to escalate, not a task failure
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: deliberately unasserted; recording the pair is the deliverable
+- label: η
+  task_id: 3712
+  title: Index runbook + correct the two false certifications
+  capabilities:
+  - name: ensure-indices-false-certification-corrected
+    binding: rejection-style — plans/fm-memory-identity-prd.capability-manifest.md:65
+      certifies _ensure_indices as PASS (wired) and cites it as a precedent; row-anchored
+      ERE measured to match exactly 1 line on main
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _ensure_indices.*PASS \(wired\)
+      paths:
+      - plans/fm-memory-identity-prd.capability-manifest.md
+      expect: absent
+  - name: operations-runbook-gains-an-index-section
+    binding: capability→producer — heading-anchored assertion, measured 0 on main
+      at decompose. RE-CAST from the PRD's original 'grep -i index returns zero hits',
+      which is FALSE (OPERATIONS.md:848 'index lock held by a') and therefore vacuously
+      satisfied. See manifest §C1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^#+ .*[Ii]ndex
+      paths:
+      - OPERATIONS.md
+      expect: present
+  - name: runbook-points-at-the-parser-not-a-restated-set
+    binding: INV-5 (no-lockstep-duplication) — the runbook must not hand-copy the
+      13 statements or the expected tuple set; it names α's parser as the single home
+      and gives the command to print the live expected set
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '"does not restate" is a negative prose property; a grep for the statement
+        text would false-positive on the composite-trap warning the runbook is required
+        to carry'

@@ -1,0 +1,3142 @@
+"""Drift guard over the design-invariant family's non-auto-extending sites.
+
+Task 3802. ``docs/legibility/design-invariants.md`` is the single normative
+copy of dark-factory's invariant family (INV-5, ``no-lockstep-duplication``,
+applied to the invariants themselves). Several other committed artifacts
+nonetheless restate parts of that family, and none of them auto-extend when an
+invariant is added. MEASURED, not predicted: the G7 trigger-shape list in
+``skills/prd/references/gates.md`` drifted TWICE (INV-6/INV-7 landed 2026-08-02
+without it; the 2026-08-06 addendum added only INV-8's shape — see task 3811),
+and ``CONTRIBUTING.md`` §6 restated all eight slugs twelve lines above its own
+rule forbidding exactly that.
+
+This module derives the family ONCE from the normative doc's headings and
+cross-checks every other site against it. It never stores its own snapshot slug
+list: a hardcoded constant here would be one more lock-step copy, stale on the
+next invariant exactly like the prose sites were.
+
+THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
+  * ``docs/legibility/design-invariants.md`` — SOURCE OF TRUTH. Its
+    ``## INV-N `slug``` headings define the family.
+  * ``docs/legibility/design-invariants-fixtures.md`` — one fixture section per
+    invariant, plus a rehearsal verdict table pinned for COVERAGE (never for its
+    rationale prose, which the doc itself declares a point-in-time snapshot).
+  * ``skills/prd/references/gates.md`` — TWO independent enumerations: the
+    family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
+  * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
+    invariant, never a restatement of the family.
+  * ``docs/code-quality.md`` — a PARTIAL `INV-N`-to-heuristic mapping, pinned
+    pair-wise against the normative doc, never for completeness.
+
+STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
+artifacts — the cross-artifact correspondence that fails to auto-extend when an
+invariant lands. It deliberately pins no documentation prose and no family
+COUNT: a regex over a sentence saying "eight" fires on a wording edit rather
+than on real drift, and pinning it forces test scaffolding into a doc that /prd
+G7 and /review phase 2 Read verbatim at run time (task 3802 review remediation
+removed exactly that). The sentences that used to carry counts were de-numbered
+instead, so they cannot go stale and need no guard.
+
+The ONE surviving marked span, ``inv-trigger-shapes`` in gates.md, is a pure
+DELIMITER rather than a wording pin: that file carries decoy backticked slugs
+outside both of its enumerations (`no-lockstep-duplication` discussed in prose,
+a `G7 waiver: <slug>` template), so the trigger-shape SET check needs an
+explicit boundary that a content heuristic could not supply. In the doc it is
+BARE — ``<!-- inv-trigger-shapes:begin -->``, no explanatory body — because /prd
+G7 Reads that file verbatim as gate instructions and pytest strategy notes
+interleaved with the screening list are noise to the agent executing it. The
+explanation of WHY that span is pinned as a set rather than an ordered list
+lives on ``test_gates_trigger_shape_list_covers_every_invariant`` below, where a
+reader of this guard will look for it. The marker convention follows
+CONTRIBUTING.md's existing ``lint-command-mirror`` block.
+
+PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
+package — that is what lets ``uv run --project shared pytest scripts/tests/``
+(``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
+synced verify worktree. This module is stdlib-only (``os``, ``re``,
+``subprocess``, ``pathlib``) plus ``pytest``. Both scans shell out to the
+``git`` binary (task 4971) for their tracked-file oracle — see
+``_walk_repo_files``. This module always runs inside a git worktree, so the
+REPOSITORY half of that oracle is guaranteed; the ``git`` EXECUTABLE's
+presence on ``PATH`` is not (a verify subprocess's ``PATH`` is rewritten by
+``orchestrator/src/orchestrator/verify.py::_target_subprocess_env``), which is
+why ``_walk_repo_files`` raises an actionable error rather than assuming it.
+
+EXTRACTOR CONTRACT. Every extractor below raises a loud ``AssertionError``
+naming its ``source`` rather than returning an empty list. An extractor that
+silently yields nothing turns every downstream drift assertion green while
+pinning nothing at all — strictly worse than no guard, because the check still
+reports success. Extractors are unit-tested against HAND-WRITTEN fixture
+markdown, never the live docs, so those tests stay stable under any future doc
+edit; the live assertions re-read every committed artifact fresh.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+from pathlib import Path
+from typing import NamedTuple
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+NORMATIVE_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants.md"
+FIXTURES_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants-fixtures.md"
+GATES_DOC = REPO_ROOT / "skills" / "prd" / "references" / "gates.md"
+CONTRIBUTING_DOC = REPO_ROOT / "CONTRIBUTING.md"
+CODE_QUALITY_DOC = REPO_ROOT / "docs" / "code-quality.md"
+
+# A family this small would mean the normative doc stopped parsing, not that
+# dark-factory shrank its invariant list: eight are landed and none has ever been
+# retired. The floor is a NON-VACUITY guard on every comparison downstream, kept
+# well below the live count so a deliberate retirement does not go red spuriously.
+_MINIMUM_FAMILY_SIZE = 5
+
+# The one structural shape that defines family membership. `##` exactly (a `###`
+# sub-heading is a fixture shape in the fixtures doc, not an invariant), a bare
+# integer, and a backticked lowercase-kebab slug to end of line.
+_HEADING_RE = re.compile(r"^## INV-(\d+) `([a-z0-9][a-z0-9-]*)`$", re.MULTILINE)
+
+
+def parse_invariant_headings(md_text: str, *, source: str) -> list[tuple[int, str]]:
+    """The ordered ``(number, slug)`` family declared by *md_text*'s headings.
+
+    Every failure is a loud ``AssertionError`` naming *source* and the specific
+    defect, never an empty list. That is the whole contract: an extractor that
+    silently yields nothing turns every downstream drift assertion into an
+    empty-vs-empty comparison that PASSES while pinning nothing — strictly worse
+    than no guard, because the suite still reports success. *source* is named
+    because one extractor parses several docs, so "which doc broke" is not
+    recoverable from the traceback.
+
+    Duplicates are checked BEFORE contiguity: a doubled number (1, 2, 2) is a
+    duplicate, not a numbering gap, and the message a reader gets should say so.
+    """
+    pairs = [(int(number), slug) for number, slug in _HEADING_RE.findall(md_text)]
+    assert pairs, (
+        f"{source}: no `## INV-N `slug`` headings found at all (task 3802). This "
+        f"guard derives the whole invariant family from those headings, so an "
+        f"empty parse would silently turn every other site's drift check into a "
+        f"vacuous pass. Either the heading shape changed (it must be `## INV-<n> "
+        f"`<lower-kebab-slug>`` on its own line) or the wrong file was read."
+    )
+
+    numbers = [number for number, _ in pairs]
+    slugs = [slug for _, slug in pairs]
+
+    duplicate_numbers = sorted({n for n in numbers if numbers.count(n) > 1})
+    assert not duplicate_numbers, (
+        f"{source}: duplicate number(s) {duplicate_numbers} among the invariant "
+        f"headings {pairs} (task 3802) — two sections claim the same INV-N alias, "
+        f"so any by-number reference is ambiguous. Renumber one of them."
+    )
+
+    duplicate_slugs = sorted({s for s in slugs if slugs.count(s) > 1})
+    assert not duplicate_slugs, (
+        f"{source}: duplicate slug(s) {duplicate_slugs} among the invariant "
+        f"headings {pairs} (task 3802). Slugs are the STABLE ids referenced by G7 "
+        f"waivers, `/review`'s invariant_findings and the confusion census's "
+        f"invariant_violated field, so two headings sharing one makes every "
+        f"by-slug lookup ambiguous. Give each invariant its own slug."
+    )
+
+    expected = list(range(1, len(numbers) + 1))
+    assert numbers == expected, (
+        f"{source}: invariant numbers {numbers} are not contiguous from 1 "
+        f"(expected {expected}) (task 3802). Numeric aliases are prose "
+        f"convenience over a contiguous 1..N range; a gap or an offset start "
+        f"means an invariant was removed or the doc was truncated mid-read, and "
+        f"either way the family this guard compares every other site against is "
+        f"not the one the doc means."
+    )
+    return pairs
+
+
+def _repo_relative(path: Path) -> str:
+    """A repo-relative label for assertion messages, so a red run names the file."""
+    return str(path.relative_to(REPO_ROOT))
+
+
+def canonical_family() -> list[tuple[int, str]]:
+    """The ordered family, parsed fresh from the normative doc on EVERY call.
+
+    Deliberately not a module constant or a cached snapshot: a stored slug list
+    in this file would be one more lock-step copy — the very INV-5 violation this
+    guard enforces — and would go stale on the next invariant exactly like the
+    prose sites did. Parsing at call time is what makes the source of truth
+    auto-extend: adding INV-9 to the doc immediately turns every unpinned site
+    red until it is updated.
+    """
+    return parse_invariant_headings(
+        NORMATIVE_DOC.read_text(encoding="utf-8"), source=_repo_relative(NORMATIVE_DOC)
+    )
+
+
+def canonical_slugs() -> list[str]:
+    """The family's slugs in canonical (INV-1..INV-N) order."""
+    return [slug for _, slug in canonical_family()]
+
+
+def marked_span(md_text: str, name: str, *, source: str) -> str:
+    """The text strictly between ``<!-- name:begin … -->`` and ``<!-- name:end -->``.
+
+    The begin marker's own explanatory comment is EXCLUDED from the returned
+    span: it names this test module's path and a task number, either of which a
+    claim regex downstream could match, so a span that swallowed it would pin the
+    comment instead of the prose.
+
+    Loud on a missing, duplicated or inverted marker, never a ``''`` return. An
+    empty span satisfies every claim check by containing no claims; a duplicated
+    marker is the same failure one level down, since silently taking the first
+    span leaves the second copy unpinned and free to drift.
+    """
+    begin_marker = f"<!-- {name}:begin"
+    end_marker = f"<!-- {name}:end -->"
+
+    begin_count = md_text.count(begin_marker)
+    assert begin_count == 1, (
+        f"{source}: expected exactly one `{begin_marker}` marker, found "
+        f"{begin_count} (task 3802). This marker delimits a span whose contents "
+        f"are pinned against the live invariant family. If it was deleted, "
+        f"restore it around the claim it named; if it was duplicated, one of the "
+        f"two spans is unpinned and free to drift."
+    )
+    end_count = md_text.count(end_marker)
+    assert end_count == 1, (
+        f"{source}: expected exactly one `{end_marker}` marker closing "
+        f"`{begin_marker}`, found {end_count} (task 3802) — restore the closing "
+        f"marker directly below the pinned claim."
+    )
+
+    begin_index = md_text.index(begin_marker)
+    end_index = md_text.index(end_marker)
+    assert begin_index < end_index, (
+        f"{source}: the `{name}:end` marker precedes its `{name}:begin` marker "
+        f"(task 3802) — the span is inverted, so it delimits everything except "
+        f"the claim it was meant to pin. Swap them."
+    )
+
+    comment_close = md_text.index("-->", begin_index)
+    assert comment_close < end_index, (
+        f"{source}: the `{begin_marker}` comment is never closed with `-->` "
+        f"before the `{name}:end` marker (task 3802)."
+    )
+    return md_text[comment_close + len("-->") : end_index]
+
+
+# A backticked token whose ENTIRE content is the canonical slug shape. Requiring
+# the closing backtick immediately after the run is what excludes every
+# backticked non-slug the docs carry beside real slugs: `INV-5` (uppercase),
+# `metadata.g7_waivers` (dot), `docs/legibility/...` (slash), `_run()`
+# (underscore), `G7 waiver: <slug>` (space).
+_SLUG_TOKEN_RE = re.compile(r"`([a-z0-9][a-z0-9-]*)`")
+
+# The family-inventory row's own anchor. A row PREFIX rather than a marked span:
+# it is already a stable, self-describing anchor, and the test asserts there is
+# exactly one such line — which a content heuristic could not.
+_FAMILY_ROW_PREFIX = "| dark-factory |"
+
+
+def slugs_in_span(span_text: str) -> list[str]:
+    """Backticked canonical-slug-shaped tokens, in document order, duplicates kept.
+
+    Duplicates are deliberately NOT collapsed here. The live trigger-shape
+    paragraph names one invariant twice because two distinct trigger shapes map
+    to it, while the family-inventory row must not repeat a slug at all — so
+    multiplicity is the CALLER's decision, and an extractor that de-duplicated
+    would quietly take it away from both.
+
+    Takes a span, not a whole document, precisely because slug-shaped tokens
+    appear in ordinary prose too (gates.md discusses `no-lockstep-duplication` by
+    name outside both enumerations). Delimiting the span is the caller's job.
+    """
+    return _SLUG_TOKEN_RE.findall(span_text)
+
+
+def dark_factory_family_row(md_text: str) -> str:
+    """The single ``| dark-factory |`` row of gates.md's family-inventory table.
+
+    Loud when the row is absent or duplicated, never a ``''`` return. The row is
+    matched by its LINE PREFIX rather than by content: the adjacent ``| reify |``
+    row lists INV-SF slugs of exactly the same lexical shape, so any "table row
+    containing backticked slugs" heuristic would merge two projects' families
+    into a set that equals neither — and would then blame the wrong rows in its
+    diff.
+    """
+    rows = [line for line in md_text.splitlines() if line.startswith(_FAMILY_ROW_PREFIX)]
+    assert len(rows) == 1, (
+        f"skills/prd/references/gates.md: expected exactly one line starting "
+        f"`{_FAMILY_ROW_PREFIX}` in the G7 family-inventory table, found "
+        f"{len(rows)} (task 3802). Absent means this guard would pin nothing; "
+        f"duplicated means one of the two rows is unpinned and free to drift. "
+        f"Matched rows: {rows!r}"
+    )
+    return rows[0]
+
+
+# A rehearsal verdict row, anchored on its Fixture ID cell. Matched by ROW SHAPE
+# over the whole document rather than per-table: the live row set is split over a
+# base table plus two dated addendum tables, so "parse the table" would silently
+# cover a third of it.
+_VERDICT_ROW_RE = re.compile(r"^\| `INV-(\d+)-(PRD|CODE)` \|")
+
+_BACKTICKED_SLUG_RE = re.compile(r"^`([a-z0-9][a-z0-9-]*)`$")
+
+# The column this guard reads out of every verdict table, matched case-insensitively
+# on the header cell rather than by position.
+_EXPECTED_SLUG_HEADING = "expected slug"
+
+
+def _table_cells(line: str) -> list[str]:
+    """A pipe-table row's cells, index 1 being the first real column.
+
+    ``"| a | b |".split("|")`` yields a leading and a trailing empty string, so
+    the 1-based indexing is the split's, not a convention invented here — which
+    is why a header index resolved from one row is directly usable on another.
+    """
+    return [cell.strip() for cell in line.split("|")]
+
+
+def verdict_table_rows(md_text: str, *, source: str) -> list[tuple[int, str, str]]:
+    """Every rehearsal verdict row as ``(number, shape, expected_slug)``.
+
+    The Expected-slug column index is resolved from each table's own HEADER row
+    rather than hardcoded. The live doc splits its rows across three tables (a
+    base table plus two dated addenda), each with its own header; hardcoding a
+    position means that a future addendum which inserts, drops or reorders a
+    column is read at whichever cell happens to land at that index — failing with
+    "an unreadable Expected-slug cell", which blames the row, or worse comparing
+    the wrong column against the canonical family and reading green.
+
+    A row that precedes any header, is too short for its table's resolved index,
+    or whose cell is empty or not a backticked slug, RAISES rather than yielding
+    ``None``: a ``None`` would flow into the slug-equality check and surface as
+    "expected `contracts-machine-checked`, got None" — a red with a misleading
+    diagnosis pointing at the family rather than at the malformed row.
+    """
+    rows: list[tuple[int, str, str]] = []
+    slug_column: int | None = None
+    for line in md_text.splitlines():
+        heading_cells = _table_cells(line)
+        if any(cell.lower() == _EXPECTED_SLUG_HEADING for cell in heading_cells):
+            slug_column = next(
+                index
+                for index, cell in enumerate(heading_cells)
+                if cell.lower() == _EXPECTED_SLUG_HEADING
+            )
+
+        match = _VERDICT_ROW_RE.match(line)
+        if match is None:
+            continue
+        row_id = f"`INV-{match.group(1)}-{match.group(2)}`"
+        assert slug_column is not None, (
+            f"{source}: verdict row {row_id} appears before any table header "
+            f"naming an `Expected slug` column (task 3802). This guard resolves "
+            f"that column from the header of the table the row sits in, so a "
+            f"headerless table would have to be read positionally — which "
+            f"silently compares the wrong column when a table's layout differs."
+        )
+        cells = _table_cells(line)
+        assert len(cells) > slug_column, (
+            f"{source}: verdict row {line!r} has {len(cells)} pipe-separated "
+            f"cells, too few to carry the Expected-slug column its table's "
+            f"header puts at index {slug_column} (task 3802)."
+        )
+        slug_match = _BACKTICKED_SLUG_RE.match(cells[slug_column])
+        assert slug_match is not None, (
+            f"{source}: the Expected-slug cell of verdict row {row_id} is "
+            f"{cells[slug_column]!r}, not a backticked slug (task 3802). That "
+            f"column is the one this guard compares against the normative "
+            f"family, so an unreadable cell must fail loudly rather than compare "
+            f"as None."
+        )
+        rows.append((int(match.group(1)), match.group(2), slug_match.group(1)))
+
+    assert rows, (
+        f"{source}: no `| `INV-N-PRD|CODE` |` verdict rows found at all (task "
+        f"3802) — the coverage check would pass vacuously. Either the row shape "
+        f"changed or the wrong file was read."
+    )
+    return rows
+
+
+def assert_verdict_table_covers(
+    md_text: str, family: list[tuple[int, str]], *, source: str
+) -> None:
+    """Every invariant is rehearsed in both shapes, with the right expected slug.
+
+    COVERAGE only — never the Verdict/rationale column, which the doc's own
+    "Snapshot caveat" declares a point-in-time transcription rather than a live
+    pin on the G7 / Step-5.5 text.
+
+    Unknown numbers are checked FIRST so a renumbering reports "INV-9 names no
+    current invariant" rather than the per-invariant shape failure it also causes.
+    """
+    rows = verdict_table_rows(md_text, source=source)
+    canonical = dict(family)
+
+    unknown = sorted({number for number, _, _ in rows if number not in canonical})
+    assert not unknown, (
+        f"{source}: verdict row(s) for INV-{unknown} name no current invariant "
+        f"(task 3802); the family is INV-1..INV-{len(family)}. Delete the orphan "
+        f"rows, or renumber them if the fixture survived a family renumbering."
+    )
+
+    for number, slug in family:
+        shapes = sorted(shape for row_number, shape, _ in rows if row_number == number)
+        assert shapes == ["CODE", "PRD"], (
+            f"{source}: INV-{number} `{slug}` has verdict rows {shapes}, expected "
+            f"exactly one PRD row and one CODE row (task 3802). The rehearsal "
+            f"table does not auto-extend: a new invariant lands with nothing "
+            f"calibrating the G7 walk (PRD shape) or the /review Step-5.5 audit "
+            f"(CODE shape) against it."
+        )
+
+    mismatched = [
+        (number, shape, cell, canonical[number])
+        for number, shape, cell in rows
+        if cell != canonical[number]
+    ]
+    assert not mismatched, (
+        f"{source}: verdict row(s) whose Expected-slug cell disagrees with "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802) — (number, shape, cell, "
+        f"canonical): {mismatched}. The slug is what the gate must emit, so a "
+        f"stale cell rehearses the wrong acceptance."
+    )
+
+
+# Every site this module pins, and WHAT is pinned there. Registration means "this
+# file's relationship to the family is mechanized", not "this file enumerates" —
+# CONTRIBUTING.md is registered precisely because it must enumerate NOTHING.
+# `test_every_enumeration_site_is_pinned` checks this registry against a scan, so
+# it cannot quietly fall behind the repo the way the prose sites did.
+PINNED_SITES = {
+    "docs/legibility/design-invariants.md": (
+        "SOURCE OF TRUTH — its `## INV-N `slug`` headings define the family"
+    ),
+    "docs/legibility/design-invariants-fixtures.md": (
+        "one fixture section per invariant, plus the rehearsal verdict table "
+        "pinned for COVERAGE (never for its snapshot rationale prose)"
+    ),
+    "skills/prd/references/gates.md": (
+        "two independent enumerations — the family-inventory row (ordered) and "
+        "the `inv-trigger-shapes` G7 fallback span (set)"
+    ),
+    "CONTRIBUTING.md": (
+        "pinned as an ABSENCE: at most one by-name citation, never a restatement"
+    ),
+    "docs/code-quality.md": (
+        "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
+        "normative doc — never for completeness"
+    ),
+}
+
+# Four distinct slugs is an enumeration, not a discussion. Below it sit the docs
+# that legitimately reference an invariant or two by name (skills/prd's
+# decompose-mode.md and skills/review's phase2-architecture.md each name exactly
+# one), which must stay unregistered — a threshold that flagged them would train
+# readers to register files to silence the guard.
+_ENUMERATION_THRESHOLD = 4
+
+# EVERY markdown file in the repo, not a hand-listed set of roots. An earlier
+# revision scanned only `*.md`, `docs/legibility/**` and `skills/**` — which left
+# the rest of docs/ and every package tree invisible, so a new enumeration site
+# written into `docs/` or a package README would drift on the next invariant with
+# nothing going red. That is the exact failure this module exists to prevent, so
+# the scan is now repo-wide and the EXCLUSIONS below carry the whole policy.
+_EXCLUDED_TREES = (
+    # Point-in-time record trees. Their PRDs and capability manifests transcribe
+    # slugs as G7 walk records of the family AS IT WAS, and must not be
+    # retro-edited when it changes (a scan measured fourteen such files at 5-7
+    # slugs each). Pinning them would force rewriting history.
+    "plans",
+    "docs/prds",
+)
+
+_EXCLUDED_TREE_PARTS = tuple(tuple(tree.split("/")) for tree in _EXCLUDED_TREES)
+
+# Not repo content: build output and vendored trees. Dot-directories are
+# pruned by name rather than listed, matching `.git`, `.venv`, `.task` and
+# `.pytest_cache` alike. Most of these never reach `git ls-files` at all,
+# since they are gitignored — task 4971 re-sourced the walk from the
+# tracked-file list, which is what keeps `.worktrees/` (a full repo copy per
+# in-flight task; an unpruned filesystem glob over it did not finish in 120s)
+# out cheaply, measured at 0.025s. But `.claude/` IS tracked, so the
+# dot-prefix rule still has to run explicitly on top of the tracked list
+# rather than being retired now that the walk no longer touches the disk tree.
+_PRUNED_DIR_NAMES = frozenset({"node_modules", "__pycache__", "site-packages", "venv"})
+
+
+def _scan_label(path: Path) -> str:
+    """A registry-comparable label: repo-relative in the repo, absolute outside it.
+
+    The fallback is for this module's own unit tests, which scan hand-written
+    fixture files under ``tmp_path``. Those deliberately do not live in the repo —
+    a fixture that enumerated the family from inside the scan roots would turn the
+    live assertion red on this guard's own test data.
+    """
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+# This module's own path. The citation scan below excludes it: the fixtures in
+# this file embed deliberate decoy `INV-n <slug>` pairings and a phantom
+# citation, so a scan that read its own test data would go red on it forever.
+# The enumeration scan does NOT exclude it — that one is a threshold scan over
+# markdown, and this is a `.py` file it can never reach.
+_THIS_MODULE = Path(__file__).resolve()
+
+
+def _scrubbed_git_env() -> dict[str, str]:
+    """``os.environ`` with every ``GIT_*`` override removed.
+
+    ``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE`` and
+    ``GIT_CEILING_DIRECTORIES`` are all inherited from ``os.environ`` by
+    default, and any one of them can silently retarget a git invocation at a
+    different repository or index than its ``cwd`` implies — undermining the
+    exact ambient-state independence task 4971 exists to give this module's
+    scans.
+    """
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run ``git`` *args* against *cwd*, with `_scrubbed_git_env()`.
+
+    Shared by `_walk_repo_files` and the test fixtures' `_write_scan_tree` so
+    the two call sites cannot drift on the env-scrubbing.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd, capture_output=True, text=True, check=True, timeout=60,
+        env=_scrubbed_git_env(),
+    )
+
+
+def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
+    """Every TRACKED file under *root* ending in one of *suffixes*, filtered.
+
+    ONE walker behind both scans. Two walks that had to agree on a prune policy
+    byte-for-byte would be the lock-step duplication INV-5 forbids — in the very
+    module that enforces that family — and the copy would drift the first time an
+    exclusion was added to one of them.
+
+    Sourced from ``git ls-files``, never a filesystem walk (task 4971): an
+    untracked file — gitignored watcher output, a stray scratch file — must not
+    be able to flip either scan's verdict on nothing but local working-tree
+    state. MEASURED incident: the citation scan went red in project_root over
+    five backticked tokens in an untracked ``data/escalations/*`` digest, and
+    stayed green in an otherwise-identical worktree with no ``data/`` at all —
+    the verdict was a property of watcher timing, not of repo content.
+
+    Every exclusion below is still applied, component-wise, ON TOP of the
+    tracked list: trackedness is not a substitute for the policy, since some
+    excluded trees (``docs/prds/``, ``.claude/``) are themselves TRACKED and
+    gitignore says nothing about them (measured: the bare tracked list would
+    add 339 such files back).
+
+    COST, not just benefit: a file that has been written but not yet
+    ``git add``ed is invisible to both scans, same as an untracked one — an
+    author who writes a new doc restating four canonical slugs and runs this
+    module locally before staging it gets a GREEN verdict on content the old
+    filesystem walk would have flagged. Acceptable rather than a defect: every
+    dispatched agent commits before verify runs, and pre-commit sees staged
+    content — but stage a new file before trusting a green run of this module.
+    """
+    pathspecs = [f"*{suffix}" for suffix in suffixes]
+    try:
+        listing = _run_git(["ls-files", "-z", "--", *pathspecs], cwd=root).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # No filesystem-walk fallback here, ever (task 4971): this walker's
+        # entire purpose is that a scan's verdict comes from TRACKED files
+        # only, never from local working-tree state — falling back to
+        # `os.walk` on a failed oracle would silently restore the exact
+        # incident this task fixed, in precisely the situation nobody is
+        # watching for it (`no-silent-fail-soft`). A bare exception is not
+        # enough either: none of `CalledProcessError` (git exited non-zero,
+        # e.g. *root* is not a repo), `TimeoutExpired` (the 60s budget above)
+        # or `OSError` (no `git` on PATH, or *root* does not exist) names the
+        # root or the contract on its own (`structured-facts-at-failure`).
+        returncode = getattr(exc, "returncode", None)
+        stderr = getattr(exc, "stderr", None)
+        detail = stderr.strip() if stderr else str(exc)
+        outcome = f"exited {returncode}" if returncode is not None else "could not be run"
+        raise RuntimeError(
+            f"the tracked-file scan of {root} failed (task 4971): `git ls-files -z "
+            f"-- {' '.join(pathspecs)}` {outcome} — {detail}. This walker "
+            f"sources every scan from TRACKED files only, by design, so {root} must "
+            f"be a git repository (or a subdirectory of one), with `git` on PATH, "
+            f"for the scan to run at all — there is no filesystem-walk fallback."
+        ) from exc
+
+    found: list[Path] = []
+    for relative in listing.split("\0"):
+        if not relative or not relative.endswith(suffixes):
+            continue
+        parent_parts = Path(relative).parts[:-1]
+        if any(part.startswith(".") or part in _PRUNED_DIR_NAMES for part in parent_parts):
+            continue
+        path = root / relative
+        if _in_excluded_tree(path, root):
+            continue
+        # `git ls-files` reads the INDEX, not the worktree: a path can be
+        # listed while missing on disk (routine mid-rebase or mid-merge).
+        # Dropping it here is safe — a file absent from the worktree has no
+        # content to scan — rather than letting a downstream `read_text` raise
+        # `FileNotFoundError` for a reason unrelated to citation drift (task
+        # 4971). The aggregate anti-vacuity guards still cover the case where
+        # the skew is large enough to matter.
+        if not path.is_file():
+            continue
+        found.append(path)
+    # `git ls-files` lists an UNMERGED path once per merge stage — a
+    # conflicted worktree can yield the same path 2-3x (verified: 3x after a
+    # conflicting `git merge`). Both callers treat this walker's result as
+    # set-like (no duplicates), so dedupe here rather than let a conflicted
+    # tree triplicate every drift entry downstream.
+    return sorted(set(found))
+
+
+def _enumeration_scan_files() -> list[Path]:
+    """Every markdown file in the repo that the registry is responsible for."""
+    return _walk_repo_files(REPO_ROOT, (".md",))
+
+
+def _citation_scan_files(root: Path = REPO_ROOT) -> list[Path]:
+    """Every ``.py`` and ``.md`` file the two drift assertions read, minus this one.
+
+    Loud on an empty result rather than returning ``[]``: "no drift found" and
+    "nothing was read" are indistinguishable downstream, and only one of them is
+    good news. *root* is a seam for this module's own fixture trees, which must
+    live outside the repo for exactly that reason.
+
+    ``.py`` and ``.md`` ONLY. Restricting the extension set is what keeps
+    ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` structurally out of
+    reach: it carries the phantom slug, but it is a CAPTURED replay corpus
+    regenerated only by ``shared/tests/toolcall_markup_corpus_extract.py``, so a
+    report against it would invite a hand-edit that corrupts the fixture.
+    Vendored upstream content (the ``graphiti``/``mem0`` submodules) is out of
+    reach for a different reason, by construction rather than by this filter:
+    ``git ls-files`` reports a submodule as an extensionless gitlink entry and
+    never descends into its tree, so the ``-- '*.py' '*.md'`` pathspecs passed
+    to ``_walk_repo_files`` cannot match it in the first place.
+    """
+    found = [path for path in _walk_repo_files(root, (".py", ".md")) if path != _THIS_MODULE]
+    assert found, (
+        f"the citation scan found no files under {root} to check (task 3803) — "
+        f"an empty scan reports no drift, which is indistinguishable from a "
+        f"clean repo. Check the walk's prune list."
+    )
+    return found
+
+
+def _in_excluded_tree(path: Path, root: Path = REPO_ROOT) -> bool:
+    """Is *path* inside one of the point-in-time record trees under *root*?
+
+    Compares whole path COMPONENTS, never a string prefix: ``plans-archive/x.md``
+    is not inside ``plans/``, and a substring test would silently stop scanning a
+    tree nobody meant to exclude.
+
+    *root* defaults to the repo but is taken from the caller so the policy
+    travels with the walk: the scans' own fixture trees are built under
+    ``tmp_path``, and an exclusion that only ever resolved against ``REPO_ROOT``
+    could not be exercised there — it would be asserted by reading the code.
+    """
+    parts = path.relative_to(root).parts
+    return any(parts[: len(tree)] == tree for tree in _EXCLUDED_TREE_PARTS)
+
+
+def unregistered_enumeration_sites(
+    files: list[Path],
+    registry: dict[str, str],
+    family: list[tuple[int, str]],
+    *,
+    threshold: int,
+) -> list[str]:
+    """Files restating `threshold`+ DISTINCT slugs of `family` that `registry` omits.
+
+    Loud on an empty scan or an empty family rather than returning ``[]``: an
+    empty result is this guard's strongest possible verdict ("every enumeration
+    site is pinned"), and an over-broad prune or an unparsed family would report
+    it while having compared nothing at all.
+    """
+    assert files, (
+        "the enumeration scan received no files to check (task 3802) — an empty "
+        "scan returns an empty result, which is indistinguishable from `every "
+        "enumeration site is pinned`. Check the walk's prune list."
+    )
+    assert family, (
+        "the enumeration scan received an empty invariant family (task 3802) — "
+        "with no slugs to look for, no file can ever clear the threshold and the "
+        "scan passes vacuously."
+    )
+
+    slugs = [slug for _, slug in family]
+    unregistered = []
+    for path in sorted(files):
+        label = _scan_label(path)
+        if label in registry:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if len({slug for slug in slugs if slug in text}) >= threshold:
+            unregistered.append(label)
+    return unregistered
+
+
+# An `INV-<n>` alias immediately followed by a lowercase-kebab token — the ONE
+# structural shape a citation of an invariant BY NUMBER takes in this repo.
+#
+# `{0,2}` on each side, not `?`: this repo's Python docstrings use reST
+# ``double-backtick`` markup while its markdown uses single backticks, and a
+# one-backtick regex is BLIND to
+# `dashboard/src/dashboard/data/escalations.py:255` — "instead (INV-2,
+# ``no-silent-fail-soft``)" — a measured drift site.
+#
+# The separator class requires at least one character so `INV-3rd` cannot pair
+# with a following token, and admits the possessive because this repo writes
+# "INV-4's storm-escape" (orchestrator/src/orchestrator/deterministic_runner.py
+# :293 and :1567) as often as it writes "INV-4 storm-escape". `:` is in the
+# class so a `#: ` comment continuation marker survives the line join below.
+_ALIAS_PAIR_RE = re.compile(
+    r"INV-(\d+)(?:['’]s)?[\s,;:(\[]+\s*`{0,2}([a-z][a-z0-9]*(?:-[a-z0-9]+)+)`{0,2}"
+)
+
+# Leading comment/quote/indent markers stripped from a CONTINUATION line before
+# it is joined to its predecessor: `#`, `*`, `>` and whitespace. Deliberately
+# not `-`: a markdown list item beginning with a kebab token would otherwise
+# pair with a bare `INV-n` ending the line above it, inventing a citation.
+_CONTINUATION_MARKER_RE = re.compile(r"^[\s#*>]*")
+
+
+class AliasPair(NamedTuple):
+    """One `INV-<n>` / kebab-token pairing, tagged with how it was written.
+
+    ``backticks`` and ``wrapped`` are not decoration: the live assertion asserts
+    the scan still OBSERVES both shapes, which is the only way to prove the
+    extractor was not quietly narrowed back to single-backtick, single-line
+    matching. Re-deriving those shapes from the file text with a second regex
+    would keep passing after exactly that regression.
+    """
+
+    line: int
+    number: int
+    token: str
+    backticks: int
+    wrapped: bool
+
+
+def invariant_alias_pairs(text: str, *, source: str) -> list[AliasPair]:
+    """Every `INV-<n>` / kebab-token pairing in *text*, in order, duplicates kept.
+
+    Loud when *text* carries no pairing at all, never an empty list, per this
+    module's extractor contract: the callers are a repair list and a live drift
+    assertion, and both read "nothing found" as "nothing wrong".
+
+    Duplicates are preserved for the same reason ``slugs_in_span`` preserves
+    them — the caller is a list of sites to repair, and collapsing two
+    occurrences of one wrong pairing would under-report the work.
+
+    TWO-LINE WINDOW. Each line is joined to its successor (with the successor's
+    leading comment/quote/indent markers stripped) before matching, and any
+    match starting past the first line is DISCARDED so every pairing is
+    attributed exactly once, to the line it starts on. MEASURED on base
+    eba215060c: 21 pairings span a line break repo-wide and one of them is
+    genuine drift — ``fused-memory/scripts/census_memory_metadata.py:163``,
+    where ``INV-2`` ends :163 and ``no-silent-fail-soft`` opens :164. A
+    line-scoped extractor misses it while reporting a smaller, cleaner result.
+
+    A hyphen-wrapped slug (``contracts-machine-`` / ``checked``) yields its
+    leading segments as the token, which the prefix carve-out in
+    ``near_miss_alias_pairs`` then clears under its own number.
+    """
+    pairs = _alias_pairs_in(text)
+    assert pairs, (
+        f"{source}: no `INV-<n> <kebab-token>` pairing found at all (task 3803). "
+        f"An empty parse would turn the alias drift check into an empty-vs-empty "
+        f"comparison that PASSES while examining nothing. Either the citation "
+        f"shape changed or the wrong text was read."
+    )
+    return pairs
+
+
+def _alias_pairs_in(text: str) -> list[AliasPair]:
+    """The matching half of ``invariant_alias_pairs``, without its loud contract.
+
+    Split out for the repo-wide scan, which reads ~1700 files of which most cite
+    no invariant by number at all — a per-file loud contract there would fail on
+    ordinary source. The scan carries the anti-vacuity burden instead, and does
+    it more strongly: it asserts the live result still contains a correct
+    pairing, a shorthand one, a double-backticked one and a wrapped one before
+    it trusts an empty drift list.
+    """
+    lines = text.split("\n")
+    pairs: list[AliasPair] = []
+    for index, line in enumerate(lines):
+        successor = lines[index + 1] if index + 1 < len(lines) else ""
+        window = line + " " + _CONTINUATION_MARKER_RE.sub("", successor)
+        for match in _ALIAS_PAIR_RE.finditer(window):
+            if match.start() >= len(line):
+                continue  # starts on the successor line; that line reports it
+            matched = match.group(0)
+            pairs.append(
+                AliasPair(
+                    line=index + 1,
+                    number=int(match.group(1)),
+                    token=match.group(2),
+                    backticks=2 if "``" in matched else (1 if "`" in matched else 0),
+                    wrapped=match.end() > len(line),
+                )
+            )
+    return pairs
+
+
+def _segments(token: str) -> tuple[str, ...]:
+    """A kebab token as its hyphen SEGMENTS, never as a raw string.
+
+    Every comparison below is segment-wise on purpose. A ``startswith`` test on
+    the raw string is subtly wrong in both directions: it would call
+    ``storm-escape-r`` a prefix of ``storm-escape-required`` (it is a typo, not
+    shorthand), and would call ``no-silent-fail-softly`` a match for
+    ``no-silent-fail-soft``.
+    """
+    return tuple(token.split("-"))
+
+
+def _is_proper_prefix(token: str, slug: str) -> bool:
+    """Is *token* a strictly shorter segment-wise prefix of *slug*?"""
+    short, full = _segments(token), _segments(slug)
+    return len(short) < len(full) and full[: len(short)] == short
+
+
+def _is_confusable(token: str, slug: str) -> bool:
+    """Would a reader take *token* for *slug*?
+
+    Exact match, or a shared first TWO hyphen-segments. Two segments rather than
+    a similarity score or an allowlist: a score needs a threshold nobody can
+    defend on 168 live pairings, and an allowlist trains readers to register a
+    file to silence the guard — the failure mode this module already warns about
+    at ``_ENUMERATION_THRESHOLD``. MEASURED on base eba215060c: the two-segment
+    rule flags all eight real drift sites with ZERO false positives.
+    """
+    return token == slug or _segments(token)[:2] == _segments(slug)[:2]
+
+
+def near_miss_alias_pairs(
+    pairs: list[AliasPair], family: list[tuple[int, str]]
+) -> list[AliasPair]:
+    """The pairings of *pairs* that CONTRADICT *family*, in the order given.
+
+    Loud on an empty *family* rather than returning ``[]``: with no canonical
+    slugs to be confusable with, nothing can ever be flagged and the live
+    assertion would report "no drift" having compared nothing.
+
+    THE THREE-LIMB RULE, each limb forced by measured live data:
+
+    1. Under its OWN number, a token equal to the canonical slug is clean — and
+       so is a segment-wise PROPER PREFIX of it. The prefix carve-out is
+       load-bearing: without it the guard fires on twelve correct citations
+       against eight true hits (measured on base eba215060c) —
+       ``INV-4 storm-escape`` at
+       ``orchestrator/src/orchestrator/merge_queue.py::_run_post_merge_verify``,
+       ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_ready_to_merge_report``,
+       ``orchestrator/src/orchestrator/deterministic_runner.py``'s module
+       docstring and
+       ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._file_curator_adjudication_missing_and_block``,
+       ``orchestrator/tests/test_merge_queue.py::TestRunPostMergeVerify.test_deterministic_red_attempt0_never_narrowed_retried``,
+       ``orchestrator/tests/test_workflow_ready_to_merge.py::TestReadyToMergeIdempotency``,
+       ``fused-memory/tests/test_memory_service.py::TestUpdateMemoryStormCounter``,
+       ``fused-memory/tests/test_referent_queue_threading.py::TestReferentSourceCounter``,
+       ``shared/tests/test_prompt_artifact.py::TestUnreadableProvenanceWarns``;
+       ``INV-2 structured-facts`` at
+       ``fused-memory/src/fused_memory/server/consolidation.py::validate_consolidate_args``
+       and
+       ``fused-memory/tests/test_task_interceptor.py::TestProseAdvisoryDeliverableAttribution.test_suppression_is_logged_with_structured_facts``;
+       and ``INV-1 contracts-machine`` in the module docstring of
+       ``dashboard/src/dashboard/data/task_runtime.py`` (NOT the same-basename
+       ``orchestrator/src/orchestrator/task_runtime.py``), where the full slug is
+       hyphen-wrapped across a comment line break. Shorthand and line wraps are
+       how this repo actually cites invariants in prose, and a guard wrong more
+       often than right gets silenced.
+
+    2. Otherwise the pairing is DRIFT iff its token is confusable with some
+       canonical slug. Prefix-ness does NOT exculpate under a different number:
+       ``INV-2 no-silent-fail`` is a truncation of INV-9's slug filed under
+       INV-2, which is precisely the drift being hunted.
+
+    3. A token confusable with nothing canonical is always clean, whatever its
+       number. This repo carries module-local INV-n schemes — task 2885's
+       PRD-local ``INV-3 dangling-successor-edge``, test_lock_table.py's
+       ``INV-1: strictly-higher-priority`` — that are not this family at all.
+
+    FILE-LEVEL ANCHORING ON A ``design-invariants.md`` MENTION WAS EVALUATED AND
+    REJECTED: it fails in both directions on live data. merge_queue.py mentions
+    the doc once across ~15k lines and would false-positive its PRD-local INV-3,
+    while scripts/migrate_transcript_archive_gunzip.py mentioned it zero times
+    and its genuine ``INV-3 corroborate-before-destroy`` drift — repaired by
+    this task, and caught only because the rule looks at the token rather than
+    at the file — would have been missed entirely.
+    """
+    assert family, (
+        "the alias check received an empty invariant family (task 3803) — with "
+        "no canonical slugs to be confusable with, no pairing can ever be "
+        "flagged and the check passes vacuously."
+    )
+
+    canonical = dict(family)
+    slugs = [slug for _, slug in family]
+
+    # Unpacked positionally rather than read by attribute: the rule is about a
+    # `(number, token)` pairing, not about the record type, so it stays
+    # exercisable with plain tuples in the fixture tests below.
+    near_misses: list[AliasPair] = []
+    for pair in pairs:
+        _, number, token, _, _ = pair
+        own = canonical.get(number)
+        if own is not None and (token == own or _is_proper_prefix(token, own)):
+            continue
+        if any(_is_confusable(token, slug) for slug in slugs):
+            near_misses.append(pair)
+    return near_misses
+
+
+def alias_pairs_not_in_family(
+    pairs: list[AliasPair], family: list[tuple[int, str]]
+) -> list[AliasPair]:
+    """The pairings of *pairs* whose `(number, token)` is not an EXACT member of *family*.
+
+    STRICT, where `near_miss_alias_pairs` above is deliberately LENIENT.
+    MEASURED against ``docs/code-quality.md``'s five live pairings rather than
+    reasoned about: `near_miss_alias_pairs` flags a RENUMBERING but returns
+    `[]` for a slug RENAME (``one-fact-one-home`` -> ``single-home-per-fact``)
+    and for a RETIREMENT (INV-11 removed), because its limb 3 deliberately
+    clears a token confusable with nothing canonical — and a renamed or
+    retired slug is exactly that: it no longer resembles anything in the
+    family, including its own former self. This predicate adds those two
+    modes; the renumbering case it also catches is coverage it shares with
+    `near_miss_alias_pairs`, not a duplicate of it — the rule here is a
+    different, stricter one that happens to catch it too.
+
+    MUST STAY PER-SITE, NEVER REPO-WIDE. The near-miss section comment above
+    already measured why a universal exact-match check is wrong: this repo
+    carries module-local `INV-n` numbering schemes unrelated to this family
+    (task 2885's PRD-local ``INV-3 dangling-successor-edge``,
+    test_lock_table.py's ``INV-1: strictly-higher-priority``), and "a guard
+    that is wrong half the time gets silenced". A registered `PINNED_SITES`
+    entry is the one context where that objection does not apply —
+    registration is the explicit claim that the file's relationship to the
+    family is mechanized — which is why this predicate is called only from a
+    per-site live assertion, never from the repo-wide scans.
+
+    A proper PREFIX shorthand under its own number — which
+    `near_miss_alias_pairs` clears as legitimate shorthand in ordinary prose —
+    IS reported here. That asymmetry is deliberate: shorthand is acceptable
+    when discussing an invariant, but not inside a mapping pinned for
+    correctness, where the pairing itself is the content being pinned.
+
+    Loud on an empty *family*, like `near_miss_alias_pairs`: with no canonical
+    pairings to check membership against, every pairing would trivially be a
+    non-member and the verdict would be meaningless.
+    """
+    assert family, (
+        "alias_pairs_not_in_family received an empty invariant family (task "
+        "5230) — with no canonical pairings to check membership against, "
+        "every pairing would trivially be a non-member and the verdict would "
+        "be meaningless."
+    )
+
+    canonical_pairs = set(family)
+
+    # Unpacked positionally rather than read by attribute, like
+    # `near_miss_alias_pairs` above: the rule is about a `(number, token)`
+    # pairing, not about the record type, so it stays exercisable with plain
+    # tuples in the fixture tests below.
+    non_members: list[AliasPair] = []
+    for pair in pairs:
+        _, number, token, _, _ = pair
+        if (number, token) not in canonical_pairs:
+            non_members.append(pair)
+    return non_members
+
+
+# The normative doc's FILENAME, not its full path: prose cites it as
+# `docs/legibility/design-invariants.md`, as `design-invariants.md`, and inside
+# longer sentences, and all three are the same pointer.
+_ANCHOR_FILENAME = "design-invariants.md"
+
+# Scrubbed from a window line before it is scanned, longest first. Both are
+# three-or-more-segment kebab tokens with a suffix, so an extractor that
+# tokenized them would report the very pointer that made it look — a guard
+# permanently red on correct documentation.
+_ANCHOR_PATH_TOKENS = ("design-invariants-fixtures.md", _ANCHOR_FILENAME)
+
+# Lines either side of an anchor that count as "beside" it. Two is enough to
+# span a wrapped sentence and a following parenthetical without dragging in the
+# rest of the paragraph.
+_CITATION_WINDOW = 2
+
+# A BACKTICKED kebab token of at least three segments. Three is the shape floor
+# every canonical slug clears (`storm-escape-required` 3 ...
+# `loop-thread-occupancy-bounded` 4) and it excludes two-segment prose such as
+# `fail-soft`. Backticks are required on both sides, which is what keeps the
+# doc's own path out: `docs/legibility/design-invariants.md` carries slashes and
+# a dot inside its backticks, so it can never match.
+_CITATION_TOKEN_RE = re.compile(r"`([a-z][a-z0-9]*(?:-[a-z0-9]+){2,})`")
+
+
+def doc_anchored_slug_citations(text: str, *, source: str) -> list[tuple[int, str]]:
+    """``(line, token)`` for every backticked slug-shaped token cited beside the doc.
+
+    "Beside" means within ``_CITATION_WINDOW`` lines of a line naming
+    ``design-invariants.md``. The anchor is what makes this guard allowlist-free:
+    a repo-wide scan for slug-shaped tokens would drag in every kebab identifier
+    in a 15k-line module, and the resulting noise is how a guard gets silenced.
+
+    A text with NO anchor returns ``[]`` quietly — that is most of the repo, and
+    a loud extractor would fail on nearly every file. So does an anchored text
+    whose neighbourhood cites nothing in backticks: MEASURED on base
+    eba215060c, 30 of the 38 anchored files are exactly that shape (they point
+    at the doc in prose without naming a slug), so raising there would report a
+    defect on correct documentation.
+
+    What IS loud is an anchor whose whole window scrubs away to nothing: the
+    text is provably about the invariant family, yet the extractor has no text
+    left to examine, and ``[]`` there would be indistinguishable from "nothing
+    cited wrong".
+    """
+    lines = text.split("\n")
+    anchors = [index for index, line in enumerate(lines) if _ANCHOR_FILENAME in line]
+    if not anchors:
+        return []
+
+    windowed: set[int] = set()
+    for anchor in anchors:
+        start = max(0, anchor - _CITATION_WINDOW)
+        windowed.update(range(start, min(len(lines), anchor + _CITATION_WINDOW + 1)))
+
+    scrubbed: list[tuple[int, str]] = []
+    for index in sorted(windowed):
+        line = lines[index]
+        for path_token in _ANCHOR_PATH_TOKENS:
+            line = line.replace(path_token, "")
+        scrubbed.append((index, line))
+
+    assert any(line.strip() for _, line in scrubbed), (
+        f"{source}: a `{_ANCHOR_FILENAME}` citation was found, but scrubbing the "
+        f"anchor's own path left no text at all to examine within "
+        f"{_CITATION_WINDOW} lines of it (task 3803). An empty result here would "
+        f"read as `this file cites nothing wrong` while nothing had been read."
+    )
+
+    return [
+        (index + 1, match.group(1))
+        for index, line in scrubbed
+        for match in _CITATION_TOKEN_RE.finditer(line)
+    ]
+
+
+def noncanonical_citations(
+    citations: list[tuple[int, str]], family: list[tuple[int, str]]
+) -> list[tuple[int, str]]:
+    """The citations of *citations* naming a slug *family* does not back.
+
+    Loud on an empty *family* rather than returning every citation: a family
+    that failed to parse would report the whole repo as phantom citations, which
+    a reader would resolve by deleting the check.
+
+    A PHANTOM is a slug-shaped token cited as if canonical with no heading
+    behind it. `no-silent-fail-soft` was one for months — minted independently
+    in dozens of comments, filed under INV-2 five times and INV-4 once because
+    neither fit, and invisible to every by-slug lookup. This is the check that
+    would have caught it on the first citation.
+    """
+    assert family, (
+        "the citation check received an empty invariant family (task 3803) — "
+        "with no canonical vocabulary every citation is a phantom, so the check "
+        "would report the whole repo rather than the one slug that drifted."
+    )
+
+    canonical = {slug for _, slug in family}
+    return [(line, token) for line, token in citations if token not in canonical]
+
+
+# ---------------------------------------------------------------------------
+# parse_invariant_headings — the family extractor, fixture-driven tests
+# ---------------------------------------------------------------------------
+
+# (a) Happy path. Three well-formed headings in document order.
+_HEADINGS_HAPPY = """\
+# Design invariants
+
+Intro prose.
+
+## INV-1 `a-slug`
+
+**Rule**: something.
+
+## INV-2 `b-slug`
+
+**Rule**: something else.
+
+## INV-3 `c-slug`
+"""
+
+# (b) Decoy immunity, every decoy shape the real doc actually carries:
+# a `### INV-N `slug`` SUB-heading (the fixtures doc uses those for shapes), an
+# inline prose mention of a number outside the family, a backticked slug inside
+# a body paragraph (design-invariants.md's own §Census seam does this), and a
+# `## INV-N` heading carrying no backticked slug at all.
+_HEADINGS_DECOY = """\
+# Design invariants
+
+A gate checklist. Numeric aliases are prose convenience; INV-9 is not a thing.
+
+## INV-1 `a-slug`
+
+### INV-4 `sub-shape`
+
+Body prose naming `b-slug` and `c-slug` mid-sentence, which is a reference,
+not an enumeration.
+
+## INV-2 `b-slug`
+
+## INV-5
+
+## INV-3 `c-slug`
+"""
+
+# (c) THE VACUITY HAZARD: a doc that no longer parses. Structurally plausible —
+# it still talks about invariants — but carries zero matching headings, e.g.
+# after a heading-level or backtick-style edit.
+_HEADINGS_NONE = """\
+# Design invariants
+
+INV-1 contracts-machine-checked
+INV-2 structured-facts-at-failure
+
+### INV-1 `a-slug`
+"""
+
+# (d) Non-contiguous numbering — an invariant deleted without renumbering.
+_HEADINGS_GAP = """\
+## INV-1 `a-slug`
+
+## INV-2 `b-slug`
+
+## INV-4 `d-slug`
+"""
+
+# (e) Numbering that does not start at 1 — a doc split, or a truncated read.
+_HEADINGS_OFFSET = """\
+## INV-2 `b-slug`
+
+## INV-3 `c-slug`
+"""
+
+# (f) Duplicate slug across two headings. Slugs are stable IDS referenced by G7
+# waivers and `/review`'s invariant_findings; two headings sharing one makes
+# every downstream by-slug lookup ambiguous.
+_HEADINGS_DUP_SLUG = """\
+## INV-1 `a-slug`
+
+## INV-2 `a-slug`
+
+## INV-3 `c-slug`
+"""
+
+# (g) Duplicate number — a bad merge that landed two INV-2 sections.
+_HEADINGS_DUP_NUMBER = """\
+## INV-1 `a-slug`
+
+## INV-2 `b-slug`
+
+## INV-2 `c-slug`
+"""
+
+_FIXTURE_SOURCE = "a hand-written fixture"
+
+
+def test_parse_invariant_headings_returns_ordered_number_slug_pairs() -> None:
+    """(a) Headings parse to ``(number, slug)`` pairs in document order."""
+    assert parse_invariant_headings(_HEADINGS_HAPPY, source=_FIXTURE_SOURCE) == [
+        (1, "a-slug"),
+        (2, "b-slug"),
+        (3, "c-slug"),
+    ]
+
+
+def test_parse_invariant_headings_ignores_every_decoy_shape() -> None:
+    """(b) Sub-headings, prose mentions and slug-less headings are not family members.
+
+    The decoys are measured, not hypothetical: the fixtures doc uses ``###``
+    sub-headings per fixture shape, and design-invariants.md's Census seam
+    references slugs in running prose. A heuristic keyed on "a backticked slug
+    near an INV- token" would swallow all of them.
+    """
+    assert parse_invariant_headings(_HEADINGS_DECOY, source=_FIXTURE_SOURCE) == [
+        (1, "a-slug"),
+        (2, "b-slug"),
+        (3, "c-slug"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case", "expected_evidence"),
+    [
+        pytest.param(_HEADINGS_NONE, "zero headings", [], id="zero-headings"),
+        pytest.param(_HEADINGS_GAP, "non-contiguous", [repr([1, 2, 4])], id="numbering-gap"),
+        pytest.param(_HEADINGS_OFFSET, "does not start at 1", [repr([2, 3])], id="offset-start"),
+        pytest.param(
+            _HEADINGS_DUP_SLUG, "duplicate slug", [repr(["a-slug"])], id="duplicate-slug"
+        ),
+        pytest.param(
+            _HEADINGS_DUP_NUMBER, "duplicate number", [repr([2])], id="duplicate-number"
+        ),
+    ],
+)
+def test_parse_invariant_headings_fails_loudly(
+    markdown_text: str, case: str, expected_evidence: list[str]
+) -> None:
+    """(c-g) Every malformed family RAISES and names its ``source``.
+
+    Zero headings is the vacuity hazard this whole module is built around: an
+    extractor that returned ``[]`` would turn every downstream drift assertion
+    into an empty-vs-empty comparison that passes while pinning nothing —
+    strictly worse than no guard, because the suite still reports success. The
+    remaining cases are the same failure one level down: a family with a gap, an
+    offset start, or a duplicate id silently mis-describes what the other sites
+    are being compared against.
+
+    Naming ``source`` in the message is what makes a red run actionable: four
+    different docs are parsed by this one extractor, so "which doc broke" is not
+    recoverable from the traceback alone.
+
+    ``expected_evidence`` pins the REPR OF THE OFFENDING VALUE — the numbers that
+    are not contiguous, the slug or number that repeats — never a phrase of the
+    message's English, matching the policy the rest of this module already
+    follows. A wording pin is red on a harmless reword and green on a message
+    degraded to uselessness as long as the one word survives; the offending-value
+    repr is exactly the datum a reader needs to go fix the doc, and it also
+    discriminates the gap case from the offset case, which a shared "contiguous"
+    substring never did. The zero-headings case carries no offending value — its
+    whole contract is that it raises at all instead of returning ``[]`` — so the
+    raise plus the ``source`` name is all there is to assert.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        parse_invariant_headings(markdown_text, source=_FIXTURE_SOURCE)
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message, f"{case}: message must name the source doc: {message!r}"
+    for evidence in expected_evidence:
+        assert evidence in message, (
+            f"{case}: message must quote the offending value {evidence}, so a "
+            f"reader can see what to fix: {message!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# LIVE: the normative doc parses, and the fixtures doc's sections match it
+# ---------------------------------------------------------------------------
+
+
+def test_normative_doc_parses_to_a_contiguous_unique_family() -> None:
+    """The real design-invariants.md yields a usable family — the vacuity floor.
+
+    Contiguity and uniqueness are already enforced inside the extractor; what
+    this adds is the SIZE floor. Every other assertion in this module compares
+    some site against ``canonical_family()``, so a doc that stopped parsing (a
+    heading-style edit, a move) would otherwise make them all pass while pinning
+    nothing. The floor sits well below the eight landed invariants so a
+    deliberate retirement does not go red spuriously.
+    """
+    family = canonical_family()
+
+    assert len(family) >= _MINIMUM_FAMILY_SIZE, (
+        f"{_repo_relative(NORMATIVE_DOC)} parsed to only {len(family)} invariant(s) "
+        f"{family} (task 3802), below the non-vacuity floor of "
+        f"{_MINIMUM_FAMILY_SIZE}. Every cross-site check in this module is "
+        f"relative to this family, so a truncated parse would silently pin "
+        f"nothing. Check the `## INV-N `slug`` heading shape in that doc."
+    )
+
+
+def test_fixtures_doc_sections_match_the_normative_family() -> None:
+    """Every invariant has a calibration-fixture section, and no orphans exist.
+
+    ``docs/legibility/design-invariants-fixtures.md`` carries one ``## INV-N
+    `slug``` section per invariant. That correspondence does NOT auto-extend —
+    it is hand-maintained — so a new invariant lands with no seeded violations to
+    calibrate the G7 / Step-5.5 walk against, and a retired one leaves a section
+    referencing a slug no gate will ever emit. Compared as an ordered list, since
+    both docs number their sections and disagreeing order means one of them
+    renumbered without the other.
+    """
+    normative = canonical_family()
+    fixtures = parse_invariant_headings(
+        FIXTURES_DOC.read_text(encoding="utf-8"), source=_repo_relative(FIXTURES_DOC)
+    )
+
+    missing = [pair for pair in normative if pair not in fixtures]
+    extra = [pair for pair in fixtures if pair not in normative]
+    assert not missing and not extra, (
+        f"{_repo_relative(FIXTURES_DOC)} has drifted from "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
+        f"  MISSING fixture section(s) (invariant exists, nothing calibrates the "
+        f"walk against it): {missing}\n"
+        f"  ORPHAN fixture section(s) (fixture exists for no current invariant): "
+        f"{extra}\n"
+        f"  normative: {normative}\n"
+        f"  fixtures:  {fixtures}\n"
+        f"Add a `## INV-N `slug`` section with a PRD-leaf-shaped and a "
+        f"code-snippet-shaped seeded violation for each missing invariant, or "
+        f"delete the orphan section."
+    )
+    assert fixtures == normative, (
+        f"{_repo_relative(FIXTURES_DOC)}'s sections carry the same invariants as "
+        f"{_repo_relative(NORMATIVE_DOC)} but in a different ORDER (task 3802):\n"
+        f"  normative: {normative}\n"
+        f"  fixtures:  {fixtures}\n"
+        f"One doc renumbered without the other."
+    )
+
+
+# ---------------------------------------------------------------------------
+# marked_span — fixture-driven tests
+#
+# The one surviving marked span is `inv-trigger-shapes` in gates.md, and it is a
+# pure DELIMITER: that file carries decoy backticked slugs outside both of its
+# enumerations (`no-lockstep-duplication` discussed in prose, a `G7 waiver:
+# <slug>` template), so the trigger-shape SET check needs an explicit boundary
+# rather than a content heuristic. The fixtures below therefore name a neutral
+# marker, not one that exists in any committed doc.
+# ---------------------------------------------------------------------------
+
+# (a) Happy path. The live gates.md marker is BARE — no explanatory body, so /prd
+# G7 does not Read pytest strategy notes as gate instructions — but the extractor
+# must still tolerate a commented begin marker, because the sibling
+# `lint-command-mirror` block in CONTRIBUTING.md carries one. What this fixture
+# pins is that such a comment's own prose lands OUTSIDE the returned span: it
+# names a test path, out of which a slug-shaped token could be read.
+_SPAN_HAPPY = """\
+Some prose above.
+
+<!-- a-fixture-span:begin
+     Pinned by scripts/tests/test_design_invariants_consistency.py — task 3802. -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:end -->
+
+Some prose below.
+"""
+
+_SPAN_NO_BEGIN = """\
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:end -->
+"""
+
+_SPAN_NO_END = """\
+<!-- a-fixture-span:begin -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+"""
+
+_SPAN_DUPLICATE_BEGIN = """\
+<!-- a-fixture-span:begin -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:begin -->
+A second, unpinned copy.
+<!-- a-fixture-span:end -->
+"""
+
+_SPAN_DUPLICATE_END = """\
+<!-- a-fixture-span:begin -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:end -->
+More prose.
+<!-- a-fixture-span:end -->
+"""
+
+_SPAN_INVERTED = """\
+<!-- a-fixture-span:end -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:begin -->
+"""
+
+# A synthetic family standing in for the live one, so these tests keep asserting
+# the same thing when a ninth invariant lands.
+_FIXTURE_FAMILY = [(number, f"slug-{number}") for number in range(1, 9)]
+_FIXTURE_SPAN_NAME = "a-fixture-span"
+
+
+def test_marked_span_returns_only_the_text_between_the_markers() -> None:
+    """(a) The begin comment's own prose is excluded; the wrapped content is not."""
+    span = marked_span(_SPAN_HAPPY, _FIXTURE_SPAN_NAME, source=_FIXTURE_SOURCE)
+
+    assert "The wrapped claim, naming `alpha-slug` and `beta-slug`." in span
+    assert "Pinned by scripts/tests" not in span, (
+        "the begin comment's explanatory prose must sit outside the span — it "
+        f"names a test path a slug-shaped token could be read out of: {span!r}"
+    )
+    assert "prose above" not in span and "prose below" not in span
+
+
+_FIXTURE_BEGIN_MARKER = f"<!-- {_FIXTURE_SPAN_NAME}:begin"
+_FIXTURE_END_MARKER = f"<!-- {_FIXTURE_SPAN_NAME}:end -->"
+
+# The bare marker NAMES, without the `<!-- ` comment opener. The inverted-span
+# message quotes both of them (it has no whole comment to quote — the defect is
+# their relative order, not either one's text).
+_FIXTURE_BEGIN_NAME = f"{_FIXTURE_SPAN_NAME}:begin"
+_FIXTURE_END_NAME = f"{_FIXTURE_SPAN_NAME}:end"
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case", "expected_markers"),
+    [
+        pytest.param(_SPAN_NO_BEGIN, "missing begin", [_FIXTURE_BEGIN_MARKER], id="missing-begin"),
+        pytest.param(_SPAN_NO_END, "missing end", [_FIXTURE_END_MARKER], id="missing-end"),
+        pytest.param(
+            _SPAN_DUPLICATE_BEGIN, "duplicate begin", [_FIXTURE_BEGIN_MARKER], id="duplicate-begin"
+        ),
+        pytest.param(
+            _SPAN_DUPLICATE_END, "duplicate end", [_FIXTURE_END_MARKER], id="duplicate-end"
+        ),
+        pytest.param(
+            _SPAN_INVERTED,
+            "inverted",
+            [_FIXTURE_BEGIN_NAME, _FIXTURE_END_NAME],
+            id="inverted-markers",
+        ),
+    ],
+)
+def test_marked_span_fails_loudly_on_a_broken_marker(
+    markdown_text: str, case: str, expected_markers: list[str]
+) -> None:
+    """A missing, duplicated or inverted marker RAISES — never returns ''.
+
+    Missing is the vacuity hazard: an empty span satisfies the SET comparison it
+    feeds by containing no slugs to compare. Duplicated is the same failure one
+    level down — silently taking the first span leaves the second copy unpinned
+    and free to drift, which is precisely the defect this module exists to catch.
+
+    Every case pins the MARKER LITERALS the message must quote — caller-supplied
+    data, not a rendered count and not a phrase of the message's English. Which
+    marker broke is the fact a reader needs in order to go fix the doc; "found 2"
+    is the same message's formatting, and pinning it turns a reword red while
+    leaving a message that dropped the marker name — the part that makes it
+    actionable — green. Inversion is the same rule applied to a two-marker
+    defect: it quotes BOTH names, since the defect is their order rather than
+    either one's text, so the assertion stays on data the caller handed in.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        marked_span(markdown_text, _FIXTURE_SPAN_NAME, source=_FIXTURE_SOURCE)
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
+    assert _FIXTURE_SPAN_NAME in message, f"{case}: must name the marker: {message!r}"
+    for marker in expected_markers:
+        assert marker in message, (
+            f"{case}: message must quote the offending marker `{marker}`, so a "
+            f"reader can see which one to fix: {message!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# gates.md — TWO independent enumerations, pinned differently on purpose
+#
+# Task 3811 (commit f29da1855b) deliberately preserved the two-site shape:
+# gates.md:181 records that collapsing them was considered and REJECTED. The
+# family-inventory row is read generically off each project's own normative doc
+# by projects that HAVE adopted one; the trigger-shape list exists precisely for
+# projects that have NOT, and is a hand-distilled illustrative set. So both are
+# pinned, but not in the same way — see the two live tests below.
+# ---------------------------------------------------------------------------
+
+_GATES_TRIGGER_SPAN = "inv-trigger-shapes"
+
+_SLUGS_HAPPY = "adds a fallback (`storm-escape-required`)? a contract in prose (`a-slug`)?"
+
+# Every backticked non-slug shape the real docs carry near an enumeration:
+# a numeric alias, a dotted metadata key, an angle-bracket placeholder, a
+# CamelCase symbol, a path, and a call expression.
+_SLUGS_DECOYS = (
+    "See `INV-5`, `metadata.g7_waivers`, `G7 waiver: <slug>`, `FailureCategory`, "
+    "`docs/legibility/design-invariants.md`, `_run()` and `Y` — none is a slug, "
+    "but `real-slug` is."
+)
+
+# The measured shape of the live trigger-shape paragraph: `contracts-machine-checked`
+# appears TWICE, once for "a tool without a declared filter/envelope convention"
+# and once for "a contract in prose". Duplicates must survive extraction so the
+# caller — not the extractor — decides whether order and multiplicity matter.
+_SLUGS_DUPLICATED = (
+    "a tool without a declared envelope (`contracts-machine-checked`)? "
+    "a contract in prose (`contracts-machine-checked`)? "
+    "a log-scrape (`structured-facts-at-failure`)?"
+)
+
+# A fixture table carrying BOTH project rows. The reify row's INV-SF slugs are
+# the same lexical shape as dark-factory's, so an extractor keyed on "a table row
+# with backticked slugs" would silently merge two projects' families — and the
+# merged set would then never equal either one.
+_FAMILY_ROW_TABLE = """\
+| Project | Family |
+|---|---|
+| dark-factory | INV-1..3 — `a-slug`, `b-slug`, `c-slug` (the doc is normative) |
+| reify | INV-SF-1..2 (silent-failure) — `undef-has-provenance`, `diagnostics-carry-codes` |
+"""
+
+_FAMILY_ROW_ABSENT = """\
+| Project | Family |
+|---|---|
+| reify | INV-SF-1..2 (silent-failure) — `undef-has-provenance`, `diagnostics-carry-codes` |
+"""
+
+_FAMILY_ROW_DUPLICATED = """\
+| dark-factory | INV-1..3 — `a-slug`, `b-slug`, `c-slug` |
+| reify | INV-SF-1..2 — `undef-has-provenance` |
+| dark-factory | INV-1..2 — `a-slug`, `b-slug` |
+"""
+
+
+def test_slugs_in_span_returns_backticked_slugs_in_document_order() -> None:
+    assert slugs_in_span(_SLUGS_HAPPY) == ["storm-escape-required", "a-slug"]
+
+
+def test_slugs_in_span_ignores_backticked_non_slug_tokens() -> None:
+    """Numeric aliases, dotted keys, placeholders, CamelCase and paths are not slugs.
+
+    All six shapes are measured in gates.md and design-invariants.md near an
+    enumeration. An extractor keyed on "anything backticked" would fold them into
+    the family and make the set comparison fail with a nonsense diff.
+    """
+    assert slugs_in_span(_SLUGS_DECOYS) == ["real-slug"]
+
+
+def test_slugs_in_span_preserves_duplicates_in_order() -> None:
+    """Duplicates survive extraction; the CALLER decides whether they matter.
+
+    The live trigger-shape paragraph names `contracts-machine-checked` twice
+    because two distinct trigger shapes map to that one invariant. Silently
+    de-duplicating inside the extractor would hide that from the ordered
+    family-row check, which legitimately must not tolerate a repeat.
+    """
+    assert slugs_in_span(_SLUGS_DUPLICATED) == [
+        "contracts-machine-checked",
+        "contracts-machine-checked",
+        "structured-facts-at-failure",
+    ]
+
+
+def test_dark_factory_family_row_ignores_the_reify_row() -> None:
+    """DECOY IMMUNITY: the sibling project's row has the same lexical shape.
+
+    Merging the two families is the failure that would not announce itself — the
+    combined set simply never equals dark-factory's, and the diff would blame the
+    wrong rows.
+    """
+    row = dark_factory_family_row(_FAMILY_ROW_TABLE)
+
+    assert slugs_in_span(row) == ["a-slug", "b-slug", "c-slug"]
+    assert "undef-has-provenance" not in row
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case", "expected_matches"),
+    [
+        pytest.param(_FAMILY_ROW_ABSENT, "absent", [], id="row-absent"),
+        pytest.param(
+            _FAMILY_ROW_DUPLICATED,
+            "duplicated",
+            [
+                "| dark-factory | INV-1..3 — `a-slug`, `b-slug`, `c-slug` |",
+                "| dark-factory | INV-1..2 — `a-slug`, `b-slug` |",
+            ],
+            id="row-duplicated",
+        ),
+    ],
+)
+def test_dark_factory_family_row_fails_loudly(
+    markdown_text: str, case: str, expected_matches: list[str]
+) -> None:
+    """A missing or duplicated row RAISES — never returns ''.
+
+    Absent is the vacuity hazard (an empty row yields an empty slug list, and
+    empty-vs-a-real-family at least fails loudly — but empty-vs-empty would not,
+    if the family ever failed to parse too). Duplicated means one of the two rows
+    is unpinned and free to drift.
+
+    Both cases pin the REPR OF WHAT MATCHED rather than the rendered count. That
+    repr is what makes a duplicate report actionable — it names both offending
+    rows, so the reader can see which is the stale copy — whereas "found 2" is
+    the message's number formatting, red on a reword and green on a message that
+    dropped the rows entirely.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        dark_factory_family_row(markdown_text)
+
+    message = str(excinfo.value)
+    assert "gates.md" in message, f"{case}: message must name the doc: {message!r}"
+    assert _FAMILY_ROW_PREFIX in message, f"{case}: message must name the row anchor: {message!r}"
+    assert repr(expected_matches) in message, (
+        f"{case}: message must quote the rows it matched, so a reader can see "
+        f"which copy is stale: {message!r}"
+    )
+
+
+def test_gates_family_row_lists_the_whole_family_in_order() -> None:
+    """LIVE: gates.md's family-inventory row transcribes the family, in order.
+
+    Pinned as an ORDERED list, unlike the trigger-shape span below: this row is a
+    straight canonical-order transcription today, so ordering is free signal —
+    a mis-ordered row means someone edited it by hand against a stale copy.
+    """
+    text = GATES_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(GATES_DOC)
+    row = dark_factory_family_row(text)
+    listed = slugs_in_span(row)
+    canonical = canonical_slugs()
+
+    assert listed == canonical, (
+        f"{source}: the `| dark-factory |` family-inventory row has drifted from "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
+        f"  row:       {listed}\n"
+        f"  normative: {canonical}\n"
+        f"Update the row to list every slug in canonical INV-1..N order. It is "
+        f"illustrative — the doc is normative — but an illustration naming the "
+        f"wrong family is worse than none."
+    )
+
+
+def test_gates_trigger_shape_list_covers_every_invariant() -> None:
+    """LIVE: the G7 fallback trigger-shape list names every invariant at least once.
+
+    A SET comparison, deliberately, and not an ordered or exact-multiset one. The
+    paragraph is in NON-canonical order and legitimately names
+    `contracts-machine-checked` TWICE — once for "a tool without a declared
+    filter/envelope convention", once for "a contract in prose" — because two
+    distinct trigger shapes map to that invariant. An ordered assertion would be
+    RED-and-unfixable without rewriting normative gate prose this task is not
+    scoped to author.
+
+    That rationale lives HERE rather than beside the marker in gates.md. The
+    ``inv-trigger-shapes:begin`` comment once carried it, which put pytest
+    strategy notes into a file /prd G7 Reads verbatim as gate instructions — an
+    agent executing the screening list would read "pinned as a SET ... one
+    invariant deliberately appears twice" as part of the gate. The marker there
+    is now bare; the delimiter is still needed, because gates.md carries decoy
+    backticked slugs outside both enumerations.
+
+    A set still catches the defect this site has actually exhibited twice: an
+    invariant added to the normative doc with no trigger shape appended here, so
+    projects with no invariants file of their own screen against an incomplete
+    list and never see the new failure mode.
+    """
+    text = GATES_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(GATES_DOC)
+    span = marked_span(text, _GATES_TRIGGER_SPAN, source=source)
+
+    listed = set(slugs_in_span(span))
+    canonical = set(canonical_slugs())
+    missing = sorted(canonical - listed)
+    unknown = sorted(listed - canonical)
+
+    assert not missing and not unknown, (
+        f"{source}: the G7 trigger-shape fallback list inside the "
+        f"`{_GATES_TRIGGER_SPAN}` marker has drifted from "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
+        f"  MISSING (invariant exists, no trigger shape screens for it): {missing}\n"
+        f"  UNKNOWN (trigger shape names no current invariant): {unknown}\n"
+        f"Append the new invariant's trigger shape to the G7 fallback list in "
+        f"gates.md — the same instruction that paragraph's own follow-up already "
+        f"carries. This list is what projects WITHOUT their own "
+        f"design-invariants.md screen against, so a gap here is a gate that "
+        f"silently stops covering a known failure mode."
+    )
+
+
+# ---------------------------------------------------------------------------
+# CONTRIBUTING.md — pinned as an ABSENCE
+#
+# §6 restated all eight slugs twelve lines above its own rule saying not to
+# ("it's the single normative copy ...; don't restate them elsewhere"), and
+# design-invariants.md says the same at its head ("no restatement, per INV-5").
+# The fix DELETES the duplicate rather than re-syncing it, so this site cannot
+# go stale again; the assertion below is the machine-checkable form of the
+# anti-restatement rule itself.
+# ---------------------------------------------------------------------------
+
+# CONTRIBUTING.md's own bound, tighter than `_ENUMERATION_THRESHOLD` because that
+# doc is where the "single normative copy; don't restate them elsewhere" rule is
+# WRITTEN — a partial list there contradicts its own §6 long before it reaches
+# four slugs. Not zero, though: the rule being mechanized is "don't restate the
+# family", not "never name an invariant", and a single by-name citation is what
+# the rest of the repo does (gates.md discusses `no-lockstep-duplication` in
+# prose, skills/review's phase2-architecture.md names one in a JSON example).
+# An absolute-zero pin would turn the suite red for one correct sentence.
+_CONTRIBUTING_SLUG_BUDGET = 1
+
+
+def test_contributing_does_not_restate_the_invariant_family() -> None:
+    """LIVE: CONTRIBUTING.md points at the normative doc instead of copying it.
+
+    ONE assertion — whole-file, at most ``_CONTRIBUTING_SLUG_BUDGET`` distinct
+    canonical slugs. CONTRIBUTING.md §6 used to restate all eight, twelve lines
+    above its own rule forbidding restatement. Re-syncing that list would have
+    fixed the contradiction and left the site free to drift again on the next
+    invariant; deleting it means there is nothing left to drift. This is the
+    anti-restatement rule made machine-checkable — it fails the moment anyone
+    re-introduces a copy, which a content-equality pin never would.
+
+    Deliberately the ONLY assertion here. Earlier revisions also pinned §6's
+    prose (no `<cardinal> invariants` phrase, must contain the normative doc's
+    literal path); both were substring pins on wording that would fire on an
+    ordinary editorial rewrite rather than on family drift, and neither is a
+    cross-artifact structural claim. Removed in the task-3802 review remediation.
+    """
+    text = CONTRIBUTING_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(CONTRIBUTING_DOC)
+
+    restated = [slug for slug in canonical_slugs() if slug in text]
+    assert len(restated) <= _CONTRIBUTING_SLUG_BUDGET, (
+        f"{source} names {len(restated)} invariant slug(s) {restated}, more than "
+        f"the {_CONTRIBUTING_SLUG_BUDGET} a single by-name citation needs (task "
+        f"3802). That doc's own §6 says of design-invariants.md: \"it's the "
+        f"single normative copy; don't restate them elsewhere\", and the "
+        f"normative doc says the same at its head (\"no restatement, per "
+        f"INV-5\"). Replace the copy with a pointer to "
+        f"{_repo_relative(NORMATIVE_DOC)} — a restated list here has already "
+        f"gone stale once and cannot be kept current by policy alone."
+    )
+
+
+# ---------------------------------------------------------------------------
+# docs/code-quality.md — pinned as a PARTIAL mapping, pair-wise against the
+# normative doc
+#
+# The "Relationship to the design invariants" section maps a subset of the
+# family to Leo's fourteen numbered quality heuristics — four of eleven
+# invariants today, only those that already encode a heuristic in checkable
+# form — and that mapping is the section's entire content. Ratified by Leo on
+# 2026-09-03 (commit 7938676c28); this guard pins the mapping pair-wise
+# without editing a byte of the doc (task 5230).
+#
+# STRICT membership (`alias_pairs_not_in_family`), not the repo-wide near-miss
+# rule: MEASURED against this doc's five live pairings, `near_miss_alias_pairs`
+# flags a renumbering but misses a slug RENAME and a RETIREMENT — see
+# `alias_pairs_not_in_family`'s docstring for the full comparison — and both
+# leave a citation resolving to nothing, which a mapping pinned for
+# correctness cannot tolerate.
+#
+# Deliberately NO completeness limb. The section is a MAPPING claim naming
+# only the invariants that encode a quality heuristic, so it is partial by
+# construction and an exhaustiveness assertion would be wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_code_quality_doc_pairs_every_invariant_with_its_canonical_slug() -> None:
+    """LIVE: every `INV-N`/slug pairing in docs/code-quality.md is exact.
+
+    TWO assertions, deliberately no more.
+
+    NON-VACUITY FIRST. MEASURED: this doc's header carries a citation
+    (`INV-9 one-fact-one-home`) OUTSIDE the "Relationship to the design
+    invariants" mapping section, so deleting the whole mapping would still
+    leave `invariant_alias_pairs` returning one clean pairing without raising
+    its loud empty-parse error — the strict check below would then pass over
+    one clean pairing while the doc mapped nothing. This limb requires the
+    pairings to still name at least `_ENUMERATION_THRESHOLD` distinct
+    canonical slugs — exactly the condition that made this site registrable in
+    PINNED_SITES in the first place, so its failure means "de-register the
+    site", not "weaken this assertion".
+
+    THEN STRICT MEMBERSHIP. `alias_pairs_not_in_family` against
+    `canonical_family()` — no near-miss carve-outs — because a mapping pinned
+    for correctness must not let a renamed or retired slug read as clean.
+
+    NO COMPLETENESS LIMB. The section names only the invariants that already
+    encode a quality heuristic (4 of 11 today); it is a partial mapping by
+    construction, not an enumeration of the family, so asserting it covers
+    every invariant would be wrong.
+    """
+    text = CODE_QUALITY_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(CODE_QUALITY_DOC)
+
+    pairs = invariant_alias_pairs(text, source=source)
+
+    distinct_slugs = {token for _, _, token, _, _ in pairs}
+    assert len(distinct_slugs) >= _ENUMERATION_THRESHOLD, (
+        f"{source} names only {len(distinct_slugs)} distinct canonical "
+        f"slug(s) {sorted(distinct_slugs)} across its `INV-N`/slug pairings — "
+        f"under the {_ENUMERATION_THRESHOLD}-slug enumeration threshold that "
+        f"made this site registrable in PINNED_SITES in the first place (task "
+        f"5230). If the mapping section was trimmed or removed on purpose, "
+        f"de-register {source} from PINNED_SITES instead of weakening this "
+        f"assertion."
+    )
+
+    drifted = alias_pairs_not_in_family(pairs, canonical_family())
+    assert not drifted, (
+        f"{source} pairs (line, number, token) "
+        f"{[(p.line, p.number, p.token) for p in drifted]} with a number/slug "
+        f"combination that is not in the canonical family (task 5230). "
+        f"{_repo_relative(NORMATIVE_DOC)} is the only place a slug is defined "
+        f"— either renumber the citation to match it, or the slug was "
+        f"respelled or retired there and this doc's citation needs the same "
+        f"treatment, or the citation used a shorthand prefix (e.g. `INV-4 "
+        f"storm-escape`) — ordinary prose may do that, but a mapping pinned "
+        f"for correctness may not, so spell the slug in full."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The fixtures doc's rehearsal verdict table — pinned for COVERAGE only
+#
+# The doc carries an explicit "Snapshot caveat" declaring the Verdict column a
+# point-in-time transcription of the G7 / Step-5.5 wording, NOT a live pin on
+# those source docs, and tells readers to re-walk rather than trust the quoted
+# rationale as current. So this guard asserts COVERAGE — every invariant present
+# in both PRD and CODE shape, each row's Expected-slug cell equal to the
+# canonical slug — and never the prose. Coverage is the property that actually
+# fails to auto-extend when an invariant is added, so it is the right thing to
+# mechanize. The legend's "<N> rows cumulative" line is deliberately NOT pinned:
+# that is a transcribed number, and the doc's own Snapshot caveat already tells
+# readers to re-walk rather than trust one.
+# ---------------------------------------------------------------------------
+
+_SMALL_FAMILY = [(1, "a-slug"), (2, "b-slug")]
+
+# Rows are split over THREE tables in the live doc (a base table plus two dated
+# addenda), so the extractor must collect across all of them rather than parse
+# "the" table. Modelled on that shape.
+_VERDICT_HAPPY = """\
+Acceptance: every fixture flags with the correct slug — 4 rows cumulative, all `Y`.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|
+| `INV-1-PRD` | PRD | INV-1 a-slug | `a-slug` | G7's list fires | Y |
+| `INV-1-CODE` | CODE | INV-1 a-slug | `a-slug` | Step 5.5 fires | Y |
+
+### Addendum — later walk
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|
+| `INV-2-PRD` | PRD | INV-2 b-slug | `b-slug` | G7's list fires | Y |
+| `INV-2-CODE` | CODE | INV-2 b-slug | `b-slug` | Step 5.5 fires | Y |
+"""
+
+_VERDICT_MISSING_CODE = _VERDICT_HAPPY.replace(
+    "| `INV-2-CODE` | CODE | INV-2 b-slug | `b-slug` | Step 5.5 fires | Y |\n", ""
+).replace("4 rows cumulative", "3 rows cumulative")
+
+_VERDICT_WRONG_SLUG = _VERDICT_HAPPY.replace(
+    "| `INV-2-PRD` | PRD | INV-2 b-slug | `b-slug` |",
+    "| `INV-2-PRD` | PRD | INV-2 b-slug | `a-slug` |",
+)
+
+_VERDICT_UNKNOWN_NUMBER = _VERDICT_HAPPY.replace("| `INV-2-CODE` |", "| `INV-9-CODE` |")
+
+_VERDICT_HEADER = "| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |\n|---|---|---|---|---|---|\n"
+
+_VERDICT_TOO_FEW_COLUMNS = _VERDICT_HEADER + "| `INV-1-PRD` | PRD |\n"
+
+_VERDICT_EMPTY_SLUG_CELL = _VERDICT_HEADER + "| `INV-1-PRD` | PRD | INV-1 a-slug |  | fires | Y |\n"
+
+# A data row with no header above it at all. Read positionally this parses fine
+# and yields a plausible-looking slug — which is exactly why it must not be.
+_VERDICT_NO_HEADER = "| `INV-1-PRD` | PRD | INV-1 a-slug | `a-slug` | fires | Y |\n"
+
+# An addendum table that inserts a `Walk date` column BEFORE `Expected slug`, so
+# the canonical index-4 cell is no longer the slug. This is the drift shape the
+# positional read would have swallowed: index 4 here holds a date, and the guard
+# would either blame the row for being "unreadable" or — with a slug-shaped cell
+# in that position — compare the wrong column and read green.
+_VERDICT_REORDERED_COLUMNS = """\
+| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|
+| `INV-1-PRD` | PRD | INV-1 a-slug | `a-slug` | G7's list fires | Y |
+| `INV-1-CODE` | CODE | INV-1 a-slug | `a-slug` | Step 5.5 fires | Y |
+
+### Addendum — a later walk that added a column
+
+| Fixture ID | Shape | Invariant | Walk date | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|---|
+| `INV-2-PRD` | PRD | INV-2 b-slug | 2026-08-09 | `b-slug` | G7's list fires | Y |
+| `INV-2-CODE` | CODE | INV-2 b-slug | 2026-08-09 | `b-slug` | Step 5.5 fires | Y |
+"""
+
+
+def test_verdict_table_rows_collects_rows_across_every_table() -> None:
+    """Rows are collected by ROW SHAPE, not per-table — the live set is split in three."""
+    assert verdict_table_rows(_VERDICT_HAPPY, source=_FIXTURE_SOURCE) == [
+        (1, "PRD", "a-slug"),
+        (1, "CODE", "a-slug"),
+        (2, "PRD", "b-slug"),
+        (2, "CODE", "b-slug"),
+    ]
+
+
+def test_verdict_table_rows_resolves_the_slug_column_per_table() -> None:
+    """Each table's Expected-slug column is resolved from ITS OWN header.
+
+    The live doc already splits its rows over three separately-headed tables. A
+    hardcoded column index survives that only for as long as every addendum
+    happens to repeat the same layout; the moment one inserts a column, the
+    positional read silently moves to a different cell. Resolving per header is
+    what makes "which column is the slug" a fact read off the document rather
+    than a constant maintained in this module.
+    """
+    assert verdict_table_rows(_VERDICT_REORDERED_COLUMNS, source=_FIXTURE_SOURCE) == [
+        (1, "PRD", "a-slug"),
+        (1, "CODE", "a-slug"),
+        (2, "PRD", "b-slug"),
+        (2, "CODE", "b-slug"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case"),
+    [
+        pytest.param(_VERDICT_TOO_FEW_COLUMNS, "too few columns", id="short-row"),
+        pytest.param(_VERDICT_EMPTY_SLUG_CELL, "empty expected-slug cell", id="empty-slug-cell"),
+        pytest.param(_VERDICT_NO_HEADER, "no header row", id="no-header"),
+        pytest.param("no table here at all\n", "no rows", id="no-rows"),
+    ],
+)
+def test_verdict_table_rows_fails_loudly(markdown_text: str, case: str) -> None:
+    """A malformed, headerless or absent row RAISES rather than yielding ``None``.
+
+    Yielding ``None`` for an unreadable Expected-slug cell would make the
+    slug-equality check below compare ``None`` against a real slug — a red with a
+    misleading diagnosis — and an empty row list would make coverage pass
+    vacuously. The headerless case is the same hazard one level up: a row with no
+    header above it can only be read positionally, and a positional read of a
+    table whose layout differs compares the wrong column without saying so.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        verdict_table_rows(markdown_text, source=_FIXTURE_SOURCE)
+
+    assert _FIXTURE_SOURCE in str(excinfo.value), case
+
+
+def test_assert_verdict_table_covers_accepts_a_complete_table() -> None:
+    assert_verdict_table_covers(_VERDICT_HAPPY, _SMALL_FAMILY, source=_FIXTURE_SOURCE)
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case", "expected_repr"),
+    [
+        pytest.param(
+            _VERDICT_MISSING_CODE, "missing CODE row", repr(["PRD"]), id="missing-code-row"
+        ),
+        pytest.param(
+            _VERDICT_WRONG_SLUG,
+            "wrong expected slug",
+            repr((2, "PRD", "a-slug", "b-slug")),
+            id="wrong-slug",
+        ),
+        pytest.param(
+            _VERDICT_UNKNOWN_NUMBER, "unknown invariant", repr([9]), id="unknown-number"
+        ),
+    ],
+)
+def test_assert_verdict_table_covers_rejects_drift(
+    markdown_text: str, case: str, expected_repr: str
+) -> None:
+    """Each drift shape the table can develop when the family changes fires.
+
+    Each case asserts the message quotes the REPR OF THE OFFENDING VALUE — the
+    shapes actually found, the mismatched ``(number, shape, cell, canonical)``
+    tuple, the orphan numbers — rather than a phrase of the message's wording.
+    A repr is contractually load-bearing: a reader cannot act on "the table has
+    drifted" without being told which row, so a message that stopped carrying it
+    would have genuinely regressed. Pinning wording instead makes an editorial
+    reword red while a message degraded to uselessness stays green.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        assert_verdict_table_covers(markdown_text, _SMALL_FAMILY, source=_FIXTURE_SOURCE)
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message, f"{case}: {message!r}"
+    assert expected_repr in message, f"{case}: message must quote the offending value: {message!r}"
+
+
+def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
+    """LIVE: the rehearsal table walks every invariant in both fixture shapes.
+
+    Coverage only. The Verdict/rationale column is deliberately NOT pinned: the
+    doc's own "Snapshot caveat" declares it a point-in-time transcription of the
+    G7 and Step-5.5 text as it read on 2026-07-14, and instructs readers to
+    re-walk the fixtures against the current wording rather than trust the quoted
+    rationale. Pinning that prose would contradict the doc's stated contract and
+    would go red on any unrelated gate-wording edit.
+    """
+    assert_verdict_table_covers(
+        FIXTURES_DOC.read_text(encoding="utf-8"),
+        canonical_family(),
+        source=_repo_relative(FIXTURES_DOC),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registry completeness — the SITE LIST is itself mechanized
+#
+# A drift guard whose site list is hand-maintained reproduces the exact defect it
+# exists to prevent: it reads green while a newly created enumeration site sits
+# unpinned. So `PINNED_SITES` is not trusted — it is checked against a scan of
+# EVERY markdown file in the repo. Any of them carrying at least
+# `_ENUMERATION_THRESHOLD` DISTINCT canonical slugs must be registered.
+#
+# Repo-wide is load-bearing, not thoroughness for its own sake. An earlier
+# revision scanned three roots (`*.md`, `docs/legibility/**`, `skills/**`), which
+# left the rest of docs/ and every package tree unwatched — a new enumeration in
+# a package README would have drifted on the next invariant with nothing red.
+#
+# Registration means "this file's relationship to the family is pinned", NOT
+# "this file enumerates": CONTRIBUTING.md is registered and carries ZERO slugs
+# today, because what is pinned there is the ABSENCE of a restatement.
+#
+# plans/ and docs/prds/ are excluded BY DESIGN, not by oversight. Their PRDs and
+# capability manifests transcribe slugs as point-in-time G7 walk records (a scan
+# measured fourteen such files at 5-7 slugs each); those records must NOT be
+# updated when the family changes, so pinning them would force rewriting history.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "excluded", "case"),
+    [
+        pytest.param("plans/some-prd.md", True, "inside an excluded tree", id="excluded-root"),
+        pytest.param("plans", True, "the excluded tree itself", id="excluded-dir"),
+        pytest.param("docs/prds/a-prd.md", True, "a nested excluded tree", id="excluded-nested"),
+        pytest.param("docs/prds", True, "the nested tree itself", id="excluded-nested-dir"),
+        pytest.param("plans-archive/x.md", False, "same prefix, different dir", id="same-prefix"),
+        pytest.param("docs/prdsomething.md", False, "same prefix, a file", id="same-prefix-file"),
+        pytest.param("docs/legibility/x.md", False, "a sibling of an excluded tree", id="sibling"),
+        pytest.param("CONTRIBUTING.md", False, "a repo-root file", id="repo-root"),
+    ],
+)
+def test_in_excluded_tree_matches_whole_path_components(
+    relative_path: str, excluded: bool, case: str
+) -> None:
+    """Exclusion is by path COMPONENT, never by string prefix.
+
+    The distinction has teeth in both directions: a prefix test would exclude a
+    hypothetical ``plans-archive/`` nobody meant to exclude (silently unwatching a
+    whole tree), while a bare basename test would exclude any ``prds`` directory
+    anywhere. Directories are checked as well as files because the scan PRUNES
+    excluded trees during the walk rather than filtering afterwards, so this
+    predicate is called on directory names too.
+    """
+    assert _in_excluded_tree(REPO_ROOT / relative_path) is excluded, case
+
+
+def _write_fixture_site(directory: Path, name: str, slugs: list[str]) -> Path:
+    """A throwaway markdown file enumerating `slugs`, for the scan's unit tests.
+
+    Written under ``tmp_path`` rather than into the repo: the scan's own fixtures
+    must not be discoverable BY the scan, or the live assertion would go red on
+    this module's test data.
+    """
+    body = "\n".join(f"- `{slug}` — a restated entry" for slug in slugs)
+    path = directory / name
+    path.write_text(f"# fixture site\n\n{body}\n", encoding="utf-8")
+    return path
+
+
+_FIXTURE_SLUGS = [slug for _, slug in _FIXTURE_FAMILY]
+
+
+def test_unregistered_enumeration_sites_is_empty_when_every_site_is_pinned(
+    tmp_path: Path,
+) -> None:
+    """The green case: over-threshold files are all registered, so nothing is returned.
+
+    Includes the two shapes that must NOT be reported — a registered file carrying
+    zero slugs (CONTRIBUTING.md's post-fix state, pinned as an absence) and an
+    unregistered file that mentions slugs but stays under the threshold.
+    """
+    enumerating = _write_fixture_site(tmp_path, "enumerating.md", _FIXTURE_SLUGS[:4])
+    absence = _write_fixture_site(tmp_path, "absence.md", [])
+    under = _write_fixture_site(tmp_path, "under-threshold.md", _FIXTURE_SLUGS[:3])
+
+    registry = {str(enumerating): "enumerates the family", str(absence): "pinned as an absence"}
+
+    assert (
+        unregistered_enumeration_sites(
+            [enumerating, absence, under], registry, _FIXTURE_FAMILY, threshold=4
+        )
+        == []
+    )
+
+
+def test_unregistered_enumeration_sites_reports_a_new_unpinned_site(tmp_path: Path) -> None:
+    """A NEW enumeration site that nobody pinned is exactly what this scan is for."""
+    registered = _write_fixture_site(tmp_path, "registered.md", _FIXTURE_SLUGS[:5])
+    newcomer = _write_fixture_site(tmp_path, "newcomer.md", _FIXTURE_SLUGS[:4])
+
+    registry = {str(registered): "enumerates the family"}
+
+    assert unregistered_enumeration_sites(
+        [registered, newcomer], registry, _FIXTURE_FAMILY, threshold=4
+    ) == [str(newcomer)]
+
+
+def test_unregistered_enumeration_sites_counts_distinct_slugs_only(tmp_path: Path) -> None:
+    """Threshold is DISTINCT slugs: a doc quoting one slug six times is not an enumeration.
+
+    Counting occurrences instead would flag every doc that discusses a single
+    invariant in depth — noise that would train readers to add files to the
+    registry to silence it, which is how a guard stops meaning anything.
+    """
+    repeated = _write_fixture_site(tmp_path, "repeated.md", [_FIXTURE_SLUGS[0]] * 6)
+
+    assert unregistered_enumeration_sites([repeated], {}, _FIXTURE_FAMILY, threshold=4) == []
+
+
+def test_unregistered_enumeration_sites_fails_loudly_on_an_empty_scan(tmp_path: Path) -> None:
+    """An empty file list RAISES rather than returning ``[]``.
+
+    ``[]`` from an empty scan is indistinguishable from "every site is pinned" —
+    an over-broad prune would report the guard's strongest possible result while
+    checking nothing at all.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        unregistered_enumeration_sites([], {}, _FIXTURE_FAMILY, threshold=4)
+
+    assert "no files" in str(excinfo.value).lower()
+    assert tmp_path.exists()  # the fixture dir is unused here by design
+
+
+def test_every_enumeration_site_is_pinned() -> None:
+    """LIVE: no markdown file enumerates the family without being registered.
+
+    The scan is repo-wide — every ``*.md`` file, minus the point-in-time record
+    trees and non-content directories — so the claim in this docstring is the
+    claim the code checks. It used to cover three hand-listed roots while
+    promising the strong form, which left a new enumeration in `docs/` or a
+    package README free to drift with nothing red.
+
+    This is the assertion that keeps `PINNED_SITES` honest. Without it the
+    registry would be one more hand-maintained enumeration — the very shape this
+    module exists to mechanize — and a newly written site could enumerate the
+    family, drift on the next invariant, and never turn anything red.
+
+    The scan is asserted NON-VACUOUS in two independent ways before its result is
+    trusted: every registered site must actually be reachable by the walk (a
+    moved doc or an over-broad prune is otherwise silently unpinned), and the
+    normative doc itself must clear the threshold (it defines every slug, so if
+    IT does not register as an enumeration the reader, the slug family, or the
+    threshold is broken).
+    """
+    family = canonical_family()
+    scanned = _enumeration_scan_files()
+
+    missing = sorted(site for site in PINNED_SITES if REPO_ROOT / site not in scanned)
+    assert not missing, (
+        f"registered site(s) {missing} are not reachable by the enumeration scan "
+        f"(task 3802). Either the file moved — update PINNED_SITES — or the walk "
+        f"now prunes it (excluded trees {sorted(_EXCLUDED_TREES)}, directory names "
+        f"{sorted(_PRUNED_DIR_NAMES)}, and anything dot-prefixed), in which case a "
+        f"whole tree of sites is unpinned and this guard is reading green over "
+        f"nothing."
+    )
+
+    normative_text = NORMATIVE_DOC.read_text(encoding="utf-8")
+    assert NORMATIVE_DOC in scanned and (
+        len({slug for _, slug in family if slug in normative_text}) >= _ENUMERATION_THRESHOLD
+    ), (
+        f"{_repo_relative(NORMATIVE_DOC)} defines every slug in the family yet "
+        f"does not clear the {_ENUMERATION_THRESHOLD}-slug enumeration threshold "
+        f"(task 3802) — the scan cannot detect an enumeration site at all, so its "
+        f"empty result below would be vacuous."
+    )
+
+    leaked = sorted(_repo_relative(path) for path in scanned if _in_excluded_tree(path))
+    assert not leaked, (
+        f"the enumeration scan returned {len(leaked)} file(s) from the excluded "
+        f"record trees {sorted(_EXCLUDED_TREES)} (task 3802): {leaked[:5]}. Those "
+        f"trees hold point-in-time G7 walk records that must not be retro-edited, "
+        f"so pruning them is the policy, not an optimisation."
+    )
+
+    unregistered = unregistered_enumeration_sites(
+        scanned, PINNED_SITES, family, threshold=_ENUMERATION_THRESHOLD
+    )
+    assert not unregistered, (
+        f"markdown file(s) {unregistered} restate {_ENUMERATION_THRESHOLD}+ "
+        f"invariant slugs but are not in PINNED_SITES (task 3802). Every such "
+        f"copy has to be updated by hand when an invariant is added, and every "
+        f"one this repo has had drifted. Either pin the site here (add it to "
+        f"PINNED_SITES with an assertion covering what it enumerates) or stop "
+        f"enumerating there and point at {_repo_relative(NORMATIVE_DOC)} instead. "
+        f"Note that plans/ and docs/prds/ are excluded on purpose — they record "
+        f"point-in-time G7 walks that must not be retro-edited — so a new PRD "
+        f"transcribing slugs will never appear here."
+    )
+
+
+# ---------------------------------------------------------------------------
+# invariant_alias_pairs / near_miss_alias_pairs — the near-miss ALIAS guard
+#
+# A slug is only a stable id if a citation naming it agrees with the number it
+# is filed under. Task 3803 measured the failure mode on live data: the phantom
+# `no-silent-fail-soft` was minted independently in dozens of comments, and the
+# numbered ones reached for INV-2 five times and INV-4 once because neither fit.
+# Promotion to INV-11 makes those citations correct in place — but only the ones
+# that carry the RIGHT number, and nothing was watching the number.
+#
+# THE GUARD IS A NEAR-MISS DETECTOR, NOT A VOCABULARY CHECK. This repo carries
+# module-local INV-n numbering schemes that have nothing to do with the design
+# invariants (task 2885's PRD-local `INV-3 dangling-successor-edge`,
+# test_lock_table.py's per-module park-stack `INV-1: strictly-higher-priority`).
+# A universal "every INV-n pairing must be canonical" check flags those, and a
+# guard that is wrong half the time gets silenced — the same failure mode this
+# module already warns about at `_ENUMERATION_THRESHOLD`.
+# ---------------------------------------------------------------------------
+
+# HAND-WRITTEN fixture data, not a snapshot of the live family. It mirrors the
+# live family's SHAPES (a four-segment slug, two slugs sharing no prefix, a slug
+# whose truncation is a plausible alias) because the confusability rule can only
+# be pinned against realistic tokens. It is deliberately non-contiguous — 1..5
+# then 9 — so no reader mistakes it for a copy that has to be kept in sync: the
+# live assertions derive their vocabulary from `canonical_family()`, and adding
+# or renaming an invariant must leave this fixture untouched.
+_ALIAS_FIXTURE_FAMILY = [
+    (1, "contracts-machine-checked"),
+    (2, "structured-facts-at-failure"),
+    (3, "corroborate-before-acting"),
+    (4, "storm-escape-required"),
+    (5, "no-lockstep-duplication"),
+    (9, "no-silent-fail-soft"),
+]
+
+_ALIAS_HAPPY = """\
+The escalation path refuses rather than returning None (INV-2 no-silent-fail-soft).
+Aggregate audibility is a separate question (INV-4 storm-escape-required).
+A second sentence cites the same pairing again (INV-2 no-silent-fail-soft).
+"""
+
+# reST double-backtick markup: how this repo's PYTHON docstrings cite a slug,
+# where its markdown uses single backticks. Modelled on the live shape at
+# dashboard/src/dashboard/data/escalations.py.
+_ALIAS_DOUBLE_BACKTICK = '''\
+    """Raise on a truncated scroll instead (INV-2, ``no-silent-fail-soft``).
+
+    A trailing line so the two-line window has a successor to join.
+    """
+'''
+
+# A pairing WRAPPED across a line break, with a `#: ` continuation marker.
+# Modelled on the live shape at fused-memory/scripts/census_memory_metadata.py.
+_ALIAS_WRAPPED = """\
+#: The caller cannot tell the shortfall apart from a clean census (INV-2
+#: no-silent-fail-soft).
+#: A trailing comment line.
+"""
+
+_ALIAS_SUCCESSOR_ONLY = """\
+A line carrying no citation at all.
+The whole pairing lives on this line (INV-4 storm-escape-required).
+A trailing line.
+"""
+
+_ALIAS_NONE = "Prose that cites no invariant by number anywhere in it.\n"
+
+
+def _pair(
+    number: int, token: str, *, line: int = 1, backticks: int = 0, wrapped: bool = False
+) -> AliasPair:
+    """A hand-built alias record, for tests of the RULE rather than the extractor.
+
+    Returns an :class:`AliasPair`, not a bare tuple: `near_miss_alias_pairs`
+    takes `list[AliasPair]`, and `list` is invariant, so a list of plain
+    5-tuples is not assignable to it however identical the field types are.
+    Equality is unaffected either way — a NamedTuple compares equal to the
+    plain tuple with the same members — so the `== pairs` assertions below
+    read exactly as before.
+    """
+    return AliasPair(
+        line=line, number=number, token=token, backticks=backticks, wrapped=wrapped
+    )
+
+
+def test_invariant_alias_pairs_collects_every_pairing_in_document_order() -> None:
+    """Ordered, duplicates preserved, each tagged with the line it starts on.
+
+    Duplicates are kept for the same reason `slugs_in_span` keeps them: the
+    caller is a repair list, and collapsing two occurrences of one wrong pairing
+    into one would under-report the work.
+    """
+    assert invariant_alias_pairs(_ALIAS_HAPPY, source=_FIXTURE_SOURCE) == [
+        _pair(2, "no-silent-fail-soft", line=1),
+        _pair(4, "storm-escape-required", line=2),
+        _pair(2, "no-silent-fail-soft", line=3),
+    ]
+
+
+def test_invariant_alias_pairs_reads_rest_double_backticks() -> None:
+    """A ``double-backticked`` slug is the same citation as a bare one.
+
+    MEASURED on base eba215060c: a one-backtick extractor is BLIND to
+    dashboard/src/dashboard/data/escalations.py:255 — a genuine drift site — so
+    tolerating zero, one or two backticks is a correctness requirement, not a
+    nicety. The backtick COUNT is reported so the live assertion can prove the
+    scan still observes the reST shape rather than trusting the regex.
+    """
+    assert invariant_alias_pairs(_ALIAS_DOUBLE_BACKTICK, source=_FIXTURE_SOURCE) == [
+        _pair(2, "no-silent-fail-soft", line=1, backticks=2)
+    ]
+
+
+def test_invariant_alias_pairs_reads_a_pairing_wrapped_across_a_line_break() -> None:
+    """A pairing split by a line break is reported once, on the line it STARTS on.
+
+    MEASURED: 21 line-spanning pairings exist repo-wide, one of them genuine
+    drift (fused-memory/scripts/census_memory_metadata.py:163). A line-scoped
+    extractor silently misses it and reports a smaller, cleaner-looking result.
+    """
+    assert invariant_alias_pairs(_ALIAS_WRAPPED, source=_FIXTURE_SOURCE) == [
+        _pair(2, "no-silent-fail-soft", line=1, wrapped=True)
+    ]
+
+
+def test_invariant_alias_pairs_attributes_a_pairing_to_exactly_one_line() -> None:
+    """A pairing wholly inside the SUCCESSOR line belongs to that line, once.
+
+    The two-line window makes every pairing visible twice — once as its own
+    line's match and once as its predecessor's continuation. Discarding matches
+    that start past the first line is what keeps the repair list from doubling.
+    """
+    assert invariant_alias_pairs(_ALIAS_SUCCESSOR_ONLY, source=_FIXTURE_SOURCE) == [
+        _pair(4, "storm-escape-required", line=2)
+    ]
+
+
+def test_invariant_alias_pairs_fails_loudly_on_a_text_with_no_pairing() -> None:
+    """No pairing at all RAISES, naming *source*, per the extractor contract."""
+    with pytest.raises(AssertionError) as excinfo:
+        invariant_alias_pairs(_ALIAS_NONE, source=_FIXTURE_SOURCE)
+
+    assert _FIXTURE_SOURCE in str(excinfo.value)
+
+
+def test_near_miss_alias_pairs_flags_a_canonical_slug_under_the_wrong_number() -> None:
+    """The headline drift: the right slug, the wrong number.
+
+    Pinned in all three written forms — bare, reST double-backticked, and
+    wrapped across a line break — because each was a measured blind spot.
+    """
+    pairs = [
+        _pair(2, "no-silent-fail-soft"),
+        _pair(4, "no-silent-fail-soft", line=7),
+        _pair(2, "no-silent-fail-soft", line=9, backticks=2),
+        _pair(2, "no-silent-fail-soft", line=11, wrapped=True),
+    ]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_near_miss_alias_pairs_flags_a_truncation_under_the_wrong_number() -> None:
+    """`INV-2 no-silent-fail` is a truncation of INV-9's slug filed under INV-2.
+
+    Prefix-ness exculpates only under a token's OWN number (see the carve-out
+    test below); under a different one it is precisely the drift being hunted.
+    """
+    pairs = [_pair(2, "no-silent-fail")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_near_miss_alias_pairs_flags_a_paraphrase_under_the_right_number() -> None:
+    """`INV-3 corroborate-before-destroy` shares two segments but DIVERGES.
+
+    A paraphrase, not shorthand: it is not a truncation of
+    `corroborate-before-acting`, it is a different third segment. The number is
+    right and the token still has to be repaired, which is why the rule looks at
+    the token even when the number checks out.
+    """
+    pairs = [_pair(3, "corroborate-before-destroy")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_near_miss_alias_pairs_clears_a_proper_prefix_under_its_own_number() -> None:
+    """Shorthand and hyphen-wrapped line breaks under the RIGHT number are CLEAN.
+
+    THE CARVE-OUT IS LOAD-BEARING. Without it the live guard fires on twelve
+    correct citations against eight true hits (measured on base eba215060c) —
+    `INV-4 storm-escape` nine times, `INV-2 structured-facts` twice, and
+    `INV-1 contracts-machine` once where the full slug is hyphen-wrapped across
+    a comment line break. A guard wrong more often than right gets silenced.
+    """
+    pairs = [
+        _pair(4, "storm-escape"),
+        _pair(2, "structured-facts"),
+        _pair(1, "contracts-machine"),
+        _pair(1, "contracts-machine", line=5, wrapped=True),
+        _pair(4, "storm-escape-required", line=7),
+    ]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_near_miss_alias_pairs_clears_a_module_local_numbering_scheme() -> None:
+    """INV-n schemes that are not the design-invariant family are not drift.
+
+    These are the false positives a naive alias checker cannot survive — real
+    live citations of PRD-local and per-module invariant lists.
+    `instrument-before-acting` is the sharpest: it shares the WORD `before` AND
+    the number INV-3 with `corroborate-before-acting`, yet differs in segment
+    one, so a looser rule would flag three correct sites.
+    """
+    pairs = [
+        _pair(3, "instrument-before-acting"),
+        _pair(3, "dangling-successor-edge"),
+        _pair(1, "strictly-higher-priority"),
+        _pair(3, "dead-base"),
+        _pair(2, "contract-currency"),
+        _pair(5, "single-home"),
+        _pair(4, "loud-over-silent"),
+    ]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_near_miss_alias_pairs_is_asymmetric_in_the_number() -> None:
+    """The SAME token is clean under one number and drift under another.
+
+    Pinned explicitly so a future reader cannot collapse the rule back into a
+    number-blind vocabulary check: `storm-escape` is legitimate shorthand under
+    INV-4 and a near-miss under INV-2.
+    """
+    clean = _pair(4, "storm-escape")
+    drift = _pair(2, "storm-escape", line=3)
+
+    assert near_miss_alias_pairs([clean, drift], _ALIAS_FIXTURE_FAMILY) == [drift]
+
+
+def test_near_miss_alias_pairs_fails_loudly_on_an_empty_family() -> None:
+    """An empty family RAISES rather than clearing every pairing.
+
+    With no canonical slugs to be confusable with, nothing can ever be flagged
+    and the live assertion would report "no drift" while comparing nothing.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        near_miss_alias_pairs([_pair(2, "no-silent-fail-soft")], [])
+
+    assert "family" in str(excinfo.value).lower()
+
+
+def test_alias_pairs_not_in_family_clears_an_exact_pairing() -> None:
+    """An exact `(number, slug)` match is a member of the family — clean."""
+    pairs = [_pair(2, "structured-facts-at-failure")]
+
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_alias_pairs_not_in_family_flags_a_renamed_slug_under_its_own_number() -> None:
+    """RENAME drift: the right number, a slug the family no longer spells that way.
+
+    MEASURED gap: `near_miss_alias_pairs` returns `[]` for this pairing because
+    its limb 3 clears a token confusable with nothing canonical — a renamed
+    slug is exactly that, confusable with neither its own former spelling nor
+    any other canonical slug. Strict membership has no such carve-out.
+    """
+    pairs = [_pair(9, "quiet-degradation-forbidden")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_pairing_under_a_retired_number() -> None:
+    """RETIRE drift: a number the family no longer defines at all.
+
+    Same measured gap as the rename case: the token is confusable with nothing
+    canonical, so `near_miss_alias_pairs` clears it while strict membership
+    cannot — the number is not even a key in the family.
+    """
+    pairs = [_pair(11, "legacy-fallback-behavior")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_renumbered_slug() -> None:
+    """RENUMBER drift: a canonical slug cited under the wrong number.
+
+    Also caught by `near_miss_alias_pairs` (limb 2) — pinned here too so the
+    strict rule's whole coverage is stated in one place rather than split
+    across two test sections.
+    """
+    pairs = [_pair(2, "no-silent-fail-soft")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_proper_prefix_under_its_own_number() -> None:
+    """Shorthand `near_miss_alias_pairs` clears is still not an EXACT member.
+
+    Deliberate asymmetry with the near-miss guard, which carves out a proper
+    prefix under its own number as legitimate shorthand (measured: twelve
+    correct citations live this way — see
+    `test_near_miss_alias_pairs_clears_a_proper_prefix_under_its_own_number`).
+    Strict family membership has no shorthand carve-out: only an exact
+    `(number, slug)` pairing counts as pinned.
+    """
+    pairs = [_pair(4, "storm-escape")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_module_local_numbering_scheme() -> None:
+    """Proof the predicate is UNSAFE to run repo-wide — why it stays per-site.
+
+    `near_miss_alias_pairs` clears this because the token is confusable with
+    nothing canonical — a real citation of a PRD-local invariant list (task
+    2885's `INV-3 dangling-successor-edge`), not this family. Strict family
+    membership has no such carve-out and flags it too, which is exactly why
+    this predicate must never run over ordinary repo content: a guard wrong on
+    every module-local numbering scheme in the repo would be silenced.
+    """
+    pairs = [_pair(3, "dangling-successor-edge")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_filters_per_pair_not_all_or_nothing() -> None:
+    """Per-pair filtering, not all-or-nothing — pins order preservation too.
+
+    MEASURED gap: every other test in this section passes a single-element
+    `pairs` list, so an all-or-nothing mutant (`return list(pairs) if
+    any((n, t) not in family for ...) else []`) survives every one of them.
+    Mirrors `test_near_miss_alias_pairs_is_asymmetric_in_the_number` above,
+    which pins the equivalent per-pair property for the lenient sibling.
+    """
+    clean = _pair(2, "structured-facts-at-failure")
+    drift = _pair(2, "no-silent-fail-soft", line=3)
+
+    assert alias_pairs_not_in_family([clean, drift], _ALIAS_FIXTURE_FAMILY) == [drift]
+
+
+def test_alias_pairs_not_in_family_fails_loudly_on_an_empty_family() -> None:
+    """An empty family RAISES rather than returning `[]`, per the extractor contract.
+
+    With no canonical pairings to check membership against, every pairing
+    would trivially be a non-member and the verdict would be meaningless.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        alias_pairs_not_in_family([_pair(2, "no-silent-fail-soft")], [])
+
+    assert "family" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# doc_anchored_slug_citations / noncanonical_citations — the CITATION guard
+#
+# The second half of task 3803's mechanization. The alias guard above catches a
+# citation filed under the wrong NUMBER; this one catches a citation naming a
+# slug that is not in the family at all — a PHANTOM. `no-silent-fail-soft` was
+# exactly that for months: cited as if canonical in dozens of comments, backed
+# by no heading anywhere, so no vocabulary check could ever have resolved it.
+#
+# BACKTICKED-ONLY, AND ANCHORED WITHIN +/-2 LINES OF A `design-invariants.md`
+# MENTION. Both narrowings are false-positive discipline, and both are what let
+# this guard ship with NO allowlist: ordinary prose is full of kebab phrases
+# (`point-in-time`, `read-before-write`, `machine-readable`), and a check that
+# reported them would be registered away into silence within a release.
+# ---------------------------------------------------------------------------
+
+# The pre-promotion vocabulary: `_ALIAS_FIXTURE_FAMILY` minus its INV-9 entry.
+# Used to model the promotion itself — the same phantom citation is reported
+# against this family and clean against the full one.
+_CITATION_FIXTURE_FAMILY = _ALIAS_FIXTURE_FAMILY[:5]
+
+_CITATION_HAPPY = """\
+The classifier refuses on an unmodelled status rather than folding it into
+`excluded` — see `docs/legibility/design-invariants.md` INV-2
+(`structured-facts-at-failure`), whose shape this mirrors.
+"""
+
+_CITATION_PHANTOM = """\
+Instrumented at the write boundary, per `docs/legibility/design-invariants.md`:
+a partial result must arrive as partial (`no-silent-fail-soft`), never as a
+clean success (`structured-facts-at-failure`).
+"""
+
+_CITATION_FAR = """\
+A paragraph naming `docs/legibility/design-invariants.md` and nothing else.
+One line of unrelated prose.
+Two lines of unrelated prose.
+Three lines of unrelated prose.
+Four lines later, an unrelated `no-lockstep-duplication` mention.
+"""
+
+_CITATION_UNBACKTICKED = """\
+See docs/legibility/design-invariants.md for the family. The verdict table is a
+point-in-time snapshot, the census is machine-readable, and the archive move is
+read-before-write ordered.
+"""
+
+_CITATION_SIBLING_PATH = """\
+Calibration fixtures live at `docs/legibility/design-invariants-fixtures.md`,
+beside `docs/legibility/design-invariants.md` itself.
+"""
+
+_CITATION_TWO_SEGMENT = """\
+`docs/legibility/design-invariants.md` draws the line: a `fail-soft` path is not
+automatically a defect.
+"""
+
+_CITATION_UNANCHORED = """\
+A module docstring citing `no-silent-fail-soft` with no pointer to the
+normative doc anywhere near it.
+"""
+
+# The whole window is the anchor's own path, so scrubbing it leaves nothing.
+_CITATION_PATH_ONLY = "design-invariants.md\n"
+
+
+def test_doc_anchored_slug_citations_collects_backticked_slugs_near_the_anchor() -> None:
+    """A backticked slug within +/-2 lines of the doc's path is a CITATION.
+
+    ``excluded`` (one segment) is in the fixture on purpose: the shape floor is
+    at least three hyphen-separated segments, which every canonical slug clears.
+    """
+    assert doc_anchored_slug_citations(_CITATION_HAPPY, source=_FIXTURE_SOURCE) == [
+        (3, "structured-facts-at-failure")
+    ]
+
+
+def test_doc_anchored_slug_citations_ignores_a_token_beyond_the_window() -> None:
+    """Four lines from the anchor is prose, not a citation of the family.
+
+    The window is what keeps this guard free of an allowlist. Scanning whole
+    files instead would drag in every kebab token in a 15k-line module.
+    """
+    assert doc_anchored_slug_citations(_CITATION_FAR, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_ignores_unbackticked_prose() -> None:
+    """`point-in-time`, `machine-readable`, `read-before-write` are not citations.
+
+    Backticked-only is deliberate false-positive discipline: unbackticked kebab
+    phrases sit beside doc pointers constantly, and reporting them would train
+    readers to silence the guard rather than fix a slug.
+    """
+    assert doc_anchored_slug_citations(_CITATION_UNBACKTICKED, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_never_reports_the_anchor_itself() -> None:
+    """The doc's own path — and its sibling fixtures path — are not citations.
+
+    ``design-invariants-fixtures`` is a three-segment kebab token, so an
+    extractor that tokenized the anchor would report the pointer that made it
+    look and stay red forever on correct documentation.
+    """
+    assert doc_anchored_slug_citations(_CITATION_SIBLING_PATH, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_ignores_a_token_below_the_shape_floor() -> None:
+    """Two segments is prose (`fail-soft`); three is the floor every slug clears."""
+    assert doc_anchored_slug_citations(_CITATION_TWO_SEGMENT, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_returns_nothing_for_an_unanchored_text() -> None:
+    """No pointer to the doc, no citation — a quiet ``[]``, not a failure.
+
+    Most files in the repo are this shape, so it must not be loud. The
+    non-vacuity guarantee is a property of the whole SCAN (the live assertion
+    checks that at least one canonical citation was examined repo-wide), not of
+    each file read in isolation.
+    """
+    assert doc_anchored_slug_citations(_CITATION_UNANCHORED, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_fails_loudly_when_nothing_remains_to_examine() -> None:
+    """An anchor whose whole window scrubs away to nothing RAISES, naming *source*.
+
+    This is the extractor contract's floor: the anchor was found, so the text
+    IS about the invariant family, yet the scan has no text left to look at.
+    Returning ``[]`` there is indistinguishable from "cited nothing wrong".
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        doc_anchored_slug_citations(_CITATION_PATH_ONLY, source=_FIXTURE_SOURCE)
+
+    assert _FIXTURE_SOURCE in str(excinfo.value)
+
+
+def test_noncanonical_citations_reports_a_phantom_slug() -> None:
+    """A cited slug backed by no heading is the defect this guard exists for."""
+    citations = doc_anchored_slug_citations(_CITATION_PHANTOM, source=_FIXTURE_SOURCE)
+
+    assert noncanonical_citations(citations, _CITATION_FIXTURE_FAMILY) == [
+        (2, "no-silent-fail-soft")
+    ]
+
+
+def test_noncanonical_citations_clears_the_phantom_once_it_is_promoted() -> None:
+    """Promotion resolves the phantom IN PLACE — the citation never moves.
+
+    This is the whole economic case for promoting `no-silent-fail-soft` to INV-11
+    rather than rewriting its citations: the same text is a defect against the
+    pre-promotion vocabulary and correct against the post-promotion one.
+    """
+    citations = doc_anchored_slug_citations(_CITATION_PHANTOM, source=_FIXTURE_SOURCE)
+
+    assert noncanonical_citations(citations, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
+    """An empty family RAISES rather than reporting every citation as a phantom."""
+    with pytest.raises(AssertionError) as excinfo:
+        noncanonical_citations([(1, "structured-facts-at-failure")], [])
+
+    assert "family" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# _citation_scan_files — the drift scan's file walk
+#
+# The `.py`-and-`.md` sibling of `_enumeration_scan_files`. Two walks that must
+# agree on a prune policy byte-for-byte would be exactly the lock-step
+# duplication INV-5 forbids — and this module exists to enforce that family — so
+# both are built on ONE shared walker and differ only in their extension set and
+# in this module's self-exclusion.
+#
+# SELF-EXCLUSION IS NOT COSMETIC. The fixtures above embed deliberate decoy
+# pairings (`INV-3 dangling-successor-edge`, `INV-2 no-silent-fail`) and a
+# phantom citation. Without excluding this file, the live assertions would go
+# red on the guard's own test data — the identical hazard `_scan_label`'s
+# docstring documents for the `tmp_path` fixtures.
+# ---------------------------------------------------------------------------
+
+def _write_scan_tree(
+    root: Path, relative_paths: list[str], *, untracked: tuple[str, ...] = ()
+) -> None:
+    """Build a real git repo at *root*: *relative_paths* end up TRACKED via
+    ``git init`` + ``git add -A -f``; any *untracked* paths are written only
+    AFTER the add, so they stay out of the index.
+
+    A real repo, not a bare directory: task 4971 re-sources the scan from
+    ``git ls-files``, so trackedness must be exercised by the fixture rather
+    than asserted by reading the code — the same reasoning `_in_excluded_tree`'s
+    docstring gives for taking `root` from the caller. No commit and no
+    `user.email`/`user.name` config is needed: `git ls-files` reads the index,
+    not history. Both git calls go through `_run_git`, which scrubs ambient
+    `GIT_*` overrides — an ambient `GIT_DIR` would otherwise silently retarget
+    `git init`/`git add` at a different repository than *root*.
+    """
+    for relative in relative_paths:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    for args in (("init", "-q"), ("add", "-A", "-f")):
+        _run_git(list(args), cwd=root)
+
+    for relative in untracked:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+
+def test_citation_scan_files_collects_python_and_markdown(tmp_path: Path) -> None:
+    """Both extensions, and NOTHING else — `.jsonl` in particular.
+
+    The extension set is what keeps `shared/tests/fixtures/toolcall_markup_corpus
+    .jsonl` structurally out of reach. That file carries the phantom slug but is
+    a CAPTURED replay corpus, regenerated only by its extract script; a guard
+    that reported it would invite a hand-edit that corrupts the fixture.
+    """
+    _write_scan_tree(tmp_path, ["a.py", "b.md", "corpus.jsonl", "notes.txt", "pkg/c.py"])
+
+    assert _citation_scan_files(root=tmp_path) == [
+        tmp_path / "a.py",
+        tmp_path / "b.md",
+        tmp_path / "pkg" / "c.py",
+    ]
+
+
+def test_citation_scan_files_prunes_the_point_in_time_record_trees(tmp_path: Path) -> None:
+    """`plans/` and `docs/prds/` stay pruned, via the SHARED `_in_excluded_tree`.
+
+    Reused rather than re-specified: those trees hold PRDs and capability
+    manifests that transcribe slugs as G7 walk records of the family AS IT WAS,
+    so a citation there is history, not drift, and repairing it would mean
+    rewriting the record.
+    """
+    _write_scan_tree(
+        tmp_path, ["plans/a-prd.md", "docs/prds/b-prd.py", "docs/legibility/c.md"]
+    )
+
+    assert _citation_scan_files(root=tmp_path) == [tmp_path / "docs" / "legibility" / "c.md"]
+
+
+def test_citation_scan_files_prunes_dot_and_vendored_directories(tmp_path: Path) -> None:
+    """Dot-directories and vendored trees are pruned for the same cost reason.
+
+    `.worktrees/` in the main checkout holds a full repo copy per in-flight task,
+    which is what made an unpruned glob unfinishable in 120s when the enumeration
+    scan measured it.
+    """
+    _write_scan_tree(
+        tmp_path,
+        [
+            ".worktrees/3803/a.py",
+            "node_modules/b.md",
+            "pkg/__pycache__/c.py",
+            "pkg/keep.py",
+        ],
+    )
+
+    assert _citation_scan_files(root=tmp_path) == [tmp_path / "pkg" / "keep.py"]
+
+
+def test_citation_scan_files_excludes_this_guard_module() -> None:
+    """LIVE: the scan never reads the file whose fixtures are deliberate decoys.
+
+    Two-sided on purpose. Absence alone would also be satisfied by a walk that
+    collected nothing at all, so this pins that the same walk DOES reach this
+    module's directory — the exclusion is targeted, not a broken walk.
+    """
+    scanned = _citation_scan_files()
+
+    assert _THIS_MODULE not in scanned
+    assert _THIS_MODULE.parent / "conftest.py" in scanned
+
+
+def test_citation_scan_files_fails_loudly_on_an_empty_scan(tmp_path: Path) -> None:
+    """An empty result RAISES rather than reporting a clean repo.
+
+    Same contract as `unregistered_enumeration_sites`: "no drift found" and
+    "nothing was read" are indistinguishable downstream, and only one of them is
+    good news. The repo is initialised but empty — a non-repo root is a
+    different, louder failure mode covered separately (task 4971).
+    """
+    _write_scan_tree(tmp_path, [])
+
+    with pytest.raises(AssertionError) as excinfo:
+        _citation_scan_files(root=tmp_path)
+
+    assert "no files" in str(excinfo.value).lower()
+
+
+def test_citation_scan_files_ignores_untracked_files(tmp_path: Path) -> None:
+    """Reproduces task 4971 hermetically: an untracked file must not be scanned.
+
+    `project_root`'s gitignored `/data/` holds live escalation-watcher output.
+    `_citation_scan_files` used to walk the filesystem, so a digest the watcher
+    had just rewritten under `data/escalations/afk-digest.md` was scanned too —
+    and it happened to carry several backticked `esc-<task>-<n>` tokens beside
+    a `design-invariants.md` mention, which the citation guard's anchor logic
+    reads exactly like a slug citation. The guard went red over five "phantom"
+    citations that were never committed, while an otherwise-identical worktree
+    with no `data/` directory at all stayed green — the verdict was a property
+    of watcher timing, not of repo content.
+
+    The untracked fixture below is not merely absent-by-name: its body is the
+    same shape (an anchor mention within `_CITATION_WINDOW` lines of backticked
+    tokens), so it would actively surface as phantom citations were the scan to
+    reach it. Must FAIL against the os.walk-based walker, which returns both
+    files with no regard for git's index.
+    """
+    _write_scan_tree(
+        tmp_path,
+        ["docs/legibility/note.md"],
+        untracked=("data/escalations/afk-digest.md",),
+    )
+    (tmp_path / "data" / "escalations" / "afk-digest.md").write_text(
+        "Filed against `docs/legibility/design-invariants.md`'s citation guard:\n"
+        "`esc-3381-7`, `esc-3780-3`, `esc-3815-4`, `esc-4293-3`, `esc-4184-4`.\n",
+        encoding="utf-8",
+    )
+
+    scanned = _citation_scan_files(root=tmp_path)
+
+    assert tmp_path / "docs" / "legibility" / "note.md" in scanned
+    assert tmp_path / "data" / "escalations" / "afk-digest.md" not in scanned
+
+
+def test_citation_scan_files_skips_index_entries_absent_from_the_worktree(
+    tmp_path: Path,
+) -> None:
+    """A deleted-but-tracked index entry must be dropped, not crash the scan.
+
+    `git ls-files` keeps listing a path after it is deleted from the working
+    tree — verified in a scratch repo, and routine in a mid-rebase or
+    mid-merge tree. Left unguarded, mapping every index entry straight to
+    `root / relative` hands `_live_citations`/`_live_alias_pairs` a path whose
+    `read_text` raises `FileNotFoundError`, crashing the guard for a reason
+    that has nothing to do with citation drift. Must FAIL against the step-2
+    walker, which performs no `is_file()` check.
+    """
+    _write_scan_tree(tmp_path, ["keep.md", "gone.md"])
+    (tmp_path / "gone.md").unlink()
+
+    scanned = _citation_scan_files(root=tmp_path)
+
+    assert scanned == [tmp_path / "keep.md"]
+    for path in scanned:
+        path.read_text(encoding="utf-8")
+
+
+def test_walk_repo_files_fails_loudly_when_the_tracked_file_oracle_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A non-repo root must RAISE, actionably — never fall back to a filesystem walk.
+
+    `tmp_path` is deliberately never made into a git repo here. Git does NOT
+    refuse to look outside `cwd`: it resolves the enclosing repo by walking UP
+    from `cwd`, ceiling-less by default — verified: from a `deep/nested`
+    directory below an initialised repo, `git ls-files` still finds that repo
+    and exits 0. So this test's hermeticity was never about git declining to
+    walk up; it depends on pytest's default `tmp_path` base
+    (`/tmp/pytest-of-*`) happening to sit outside any repo. Guarded explicitly
+    below rather than assumed, because a `--basetemp` or `TMPDIR` pointed
+    inside a checkout would otherwise make `_walk_repo_files` silently return
+    `[]` instead of raising, under nothing but ambient test-runner
+    configuration.
+
+    A silent filesystem fall-back here would restore the exact incident this
+    task fixes, and do so precisely where nobody is watching —
+    `no-silent-fail-soft` is a canonical slug in the family this module
+    enforces. Asserts on the STRUCTURED facts a reader needs to act (the
+    offending root, and that the scan sources from tracked files), never on
+    git's raw stderr wording, which is the git binary's implementation detail,
+    not this module's contract (`structured-facts-at-failure`). Must FAIL
+    against step-2/step-4, where `check=True` surfaces a bare
+    `subprocess.CalledProcessError` naming neither.
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        env=_scrubbed_git_env(),
+    )
+    if probe.returncode == 0:
+        pytest.skip(
+            f"{tmp_path} resolves inside a git repository via git's ceiling-less "
+            f"upward search from cwd, so this environment cannot exercise the "
+            f"non-repo failure mode hermetically."
+        )
+
+    with pytest.raises(Exception) as excinfo:
+        _walk_repo_files(tmp_path, (".py", ".md"))
+
+    message = str(excinfo.value)
+    assert str(tmp_path) in message, message
+    assert "tracked" in message.lower(), message
+
+
+def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
+    """ANTI-REGRESSION PIN: the SHARED walker excludes untracked `.md`, not just `.py`.
+
+    `_enumeration_scan_files` has no `root` seam of its own — it hardcodes
+    `_walk_repo_files(REPO_ROOT, (".md",))` — so this exercises the shared
+    walker directly instead. `project_root` carries 3313 untracked
+    `data/**/*.md` watcher digests (task 4971), any one of which could cross
+    `_ENUMERATION_THRESHOLD` and turn `test_every_enumeration_site_is_pinned`
+    red on nothing but watcher timing — the identical flake fixed for the
+    citation scan, because both scans share this one walker.
+
+    The untracked fixture restates FOUR canonical slugs, at
+    `_ENUMERATION_THRESHOLD`: it is not merely absent-by-name, it is the exact
+    shape that would flag as an enumeration site were the walk to reach it.
+
+    Expected to PASS already on arrival — the walker is shared with
+    `_citation_scan_files`, fixed in step-2/step-6, so this is not a RED test.
+    It is kept as an explicit anti-regression PIN: a future change that
+    re-narrows the tracked-file fix back onto `_citation_scan_files` alone, or
+    that re-diverges the enumeration path onto its own filesystem walk, must
+    turn this red.
+    """
+    _write_scan_tree(
+        tmp_path,
+        ["docs/site.md"],
+        untracked=("data/digests/digest.md",),
+    )
+    (tmp_path / "data" / "digests" / "digest.md").write_text(
+        "Restates the family: `contracts-machine-checked`, "
+        "`structured-facts-at-failure`, `corroborate-before-acting`, "
+        "`storm-escape-required`.\n",
+        encoding="utf-8",
+    )
+
+    assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "site.md"]
+
+
+# ---------------------------------------------------------------------------
+# LIVE: the two repo-wide drift assertions
+#
+# Everything above pins the RULES against hand-written fixtures. These two read
+# the repo and are the assertions that actually go red when a citation drifts.
+#
+# Both derive their vocabulary from `canonical_family()` — never a slug list
+# stored here, which would be one more lock-step copy of the family and stale on
+# the next invariant, exactly like the prose sites this module was written for.
+#
+# MEASURED ON BASE 16fd29df5698, under the tracked-file oracle (task 4971), as
+# a starting point rather than a pinned constant: the scan reads 1845 files
+# and finds 153 exactly-correct pairings, 12 legitimate shorthand prefixes, 14
+# written with reST double-backticks and 36 wrapped across a line break —
+# these four are the overlapping ANTI-VACUITY OBSERVATIONS the test below
+# gates on, not a partition, so they do not sum to a pairing total. It finds
+# 14 doc-anchored backticked citations, all canonical.
+#
+# `git ls-files` reports the `graphiti` and `mem0` submodules as gitlink
+# entries rather than descending into their trees, so their vendored upstream
+# files never reach either scan — they are not this repo's authored content,
+# and the counts above were re-measured AFTER that drop, not compensated for
+# it.
+# ---------------------------------------------------------------------------
+
+
+def _live_alias_pairs(files: list[Path]) -> list[tuple[str, AliasPair]]:
+    """Every numbered pairing in *files*, each tagged with its scan label."""
+    found: list[tuple[str, AliasPair]] = []
+    for path in files:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found.extend((_scan_label(path), pair) for pair in _alias_pairs_in(text))
+    return found
+
+
+def _live_citations(files: list[Path]) -> list[tuple[str, int, str]]:
+    """Every doc-anchored backticked slug citation in *files*, with its label."""
+    found: list[tuple[str, int, str]] = []
+    for path in files:
+        label = _scan_label(path)
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found.extend(
+            (label, line, token)
+            for line, token in doc_anchored_slug_citations(text, source=label)
+        )
+    return found
+
+
+def _assert_scan_is_trustworthy(scanned: list[Path]) -> None:
+    """The scan reached the repo and stayed out of the point-in-time record trees.
+
+    Non-emptiness is already loud inside ``_citation_scan_files``; what this adds
+    is the other direction — a walk that stopped pruning would report drift in
+    ``plans/`` and ``docs/prds/``, whose G7 walk records transcribe the family AS
+    IT WAS and must never be retro-edited.
+    """
+    leaked = sorted(_scan_label(path) for path in scanned if _in_excluded_tree(path))
+    assert not leaked, (
+        f"the citation scan returned {len(leaked)} file(s) from the excluded "
+        f"record trees {sorted(_EXCLUDED_TREES)} (task 3803): {leaked[:5]}. Those "
+        f"trees hold point-in-time G7 walk records that must not be retro-edited, "
+        f"so pruning them is the policy, not an optimisation."
+    )
+
+
+def test_no_invariant_alias_contradicts_the_canonical_family() -> None:
+    """LIVE: no `INV-<n>` cites a token confusable with a DIFFERENT invariant.
+
+    The drift this catches is a slug filed under the wrong number — a citation
+    that looks canonical, satisfies any vocabulary check, and sends a reader to
+    the wrong invariant. `no-silent-fail-soft` accumulated six of them while it
+    had no number of its own.
+
+    FOUR ANTI-VACUITY OBSERVATIONS gate the verdict, because an empty drift list
+    is this guard's strongest possible claim and a narrowed regex produces the
+    same empty list. The scan must still observe (1) an exactly-correct pairing,
+    (2) a legitimate prefix shorthand — proof the carve-out did not swallow
+    everything — (3) a pairing written with reST double-backticks and (4) one
+    wrapped across a line break. The last two are not hypothetical shapes: each
+    hides one of the eight sites this task exists to repair, and a regression
+    narrowing the extractor back to single-backtick or single-line matching
+    would otherwise read GREEN while going blind to them.
+    """
+    family = canonical_family()
+    canonical = dict(family)
+    scanned = _citation_scan_files()
+    _assert_scan_is_trustworthy(scanned)
+
+    pairs = _live_alias_pairs(scanned)
+    exact = [p for _, p in pairs if p.token == canonical.get(p.number)]
+    shorthand = [
+        p
+        for _, p in pairs
+        if p.number in canonical and _is_proper_prefix(p.token, canonical[p.number])
+    ]
+    double_backticked = [p for _, p in pairs if p.backticks == 2]
+    line_wrapped = [p for _, p in pairs if p.wrapped]
+
+    assert exact and shorthand, (
+        f"the alias scan observed {len(exact)} exactly-correct and "
+        f"{len(shorthand)} shorthand pairing(s) across {len(scanned)} files (task "
+        f"3803). Both must be non-zero before an empty drift list means anything: "
+        f"zero correct pairings means the extractor stopped matching, and zero "
+        f"shorthand ones means the prefix carve-out is swallowing every pairing."
+    )
+    assert double_backticked and line_wrapped, (
+        f"the alias scan observed {len(double_backticked)} double-backticked and "
+        f"{len(line_wrapped)} line-wrapped pairing(s) (task 3803). Both shapes "
+        f"exist in abundance in this repo — reST markup in Python docstrings, and "
+        f"long citations wrapped across a comment line break — and each hides a "
+        f"real drift site, so zero of either means the extractor was narrowed and "
+        f"is now blind rather than clean."
+    )
+
+    drifted = [
+        (label, pair.line, pair.number, pair.token)
+        for label, pair in pairs
+        if near_miss_alias_pairs([pair], family)
+    ]
+    assert not drifted, (
+        f"{len(drifted)} invariant citation(s) name a token confusable with a "
+        f"DIFFERENT invariant than the number they are filed under (task 3803): "
+        f"{drifted}. Each entry is (file, line, number, token). Either the number "
+        f"is wrong (renumber the citation) or the token is a paraphrase of the "
+        f"canonical slug (respell it). The canonical family is "
+        f"{family} — parsed from {_repo_relative(NORMATIVE_DOC)}, which is the "
+        f"only place a slug is defined. Shorthand under the RIGHT number is "
+        f"deliberately not reported, so everything listed here is real drift."
+    )
+
+
+def test_every_doc_anchored_slug_citation_is_canonical() -> None:
+    """LIVE: no backticked slug is cited beside the doc without a heading behind it.
+
+    A PHANTOM slug is worse than a wrong one: it reads as canonical, resolves to
+    nothing, and cannot be found by any by-slug lookup, so it accumulates
+    citations indefinitely. `no-silent-fail-soft` did exactly that for months.
+
+    Gated on observing at least one CANONICAL citation, for the same reason as
+    the alias assertion above: with none, "no phantom citations" would be a
+    verdict about a scan that read nothing.
+    """
+    family = canonical_family()
+    slugs = set(canonical_slugs())
+    scanned = _citation_scan_files()
+    _assert_scan_is_trustworthy(scanned)
+
+    citations = _live_citations(scanned)
+    canonical_seen = [c for c in citations if c[2] in slugs]
+    assert canonical_seen, (
+        f"the citation scan examined {len(scanned)} files and found no CANONICAL "
+        f"backticked slug cited beside {_repo_relative(NORMATIVE_DOC)} at all "
+        f"(task 3803). This repo has many; zero means the anchor or the token "
+        f"shape stopped matching, so an empty phantom list below would be a "
+        f"verdict about nothing."
+    )
+
+    phantom = [
+        (label, line, token)
+        for label, line, token in citations
+        if noncanonical_citations([(line, token)], family)
+    ]
+    assert not phantom, (
+        f"{len(phantom)} backticked slug(s) are cited beside "
+        f"{_repo_relative(NORMATIVE_DOC)} with no `## INV-N `slug`` heading "
+        f"behind them (task 3803): {phantom}. Each entry is (file, line, token). "
+        f"Either the concept deserves an invariant of its own — add the heading, "
+        f"its gates.md trigger shape and its fixtures in the SAME commit — or the "
+        f"citation means an existing one and should name it. The canonical "
+        f"vocabulary is {sorted(slugs)}."
+    )

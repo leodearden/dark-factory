@@ -10,5 +10,42 @@ Environment=ORCH_UNIT=orchestrator-watchdog.service
 # Python implementation 2026-05-28: ss-based probe, startup-grace window,
 # is_unit_enabled skip, tested in tests/scripts/test_orchestrator_watchdog.py.
 ExecStart=/home/leo/src/dark-factory/scripts/orchestrator-watchdog.py
+# Belt-and-braces bound on the WHOLE tick. systemd disables TimeoutStartSec for
+# Type=oneshot by default, and orchestrator-watchdog.timer's OnUnitActiveSec=60
+# measures from THIS unit's last activation — so a tick that never returns is
+# not a slow tick, it is the END of supervision: the timer never re-triggers
+# and nothing says so. Every child the script spawns is already individually
+# bounded (probe/show 5s, reset-failed 10s, stop/start 45s, the delegated
+# `systemd-run --no-block` fleet/fm redeploy registrations 10s, the fm
+# /health fetch 15s, and now systemd-cat itself 5s), but a single tick can run
+# several of those sequentially: main() alone walks up to 7 WATCHED units, and
+# a full stop+reset-failed+start restart on a wedged unit is ~100s on its own.
+# Absolute worst case in one tick — every WATCHED unit AND fused-memory wedged
+# and restarted, plus the staleness passes walking every running unit — is
+# roughly 7*(5+5+5+100) + (5+5+5+15+100) + 120 + 40 ≈ 1100s. 1800 clears that
+# with margin, so this can only ever fire on a genuine wedge (stuck journald,
+# uninterruptible I/O), never on a legitimately slow multi-unit restart tick.
+#
+# Why 1800 and not the 300 the sibling orchestrator-*.service / dashboard-
+# watchdog units use, given that a wedge then goes unsupervised for up to 30min:
+#   1. A bound BELOW the ~1100s worst case does not just abort one slow tick,
+#      it starves the tail. main() always walks WATCHED in the same order, so a
+#      kill at, say, 600s lands mid-recovery every time and the last units in
+#      the list are never reached — a permanent hole in supervision, which is
+#      worse than the bounded outage this directive exists to cap. The restart
+#      work being idempotent makes the retry safe, not productive.
+#   2. This is the SECOND bound, not the first. Every child is individually
+#      bounded (max 45s), so reaching 1800s at all requires a child that
+#      outlives its own timeout — a D-state/uninterruptible wait, which neither
+#      SIGTERM nor SIGKILL clears, so a tighter number would not shorten the
+#      real outage either. It is a last-resort unwedge, not the working bound.
+# If WATCHED grows or the per-child bounds rise, re-derive the ~1100s figure
+# above and keep this comfortably clear of it rather than tuning it downward.
+TimeoutStartSec=1800
 StandardOutput=journal
+# The script logs its decisions via systemd-cat -t orchestrator-watchdog; this
+# routes anything else it prints (e.g. the stderr fallback in log() when
+# systemd-cat itself is unavailable or wedged) to the same journal, so
+# `journalctl --user -t orchestrator-watchdog` is the single place to read why
+# this watchdog acted.
 StandardError=journal

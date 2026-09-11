@@ -12,10 +12,9 @@ from __future__ import annotations
 import json
 
 import pytest
+import trial_module_tagger_haiku as mod  # pyright: ignore[reportMissingImports]
 
 from orchestrator import module_tagger_prompt
-
-import trial_module_tagger_haiku as mod
 
 
 def _extract_json_block(md: str) -> dict:
@@ -212,11 +211,11 @@ def _summary(*, haiku_f1, sonnet_f1, jaccard, worse, n):
 
 
 def test_decision_thresholds_are_module_level_named_constants():
-    assert mod.F1_PARITY_BAND == pytest.approx(0.05)
-    assert mod.F1_FAIL_GAP == pytest.approx(0.15)
-    assert mod.AGREEMENT_FLOOR == pytest.approx(0.70)
-    assert mod.AGREEMENT_FAIL == pytest.approx(0.50)
-    assert mod.ADJ_WORSE_FAIL == pytest.approx(0.60)
+    assert pytest.approx(0.05) == mod.F1_PARITY_BAND
+    assert pytest.approx(0.15) == mod.F1_FAIL_GAP
+    assert pytest.approx(0.70) == mod.AGREEMENT_FLOOR
+    assert pytest.approx(0.50) == mod.AGREEMENT_FAIL
+    assert pytest.approx(0.60) == mod.ADJ_WORSE_FAIL
     assert mod.MIN_SAMPLES == 20
 
 
@@ -424,7 +423,9 @@ def _make_adjudicate_fn(calls):
 
     def adjudicate_fn(prompt):
         calls.append(prompt)
-        tid = re.search(r'^id: (\S+)$', prompt, re.MULTILINE).group(1)
+        match = re.search(r'^id: (\S+)$', prompt, re.MULTILINE)
+        assert match, f'adjudication prompt carries no "id:" line: {prompt!r}'
+        tid = match.group(1)
         return {'winner': _WINNERS[tid]}
 
     return adjudicate_fn
@@ -456,10 +457,13 @@ def test_run_trial_adjudicates_only_haiku_sonnet_disagreements():
     mod.run_trial(_ALL_TASKS, _DIRS, _make_invoke_fn(invoke_calls),
                   _make_adjudicate_fn(adj_calls))
 
+    def _task_id(prompt: str) -> str:
+        match = re.search(r'^id: (\S+)$', prompt, re.MULTILINE)
+        assert match, f'adjudication prompt carries no "id:" line: {prompt!r}'
+        return match.group(1)
+
     # T1 haiku==sonnet (exact agreement) → NOT adjudicated; T2/T3/T4 disagree.
-    adjudicated_ids = {
-        re.search(r'^id: (\S+)$', p, re.MULTILINE).group(1) for p in adj_calls
-    }
+    adjudicated_ids = {_task_id(p) for p in adj_calls}
     assert adjudicated_ids == {'2', '3', '4'}
     assert len(adj_calls) == 3
 

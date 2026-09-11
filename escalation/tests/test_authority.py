@@ -18,6 +18,8 @@ stays in sync with the duplicated string.
 
 from __future__ import annotations
 
+import pytest
+
 from escalation.authority import (
     L2_AUTO_CLOSE_ACTION,
     L2_AUTO_CLOSE_ALLOWLIST,
@@ -81,6 +83,54 @@ class TestCrossLayerIdentityLockstep:
         assert identity in PROMOTE_ALLOWED, (
             f'Real watcher identity {identity!r} must remain in PROMOTE_ALLOWED'
         )
+
+    def test_runner_curator_category_is_in_the_deny_list(self) -> None:
+        """The category the DeterministicRunner ACTUALLY files stays denied.
+
+        Same anti-drift shape as the ``_WATCHER_AUTO_IDENTITY`` pin above, for
+        the same documented reason: the string lives as a bare literal in
+        ``orchestrator.deterministic_runner`` and again in this package's
+        denylist, with nothing otherwise tying the two together — so a rename
+        on either side would silently re-open the auto-close hole while every
+        test stayed green.
+
+        The orchestrator import is FUNCTION-LOCAL, exactly as
+        ``test_watcher_wire_identity_is_mapped_and_promote_allowed`` does it:
+        escalation is the lower fleet-wide package and must not module-level
+        import orchestrator (see authority.py's module docstring).
+        """
+        from orchestrator.deterministic_runner import (
+            CURATOR_ADJUDICATION_MISSING_CATEGORY,
+        )
+
+        assert CURATOR_ADJUDICATION_MISSING_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES, (
+            f'The category the DeterministicRunner actually files '
+            f'({CURATOR_ADJUDICATION_MISSING_CATEGORY!r}) must be denied auto-close'
+        )
+
+    def test_runner_milestone_categories_are_in_the_deny_list(self) -> None:
+        """The runner's OTHER two born-at-L2 categories stay denied too.
+
+        Reviewer amendment: 'milestone_gate' and 'milestone_check_failed' sit in
+        the same denylist with the same exposure as the curator category above,
+        so pinning only the curator one would leave the identical silent-rename
+        hole open on its siblings — and leave a reader of authority.py with an
+        unexplained asymmetry between members of one frozenset.
+
+        Asserted in a SEPARATE test from the curator pin (not appended to it) so
+        a milestone rename and a curator rename identify themselves distinctly
+        in the failure report.
+        """
+        from orchestrator.deterministic_runner import (
+            MILESTONE_CHECK_FAILED_CATEGORY,
+            MILESTONE_GATE_CATEGORY,
+        )
+
+        for category in (MILESTONE_GATE_CATEGORY, MILESTONE_CHECK_FAILED_CATEGORY):
+            assert category in L2_AUTO_CLOSE_DENY_CATEGORIES, (
+                f'The category the DeterministicRunner actually files '
+                f'({category!r}) must be denied auto-close'
+            )
 
 
 class TestL2AutoCloseClass:
@@ -192,8 +242,19 @@ class TestL2AutoCloseClass:
         )
         assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
 
+    def test_stale_task_scoped_status_colon_citation(self) -> None:
+        """The anchored 'status=' alternative also accepts the ':' spelling —
+        untouched by the task-4192 tightening, pinned here as a regression guard."""
+        resolution = 'probe: get_task 604 -> status: cancelled'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
+
     def test_stale_task_scoped_rescoped_citation(self) -> None:
-        resolution = 'Subject task was re-scoped per get_task; escalation moot.'
+        resolution = 'get_task 3821 -> re-scoped to task 3821; escalation moot.'
         result = l2_auto_close_class(
             identity=self.WATCHER, level=2, action='close_only',
             category='task_failure', agent_role='some-agent',
@@ -202,13 +263,136 @@ class TestL2AutoCloseClass:
         assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
 
     def test_stale_task_scoped_redispatched_citation(self) -> None:
-        resolution = 'Subject task was re-dispatched per get_task; escalation moot.'
+        resolution = 'Subject task re-dispatched as run-abc123/3821 per get_task; escalation moot.'
         result = l2_auto_close_class(
             identity=self.WATCHER, level=2, action='close_only',
             category='task_failure', agent_role='some-agent',
             resolution=resolution,
         )
         assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
+
+    @pytest.mark.parametrize(
+        'resolution',
+        (
+            're-scoped into 3821',
+            're-scoped as task 3821',
+            'rescoped to 3821',
+            're-dispatched as task 3821',
+            'redispatched as run abc123',
+            # '#'-prefixed / quoted spellings: how this repo idiomatically
+            # writes a task reference ('Task #841'), so the watcher will reach
+            # for them. Punctuation must not disqualify an otherwise-good
+            # citation, or a legitimate close silently fails level_forbidden.
+            're-scoped to task #3821',
+            're-scoped to #3821',
+            're-scoped to `3821`',
+            're-scoped to "task 3821"',
+            're-dispatched as run #abc123',
+            're-dispatched as `run-abc123`',
+        ),
+    )
+    def test_stale_task_scoped_cited_spelling_variants(self, resolution: str) -> None:
+        """The accepted citation spellings: 're-scoped' takes to/into/as,
+        're-dispatched' takes 'as' only; the 'task' word, the '-' between a
+        run/task keyword and its identifier, and a '#'/quote/backtick wrapper
+        around the identifier are all optional.
+
+        Parametrized rather than looped so every spelling is reported
+        independently — a loop would abort the matrix at the first failure.
+        """
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result == 'stale_task_scoped', (
+            f'Expected cited variant {resolution!r} to match, got: {result!r}'
+        )
+
+    def test_stale_task_scoped_casual_rescoped_prose_no_match(self) -> None:
+        """Casual 're-scoped' prose with no concrete task identifier is NOT a
+        live get_task citation — it must not satisfy the evidence requirement."""
+        resolution = 'The concern was rescoped last week.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (casual "rescoped" prose cites no task), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_casual_redispatched_prose_no_match(self) -> None:
+        """Casual 're-dispatched' prose with no concrete run/task identifier is
+        NOT a live get_task citation."""
+        resolution = 're-dispatched it this morning, all good.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (casual "re-dispatched" prose cites no run/task), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_uncited_rescoped_no_match(self) -> None:
+        """Naming get_task without quoting WHAT it returned is not evidence:
+        this exact string was blessed before task 4192 and must no longer pass."""
+        resolution = 'Subject task was re-scoped per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (re-scoped with no task citation), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_uncited_redispatched_no_match(self) -> None:
+        """The re-dispatched counterpart of the above — also blessed before
+        task 4192, also no longer sufficient."""
+        resolution = 'Subject task was re-dispatched per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (re-dispatched with no run/task citation), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_redispatched_wrong_preposition_no_match(self) -> None:
+        """The asymmetry is deliberate and load-bearing: 're-scoped' admits
+        to/into/as but 're-dispatched' admits 'as' ONLY. Pinned here because
+        the other re-dispatched negatives all fail for the missing-identifier
+        reason, so widening the alternative to (?:to|into|as) would otherwise
+        pass the whole suite while silently dropping the documented contract.
+        """
+        resolution = 'Subject task re-dispatched to task 3821 per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match ("re-dispatched TO" is not the admitted '
+            f'preposition — only "as" is), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_digitless_identifier_no_match(self) -> None:
+        """The citation's identifier must contain a digit — a word-shaped
+        'identifier' that is really just more prose is not a citation. The
+        symmetric counterpart of the wrong-preposition guard above: here the
+        preposition IS right and only the identifier fails."""
+        resolution = 'Subject task re-scoped to task abc per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (identifier carries no digit), got: {result!r}'
+        )
 
     def test_stale_task_scoped_no_status_citation_no_match(self) -> None:
         resolution = 'Looks stale but no live status was checked.'
@@ -276,6 +460,21 @@ class TestL2AutoCloseClass:
         )
         assert result is None, f'Expected denylist to block design_concern, got: {result!r}'
 
+    def test_design_concern_denied_even_with_cited_rescoped_evidence(self) -> None:
+        """The denylist beats class (c)'s re-scoped citation too, not just its
+        'status=' alternative — every other denylist test uses 'status=done',
+        so nothing else pins this second door shut."""
+        resolution = 're-scoped to task 3821'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='design_concern', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block design_concern despite cited re-scoped '
+            f'evidence, got: {result!r}'
+        )
+
     def test_milestone_gate_denied(self) -> None:
         resolution = 'Subject task status=done per get_task; escalation moot.'
         result = l2_auto_close_class(
@@ -299,6 +498,31 @@ class TestL2AutoCloseClass:
             f'Expected denylist to block milestone_check_failed, got: {result!r}'
         )
 
+    def test_curator_adjudication_missing_denied_even_for_non_deterministic_role(self) -> None:
+        """'curator_adjudication_missing' is blocked by CATEGORY — the
+        highest-stakes member of the denylist.
+
+        It is the re-ask ``orchestrator.deterministic_runner`` files when a
+        ``human_curator_gate`` task resumes with no
+        ``human_curator_adjudicated_at`` stamp, so auto-closing it re-opens
+        the task-3181 phantom-done hazard the category exists to stop
+        (esc-3181-1 was auto-resolved by the watcher whose own resolution text
+        said the curator work was "deliberately NOT executed"). Class (c)
+        ``stale_task_scoped`` is both category- AND role-agnostic and accepts
+        a bare ``status=done`` marker, so without this denylist entry a filing
+        under any role other than ``orchestrator-deterministic`` sails
+        straight through — defense-in-depth, exactly as for
+        'milestone_check_failed' above."""
+        resolution = 'Subject task status=done per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='curator_adjudication_missing', agent_role='some-other-role',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block curator_adjudication_missing, got: {result!r}'
+        )
+
     def test_orchestrator_deterministic_role_denied_even_for_infra_issue(self) -> None:
         resolution = 'live probe: curator paused=false — transient infra self-cleared.'
         result = l2_auto_close_class(
@@ -320,6 +544,7 @@ class TestL2AutoCloseClass:
         assert 'design_concern' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_gate' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_check_failed' in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert 'curator_adjudication_missing' in L2_AUTO_CLOSE_DENY_CATEGORIES
 
     def test_deny_roles_are_frozenset_containing_expected_members(self) -> None:
         assert isinstance(L2_AUTO_CLOSE_DENY_ROLES, frozenset)

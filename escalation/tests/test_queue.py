@@ -7,17 +7,37 @@ import fcntl
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _scan_race_helpers import relocating_read_text, unreadable_read_text
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue, iter_all_escalation_paths
+from escalation.queue import (
+    _MAX_AMENDMENT_DETAIL_CHARS,
+    _MAX_AMENDMENT_LINE_CHARS,
+    _MAX_AMENDMENT_OPTIONS,
+    _MAX_AMENDMENTS,
+    _MAX_ROOT_CAUSE_VARIANTS,
+    AmendmentOutcome,
+    EscalationQueue,
+    iter_all_escalation_paths,
+)
+
+#: "argument not supplied", distinct from an explicitly-passed ``None``.
+#: Needed wherever a helper's default must not collide with a MEANINGFUL
+#: ``None`` value — e.g. seeding a record whose ``citation_sha`` is genuinely
+#: absent, which ``citation_sha=None`` would otherwise read as "use the
+#: default sha" (amendment pass, task 4499).
+_UNSET: Any = object()
 
 
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
@@ -37,6 +57,35 @@ def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', l
 def _submit_escalation(queue: EscalationQueue, esc: Escalation) -> None:
     """Write an escalation directly, bypassing the callback."""
     queue.submit(esc)
+
+
+def _aged_escalation(
+    esc_id: str,
+    *,
+    age_secs: float,
+    task_id: str = '1',
+    level: int = 0,
+    severity: str = 'blocking',
+) -> Escalation:
+    """An escalation explicitly stamped *age_secs* in the past.
+
+    Every age-aware test pins its own timestamps and passes its own explicit
+    threshold, so no assertion here depends on the production default value of
+    ``orphan_l0_timeout_secs`` (task 3172).
+    """
+    esc = _make_escalation(esc_id, task_id=task_id, level=level)
+    esc.severity = severity
+    esc.timestamp = (datetime.now(UTC) - timedelta(seconds=age_secs)).isoformat()
+    return esc
+
+
+_PENDING_SECS_RE = re.compile(r'\[pending_secs=(\d+)\b')
+
+
+def _pending_secs(resolution: str) -> int | None:
+    """Parse the pending-age token out of a dismissal resolution, or None."""
+    m = _PENDING_SECS_RE.search(resolution)
+    return int(m.group(1)) if m else None
 
 
 class TestDismissAllPending:
@@ -60,7 +109,9 @@ class TestDismissAllPending:
         updated = queue.get('esc-1-1')
         assert updated is not None
         assert updated.status == 'dismissed'
-        assert updated.resolution == 'Stale from prior run'
+        # Prefix, not equality: the pending age is always recorded (task 3172).
+        assert updated.resolution is not None
+        assert updated.resolution.startswith('Stale from prior run')
 
     def test_multiple_pending_all_dismissed(self, tmp_path: Path):
         """Multiple pending escalations are all dismissed; count matches."""
@@ -117,7 +168,12 @@ class TestDismissAllPending:
         assert dismissed_esc.resolution == 'User dismissed earlier'  # unchanged
 
     def test_resolution_message_preserved(self, tmp_path: Path):
-        """Resolution message is preserved on dismissed escalations."""
+        """Resolution message is preserved on dismissed escalations.
+
+        The caller's message is now a PREFIX rather than the whole string:
+        per-record pending age is always recorded alongside it (task 3172
+        ASK A), so a swept record carries how long it had been waiting.
+        """
         queue = EscalationQueue(tmp_path / 'queue')
         queue.submit(_make_escalation('esc-1-1'))
 
@@ -126,7 +182,9 @@ class TestDismissAllPending:
 
         esc = queue.get('esc-1-1')
         assert esc is not None
-        assert esc.resolution == msg
+        assert esc.resolution is not None
+        assert esc.resolution.startswith(msg)
+        assert _pending_secs(esc.resolution) is not None
 
     def test_mixed_statuses_only_pending_dismissed(self, tmp_path: Path):
         """With a mix of pending/resolved/dismissed, only pending ones are dismissed."""
@@ -150,6 +208,240 @@ class TestDismissAllPending:
         assert queue.get('esc-3-1').status == 'resolved'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').status == 'dismissed'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').resolution == 'dismissed already'  # type: ignore[union-attr]
+
+
+class TestDismissAllPendingAgeAware:
+    """dismiss_all_pending() records pending age and stamps long strands distinctly.
+
+    The origin incident (task 3172): a restart swept esc-5189-7, pending 20h58m
+    with a workflow parked on it, using the same fixed resolution string and the
+    same 'benign' class as esc-5685-1, pending ~90s.  The two records were
+    indistinguishable afterwards, so a 20h strand read as ordinary restart
+    noise.  These tests pin that they are now distinguishable.
+    """
+
+    STRAND_AGE_SECS = 75480.0  # 20h58m — esc-5189-7
+    FRESH_AGE_SECS = 90.0  # ~90s — esc-5685-1
+    THRESHOLD_SECS = 600.0
+
+    def _seed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(
+            _aged_escalation(
+                'esc-5189-7', age_secs=self.STRAND_AGE_SECS, task_id='5189', severity='blocking'
+            )
+        )
+        queue.submit(
+            _aged_escalation('esc-5685-1', age_secs=self.FRESH_AGE_SECS, task_id='5685')
+        )
+        queue.submit(_aged_escalation('esc-9-1', age_secs=self.STRAND_AGE_SECS, task_id='9', level=1))
+        return queue
+
+    def test_returns_plain_int_count_of_dismissed_l0s(self, tmp_path: Path):
+        """Return type stays a plain int — the L1 is not counted."""
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert type(count) is int
+        assert count == 2
+
+    def test_level_1_escalation_untouched(self, tmp_path: Path):
+        """A 20h-old L1 is still preserved across the age-aware sweep."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        l1 = queue.get('esc-9-1')
+        assert l1 is not None
+        assert l1.status == 'pending'
+        assert l1.resolution_class is None
+
+    def test_strand_and_fresh_record_get_distinguishable_classes(self, tmp_path: Path):
+        """THE user-observable signal: the 20h strand and the 90s artifact differ."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert strand.resolution_class == 'stale-strand'
+        assert fresh.resolution_class == 'benign'
+        assert strand.resolution_class != fresh.resolution_class
+
+    def test_effective_benign_reads_both_stamps_verbatim(self, tmp_path: Path):
+        """The dashboard classifier reads each stamp as stamped, not inferred."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert effective_benign(strand) == ('stale-strand', 'stamped')
+        assert effective_benign(fresh) == ('benign', 'stamped')
+
+    def test_both_resolutions_keep_caller_message_and_record_pending_age(self, tmp_path: Path):
+        """Every dismissed L0 keeps the caller's message and gains its own age."""
+        queue = self._seed(tmp_path)
+        msg = 'Auto-dismissed: orchestrator restarted — stale from prior run'
+
+        queue.dismiss_all_pending(msg, strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert strand.resolution is not None and fresh.resolution is not None
+        assert strand.resolution.startswith(msg)
+        assert fresh.resolution.startswith(msg)
+        assert abs(_pending_secs(strand.resolution) - self.STRAND_AGE_SECS) < 5  # type: ignore[operator]
+        assert abs(_pending_secs(fresh.resolution) - self.FRESH_AGE_SECS) < 5  # type: ignore[operator]
+
+    def test_resolution_records_severity_alongside_age(self, tmp_path: Path):
+        """The durable blocked-ness signal travels with the swept record."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        assert strand is not None
+        assert strand.resolution is not None
+        assert 'severity=blocking' in strand.resolution
+
+
+class TestDismissAllPendingAgeAwareDegrades:
+    """The age-aware sweep degrades honestly — loudly, and never into a false strand.
+
+    Clearing stale L0s at startup must still happen even when a record's
+    timestamp cannot be aged; what must NOT happen is a malformed record being
+    silently promoted to 'stale-strand' by a floor sentinel, or dropped in
+    silence (task 3172).
+    """
+
+    THRESHOLD_SECS = 600.0
+
+    def test_unparseable_timestamp_is_still_dismissed(self, tmp_path: Path):
+        """A garbage timestamp does not stop the record from being swept."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert count == 1
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.status == 'dismissed'
+
+    def test_unparseable_timestamp_is_never_stamped_stale_strand(self, tmp_path: Path):
+        """A malformed record must not read as maximally stale.
+
+        The parse fallback sorts an unparseable record as NEWEST, so a corrupt
+        timestamp can never be mislabelled a 20h strand.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.resolution_class != 'stale-strand'
+        assert swept.resolution_class == 'benign'
+
+    def test_unparseable_timestamp_carries_no_age_token(self, tmp_path: Path):
+        """No age is claimed for a record whose age is unknowable."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        msg = 'Stale from prior run'
+        queue.dismiss_all_pending(msg, strand_age_secs=self.THRESHOLD_SECS)
+
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.resolution is not None
+        assert swept.resolution.startswith(msg)
+        assert _pending_secs(swept.resolution) is None
+
+    def test_unparseable_timestamp_logs_a_warning(self, tmp_path: Path, caplog):
+        """The skip is LOUD — a warning names the offending escalation."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        with caplog.at_level(logging.WARNING):
+            queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-7-1' in m for m in warnings), warnings
+
+    def test_naive_timestamp_is_treated_as_utc(self, tmp_path: Path):
+        """A tz-naive stamp is read as UTC, not misread as ancient.
+
+        The record is deliberately RECENT: if a naive stamp were mishandled it
+        would age out to something enormous and be mis-stamped a strand.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-8-1', task_id='8')
+        esc.timestamp = (datetime.now(UTC) - timedelta(seconds=90)).replace(tzinfo=None).isoformat()
+        queue.submit(esc)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert count == 1
+        swept = queue.get('esc-8-1')
+        assert swept is not None
+        assert swept.status == 'dismissed'
+        assert swept.resolution_class == 'benign'
+        assert swept.resolution_class != 'stale-strand'
+        assert abs(_pending_secs(swept.resolution) - 90) < 5  # type: ignore[operator]
+
+    def test_omitted_threshold_preserves_pre_3172_classification(self, tmp_path: Path):
+        """Opt-in default: without strand_age_secs a 20h L0 is still 'benign'.
+
+        A caller that has not been considered cannot be silently reclassified.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-5189-7', age_secs=75480.0, task_id='5189'))
+
+        count = queue.dismiss_all_pending('Stale from prior run')
+
+        assert count == 1
+        swept = queue.get('esc-5189-7')
+        assert swept is not None
+        assert swept.resolution_class == 'benign'
+        assert effective_benign(swept) == ('benign', 'stamped')
+
+    def test_resolve_failure_does_not_abort_the_age_aware_sweep(self, tmp_path: Path):
+        """One raising record cannot cost the others their dismissal or the count."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=75480.0, task_id='1'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
+
+        original_resolve = queue.resolve
+
+        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False, **kwargs):
+            if esc_id == 'esc-2-1':
+                raise OSError('disk full')
+            return original_resolve(esc_id, resolution, dismiss=dismiss, **kwargs)
+
+        with patch.object(queue, 'resolve', side_effect=patched_resolve):
+            count = queue.dismiss_all_pending(
+                'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS
+            )
+
+        assert count == 2
+        assert queue.get('esc-1-1').resolution_class == 'stale-strand'  # type: ignore[union-attr]
+        assert queue.get('esc-3-1').resolution_class == 'benign'  # type: ignore[union-attr]
+        assert queue.get('esc-2-1').status == 'pending'  # type: ignore[union-attr]
 
 
 class TestDismissAllPendingResilience:
@@ -347,6 +639,82 @@ class TestGetWithDuplicateArchiveCandidates:
         )
         assert any('esc-1-1' in r.message for r in warning_records), (
             f'Expected a WARNING mentioning esc-1-1; got: {[r.message for r in warning_records]}'
+        )
+
+
+class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
+    """get_by_task must find a record whose FILENAME does not encode its task_id.
+
+    WHY THIS EXISTS — do not "optimise" it away.  ``make_id``'s argument is an
+    id-NAMESPACE key, not a task_id: it names the durable counter ``esc-{key}.seq``
+    and the id stem ``esc-{key}-{n}``, and nothing more.  Five production sites
+    diverge deliberately — ``curator_escalator.py`` x3 (``make_id('curator')``
+    with ``task_id='task-curator'``) and ``ticket_janitor.py`` x2
+    (``make_id('ticket-janitor')``, same task_id) — so ``'task-curator'`` alone
+    carries three stem families in the live corpus (``esc-curator-*`` 31,
+    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).
+
+    The false identity "for every record file, ``stem.startswith(
+    f'esc-{record.task_id}-')``" is therefore FALSE (42 of 2,972 corpus records
+    violate it), and believing it cost TWO design cycles: task 3999's 2026-08-11
+    amendment and ``plans/resume-charter-loss-remediation-prd.md``, both
+    withdrawn 2026-08-20 under ruling esc-3999-2.  ``get_by_task`` is correct
+    precisely BECAUSE it globs the unscoped ``esc-*.json`` and filters on the
+    STORED ``task_id`` FIELD.
+
+    THE BOUNDARY THIS TEST DRAWS: it forbids scoping ``get_by_task``'s glob to
+    ``f'esc-{task_id}-*.json'``.  That change was already rejected on its own
+    merits in esc-3999-2 — a measured 15x on a path costing 20-90 CPU-seconds/day
+    over a corpus the 30-day pruner already bounds, weighed against a
+    silent-record-loss failure mode and the erosion of contract D11
+    (``index_drift_detector.py``, task 3709, which put an opaque dedup key in the
+    task_id slot precisely BECAUSE get_by_task filters on the stored field).
+
+    This test is GREEN on arrival — it characterises existing correct behaviour —
+    so its honest RED is a MUTATION check: swap both globs to the scoped form and
+    it must go red.  That check was run and recorded in this commit.
+    """
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_pending_divergent_stem_is_found_by_stored_task_id(self, tmp_path: Path):
+        """Both live stem families for one task_id come back from get_by_task."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # The divergent specimen: stem says 'curator', the record says 'task-curator'.
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        # The SAME task_id under the other live stem family, for contrast.
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+
+        results = queue.get_by_task('task-curator')
+
+        assert {e.id for e in results} == {'esc-curator-1', 'esc-task-curator-1'}, (
+            'get_by_task filters on the STORED task_id field, not on the '
+            f'filename: got {sorted(e.id for e in results)}'
+        )
+
+    def test_archived_divergent_stem_is_still_found(self, tmp_path: Path):
+        """The archive tier must not lose the divergent record either."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+        queue.resolve('esc-curator-1', 'handled')
+
+        # It has moved out of the queue root and into archive/YYYY-MM-DD/.
+        assert not (queue.queue_dir / 'esc-curator-1.json').exists()
+
+        results = queue.get_by_task('task-curator')
+
+        assert 'esc-curator-1' in {e.id for e in results}, (
+            'an ARCHIVED divergent-stem record must still be found by its stored '
+            f'task_id: got {sorted(e.id for e in results)}'
         )
 
 
@@ -1412,11 +1780,472 @@ class TestGetPendingParseFailure:
         )
 
 
+class TestScanSurvivesRecordArchivedMidScan:
+    """An unlocked glob-then-read scan must survive a record relocated by a
+    concurrent archive sweep between the directory listing and the read.
+
+    The glob snapshots the queue root; the reads happen afterwards, one file
+    at a time, holding no lock.  A concurrent ``resolve()`` or startup sweep
+    can ``os.replace`` any of those files into ``archive/<date>/`` in that
+    window, so the read raises ``FileNotFoundError`` — an ``OSError``, which
+    none of the scan sites' ``except (json.JSONDecodeError, KeyError,
+    TypeError)`` tuples cover.  The blast radius is the WHOLE listing, and it
+    crosses tasks: every root file is read before the ``task_id`` filter runs,
+    so archiving an unrelated task's record kills a caller's query.
+    """
+
+    def test_get_by_task_survives_unrelated_record_archived_mid_scan(
+        self, tmp_path: Path, caplog,
+    ):
+        """A task-4176 query must survive the archival of a task-3517 record.
+
+        RED on main: ``FileNotFoundError: [Errno 2] No such file or directory:
+        '.../queue/esc-3517-5.json'`` escapes ``get_by_task`` entirely.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) The unrelated archival must not void the caller's listing.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving task-4176 record, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) Loud enough to audit: the vanished path is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any(str(doomed) in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG naming {doomed}; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but NOT loud enough to cry wolf.  A record archived mid-scan
+        # is expected concurrency, not corruption — and for status='pending'
+        # it would have been filtered out anyway, an archived record being by
+        # definition no longer pending.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign mid-scan archival; '
+            f'got: {[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+
+    def test_get_by_task_keeps_an_unreadable_file_loud_and_distinguishable(
+        self, tmp_path: Path, caplog,
+    ):
+        """A present-but-unreadable file must not void the listing OR go quiet.
+
+        This is the guard against the fix degrading into a silent fail-soft.
+        A ``PermissionError`` (or EIO, or fd exhaustion) means the file IS
+        there and something is genuinely wrong — operator-actionable, unlike
+        the benign archived-mid-scan case, and it must reach the channel
+        operators actually watch.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        flaky = unreadable_read_text(doomed)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) One unreadable file must not void the whole listing either.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the readable record to survive, got '
+            f'{[e.id for e in results]}'
+        )
+
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        # (b) A permissions/EIO fault is operator-actionable: stay loud.
+        assert any(str(doomed) in r.getMessage() for r in loud), (
+            f'Expected a WARNING-or-above naming {doomed}; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+        # (c) ...on the right channel.  An I/O fault is not a parse fault, and
+        # conflating them sends an operator hunting for corrupt JSON.
+        assert not any('Failed to parse' in r.getMessage() for r in loud), (
+            f"An I/O fault must not be reported as a parse failure; got: "
+            f'{[r.getMessage() for r in loud]}'
+        )
+
+
+    def test_get_pending_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """get_pending() carries the identical gap and is pinned independently.
+
+        This scan also backs ``dismiss_all_pending``, so the startup L0 sweep
+        inherits the fix.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_pending()
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record, got {[e.id for e in results]}'
+        )
+
+    def test_find_terminal_by_citation_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The targeted ``esc-{task_id}-*.json`` glob has the same shape.
+
+        Both records are terminal and both match the glob, so both are read —
+        and the one the caller is NOT looking for is the one relocated, again
+        pinning that the blast radius is the whole listing rather than the
+        record that moved.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        citation = 'b' * 40
+        category = 'provenance_unattributed'
+
+        # Written directly rather than submit+resolve()'d: resolve() archives
+        # the record, and this test needs BOTH terminal records sitting in the
+        # queue root where the concurrent sweep would find them.
+        for esc_id, sha in (('esc-4176-1', citation), ('esc-4176-2', 'c' * 40)):
+            esc = _make_escalation(esc_id, task_id='4176', status='resolved', level=1)
+            esc.category = category
+            esc.citation_sha = sha
+            esc.resolved_at = datetime.now(UTC).isoformat()
+            (queue.queue_dir / f'{esc_id}.json').write_text(esc.to_json())
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            found = queue.find_terminal_by_citation('4176', category, citation)
+
+        assert found is not None, (
+            'the surviving terminal record must still be found when an '
+            'unrelated sibling is archived mid-scan'
+        )
+        assert found.id == 'esc-4176-1', f'wrong record returned: {found.id!r}'
+
+
+class TestGetRetriesRelocationBetweenLocateAndRead:
+    """Task 5118, workstream A: ``get()`` must retry, not raise or return
+    ``None``, when the archive sweep relocates the record between
+    ``_locate_path`` and ``read_text``.
+
+    Unlike the glob-then-read scans above (``get_by_task``, ``get_pending``,
+    ``find_terminal_by_citation``), ``get()`` is ``_locate_path``-then-read:
+    its blast radius is the single record the caller asked about, and the
+    correct repair is re-locate-and-retry rather than "skip and continue" —
+    the record MOVED, it did not vanish.
+    """
+
+    def test_get_recovers_a_record_relocated_between_locate_and_read(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: ``FileNotFoundError`` escapes ``get()`` entirely
+        once ``_locate_path`` has already returned the (about to be stale)
+        root path.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            result = queue.get('esc-1-1')
+
+        # (a) The record is recovered, not lost — the retry's fresh
+        # _locate_path call finds it at its new archive location.
+        assert result is not None, 'expected the relocated record to be recovered'
+        assert result.id == 'esc-1-1'
+
+        # (b) Loud enough to audit: the retry is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any('esc-1-1' in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG mentioning esc-1-1; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but not loud enough to cry wolf — a mid-read relocation is
+        # expected concurrency, not corruption.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign relocation; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+    def test_get_returns_none_for_a_record_genuinely_deleted_mid_read(
+        self, tmp_path: Path,
+    ):
+        """A record deleted (not relocated) mid-read must still resolve to
+        ``None`` after the retry — no raise, no infinite loop.
+
+        Distinguishes real relocation (recoverable via re-locate) from real
+        deletion (genuinely gone): the interposition here unlinks the file
+        outright instead of moving it into the archive tree, so the retry's
+        fresh ``_locate_path`` call finds nothing anywhere and must fall back
+        to ``None`` cleanly.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            result = queue.get('esc-1-1')
+
+        assert result is None
+
+    def test_get_propagates_a_present_but_unreadable_record(
+        self, tmp_path: Path,
+    ):
+        """A present-but-unreadable record must still raise — boundary pin
+        against the fix over-catching.
+
+        GREEN on main already (the un-fixed ``get()`` never caught
+        ``OSError`` either). Proves the retry loop's handler catches
+        ``FileNotFoundError`` only, never bare ``OSError``: a genuine
+        EACCES/EIO fault must not be degraded into the treatment a routine
+        archival gets (silently retried and then swallowed to ``None``).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        flaky = unreadable_read_text(doomed)
+
+        with (
+            patch.object(Path, 'read_text', flaky),
+            pytest.raises(PermissionError),
+        ):
+            queue.get('esc-1-1')
+
+    def test_get_returns_none_for_a_genuinely_nonexistent_id(self, tmp_path: Path):
+        """An id that never existed still resolves to ``None`` (no retry
+        machinery regression on the ordinary not-found path)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        assert queue.get('esc-1-999') is None
+
+
+class TestGetByTaskRecoversRecordRelocatedMidScan:
+    """Task 5118, workstream B (follow-up to task 5111's amendment 8):
+    ``get_by_task`` must recover — not silently drop — a record relocated
+    root -> archive inside the scan window, for an archive-including scan.
+
+    ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
+    record moved out of the root during that loop is in neither the
+    archive-tier snapshot (taken too early) nor the root copy (gone by read
+    time).  Before this fix that produced a silently SHORT listing; the fix
+    re-locates the id and retries the read once.
+    """
+
+    def test_get_by_task_recovers_relocated_record_into_a_complete_listing(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: the relocated record is silently missing from
+        ``results`` instead of being recovered via re-glob.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        # (a) The listing is complete — the relocated record is recovered,
+        # not silently dropped.
+        assert {e.id for e in results} == {'esc-4176-1', 'esc-4176-2'}, (
+            f'Expected both records via re-glob recovery, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) The recovery ITSELF is named at DEBUG for auditability — not
+        # just the (also-DEBUG) 'vanished mid-scan' line read_escalation_for_scan
+        # already logs before the recovery even runs, which also mentions the
+        # path and would satisfy a substring-only check on its own. Assert on
+        # the recovery line's distinguishing wording so weakening or removing
+        # it (while the earlier 'vanished' line stays) still fails this test.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any(
+            'recovered' in r.getMessage() and 'esc-4176-2' in r.getMessage()
+            for r in debug_records
+        ), (
+            f'Expected a DEBUG naming the recovery of esc-4176-2; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+    def test_get_by_task_pending_scan_does_not_recover_a_relocated_record(
+        self, tmp_path: Path,
+    ):
+        """A ``status='pending'`` scan does not attempt recovery: the archive
+        is skipped there by design, and a record relocated out of the root
+        is by definition no longer pending — it would be filtered out on
+        status even if recovered, so recovering it would only add archive
+        I/O to the fast path for no behavioural difference.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_by_task('4176', status='pending')
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving pending record, got '
+            f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_drops_a_record_genuinely_deleted_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The ``relocated is None`` branch: a record DELETED (not
+        relocated) mid-scan on an archive-including scan cannot be
+        recovered — the fresh ``_locate_path`` re-probe finds it nowhere —
+        so the listing must come back one short WITHOUT raising, exactly
+        like the pre-recovery behaviour for a genuine deletion.
+
+        Distinguishes recoverable relocation from real deletion the same
+        way ``TestGetRetriesRelocationBetweenLocateAndRead``'s deletion test
+        does for ``get()``: the interposition unlinks the file outright
+        instead of moving it into the archive tree.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after a genuine mid-scan '
+            f'deletion (no recovery possible, no raise), got '
+            f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_recovery_reread_failure_logs_reglob_context(
+        self, tmp_path: Path, caplog,
+    ):
+        """The recovery's OWN re-read can itself fail differently from the
+        first vanish — e.g. an EACCES fault at the newly-located archive
+        path.  That failure must be logged through the recovery's distinct
+        ``'queue.get_by_task (re-glob after vanish)'`` context, not silently
+        conflated with the ordinary scan's WARNING wording, and the record
+        must still be dropped (not raise) exactly like any other unreadable
+        file.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        relocated_path = archive_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(str(doomed), str(relocated_path))
+            if self == relocated_path:
+                raise PermissionError(13, 'Permission denied', str(relocated_path))
+            return original_read_text(self, *args, **kwargs)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the recovery to give up (not raise) after its own '
+            f're-read also fails, got {[e.id for e in results]}'
+        )
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.WARNING
+        ]
+        assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming the re-glob-after-vanish context; got: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
     C9 / finding 10.4).  These tests encode PRD boundary test D1: strictly
-    increasing, no collision, no rescan dependence.
+    increasing, no collision, and no directory-rescan dependence *in steady
+    state* (task 3238 added a one-shot bounded reconciliation that fires only
+    when the counter is absent or unparseable; the sibling gate statement is
+    escalation/tests/test_status_authority_gate.py::TestD1MakeIdCounter).
     """
 
     def test_make_id_is_durable_across_restart(self, tmp_path: Path):
@@ -1486,44 +2315,63 @@ class TestMakeIdCounter:
         )
 
     def test_make_id_does_not_scan_archive(self, tmp_path: Path):
-        """make_id() never touches the archive — _iter_archive_paths is not called.
+        """make_id() never touches the archive WHILE THE COUNTER IS INTACT.
 
-        Seeds an archive file directly (bypassing the queue/counter) so that
-        if make_id() still consulted the archive it would see it. Spies on
-        _iter_archive_paths and asserts it is never invoked.
+        Seeds an archive file directly (bypassing the queue) so that if
+        make_id() still consulted the archive it would see it, AND a counter
+        file, so the fixture expresses the real steady state (counter
+        present + archive present) rather than a lost counter. Spies on
+        _iter_archive_paths and asserts it is never invoked; the minted ids
+        are counter-derived and archive-independent.
 
         RED on main: make_id() calls _scan_archive_max_seq() ->
         _iter_archive_paths() on the cache miss (the first call for this
         task_id), so call_count would be >= 1, not 0.
+
+        For the LOST-counter path — where a bounded one-shot archive scan IS
+        performed, exactly once, to avoid re-minting ids that get() resolves
+        to archived records — see
+        ``test_make_id_recovery_scan_is_one_shot_then_steady_state_is_scan_free``.
         """
         queue_dir = tmp_path / 'queue'
         archive_dir = queue_dir / 'archive' / '2025-06-10'
         archive_dir.mkdir(parents=True, exist_ok=True)
         seeded = _make_escalation('esc-cnt-5', task_id='cnt', status='resolved')
         (archive_dir / 'esc-cnt-5.json').write_text(seeded.to_json())
+        (queue_dir / 'esc-cnt.seq').write_text('5')
 
         queue = EscalationQueue(queue_dir)
         with patch.object(
             queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
         ) as spy:
-            queue.make_id('cnt')
-            queue.make_id('cnt')
+            first_id = queue.make_id('cnt')
+            second_id = queue.make_id('cnt')
 
         assert spy.call_count == 0, (
-            f'make_id() must not scan the archive; _iter_archive_paths called '
-            f'{spy.call_count}x'
+            f'make_id() must not scan the archive while the counter is intact; '
+            f'_iter_archive_paths called {spy.call_count}x'
+        )
+        assert (first_id, second_id) == ('esc-cnt-6', 'esc-cnt-7'), (
+            f'Expected counter-derived (archive-independent) ids; got '
+            f'{first_id!r}, {second_id!r}'
         )
 
-    def test_make_id_corrupt_counter_logs_error_and_resets_to_one(
+    def test_make_id_corrupt_counter_with_no_disk_evidence_starts_at_one(
         self, tmp_path: Path, caplog,
     ):
-        """A corrupt/unparseable counter file is treated as 0 and logged as an ERROR.
+        """A corrupt counter with NOTHING to recover from reconciles to 0, minting 1.
 
-        The counter is authoritative with no archive-scan fallback (PRD C9):
-        losing it is unrecoverable data loss, not a routine, self-healing
-        event, so it must be loud (ERROR) rather than a WARNING — a lost
-        counter silently re-mints ids from 1, colliding with any escalations
-        already issued for this task_id.
+        This pins the nothing-to-recover sub-case of the corrupt-counter
+        path: an unparseable counter is reconciled from the one-shot bounded
+        root+archive scan (``test_make_id_corrupt_counter_reconciles_instead_of_colliding``
+        covers the case where that scan finds records), and for a genuinely
+        fresh task_id — empty queue root, no archive at all — the scan yields
+        0, so the mint is legitimately 'esc-cnt-1'.
+
+        The ERROR is still unconditional here, unlike the absent-counter
+        branch: an unparseable counter is unrecoverable data loss an operator
+        must see even when it happens to be self-healing, whereas an absent
+        counter is the ordinary first-mint state of every new task_id.
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1532,7 +2380,10 @@ class TestMakeIdCounter:
         with caplog.at_level(logging.ERROR, logger='escalation.queue'):
             result = queue.make_id('cnt')
 
-        assert result == 'esc-cnt-1'
+        assert result == 'esc-cnt-1', (
+            'with no root or archive records to recover from, reconciliation '
+            f'yields 0 and the mint is 1; got {result!r}'
+        )
 
         error_records = [
             r for r in caplog.records
@@ -1581,14 +2432,16 @@ class TestMakeIdCounter:
         self, tmp_path: Path, caplog,
     ):
         """An absent counter file is logged as an ERROR when the queue root
-        already holds escalations for the task_id.
+        already holds escalations for the task_id, and the counter is
+        reconciled past them.
 
-        Without this check, a lost counter (aggressive cleanup, fresh
-        checkout, disk restore, accidental rm of the non-.json sidecar) is
-        indistinguishable from a legitimately-new task_id and silently
-        re-mints ids that collide with ones already issued — with zero
-        observability. The mint still starts from 0 (no archive-scan
-        fallback survives this check); only the logging changes.
+        A lost counter (aggressive cleanup, fresh checkout, disk restore,
+        accidental rm of the non-.json sidecar) is indistinguishable from a
+        legitimately-new task_id on its own, and silently re-minting from 1
+        would collide with ids already issued — here, literally with the
+        esc-cnt-1 already sitting in the queue root. The mint reconciles
+        from a one-shot bounded root+archive scan (max observed + 1) and
+        stays loudly observable.
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1598,9 +2451,12 @@ class TestMakeIdCounter:
         with caplog.at_level(logging.ERROR, logger='escalation.queue'):
             result = queue.make_id('cnt')
 
-        assert result == 'esc-cnt-1', (
-            'counter is authoritative with no archive-scan fallback — even when '
-            'suspicious, it must still start from 0, not derive a seq from disk'
+        assert result == 'esc-cnt-2', (
+            'the lost counter must be reconciled past the esc-cnt-1 already in '
+            f'the queue root, not restarted from 0; got {result!r}'
+        )
+        assert queue.get('esc-cnt-2') is None, (
+            'the minted id must not resolve to a pre-existing record'
         )
 
         error_records = [
@@ -1610,8 +2466,14 @@ class TestMakeIdCounter:
         assert error_records, (
             f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
         )
-        assert any('counter file' in r.message and 'absent' in r.message for r in error_records), (
-            f'Expected an ERROR about the absent counter file; got: {[r.message for r in error_records]}'
+        assert any(
+            'counter file' in r.message
+            and 'absent' in r.message
+            and 'highest observed sequence 1' in r.message
+            for r in error_records
+        ), (
+            'Expected an ERROR about the absent counter file naming the recovered '
+            f'maximum (1); got: {[r.message for r in error_records]}'
         )
 
     def test_make_id_missing_counter_no_existing_escalations_silent(
@@ -1619,9 +2481,10 @@ class TestMakeIdCounter:
     ):
         """An absent counter file for a genuinely-new task_id logs nothing.
 
-        Complements the previous test: the ERROR is conditional on finding
-        pre-existing root evidence, not fired on every absent counter (which
-        would make the common brand-new-task_id path noisy).
+        Complements the previous test: the ERROR is conditional on
+        reconciliation actually recovering something — pre-existing root OR
+        archive evidence — not fired on every absent counter (which would
+        make the common brand-new-task_id path noisy).
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1656,6 +2519,259 @@ class TestMakeIdCounter:
         # Simulate restart: fresh instance, no in-memory state carried over.
         queue2 = EscalationQueue(queue_dir)
         assert queue2.make_id('1-2') == 'esc-1-2-3'
+
+    def test_make_id_lost_counter_does_not_mint_id_resolving_to_archived_record(
+        self, tmp_path: Path, caplog,
+    ):
+        """A LOST counter must not mint an id that get() resolves to an old record.
+
+        This is the headline acceptance criterion (task 3238): every
+        escalation for a task_id may have been resolved and archived, leaving
+        the queue root empty and (after an aggressive cleanup / fresh
+        checkout / disk restore) no counter file either.  The root-only
+        ``_root_has_existing_escalations`` probe cannot see that evidence, so
+        the mint restarted from 1 — and because ``get()`` falls back to the
+        archive, each re-minted id resolved to a DIFFERENT, older,
+        already-resolved record, corrupting escalation identity and audit
+        provenance.
+
+        The fix reconciles the counter from a one-shot bounded root+archive
+        scan on the repair path, so the next id is strictly greater than
+        every sequence observed on disk.
+
+        RED before the fix: make_id() returns 'esc-cnt-1' on the very first
+        call and ``queue.get('esc-cnt-1')`` resolves the archived record via
+        _locate_path's archive fallback; nothing is logged at all (the
+        archive-only case is invisible to the root-only probe).
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for seq in (1, 2, 3):
+            seeded = _make_escalation(f'esc-cnt-{seq}', task_id='cnt', status='resolved')
+            (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        # The lost-counter fixture: no root records, no counter file.
+        assert not list(queue_dir.glob('esc-cnt-*.json'))
+        assert not (queue_dir / 'esc-cnt.seq').exists()
+
+        queue = EscalationQueue(queue_dir)
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            minted = [queue.make_id('cnt') for _ in range(3)]
+
+        assert minted == ['esc-cnt-4', 'esc-cnt-5', 'esc-cnt-6'], (
+            f'Expected the counter to be reconciled past the archived max (3); '
+            f'got {minted}'
+        )
+
+        for minted_id in minted:
+            assert queue.get(minted_id) is None, (
+                f'{minted_id} resolves to a pre-existing record — a freshly '
+                f'minted id must never collide with an archived escalation'
+            )
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(
+            'highest observed sequence 3' in r.message and 'reconcil' in r.message.lower()
+            for r in error_records
+        ), (
+            'Expected an ERROR naming the recovered maximum (3) and the '
+            f'reconciliation; got: {[r.message for r in error_records]}'
+        )
+
+    def test_make_id_recovery_max_is_numeric_not_lexicographic(
+        self, tmp_path: Path,
+    ):
+        """Recovery takes the NUMERIC maximum, not the lexicographic one.
+
+        Every other recovery fixture uses single-digit sequences, where
+        ``max(int(...))`` and ``max(str)`` agree — so a regression from an
+        integer comparison to a raw-stem-suffix string comparison would pass
+        all of them. It would NOT be benign: for a task_id that accumulated
+        ten escalations, '9' > '10' lexicographically, so recovery would come
+        back as 9 and mint 'esc-cnt-10' — an id the seeded archive already
+        holds, which is exactly the collision task 3238 exists to prevent.
+        The multi-digit case is also the realistic one: a task_id whose
+        counter was lost has usually issued more than nine escalations.
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for seq in (9, 10):
+            seeded = _make_escalation(f'esc-cnt-{seq}', task_id='cnt', status='resolved')
+            (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        assert not (queue_dir / 'esc-cnt.seq').exists()
+
+        queue = EscalationQueue(queue_dir)
+        # Fixture guard: the record a lexicographic max would collide with is
+        # genuinely resolvable, so the assertion below is not vacuous.
+        assert queue.get('esc-cnt-10') is not None
+
+        minted = queue.make_id('cnt')
+        assert minted == 'esc-cnt-11', (
+            f"Expected the numeric max (10) + 1; got {minted!r} — 'esc-cnt-10' "
+            f'means recovery compared stem suffixes as strings and recovered 9'
+        )
+        assert queue.get(minted) is None, (
+            f'{minted} resolves to a pre-existing archived record'
+        )
+
+    def test_make_id_recovery_is_prefix_anchored_for_hyphenated_task_ids(
+        self, tmp_path: Path,
+    ):
+        """Recovery anchors on the KNOWN task_id, never parsing it out of a filename.
+
+        The retired archive-scan derivation parsed the trailing integer after
+        the last hyphen of an esc-<task_id>-<seq> stem — a latent correctness
+        bug for hyphenated task_ids (see
+        ``test_make_id_task_id_with_hyphen_uses_correct_counter_file``).
+        Reintroducing that parse on the repair path would resurrect it:
+        recovering task '1-2' would match esc-1-2-3-9.json (a DIFFERENT
+        task_id, '1-2-3') and mint 'esc-1-2-10'.
+
+        Recovery instead strips the literal 'esc-{task_id}-' prefix and
+        requires the remainder to parse as an int, so the glob's over-match
+        is harmless.
+
+        RED before the fix: returns 'esc-1-2-1' (no recovery at all).
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        # Genuine evidence for task '1-2': seq 4.
+        real = _make_escalation('esc-1-2-4', task_id='1-2', status='resolved')
+        (archive_dir / f'{real.id}.json').write_text(real.to_json())
+        # Decoy: task '1-2-3' seq 9 — matches the glob, must NOT parse as a seq for '1-2'.
+        decoy_archive = _make_escalation('esc-1-2-3-9', task_id='1-2-3', status='resolved')
+        (archive_dir / f'{decoy_archive.id}.json').write_text(decoy_archive.to_json())
+        # Decoy in the root: task '1-2x' seq 7 — excluded by the glob prefix itself.
+        decoy_root = _make_escalation('esc-1-2x-7', task_id='1-2x')
+        (queue_dir / f'{decoy_root.id}.json').write_text(decoy_root.to_json())
+
+        assert not (queue_dir / 'esc-1-2.seq').exists()
+
+        queue = EscalationQueue(queue_dir)
+        first = queue.make_id('1-2')
+        assert first == 'esc-1-2-5', (
+            f"Expected esc-1-2-5 (max+1 over prefix-anchored matches only); got "
+            f"{first!r} — 'esc-1-2-10' means the '1-2-3' decoy contaminated "
+            f"recovery, 'esc-1-2-1' means no recovery happened"
+        )
+
+        # The reconciled counter is durable, so a restart continues from it.
+        assert (queue_dir / 'esc-1-2.seq').exists()
+        queue2 = EscalationQueue(queue_dir)
+        assert queue2.make_id('1-2') == 'esc-1-2-6'
+
+    def test_make_id_corrupt_counter_reconciles_instead_of_colliding(
+        self, tmp_path: Path, caplog,
+    ):
+        """An UNPARSEABLE counter reconciles from disk rather than restarting at 1.
+
+        Same acceptance criterion as the lost-counter case, applied to the
+        corrupt-counter path: resetting to 0 mints 'esc-cnt-1', which
+        ``get()`` resolves to the live root record. Recovery spans BOTH
+        halves of the namespace (root esc-cnt-1 + archived esc-cnt-2), so
+        the next id is 3.
+
+        RED after step-2: the ``except ValueError`` branch still hard-sets
+        current = 0, so make_id returns 'esc-cnt-1' and the counter is
+        repaired to 1, not 3.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-cnt-1', task_id='cnt'))
+
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived = _make_escalation('esc-cnt-2', task_id='cnt', status='resolved')
+        (archive_dir / f'{archived.id}.json').write_text(archived.to_json())
+
+        (queue_dir / 'esc-cnt.seq').write_text('not-an-int')
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('cnt')
+
+        assert result == 'esc-cnt-3', (
+            f'Expected max observed across root (1) and archive (2), +1; got {result!r}'
+        )
+        assert queue.get('esc-cnt-3') is None, (
+            'the minted id must resolve to no pre-existing record, root or archive'
+        )
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(
+            'could not parse counter file' in r.message
+            and 'highest observed sequence 2' in r.message
+            for r in error_records
+        ), (
+            "Expected an ERROR retaining 'could not parse counter file' and naming "
+            f'the recovered maximum (2); got: {[r.message for r in error_records]}'
+        )
+
+        # The corrupt contents were durably repaired, so a restart continues
+        # from the reconciled value with no further archive scan.
+        assert (queue_dir / 'esc-cnt.seq').read_text().strip() == '3'
+        queue2 = EscalationQueue(queue_dir)
+        with patch.object(
+            queue2, '_iter_archive_paths', wraps=queue2._iter_archive_paths,
+        ) as spy:
+            assert queue2.make_id('cnt') == 'esc-cnt-4'
+        assert spy.call_count == 0, (
+            f'The repaired counter must make the next mint scan-free; '
+            f'_iter_archive_paths called {spy.call_count}x'
+        )
+
+    def test_make_id_recovery_scan_is_one_shot_then_steady_state_is_scan_free(
+        self, tmp_path: Path,
+    ):
+        """The repair scan fires at most once per task_id per counter lifetime.
+
+        PRD C9's substance — the counter, not a directory scan, is the sole
+        source of the next sequence — is preserved: the reconciliation scan
+        runs only when the counter is absent-or-unparseable, and its result
+        is immediately made durable, so every subsequent mint is scan-free.
+
+        RED before the fix: the first-call count is 0, not 1 (no recovery
+        scan exists).
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for seq in (1, 2, 3):
+            seeded = _make_escalation(f'esc-cnt-{seq}', task_id='cnt', status='resolved')
+            (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        queue = EscalationQueue(queue_dir)
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            assert queue.make_id('cnt') == 'esc-cnt-4'
+            assert spy.call_count == 1, (
+                f'The lost-counter repair must scan the archive exactly once; '
+                f'_iter_archive_paths called {spy.call_count}x'
+            )
+
+            for _ in range(3):
+                queue.make_id('cnt')
+            assert spy.call_count == 1, (
+                f'Steady state must be scan-free once the counter is durable; '
+                f'_iter_archive_paths called {spy.call_count}x in total'
+            )
 
 
 class TestIterAllEscalationPaths:
@@ -2163,6 +3279,252 @@ class TestAttachDedupeChild:
         assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
 
+class TestAttachDedupeChildGrowthBound:
+    """dedupe_children is BOUNDED, and the bound is loud.
+
+    Why a bound is needed: ``DedupeConfig.for_gate_backlog()`` sets
+    ``infra_dedupe_window_secs=float('inf')`` by design (a 300h-old gate MUST
+    still fold), so nothing ever ages a gate-backlog parent out — it gains one
+    child id per Stage-1 cycle for as long as a human has not decided, and that
+    whole record is read and parsed by ``get_pending()`` on every subsequent
+    dedupe scan.
+
+    Retention is HEAD-PRESERVING (first ``_MAX_DEDUPE_CHILDREN_HEAD`` + most
+    recent), not the pure oldest-shed used for ``amendments``: this list has no
+    external anchor for the fold's ORIGIN, so shedding purely oldest-first would
+    erase where the parent came from and leave only-recent ids — the least useful
+    provenance possible on a record whose whole problem is that it is old.
+
+    Every expected value below is DERIVED from the module constants, never
+    transcribed as a literal: a hand-copied literal encodes the constant's VALUE
+    instead of its NAME and silently drifts when the cap is retuned (test_server's
+    ``_COMPACT_KEYS`` comment records that this drift already happened once here).
+    """
+
+    #: How far past the cap these tests push.  Small on purpose — the shed is
+    #: per-attach in steady state, so K attaches past the cap shed exactly K.
+    K = 5
+
+    #: How far OVER the cap a record is seeded straight onto disk (bypassing
+    #: attach_dedupe_child) in the bulk-shed case.  Must be > 1: that is the
+    #: whole point — it forces `shed > 1`, the multi-element `del` slice that
+    #: the steady-state cases can never reach.
+    OVER_CAP_SEED = 30
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '1', severity: str = 'blocking') -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity=severity,
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+
+    def _attach_n(self, queue: EscalationQueue, parent_id: str, n: int) -> list[str]:
+        """Attach *n* children with predictable ids; returns the attach ORDER."""
+        order = [f'esc-child-{i}' for i in range(n)]
+        for child_id in order:
+            queue.attach_dedupe_child(parent_id, child_id)
+        return order
+
+    def test_at_the_cap_nothing_is_shed(self, tmp_path: Path):
+        """(a) Exactly at the cap: every id is still present, in order, nothing counted.
+
+        Named for what it ASSERTS (``_MAX_DEDUPE_CHILDREN`` attaches — the
+        boundary itself), not for the strictly-below case it does not exercise:
+        the cap fires on ``>``, so the last non-shedding attach IS the one at
+        the cap, and that is the edge worth pinning.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert len(from_disk.dedupe_children) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children == order, 'At the cap nothing may be shed or reordered'
+        assert from_disk.dedupe_children_truncated == 0
+
+    def test_past_the_cap_sheds_the_oldest_non_head_ids_and_counts_them(self, tmp_path: Path):
+        """(b) Past the cap: the list is bounded, the HEAD and the TAIL both survive,
+        and exactly the oldest NON-head ids are shed and counted."""
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN + self.K)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        assert len(kept) == _MAX_DEDUPE_CHILDREN, (
+            f'dedupe_children must be BOUNDED at _MAX_DEDUPE_CHILDREN='
+            f'{_MAX_DEDUPE_CHILDREN}, got {len(kept)}'
+        )
+        assert from_disk.dedupe_children_truncated == self.K
+
+        # Head retention — the ids that ESTABLISHED the fold survive.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == order[:_MAX_DEDUPE_CHILDREN_HEAD], (
+            'The first _MAX_DEDUPE_CHILDREN_HEAD ids must be retained: on a '
+            "weeks-old parent they are the only record of the fold's origin"
+        )
+        # Tail retention — current activity survives.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == order[-tail_len:], (
+            'The most recent ids must be retained'
+        )
+
+        # Exactly the oldest NON-head ids were shed.
+        shed = order[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + self.K]
+        assert set(shed).isdisjoint(kept), f'Expected {shed} to have been shed, found some kept'
+
+        # The true-provenance-total identity: the loss is assertable FROM THE
+        # RECORD, never log-only (INV-8).
+        assert len(kept) + from_disk.dedupe_children_truncated == _MAX_DEDUPE_CHILDREN + self.K
+
+    def test_an_over_cap_record_seeded_on_disk_sheds_the_whole_excess_in_one_fold(
+        self, tmp_path: Path,
+    ):
+        """(b2) A record that arrives ALREADY over the cap sheds the entire
+        excess on its first fold — `shed > 1`, the multi-element `del` slice.
+
+        The steady-state cases above can only ever produce ``shed == 1``,
+        because they grow the list one attach at a time.  That branch is NOT
+        the only reachable one: ``attach_dedupe_child`` is not the sole writer
+        of ``dedupe_children``.  `fused-memory/scripts/backfill_recon_escalations.py`
+        assigns ``canonical.dedupe_children = list(collapse.child_ids)``
+        wholesale and persists it with ``queue.submit()``, which writes the
+        record verbatim and enforces no cap — so an arbitrarily long list can
+        legitimately exist on disk, and the FIRST subsequent fold must shed
+        ``len - cap + 1`` ids in one `del`, crediting every one of them to
+        ``dedupe_children_truncated``.
+
+        Seeded through ``submit`` rather than ``_rewrite`` precisely because
+        ``submit`` is the production path that creates this shape.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        seeded_total = _MAX_DEDUPE_CHILDREN + self.OVER_CAP_SEED
+        seeded = [f'esc-seed-{i}' for i in range(seeded_total)]
+
+        esc = self._make_infra_esc('esc-1-1')
+        esc.dedupe_children = list(seeded)
+        esc.dedupe_count = seeded_total
+        queue.submit(esc)
+
+        # Precondition: submit really does persist an over-cap list untouched.
+        pre = queue.get('esc-1-1')
+        assert pre is not None
+        assert len(pre.dedupe_children) == seeded_total, (
+            'submit must write dedupe_children verbatim — if it ever starts '
+            'capping, this test is no longer exercising the bulk-shed path'
+        )
+        assert pre.dedupe_children_truncated == 0
+
+        queue.attach_dedupe_child('esc-1-1', 'esc-late-1')
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        # One fold, many ids shed: the excess plus the id just appended.
+        expected_shed = self.OVER_CAP_SEED + 1
+        assert expected_shed > 1, 'OVER_CAP_SEED must force the multi-element del slice'
+        assert len(kept) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children_truncated == expected_shed, (
+            f'A single fold on an over-cap record must credit ALL {expected_shed} '
+            f'dropped ids, got {from_disk.dedupe_children_truncated}'
+        )
+
+        # Head retention survives a bulk shed exactly as it does a single one.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == seeded[:_MAX_DEDUPE_CHILDREN_HEAD]
+
+        # Tail: the most recent ids, ending with the id just attached.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        expected_tail = (seeded + ['esc-late-1'])[-tail_len:]
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == expected_tail
+        assert kept[-1] == 'esc-late-1', 'the id just folded in must survive'
+
+        # Exactly the oldest NON-head ids were shed — contiguously, in one slice.
+        shed = seeded[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + expected_shed]
+        assert len(shed) == expected_shed
+        assert set(shed).isdisjoint(kept)
+
+        # The true-provenance-total identity holds across a bulk shed too.
+        assert len(kept) + from_disk.dedupe_children_truncated == seeded_total + 1
+        # And the recurrence signal is untouched by a bulk shed.
+        assert from_disk.dedupe_count == seeded_total + 1
+
+    def test_the_cap_never_touches_dedupe_count_or_severity(self, tmp_path: Path):
+        """(c) The cap bounds PROVENANCE only.
+
+        dedupe_count is the load-bearing recurrence signal (task 3522) — a
+        recon-watcher drain sorts the longest-rotting gates by it and
+        sweep._pick_richer ranks on it — so it must keep climbing past the cap.
+        Severity promotion is likewise unaffected, and is never demoted.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1', severity='info'))
+
+        total = _MAX_DEDUPE_CHILDREN + self.K
+        self._attach_n(queue, 'esc-1-1', total)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert from_disk.dedupe_count == total, (
+            f'dedupe_count is the recurrence SIGNAL and is never capped: expected '
+            f'{total}, got {from_disk.dedupe_count}'
+        )
+        assert from_disk.severity == 'info', 'info children must not promote an info parent'
+
+        # A promotion AFTER the cap is crossed still takes effect.
+        promoted = queue.attach_dedupe_child('esc-1-1', 'esc-late-1', child_severity='blocking')
+        assert promoted is not None
+        assert promoted.severity == 'blocking', (
+            'max_severity promotion must still work once the list is at the cap'
+        )
+        assert promoted.dedupe_count == total + 1
+
+    def test_shedding_logs_a_warning_naming_the_running_total(self, tmp_path: Path, caplog):
+        """(d) The loss is LOUD: a WARNING names the parent and the running total.
+
+        no-silent-fail-soft — a bound that drops ids quietly is exactly the
+        silent degradation this repo forbids.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        # Fill to the cap OUTSIDE the caplog window, so only shed warnings land.
+        self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.attach_dedupe_child('esc-1-1', 'esc-over-1')
+
+        shed_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.WARNING
+            and 'esc-1-1' in r.getMessage()
+            and 'truncated=1' in r.getMessage()
+        ]
+        assert shed_records, (
+            'Expected a WARNING from escalation.queue naming the parent id and the '
+            f'running dedupe_children_truncated total, got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+
 class TestFindPendingL2ByRootCause:
     """EscalationQueue.find_pending_l2_by_root_cause() locates a pending L2 by root_cause string."""
 
@@ -2328,6 +3690,171 @@ class TestFindPendingL2ByRootCause:
             f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
         )
 
+    # ------------------------------------------------------------------
+    # Canonical-form matching (task 3998).  The match used to be stripped
+    # EXACT-string equality, so an L2 filed as 'Watcher lease stolen.' and a
+    # re-promote spelled 'watcher  lease STOLEN' minted two L2s for one cause.
+    # ------------------------------------------------------------------
+
+    def test_root_cause_match_is_canonicalised(self, tmp_path: Path):
+        """THE PIN: case, whitespace runs and trailing punctuation all fold.
+
+        PRD boundary row B4.  This is the capability the task delivers: the
+        stored key and the query differ in case, in internal whitespace and in a
+        trailing '.', and the lookup must still route the re-promote to the
+        existing L2 instead of minting a near-duplicate.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Watcher lease stolen.')
+
+        result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result == l2.id, (
+            f'Expected the canonically-equal query to find {l2.id!r}; got {result!r}'
+        )
+
+    def test_punctuation_is_a_separator_at_the_match_site(self, tmp_path: Path):
+        """A delimiter-dense key folds onto its space-separated spelling."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'starvation:2370:persistent-lock-contention')
+
+        result = queue.find_pending_l2_by_root_cause(
+            'Starvation 2370 persistent lock contention'
+        )
+
+        assert result == l2.id, f'Expected {l2.id!r}; got {result!r}'
+
+    def test_canonically_distinct_keys_still_miss(self, tmp_path: Path):
+        """The CONSERVATIVE direction — the regression guard against deletion semantics.
+
+        Under DELETION semantics (``a.b`` -> ``ab``) these two keys collapse into
+        one and two distinct incidents are silently absorbed into a single L2.
+        69% of live root_cause keys carry a digit adjacent to a separator, so
+        this is the common shape, not a corner case.  An under-fold leaves a
+        noisy but safe duplicate; an over-fold is silent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'risk:3184')
+
+        assert queue.find_pending_l2_by_root_cause('risk:318:4') is None
+
+        queue2 = EscalationQueue(tmp_path / 'esc2')
+        self._make_l2(queue2, 'task-2', 'curator-failure:account-cap-2026-08-05')
+
+        assert queue2.find_pending_l2_by_root_cause(
+            'curator-failure:account-cap-2026-0-805'
+        ) is None
+
+    @pytest.mark.parametrize('query', ['::', '--', '  :  ', '!!!'])
+    def test_query_with_empty_canonical_form_never_matches(
+        self, tmp_path: Path, query: str,
+    ):
+        """The falsy-key guard now applies to the CANONICAL form, not `.strip()`.
+
+        `'::'` survives `.strip()` but carries no identity at all, so it must not
+        be used as a lookup key against a real L2.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        assert queue.find_pending_l2_by_root_cause(query) is None
+
+    @pytest.mark.parametrize('query', ['::', '--', 'Bad merge strategy', ''])
+    def test_stored_key_with_empty_canonical_form_is_never_matched(
+        self, tmp_path: Path, query: str,
+    ):
+        """The guard is symmetric: a stored all-punctuation key matches nothing.
+
+        Such an L2 is unfoldable by construction, which is why the server refuses
+        to mint one in the first place (see promote_to_l2's mint validation).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', '::')
+
+        assert queue.find_pending_l2_by_root_cause(query) is None
+
+    def test_oldest_wins_across_canonically_equal_spellings(self, tmp_path: Path):
+        """Oldest-wins still holds when the matches are canonical, not exact.
+
+        Two pending L2s carrying textually-DIFFERENT but canonically-EQUAL keys
+        must resolve to the older one, exactly as two exact-key twins do — the
+        tie-break is unchanged by canonicalisation.
+        """
+        import time
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_l2(queue, 'task-1', 'Watcher lease stolen.')
+        time.sleep(0.01)  # ensure distinct timestamps
+        newer = self._make_l2(queue, 'task-2', 'watcher  lease STOLEN')
+
+        result = queue.find_pending_l2_by_root_cause('WATCHER-LEASE-STOLEN')
+
+        assert result == older.id, (
+            f'Expected oldest id={older.id!r}, got {result!r} (newer={newer.id!r})'
+        )
+
+    def test_l0_l1_with_canonically_matching_root_cause_still_excluded(
+        self, tmp_path: Path,
+    ):
+        """The level==2 filter is unchanged — canonicalisation must not widen it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        for level, role in ((0, 'implementer'), (1, 'steward')):
+            esc = Escalation(
+                id=queue.make_id(f'task-{level}'),
+                task_id=f'task-{level}',
+                agent_role=role,
+                severity='blocking',
+                category='design_concern',
+                summary=f'L{level} test',
+                level=level,
+                root_cause='Watcher lease stolen.',
+            )
+            queue.submit(esc)
+
+        result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result is None, f'Expected None (level filter), got {result!r}'
+
+    def test_corrupt_timestamp_warning_fires_on_a_canonical_match(
+        self, tmp_path: Path, caplog,
+    ):
+        """The malformed-timestamp WARNING path survives the switch to canonical matching.
+
+        The parse happens only for entries that MATCHED, so a match found
+        canonically rather than exactly must still reach it — otherwise the
+        data-quality signal would silently vanish for exactly the folds this task
+        adds.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = Escalation(
+            id=queue.make_id('task-99'),
+            task_id='task-99',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster corrupt-ts canonical test',
+            level=2,
+            root_cause='Watcher lease stolen.',
+        )
+        l2.timestamp = 'not-a-timestamp'
+        queue.submit(l2)
+
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
+            result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result == l2.id, (
+            f'Expected corrupt-ts L2 to still be returned; got result={result!r}'
+        )
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'queue.find_pending_l2_by_root_cause' in r.message
+        ]
+        assert warning_records, (
+            f"Expected >=1 WARNING mentioning 'queue.find_pending_l2_by_root_cause'; "
+            f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
+        )
+
 
 class TestAddMembersToL2:
     """EscalationQueue.add_members_to_l2() appends member ids to a pending L2."""
@@ -2474,6 +4001,576 @@ class TestAddMembersToL2:
         assert len(result.members) == 3, (
             f'Expected 3 unique members (esc-l1-0, esc-l1-1, esc-l1-2), got {result.members}'
         )
+
+    # -- C2: incoming framing is PRESERVED, not discarded (task 3997) --------
+
+    def _framed_l2(self, queue: EscalationQueue) -> Escalation:
+        """A pending L2 carrying its OWN original framing, so it is assertable."""
+        esc = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='ORIGINAL one-line hypothesis',
+            detail='ORIGINAL evidence text',
+            root_cause='Bad merge strategy',
+            options=['A: fix', 'B: rollback'],
+            level=2,
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> Escalation:
+        return Escalation.from_json((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def test_add_members_preserves_incoming_framing(self, tmp_path: Path):
+        """A fold's incoming framing is APPENDED to `amendments`, never discarded.
+
+        C2.  Repeated promotes of the same cluster used to drop every incoming
+        root_cause/evidence/options/summary on the floor (measured: 336,875
+        characters lost).  They are now preserved alongside — never instead of —
+        the record's own original framing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        original_ts = l2.timestamp
+
+        result = queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'],
+            root_cause='canonical root cause v2',
+            evidence='NEW evidence text authored by this promote',
+            options=['C: third way'],
+            summary='new one-line hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        # (a) the incoming framing landed, verbatim.
+        assert len(result.amendments) == 1, (
+            f'Expected exactly one amendment, got {result.amendments!r}'
+        )
+        amendment = result.amendments[0]
+        assert amendment['root_cause'] == 'canonical root cause v2'
+        assert amendment['summary'] == 'new one-line hypothesis'
+        assert amendment['options'] == ['C: third way']
+        assert amendment['detail'] == 'NEW evidence text authored by this promote', (
+            "the incoming `evidence` argument is stored under `detail` — the same "
+            f'field the create path writes it to; got {amendment!r}'
+        )
+        assert amendment['agent_role'] == 'escalation-watcher-auto'
+
+        # (b) the queue stamped the clock itself — a real, parseable ISO instant.
+        from datetime import datetime
+        assert amendment['timestamp'], f'amendment carries no timestamp: {amendment!r}'
+        datetime.fromisoformat(amendment['timestamp'])
+
+        # (c) APPEND, NOT OVERWRITE: the record's own framing is immutable.
+        assert result.root_cause == 'Bad merge strategy'
+        assert result.detail == 'ORIGINAL evidence text'
+        assert result.options == ['A: fix', 'B: rollback']
+        assert result.summary == 'ORIGINAL one-line hypothesis'
+        assert result.timestamp == original_ts
+
+        # (d) DURABILITY: it is on disk, not just on the returned object.
+        reloaded = self._on_disk(queue, l2.id)
+        assert reloaded.amendments == result.amendments, (
+            f'amendment did not survive to disk: {reloaded.amendments!r}'
+        )
+        assert reloaded.root_cause == 'Bad merge strategy'
+
+    def test_add_members_records_amendment_with_no_new_members(self, tmp_path: Path):
+        """A framing-only fold (ZERO new members) still preserves the framing.
+
+        This is the repeated-promote-of-the-same-cluster case where the measured
+        336,875 characters were lost: `if not new_member_ids and severity_floor
+        is None: return esc` treated it as a no-op and discarded the framing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='same cluster, third pass',
+            evidence='third-pass evidence',
+            summary='third-pass hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        assert len(result.amendments) == 1, (
+            f'A framing-only fold must NOT be treated as a no-op: {result.amendments!r}'
+        )
+        assert result.amendments[0]['detail'] == 'third-pass evidence'
+        # New framing IS a substantive content change: it is exactly the
+        # re-assess trigger the watcher's stamp-then-skip protocol keys off
+        # (updated_at > triaged_at), so it must bump rather than sit silent.
+        assert result.updated_at is not None, (
+            'A framing-only fold must stamp updated_at — otherwise a record that '
+            'silently gained new framing is skipped forever'
+        )
+        assert result.members == ['esc-l1-0'], (
+            f'members must be untouched by a framing-only fold, got {result.members}'
+        )
+        assert self._on_disk(queue, l2.id).amendments == result.amendments
+
+    def test_add_members_without_framing_records_no_amendment(self, tmp_path: Path):
+        """The existing two-positional-arg call form appends nothing (back-compat).
+
+        No framing means no amendment: a bare member append must not manufacture
+        an empty row that burns cap budget and reads as a reframing that never
+        happened.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is not None
+        assert result.members == ['esc-l1-0', 'esc-l1-1']
+        assert result.amendments == [], (
+            f'A framing-free call must record no amendment, got {result.amendments!r}'
+        )
+        assert self._on_disk(queue, l2.id).amendments == []
+
+    def test_repeated_identical_framing_records_one_amendment(self, tmp_path: Path):
+        """Framing identical to the LAST amendment is a true no-op — not re-recorded.
+
+        A rotation re-promoting the same cluster with UNCHANGED text has
+        contributed nothing.  Re-recording it would manufacture a spurious
+        updated_at bump (re-triggering the watcher's re-assess on a no-op — the
+        contract task 3976 pinned) and burn cap budget, so _MAX_AMENDMENTS worth
+        of identical rows would push genuinely-distinct earlier framings out via
+        the drop-oldest policy.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        framing = {
+            'root_cause': 'canonical root cause v2',
+            'evidence': 'evidence text',
+            'summary': 'hypothesis',
+            'options': ['C: third way'],
+            'agent_role': 'escalation-watcher-auto',
+        }
+
+        first = queue.add_members_to_l2(l2.id, [], **framing)
+        assert first is not None and len(first.amendments) == 1
+        bumped_at = first.updated_at
+        assert bumped_at is not None
+
+        again = queue.add_members_to_l2(l2.id, [], **framing)
+
+        assert again is not None
+        assert len(again.amendments) == 1, (
+            f'identical framing must not be re-recorded, got {again.amendments!r}'
+        )
+        assert again.updated_at == bumped_at, (
+            'a framing-identical re-promote is a true no-op and must not bump '
+            f'updated_at, got {bumped_at!r} -> {again.updated_at!r}'
+        )
+
+        # But a genuine reframing is new relative to what the record currently
+        # says, so it IS recorded.
+        changed = queue.add_members_to_l2(
+            l2.id, [], **{**framing, 'summary': 'a genuinely different hypothesis'},
+        )
+        assert changed is not None
+        assert len(changed.amendments) == 2, (
+            f'a changed framing must be recorded, got {changed.amendments!r}'
+        )
+
+        # A -> B -> A: returning to an EARLIER position is new relative to what
+        # the record currently says, so it is recorded too.  This is the whole
+        # justification for comparing against the LAST position rather than the
+        # whole list — without this call, an "optimisation" that deduped against
+        # every past amendment would pass this suite untouched.
+        returned = queue.add_members_to_l2(l2.id, [], **framing)
+        assert returned is not None
+        assert len(returned.amendments) == 3, (
+            f'a return to an earlier framing must be recorded, got '
+            f'{returned.amendments!r}'
+        )
+        first_view, last_view = (
+            {k: a[k] for k in ('root_cause', 'summary', 'detail', 'options')}
+            for a in (returned.amendments[0], returned.amendments[-1])
+        )
+        assert last_view == first_view, (
+            f'the re-submitted framing must round-trip verbatim (timestamp aside): '
+            f'{first_view!r} -> {last_view!r}'
+        )
+        assert returned.amendments[-1]['timestamp'] != returned.amendments[0]['timestamp'], (
+            'each amendment is stamped at ITS OWN write time; two entries sharing '
+            'a timestamp would mean the queue reused the first stamp'
+        )
+
+    def test_repromote_identical_to_the_records_own_framing_is_a_no_op(
+        self, tmp_path: Path,
+    ):
+        """The FIRST re-promote is compared against the record's OWN framing.
+
+        An L2's first re-promote is the one most likely to carry text
+        byte-identical to the create — the watcher recomputes the same cluster
+        and re-sends the same framing.  Treating "no amendments yet" as
+        "nothing to compare against" recorded a verbatim copy of the record's
+        own root_cause/detail/options/summary: one spurious `updated_at` bump
+        per L2, which re-triggers the watcher's stamp-then-skip re-assess
+        protocol (the contract task 3976 pinned) on a genuine no-op, plus one
+        cap slot burned on text already durably on the record.
+
+        The record's own framing IS the implicit `amendments[-1]`.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id,
+            ['esc-l1-0'],  # already a member: nothing new to append either
+            # Byte-identical to what _framed_l2 created the record with.
+            root_cause='Bad merge strategy',
+            evidence='ORIGINAL evidence text',
+            options=['A: fix', 'B: rollback'],
+            summary='ORIGINAL one-line hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        assert result.amendments == [], (
+            'framing identical to the record\'s OWN framing contributes nothing '
+            f'and must not be recorded, got {result.amendments!r}'
+        )
+        assert result.updated_at is None, (
+            'a no-op must not bump updated_at — that bump re-triggers the '
+            f'watcher re-assess protocol on nothing, got {result.updated_at!r}'
+        )
+        # DURABILITY: not merely absent from the returned object.
+        on_disk = self._on_disk(queue, l2.id)
+        assert on_disk.amendments == []
+        assert on_disk.updated_at is None
+
+    def test_repromote_differing_only_in_root_cause_whitespace_is_a_no_op(
+        self, tmp_path: Path,
+    ):
+        """The dedup KEY is compared stripped, mirroring how the fold was routed.
+
+        `find_pending_l2_by_root_cause` matches on `root_cause.strip()`, and the
+        create path stores the stripped value — so a fold whose key differs only
+        in surrounding whitespace found THIS L2 by that very key.  Recording it
+        as new framing would contradict the lookup that routed it here.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        result = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='  Bad merge strategy\n',
+            evidence='ORIGINAL evidence text',
+            options=['A: fix', 'B: rollback'],
+            summary='ORIGINAL one-line hypothesis',
+        )
+
+        assert result is not None
+        assert result.amendments == [], (
+            f'whitespace on the dedup key is not a reframing, got {result.amendments!r}'
+        )
+        assert result.updated_at is None
+
+    def test_amendment_fields_are_elided_to_their_named_caps(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Each entry is BYTE-bounded, marked, and the loss is counted.
+
+        The entry cap alone bounds nothing: an amendment's `detail` is the
+        promote's unbounded free-text `evidence` argument — the same field the
+        compact projection exists to keep off the wire — so a hot-folding L2
+        could sit "inside `_MAX_AMENDMENTS`" while growing by hundreds of KB,
+        and every reader of a FULL record pays that (`get_escalation`,
+        `get_pending_escalations(compact=False)`, every sweep's JSON parse).
+
+        Bounds are derived from the constants' NAMES, never their values.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        over = 50  # comfortably past every cap, whatever they are retuned to
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.add_members_to_l2(
+                l2.id, [],
+                root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
+                summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
+                evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+                options=(
+                    ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
+                    * (_MAX_AMENDMENT_OPTIONS + 2)
+                ),
+                agent_role='escalation-watcher-auto',
+            )
+
+        assert result is not None
+        assert len(result.amendments) == 1
+        amendment = result.amendments[0]
+
+        # (a) the KEPT text of each field is capped — the marker is allowed to
+        # push the stored string past the cap, but the payload is not.
+        assert amendment['root_cause'].count('R') == _MAX_AMENDMENT_LINE_CHARS
+        assert amendment['summary'].count('S') == _MAX_AMENDMENT_LINE_CHARS
+        assert amendment['detail'].count('D') == _MAX_AMENDMENT_DETAIL_CHARS
+        # (b) the options LIST is capped in length, and each option in width.
+        assert len(amendment['options']) == _MAX_AMENDMENT_OPTIONS, (
+            f'the options list must be length-capped, got '
+            f'{len(amendment["options"])}'
+        )
+        assert all(
+            o.count('O') == _MAX_AMENDMENT_LINE_CHARS for o in amendment['options']
+        )
+        # (c) the elision is MARKED IN-BAND, so a reader can tell the head of a
+        # framing from the whole of one without cross-referencing anything.
+        assert amendment['detail'].endswith(' ...]'), (
+            f'elision must be marked in-band, got tail {amendment["detail"][-80:]!r}'
+        )
+        assert str(over) in amendment['detail'], (
+            f'the marker must name what it dropped: {amendment["detail"][-120:]!r}'
+        )
+        # (d) the loss is DURABLY COUNTED on the record (INV-8) — the byte-side
+        # counterpart of amendments_truncated.
+        shed_options = 2 * (_MAX_AMENDMENT_LINE_CHARS + over)
+        expected = over * (3 + _MAX_AMENDMENT_OPTIONS) + shed_options
+        assert result.amendments_chars_elided == expected, (
+            f'expected {expected} elided chars, got {result.amendments_chars_elided}'
+        )
+        assert self._on_disk(queue, l2.id).amendments_chars_elided == expected
+        assert any(
+            'elided' in r.getMessage() for r in caplog.records
+        ), 'elision must also be loud in the log'
+
+        # (e) elision does not defeat repeat detection: the SAME oversized
+        # framing re-submitted is still a no-op, because both sides are elided
+        # by the same builder.
+        bumped_at = result.updated_at
+        again = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
+            summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
+            evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+            options=(
+                ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
+                * (_MAX_AMENDMENT_OPTIONS + 2)
+            ),
+        )
+        assert again is not None
+        assert len(again.amendments) == 1, (
+            f'elided framing must still compare equal, got {again.amendments!r}'
+        )
+        assert again.updated_at == bumped_at
+
+    def test_amendment_list_size_envelope_is_bounded(self, tmp_path: Path):
+        """The whole list's SIZE — not just its length — is bounded by the caps.
+
+        The property the caps exist for, asserted end-to-end: feed folds far
+        larger than any cap, fill past `_MAX_AMENDMENTS`, and the stored framing
+        still fits an envelope computed FROM the constants.  Without per-field
+        elision this is ~5 MB of durable record.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        huge = 50_000
+
+        for i in range(_MAX_AMENDMENTS + 3):
+            queue.add_members_to_l2(
+                l2.id, [],
+                root_cause=f'{i}' + 'R' * huge,
+                summary=f'{i}' + 'S' * huge,
+                evidence=f'{i}' + 'D' * huge,
+                options=[f'{i}' + 'O' * huge] * 10,
+                agent_role='escalation-watcher-auto',
+            )
+
+        record = self._on_disk(queue, l2.id)
+        assert len(record.amendments) == _MAX_AMENDMENTS
+        stored = sum(
+            len(a['root_cause']) + len(a['summary']) + len(a['detail'])
+            + sum(len(o) for o in a['options'])
+            for a in record.amendments
+        )
+        # Per-entry payload, derived from the constants; the marker allowance
+        # covers the in-band elision notes (one per elided field).
+        marker_allowance = 120
+        fields_per_entry = 3 + _MAX_AMENDMENT_OPTIONS
+        envelope = _MAX_AMENDMENTS * (
+            2 * _MAX_AMENDMENT_LINE_CHARS
+            + _MAX_AMENDMENT_DETAIL_CHARS
+            + _MAX_AMENDMENT_OPTIONS * _MAX_AMENDMENT_LINE_CHARS
+            + fields_per_entry * marker_allowance
+        )
+        assert stored <= envelope, (
+            f'amendments must stay inside the {envelope}-char envelope the caps '
+            f'imply, got {stored}'
+        )
+        # And the byte loss is counted, not silent.
+        assert record.amendments_chars_elided > 0
+
+    def test_add_members_reports_its_amendment_outcome(self, tmp_path: Path):
+        """The WRITER reports what it did, on every return path.
+
+        `promote_to_l2` needs two facts per fold — did this call record framing,
+        and did it shed any — to report `amendment_recorded` and to trigger the
+        truncation storm escape.  Re-deriving them in the server from a pre-read
+        plus a "did the count grow" heuristic cost a second full record parse per
+        fold and raced: this queue is built for cross-process mutators, so a
+        concurrent fold between the pre-read and the call made the flag wrong in
+        either direction.  Computed inside `escalation_id_lock`, it is exact.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        def fresh() -> AmendmentOutcome:
+            # Deliberately seeded with WRONG values on every key, so "filled on
+            # every return path" is actually tested rather than assumed.
+            return {
+                'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+            }
+
+        def amendment_facts(outcome: AmendmentOutcome) -> dict[str, object]:
+            """Just the amendment half — the variant half has its own suite."""
+            return {'recorded': outcome['recorded'], 'dropped': outcome['dropped']}
+
+        # (a) NOT FOUND — EVERY key filled, not left missing, so the caller can
+        # read any of them without guarding.
+        missing = fresh()
+        assert queue.add_members_to_l2(
+            'esc-does-not-exist', ['esc-l1-9'], outcome=missing,
+        ) is None
+        assert missing == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+
+        # (b) NO-OP early return (no members, no floor, no framing).
+        noop = fresh()
+        queue.add_members_to_l2(l2.id, [], outcome=noop)
+        assert noop == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+
+        # (c) a bare member append records nothing — and carries no spelling, so
+        # it seeds no variant either.
+        bare = fresh()
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], outcome=bare)
+        assert bare == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+
+        # (d) framing recorded, nothing shed.  One definition of the framing
+        # text, used by both this call and the repeat below, so (e) is a true
+        # byte-identical re-promote by construction.
+        def fold(outcome: AmendmentOutcome) -> None:
+            queue.add_members_to_l2(
+                l2.id, [], outcome=outcome,
+                root_cause='canonical root cause v2',
+                evidence='first evidence',
+                summary='first hypothesis',
+            )
+
+        recorded = fresh()
+        fold(recorded)
+        assert amendment_facts(recorded) == {'recorded': True, 'dropped': 0}
+
+        # (e) a framing-identical repeat is suppressed — and says so.
+        repeat = fresh()
+        fold(repeat)
+        assert amendment_facts(repeat) == {'recorded': False, 'dropped': 0}, (
+            'a suppressed repeat must not report a write'
+        )
+
+        # (f) at the cap, an append SHEDS — and the count is this call's own,
+        # not a difference inferred from a racy pre-read.
+        for i in range(_MAX_AMENDMENTS):
+            queue.add_members_to_l2(
+                l2.id, [], root_cause=f'fill {i}', evidence=f'fill evidence {i}',
+            )
+        truncating = fresh()
+        queue.add_members_to_l2(
+            l2.id, [], outcome=truncating,
+            root_cause='one past the cap', evidence='overflow evidence',
+        )
+        assert amendment_facts(truncating) == {'recorded': True, 'dropped': 1}, (
+            f'a truncating append must report both facts, got {truncating}'
+        )
+        capped = queue.get(l2.id)
+        assert capped is not None and len(capped.amendments) == _MAX_AMENDMENTS
+
+    def test_amendment_list_is_capped_and_truncation_is_loud(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Amendment growth is bounded, sheds the OLDEST, and counts what it shed.
+
+        INV-7: the cap has a NAME (`_MAX_AMENDMENTS`), a direction (drop oldest)
+        and an owner (this method, at write time).  The loop bound is derived
+        FROM the constant, never hardcoded — a literal here would encode the
+        constant's VALUE instead of its NAME and go stale the moment it is
+        retuned (sibling task 3998 raises the fold rate by design).
+
+        Shedding the OLDEST is safe precisely because the ORIGINAL framing is
+        never in this list at all: it lives permanently in the record's own
+        immutable root_cause/detail/options/summary, so the oldest amendment is
+        the least-informative entry and a rotation triaging NOW needs the most
+        recent framing.
+        """
+        overflow = 3
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            for i in range(_MAX_AMENDMENTS + overflow):
+                result = queue.add_members_to_l2(
+                    l2.id, [],
+                    root_cause=f'root cause pass {i}',
+                    evidence=f'evidence pass {i}',
+                    agent_role='escalation-watcher-auto',
+                )
+
+        assert result is not None
+        # (a) growth is BOUNDED.
+        assert len(result.amendments) == _MAX_AMENDMENTS, (
+            f'Expected the list capped at {_MAX_AMENDMENTS}, '
+            f'got {len(result.amendments)}'
+        )
+        # (b) the RETAINED entries are the most RECENT ones — identified by
+        # index-derived content, not by position alone.
+        retained = {a['root_cause'] for a in result.amendments}
+        assert retained == {
+            f'root cause pass {i}'
+            for i in range(overflow, _MAX_AMENDMENTS + overflow)
+        }, f'Expected the newest {_MAX_AMENDMENTS} passes to survive, got {sorted(retained)}'
+        assert result.amendments[-1]['detail'] == (
+            f'evidence pass {_MAX_AMENDMENTS + overflow - 1}'
+        ), 'the most recent framing must be the LAST entry'
+        # (c) the loss is DURABLY COUNTED on the record — assertable without
+        # scraping logs (INV-8).
+        assert result.amendments_truncated == overflow, (
+            f'Expected {overflow} shed entries counted, got {result.amendments_truncated}'
+        )
+
+        # (d) and it is LOUD.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'escalation.queue'
+        ]
+        assert warning_records, (
+            f"Expected a WARNING at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(l2.id in r.getMessage() for r in warning_records), (
+            f'Expected a truncation WARNING naming {l2.id}; '
+            f'got {[r.getMessage() for r in warning_records]}'
+        )
+
+        # The cap is enforced on DISK too, not just on the returned object —
+        # the trim rides the same single _rewrite as the append.
+        reloaded = self._on_disk(queue, l2.id)
+        assert len(reloaded.amendments) == _MAX_AMENDMENTS
+        assert reloaded.amendments_truncated == overflow
+        assert {a['root_cause'] for a in reloaded.amendments} == retained
 
 
 class TestStampTriage:
@@ -2624,8 +4721,10 @@ class TestStampTriage:
 
 class TestUpdatedAtStamp:
     """updated_at is a last-substantive-change marker: bumped by add_members_to_l2's real
-    append path, left untouched by its no-op path, and never touched by stamp_triage
-    (an annotation must not masquerade as a content change)."""
+    append path, left untouched by its no-op path, never touched by stamp_triage
+    (an annotation must not masquerade as a content change), and bumped by
+    attach_dedupe_child (a fold IS a content change — recurrence count up, possible
+    severity promotion)."""
 
     def _make_l2(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
         esc = Escalation(
@@ -2676,6 +4775,86 @@ class TestUpdatedAtStamp:
         assert result.updated_at is None, (
             f'Expected updated_at to stay None after stamp_triage, got {result.updated_at!r}'
         )
+
+    def _make_pending_parent(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
+        """Seed a PENDING dedupe parent.
+
+        attach_dedupe_child loads from the queue ROOT only and returns None for
+        archived parents, so this record must stay pending — hence a plain
+        submit and no resolve.  Seeded at ``info`` so the fold below also
+        exercises the max_severity promotion that makes the staleness bump
+        load-bearing.
+        """
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_attach_dedupe_child_sets_updated_at_on_a_triaged_parent(self, tmp_path: Path):
+        """(d) A dedupe fold IS a substantive change, so it must bump updated_at.
+
+        The contract this defends: a triaged pending parent that then folds in
+        duplicates gains recurrence count (``dedupe_count``) and can be promoted
+        info->blocking by ``max_severity``, yet used to read ``updated_at is
+        None``.  An L1/L2 rotation applying the "updated_at is not None and is
+        newer than triaged_at" re-verify rule (the triage quad in models.py;
+        skills/escalation-watcher/SKILL.md) would therefore trust the now-stale
+        triage note and skip re-assessing a record that has materially changed.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_pending_parent(queue)
+        assert parent.updated_at is None
+        assert parent.triaged_at is None
+
+        stamped = queue.stamp_triage(
+            parent.id,
+            triaged_by='escalation-watcher-auto',
+            triage_note='verified predicate + probe',
+        )
+        assert stamped is not None
+
+        # Re-pin the existing stamp_triage contract as THIS test's precondition:
+        # an annotation stamps triaged_at and leaves updated_at alone, so the
+        # bump asserted below can only have come from the fold.
+        after_triage = queue.get(parent.id)
+        assert after_triage is not None
+        assert after_triage.triaged_at is not None
+        assert after_triage.updated_at is None, (
+            'Precondition: stamp_triage must not bump updated_at, got '
+            f'{after_triage.updated_at!r}'
+        )
+
+        result = queue.attach_dedupe_child(parent.id, 'esc-2-1', child_severity='blocking')
+
+        assert result is not None
+        assert result.updated_at is not None, (
+            'Expected attach_dedupe_child to stamp updated_at: a fold raises '
+            'dedupe_count and can promote severity, so a parent reading '
+            'updated_at=None after folding makes an L1/L2 rotation trust a '
+            'stale triage note and skip re-assessing it'
+        )
+        assert result.triaged_at is not None
+        assert result.updated_at > result.triaged_at, (
+            "The watcher's stamp-then-skip protocol keys off STRICTLY newer, so "
+            f'updated_at ({result.updated_at!r}) must exceed triaged_at '
+            f'({result.triaged_at!r})'
+        )
+
+        # The same two properties must hold on the PERSISTED record, not only on
+        # the returned object.
+        from_disk = queue.get(parent.id)
+        assert from_disk is not None
+        assert from_disk.updated_at is not None, (
+            'Expected the bump to be durable, not only on the returned object'
+        )
+        assert from_disk.triaged_at is not None
+        assert from_disk.updated_at > from_disk.triaged_at
 
 
 class TestResolveCascade:
@@ -3168,6 +5347,11 @@ class TestEscalationIdLock:
 # ---------------------------------------------------------------------------
 
 _CHILD_SCRIPT = Path(__file__).parent / '_concurrent_queue_child.py'
+#: A SECOND child-runner, for `note_suppressed_refile`'s cross-process
+#: increment.  It would naturally be a fifth op on `_CHILD_SCRIPT` above; that
+#: file was outside the editable scope of task 4499, so the op lives in its own
+#: file.  Folding it back in is a clean follow-up (see the script's docstring).
+_SUPPRESSED_REFILE_CHILD = Path(__file__).parent / '_suppressed_refile_child.py'
 
 
 class TestAddMembersToL2Concurrency:
@@ -3459,6 +5643,97 @@ class TestConcurrentResolveExactlyOneArchive:
 # Step-7: Deterministic spy test proving submit/submit_resolved/resolve adopt lock (RED)
 # ---------------------------------------------------------------------------
 
+class TestSubmitLogsIdTaskIdDivergence:
+    """submit() makes an id/task_id divergence OBSERVABLE — and never rejects it.
+
+    ``make_id``'s argument is an id-NAMESPACE key, not a task_id, so a record's
+    filename stem need not encode its stored ``task_id``.  Five production sites
+    diverge deliberately (curator_escalator.py x3 via ``make_id('curator')``
+    with ``task_id='task-curator'``; ticket_janitor.py x2 via
+    ``make_id('ticket-janitor')``).  Believing the false identity
+    ``stem.startswith(f'esc-{record.task_id}-')`` has already cost two design
+    cycles (task 3999's 2026-08-11 amendment and
+    plans/resume-charter-loss-remediation-prd.md, both withdrawn 2026-08-20 as
+    ruling esc-3999-2), so the divergence is logged where it is CREATED rather
+    than being rediscovered by the next failed design.
+    """
+
+    #: The stable fragment of the guard's message.  Asserting on this plus the
+    #: two interpolated values, rather than on the full sentence, keeps the
+    #: tests from pinning prose.
+    MARKER = 'does not encode its task_id'
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_divergent_stem_is_logged_with_both_values(self, tmp_path: Path, caplog):
+        """(a) The LIVE specimen is logged, showing BOTH halves of the divergence.
+
+        A reader who hits this line must be able to see the divergence itself,
+        not be told one half of it — so the id and the task_id are both on it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        matching = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.INFO
+            and 'esc-curator-1' in r.getMessage()
+            and 'task-curator' in r.getMessage()
+            and self.MARKER in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            'Expected exactly one escalation.queue record naming both the id and '
+            f'the task_id; got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_conforming_stem_logs_no_divergence_line(self, tmp_path: Path, caplog):
+        """(b) Silent on the conforming majority — 97 of 102 construction sites.
+
+        A guard that fired on every submit would be noise nobody reads.  Filters
+        on the marker rather than counting records, since submit already emits an
+        unconditional 'Escalation submitted: ...' INFO of its own.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-42-1', '42'))
+
+        divergence = [r for r in caplog.records if self.MARKER in r.getMessage()]
+        assert not divergence, (
+            'A conforming id must not log a divergence line; got: '
+            f'{[r.getMessage() for r in divergence]}'
+        )
+
+    def test_divergent_submit_is_still_written_and_retrievable(self, tmp_path: Path):
+        """(c) OBSERVABILITY ONLY — the guard must never reject and never raise.
+
+        The five divergent production sites are legitimate by design.  Turning
+        this into enforcement would break them, which is why the record must
+        still land and still be findable BY ITS STORED task_id.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        assert queue.get('esc-curator-1') is not None, (
+            'the divergent record must still be written'
+        )
+        assert 'esc-curator-1' in {e.id for e in queue.get_by_task('task-curator')}, (
+            'the divergent record must still be retrievable by its STORED task_id'
+        )
+
+
 class TestSubmitResolveAdoptLock:
     """Spy test: submit, submit_resolved, and resolve must call escalation_id_lock with correct id."""
 
@@ -3542,6 +5817,158 @@ class TestSubmitResolveAdoptLock:
         assert any(eid == 'esc-3-1' for _, eid in acquired), (
             f'Expected lock acquisition for esc-3-1; got {acquired}'
         )
+
+
+class TestPatchResolutionMetadataLock:
+    """patch_resolution_metadata must serialize its read-modify-write per id.
+
+    It is the LONE mutator in this module that did not take
+    ``escalation_id_lock`` — submit, resolve, park, submit_resolved,
+    add_members_to_l2, stamp_triage, attach_dedupe_child and
+    note_suppressed_refile all do.  Its read-modify-write is on the FULL record,
+    so an unlocked interleave with any of them drops the loser's change
+    wholesale: not just the two patched fields, but every field the loser's
+    in-memory copy carried.
+    """
+
+    def _resolved(self, queue: EscalationQueue, esc_id: str = 'esc-1-1') -> Escalation:
+        """Seed an ARCHIVED, resolved record.
+
+        patch_resolution_metadata returns None for anything still pending, so a
+        pending record would make these tests vacuous.
+        """
+        esc = _make_escalation(esc_id, level=1)
+        esc.category = 'provenance_unattributed'
+        esc.citation_sha = 'b' * 40
+        _submit_escalation(queue, esc)
+        resolved = queue.resolve(esc_id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        assert resolved is not None
+        return resolved
+
+    def test_patch_resolution_metadata_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(a) The cheap direct assertion: a lock is acquired for the right id.
+
+        Paired with (b) on purpose — on its own this would pass even if the lock
+        wrapped nothing at all.
+        """
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)  # seed WITHOUT the spy
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.patch_resolution_metadata(
+                'esc-1-1', resolved_by='steward-patch', resolution_turns=5,
+            )
+
+        assert any(eid == 'esc-1-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-1-1; got {acquired}'
+        )
+
+    @pytest.mark.timeout(30)
+    def test_patch_holds_the_lock_across_its_whole_read_modify_write(self, tmp_path: Path, monkeypatch):
+        """(b) The SEMANTIC test — the lock must span read..write, not just exist.
+
+        Deliberately NOT the probabilistic two-process shape used by
+        TestAttachDedupeChildConcurrency, for a reason specific to this method:
+        both fields it patches are idempotent last-write-wins SETs, so a
+        patch-vs-patch race produces the correct final value either way and a
+        lost update is INVISIBLE.  The defect is observable only against a
+        mutator whose loss shows, so this races the patch against
+        note_suppressed_refile's ``refiles_suppressed`` INCREMENT.
+
+        Timing is then made deterministic by interposing on the instance's
+        _atomic_write_path, which launches the child BETWEEN the patch's read
+        and its write:
+
+        - WITHOUT the lock: the child finds the sidecar free, bumps 0->1 and
+          writes; the patch's real write then lands its stale in-memory copy and
+          the increment is LOST.  refiles_suppressed reads 0 EVERY time.
+        - WITH the lock: the child BLOCKS on the flock, the 3s wait times out,
+          the patch completes and releases, and the child then bumps on top of
+          the patched record.  refiles_suppressed reads 1 and resolved_by reads
+          'steward-patch' EVERY time.
+
+        The ~3s wait is paid only on the green path.  This shape is what
+        _suppressed_refile_child.py's own docstring records as the fix for a
+        MEASURED failure mode: two processes that never actually overlap make a
+        concurrency test pass even with the lock deleted.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        self._resolved(queue)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        # Pre-create the go-file: the child is barrier-aware, and here we want it
+        # to run IMMEDIATELY on launch rather than park.  The ready-file path is
+        # required by its CLI but nothing waits on it.
+        go = tmp_path / 'go'
+        go.write_text('go')
+        ready = tmp_path / 'ready-child'
+
+        real_write = queue._atomic_write_path
+        launched: list[subprocess.Popen] = []
+
+        def interposing_write(path: Path, json_text: str, *, durable: bool = False) -> None:
+            # Fire once, on the patch's own write — between its read and its write.
+            if not launched:
+                proc = subprocess.Popen(
+                    [
+                        sys.executable, str(_SUPPRESSED_REFILE_CHILD), str(queue_dir),
+                        'esc-1-1', '1', str(ready), str(go),
+                    ],
+                    env=env,
+                )
+                launched.append(proc)
+                # Returns fast when the sidecar is FREE (the unlocked bug);
+                # times out when the patch is correctly holding it.  Either way
+                # the real write below runs — the timeout IS the green path.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=3)
+            real_write(path, json_text, durable=durable)
+
+        monkeypatch.setattr(queue, '_atomic_write_path', interposing_write)
+
+        try:
+            queue.patch_resolution_metadata('esc-1-1', resolved_by='steward-patch')
+            assert launched, 'the interposing write never fired — the test is vacuous'
+            rc = launched[0].wait(timeout=15)
+        finally:
+            for proc in launched:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc == 0, f'child exited rc={rc} (rc=3 means the barrier wedged)'
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.refiles_suppressed == 1, (
+            'the concurrent locked INCREMENT was clobbered by the unlocked patch: '
+            f'expected refiles_suppressed=1, got {record.refiles_suppressed}'
+        )
+        assert record.resolved_by == 'steward-patch', (
+            f"the patch's own write was lost: resolved_by={record.resolved_by!r}"
+        )
+
+        # No resurrection: the record stays where it lives, in exactly one place.
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'patching an archived record must not resurrect it into the queue root'
+        )
+        archived = list(queue.queue_dir.glob('archive/*/esc-1-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy, found {archived}'
 
 
 class TestArchiveListingMemoisation:
@@ -4122,3 +6549,906 @@ class TestResolveGrantedFiles:
         updated = queue.get('esc-1-1')
         assert updated is not None
         assert updated.granted_files == []
+
+
+class TestResolvedAtIsStampedFromTheLiveClock:
+    """REGRESSION PIN, not a fix — companion to the models-side pin (task 3236).
+
+    See ``test_models.py::TestTimestampIsStampedFromTheLiveClock``: no
+    cached/session clock exists in the stamping code, so this pins the
+    falsifiable part — resolved_at is stamped, tz-aware, and ordered after the
+    record's own timestamp.
+    """
+
+    def test_resolve_stamps_resolved_at_after_timestamp(self, tmp_path):
+        """resolved_at is stamped, tz-aware, and never precedes timestamp."""
+        from datetime import datetime
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = _make_escalation('esc-1-1')
+        queue.submit(esc)
+
+        resolved = queue.resolve('esc-1-1', 'fixed', resolved_by='steward')
+
+        assert resolved is not None
+        assert resolved.resolved_at is not None, 'resolve() left resolved_at unstamped'
+        stamped = datetime.fromisoformat(resolved.resolved_at)
+        assert stamped.tzinfo is not None, f'Naive resolved_at: {resolved.resolved_at!r}'
+        assert stamped >= datetime.fromisoformat(resolved.timestamp), (
+            f'resolved_at {resolved.resolved_at!r} precedes timestamp '
+            f'{resolved.timestamp!r} for the same record'
+        )
+
+
+class TestAddMembersToL2SeverityFloor:
+    """add_members_to_l2 applies an UPWARD-ONLY severity floor (task 3976).
+
+    Invariant: **an L2's severity is monotonically non-decreasing after mint.**
+
+    This closes a regression that promote_to_l2's new inherited default would
+    otherwise introduce.  Before, every L2 was born 'blocking', so this method
+    never touching severity was harmless.  Once an L2 can be born 'info', a
+    genuine blocker folding into it under the same root_cause would sit at
+    'info' forever — under-escalation, the exact mirror of the inflation this
+    task removes.
+    """
+
+    def _make_l2(
+        self,
+        queue: EscalationQueue,
+        severity: str = 'info',
+        task_id: str = 'task-1',
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity=severity,
+            category='design_concern',
+            summary='L2 cluster for severity-floor test',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> dict[str, Any]:
+        return json.loads((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def test_floor_promotes_info_l2_to_blocking(self, tmp_path: Path):
+        """(a) A blocking floor raises an info L2 — in the return value AND on disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'], severity_floor='blocking')
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'Expected the floor to raise info→blocking, got {result.severity!r}'
+        )
+        assert self._on_disk(queue, l2.id)['severity'] == 'blocking', (
+            'The promoted severity must be persisted, not only returned'
+        )
+
+    def test_floor_never_demotes(self, tmp_path: Path):
+        """(b) A lower floor is a no-op — the floor can only ever add attention."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'], severity_floor='info')
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'A floor must never demote; got {result.severity!r}'
+        )
+
+    def test_floor_is_ranked_not_string_compared(self, tmp_path: Path):
+        """(c) critical outranks blocking, and blocking does not outrank critical."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        blocking_l2 = self._make_l2(queue, severity='blocking', task_id='task-1')
+        critical_l2 = self._make_l2(queue, severity='critical', task_id='task-2')
+
+        raised = queue.add_members_to_l2(
+            blocking_l2.id, ['esc-new'], severity_floor='critical',
+        )
+        held = queue.add_members_to_l2(
+            critical_l2.id, ['esc-new'], severity_floor='blocking',
+        )
+
+        assert raised is not None
+        assert raised.severity == 'critical'
+        assert held is not None
+        assert held.severity == 'critical', (
+            f'blocking must not outrank critical; got {held.severity!r}'
+        )
+
+    def test_omitting_the_floor_is_a_no_op(self, tmp_path: Path):
+        """(d) Every existing caller is unaffected — severity is untouched."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'])
+
+        assert result is not None
+        assert result.severity == 'info', (
+            f'Omitting severity_floor must not change severity; got {result.severity!r}'
+        )
+
+    def test_severity_only_change_bumps_updated_at(self, tmp_path: Path):
+        """(e) A severity-only change IS a content change — it must bump updated_at.
+
+        The watcher's re-assess protocol keys off updated_at > triaged_at
+        ('Triage-ack freshness contract'), so a record that silently got more
+        severe without bumping would be stamp-then-skipped forever.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+        # No NEW member ids — 'esc-l1-0' is already present.
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id, ['esc-l1-0'], severity_floor='blocking',
+        )
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert result.updated_at is not None, (
+            'A severity-only promotion must stamp updated_at'
+        )
+
+        before = result.updated_at
+        raised_again = queue.add_members_to_l2(
+            l2.id, ['esc-l1-0'], severity_floor='critical',
+        )
+        assert raised_again is not None
+        assert raised_again.updated_at is not None
+        assert raised_again.updated_at > before, (
+            f'Expected updated_at to strictly increase, got {before!r} -> '
+            f'{raised_again.updated_at!r}'
+        )
+
+    def test_no_op_stays_a_no_op(self, tmp_path: Path):
+        """(f) No new members AND a floor at/below current severity → no bump.
+
+        Do not manufacture a re-assess trigger for nothing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-0'], severity_floor='info')
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert result.updated_at is None, (
+            f'Expected no updated_at bump for a true no-op, got {result.updated_at!r}'
+        )
+
+    def test_unknown_floor_does_not_corrupt_the_record(self, tmp_path: Path, caplog):
+        """(g) An unknown floor fails soft to rank 0 — the record keeps its severity."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        with caplog.at_level(logging.WARNING):
+            result = queue.add_members_to_l2(
+                l2.id, ['esc-new'], severity_floor='warn',
+            )
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'An unknown floor must not corrupt severity; got {result.severity!r}'
+        )
+        assert self._on_disk(queue, l2.id)['severity'] == 'blocking'
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unrecognised severity; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+
+class TestAddMembersToL2RootCauseVariants:
+    """`root_cause_variants` — the distinct PRE-canonical spellings a cluster folded (task 3998).
+
+    Canonicalising the root-cause match makes MORE promotes fold by design, so
+    the failure it introduces is OVER-folding: distinct causes silently merged
+    under one canonical key.  The only observable signature is the set of
+    mutually-distinct spellings one L2 has been addressed by, which is what
+    `add_members_to_l2` — the SOLE writer — accumulates here.
+    """
+
+    def _make_l2(
+        self, queue: EscalationQueue, task_id: str = 'task-1',
+        root_cause: str = 'Watcher lease stolen.',
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause=root_cause,
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_first_fold_seeds_the_records_own_spelling_then_appends(self, tmp_path: Path):
+        """(a) The record's OWN spelling is seeded first, then the incoming one.
+
+        Seeding matters: the distinct count must reflect every spelling the
+        cluster has EVER been addressed by, not only the post-mint ones —
+        otherwise the first fold reads as "1 variant" when two distinct spellings
+        have already reached this L2.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants == [
+            'Watcher lease stolen.', 'watcher  lease STOLEN',
+        ], f'expected own-then-incoming, got {record.root_cause_variants!r}'
+        assert record.root_cause_variants_truncated == 0
+
+    def test_byte_identical_respelling_adds_nothing_and_does_not_bump_updated_at(
+        self, tmp_path: Path,
+    ):
+        """(b) A repeat of an already-listed spelling is not a new variant.
+
+        It must also not manufacture a spurious `updated_at` bump, which would
+        re-trigger the watcher's re-assess protocol on a true no-op.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+        before = queue.get(l2.id)
+        assert before is not None
+
+        # Same members, same spelling — nothing new on any axis.
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+
+        after = queue.get(l2.id)
+        assert after is not None
+        assert after.root_cause_variants == before.root_cause_variants, (
+            f'a repeated spelling must not be listed twice: {after.root_cause_variants!r}'
+        )
+        assert after.updated_at == before.updated_at, (
+            f'no-op fold must not bump updated_at: '
+            f'{before.updated_at!r} -> {after.updated_at!r}'
+        )
+
+    def test_two_spellings_of_one_canonical_key_produce_two_variants(
+        self, tmp_path: Path,
+    ):
+        """(c) THE POINT: canonically-equal spellings are separately recorded.
+
+        The match folded them together; the pre-canonical spellings are the only
+        evidence that the fold happened at all.
+        """
+        from escalation.canonical import canonical_root_cause
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+        queue.add_members_to_l2(l2.id, ['esc-l1-2'], root_cause='WATCHER-LEASE-STOLEN')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        # All three canonicalise to ONE key — that is exactly why they must be
+        # kept apart on the record.
+        canonical = {canonical_root_cause(v) for v in record.root_cause_variants}
+        assert len(canonical) == 1, f'expected one canonical class, got {canonical!r}'
+        assert len(record.root_cause_variants) == 3, (
+            f'expected 3 distinct spellings, got {record.root_cause_variants!r}'
+        )
+
+    def test_framing_free_fold_touches_neither_field(self, tmp_path: Path):
+        """(d) A plain member append carries no spelling and records none."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants == [], (
+            f'a framing-free fold must not seed variants: {record.root_cause_variants!r}'
+        )
+        assert record.root_cause_variants_truncated == 0
+
+    def test_cap_sheds_oldest_and_counts_every_drop(self, tmp_path: Path):
+        """(e) Oldest-shed at `_MAX_ROOT_CAUSE_VARIANTS`, each drop counted durably.
+
+        The TRUE distinct count stays `len(variants) + truncated`, so the loss is
+        a structured fact on the record rather than log-only (INV-8).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        overshoot = 5
+        total_spellings = _MAX_ROOT_CAUSE_VARIANTS + overshoot
+        # -1 because the record's own spelling is seeded by the first fold.
+        for i in range(total_spellings - 1):
+            queue.add_members_to_l2(l2.id, [f'esc-l1-{i}'], root_cause=f'cause number {i}')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert len(record.root_cause_variants) == _MAX_ROOT_CAUSE_VARIANTS, (
+            f'list must be capped, got {len(record.root_cause_variants)}'
+        )
+        assert record.root_cause_variants_truncated == overshoot, (
+            f'expected {overshoot} drops counted, got {record.root_cause_variants_truncated}'
+        )
+        assert (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+            == total_spellings
+        ), 'the true distinct count must stay recoverable from the record'
+        # OLDEST shed: the record's own seeded spelling is the first to go.
+        assert 'Watcher lease stolen.' not in record.root_cause_variants
+        assert f'cause number {total_spellings - 2}' in record.root_cause_variants, (
+            'the most recent spelling must survive'
+        )
+
+    def test_long_spelling_is_elided_with_the_in_band_marker(self, tmp_path: Path):
+        """(e cont.) Each stored spelling is capped by the existing `_elide` helper."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        long_cause = 'x' * (_MAX_AMENDMENT_LINE_CHARS + 250)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause=long_cause)
+
+        record = queue.get(l2.id)
+        assert record is not None
+        stored = record.root_cause_variants[-1]
+        assert stored != long_cause, 'an over-long spelling must be elided'
+        assert stored.startswith('x' * _MAX_AMENDMENT_LINE_CHARS)
+        assert 'elided' in stored, (
+            f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
+        )
+
+    def test_outcome_reports_variant_facts_on_every_return_path(self, tmp_path: Path):
+        """(f) `variant_added` / `variants` are complete on every return, like recorded/dropped.
+
+        Reported from INSIDE `escalation_id_lock` where they are already
+        computed — a caller re-deriving them from a pre-read would be wrong in
+        both directions under the cross-process folds this queue is built for.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        # (i) NOT-FOUND early return — every key still present.
+        missing: AmendmentOutcome = {
+            'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+        }
+        assert queue.add_members_to_l2('esc-nope-1', ['x'], outcome=missing) is None
+        assert missing['variant_added'] is False, f'not-found must reset: {missing}'
+        assert missing['variants'] == 0, f'not-found must reset: {missing}'
+
+        # (ii) NO-OP early return (no members, no floor, no framing).
+        noop: AmendmentOutcome = {
+            'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+        }
+        assert queue.add_members_to_l2(l2.id, [], outcome=noop) is not None
+        assert noop['variant_added'] is False, f'no-op must reset: {noop}'
+        assert noop['variants'] == 0, f'no-op must reset: {noop}'
+
+        # (iii) a real variant-adding fold.
+        first: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN', outcome=first,
+        )
+        assert first['variant_added'] is True, f'expected a new variant: {first}'
+        assert first['variants'] == 2, (
+            f'own spelling + incoming = 2 distinct: {first}'
+        )
+
+        # (iv) a REPEAT fold adds nothing but still reports the running total.
+        repeat: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': True, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN', outcome=repeat,
+        )
+        assert repeat['variant_added'] is False, f'a repeat adds no variant: {repeat}'
+        assert repeat['variants'] == 2, (
+            f'the running DISTINCT total is still reported: {repeat}'
+        )
+
+    def test_variants_count_includes_truncated_drops(self, tmp_path: Path):
+        """(f cont.) `variants` is the TRUE distinct total, not just the list length.
+
+        Past the cap the list stops growing, so reporting `len(list)` would make
+        the over-fold signal plateau exactly when it matters most.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        for i in range(_MAX_ROOT_CAUSE_VARIANTS + 2):
+            queue.add_members_to_l2(l2.id, [f'esc-l1-{i}'], root_cause=f'cause number {i}')
+
+        outcome: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-last'], root_cause='a brand new spelling', outcome=outcome,
+        )
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert outcome['variants'] == (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+        ), f'reported total must match the record: {outcome}'
+        assert outcome['variants'] > _MAX_ROOT_CAUSE_VARIANTS, (
+            f'the count must keep climbing past the cap: {outcome}'
+        )
+
+
+class TestAddMembersToL2VariantConcurrency:
+    """Two-OS-process test: concurrent variant-carrying folds must lose no spelling."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_variant_folds_preserve_the_union(self, tmp_path: Path):
+        """Variants accumulate inside the SAME `escalation_id_lock` as members.
+
+        Without that, each process reads the same pre-mutation snapshot and the
+        second write clobbers the first's spelling — and the over-fold signal
+        would silently under-count exactly under the concurrent load that makes
+        an over-fold likely.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        l2 = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='info',
+            category='design_concern',
+            summary='Concurrent variant test',
+            level=2,
+            root_cause='seeded spelling',
+            members=[],
+        )
+        queue.submit(l2)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        # Kept well under the cap so the assertion is about the LOCK, not the
+        # trimmer: 2*count + 1 seeded spelling must all fit.
+        count = (_MAX_ROOT_CAUSE_VARIANTS - 1) // 2
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+        proc_a = subprocess.Popen(
+            child_args + ['add_members_with_variant', l2.id, 'a', str(count)], env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['add_members_with_variant', l2.id, 'b', str(count)], env=env,
+        )
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants_truncated == 0, (
+            'this scenario must stay under the cap so it tests the lock'
+        )
+        expected = {'seeded spelling'} | {
+            f'cause {prefix} {i}' for prefix in ('a', 'b') for i in range(count)
+        }
+        assert set(record.root_cause_variants) == expected, (
+            'concurrent folds lost spellings — missing: '
+            f'{sorted(expected - set(record.root_cause_variants))}'
+        )
+
+
+class TestFindTerminalByCitation:
+    """EscalationQueue.find_terminal_by_citation() — "was this exact evidence already adjudicated?"
+
+    The complement of ``has_open_l1``, which asks "is a duplicate still OPEN?"
+    and reads PENDING records only.  Once the auto-watcher resolves a
+    ``provenance_unattributed`` L1 the pending guard goes False, and because the
+    reject condition is ABSORBING the very next tick refiles the identical
+    finding — a close-then-refile ping-pong.  This read closes that loop by
+    matching the TERMINAL record carrying the same
+    ``(task_id, category, citation_sha)`` triple (task 4499).
+    """
+
+    CITATION = 'b' * 40
+    CATEGORY = 'provenance_unattributed'
+
+    def _filed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str,
+        *,
+        task_id: str = '1',
+        citation_sha: str | None = _UNSET,
+        category: str | None = None,
+    ) -> Escalation:
+        """Submit a provenance-shaped L1 carrying *citation_sha*.
+
+        *citation_sha* defaults to the ``_UNSET`` sentinel rather than to
+        ``None`` so that ``citation_sha=None`` seeds a record whose identity is
+        genuinely ABSENT — the state a ``no_citation`` reject files.  Defaulting
+        on ``None`` would silently substitute ``CITATION`` there and make the
+        "stored without a citation" cell unreachable (amendment pass).
+        """
+        esc = _make_escalation(esc_id, task_id=task_id, level=1)
+        esc.category = category if category is not None else self.CATEGORY
+        esc.citation_sha = self.CITATION if citation_sha is _UNSET else citation_sha
+        _submit_escalation(queue, esc)
+        return esc
+
+    def _archived_path(self, queue: EscalationQueue, esc_id: str) -> Path:
+        matches = list((queue.queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        assert len(matches) == 1, f'expected exactly one archive copy of {esc_id}; got {matches}'
+        return matches[0]
+
+    def _force_resolved_at(self, queue: EscalationQueue, esc_id: str, stamp: str) -> None:
+        """Rewrite an archived record's resolved_at so ordering is clock-independent."""
+        path = self._archived_path(queue, esc_id)
+        data = json.loads(path.read_text())
+        data['resolved_at'] = stamp
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_resolved_record_matching_the_triple_is_returned(self, tmp_path: Path):
+        """(1) The whole point — a resolved record on this exact evidence is found."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign', resolved_by='escalation-watcher-auto')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a resolved record on this citation must be found'
+        assert found.id == 'esc-1-1', f'wrong record returned: {found.id!r}'
+
+    def test_dismissed_record_is_also_terminal(self, tmp_path: Path):
+        """(2) A dismissal is an equally terminal decision on that exact evidence."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'not a real defect', dismiss=True)
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a DISMISSED record adjudicates the evidence just as a resolved one does'
+        assert found.status == 'dismissed', f'expected dismissed; got {found.status!r}'
+
+    def test_different_citation_sha_does_not_match(self, tmp_path: Path):
+        """(3) Genuine NEW evidence must escape — a different sha is a different finding."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, 'c' * 40) is None
+
+    def test_different_category_does_not_match(self, tmp_path: Path):
+        """(4) A different root cause must escape suppression."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', category='task_failure')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None
+
+    def test_pending_record_is_not_reported(self, tmp_path: Path):
+        """(5) A pending match is has_open_l1's contract, deliberately not this one's."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None, (
+            'a still-pending record must NOT be reported as adjudicated'
+        )
+
+    @pytest.mark.parametrize('falsy', [None, ''])
+    def test_falsy_lookup_key_short_circuits(self, tmp_path: Path, falsy: str | None):
+        """(6a) LOOKUP-KEY half — a no_citation verdict carries no identity to match on.
+
+        The record here deliberately carries a FULL identity (``CITATION``): the
+        point is that the incoming filing has none, so the ``find_dedupe_parent``
+        falsy-key short-circuit answers None before any record is compared.  A
+        no_citation reject can therefore never be suppressed — not even against
+        a resolution on the very same task and category.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, falsy) is None, (
+            f'falsy lookup key {falsy!r} must short-circuit to None, never match'
+        )
+
+    @pytest.mark.parametrize('stored', [None, ''])
+    def test_record_stored_without_a_citation_never_matches_a_real_sha(
+        self, tmp_path: Path, stored: str | None,
+    ):
+        """(6b) STORED-IDENTITY half — the other direction, and the one the short-circuit misses.
+
+        A resolution filed with no evidence identity (the ``no_citation`` arm)
+        must never be returned for a filing that DOES carry a sha: that would be
+        a cross-finding collapse, suppressing real evidence against an
+        adjudication of something else entirely.  Pinned separately from (6a)
+        because it survives the falsy-key short-circuit being moved or removed —
+        the per-record ``esc.citation_sha != citation_sha`` comparison is what
+        has to reject it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', citation_sha=stored)
+        queue.resolve('esc-1-1', 'confirmed benign')
+        seeded = queue.get('esc-1-1')
+        assert seeded is not None and seeded.citation_sha == stored, (
+            'Pre-condition: the record must really be stored WITHOUT an identity'
+        )
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None, (
+            f'a record stored with citation_sha={stored!r} matched a real sha — '
+            'unrelated findings would collapse into one another'
+        )
+
+    def test_no_record_at_all_returns_none(self, tmp_path: Path):
+        """(7) An empty queue answers None rather than raising."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None
+
+    def test_glob_over_match_on_hyphenated_sibling_task_is_rejected(self, tmp_path: Path):
+        """(8) `esc-{task_id}-*.json` over-matches sibling hyphenated ids.
+
+        The hyphen hazard `_recover_seq_from_disk` documents: the glob for task
+        '1-2' also matches esc-1-2-3-9.json, which belongs to task '1-2-3'.  The
+        record's OWN task_id field is the authoritative filter.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-2-3-9', task_id='1-2-3')
+        queue.resolve('esc-1-2-3-9', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1-2', self.CATEGORY, self.CITATION) is None, (
+            "task '1-2-3' record leaked into task '1-2' via the glob over-match"
+        )
+        assert queue.find_terminal_by_citation('1-2-3', self.CATEGORY, self.CITATION) is not None, (
+            'the owning task must still find its own record'
+        )
+
+    def test_newest_terminal_record_wins(self, tmp_path: Path):
+        """(9) Several terminal matches — the newest by resolved_at is returned."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'first adjudication')
+        self._filed(queue, 'esc-1-2')
+        queue.resolve('esc-1-2', 'second adjudication')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', '2026-06-01T00:00:00+00:00')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None
+        assert found.id == 'esc-1-2', (
+            f'expected the NEWEST adjudication esc-1-2; got {found.id!r}'
+        )
+
+    def test_malformed_resolved_at_sorts_oldest_and_never_displaces(self, tmp_path: Path):
+        """A malformed stamp is treated as oldest — it never displaces a well-formed newer match.
+
+        Loud-over-silent: the record is still a legitimate adjudication, so it is
+        never dropped; it simply loses the newest-wins comparison.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'well-formed adjudication')
+        self._filed(queue, 'esc-1-2')
+        queue.resolve('esc-1-2', 'adjudication with a broken stamp')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', 'not-a-timestamp')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a malformed stamp must not drop the record entirely'
+        assert found.id == 'esc-1-1', (
+            f'the malformed-stamp record displaced a well-formed one: {found.id!r}'
+        )
+
+
+class TestNoteSuppressedRefile:
+    """EscalationQueue.note_suppressed_refile() — the INV-4 storm counter (task 4499).
+
+    Bumping ``refiles_suppressed`` on the RESOLUTION makes "this adjudication
+    has absorbed N identical refiles" a durable structured fact rather than
+    log-only (INV-2).  Shares ``patch_resolution_metadata``'s locate-then-patch-
+    in-place shape, so the same no-resurrection contract applies: the archived
+    copy is rewritten where it lives, never lifted back into the queue root.
+    """
+
+    def _resolved(self, queue: EscalationQueue, esc_id: str = 'esc-1-1') -> Escalation:
+        esc = _make_escalation(esc_id, level=1)
+        esc.category = 'provenance_unattributed'
+        esc.citation_sha = 'b' * 40
+        _submit_escalation(queue, esc)
+        resolved = queue.resolve(esc_id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        assert resolved is not None
+        return resolved
+
+    def test_increments_from_zero_and_returns_the_updated_record(self, tmp_path: Path):
+        """(1) The base case — 0 -> 1, and the updated Escalation comes back."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+
+        result = queue.note_suppressed_refile('esc-1-1')
+
+        assert result is not None, 'note_suppressed_refile must return the updated Escalation'
+        assert result.refiles_suppressed == 1, (
+            f'expected 1 absorbed refile; got {result.refiles_suppressed!r}'
+        )
+
+    def test_is_repeatable_and_accumulates_on_disk(self, tmp_path: Path):
+        """(2) Three calls -> 3, re-read from DISK each time (not from the return value).
+
+        A storm counter that only accumulated in memory would read 1 forever to
+        the next process, which is precisely the storm case.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+
+        for expected in (1, 2, 3):
+            queue.note_suppressed_refile('esc-1-1')
+            reread = queue.get('esc-1-1')
+            assert reread is not None
+            assert reread.refiles_suppressed == expected, (
+                f'on-disk counter should read {expected}; got {reread.refiles_suppressed!r}'
+            )
+
+    def test_patches_in_place_without_resurrecting_into_the_queue_root(self, tmp_path: Path):
+        """(3) The archive copy is bumped where it lives; the root stays clean."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Pre-condition: a resolved record lives in the archive, not the root'
+        )
+
+        queue.note_suppressed_refile('esc-1-1')
+
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'RESURRECTION BUG: the archived record was written back into the queue root'
+        )
+        archived = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy; got {archived}'
+        assert json.loads(archived[0].read_text())['refiles_suppressed'] == 1
+
+    def test_leaves_the_resolution_untouched(self, tmp_path: Path):
+        """(4) Only the counter moves — the adjudication itself is immutable here."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        before = self._resolved(queue)
+
+        queue.note_suppressed_refile('esc-1-1')
+
+        after = queue.get('esc-1-1')
+        assert after is not None
+        assert after.status == before.status, f'status changed: {after.status!r}'
+        assert after.resolution == before.resolution, f'resolution changed: {after.resolution!r}'
+        assert after.resolved_at == before.resolved_at, f'resolved_at changed: {after.resolved_at!r}'
+        assert after.resolved_by == before.resolved_by, f'resolved_by changed: {after.resolved_by!r}'
+        assert after.citation_sha == before.citation_sha, (
+            f'citation_sha changed: {after.citation_sha!r} — the identity must stay stable'
+        )
+
+    def test_unknown_id_returns_none(self, tmp_path: Path):
+        """(5) A missing record is answered, not raised on."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        assert queue.note_suppressed_refile('esc-nope-1') is None
+
+    def test_pending_record_is_not_counted_and_not_written(self, tmp_path: Path):
+        """(6) Terminal-only, mirroring patch_resolution_metadata's guard.
+
+        A pending record has absorbed nothing — its own open-L1 veto is what
+        suppresses the refile, and stamping a counter on it would misattribute
+        the storm.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1', level=1)
+        esc.category = 'provenance_unattributed'
+        _submit_escalation(queue, esc)
+        before = (queue.queue_dir / 'esc-1-1.json').read_text()
+
+        assert queue.note_suppressed_refile('esc-1-1') is None
+
+        assert (queue.queue_dir / 'esc-1-1.json').read_text() == before, (
+            'a pending record must be left byte-identical'
+        )
+
+    @pytest.mark.timeout(60)
+    def test_concurrent_bumps_lose_no_count(self, tmp_path: Path):
+        """(7) TWO OS PROCESSES — the increment runs under the lock, so no bump is lost.
+
+        The one property `escalation_id_lock` exists to provide here, and the
+        only test in this class that can see it: every other test is
+        single-process and sequential, so the lock could be deleted outright (or
+        the read-modify-write hoisted out of the ``with`` block) and they would
+        all still pass.
+
+        This matters because the counter is an INCREMENT, not the last-write-
+        wins field SET that ``patch_resolution_metadata`` performs — two
+        processes that both read N and both write N+1 silently lose one, and a
+        lost bump is invisible in the final value unless the expected total is
+        known exactly.  The under-count would land precisely under the
+        concurrent load that makes a storm likely, which is when the counter is
+        the only signal anyone has.
+
+        Mirrors ``TestAddMembersToL2VariantConcurrency`` above, which pins the
+        analogous lost-update on ``root_cause_variants``.
+
+        The RENDEZVOUS BARRIER is what makes it non-vacuous, and was added only
+        after measuring that its absence made it so: spawn-and-wait alone has
+        the children racing their own interpreter startup rather than the
+        counter, so process A finished all its bumps before B had imported and
+        the test passed with the lock deleted.  Releasing both children from a
+        barrier — after each has paid its startup and parked — is what puts two
+        read-modify-writes on the same record at the same time.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        self._resolved(queue)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        count = 150
+        go = tmp_path / 'go'
+        ready = {tag: tmp_path / f'ready-{tag}' for tag in ('a', 'b')}
+        child_args = [
+            sys.executable, str(_SUPPRESSED_REFILE_CHILD), str(queue_dir), 'esc-1-1',
+            str(count),
+        ]
+        procs = {
+            tag: subprocess.Popen(child_args + [str(ready[tag]), str(go)], env=env)
+            for tag in ('a', 'b')
+        }
+        rc_a = rc_b = None
+        try:
+            deadline = time.monotonic() + 40
+            while not all(p.exists() for p in ready.values()):
+                assert time.monotonic() < deadline, (
+                    'children never reached the barrier: '
+                    f'{ {tag: p.exists() for tag, p in ready.items()} }'
+                )
+                time.sleep(0.005)
+            go.write_text('go')
+
+            rc_a = procs['a'].wait(timeout=50)
+            rc_b = procs['b'].wait(timeout=50)
+        finally:
+            for proc in procs.values():
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.refiles_suppressed == 2 * count, (
+            'concurrent bumps were LOST — the storm counter under-reports under '
+            f'exactly the load that makes a storm likely: expected {2 * count}, '
+            f'got {record.refiles_suppressed}'
+        )
+        assert record.status == 'resolved', (
+            f'the concurrent bumps disturbed the adjudication: {record.status!r}'
+        )

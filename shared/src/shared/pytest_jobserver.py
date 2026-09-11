@@ -28,6 +28,7 @@ Enable per subproject by adding::
 
 to that subproject's top-level conftest.py.
 """
+
 from __future__ import annotations
 
 import atexit

@@ -467,8 +467,9 @@ class TestResetHoldsLaneLock:
         # Comfortably longer than the ~0.3s external hold below, but far
         # short of the real 30s default so a regression that never
         # acquires (and so never blocks at all) still fails fast rather
-        # than via this test hanging for 30s.
-        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 5)
+        # than via this test hanging for 30s.  The RESET path has its own
+        # constant (task 3003), distinct from _seed_warm_lane's.
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 5)
 
         merge_commit_a = await _get_merge_commit(real_git_ops, 'reset-lock-a1', 'rla1.py')
         await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)  # create-once
@@ -519,33 +520,89 @@ class TestResetHoldsLaneLock:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
 
-    async def test_reset_raises_runtime_error_when_lane_lock_held_past_timeout(
+    async def test_reset_raises_typed_contended_when_lane_lock_held_past_timeout(
         self, real_git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ):
         """Fail-CLOSED: when a foreign holder keeps <lane_dir>.lock held past
-        the bounded wait, reset_persistent_merge_worktree must RAISE
-        RuntimeError rather than mutate the tree unprotected — this is the
-        central safety guarantee step-4 adds (a live reify/DF holder must
-        block the mutation, never be silently ignored).
+        the bounded wait, reset_persistent_merge_worktree must RAISE rather
+        than mutate the tree unprotected — this is the central safety
+        guarantee step-4 adds (a live reify/DF holder must block the mutation,
+        never be silently ignored).
+
+        task 3003 tightens the CLASSIFICATION of that raise: it must be the
+        typed :class:`MergeVerifyLeaseContended`, not a bare ``RuntimeError``,
+        so the merge worker's requeue seam DEFERS the dispatch instead of the
+        generic ``except Exception`` mapping it to a deterministic-reason
+        MergeOutcome('blocked') that feeds the anti-thrash ladder.
+
+        NOTE the payload assertions are load-bearing:
+        ``MergeVerifyLeaseContended`` IS-A ``RuntimeError``, so the old
+        ``pytest.raises(RuntimeError, match='Timed out')`` would keep passing
+        after the fix while pinning nothing about the new contract.
+
+        The holder is a genuine ``flock(1)`` SUBPROCESS (task 3081): this test
+        has always claimed "a foreign holder", but it used to stage one as a
+        second fd in this same process — which at kernel level is precisely the
+        B13 SELF-OWNED case, since ``/proc/locks`` reports our own pid.  Once
+        that case is detected and typed separately, a same-process fd would no
+        longer exercise foreign contention at all, and this test would be
+        quietly asserting something other than what it says.
         """
+        from test_lane_lock_leak_guard import (  # noqa: PLC0415
+            foreign_lane_lock_holder,
+        )
+
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
 
         # Small enough the test doesn't wait the real 30s default, but long
         # enough it can't be satisfied by anything other than a genuine
-        # timeout of the bounded wait.
-        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 1)
+        # timeout of the bounded wait.  The RESET path has its own constant
+        # (task 3003) — patching the seed's would no longer shorten this wait.
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
 
         merge_commit_a = await _get_merge_commit(real_git_ops, 'reset-lock-b1', 'rlb1.py')
         await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)  # create-once
         merge_commit_b = await _get_merge_commit(real_git_ops, 'reset-lock-b2', 'rlb2.py')
 
         lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            with pytest.raises(RuntimeError, match='Timed out'):
+        with foreign_lane_lock_holder(lock_path):
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
                 await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+            assert excinfo.value.lock_path == lock_path, (
+                'the typed exception must carry the contended lane lock path '
+                'so the operator log names the actual inode'
+            )
+            assert excinfo.value.wait_secs == 1, (
+                'the typed exception must carry the RESET path\'s own bounded '
+                'wait (the monkeypatched _RESET_WARM_LANE_LOCK_WAIT_SECS), not '
+                'the seed constant or a hardcoded default'
+            )
+            # task 3003 amend (reviewer_comprehensive, error_message_accuracy):
+            # the replaced bare RuntimeError named the tree it was protecting
+            # ('refusing to mutate {warm_path} unprotected'); the typed raise
+            # must keep that context rather than only the lock inode.
+            assert (
+                excinfo.value.protected_path
+                == real_git_ops.persistent_merge_worktree_path
+            ), (
+                'the typed exception must name the warm worktree the refusal '
+                'is protecting, which the lock path alone does not convey'
+            )
+            _msg = str(excinfo.value)
+            assert str(real_git_ops.persistent_merge_worktree_path) in _msg, (
+                f'the message must still name the protected tree; got {_msg!r}'
+            )
+            # …and it must state only what was OBSERVED, never the caller's
+            # disposition: this exact raise site is ALSO reached by cli.py's
+            # `verify-merge` (via acquire_host_verify_worktree), where it is a
+            # TERMINAL bail — telling that operator the dispatch is being
+            # 'deferred' and will be retried would be simply false.
+            assert 'deferring' not in _msg.lower(), (
+                f'the message must be caller-neutral — the merge worker defers '
+                f'and logs so itself, but verify-merge exits; got {_msg!r}'
+            )
 
             _, head_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'],
@@ -556,9 +613,6 @@ class TestResetHoldsLaneLock:
                 'block the reset entirely — the tree must be left '
                 'untouched, never mutated unprotected'
             )
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
 
 
 # ---------------------------------------------------------------------------

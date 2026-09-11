@@ -273,3 +273,106 @@ class TestMakeRebuildDetail:
             assert sig.parameters[param_name].kind == inspect.Parameter.KEYWORD_ONLY, (
                 f'{param_name} should be KEYWORD_ONLY'
             )
+
+
+# ---------------------------------------------------------------------------
+# make_graph_mock: cypher-aware dispatch (task 4340)
+# ---------------------------------------------------------------------------
+
+
+class TestMakeGraphMockCypherDispatch:
+    """make_graph_mock must dispatch on the cypher, not answer everything alike.
+
+    Task 4340 paginated two whole-graph reads. A paginated read issues a
+    single-row ``count(*)`` census probe and then a series of
+    ``SKIP n LIMIT m`` pages. A fixture that answers EVERY query with the same
+    rows would hand the census probe a page of edge rows, whose first column
+    is a uuid string — ``int('node-1')`` is unusable as a count — so every
+    existing caller would silently flip to ``complete=False`` plus a WARNING.
+
+    Patching around that per-test would leave a shared fixture that actively
+    lies about the read shape it stands in for, and the next person to
+    paginate something would rediscover the same trap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_census_query_answers_with_a_single_row_count(self, make_graph_mock):
+        """A ``count(`` query gets ONE row holding the row count, never page rows."""
+        rows = [['node-1', 'e1', 'f', 'n'], ['node-2', 'e2', 'f', 'n']]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query('MATCH (n:Entity) RETURN count(*)')
+        assert result.result_set == [[2]]
+        assert len(result.result_set) == 1
+        # The census and the pages agree BY CONSTRUCTION.
+        assert result.result_set[0][0] == len(rows)
+
+    @pytest.mark.asyncio
+    async def test_a_count_column_among_others_is_not_a_census(self, make_graph_mock):
+        """The census dispatch is NARROW: only a bare `RETURN count(*)` projection.
+
+        A loose `'count(' in cypher` test also captures ordinary queries that
+        return a count as one column among several — find_duplicate_entity_nodes
+        issues `RETURN n.uuid, ..., count(e)` — and handing those a
+        single-column [[n]] row raises IndexError deep inside the method under
+        test, nowhere near the fixture.
+        """
+        rows = [['dup-uuid-1', 200, 2]]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query(
+            'MATCH (n:Entity {name: $name})-[e:RELATES_TO]-() '
+            'RETURN n.uuid, n.created_at, count(e) AS edge_count'
+        )
+        assert result.result_set == rows
+
+    @pytest.mark.asyncio
+    async def test_paged_query_answers_with_the_requested_slice(self, make_graph_mock):
+        rows = [[f'n{i}'] for i in range(10)]
+        graph = make_graph_mock(rows)
+        first = await graph.ro_query('MATCH (n) RETURN n.uuid SKIP 0 LIMIT 4')
+        second = await graph.ro_query('MATCH (n) RETURN n.uuid SKIP 4 LIMIT 4')
+        assert first.result_set == rows[0:4]
+        assert second.result_set == rows[4:8]
+
+    @pytest.mark.asyncio
+    async def test_skip_past_the_end_yields_no_rows(self, make_graph_mock):
+        """The boundary that terminates a page loop."""
+        rows = [[f'n{i}'] for i in range(10)]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query('MATCH (n) RETURN n.uuid SKIP 40 LIMIT 4')
+        assert result.result_set == []
+
+    @pytest.mark.asyncio
+    async def test_plain_query_still_answers_with_every_row(self, make_graph_mock):
+        """BACK-COMPAT: a non-paged, non-census query behaves exactly as before."""
+        rows = [['node-1', 'e1', 'f', 'n'], ['node-2', 'e2', 'f', 'n']]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query('MATCH (n:Entity)-[e:RELATES_TO]-() RETURN n.uuid')
+        assert result.result_set == rows
+
+    @pytest.mark.asyncio
+    async def test_ro_rows_and_q_rows_still_split_the_two_paths(self, make_graph_mock):
+        """BACK-COMPAT: .query stays a separate AsyncMock with its own rows."""
+        graph = make_graph_mock(ro_rows=[['ro']], q_rows=[['q']])
+        assert isinstance(graph.ro_query, AsyncMock)
+        assert isinstance(graph.query, AsyncMock)
+        assert (await graph.ro_query('MATCH (n) RETURN n')).result_set == [['ro']]
+        assert (await graph.query('MATCH (n) RETURN n')).result_set == [['q']]
+
+    @pytest.mark.asyncio
+    async def test_header_still_applies_to_every_dispatch_branch(self, make_graph_mock):
+        """BACK-COMPAT: by-name column resolution keeps working on every branch."""
+        header = [[1, 'label'], [1, 'properties']]
+        graph = make_graph_mock([['a', 'b']], header=header)
+        for cypher in (
+            'CALL db.indexes()',
+            'MATCH (n) RETURN count(*)',
+            'MATCH (n) RETURN n SKIP 0 LIMIT 5',
+        ):
+            assert (await graph.ro_query(cypher)).header == header
+
+    @pytest.mark.asyncio
+    async def test_default_rows_is_empty(self, make_graph_mock):
+        """BACK-COMPAT: make_graph_mock() with no args answers with no rows."""
+        graph = make_graph_mock()
+        assert (await graph.ro_query('MATCH (n) RETURN n')).result_set == []
+        assert (await graph.ro_query('MATCH (n) RETURN count(*)')).result_set == [[0]]

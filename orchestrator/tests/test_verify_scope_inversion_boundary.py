@@ -514,8 +514,19 @@ class TestRow2TaskRoleSignal:
 
 # ---------------------------------------------------------------------------
 # Row 3: "docs-only trivial, both roles" — R2 parity survives the inversion.
-# A `.md`-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at
-# BOTH role='task'/'merge', breadth-independent, producer AND consumer.
+# A `.md`-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at the
+# PRODUCER seam (``run_scoped_verification`` with is_merge_verify=False) for
+# BOTH role='task'/'merge', breadth-independent — zero commands.
+#
+# INV-1 (task 2883) UPDATE: the CONSUMER seam is the *adoptable* merge verdict
+# (``_run_post_merge_verify`` → is_merge_verify=True). INV-1 abolishes the
+# no-evidence trivial pass there: a docs-only ('no_source_files') diff at the
+# real merge gate no longer trivially passes — it escalates to the project's
+# full gate when a full-gate command exists (see
+# test_merge_verdict_integrity_inv1.py's
+# test_zero_module_global_command_runs_full_gate_and_emits_event). So the
+# consumer side of this row now runs exactly the escalated global full gate,
+# not zero commands; the producer/task-role trivial short-circuit is unchanged.
 # ---------------------------------------------------------------------------
 
 # A dedicated row-3 main SHA (see ROW1_MAIN_SHA's docstring note on why every
@@ -529,9 +540,17 @@ class TestRow3DocsOnlyTrivialBothRoles:
     module-config and fallback branches (verify_plan.derive_verify_plan) —
     zero ``run_verification`` calls, independent of role or
     ``merge_verify_breadth`` (R2). This row pins that the inversion (κ/λ)
-    never regresses this pre-existing invariant, at both the producer
-    (``run_scoped_verification``) and consumer (``_run_post_merge_verify``)
-    seams.
+    never regresses this pre-existing invariant at the PRODUCER
+    (``run_scoped_verification``, is_merge_verify=False) seam.
+
+    INV-1 (task 2883) amends the CONSUMER seam: the adoptable merge verdict
+    (``_run_post_merge_verify`` → is_merge_verify=True) no longer trivially
+    passes a no-evidence resolution. A docs-only diff at the real merge gate
+    now escalates to the project's full gate (a ``trivial_pass_escalated``
+    event with reason='no_source_files', resolution='full_gate') and runs the
+    escalated global command — so the consumer assertion below pins exactly
+    ONE escalated full-gate run, not zero. The producer/task-role trivial
+    short-circuit is untouched (INV-1 gates on is_merge_verify).
     """
 
     @pytest.mark.asyncio
@@ -557,9 +576,15 @@ class TestRow3DocsOnlyTrivialBothRoles:
         )
         assert executed == {}
 
-        # -- CONSUMER side: parity check — the SAME docs-only diff also
-        # executes zero commands at the real merge gate (always role='merge'
-        # under the hood, regardless of this test's parametrized role).
+        # -- CONSUMER side: INV-1 (task 2883). The SAME docs-only diff at the
+        # real *adoptable* merge gate (always is_merge_verify=True under the
+        # hood, regardless of this test's parametrized role) no longer
+        # trivially passes: with a zero-module-config project whose global
+        # command is non-empty (_make_config), the no-evidence resolution
+        # escalates to the project's full gate and runs it exactly once. The
+        # verdict still PASSES (the escalated global gate's fake returns pass),
+        # so the outcome is still the verify-passed sentinel (None) — but via
+        # real evidence, not a vacuous short-circuit.
         consumer_fake = _run_verification_spy()
         outcome = await _drive_merge_gate(
             tmp_path,
@@ -572,9 +597,10 @@ class TestRow3DocsOnlyTrivialBothRoles:
             run_verification_fake=consumer_fake,
         )
         assert outcome is None, f'expected the verify-passed sentinel (None); got {outcome!r}'
-        assert consumer_fake.await_count == 0, (
-            f'docs-only diff must execute zero commands at the merge gate; '
-            f'got {consumer_fake.await_count} call(s)'
+        assert consumer_fake.await_count == 1, (
+            f'INV-1: a docs-only diff at the adoptable merge gate must escalate '
+            f'to the global full gate and run it exactly once (never a '
+            f'no-evidence trivial pass); got {consumer_fake.await_count} call(s)'
         )
 
 
@@ -1105,9 +1131,11 @@ def _row8_assert_legacy_scoped_shape(executed_mc: ModuleConfig) -> None:
     pytest must be SKIPPED (``None``): a source-only diff has no
     collectable test file to file-scope, and the R3 task-role pytest floor
     (``TestRow2TaskRoleSignal`` above) is gated to ``role == 'task'`` only
-    (``verify_plan._derive_module_runs``'s ``elif role == 'task':`` branch)
-    — ``role == 'merge'`` always falls through to the legacy ``else:``
-    SKIPPED arm, unchanged by λ (R4). lint/pyright, in contrast, stay
+    (``verify_plan._derive_module_runs``'s ``elif role == 'task' and
+    production_trigger is not None:`` branch — moved ABOVE the
+    collectable-tests branch by task 3294, still role-gated, so this row's
+    outcome is unchanged) — ``role == 'merge'`` always falls through to the
+    legacy ``else:`` SKIPPED arm, unchanged by λ (R4). lint/pyright, in contrast, stay
     FILE_SCOPED and non-``None``: D1/D2 file-scoping never forked on role
     or ``merge_verify_breadth`` to begin with, so R4 has nothing to roll
     back there.
@@ -1270,12 +1298,16 @@ class TestRow9FallbackNarrowingNeverWholeRepoChain:
 # ---------------------------------------------------------------------------
 
 
-# modA's touched file is a collectable TEST file — pytest is FILE_SCOPED to
-# it at BOTH roles (the collectable-tests branch of
-# verify_plan._derive_module_runs never forks on role). modB's touched file
-# is a plain SOURCE file with no collectable test alongside it, which DOES
-# fork by role: FULL_SUITE at role='task' (the R3 owning-module pytest
-# floor) vs SKIPPED at role='merge' (R4 — the legacy shape).
+# modA's touched file is a collectable TEST file and NOTHING ELSE under that
+# prefix — no SOURCE/STRUCTURAL file — so pytest is FILE_SCOPED to it at BOTH
+# roles. (Narrow claim, deliberately: since task 3294 the collectable-tests
+# branch is reached only when no production file was touched under the same
+# prefix, because the role='task' floor now sits ABOVE it. A modA diff that
+# ALSO touched a production file would fork by role, which is not the shape
+# this row exercises.) modB's touched file is a plain SOURCE file with no
+# collectable test alongside it, which DOES fork by role: FULL_SUITE at
+# role='task' (the R3 owning-module pytest floor) vs SKIPPED at role='merge'
+# (R4 — the legacy shape).
 ROW10_MODA_TEST_PATH: str = 'moda/tests/test_thing.py'
 ROW10_MODA_TEST_CONTENT: str = 'def test_thing():\n    pass\n'
 ROW10_MODB_SOURCE_PATH: str = 'modb/helpers.py'
@@ -1402,4 +1434,138 @@ class TestRow10PlanAuthorityBothRoles:
         # an independently re-derived diagnostic mirror.
         assert result.plan == expected_plan.to_dict(), (
             f'VerifyResult.plan (role={role!r}) must reflect the EXECUTED plan'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Row 6b (task 3173): the SAME ν/I1 non-consumption contract as row 6, driven
+# by an EXTERNALLY KILLED leg — the category whose whole point is that the
+# gate produced no verdict at all.
+#
+# The measured incident surfaced this to the human as
+#   "Post-merge verification failed: Failures: lint issues"
+# — a branch-blaming, human-routed BRANCH verdict for a lint process that was
+# SIGKILLed at 0.31s having emitted zero diagnostics.  It must instead route
+# the loud transient-infra hold (an infra_issue that bypasses the steward and
+# consumes no merge attempt), and the reason must SAY what happened.
+#
+# The category AND summary here are produced by the real `_summarize_checks`
+# rather than hand-authored literals, so this row cannot drift from the
+# producer it is asserting on.
+# ---------------------------------------------------------------------------
+
+ROW6B_MAIN_SHA: str = 'r6bmain000000000000000000000000000000000'
+ROW6B_LINT_CMD: str = './scripts/verify.sh lint --scope branch --include-infra'
+ROW6B_LINT_OUT: str = 'DF_VERIFY_ROLE=merge — forcing --scope all\n'
+ROW6B_LINT_DURATION: float = 0.31010722508654
+
+
+def _fake_run_verification_killed_lint(passed_prefixes: dict[str, bool]) -> AsyncMock:
+    """Row 6b's analogue of :func:`_fake_run_verification_by_module`, whose
+    failing result's ``category``/``summary`` come from the REAL
+    ``verify._summarize_checks`` for a lint leg killed by signal 9 at 0.31s.
+    """
+    from orchestrator.verify import _summarize_checks
+
+    # Five-tuple since the task-3173 review amendment: the fifth element is
+    # one category per FAILING leg, which merge_queue's veto gate reads instead
+    # of inferring verdict-lessness from the severity-ranked aggregate.
+    passed_flag, category, cause_hint, summary, failing_legs = _summarize_checks(
+        0, '', False, None,
+        -9, ROW6B_LINT_OUT, False, ROW6B_LINT_CMD,
+        0, '', False, None,
+        lint_duration=ROW6B_LINT_DURATION,
+    )
+    assert not passed_flag and category == 'infra_kill', (
+        f'sanity: the producer must classify this as infra_kill; got {category!r}'
+    )
+    assert failing_legs == ['infra_kill'], (
+        f'sanity: the only failing leg here is the killed lint leg; got {failing_legs!r}'
+    )
+
+    async def _fake(worktree, config, module_config=None, **kwargs):
+        if module_config is None or passed_prefixes.get(module_config.prefix, True):
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='All checks passed', failing_test_ids=[],
+            )
+        return VerifyResult(
+            passed=False, test_output='', lint_output=ROW6B_LINT_OUT, type_output='',
+            summary=summary, category=category, cause_hint=cause_hint,
+            failing_test_ids=[],
+        )
+    return AsyncMock(side_effect=_fake)
+
+
+class TestRow6bExternalKillIsAnInfraHoldNotABranchVerdict:
+    """Row 6b (task 3173): a PERSISTENT externally-killed merge verify routes
+    the loud transient-infra hold, consumes no attempt, and names the kill —
+    it never surfaces as a branch verdict.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.exercise_merge_verify
+    async def test_row6b_persistent_kill_routes_the_infra_hold_and_says_so(
+        self, tmp_path: Path,
+    ) -> None:
+        assert 'infra_kill' in INFRA_TRANSIENT_CATEGORIES, (
+            "sanity: 'infra_kill' must be an INFRA_TRANSIENT_CATEGORIES member "
+            'for this row to exercise the intended ν policy path'
+        )
+
+        mod_a, _mod_b, _config = _two_module_registry(tmp_path, breadth='full')
+        my_timeouts: dict[str, int] = {}
+        my_enospc_retries: dict[str, int] = {}
+        merge_fake = _fake_run_verification_killed_lint({mod_a.prefix: False})
+        outcome = await _drive_merge_gate(
+            tmp_path,
+            task_id='row6b-3173',
+            module_configs_registry={'moda': mod_a},
+            touched_module_configs=[mod_a],
+            task_files=['moda/thing.py'],
+            task_files_content={'moda/thing.py': 'x = 1\n'},
+            main_sha=ROW6B_MAIN_SHA,
+            run_verification_fake=merge_fake,
+            timeouts=my_timeouts,
+            enospc_retries=my_enospc_retries,
+        )
+
+        # (1) the loud transient-infra hold, NOT a branch verdict.
+        assert outcome is not None, (
+            'expected a blocked MergeOutcome (infra hold), got the '
+            'verify-passed sentinel'
+        )
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'a persistent externally-killed merge verify must route the loud '
+            f'transient-infra hold (infra_issue, bypasses the steward, consumes '
+            f'no attempt); got {outcome.reason!r}'
+        )
+
+        # (2) the reason SAYS what actually happened — every clause measured.
+        assert 'infra_kill' in outcome.reason
+        assert 'signal 9' in outcome.reason
+        assert 'no diagnostics produced' in outcome.reason
+        assert 'indeterminate' in outcome.reason
+
+        # (3) and never the two branch-blaming strings the incident surfaced.
+        assert 'Post-merge verification failed' not in outcome.reason, (
+            f'the incident surfaced the kill as a branch verdict; got '
+            f'{outcome.reason!r}'
+        )
+        assert 'Failures: lint issues' not in outcome.reason, (
+            f'the exact string the measured incident surfaced for a process '
+            f'that emitted ZERO diagnostics; got {outcome.reason!r}'
+        )
+
+        # (4) ν/I1 non-consumption, matching row 6's both-consumers assertions.
+        assert my_timeouts == {}, (
+            f'a persistent externally-killed outcome must not bump the merge '
+            f'timeout loop-breaker (no merge verify attempt consumed); got '
+            f'{my_timeouts}'
+        )
+        assert merge_fake.await_count == 2, (
+            f'expected the BOUNDED shared enospc/infra retry budget (one '
+            f'in-place retry) to exhaust rather than retry silently forever; '
+            f'got {merge_fake.await_count} call(s)'
         )

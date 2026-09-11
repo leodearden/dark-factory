@@ -43,6 +43,7 @@ from orchestrator.merge_types import MergeRequest
 # body).  They are imported here only so TestReachBackRouting has a "naive"
 # orchestrator.merge_shadow.<name> patch target to assert is NOT what governs.
 from orchestrator.verify import run_scoped_verification  # noqa: F401
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_runner import (  # noqa: F401
     LocalRunner,
     VerifyRunnerPool,
@@ -51,6 +52,7 @@ from orchestrator.verify_runner import (  # noqa: F401
 
 if TYPE_CHECKING:
     from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.verify import VerifyResult
 
 logger = logging.getLogger('orchestrator.merge_queue')
 
@@ -130,6 +132,28 @@ _NEXTEST_TEST_LINE_RE = re.compile(
 _LIBTEST_TEST_LINE_RE = re.compile(
     r'^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED)\s*$'
 )
+
+
+# Matches reify run_all.sh's BARE {failed}-member classifier marker line.
+# Capture group: (1) the space-separated member names.
+#
+# Producer: reify tests/infra/run_all.sh:26-36 (documented contract) and
+# :1839-1841 (the emitting `printf 'FAILED %s\n' "${failed_names[*]}"`).  This
+# is the same line DF's own verify.py already classifies via `^FAILED\s`
+# (pattern #7b), so the format is established and source-verified.
+#
+# Anchored at line start with a REQUIRED space, so the sibling human-readable
+# summary `=== FAILED: <names> ===` (run_all.sh:1840) cannot also match and
+# double-count the members.
+_RUN_ALL_FAILED_MARKER_RE = re.compile(r'^FAILED[ \t]+(.*)$', re.MULTILINE)
+
+
+# The sentinel token reify's SECOND marker producer appends when an outer
+# timeout SIGTERMs a run mid-flight: `tests/infra/run_all.sh:684-685`
+# (`_ra_on_term`) emits `printf 'FAILED %s(partial)\n' "${_names:+$_names }"`.
+# Its presence means the marker describes an INTERRUPTED run, so
+# :func:`parse_failed_run_all_members` refuses to narrow on it entirely.
+_RUN_ALL_PARTIAL_MARKER_TOKEN = '(partial)'
 
 
 def _classify_test_status(raw_status: str) -> str:
@@ -288,6 +312,253 @@ def did_not_pass_subset(fail_fast_map: Mapping[str, str]) -> list[str]:
         when every test passed.
     """
     return sorted(t for t, v in fail_fast_map.items() if v != 'pass')
+
+
+def nextest_filter_ids(subset: Iterable[str]) -> list[str]:
+    """Map DF's per-test key space into cargo-nextest's ``test(=...)`` domain.
+
+    DF's internal ids are :func:`parse_per_test_results` keys — ``"<binary-id>
+    <test-name>"`` on the nextest branch, a bare test path on the libtest
+    branch.  cargo-nextest's ``test(=...)`` equality matcher accepts only the
+    **bare test name**, so this strips the binary-id prefix at the single
+    filter-file write boundary.  Everything upstream (``build_fail_fast_map``,
+    :func:`did_not_pass_subset`) keeps operating in the uniform parse-key space.
+
+    **Why this mapping exists.** Resolved empirically against cargo-nextest
+    0.9.136 — the exact version reify's merge gate runs — not from docs::
+
+        cargo nextest list -E 'test(=mymod::mytest)'          -> MATCHES
+        cargo nextest list -E 'test(=nxprobe mymod::mytest)'  -> MATCHES NOTHING
+
+    reify wraps every filter-file line as ``test(=<line>)`` at one construction
+    site (``verify.sh`` ``emit_nextest_pass``).  Emitting the full ``"<binary-id>
+    <test-name>"`` key therefore produces a file that is **non-empty** — so
+    reify's loud "retry refused: no subset" fallback never fires — and that
+    matches **ZERO tests**: a narrowed retry that runs nothing and reports PASS.
+    That is a **FALSE GREEN**, strictly worse than not narrowing at all.
+
+    **Soundness of the bare form.** An unqualified ``test(=name)`` term matches
+    that name in *every* binary, so the resulting run is a **superset** of the
+    intended subset.  That errs in the safe direction: it may re-run a test that
+    already passed in another binary, but it never *skips* a did-not-pass test.
+
+    Args:
+        subset: Test ids in :func:`parse_per_test_results`' key space.
+
+    Returns:
+        Bare nextest test names, **input order preserved**, exact duplicates
+        collapsed to their first occurrence (two binaries running the same test
+        name need only one ``test(=name)`` term).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for test_id in subset:
+        # Split on the FIRST space only: nextest permits spaces inside test
+        # names for some harnesses, and splitting on every space would truncate
+        # such a name — silently dropping it from the retry subset.
+        _, _, bare = test_id.partition(' ')
+        name = bare if bare else test_id
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _nextest_case_is_planned(meta: object) -> bool:
+    """True when a ``testcases`` entry is a test nextest would actually RUN.
+
+    cargo-nextest lists every DISCOVERED test, including ones it has already
+    decided to skip, and marks them (real 0.9.136 bytes, see
+    ``tests/fixtures/reify_verify_retry/nextest-list-ignored.json``)::
+
+        "alpha::test_ignored": {"ignored": true,
+                                "filter-match": {"status": "mismatch",
+                                                 "reason": "ignored"}}
+        "gamma::test_one":     {"ignored": false,
+                                "filter-match": {"status": "mismatch",
+                                                 "reason": "expression"}}
+
+    Counting those as *planned* would be permanently self-inflating:
+    :func:`parse_per_test_results` deliberately drops SKIP/ignored result lines,
+    so a skipped test never has a verdict, is annotated ``'not-started'`` by
+    :func:`build_fail_fast_map`, and therefore lands in the {did-not-pass}
+    subset of **every** narrowed retry.  It is never *unsafe* — nextest still
+    refuses to run it — but it pushes every filter file toward reify's
+    ``REIFY_VERIFY_RETRY_MAX_SUBSET`` ceiling, and tripping that ceiling makes
+    reify refuse narrowing for the whole profile.  A workspace with many
+    ``#[ignore]``d tests would silently lose the capability.
+
+    Fail-safe bias: an entry whose shape is unrecognised (not a dict, no
+    ``filter-match``, a non-string ``status``) is treated as PLANNED.  That errs
+    toward the superset the module's ``None``-is-never-empty rule already
+    accepts — it can only re-run more tests, never skip one.
+    """
+    if not isinstance(meta, dict):
+        return True
+    if meta.get('ignored'):
+        return False
+    filter_match = meta.get('filter-match')
+    if isinstance(filter_match, dict):
+        status = filter_match.get('status')
+        if isinstance(status, str) and status != 'matches':
+            return False
+    return True
+
+
+def parse_nextest_list_planned(stdout: str) -> list[str] | None:
+    """Parse ``cargo nextest list --message-format json`` into the planned set.
+
+    Pure — no I/O, no subprocess — so it is trivially unit-testable against
+    checked-in real producer bytes
+    (``tests/fixtures/reify_verify_retry/nextest-list.json``, unmodified
+    cargo-nextest 0.9.136 output) and reusable outside the probe.
+
+    **Key-space contract.** The returned ids are ``f"{binary-id} {test-name}"``
+    — exactly :func:`parse_per_test_results`' key space — so
+    ``build_fail_fast_map(planned, verdicts)`` composes directly with no
+    translation.  They are mapped through :func:`nextest_filter_ids` **only** at
+    the moment they are written to a nextest filter file.
+
+    **Fail-safe input path.** Every ``json.loads`` and field access is guarded:
+    any malformed shape returns ``None`` rather than raising.  ``None`` routes
+    the caller to a FULL verify — it is never treated as an empty plan.
+
+    Args:
+        stdout: Raw stdout of ``cargo nextest list --message-format json``.
+
+    **Skipped tests are NOT planned.** Entries nextest has already excluded —
+    ``#[ignore]``d, or filtered out by a filterset expression — are dropped via
+    :func:`_nextest_case_is_planned`; see that docstring for why counting them
+    would silently disable the capability on an ignore-heavy workspace.  Note
+    that the document's own top-level ``test-count`` counts them, so it is NOT
+    the planned count and is deliberately not read here.
+
+    Returns:
+        Sorted test ids on success.  ``[]`` for a well-formed document whose
+        suites carry no RUNNABLE testcases (a genuinely test-free workspace, or
+        one where every test is ignored/filtered out).  ``None`` when the input
+        is not a parseable nextest list document — the caller MUST treat that as
+        "do not narrow", not as an empty plan.
+    """
+    try:
+        doc = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    suites = doc.get('rust-suites')
+    if not isinstance(suites, dict):
+        return None
+
+    planned: list[str] = []
+    try:
+        for suite_key, suite in suites.items():
+            if not isinstance(suite, dict):
+                return None
+            # nextest keys the rust-suites map BY the binary id, so the map key
+            # is the same value and is a sound fallback if the field is absent.
+            binary_id = suite.get('binary-id') or suite_key
+            testcases = suite.get('testcases')
+            if not isinstance(testcases, dict):
+                return None
+            planned.extend(
+                f'{binary_id} {case}'
+                for case, meta in testcases.items()
+                if _nextest_case_is_planned(meta)
+            )
+    except (AttributeError, TypeError):
+        return None
+    return sorted(planned)
+
+
+def parse_failed_run_all_members(test_output: str) -> list[str]:
+    """Extract the {failed} run_all member names from attempt-0's own log.
+
+    Consumes reify's **bare classifier marker** line, ``FAILED <space-separated
+    names>``, documented at ``reify tests/infra/run_all.sh:26-36`` and emitted
+    at ``:1839-1841``.  DF's own ``verify.py`` already classifies that same line
+    via its ``^FAILED\\s`` regex (pattern #7b), so this parser reuses an
+    established, source-verified format rather than inventing one.
+
+    The sibling human-readable summary ``=== FAILED: <names> ===`` is emitted on
+    the immediately preceding line; the anchored regex deliberately does not
+    match it, so members are never double-counted.
+
+    **The ``(partial)`` marker refuses to narrow at all.** run_all.sh has a
+    SECOND marker producer — ``:684-685`` in ``_ra_on_term``, the outer-timeout
+    SIGTERM handler — which emits
+    ``printf 'FAILED %s(partial)\\n' "${_names:+$_names }"``.  Both of its forms
+    match the same regex as the clean producer:
+
+    ==============================  =====================================
+    ``FAILED (partial)``            SIGTERM landed before any member had
+                                    recorded a nonzero exit (the
+                                    ``${_names:+...}`` guard collapses)
+    ``FAILED a.sh b.sh (partial)``  some members had failed when it landed
+    ==============================  =====================================
+
+    Whenever that token appears among the governing marker's tokens this
+    returns ``[]`` — the full run_all suite.  Emitting the sentinel as a member
+    name instead would be a **false green**: a non-empty subset passes
+    ``verify.sh:2545``'s ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`` gate, so
+    the safe fallback never fires, and ``run_all.sh:1327`` then warns
+    ``member '(partial)' not found in $INFRA_DIR (ignored)`` and runs ZERO
+    members.  The named form is refused too, for a different reason: an
+    interrupted run's failed-set is not a *complete* failed-set — members that
+    had not yet executed are neither passed nor failed, so narrowing to just
+    the named failures would silently skip them on the retry.
+
+    That is this plan's single rule, now adopted for the third time: **never
+    narrow on an incomplete plan.**  Its two siblings are
+    ``merge_queue._probe_nextest_planned`` returning ``None`` (an unknown
+    planned set routes to a full verify) and the first-profile-only rule (a
+    profile whose attempt-0 nextest pass never executed is never narrowed).
+
+    The token is matched **anywhere** in the token list rather than only in
+    trailing position, because a real run_all member is always a ``.sh``
+    basename: no legitimate member can collide with it, so a looser check can
+    only ever widen the retry to the full suite.
+
+    **[] is the SAFE degradation, not a silent narrowing.** An empty result
+    means DF sets ``REIFY_RUN_ALL_MEMBER_SUBSET`` to the empty string, and
+    ``verify.sh:2545`` gates the subset on ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]``
+    — so empty runs the **FULL** run_all suite.  A no-marker log therefore
+    widens the retry, never skips a member.
+
+    .. note::
+
+       The **gui counterpart is deliberately NOT implemented here.** No real
+       reify gui/vitest failure log was available to pin a fixture to, and
+       authoring one from prose is the exact drift class this leaf corrects
+       (PRD §12 root cause (a)) — so ``REIFY_GUI_RETRY_SPECS`` ships empty,
+       which ``verify.sh:2127-2158`` treats as "run the full gui suite".  A
+       follow-up captures real gui bytes and adds the parser.
+
+    Args:
+        test_output: Attempt-0's captured verify output (stdout+stderr blob).
+
+    Returns:
+        Member names from the LAST marker in the log, in emission order, exact
+        duplicates collapsed.  ``[]`` when no marker is present, when the marker
+        carries no names, or when the marker is a ``(partial)`` one.
+    """
+    matches = _RUN_ALL_FAILED_MARKER_RE.findall(test_output)
+    if not matches:
+        return []
+    # A merge-gate log can concatenate more than one run_all invocation; the
+    # LAST marker describes the final state.
+    tokens = matches[-1].split()
+    # Refusal is a property of the governing marker only: an earlier clean
+    # marker is not poisoned by a later partial one, and vice versa.
+    if _RUN_ALL_PARTIAL_MARKER_TOKEN in tokens:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in tokens:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +1118,144 @@ def _alarm_warm_shadow_unparseable(
     escalation_queue.submit(esc)
 
 
+def _submit_coarse_shadow_divergence_escalation(
+    escalation_queue: Any,
+    merge_commit: str,
+    cold_result: VerifyResult,
+) -> None:
+    """Submit a born-at-L2 escalation for a COARSE (suite-level) warm/cold divergence.
+
+    FIX 2 (task 2886, PRD leaf δ §3.4).  A MAP-LESS warm-passed land — a
+    trivial-pass land that ran no suite, or a remote-verdict land whose verify
+    ran off the warm local ``_merge-verify`` lane, so it has NO per-test warm
+    baseline — was re-verified from scratch with a cold FULL-gate suite that
+    FAILED.  The warm merge has ALREADY LANDED, so the commit may be red on main.
+
+    Mirrors :func:`_submit_shadow_divergence_escalation`'s born-at-L2 template:
+
+    * ``severity='critical'`` (in ``BORN_AT_L2_SEVERITIES``) → born at L2
+    * ``level=2``
+    * ``agent_role='orchestrator-warm-cold-shadow'`` (``orchestrator-`` prefix →
+      harness sentinel → not downgraded by the escalation server)
+    * ``category='risk_identified'``
+    * ``task_id=_WARM_COLD_SHADOW_SENTINEL`` — SHARED dedup key with the per-test
+      shadow-divergence alarm: both are "the warm/cold shadow detective found a
+      divergence — investigate the shadow lane", so a single open alarm
+      suppresses the other (matches the per-test global-dedup rationale).
+
+    None-safe: no-op when *escalation_queue* is None.
+    Dedup: no second submission while an open alarm for the sentinel exists.
+    """
+    if escalation_queue is None:
+        return
+
+    # Dedup: don't fire again while an open/pending shadow-divergence alarm exists
+    # (shared sentinel with the per-test path — see docstring).
+    if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_SENTINEL):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    short_sha = merge_commit[:8]
+    summary = (
+        f'Coarse warm/cold shadow divergence on {short_sha}: cold FULL-gate '
+        f'suite FAILED on a map-less warm-passed land'
+    )
+    detail = (
+        f'Commit: {merge_commit}\n'
+        f'Cold FULL-gate suite verdict: FAIL\n'
+        f'Cold verify summary: {cold_result.summary}\n'
+        '\n'
+        'This land had NO per-test warm baseline (a trivial-pass land that ran '
+        'no suite, or a remote-verdict land whose verify ran off the warm local '
+        '_merge-verify lane), so the warm/cold shadow compare degraded to a '
+        'COARSE suite-level pass/fail comparison (FIX 2, PRD leaf δ §3.4).\n'
+        '\n'
+        'The warm merge has ALREADY LANDED via the shadow/async lane and the '
+        'from-scratch cold FULL-gate suite FAILED — this commit may be RED on '
+        'main.  Investigate the cold suite failure on the landed merge commit '
+        'and consider a rollback of main.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(_WARM_COLD_SHADOW_SENTINEL),
+        task_id=_WARM_COLD_SHADOW_SENTINEL,
+        agent_role='orchestrator-warm-cold-shadow',
+        severity='critical',
+        level=2,
+        category='risk_identified',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            'Investigate the cold FULL-gate suite failure on the landed merge '
+            'commit; roll back main if the failure reproduces.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+
+async def _run_cold_shadow_verify_suite(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    event_store: EventStore | None,
+) -> VerifyResult:
+    """Run a from-scratch cold FULL-GATE verify on *merge_commit*, returning the
+    suite-level :class:`~orchestrator.verify.VerifyResult`.
+
+    Mirrors :func:`_run_cold_shadow_verify` (throwaway ``_merge-<uuid>`` worktree,
+    LOCAL-only from-scratch trust-anchor, ``finally`` cleanup, reach-back deferred
+    imports resolved from :mod:`orchestrator.merge_queue`) but with the two
+    differences the COARSE map-less compare (FIX 2) requires:
+
+    * the spec is built FULL-GATE (``task_files=None`` → verify.py workspace
+      path) so a map-less trivial-pass land is NOT re-confirmed by a same-scope
+      trivial pass — the cold leg runs the COMPLETE suite and CAN diverge
+      (PRD §8δ: re-dispatching the same no-source spec trivially passes on both
+      legs and structurally cannot catch the trivial-pass class);
+    * it returns the whole :class:`VerifyResult` (suite-level ``.passed``) rather
+      than only the per-test map, because a map-less land has no per-test warm
+      baseline to diff against.
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just warm-landed.
+        merge_commit: The merge commit SHA to verify cold.
+        event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
+
+    Returns:
+        The suite-level :class:`VerifyResult` from the cold FULL-gate dispatch.
+    """
+    # Reach-back (deferred import): mirrors _run_cold_shadow_verify — the test
+    # suite patches these pool-construction deps by string path at
+    # orchestrator.merge_queue.<name>; resolving them from merge_queue's
+    # namespace at call time keeps those patches effective.
+    import orchestrator.merge_queue as _mq
+
+    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    try:
+        # FULL-GATE: task_files=None → the complete workspace suite on the cold
+        # leg (verify.py workspace path).  A scoped/no-source spec would trivially
+        # pass and could not catch the trivial-pass divergence class (PRD §8δ).
+        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, None)
+        # LOCAL-ONLY by design (same as _run_cold_shadow_verify): this is the
+        # from-scratch cold trust-anchor control; a remote may carry warm
+        # sccache/target warmth and defeat the from-scratch-cold guarantee.
+        pool = _mq.VerifyRunnerPool(
+            [_mq.LocalRunner(
+                wt, req.config, req.module_configs, None,
+                run_scoped=_mq.run_scoped_verification,
+                run_unscoped=_mq._run_unscoped_typechecks,
+                task_id=req.task_id,
+            )],
+            event_store=event_store,
+            task_id=req.task_id,
+        )
+        return await pool.dispatch(merge_commit, spec)
+    finally:
+        await git_ops.cleanup_merge_worktree(wt)
+
+
 async def _run_cold_shadow_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -865,6 +1274,11 @@ async def _run_cold_shadow_verify(
     The throwaway worktree is NEVER the persistent warm ``_merge-verify`` path
     — it has no retained ``target/`` warmth — ensuring a true from-scratch
     cold verify (PRD §10 invariant 6(b)).
+
+    The verify body runs under ``merge_verify_lease(lane_dir=wt)`` so a
+    concurrent periodic worktree reap (task 3018) cannot delete the checkout
+    mid-verify; the lease is released before the ``finally`` cleanup — see the
+    inline comment for why that scope is load-bearing.
 
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
@@ -894,27 +1308,65 @@ async def _run_cold_shadow_verify(
 
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
     try:
-        task_files_tuple = (
-            tuple(req.task_files) if req.task_files is not None else None
-        )
-        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
-        # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor detective
-        # control (PRD §10 invariant 6(b)).  Adding remotes here would (a) defeat the
-        # from-scratch-cold guarantee (a remote may have a warm sccache/target) and
-        # (b) reintroduce remote scope-derivation concerns into the very control whose
-        # purpose is to BE the local ground truth.  See design decision in plan.json.
-        pool = _mq.VerifyRunnerPool(
-            [_mq.LocalRunner(
-                wt, req.config, req.module_configs, task_files_tuple,
-                run_scoped=_mq.run_scoped_verification,
-                run_unscoped=_mq._run_unscoped_typechecks,
+        # Hold THIS throwaway lane's flock for the duration of the verify
+        # (task 3018).  Three things to know:
+        #
+        # (i) WHY IT IS NEEDED.  Task 3018 promoted
+        #     `reap_orphaned_merge_worktrees` from a startup-only sweep to a
+        #     steady-state one fired from the merge worker's heartbeat, which
+        #     turned RESOURCE_AUDIT_WORKTREE_GRACE_SECS from a *detection*
+        #     threshold into a *destruction* deadline.  This throwaway tree is
+        #     neither registered in `_owned_merge_worktrees` (so the reap's
+        #     owned-ledger skip misses it) nor touched by
+        #     `_touch_owned_merge_worktrees` (so its measured age is real
+        #     elapsed time) — the lane flock consulted by
+        #     `remove_merge_worktree_guarded` is its ONLY liveness protection.
+        #     Holding it makes that protection independent of how long the
+        #     cold verify runs, rather than resting on an age heuristic: a
+        #     concurrent sweep gets 'skipped_lease_held' instead of deleting
+        #     the checkout out from under a running verify.
+        #
+        # (ii) PRECEDENT.  Passing `lane_dir=` an ephemeral `_merge-*`
+        #     worktree (rather than the persistent lane) is established — the
+        #     DF-2822 per-land REMOTE-green cross-check does exactly this
+        #     (merge_queue.py, `lane_dir=merge_wt`).
+        #
+        # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
+        #     MergeVerifyLeaseContended fail-safe branch is warranted: the
+        #     `_merge-<uuid>` path was just minted by
+        #     create_throwaway_verify_worktree and is uncontended by
+        #     construction — nobody else knows it.
+        #
+        # SCOPE IS LOAD-BEARING: the lease wraps ONLY the verify body and
+        # closes before the `finally` below.  If cleanup ran while we still
+        # held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING
+        # acquire would fail against OURSELVES, return 'skipped_lease_held',
+        # and leak the very tree the finally exists to remove.
+        async with git_ops.merge_verify_lease(lane_dir=wt):
+            task_files_tuple = (
+                tuple(req.task_files) if req.task_files is not None else None
+            )
+            spec = _mq.build_merge_verify_spec(
+                req.config, req.module_configs, task_files_tuple
+            )
+            # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor
+            # detective control (PRD §10 invariant 6(b)).  Adding remotes here would
+            # (a) defeat the from-scratch-cold guarantee (a remote may have a warm
+            # sccache/target) and (b) reintroduce remote scope-derivation concerns
+            # into the very control whose purpose is to BE the local ground truth.
+            # See design decision in plan.json.
+            pool = _mq.VerifyRunnerPool(
+                [_mq.LocalRunner(
+                    wt, req.config, req.module_configs, task_files_tuple,
+                    run_scoped=_mq.run_scoped_verification,
+                    run_unscoped=_mq._run_unscoped_typechecks,
+                    task_id=req.task_id,
+                )],
+                event_store=event_store,
                 task_id=req.task_id,
-            )],
-            event_store=event_store,
-            task_id=req.task_id,
-        )
-        verify = await pool.dispatch(merge_commit, spec)
-        return parse_per_test_results(verify.test_output or '')
+            )
+            verify = await pool.dispatch(merge_commit, spec)
+            return parse_per_test_results(verify.test_output or '')
     finally:
         await git_ops.cleanup_merge_worktree(wt)
 
@@ -1110,6 +1562,168 @@ async def _run_shadow_compare(
             )
 
 
+# Cold FULL-gate failure categories where the suite NEVER BUILT — the landed
+# commit's build/compile stage failed, so verify emits build/compile errors but
+# ZERO parseable test lines (an empty per-test map).  For the map-less COARSE
+# path (the SOLE detector for trivial-pass / remote-verdict lands) this is a
+# GENUINE red-main signal, NOT a throwaway-worktree infra hiccup, so it must
+# alarm rather than be swallowed by the empty-map inconclusive guard (task 2886
+# reviewer robustness amendment — otherwise a red main whose landed commit does
+# not even compile is silently undetected for this population).  Scoped to the
+# build-STAGE categories only (a compile/CLI/tree-sitter/npm build break, where
+# zero test lines is EXPECTED); TEST_FAILURE-class categories with an empty map
+# stay inconclusive since a genuine test failure normally DOES emit parseable
+# lines and an empty map there is more likely a transport/parse hiccup.  Derived
+# from FailureCategory so a new build-stage category can't drift out of the set.
+_COARSE_BUILD_FAILURE_CATEGORIES: frozenset[str] = frozenset({
+    FailureCategory.COMPILE_ERROR.value,
+    FailureCategory.CARGO_CLI_ERROR.value,
+    FailureCategory.TREE_SITTER_GENERATE_ERROR.value,
+    FailureCategory.NPM_ERROR.value,
+})
+
+
+async def _run_coarse_shadow_compare(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    escalation_queue: Any,
+    event_store: EventStore | None,
+) -> None:
+    """COARSE suite-level warm-vs-cold shadow compare for a MAP-LESS land.
+
+    FIX 2 (task 2886, PRD leaf δ §3.4).  Scheduled by
+    :func:`_maybe_schedule_shadow_compare` for the two populations that have NO
+    per-test warm map yet CAN diverge:
+
+    * trivial-pass lands (ran no suite → empty per-test map), and
+    * remote-verdict lands (verify ran off the warm local ``_merge-verify`` lane).
+
+    Without a per-test warm baseline there is nothing to diff per-test, so the
+    compare degrades to SUITE level.  The warm land implicitly PASSED (it landed),
+    so:
+
+    1. Run a from-scratch cold FULL-gate verify via
+       :func:`_run_cold_shadow_verify_suite` (``task_files=None`` — the cold leg
+       runs the COMPLETE suite so a trivial-pass land cannot be re-confirmed by a
+       same-scope trivial pass; PRD §8δ).
+    2. **Build-never-built FAIL** (cold produced no parseable test output but
+       FAILED with a build/compile category in
+       :data:`_COARSE_BUILD_FAILURE_CATEGORIES`): the landed commit does not
+       compile ⇒ born-at-L2 suspected-red alarm — this is a GENUINE red-main
+       signal, not an infra hiccup, and the coarse path is the SOLE detector for
+       the map-less population (task 2886 reviewer robustness amendment).
+    3. **Inconclusive** (cold produced no parseable test output and is NOT a
+       recognised build failure → OOM/transport/disk hiccup in the throwaway
+       worktree, or a cold PASS that ran nothing): no alarm, no event — mirrors
+       :func:`_run_shadow_compare`'s inconclusive guard (avoids alarming on
+       transport failure).  Logged with cold_passed + category for observability.
+    4. **cold FULL-gate FAIL** (with a parseable map) vs the warm-passed land ⇒
+       born-at-L2 suspected-red alarm via
+       :func:`_submit_coarse_shadow_divergence_escalation`.
+    5. **cold FULL-gate PASS** ⇒ emit ``verdict_parity_ok`` (``coarse=True``).
+
+    The coarse threshold (suite verdict gated by per-test parseability of the cold
+    output, rather than a per-command exit comparison) is tactical per PRD §9 open
+    question δ — the map-less populations only need a suite-level pass/fail signal.
+
+    **Exception handling**: any exception from the cold leg is logged at WARNING
+    and swallowed — a detective control must never crash or stall the merge worker
+    (it runs off the serial lane via ``asyncio.create_task``).
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that warm-landed (provides config +
+             module_configs for the cold verify spec).
+        merge_commit: The just-landed merge commit SHA.
+        escalation_queue: Live escalation queue, or ``None`` (None-safe).
+        event_store: Optional event store for parity-ok event emission.
+    """
+    # Reach-back (deferred import): the test suite patches the cold FULL-gate leg
+    # by string path at orchestrator.merge_queue._run_cold_shadow_verify_suite.
+    # Resolving it from merge_queue's namespace at call time keeps that patch
+    # effective post-extraction (mirrors _run_shadow_compare's reach-back).
+    from orchestrator.merge_queue import _run_cold_shadow_verify_suite
+
+    try:
+        cold = await _run_cold_shadow_verify_suite(
+            git_ops, req, merge_commit, event_store
+        )
+    except Exception:
+        logger.warning(
+            'Coarse shadow compare cold leg failed for %s — swallowing exception',
+            merge_commit[:8],
+            exc_info=True,
+        )
+        return
+
+    # Inconclusive guard (mirrors _run_shadow_compare): a cold FULL-gate that
+    # produced NO parseable test output usually signals an OOM/transport/disk
+    # hiccup in the throwaway worktree, not a genuine warm-pass/cold-fail flip.
+    # The coarse threshold is "did the suite actually run?" (per-test
+    # parseability) gating the suite-level verdict; an empty parse is inconclusive
+    # (neither alarm nor parity-ok), avoiding a false-positive born-at-L2 alarm on
+    # transport/infra failure.
+    #
+    # EXCEPT the build-never-built class (task 2886 reviewer robustness
+    # amendment): a cold FULL-gate that FAILED with a build/compile category
+    # (:data:`_COARSE_BUILD_FAILURE_CATEGORIES`) legitimately emits ZERO parseable
+    # test lines because the suite never built — yet the landed commit genuinely
+    # does not compile, which IS a red main.  For the map-less population this
+    # coarse path is the SOLE detector, so that class must ALARM instead of being
+    # swallowed as an "infra hiccup".  Category-based (not an output-regex
+    # heuristic) to honour verify_categories' closed-domain classification norm.
+    cold_map = parse_per_test_results(cold.test_output or '')
+    if not cold_map:
+        cold_cat = cold.category or ''
+        if not cold.passed and cold_cat in _COARSE_BUILD_FAILURE_CATEGORIES:
+            logger.warning(
+                'Coarse shadow compare on %s: cold FULL-gate produced no '
+                'parseable test results but FAILED with a build/compile category '
+                '(%s) — the landed commit did not build; alarming as a suspected '
+                'red main (map-less coarse path is the sole detector)',
+                merge_commit[:8], cold_cat,
+            )
+            _submit_coarse_shadow_divergence_escalation(
+                escalation_queue, merge_commit, cold
+            )
+            return
+        # Genuinely inconclusive: no parseable map AND not a recognised build
+        # failure (a transport/OOM/disk hiccup, or a cold PASS that ran nothing).
+        # Log WITH cold_passed + category so the swallowed cases are observable in
+        # the merge-worker logs (the plan deliberately keeps this off event_store —
+        # a new inconclusive EventType is out of scope for this task's locks).
+        logger.warning(
+            'Coarse shadow compare inconclusive for %s: cold FULL-gate produced '
+            'no parseable test results (cold_passed=%s, category=%r; possible '
+            'OOM/transport/disk hiccup in the throwaway worktree); not alarming',
+            merge_commit[:8], cold.passed, cold_cat,
+        )
+        return
+
+    if not cold.passed:
+        # Cold FULL-gate FAIL vs the warm-passed (implicit) map-less land: the
+        # landed commit may be RED on main.  Born-at-L2 suspected-red alarm.
+        _submit_coarse_shadow_divergence_escalation(
+            escalation_queue, merge_commit, cold
+        )
+    else:
+        # Cold FULL-gate PASS → coarse parity confirmed.  Emit verdict_parity_ok
+        # with coarse=True so downstream accounting can distinguish the coarse
+        # (suite-level) parity from the per-test path.
+        if event_store is not None:
+            event_store.emit(
+                EventType.verdict_parity_ok,
+                task_id=req.task_id,
+                data={
+                    'merge_commit': merge_commit,
+                    'shadow_compare': True,
+                    'coarse': True,
+                    'cold_test_count': len(cold_map),
+                },
+            )
+
+
 async def _maybe_schedule_shadow_compare(
     worker: SpeculativeMergeWorker,
     git_ops: GitOps,
@@ -1149,17 +1763,25 @@ async def _maybe_schedule_shadow_compare(
         event_store: Optional event store for parity-ok event emission.
     """
     # Reach-back (deferred import): the existing test suite patches the
-    # spawned coroutine by string path at
-    # orchestrator.merge_queue._run_shadow_compare (this function used to
-    # live in merge_queue.py, alongside its sibling).  Resolving it
-    # dynamically from merge_queue's namespace at call time keeps those
-    # patches effective post-extraction.
-    from orchestrator.merge_queue import _run_shadow_compare
+    # spawned coroutine(s) by string path at
+    # orchestrator.merge_queue._run_shadow_compare /
+    # orchestrator.merge_queue._run_coarse_shadow_compare (these functions used
+    # to live in merge_queue.py, alongside their siblings).  Resolving them
+    # dynamically from merge_queue's namespace at call time keeps those patches
+    # effective post-extraction.
+    from orchestrator.merge_queue import (
+        _run_coarse_shadow_compare,
+        _run_shadow_compare,
+    )
 
-    # Early exits: knob off or no warm results to compare against
+    # Early exit: knob off.
+    #
+    # FIX 2 (task 2886, PRD leaf δ §3.4): the historical ``if not warm_results:
+    # return`` early-exit is intentionally GONE.  A MAP-LESS land (empty
+    # warm_results) is exactly the trivial-pass / remote-verdict population that
+    # CAN diverge, so it must be sampled — it is routed to the COARSE
+    # suite-level compare below instead of being silently skipped.
     if not req.config.git.warm_verify_shadow_compare:
-        return
-    if not warm_results:
         return
     # None-safe: _shadow_state_path is None on bare-harness workers (mirrors the
     # escalation_queue None-safety / bare-harness contract in __init__).
@@ -1204,11 +1826,21 @@ async def _maybe_schedule_shadow_compare(
 
     # Spawn the shadow compare OFF the serial lane — this call returns IMMEDIATELY
     # without awaiting the cold verify (detective/async control, PRD §10 invariant 6(b)).
-    t = asyncio.create_task(
-        _run_shadow_compare(
+    #
+    # FIX 2 branch: a land WITH a per-test warm map uses the per-test
+    # _run_shadow_compare (unchanged); a MAP-LESS land (empty warm_results —
+    # trivial-pass or remote-verdict) degrades to the COARSE suite-level
+    # _run_coarse_shadow_compare, which runs a cold FULL-gate verify and
+    # compares its suite verdict against the warm-passed (implicit) land.
+    if warm_results:
+        compare_coro = _run_shadow_compare(
             git_ops, req, merge_commit, warm_results, escalation_queue, event_store
         )
-    )
+    else:
+        compare_coro = _run_coarse_shadow_compare(
+            git_ops, req, merge_commit, escalation_queue, event_store
+        )
+    t = asyncio.create_task(compare_coro)
 
     def _discard_task(task: asyncio.Task) -> None:  # type: ignore[type-arg]
         worker._shadow_compare_tasks.discard(task)

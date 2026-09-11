@@ -9,14 +9,30 @@ Unifies the twice-fixed scope decision between ``scope_module_config`` and
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, scope_to, strip_cwd
+from orchestrator.pytest_markers import deselecting_expression_for_targets
+from orchestrator.verify_cmd import (
+    ToolKind,
+    VerifyCmd,
+    describe_dropped_clauses,
+    has_unpreserved_chain_clauses,
+    keyword_truncation_end,
+    parse_config_command,
+    promote_cwd_to_project,
+    render,
+    scope_to,
+    split_chain_tail,
+    strip_cwd,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class FileKind(Enum):
@@ -174,12 +190,66 @@ class PlannedRun:
     an explicit reasoned PlannedRun (``cmd=None``, non-empty ``reason``)
     rather than a silently dropped command (the task-1852 "not silent"
     requirement).
+
+    ``scoped_targets`` is the worktree-root-relative file list this (module,
+    tool) slot was NARROWED to. **Invariant: non-empty iff ``scope_kind is
+    ScopeKind.FILE_SCOPED``** — FULL_SUITE is deliberately unscoped and
+    SKIPPED/TRIVIAL never ran, so empty is the correct and MEANINGFUL value
+    there, not an absence of information. (Pinned by tests, deliberately not
+    by a ``__post_init__`` assert: ``verify._safe_derive_verify_plan_dict``
+    swallows exceptions and returns ``None``, so an assert here would
+    degrade an invariant violation into losing the ENTIRE plan record —
+    silently destroying the very observability this field exists to supply.)
+
+    FIDELITY: it records the scoping INTENT the decision layer computed, NOT
+    a guarantee about what the command actually ran on — the executed command
+    may be BROADER, never narrower. Two reachable divergences: (i) when
+    :func:`_scope_prefix_to_keyword` cannot narrow (the keyword is absent, or
+    the prefix parses OPAQUE) it returns the command UNSCOPED while the slot
+    is still labelled FILE_SCOPED, so a ``type_check_command='mypy src/'``
+    slot records the touched files but type-checks the whole tree; (ii) after
+    ``verify._executed_fallback_plan`` reconciliation this field still holds
+    the DECISION-layer flat list while ``cmd`` is the executed, possibly
+    subproject-rescoped or unscoped command — the same intent-vs-execution
+    gap :func:`_derive_fallback_runs`' own "Fidelity caveat" paragraph
+    documents for ``module_prefix``/``cmd``. Read it as "what the planner
+    decided to narrow to", and ``cmd`` as "what ran".
+
+    It exists (task 3219) because ``cmd.targets`` CANNOT answer "which files
+    was this scoped to?" whenever ``cmd`` is raw-retained, and two paths
+    routinely produce exactly that: the tail-preserving chained-lint accept
+    path in :func:`_scope_prefix_to_keyword` (which every subproject's
+    ``lint_command`` hits, since each chains a sibling checker), and every
+    run rebuilt by ``verify._executed_fallback_plan``. In both cases the
+    rendered string still carries the narrowed file list, but the
+    machine-readable record was lost. It is populated uniformly for chained
+    AND unchained FILE_SCOPED runs, so a consumer never has to branch on
+    ``cmd.raw`` to read it; where ``cmd.targets`` is also populated the two
+    agree, which is a consistency check rather than a second source of truth.
+
+    It lives HERE and not on ``VerifyCmd`` because ``VerifyCmd`` is the
+    execution model, whose P3 invariant (``verify_cmd.render``) exists to
+    guarantee that no field it carries is silently dropped by ``render()`` —
+    a deliberately-non-rendering field there would be precisely the class of
+    field P3 forbids, and would make P3 self-contradictory. Relaxing P3 to
+    let a raw-retained command carry these targets instead was considered
+    and rejected: P3 is a general guard, not a lint on one call site, so
+    admitting one caller's provenance need would also free ``cargo_scope``
+    and ``serial_pytest`` — which mutate raw-retained commands by rewriting
+    ``raw`` — to leave stale structured ``targets`` behind with nothing left
+    to catch it. Scoping provenance is a PLAN fact, and ``PlannedRun`` is
+    the plan record: sibling to ``scope_kind``/``reason``, which already
+    record the WHY of a narrowing to this field's WHAT. It also rides
+    untouched through ``verify._executed_fallback_plan``'s
+    ``dataclasses.replace``-based reconciliation, which a ``VerifyCmd``-hosted
+    field would not.
     """
 
     module_prefix: str
     cmd: VerifyCmd | None
     scope_kind: ScopeKind
     reason: str
+    scoped_targets: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         """Render as a plain JSON-native dict (D3) — see ``_verify_cmd_to_dict``."""
@@ -188,6 +258,7 @@ class PlannedRun:
             'cmd': _verify_cmd_to_dict(self.cmd) if self.cmd is not None else None,
             'scope_kind': str(self.scope_kind),
             'reason': self.reason,
+            'scoped_targets': list(self.scoped_targets),
         }
 
 
@@ -206,47 +277,361 @@ class VerifyPlan:
         }
 
 
+def log_dropped_chain_clauses(
+    log: logging.Logger, raw: str, keyword: str, retained: str,
+) -> None:
+    """Report onto *log* the trailing chain clauses a gate REJECT discarded from *raw*.
+
+    Shared by BOTH scopers — ``_scope_prefix_to_keyword`` below and
+    ``verify._scope_to_keyword``, which passes its own module logger — so the
+    two records read alike structurally rather than by hand-mirroring. Same
+    argument that put the tail-preservation policy in one shared
+    ``split_chain_tail`` gate: lockstep the pair cannot drift out of. It lives
+    here rather than in ``verify_cmd`` because ``verify`` already imports this
+    module (not the reverse), and because keeping ``verify_cmd`` logging-free
+    is what lets ``has_unpreserved_chain_clauses`` stay a pure predicate.
+
+    Callers MUST gate this on ``has_unpreserved_chain_clauses(raw, tail)`` and
+    MUST call it only on the path that actually rewrites the command: both
+    scopers' bail-outs return the whole original, chain and all, so a record
+    emitted before them would name clauses that in fact still run.
+
+    *retained* is the caller's truncation point (``head[: idx + len(keyword)]``
+    — each caller already computes it, as the argument to
+    ``parse_config_command``) and must be a prefix of *raw*. The clause COUNT
+    is the top-level `&&` SEGMENT DELTA across it, NOT
+    ``len(split_top_level_and(raw)) - 1``: that earlier form counted every
+    clause in the whole original, which is right only when the keyword sits in
+    segment 0, and every ``cd X && <tool>`` config in this repo puts it in
+    segment 1. Measured, it over-reported the root ``type_check_command`` as 5
+    dropped clauses when 4 were dropped, and the root ``test_command`` as 15
+    when 14 were.
+
+    LEVEL and wording are decided by WHAT WAS DROPPED, via
+    ``describe_dropped_clauses``, not by which slot is running. If any dropped
+    clause re-invokes the tool at an argv-head position the truncation is an
+    intended SAME-TOOL FAN-OUT -> DEBUG, not the WARNING the reverse-dependency
+    widening's no-op uses: BOTH root configs are this case and hit it on every
+    fallback verify, so a louder level would be steady noise that trains
+    operators to ignore the record. If no dropped clause invokes the tool it is
+    a genuine SIBLING CHECK that will now never run -> INFO, the
+    possible-false-GREEN direction, matching the level
+    ``verify._with_junitxml_str`` uses for the missing junit report, whose
+    shape this record mirrors.
+
+    That replaces an earlier rule keyed on ``keyword == 'pytest'``, which
+    conflated which slot is running with what kind of chain got truncated.
+    They come apart in both directions on real configs: this repo's root
+    ``test_command`` is a pure pytest FAN-OUT with no sibling checker anywhere
+    (so the keyword rule reported the highest-frequency pytest-slot record in
+    the repo at INFO, claiming a dropped sibling check that does not exist),
+    while a ``cd``-rejected pyright chain ending in ``python3
+    scripts/check_pyright_config.py src`` is a genuine sibling check the
+    keyword rule buried at DEBUG under fan-out prose.
+    """
+    dropped, fan_out = describe_dropped_clauses(raw, retained, keyword)
+    log.log(
+        logging.DEBUG if fan_out else logging.INFO,
+        'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
+        '(gate rejected tail preservation) — %s',
+        keyword,
+        len(dropped),
+        raw,
+        'an intended same-tool fan-out truncation'
+        if fan_out
+        # "this command", not "the test command": the sibling case is no
+        # longer pytest-specific now that the classification comes from the
+        # dropped clauses rather than from the keyword.
+        else 'a sibling check chained onto this command will NOT run for this '
+        'verify',
+        # Attribute the record to the CALLING scoper, not to this shared
+        # helper — otherwise every record, from either scoper, points at the
+        # same line here and the file/line is useless for telling them apart.
+        stacklevel=2,
+    )
+
+
 def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
     """Scope *raw* to *files*, first-clause-scoping a raw-retained chain.
 
     The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
     operates on — and returns — a shell string): this returns a ``VerifyCmd``
     instead, since ``PlannedRun.cmd`` stores structured commands, not strings.
-    The two scopers run the IDENTICAL algorithm (true algorithmic lockstep —
-    a future change to one's scoping rule must update the other): *raw* is
-    ALWAYS truncated to everything up to and including the first occurrence
-    of *keyword* before being (re-)parsed, regardless of whether the
-    untruncated *raw* would itself have parsed as one structured command or a
-    raw-retained chain. This means content positioned after the matched
-    *keyword* occurrence — including any flags trailing the target on an
-    otherwise single-clause command, or any further ``&&``-chained clause —
-    is intentionally dropped, exactly as ``_scope_to_keyword`` drops it: a
-    value-taking flag after the target (e.g. ``'ruff check src/ --select
-    E'``) would otherwise have its value misread as an extra target by
-    ``scope_to``, so truncating first — not scoping the whole parsed command
-    — is what keeps this safe as well as byte-identical.
+    Lockstep between the two is now STRUCTURAL rather than a convention kept
+    by hand — both route through the single shared
+    ``verify_cmd.split_chain_tail`` gate, so neither can drift from the
+    other's tail-preservation rule.
+
+    Within the matched segment, *raw* is ALWAYS truncated to everything up to
+    and including the first occurrence of *keyword* before being (re-)parsed,
+    regardless of whether the untruncated segment would itself have parsed as
+    one structured command. Any flags trailing the target are therefore
+    dropped: a value-taking flag after the target (e.g. ``'ruff check src/
+    --select E'``) would otherwise have its value misread as an extra target
+    by ``scope_to``, so truncating first — not scoping the whole parsed
+    command — is what keeps this safe as well as byte-identical.
+
+    A trailing ``&&``-chained clause is decided by the gate, not by that
+    truncation. A SIBLING CHECKER (a different tool, no ``cd`` sequencing —
+    every subproject's ``lint_command`` chains a ``python3 .../check_*.py
+    <dir>`` gate after ``ruff check``) is PRESERVED unscoped and verbatim,
+    because it asserts a whole-directory invariant that narrowing would
+    break. A SAME-TOOL FAN-OUT (the root config's ``cd X && npx pyright``
+    chain) is still dropped: preserving it would run two more subprojects
+    unscoped AND leave a ``cd ../orchestrator`` that misresolves once
+    ``strip_cwd`` has removed the leading ``cd``.
+
+    The PYTEST slot is excluded from tail preservation outright (task 3218):
+    ``'pytest'`` is off the gate's ``_TAIL_PRESERVING_KEYWORDS``, so a
+    chained ``test_command`` always truncates and the returned ``VerifyCmd``
+    stays STRUCTURED (``raw is None``) — which is what keeps
+    ``with_junitxml`` and ``with_pytest_timeout`` live on it. A preserved
+    tail there would have silently cost the junit report that drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor. The dropped clauses are not silent: a
+    multi-clause command whose tail the gate rejects is reported by
+    :func:`log_dropped_chain_clauses` below, naming the keyword and the
+    dropped-clause count — at DEBUG when a dropped clause re-invokes the tool
+    (an intended same-tool fan-out truncation), at INFO when none does (a
+    sibling check that will now never run), independent of which slot is
+    running. ``verify._scope_to_keyword`` emits that same record through that
+    same shared helper, since STRUCTURAL lockstep is this pair's documented
+    property. It is emitted only on the rewriting path: both bail-outs below
+    return *raw* with its chain intact, so nothing is dropped there and
+    nothing is reported.
 
     If the *keyword*-prefix parses into a structured, non-OPAQUE command, it
-    is scoped to *files* (first-clause scoped, every trailing ``&&``-chained
-    clause dropped). *keyword* absent from *raw*, or the prefix not parsing
-    into one recognised structured invocation (P1), leaves *raw* untouched:
-    the returned ``VerifyCmd`` is forced raw-retained (``raw=raw``) so
-    rendering it reproduces *raw* byte-for-byte even when *raw* itself would
-    otherwise have parsed into a structured command — a from-scratch render
-    of which is only argv-equivalent, not guaranteed byte-identical, to the
-    original string (e.g. a ``--directory`` flag renders back as a leading
-    ``cd``).
+    is scoped to *files*. When a tail was preserved the result is returned
+    raw-retained — ``VerifyCmd(tool=<scoped tool>, raw=render(scoped) +
+    tail)`` — the same shape both bail-outs below already produce, which
+    ``render`` reproduces byte-for-byte. The real ``ToolKind`` is kept rather
+    than OPAQUE so ``run.cmd.tool`` stays meaningful downstream.
+
+    That raw-retained return drops the structured ``targets`` by design (P3),
+    so the narrowed file list is not recoverable from the returned ``cmd``;
+    scoping provenance is recorded by the caller on
+    :class:`PlannedRun`'s ``scoped_targets`` — see that field's docstring.
+
+    *keyword* absent from *raw*, or the prefix not parsing into one
+    recognised structured invocation (P1), leaves *raw* untouched: the
+    returned ``VerifyCmd`` is forced raw-retained (``raw=raw`` — the full
+    original, never the gate's head) so rendering it reproduces *raw*
+    byte-for-byte even when *raw* itself would otherwise have parsed into a
+    structured command — a from-scratch render of which is only
+    argv-equivalent, not guaranteed byte-identical, to the original string
+    (e.g. a ``--directory`` flag renders back as a leading ``cd``).
     """
     parsed = parse_config_command(raw)
     unscoped = parsed if parsed.raw is not None else VerifyCmd(tool=parsed.tool, raw=raw)
 
-    idx = raw.find(keyword)
+    head, tail = split_chain_tail(raw, keyword)
+    idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    prefix_parsed = parse_config_command(raw[: idx + len(keyword)])
+    # Task 3931 / esc-3805-1: token-aware, in LOCKSTEP with
+    # verify._scope_to_keyword's identical line — the shared
+    # `keyword_truncation_end` helper is what makes that lockstep structural
+    # rather than a convention. The old byte-offset slice cut mid-token at the
+    # `@` of a pinned npx package spec, destroying the pin before the re-parse.
+    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
+    prefix_parsed = parse_config_command(retained)
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
         return unscoped
-    return strip_cwd(scope_to(prefix_parsed, files))
+    # Sited AFTER both bail-outs on purpose — each returns *unscoped*, i.e.
+    # *raw* in full with its chain intact, so nothing is dropped there and a
+    # record would name clauses that in fact still run. Only the rewriting
+    # path below actually discards them. Same record and same level policy as
+    # verify._scope_to_keyword's, because it is literally the same call.
+    #
+    # `retained` is what makes the reported count right: it is the truncation
+    # point, so the clauses past it are exactly the ones this call discards.
+    if has_unpreserved_chain_clauses(raw, tail):
+        log_dropped_chain_clauses(logger, raw, keyword, retained)
+    scoped = strip_cwd(promote_cwd_to_project(scope_to(prefix_parsed, files)))
+    if not tail:
+        return scoped
+    return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')
+
+
+def deselecting_expression_for_command(
+    test_command: str | None,
+    targets: Sequence[str],
+    worktree_reader: Callable[[str], str | None],
+) -> str | None:
+    """*test_command*'s effective ``-m`` expression when it provably deselects EVERY target.
+
+    Returns None — "keep today's FILE_SCOPED behaviour" — for every other case,
+    including any unreadable file or unparseable expression. See
+    :mod:`orchestrator.pytest_markers` for the soundness and cost arguments;
+    both reads go through the SAME injected *worktree_reader*, so this function
+    introduces no filesystem access of its own.
+
+    SHARED BY BOTH ARMS (task 3513): the module arm passes ``mc.test_command``
+    plus that module's touched COLLECTABLE_TEST files
+    (:func:`_derive_module_runs` arm 4a, task 3494); the fallback arm passes the
+    ALREADY-EXECUTED fallback command plus its resolved file targets
+    (:func:`widen_fallback_for_marker_deselection`). Keeping ONE implementation
+    of "which commands are refused" and "where the ini file is looked for" is
+    load-bearing: were the two arms to answer differently, the arm with the
+    weaker guards would over-fire on a config its command never applies.
+
+    That sharing is also how both arms acquired CLASS-level marker detection
+    (task 4561) without either one being edited: the probe's module-wide tier
+    is ``orchestrator/pytest_markers.py::guaranteed_marker_names``, which now
+    proves a class-level ``pytestmark`` or class decorator too — but only where
+    its all-items-accounted-for guard can show every collected item lives
+    inside a marked class. Widening that ONE tier gave both arms the capability
+    in one place; adding a second call site to "wire up" the other arm would
+    have created exactly the divergence this shared probe exists to prevent.
+
+    *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
+    while the command's own targets may be cwd-relative — only the CONFIG path
+    below follows the command's ``cwd_rel``. A caller holding cwd-relative
+    targets must resolve them first.
+
+    WHERE the ini file is looked for: pytest reads ``addopts`` from its
+    ROOTDIR, which follows the command's effective cwd — NOT from any module
+    prefix. The two come apart in this very repo: the ``scripts`` and
+    ``tests/scripts`` modules both run ``uv run --project shared pytest
+    tests/scripts/ ...`` from the REPO ROOT (no ``--directory``), so a
+    ``scripts/pyproject.toml`` would never be the config pytest actually
+    applies. The effective cwd is therefore taken from the parsed command's
+    ``cwd_rel`` (a leading ``cd X &&``, or ``uv run --directory X``), falling
+    back to the repo root when the command carries neither.
+
+    Three guards REFUSE rather than guess. Each is fail-safe — no widening,
+    i.e. exactly the pre-3494 FILE_SCOPED behaviour:
+
+    1. a *test_command* that does not parse as PYTEST at all (``npm test``,
+       a shell script): a pyproject's ``addopts`` describe a suite this command
+       never invokes, so consulting them would widen on a false premise;
+    2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
+       chain): neither the effective cwd nor which invocation gets scoped is
+       recoverable from it. ``_scope_prefix_to_keyword`` truncates a chained
+       ``test_command`` to its FIRST ``pytest`` clause, so a probe that read a
+       later clause's config would describe a different invocation than the
+       one that runs;
+    3. only ``pyproject.toml`` is consulted. ``pytest.ini`` / ``setup.cfg`` /
+       ``tox.ini`` addopts are invisible here, so a module configured that way
+       simply never widens. A deliberate UNDER-fire, never an over-fire.
+    """
+    if not test_command:
+        return None
+    parsed = parse_config_command(test_command)
+    if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
+        return None
+    cwd_rel = parsed.cwd_rel
+    config_path = (
+        'pyproject.toml' if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/pyproject.toml'
+    )
+    return deselecting_expression_for_targets(
+        targets,
+        worktree_reader(config_path),
+        test_command,
+        worktree_reader,
+    )
+
+
+def widen_fallback_for_marker_deselection(
+    fallback: ModuleConfig,
+    worktree_reader: Callable[[str], str | None],
+) -> tuple[ModuleConfig, str | None]:
+    """Widen an EXECUTED fallback config whose file-scoped pytest run is fully deselected.
+
+    Returns ``(config, reason)``: the input *fallback* unchanged and a ``None``
+    reason whenever no widening is proven — the one-directional fail-safe task
+    3494 established, here closing its twin arm (task 3513).
+
+    WHAT IT IS GIVEN: the ALREADY-EXECUTED fallback ``ModuleConfig``, i.e. the
+    output of ``verify._build_fallback_config`` after ``_apply_cargo_scope``.
+    That is the whole point of the layering. :func:`_derive_fallback_runs` is a
+    pure DECISION function that cannot see the subproject rescoping
+    ``_build_fallback_config`` performs (its own "Fidelity caveat" paragraph),
+    so a probe there could read a ``pyproject.toml`` the executed command never
+    applies — the OVER-fire task 3494 forbids. Here the command's OWN SHAPE
+    decides, and the rescoping has already happened.
+
+    That is also where the feared over-fire is closed STRUCTURALLY rather than
+    by re-deriving "would ``_build_fallback_config`` rescope?" (which would
+    duplicate ``_single_subproject_prefix`` / ``_root_plus_single_subproject_prefix``
+    — a second copy of a filesystem decision, free to drift). Each guard below
+    refuses a shape whose rootdir or scoping is not recoverable from the string:
+
+    * ``test_command is None`` — the "no collectable tests" branch produced no
+      pytest run at all, so there is nothing to widen;
+    * NOT ``ToolKind.PYTEST`` — a pyproject's ``addopts`` describe a suite this
+      command never invokes;
+    * ``parsed.raw is not None`` — a raw-retained command (the task-2368 mixed
+      root+subproject chain, every ``uv run --extra ... pytest`` shape) hides
+      BOTH its effective rootdir and which clause the scoping applied to;
+    * ``not parsed.targets`` — a configured suite runs VERBATIM and unscoped
+      (``_build_fallback_config`` never file-scopes one), so it has no targets
+      to drop and cannot be the zero-collecting shape.
+
+    A directory target needs no guard of its own: ``verify._worktree_reader`` is
+    ``is_file()``-guarded and answers None for a directory, and
+    :func:`deselecting_expression_for_command` refuses any target it cannot
+    read. The conftest branch's directory targets are therefore unprovable, and
+    unprovable means unchanged.
+
+    THE REMEDY is the same as arm 4a's: ``replace(parsed, targets=())`` — the
+    unscope operation, whose two rendered forms are ``'pytest'`` and
+    ``'cd <sub> && uv run pytest'`` — re-rendered rather than hand-built, so
+    every other flag the executed command carries survives verbatim. Only
+    ``test_command`` moves; ``lint_command``/``type_check_command`` are
+    untouched, marker deselection being a pytest-only concern.
+
+    It is WIDENING, not SKIPPING, for the reason task 3494 chose the same: the
+    task-1852 SKIP precedent applies where there is NO suite at all to run,
+    whereas the proof that an ``-m`` expression exists at this rootdir is
+    itself evidence of a real marker-partitioned suite. Skipping would convert
+    a false RED into a silent no-coverage GREEN.
+
+    It is DEGRADATION, so it says so. The widened run applies the SAME
+    ``addopts``, which means the very files that triggered it remain deselected
+    and go UNRUN — the widening buys a run of the suite's OTHER tests, not
+    coverage of the changed lines. ``ScopeKind.FULL_SUITE`` forbids
+    ``scoped_targets`` (``PlannedRun``'s invariant), so the returned reason is
+    the only channel that can record which files went unexecuted, and it names
+    them explicitly rather than reading as "the change was verified".
+
+    RESIDUAL RISK, documented rather than hidden: if the widened suite ALSO
+    collects zero items, rc=5 remains a genuine RED. ``verify_classify
+    ._classify_opaque`` is deliberately untouched by this task — it carries the
+    task-1852 invariant verbatim and must stay RED for a target that vanished
+    for any other reason.
+    """
+    if not fallback.test_command:
+        return fallback, None
+    parsed = parse_config_command(fallback.test_command)
+    if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
+        return fallback, None
+    if not parsed.targets:
+        return fallback, None
+
+    # The executed command's targets are relative to ITS cwd, while
+    # *worktree_reader* reads worktree-root-relative paths. Resolve before
+    # probing, and reuse the resolved list in the reason so an operator sees the
+    # same paths the rest of the plan record uses.
+    cwd_rel = parsed.cwd_rel
+    resolved = [
+        t if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/{t}'
+        for t in parsed.targets
+    ]
+    deselecting = deselecting_expression_for_command(
+        fallback.test_command, resolved, worktree_reader,
+    )
+    if deselecting is None:
+        return fallback, None
+
+    unrun = ', '.join(resolved)
+    reason = (
+        f'pytest: touched test file(s) {unrun} are ALL deselected by the effective '
+        f'-m {deselecting!r} — fallback full suite instead of a zero-collecting '
+        f'file-scoped run (rc=5); those file(s) stay deselected in this run too '
+        f'and are NOT executed by it'
+    )
+    return replace(fallback, test_command=render(replace(parsed, targets=()))), reason
 
 
 def _derive_module_runs(
@@ -271,15 +656,78 @@ def _derive_module_runs(
     (``'lint:'``/``'pyright:'``/``'pytest:'``) so a caller can recover tool
     identity even for a SKIPPED slot, whose ``cmd`` is ``None``.
 
-    *role* (λ, task 2589, R3) is the task-role pytest floor's policy fork:
-    when the pytest branch would otherwise fall through to the "no
-    collectable test files touched" SKIPPED (a source-only or
-    structural-only diff — no conftest, no test-data, no collectable test),
-    ``role == 'task'`` runs the owning module's full ``test_command`` instead
-    — a source-only diff at task verify pre-λ produced ZERO pytest signal.
-    ``role == 'merge'`` keeps the legacy SKIPPED shape (R4): the broad merge
-    gate is a separate, knob-gated widening (see
-    ``_derive_full_suite_runs``/``merge_verify_breadth``), not this floor.
+    *role* (λ, task 2589, R3; widened by task 3294) is the task-role pytest
+    floor's policy fork. At ``role == 'task'``, ANY touched SOURCE/STRUCTURAL
+    file under the prefix runs the owning module's full ``test_command`` —
+    whether or not collectable test files were touched in the same diff.
+    Only a test-tree-ONLY diff keeps FILE_SCOPED selection (R3's
+    "touched-test-only diffs keep file-scoped selection"). ``role ==
+    'merge'`` is unchanged in every cell (R4): it keeps the legacy
+    FILE_SCOPED/SKIPPED shape, because the broad merge gate is a separate,
+    knob-gated widening (see ``_derive_full_suite_runs``/
+    ``merge_verify_breadth``), not this floor.
+
+    WHY the floor sits ABOVE the collectable-test branch (task 3294):
+    coverage must be MONOTONE in the diff. λ placed it below, so it only
+    fired when the module's touched files contained no collectable test at
+    all — a source-only diff paid the owning module's full suite, but that
+    same diff plus a test file narrowed to just that test file. Adding a test
+    REMOVED coverage. Task 3033 is the incident: its diff touched
+    ``workflow.py`` plus tests, the plan file-scoped to 36 items instead of
+    the module's ~13188, and a regression in
+    ``test_workflow_resume_on_progress.py`` — a DIFFERENT consumer of
+    ``workflow.py`` — was structurally invisible and reached a debugger.
+
+    The predicate covers SOURCE ∪ STRUCTURAL, never SOURCE alone, because
+    :func:`classify_file` returns STRUCTURAL for a Protocol/TypedDict-defining
+    production file only when content is read — and content is read only when
+    ``mc.type_check_command`` is set (see the ``need_structural`` guard
+    above). ``workflow.py`` is exactly such a file. A SOURCE-only predicate
+    would therefore make pytest breadth silently depend on whether a module
+    happens to configure a type checker.
+
+    MARKER DESELECTION (task 3494, escalation esc-3292-1): :func:`classify_file`
+    is purely PATH-based, so a ``test_*.py`` basename is COLLECTABLE_TEST
+    regardless of whether pytest would actually collect anything from it. When
+    the module's own ``addopts`` deselect every item in every touched test file
+    — as ``orchestrator``'s ``-m 'not warm_lane_bash'`` does for
+    ``tests/test_warm_lane_bash_suite.py``, whose module-level ``pytestmark``
+    carries that marker — the arm-4 FILE_SCOPED run collects ZERO items, pytest
+    exits rc=5, and ``verify_classify._classify_opaque`` classifies rc=5 as RED.
+    A false RED on a diff that touched a real, passing test file.
+
+    This is the SECOND instance of the task-1852 class ("the path says
+    collectable, pytest collects zero"), and it is fixed where the first one was
+    — in THIS scoping layer, by widening to the owning module's full suite —
+    rather than by softening rc=5 in the classification layer, which stays a
+    genuine RED for a target that vanished for any other reason.
+
+    The probe is FAIL-SAFE in exactly one direction: any unreadable file,
+    unparseable expression, or merely-unknown marker yields no widening, i.e.
+    precisely the pre-3494 behaviour. Its extra I/O is bounded at one
+    ``worktree_reader`` read of the effective-rootdir ``pyproject.toml`` per
+    ModuleConfig — through the same content-cached reader used above, so a
+    target already read for STRUCTURAL detection costs nothing further — and
+    ZERO target reads for a module that declares no ``-m`` expression at all.
+    See :func:`deselecting_expression_for_command` for where that ini file is
+    looked for and which commands are refused outright.
+
+    The widened run applies the SAME addopts, so the touched file(s) remain
+    deselected in it: the widening converts a false RED into a run of the
+    module's OTHER tests, not into coverage of the changed lines. That is the
+    right trade (a bucketed suite is re-selected by its own dedicated lane, and
+    ``not integration``/``not smoke`` tests are excluded deliberately), but it
+    is degradation, so the emitted ``reason`` names the still-unrun file(s)
+    explicitly rather than reading as "the change was verified".
+
+    The TWIN of this arm lives in :func:`_derive_fallback_runs`, and is closed
+    (task 3513) one layer down rather than in that decision function — by
+    :func:`widen_fallback_for_marker_deselection`, against the ALREADY-EXECUTED
+    fallback config. Both arms share this arm's probe,
+    :func:`deselecting_expression_for_command`, so the two can never disagree
+    about which commands are refused or where the ini file is looked for. See
+    that function's own paragraph for why the fallback arm needs the extra
+    layer.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
@@ -298,6 +746,11 @@ def _derive_module_runs(
     test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
     structural_trigger = next((f for f, k in kinds.items() if k is FileKind.STRUCTURAL), None)
     collectable_tests = [f for f, k in kinds.items() if k is FileKind.COLLECTABLE_TEST]
+    # Task 3294: SOURCE ∪ STRUCTURAL, never SOURCE alone — see the *role*
+    # paragraph in this function's docstring for why the union is load-bearing.
+    production_trigger = next(
+        (f for f, k in kinds.items() if k in (FileKind.SOURCE, FileKind.STRUCTURAL)), None,
+    )
 
     runs: list[PlannedRun] = []
 
@@ -308,6 +761,7 @@ def _derive_module_runs(
         lint_cmd = _scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
         runs.append(PlannedRun(
             mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
+            scoped_targets=tuple(scoped),
         ))
     else:
         runs.append(PlannedRun(
@@ -329,18 +783,35 @@ def _derive_module_runs(
             runs.append(PlannedRun(
                 mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
+                scoped_targets=tuple(scoped),
             ))
     else:
         runs.append(PlannedRun(
             mc.prefix, None, ScopeKind.SKIPPED, 'pyright: no type_check_command configured',
         ))
 
-    # -- pytest: FULL_SUITE (unscoped) when CONFTEST or TEST_DATA is present
-    # (D1) — a conftest's fixtures/hooks affect the whole subtree, and a data
-    # module under tests/ is consumed by tests we can't enumerate from the
-    # path alone — else FILE_SCOPED to collectable tests, else an explicit
-    # reasoned SKIPPED (the task-1852 "not silent" requirement: never a
-    # dropped command). --
+    # -- pytest: a six-arm cascade, in this order --
+    #   1. CONFTEST touched      -> FULL_SUITE (D1: fixtures/hooks affect the
+    #      whole subtree)
+    #   2. TEST_DATA touched     -> FULL_SUITE (D1: consumed by tests we can't
+    #      enumerate from the path alone)
+    #   3. role='task' AND a production (SOURCE ∪ STRUCTURAL) file touched
+    #      -> FULL_SUITE, the task-3294 floor. It sits HERE, above arm 4, so
+    #      that coverage is monotone in the diff: co-committing a test must
+    #      not narrow a run the production file alone would have widened.
+    #   4a. collectable tests, ALL provably deselected by the module's own `-m`
+    #      -> FULL_SUITE, the task-3494 arm. It sits BELOW arms 1-3 so those
+    #      stay unreachable-by-construction from the new probe, and it is a
+    #      sub-branch of arm 4 rather than a peer because it fires only on the
+    #      selection arm 4 would otherwise emit. See the MARKER DESELECTION
+    #      paragraph in this function's docstring.
+    #   4b. collectable tests     -> FILE_SCOPED to them
+    #   5. otherwise             -> an explicit reasoned SKIPPED (the task-1852
+    #      "not silent" requirement: never a dropped command)
+    # Arm 5 is reachable only at role='merge'. At role='task' every
+    # non-conftest, non-test-data .py file under the prefix is either a
+    # COLLECTABLE_TEST or SOURCE/STRUCTURAL, and `scoped` is non-empty by the
+    # guard above — so arm 3 or arm 4 always fires first. --
     if mc.test_command:
         if conftest_trigger is not None:
             test_cmd = parse_config_command(mc.test_command)
@@ -354,19 +825,54 @@ def _derive_module_runs(
                 mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
                 f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
             ))
-        elif collectable_tests:
-            test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
-            runs.append(PlannedRun(
-                mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
-                'pytest: file-scoped to touched test file(s)',
-            ))
-        elif role == 'task':
+        elif role == 'task' and production_trigger is not None:
             test_cmd = parse_config_command(mc.test_command)
-            runs.append(PlannedRun(
-                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
-                'pytest: source-only diff — owning-module full suite (task role); '
-                'sibling modules NOT run',
-            ))
+            # The reason is the operator-facing record of WHY this widened.
+            # A mixed diff (production + co-committed tests) must not be
+            # described as "source-only" — and must say that the touched
+            # tests did NOT narrow it, or the widened run reads as a scoper
+            # bug rather than the deliberate task-3294 policy.
+            if collectable_tests:
+                reason = (
+                    f'pytest: production module touched ({production_trigger}) — '
+                    'owning-module full suite (task role); co-committed test file(s) '
+                    'do NOT narrow it; sibling modules NOT run'
+                )
+            else:
+                reason = (
+                    'pytest: source-only diff — owning-module full suite (task role); '
+                    'sibling modules NOT run'
+                )
+            runs.append(PlannedRun(mc.prefix, test_cmd, ScopeKind.FULL_SUITE, reason))
+        elif collectable_tests:
+            deselecting = deselecting_expression_for_command(
+                mc.test_command, collectable_tests, worktree_reader,
+            )
+            if deselecting is not None:
+                test_cmd = parse_config_command(mc.test_command)
+                # The widened run applies the SAME addopts, so the very files
+                # that triggered the widening stay deselected in it — they are
+                # NOT executed here. FULL_SUITE forbids scoped_targets
+                # (PlannedRun's invariant), so naming them in the reason is the
+                # only channel left for recording which files went unrun; a
+                # bare "ran the owning module's full suite" would read as "the
+                # change was verified" and be exactly the silent degradation
+                # the repo's design invariants forbid.
+                unrun = ', '.join(collectable_tests)
+                runs.append(PlannedRun(
+                    mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
+                    f'pytest: touched test file(s) {unrun} are ALL deselected by the '
+                    f"module's -m {deselecting!r} — owning-module full suite instead of a "
+                    f'zero-collecting file-scoped run (rc=5); those file(s) stay '
+                    f'deselected in this run too and are NOT executed by it',
+                ))
+            else:
+                test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
+                runs.append(PlannedRun(
+                    mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
+                    'pytest: file-scoped to touched test file(s)',
+                    scoped_targets=tuple(collectable_tests),
+                ))
         else:
             runs.append(PlannedRun(
                 mc.prefix, None, ScopeKind.SKIPPED,
@@ -388,6 +894,67 @@ def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
     to the broad merge gate.
     """
     return config is not None and config.merge_verify_breadth == 'full'
+
+
+def effective_merge_module_configs(
+    config: OrchestratorConfig | None,
+    module_configs: list[ModuleConfig],
+) -> list[ModuleConfig]:
+    """The module set a MERGE-role verify actually covers.
+
+    Under ``merge_verify_breadth='full'`` a merge verify executes EVERY
+    registered module, not just the ones the merging task happened to touch —
+    so *this*, not the caller's task-scoped list, is the set every downstream
+    consumer must reason against. Flake-ledger PRD §8.2 / task 3787 (γ).
+
+    ORDERING INVARIANT (INV-5). Call this ONCE, at the merge-request boundary
+    in ``merge_queue._run_post_merge_verify``, ahead of both
+    ``build_merge_verify_spec`` and every ``LocalRunner(...)`` construction.
+    The local runner, the wire spec (and hence the remote's reconstruction of
+    it in ``verify_runner.run_merge_verify_on_worktree``) and the merge-flake
+    suppression gate then receive the IDENTICAL set BY CONSTRUCTION, rather
+    than by an assertion that two sites independently agree. The parenthetical
+    REMOTE leg was only made true by task 4536, which installs the spec's set
+    as that reconstructed config's registry — see
+    ``verify_runner.run_merge_verify_on_worktree``; until then it was
+    aspirational. Before this helper the expansion was
+    reimplemented inline at two sites inside
+    ``run_scoped_verification``, each rebinding a local that never propagated
+    out: the run executed the full registry while the suppression gate still
+    mapped failing node-ids against the task's own modules, so a red in an
+    untouched module mapped to no known subproject and the gate answered
+    "unconfirmable" — inverted exactly where it mattered most (PRD §3.1).
+
+    IDEMPOTENT: ``f(cfg, f(cfg, xs)) == f(cfg, xs)``. The full-breadth branch
+    ignores its input entirely (bar the empty-registry fallback) and the
+    scoped branch is the identity, so re-applying it to an already-resolved
+    set is a value-preserving no-op. That is what lets the surviving call
+    inside ``run_scoped_verification`` stay in place once the boundary has
+    already resolved the set.
+
+    WHOSE REGISTRY the full-breadth branch reads depends on the path, and both
+    answers are the dispatching side's by construction — which is which, and
+    why there is deliberately no third answer, is documented once at
+    ``verify_runner.run_merge_verify_on_worktree`` (task 4536).
+
+    The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
+    no registered modules returns the passed set rather than ``[]``, so the
+    broad gate degrades to today's scoped coverage instead of silently
+    verifying nothing at the very breadth that exists to verify everything.
+    Post-4536 it also serves direct-instantiated configs in tests/evals, which
+    never run discovery and whose registry is therefore empty; a zero-module
+    SPEC installs ``{}`` deliberately (the documented "discovery ran and found
+    no subprojects" value), routing that case to the INV-1 global gate.
+
+    Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
+    from ``config`` here, so there stays exactly one breadth predicate in the
+    tree (and a ``None`` config keeps degrading to the shipped 'scoped'
+    default instead of raising).
+    """
+    if not _merge_breadth_is_full(config):
+        return module_configs
+    assert config is not None  # narrowed by _merge_breadth_is_full
+    return list(config.module_configs_or_empty.values()) or module_configs
 
 
 def _derive_full_suite_runs(
@@ -497,6 +1064,34 @@ def _derive_fallback_runs(
     record of *why* a decision was made, but not always of *where*/*how* it
     ran for a subproject-shaped fallback diff.
 
+    MARKER DESELECTION (task 3494's twin, CLOSED by task 3513) is still not
+    wired HERE, and deliberately so — but the gap it left is closed one layer
+    down. The bare-default ``collectable_tests`` branch below has the identical
+    "the path says collectable, pytest collects zero" failure mode whenever the
+    repo root carries an ``addopts = "-m 'not X'"`` and the diff touches only
+    X-marked test files, so this function's own raw return value still reads
+    FILE_SCOPED for exactly that shape.
+
+    WHY NOT HERE: the "Fidelity caveat" above. This branch fires only when
+    there are NO registered module_configs, and the run this function records
+    is not necessarily the run that executes — ``_build_fallback_config`` may
+    rescope a fallback diff into a subproject (``cd <sub> && uv run pytest
+    ...``), which moves pytest's rootdir and therefore which ``addopts`` apply.
+    A probe reading the ROOT ``pyproject.toml`` here could widen on a config
+    the executed command never sees: an over-fire, the one direction task 3494
+    forbids.
+
+    WHERE IT IS CLOSED: :func:`widen_fallback_for_marker_deselection`, called
+    from ``verify.run_scoped_verification``'s fallback branch immediately after
+    ``_build_fallback_config`` + ``_apply_cargo_scope``. By then the rescoping
+    has already happened, so the EXECUTED command's own shape decides and the
+    over-fire above is structurally impossible. It rewrites the ``ModuleConfig``
+    that is about to run (this branch executes the config, not the plan — see
+    the paragraph below), and ``verify._executed_fallback_plan``'s
+    ``pytest_reason`` keyword reconciles the record to match, so what a
+    consumer of ``VerifyResult.plan`` sees is FULL_SUITE even though this
+    function decided FILE_SCOPED.
+
     This caveat describes THIS function's raw return value only. Its caller
     in :func:`run_scoped_verification` reconciles this gap before attaching
     anything to ``VerifyResult.plan``: it folds ``_build_fallback_config``'s
@@ -535,6 +1130,7 @@ def _derive_fallback_runs(
         runs.append(PlannedRun(
             _FALLBACK_PREFIX, lint_cmd, ScopeKind.FILE_SCOPED,
             'lint: file-scoped to touched file(s)',
+            scoped_targets=tuple(py_files),
         ))
     else:
         runs.append(PlannedRun(
@@ -555,6 +1151,7 @@ def _derive_fallback_runs(
             runs.append(PlannedRun(
                 _FALLBACK_PREFIX, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
+                scoped_targets=tuple(py_files),
             ))
     else:
         runs.append(PlannedRun(
@@ -614,6 +1211,7 @@ def _derive_fallback_runs(
             runs.append(PlannedRun(
                 _FALLBACK_PREFIX, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
+                scoped_targets=tuple(collectable_tests),
             ))
     else:
         runs.append(PlannedRun(

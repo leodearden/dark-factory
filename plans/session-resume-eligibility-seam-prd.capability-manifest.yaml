@@ -1,0 +1,289 @@
+prd: plans/session-resume-eligibility-seam-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3727
+  title: durable_archive_path lookup + archive_available on the session_resume_fallback
+    event
+  capabilities:
+  - name: durable-archive-path-helper-exists
+    binding: capability→producer (built by α) — transcript_archive.py is write-only
+      today; its only public entry is archive_task_transcripts (:128)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def durable_archive_path
+      paths:
+      - shared/src/shared/transcript_archive.py
+      expect: present
+  - name: archive-available-on-fallback-event
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/harness.py:7663-7668,
+      the SOLE EventType.session_resume_fallback emit site, on the _run_slot production
+      dispatch path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: archive_available
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: archive-root-resolvable-at-emit-site
+    binding: capability→producer (wired) — grep:harness.py:2108 self.config.project_root;
+      config.py:3975 transcript_archive submodel; composition precedent git_ops.py:11785
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: transcript_archive\.root
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: lookup-total-cwd-agnostic-format-agnostic
+    binding: contract invariants I-A/I-B/I-C/I-D/I-F — MEASURED cwd-agnostic (125/197
+      hits on reify's live archive; tasks 5848 and 5766 archived under two distinct
+      lane dirs)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: totality, newest-mtime determinism and the .jsonl/.jsonl.gz span are
+        behavioural properties pinned by α's B1-B6 tests, not by a grep
+- label: β
+  task_id: 3728
+  title: Composite reason reporting + by-design carve-out from the storm streak
+  capabilities:
+  - name: composite-reason-set-predicate
+    binding: capability→producer (built by β) — _session_resume_eligible (harness.py:3060-3110)
+      already evaluates four predicates; D5 restructures first-match into a full reason
+      set. Literal token pinned in β's description as the delivered-check contract
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _session_resume_reasons
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: storm-mechanism-retained-not-deleted
+    binding: anti-degenerate pin (manifest F3) — grep:harness.py:6059 _file_session_resume_storm_escalation,
+      called from :7674. β re-points its feeder; ε restores a real one. Deleting it
+      would satisfy β's signal falsely
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _file_session_resume_storm_escalation
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: capped-carveout-precedent-wired
+    binding: capability→producer (wired) — grep:harness.py:7653-7661 capped already
+      gets its own event and does NOT feed the streak; config.py:868 documents it
+      as by-design. D4 extends this precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EventType\.session_resume_capped
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: by-design-outcomes-carved-out
+    binding: capability→producer (built by β) — disabled/capped/stale/no_transcript
+      all carved out per D4
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the carve-out is a branch structure over four reason values; β's own
+        tests judge it, a grep cannot distinguish carved-out from counted
+- label: γ
+  task_id: 3729
+  title: 'Sidecar reaper: dead owner_pid AND task not in-progress'
+  capabilities:
+  - name: sidecar-reaper-exists
+    binding: capability→producer (built by γ) — sited in _recover_crashed_tasks (harness.py:3112),
+      adjacent to _adopt_recovered_session. Literal token pinned in γ's description
+      as the delivered-check contract
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _reap_zombie_sidecars
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: no-new-pid-alive-copy-or-import
+    binding: INV-5 / D7 intent (manifest F7) — harness.py:466 ALREADY defines _pid_alive,
+      byte-identical to config_dir.py:51 including PermissionError→alive. γ uses it;
+      no new copy AND no new cross-package import
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.config_dir import
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: owner-pid-populated-non-sentinel
+    binding: 'field-population — grep:artifacts.py:50 declares owner_pid: int; artifacts.py:1086
+      writes owner_pid=os.getpid() on the production sidecar write path. A real pid,
+      not a placeholder'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: owner_pid=os\.getpid\(\)
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: sidecar-clearing-primitive-reused
+    binding: capability→producer (wired) — grep:harness.py:2967 _clear_recovery_artifact
+      clears from BOTH the .task-meta and legacy roots; γ reuses it rather than unlinking
+      directly
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _clear_recovery_artifact
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: reap-emits-structured-fact
+    binding: INV-2/INV-4 resolution (manifest, γ row) — a per-reap structured fact
+      (sidecar path, task_id, owner_pid, age) plus a per-boot reap count, so a mass
+      reap is countable rather than silent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: sidecar_reaped
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: reaper-sited-before-stranded-reconcile
+    binding: corroborate-before-acting (manifest F4) — boot step 2c _recover_crashed_tasks
+      (harness.py:2362) precedes step 2d _reconcile_stranded_in_progress (harness.py:2372).
+      After 2d the 'not in-progress' conjunct is vacuous for every task
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: call-order between two boot steps is a control-flow property; γ ships
+        a test that fails if the reaper is moved after step 2d
+- label: δ
+  task_id: 3730
+  title: Reachability outranks freshness, with a derived absolute outer bound
+  capabilities:
+  - name: archive-lookup-upstream
+    binding: producer:task-α, upstream in the transitive dependency closure. Extent
+      matches exactly — δ needs Path|None for (task_id, session_id), which is α's
+      whole deliverable
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: covered by α's own durable-archive-path-helper-exists check, which gates
+        δ's dispatch through the dependency edge
+  - name: restore-into-config-dir-upstream
+    binding: 'producer:task-3578, upstream. In 3578''s declared scope: ''Make the
+      dispatch path RESTORE the relevant .jsonl into the freshly created config dir
+      before arming --resume'''
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 3578 predates the delivered-checks convention and carries no sidecar;
+        the edge gates dispatch, and δ's acceptance criteria re-verify restore success
+        at implementation
+  - name: cross-lane-cli-acceptance-re-scoped
+    binding: 'producer-extent-short RESOLVED by manifest F2 — 3578''s amendment A4
+      makes dark-factory the vacuous-cwd validation case, so 3578 can close green
+      without proving cross-lane. Signal re-cast two-tier: dark-factory session_resume
+      (lifetime 0 / 217 fallbacks, task 3221) + reify cross-lane conditioned on 3578''s
+      HARD GATE answer'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: whether the claude CLI accepts --resume against a moved cwd is an empirical
+        property of an external binary; δ's acceptance criterion is to obtain and
+        REPORT 3578's answer, not to grep for it
+  - name: absolute-outer-bound-derived
+    binding: G6 branch 1 — no guessed threshold ships. PRD Open question 1 requires
+      deriving it from observed task in-flight duration in runs.db, pinning the derivation
+      not the number, mirroring task 3621 (filed, pending) and its explicit MUST-NOT-BE-VACUOUS
+      rule
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: absolute_resume_age_secs
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: sole-archive-locator-holds
+    binding: I-E / boundary test B7, assigned to δ by manifest F5. Holds on main today
+      — both existing archive readers do whole-tree enumeration (memory_eval_transcript_corpus.py:697,
+      legibility/inventory.py:420), not session-id-keyed lookup
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \{(session_id|sid)\}\.jsonl
+      paths:
+      - orchestrator/src/orchestrator/
+      - fused-memory/src/fused_memory/
+      - fused-memory/scripts/
+      - scripts/legibility/
+      expect: absent
+  - name: session-resume-config-hot-reloadable
+    binding: 'capability→producer (wired) — grep:config.py:4929 _submodel_leaf_paths(''session_resume'',
+      SessionResumeConfig): green-tier whole-submodel group in RELOADABLE_FIELDS,
+      so the new bound is hot-appliable without a restart'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _submodel_leaf_paths\('session_resume'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ε
+  task_id: 3733
+  title: Re-point the storm streak at eligible-but-FAILED
+  capabilities:
+  - name: genuine-breakage-feeder-upstream
+    binding: 'producer:task-3578, upstream. Its own user-observable signal declares
+      the feeder verbatim: ''every CLI-level resume failure emits an event, so the
+      fallback rate is measurable rather than journal-only''. Extent confirmed against
+      3578''s text, not name-matched'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 3578 predates the delivered-checks convention and carries no sidecar;
+        the dependency edge gates ε's dispatch
+  - name: streak-fed-by-eligible-but-failed
+    binding: capability→producer (built by ε) — the streak's only feeder becomes archive-restore
+      failure plus the CLI-level 'No conversation found' path. Literal token pinned
+      in ε's description as the delivered-check contract
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: eligible_but_failed
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: storm-prose-no-longer-misdirects-to-ntp
+    binding: rejection-mechanism / INV-2 — VERIFIED PRESENT today at harness.py:5978,
+      :6098, :6103 ('Check host clock skew (NTP)') and :6108 ('Investigate clock skew
+      (NTP)'). All four are the session-resume storm block; ε replaces them with structured
+      facts naming the failed restore
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: clock skew
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: storm-escalation-mechanism-to-repoint
+    binding: capability→producer (wired) — grep:harness.py:6059 _file_session_resume_storm_escalation,
+      call site :7674, dedup via has_open_l1 at :6076
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: has_open_l1
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: fault-injection-gate
+    binding: capability→producer (built by ε) — an injected unreadable-archive fault
+      files the L1 within threshold dispatches, while a boot of pure by-design fallbacks
+      files nothing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the injected-fault → L1-within-threshold assertion IS ε's integration
+        test; the check suite is the deliverable

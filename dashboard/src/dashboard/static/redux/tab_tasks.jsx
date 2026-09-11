@@ -6,7 +6,29 @@ const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
-const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
+const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
+const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
+const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
+
+// Dot colour per activity pip. activityPips is pure and owns ORDER and
+// zero-suppression; colour is the caller's concern. Each reuses the hue
+// operators already associate with that status elsewhere in this tab
+// (PALETTE aliases `running` to the same hue as `in-progress`).
+const PIP_DOT_COLOR_T = {
+  running: CP_T.accent,
+  blocked: CP_T.bad,
+  'merge-deferred': 'var(--merge-deferred)',
+};
+
+// CSS accent per probe-status tone (runtime_format.js owns which tone each
+// status gets; this only translates a tone into a colour for the banner's
+// left rule). 'muted' means "expected, not a fault" — no accent at all.
+const PROBE_TONE_ACCENT_T = {
+  muted: 'var(--line)',
+  warn: 'var(--warn)',
+  bad: 'var(--bad)',
+};
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -173,6 +195,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           <span className="status-pip"></span>
           <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
           {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
+          {(() => { const sb = strandBadgeState(t, { compact: true }); return sb && <span className={sb.cls} title={sb.title}>{sb.label}</span>; })()}
           <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
             {t.status === 'in-progress' ? rtAge(t.started) : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
           </span>
@@ -510,6 +533,12 @@ function TaskDetail({ task, allTasks }) {
   }
   const deps = task.deps || [];
   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
+  // Why the runtime cells below are dashed. Three separable cases the operator
+  // must not confuse: the orchestrator is unreachable, OUR probe deadline fired
+  // (a starved dashboard event loop looks exactly like this), or no runtime
+  // endpoint is configured at all. Produced by task_runtime._probe_one ->
+  // active_tasks._probe_status. null on the healthy path — nothing renders.
+  const probe = rtProbe(task.runtime_status);
   return (
     <div className="task-detail">
       <h4>{task.title}</h4>
@@ -517,13 +546,26 @@ function TaskDetail({ task, allTasks }) {
 
       <div className="kv">
         <span className="k">status</span>
-        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span></span>
-        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
+        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span>
+          {/* Strand verdict (task 3543). Computed server-side from the claim
+              columns; deliberately INDEPENDENT of `agent` below, which is only
+              worktree presence and stays truthy after the agent dies. */}
+          {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
+        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.color ? <span style={{ color: ac.color }}>{ac.text}</span> : ac.text; })()}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
         <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>
         <span className="k">phase</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.phase)}</span>
         <span className="k">state</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane_state)}</span>
+        {probe && (
+          <React.Fragment>
+            <span className="k">runtime</span>
+            <span data-testid="task-runtime-probe" title={probe.hint}>
+              <span className={`badge ${probe.tone}`}>{probe.label}</span>
+              <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 6 }}>{probe.hint}</span>
+            </span>
+          </React.Fragment>
+        )}
       </div>
 
       <div className="section-lbl">Description</div>
@@ -538,14 +580,14 @@ function TaskDetail({ task, allTasks }) {
       {deps.length === 0
         ? <span className="chip-empty">no upstream dependencies</span>
         : <div className="chips multiline">{deps.map(d =>
-            <span key={d.id} className={`chip ${d.done ? 'dep-done' : 'dep-pending'}`} title={d.title}>{window.DF_SHELL.taskId(d.id)} · {d.title}</span>)}
+            <span key={d.id} className={`chip ${d.done ? 'dep-done' : 'dep-pending'}`} title={d.title}>{window.DF_SHELL.taskId(d.id)}{d.title ? ` · ${d.title}` : ''}</span>)}
           </div>}
 
       <div className="section-lbl">Blocks ({dependents.length})</div>
       {dependents.length === 0
         ? <span className="chip-empty">nothing depends on this</span>
         : <div className="chips multiline">{dependents.map(d =>
-            <span key={d.id} className="chip" title={d.title}>{window.DF_SHELL.taskId(d.id)} · {d.title}</span>)}
+            <span key={d.id} className="chip" title={d.title}>{window.DF_SHELL.taskId(d.id)}{d.title ? ` · ${d.title}` : ''}</span>)}
           </div>}
 
       {(() => {
@@ -648,11 +690,74 @@ function TasksTab({ projectFilter, search }) {
     projectFilter.length === 0 || projectFilter.includes(p.id)
   );
 
-  // Surface a single-line banner when fused-memory is unreachable for any
-  // discovered project — without it the Tasks tab renders an empty grid that
-  // looks indistinguishable from "no active work".
-  const tasksOffline = !!DF_T.TASKS_OFFLINE;
-  const offlineProjects = DF_T.TASKS_OFFLINE_PROJECTS || [];
+  // Surface a banner when task data is missing or incomplete — without it the
+  // Tasks tab renders an empty grid that looks indistinguishable from "no
+  // active work". That rationale still motivates the total-outage case, and it
+  // is exactly why the partial and degraded cases exist too: after the
+  // whole-handler budget expires, a silently-missing project would otherwise
+  // read as a project with nothing to do.
+  //
+  // The three-way distinction itself is decided SERVER-SIDE (app.api_tasks)
+  // and turned into copy by tasks_offline_banner.js. Nothing here re-derives
+  // it: a `k of N` judgement made in the JSX would drift from the one the
+  // handler made. N likewise comes from the server (TASKS_PROJECT_COUNT): the
+  // numerator is a count of task project roots, so the denominator must be
+  // one too — PROJECTS is the orchestrator-derived list, a different
+  // population that diverges whenever a root has no orchestrator (or the
+  // reverse), which made the notice understate how many projects failed.
+  const bannerNotices = tasksBannerNotices({
+    offline: !!DF_T.TASKS_OFFLINE,
+    offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
+    degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
+    countUnknownProjects: DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || [],
+    totalProjects: DF_T.TASKS_PROJECT_COUNT || 0,
+  });
+  const bannerTestIds = {
+    global: 'tasks-offline-banner',
+    partial: 'tasks-partial-banner',
+    degraded: 'tasks-degraded-banner',
+    'count-unknown': 'tasks-count-unknown-banner',
+  };
+
+  // Runtime-probe health, derived frontend-side from the ACTIVE_TASKS rows
+  // (deliberately not a new top-level payload key — the per-project fact is
+  // already fully recoverable from `runtime_status`, so a new key would carry
+  // zero extra information). `runtime_status` is produced by
+  // task_runtime._probe_one (which names the fault domain) and mapped to the
+  // row vocabulary by active_tasks._probe_status — grep either end to find
+  // the other.
+  //
+  // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
+  // answer different questions: tasksBannerNotices reports whether TASK DATA
+  // is available, a distinction decided server-side in app.api_tasks, while
+  // rtProbeSummary is a client-side derivation over the ACTIVE_TASKS rows
+  // reporting whether we could reach the ORCHESTRATORS. Those are independent
+  // — fused-memory being down says nothing about orchestrator reachability —
+  // so both banners can show at once, and neither gates the other.
+  //
+  // Folding this into tasksBannerNotices would not merely blur that: it would
+  // SUPPRESS the probe verdict. That function short-circuits
+  // (tasks_offline_banner.js:112-115) — when `offline` is true it returns a
+  // single global notice and never evaluates the other kinds — so a probe
+  // notice routed through it would vanish during precisely the fused-memory
+  // outage we must not gate on, which is when an operator is already
+  // mid-triage and least able to afford a missing signal. Pinned by
+  // test_tab_tasks_runtime.py::test_probe_banner_is_not_a_tasksbannernotices_kind.
+  //
+  // Computed over the UNFILTERED rows, and deliberately NOT narrowable.
+  // `selfInflicted` is an assertion about the DASHBOARD's own health — that it
+  // finished none of the probes it started — so its denominator must be every
+  // probed project. This was previously scoped to the projectFilter-visible
+  // rows, which let an operator narrowed to two timed-out projects manufacture
+  // an all-at-once verdict and blame the dashboard for what was actually a
+  // per-project outage: the precise misdiagnosis this banner exists to prevent.
+  // The banner is therefore a global fact.
+  //
+  // Accepted tradeoff, so a future reader does not "fix" this back: an
+  // operator filtered down to one healthy project may still see a banner about
+  // a project they cannot see. That is strictly less harmful than a false "the
+  // orchestrators may be healthy — check the dashboard first" shown mid-triage.
+  const probeSummary = rtProbeSummary(allTasks);
 
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
@@ -674,8 +779,9 @@ function TasksTab({ projectFilter, search }) {
 
   return (
     <div className="grid cols-12" style={{ gap: 16 }}>
-      {tasksOffline && (
-        <div className="col-span-12" data-testid="tasks-offline-banner"
+      {bannerNotices.map(notice => (
+        <div key={notice.kind} className="col-span-12"
+             data-testid={bannerTestIds[notice.kind]}
              style={{
                padding: '8px 12px',
                border: '1px solid var(--line)',
@@ -685,8 +791,26 @@ function TasksTab({ projectFilter, search }) {
                fontFamily: 'var(--mono)',
                fontSize: 11,
              }}>
-          fused-memory offline — task data unavailable
-          {offlineProjects.length > 0 && ` (${offlineProjects.join(', ')})`}
+          {notice.text}
+        </div>
+      ))}
+      {probeSummary && (
+        <div className="col-span-12" data-testid="tasks-runtime-probe-banner"
+             style={{
+               padding: '8px 12px',
+               border: '1px solid var(--line)',
+               // Accent by the WORST tone present, not by selfInflicted: a
+               // lone timed-out project is a 'warn' (quite possibly our own
+               // starved loop) and must not wear the same alarm colour as a
+               // confirmed orchestrator outage. rtProbe owns the mapping.
+               borderLeft: `3px solid ${PROBE_TONE_ACCENT_T[probeSummary.tone] || 'var(--warn)'}`,
+               borderRadius: 4,
+               background: 'var(--bg-2)',
+               color: 'var(--fg-2)',
+               fontFamily: 'var(--mono)',
+               fontSize: 11,
+             }}>
+          {probeSummary.text}
         </div>
       )}
       {/* Filter bar */}
@@ -712,24 +836,55 @@ function TasksTab({ projectFilter, search }) {
           {projects.map(p => {
             const projTasks = allTasks.filter(t => t.project === p.id);
             const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
-            const _fallbackDone = projTasks.filter(t => t.status === 'done').length;
+            // One pass for every header tally. running / blocked / mergeDeferred
+            // are reported SEPARATELY rather than merged into one "N active"
+            // number: only `running` is bounded by max_concurrent_tasks — a
+            // blocked or merge-deferred task holds no agent slot — so the merged
+            // number routinely exceeded the cap and read as a cap breach.
+            // 2026-07-30: dark-factory showed "43 active" against a cap of 24,
+            // reify "50 active" against 48; neither was a real breach.
+            const statusCounts = projectStatusCounts(projTasks);
+            const _fallbackDone = statusCounts.done;
+            // Display keys are picked EXPLICITLY rather than spread in from
+            // statusCounts. Its `done` is the BOUNDED tally of the done rows
+            // actually loaded (≤50 per project); spreading it onto the display
+            // object would park it beside the authoritative `complete` under a
+            // near-synonymous name, and the next `{counts.done} done` edit
+            // would silently render the lower bound as if it were the real
+            // count. Keep it reachable only via `_fallbackDone`, whose
+            // underscore says "not for display".
             const counts = {
-              total:    projTasks.length,
-              active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'merge-deferred').length,
-              pending:  projTasks.filter(t => t.status === 'pending').length,
+              total: statusCounts.total,
+              running: statusCounts.running,
+              blocked: statusCounts.blocked,
+              mergeDeferred: statusCounts.mergeDeferred,
+              pending: statusCounts.pending,
               // DONE_COUNTS carries the authoritative full count from the server.
               // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
               // (≤50 per project). If we hit that cap without a server count, show
               // "50+" so the user knows the displayed number is a lower bound.
+              // A MISSING DONE_COUNTS entry means the count was never
+              // measured — it does NOT mean zero. Falling through to
+              // _fallbackDone here rendered a confident "0 done", because the
+              // server skips the terminal window for exactly these projects
+              // so no done row was ever sent. Show unknown instead; the
+              // banner's 'count-unknown' notice names which projects.
               complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null)
                 ? DF_T.DONE_COUNTS[p.id]
-                : (_fallbackDone >= 50 ? '50+' : _fallbackDone),
+                : ((DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || []).indexOf(p.id) !== -1
+                    ? '—'
+                    : (_fallbackDone >= 50 ? '50+' : _fallbackDone)),
             };
             const isOpen = openMap[p.id] !== false; // default-open
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
               <>
-                <span className="pip"><span className="pip-dot" style={{ background: CP_T.accent }}></span>{counts.active} active</span>
+                {activityPips(counts).map(pip => (
+                  <span className="pip" key={pip.key}>
+                    <span className="pip-dot" style={{ background: PIP_DOT_COLOR_T[pip.key] }}></span>
+                    {pip.count} {pip.label}
+                  </span>
+                ))}
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.warn }}></span>{counts.pending} pending</span>
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.ok }}></span>{counts.complete} done</span>
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{filtered.length}/{counts.total} shown</span>

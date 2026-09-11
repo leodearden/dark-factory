@@ -349,5 +349,70 @@
     "strict_confirm": true,
     "expected": "Failure",
     "provenance": "Failure tail (no auth/cli-error/cap/wedge signal)"
+  },
+  {
+    "id": "server_error_529_fast_zero_cost",
+    "backend": "claude",
+    "success": false,
+    "output": "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+    "api_error_status": 529,
+    "turns": 0,
+    "cost_usd": 0.0,
+    "strict_confirm": true,
+    "expected": "ServerError",
+    "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 a fast zero-cost 529 must classify as ServerError, not fall through to Failure where the retry loop heuristic net mislabels it a cap hit"
+  },
+  {
+    "id": "server_error_529_timed_out_flush",
+    "backend": "claude",
+    "success": false,
+    "output": "",
+    "api_error_status": 529,
+    "timed_out": true,
+    "transcript_turns": 0,
+    "strict_confirm": true,
+    "expected": "ServerError",
+    "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 boundary row 1: the watchdog SIGTERM-killed CLI flushed its result JSON with api_error_status=529; ServerError outranks ZeroOutputWedge"
+  },
+  {
+    "id": "server_error_500_generic_body",
+    "backend": "claude",
+    "success": false,
+    "output": "Internal server error",
+    "api_error_status": 500,
+    "strict_confirm": true,
+    "expected": "ServerError",
+    "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 lower 5xx boundary"
+  },
+  {
+    "id": "server_error_599_upper_boundary",
+    "backend": "claude",
+    "success": false,
+    "output": "Network connect timeout error",
+    "api_error_status": 599,
+    "strict_confirm": true,
+    "expected": "ServerError",
+    "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 upper 5xx boundary"
+  },
+  {
+    "id": "server_error_499_below_boundary",
+    "backend": "claude",
+    "success": false,
+    "output": "client closed request",
+    "api_error_status": 499,
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 one below the 5xx floor: unchanged Failure tail"
+  },
+  {
+    "id": "server_error_5xx_with_cap_body_is_cap",
+    "backend": "claude",
+    "success": false,
+    "output": "You're out of extra usage \u00b7 resets in 2h",
+    "api_error_status": 503,
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 the ServerError tier sits BELOW cap detection: a 5xx carrying a real cap body still caps the account. Also rides TestB3CapHitDrivesAccountCapped, pinning that cap accounting is untouched by the new tier"
   }
 ]

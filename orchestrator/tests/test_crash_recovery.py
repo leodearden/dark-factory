@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,11 +11,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import SessionResumeConfig
+from orchestrator.config import SessionResumeConfig, TranscriptArchiveConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
+    lane_lock_path,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
+    write_lock_holder_pgid,
+)
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 
 
@@ -575,6 +583,121 @@ class TestRecoverCrashedTasks:
         assert str(wt_noplan) in cleaned_paths
         assert str(wt_noprog) in cleaned_paths
         assert len(cleanup_calls) == 2
+
+
+
+@pytest.mark.asyncio
+class TestAdoptNonDictSidecar:
+    """A sidecar that PARSED as JSON but is not an OBJECT must be rejected at
+    ADOPTION — the reachability boundary — not merely survived downstream.
+
+    ``_adopt_recovered_session`` is the SOLE writer of ``_recovered_sessions``
+    (harness.py::Harness._adopt_recovered_session), so it is the one place that
+    can make the ``_run_slot`` guard's ``recovered_session.get('session_id')``
+    sound. Today it does ``json.loads`` with NO dict validation and stores the
+    payload verbatim, so a truncated/garbage ``agent_session.json`` holding
+    ``[]``, ``"str"`` or ``7`` reaches the dispatch path intact.
+
+    Two live consequences, both contradicting docstrings already in the tree:
+      - the no-plan-lane call site does ``session_data.get('task_id')`` with no
+        enclosing try/except, so a non-dict raises straight out of
+        ``_recover_crashed_tasks`` — a method whose own docstring promises
+        "Never raises" and promises it reads the sidecar "as a RAW dict". That
+        one is PRE-EXISTING, not introduced by task 3728;
+      - ``_run_slot``'s guard builds ``resume_event_data`` from
+        ``recovered_session.get(...)`` immediately after the predicate call, so
+        the same payload raises there too — which is why the method-level guard
+        alone does not restore the guard's observable "never a stall, never a
+        scheduler-visible error" contract.
+    """
+
+    @pytest.mark.parametrize(
+        'payload', [[], 'str', 7], ids=['list', 'str', 'int'],
+    )
+    @pytest.mark.parametrize(
+        'task_id', ['35', None], ids=['keyed-by-task-id', 'no-plan-lane'],
+    )
+    async def test_non_dict_sidecar_is_not_adopted(
+        self, harness: Harness, caplog, payload, task_id
+    ):
+        """BOTH keying paths reject the payload, adopt nothing, and say why.
+
+        Parametrized over the two ``task_id`` arities because they are the two
+        branches of the single ``key = task_id if task_id is not None else
+        session_data.get('task_id')`` line: only a check placed BEFORE it
+        covers both, and the ``None`` arity is the one that raises today.
+        """
+        wt = _setup_worktree(harness.git_ops.worktree_base, '35')
+        task_dir = wt / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'agent_session.json').write_text(json.dumps(payload))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            adopted = harness._adopt_recovered_session(wt, task_id)
+
+        assert adopted is None
+        assert harness._recovered_sessions == {}
+        assert harness._recovered_session_config_dirs == {}
+        assert any(
+            type(payload).__name__ in rec.getMessage() for rec in caplog.records
+        ), (
+            f'expected a warning naming the offending type '
+            f'{type(payload).__name__!r}; got: {caplog.text!r}'
+        )
+
+    async def test_recover_crashed_tasks_survives_a_non_dict_sidecar(
+        self, harness: Harness
+    ):
+        """The no-plan lane drives the live unguarded ``.get`` through the real
+        ``_recover_crashed_tasks``, whose docstring promises it never raises.
+        """
+        wt = harness.git_ops.worktree_base / '90'
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True)
+        (task_dir / 'agent_session.json').write_text(json.dumps(['a']))
+
+        await harness._recover_crashed_tasks()  # must not raise
+
+        assert harness._recovered_sessions == {}
+        assert '90' not in harness._preserved_worktrees
+
+    async def test_non_dict_sidecar_degrades_to_a_fresh_dispatch(
+        self, harness: Harness
+    ):
+        """END-TO-END (I3): a corrupt sidecar on disk yields a FRESH dispatch —
+        ``_run_slot`` completes, and hands ``resume_session_id=None`` to the
+        workflow.
+
+        Driven through the REAL adoption path rather than by injecting the
+        non-dict straight into ``_recovered_sessions``, because adoption is the
+        sole writer of that map and therefore the only place a fix can make
+        this assertion hold; injecting past it would pin a guard that, by the
+        deliberate two-guard design, does not exist. RED today for exactly the
+        reason this class exists: the payload IS adopted, so the guard's
+        ``recovered_session.get('session_id')`` sees a list.
+        """
+        wt = _setup_worktree(harness.git_ops.worktree_base, '91')
+        task_dir = wt / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'agent_session.json').write_text(json.dumps(['a']))
+        harness._adopt_recovered_session(wt, '91')
+
+        assignment = MagicMock()
+        assignment.task_id = '91'
+        assignment.task = {'title': 'task 91'}
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            mock_wf = AsyncMock()
+            mock_wf.run.return_value = MagicMock(value='done')
+            mock_wf.metrics = MagicMock(
+                total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
+            )
+            MockWorkflow.return_value = mock_wf
+            await harness._run_slot(assignment, sem)  # must not raise
+
+        assert MockWorkflow.call_args.kwargs['resume_session_id'] is None
 
 
 def _setup_worktree_with_meta(base: Path, task_id: str, plan: dict, *, title: str):
@@ -1481,9 +1604,9 @@ class TestRecordDrivenRecovery:
 
         step-16 review-fix regression guard: cleanup_worktree's side_effect
         performs the REAL durable RELEASED write (mirroring what
-        release_warm_lane -> _lifecycle_note_released does for a real warm
-        lane) BEFORE the harness's own explicit transition runs, so an
-        unconditional second RELEASED -> RELEASED transition would raise
+        release_warm_lane -> pool.release -> _note_released_durable does for a
+        real warm lane) BEFORE the harness's own explicit transition runs, so
+        an unconditional second RELEASED -> RELEASED transition would raise
         IllegalLaneTransition uncaught out of the recovery loop.  A second,
         non-terminal lane seeded AFTER this one proves recovery keeps going
         instead of aborting mid-loop.
@@ -1512,7 +1635,9 @@ class TestRecordDrivenRecovery:
 
         harness.scheduler.get_status = AsyncMock(side_effect=_get_status)
         harness.git_ops.cleanup_worktree.side_effect = (  # type: ignore[attr-defined]
-            lambda entry, tid: harness.git_ops._lifecycle_note_released(entry)
+            lambda entry, tid: harness.git_ops._lane_lifecycle.transition(
+                entry, DurableLaneState.RELEASED,
+            )
         )
 
         await harness._recover_crashed_tasks()  # must not raise
@@ -1769,6 +1894,246 @@ class TestRecordDrivenRecoveryCompatAndRelocation:
         assert '42' in harness._recovered_plans
 
 
+class TestSessionResumeReasons:
+    """The composite eligibility predicate itself (task 3728, β / D5).
+
+    ``_session_resume_reasons`` returns a ``frozenset[str]`` of EVERY reason a
+    recovered session is ineligible; the EMPTY set means eligible. Called
+    directly here (no ``_run_slot``) because the point under test is the
+    predicate's own reporting fidelity, not the caller's routing.
+
+    The predecessor ``_session_resume_eligible`` returned ``(bool, reason)``
+    on the FIRST matching branch, so a session that was both stale AND
+    uncorroborated reported only ``stale`` — sending an operator to check NTP
+    for a session whose transcript had also vanished. Case (a) below is that
+    hidden co-occurrence, asserted directly.
+    """
+
+    def test_stale_and_no_transcript_co_occur(self, harness: Harness, tmp_path: Path):
+        """(a) HEADLINE — an AGED sidecar whose transcript is ALSO gone reports
+        BOTH reasons, not just the first one branch order happened to reach.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-both',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        # The config dir SURVIVES (so this is 'no_transcript', not 'reseeded')
+        # but holds no transcript for this session — mirrors
+        # test_transcript_absent_falls_back_no_transcript's fixture.
+        empty_cfg = tmp_path / 'claude-config-both'
+        (empty_cfg / 'projects').mkdir(parents=True)
+
+        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+
+        assert reasons == frozenset({'stale', 'no_transcript'})
+
+    def test_eligible_is_the_empty_set(self, harness: Harness, tmp_path: Path):
+        """(b) Fresh + under cap + corroborated → NO reasons. Empty == eligible;
+        there is no 'eligible' pseudo-reason to disagree with a bool.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-ok',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg_dir = _make_transcript(tmp_path, 'uuid-ok')
+
+        reasons = harness._session_resume_reasons(session, str(cfg_dir))
+
+        assert reasons == frozenset()
+        assert not reasons  # the eligibility predicate itself
+
+    def test_three_reasons_co_occur(self, harness: Harness, tmp_path: Path):
+        """(c) Aged AND capped AND provably-wiped store → all three."""
+        harness.config.session_resume = SessionResumeConfig(max_resumes_per_task=3)
+        session = {
+            'session_id': 'uuid-three',
+            'role': 'implementer',
+            'started_at': (datetime.now(UTC) - timedelta(days=2)).isoformat(),
+            'resume_count': 3,
+        }
+        gone = tmp_path / 'gone-three' / 'claude-config-x'
+        assert not gone.exists()  # provably ENOENT → the 'reseeded' arm
+
+        reasons = harness._session_resume_reasons(session, str(gone))
+
+        assert reasons == frozenset({'stale', 'capped', 'reseeded'})
+
+    def test_disabled_short_circuits_exactly(self, harness: Harness, tmp_path: Path):
+        """(d) The B6 kill switch is a property of the FEATURE, not the session:
+        it reports 'disabled' ALONE over the very inputs that would otherwise
+        yield {'stale','no_transcript'} (case a). Exact equality, so the
+        short-circuit exemption cannot silently widen to other predicates.
+        """
+        real = SessionResumeConfig()
+        harness.config.session_resume = SessionResumeConfig(enabled=False)
+        session = {
+            'session_id': 'uuid-dis',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * real.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-dis'
+        (empty_cfg / 'projects').mkdir(parents=True)
+
+        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+
+        assert reasons == frozenset({'disabled'})
+
+    def test_unparseable_or_absent_started_at_is_stale_only(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """(e) Fail-safe freshness still degrades to 'stale' — and now WITHOUT
+        swallowing the corroboration leg: over a CORROBORATED dir the set is
+        exactly {'stale'}, proving the parse failure no longer returns early.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+
+        cfg1 = _make_transcript(tmp_path, 'uuid-bad')
+        r1 = harness._session_resume_reasons(
+            {'session_id': 'uuid-bad', 'role': 'r',
+             'started_at': 'not-a-date', 'resume_count': 0},
+            str(cfg1),
+        )
+        assert 'stale' in r1
+        assert 'no_transcript' not in r1
+
+        cfg2 = _make_transcript(tmp_path, 'uuid-bad2')
+        r2 = harness._session_resume_reasons(
+            {'session_id': 'uuid-bad2', 'role': 'r', 'resume_count': 0},  # no started_at
+            str(cfg2),
+        )
+        assert 'stale' in r2
+        assert 'no_transcript' not in r2
+
+    def test_missing_corroboration_inputs_are_no_transcript(self, harness: Harness):
+        """(f1) No stashed config_dir, and no session_id, both stay 'no_transcript'
+        — an adopted session with nothing to corroborate against is pathological
+        and must stay LOUD rather than land in the silent 'reseeded' arm.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        fresh = datetime.now(UTC).isoformat()
+
+        no_dir = harness._session_resume_reasons(
+            {'session_id': 'uuid-nocfg', 'role': 'r',
+             'started_at': fresh, 'resume_count': 0},
+            None,
+        )
+        assert 'no_transcript' in no_dir
+
+        no_sid = harness._session_resume_reasons(
+            {'session_id': None, 'role': 'r', 'started_at': fresh, 'resume_count': 0},
+            '/some/where',
+        )
+        assert 'no_transcript' in no_sid
+
+    def test_unreadable_config_dir_stays_no_transcript_and_never_raises(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """(f2) I3 totality survives the rewrite: a PRESENT-but-UNREADABLE config
+        dir is a filesystem fault, not a lane wipe, so it stays a loud
+        'no_transcript' and the call does not raise.
+
+        The EACCES is INJECTED rather than produced with ``chmod(0o000)``, for
+        the reason :meth:`TestSessionResumeGuard.
+        test_unreadable_config_dir_stays_no_transcript` records: a root process
+        can stat through a 0o000 parent, which would make the row vacuous.
+        """
+        blocked = tmp_path / 'unreadable-r' / 'claude-config-x'
+        blocked.mkdir(parents=True)
+        real_stat = Path.stat
+
+        def fake_stat(self: Path, *args, **kwargs):
+            if self == blocked:
+                raise PermissionError(13, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', fake_stat)
+        harness.config.session_resume = SessionResumeConfig()
+
+        reasons = harness._session_resume_reasons(
+            {'session_id': 'uuid-eacces', 'role': 'r',
+             'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0},
+            str(blocked),
+        )
+
+        assert 'no_transcript' in reasons
+        assert 'reseeded' not in reasons
+
+    @pytest.mark.parametrize(
+        'bad_session',
+        [['a'], 'str', 7, 3.5, True, [], ()],
+        ids=['list', 'str', 'int', 'float', 'bool', 'empty-list', 'tuple'],
+    )
+    def test_non_dict_session_is_total_and_stays_by_design(
+        self, harness: Harness, tmp_path: Path, bad_session
+    ):
+        """(f3) I3 totality for a sidecar that PARSED as JSON but is not an
+        OBJECT — a truncated/garbage ``agent_session.json`` holding ``[]``,
+        ``"str"`` or ``7``.
+
+        The predecessor ``_session_resume_eligible`` was total for this input
+        only by ACCIDENT of first-match ordering: ``session['started_at']``
+        raised ``TypeError`` straight into the freshness leg's own ``except``,
+        which returned ``(False, 'stale')`` before any ``.get`` ran. A
+        composite predicate does not return early by construction, so it
+        cannot inherit that accident — it falls through to
+        ``session.get('resume_count', 0)`` and raises ``AttributeError``,
+        contradicting the docstring's "this method NEVER raises".
+
+        Four properties, because "does not raise" alone would be satisfied by
+        a spurious eligibility:
+          - NON-EMPTY, so the caller degrades to a fresh dispatch rather than
+            resuming a corrupt session;
+          - a ``frozenset`` of ``str``, the declared return shape;
+          - a SUBSET of the by-design vocabulary, so one corrupt sidecar can
+            never feed the INV-4 storm streak and page an operator.
+        """
+        from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
+
+        harness.config.session_resume = SessionResumeConfig()
+
+        reasons = harness._session_resume_reasons(bad_session, str(tmp_path))
+
+        assert isinstance(reasons, frozenset)
+        assert all(isinstance(r, str) for r in reasons)
+        assert reasons, (
+            'a non-dict session must be INELIGIBLE (non-empty reasons): the '
+            'empty set is the eligibility predicate, so returning it here '
+            'would resume a corrupt sidecar'
+        )
+        assert reasons <= _BY_DESIGN_SESSION_RESUME_REASONS, (
+            f'a corrupt sidecar reported {sorted(reasons)}, which escapes '
+            '_BY_DESIGN_SESSION_RESUME_REASONS and would therefore feed the '
+            'fallback-storm streak — one garbage file must not page an operator'
+        )
+
+    def test_disabled_still_wins_over_a_non_dict_session(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """(f4) The kill switch short-circuits BEFORE the non-dict degradation.
+
+        Pins the guard's placement — after ``enabled``, before the freshness
+        leg — executably, so D2's "'disabled' is returned ALONE" exemption
+        cannot silently widen into a mixed set when the session is garbage.
+        """
+        harness.config.session_resume = SessionResumeConfig(enabled=False)
+
+        reasons = harness._session_resume_reasons(['a'], str(tmp_path))
+
+        assert reasons == frozenset({'disabled'})
+
+
 @pytest.mark.asyncio
 class TestSessionResumeGuard:
     """γ eligibility guard in _run_slot (task 2774): an ineligible recovered
@@ -1833,7 +2198,7 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'stale'
+        assert kwargs['data']['reasons'] == ['stale']
 
     async def test_unparseable_or_missing_started_at_falls_back_stale(
         self, harness: Harness, tmp_path: Path
@@ -1860,13 +2225,14 @@ class TestSessionResumeGuard:
         assert len(emits) == 2
         for et, kwargs in emits:
             assert et == EventType.session_resume_fallback
-            assert kwargs['data']['reason'] == 'stale'
+            assert kwargs['data']['reasons'] == ['stale']
 
     async def test_transcript_absent_falls_back_no_transcript(
         self, harness: Harness, tmp_path: Path
     ):
-        """config_dir stashed but the transcript jsonl was wiped (B4 foreign-
-        acquire reseed shape) → fallback reason 'no_transcript'.
+        """The config dir SURVIVES on disk but this session's transcript jsonl
+        is absent → fallback reason 'no_transcript' (a genuine corroboration
+        failure — distinct from the whole-store wipe, which is 'reseeded').
         """
         session = {
             'session_id': 'uuid-notr',
@@ -1885,7 +2251,173 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
+
+    async def test_aged_and_uncorroborated_reports_both_reasons(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The user-observable signal of task 3728, end to end through the
+        guard: a sidecar that is BOTH too old AND missing its transcript emits
+        ONE fallback carrying BOTH reasons.
+
+        Before the composite rewrite this event said ``reason='stale'`` and
+        nothing else, because freshness was checked first — so an operator
+        triaging it went to check host clock skew for a session that had also
+        lost its transcript, and the second cause was not merely unranked but
+        absent from the wire entirely.
+
+        The list is SORTED (alphabetical, hence no_transcript before stale) so
+        ``json_extract(data,'$.reasons')`` is a stable composite group key, and
+        it is a real ``list`` — a set/frozenset would not survive the JSON
+        round-trip into runs.db.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-both-wire',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-both-wire'
+        (empty_cfg / 'projects').mkdir(parents=True)
+
+        resume_id = await _drive_session_slot(
+            harness, 'both1', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        data = kwargs['data']
+        assert data['reasons'] == ['no_transcript', 'stale']
+        assert isinstance(data['reasons'], list)
+        # The first-match scalar is GONE, not kept as an alias: retaining it
+        # would mean retaining the projection this task exists to kill, and
+        # operators would keep reading the field that misdirects them.
+        assert 'reason' not in data
+        # α's instrument still rides the same emit (no archive was written).
+        assert data['archive_available'] is False
+
+    async def test_wiped_config_dir_falls_back_reseeded(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The stashed config dir is GONE from disk → fallback reason
+        'reseeded' (task 3256).
+
+        Models the lane having been re-seeded between boot-time adoption and
+        re-dispatch: warm-lane acquire ALWAYS re-seeds from base, which wipes
+        ``<lane>/.task/`` (``git clean -xfd`` on the RECYCLE route,
+        ``rmtree(lane/'.task')`` on RESET_IN_PLACE_REATTACH) and with it the
+        whole ``claude-config-*`` transcript store. That is the always-reseed
+        invariant working as designed — an EXPECTED fallback, not a
+        corroboration failure — so it must be classified apart from
+        'no_transcript'.
+        """
+        session = {
+            'session_id': 'uuid-reseed',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        gone = tmp_path / 'gone' / 'claude-config-x'
+        assert not gone.exists()  # the reseed already swept the lane
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(harness, 'rs1', session, config_dir=gone)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        # The event type is UNCHANGED — the downgrade suppresses the
+        # escalation, not the telemetry channel (PRD open question 3).
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['reseeded']
+
+    async def test_surviving_config_dir_missing_transcript_stays_no_transcript(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A config dir that SURVIVES the lane's lifetime but has lost only
+        this session's transcript must NOT be swallowed by the new 'reseeded'
+        branch (task 3256) — it is a real, distinct failure mode and stays a
+        loud 'no_transcript' corroboration failure.
+        """
+        session = {
+            'session_id': 'uuid-survivor',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        # A REAL claude-config dir, with a projects/ tree holding some OTHER
+        # session's transcript but not this one's.
+        survivor = _make_transcript(tmp_path, 'uuid-other')
+        assert survivor.is_dir()
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'sv1', session, config_dir=survivor
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript']
+
+    async def test_unreadable_config_dir_stays_no_transcript(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A config dir that is PRESENT but UNREADABLE (EACCES on a parent,
+        ELOOP, a stale NFS handle) is a filesystem fault, not a lane wipe, and
+        must stay a loud 'no_transcript' (task 3256 amendment).
+
+        Keying the split on ``Path.exists()`` is wrong in BOTH directions: it
+        swallows exactly {ENOENT, ENOTDIR, EBADF, ELOOP} into False, filing a
+        symlink loop or bad fd under the silent, storm-exempt 'reseeded' arm,
+        and it RE-RAISES every other OSError — the EACCES injected here — out
+        through the guard's documented never-raises I3 contract. Either way a
+        genuine filesystem fault stops surfacing as the systematic breakage
+        INV-4 exists to catch. Only ENOENT/ENOTDIR is evidence of a wipe.
+
+        The error is INJECTED rather than produced with ``chmod(0o000)`` so
+        the test is deterministic and still meaningful when the suite runs as
+        root (a root process can stat through a 0o000 parent).
+        """
+        session = {
+            'session_id': 'uuid-eacces',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        blocked = tmp_path / 'unreadable' / 'claude-config-x'
+        blocked.mkdir(parents=True)
+        real_stat = Path.stat
+
+        def fake_stat(self: Path, *args, **kwargs):
+            if self == blocked:
+                raise PermissionError(13, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', fake_stat)
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'ur1', session, config_dir=blocked
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript']
 
     async def test_no_config_dir_falls_back_no_transcript(self, harness: Harness):
         """No stashed config_dir at all → cannot corroborate → 'no_transcript'."""
@@ -1903,7 +2435,7 @@ class TestSessionResumeGuard:
         emits = _session_resume_emits(harness)
         assert len(emits) == 1
         assert emits[0][0] == EventType.session_resume_fallback
-        assert emits[0][1]['data']['reason'] == 'no_transcript'
+        assert emits[0][1]['data']['reasons'] == ['no_transcript']
 
     async def test_capped_emits_capped(self, harness: Harness, tmp_path: Path):
         """resume_count at the cap → fresh dispatch + session_resume_capped (B7).
@@ -1926,14 +2458,83 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         assert emits[0][0] == EventType.session_resume_capped
 
+    async def test_capped_plus_another_reason_emits_fallback_not_capped(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A capped session that ALSO fails corroboration emits
+        session_resume_fallback carrying BOTH reasons — NOT session_resume_capped.
+
+        This pins the caller's ``reasons == {'capped'}`` EXACT-equality routing
+        (task 3728), which every other capped test leaves unexercised because
+        they all drive a fresh, corroborated session whose only failing leg is
+        the cap. Relaxing that equality to ``'capped' in reasons`` passes the
+        whole rest of the suite, and it would silently restore two defects at
+        once: config.py documents session_resume_capped as throttling of an
+        otherwise HEALTHY resumable session, so the throttle population would
+        be overstated by sessions that could not have resumed anyway, and the
+        co-occurring corroboration failure would be BURIED — first-match
+        reporting reintroduced one level up, in the event routing rather than
+        in the reason string. It would also move these dispatches between the
+        two events the event_store.py ratio recipe counts.
+
+        The streak stays 0 either way: both reasons are by-design (D4), so the
+        richer event costs nothing in escalation noise.
+        """
+        session = {
+            'session_id': 'uuid-cap-notr',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),   # fresh: not 'stale'
+            'resume_count': 3,                             # at the cap
+        }
+        # The config dir SURVIVES but holds no transcript for this session, so
+        # corroboration yields 'no_transcript' (the surviving-dir arm) rather
+        # than 'reseeded'.
+        empty_cfg = tmp_path / 'claude-config-cap-notr'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig(max_resumes_per_task=3)
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'cn1', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        # 'capped' stays visible in the set, so routing the dispatch here
+        # rather than to session_resume_capped loses no information.
+        assert kwargs['data']['reasons'] == ['capped', 'no_transcript']
+        assert harness._session_resume_fallback_streak == 0
+
 
 @pytest.mark.asyncio
 class TestSessionResumeStorm:
-    """γ fallback-storm escape (INV-4, task 2774): a per-boot RUN of
-    consecutive session_resume_fallback degradations reaching
-    fallback_storm_threshold files ONE deduped L1 escalation. The streak is
-    consecutive-per-boot (reset by any eligible resume); capped/disabled do
-    NOT feed it. Filing is best-effort — a None queue never raises (I3).
+    """γ fallback-storm escape (INV-4, task 2774; narrowed by 3256, carved out
+    by 3728): a RUN of GENUINE session-resume failures reaching
+    fallback_storm_threshold files ONE deduped L1 escalation.
+
+    The streak is a rolling CHAIN, not a per-boot running total: consecutive
+    means chained within storm_window_secs, so a gap at least that long decays
+    it to 0 (an eligible resume also resets it outright, and clears the chain's
+    comparison stamp).
+
+    WHAT FEEDS IT is the part task 3728 changed. EVERY by-design outcome is now
+    excluded by construction — 'disabled' (silent kill switch), 'capped'
+    (throttling), 'reseeded' (lane wipe) and, newly, 'stale' and
+    'no_transcript'. The last two were classified genuine while
+    ``_session_resume_reasons``' own docstring described them as the
+    anticipated reseed/wipe/clock cases, so the L1 they filed sent operators to
+    check NTP for a population the system expects to see. After the carve-out
+    NOTHING the predicate can currently produce feeds the streak — the
+    deliberate, G7-waived window that PRD leaf ε (task 3733) closes by
+    installing the archive-restore-failure feeder.
+
+    So the mechanism is RETAINED and exercised here through a SYNTHETIC feeder
+    (:meth:`_arm_synthetic_feeder`) standing in for ε's, which doubles as the
+    executable statement of the extension contract ε consumes. Filing is
+    best-effort — a None queue never raises (I3).
     """
 
     @staticmethod
@@ -1947,67 +2548,227 @@ class TestSessionResumeStorm:
         }
 
     @staticmethod
+    def _fresh_session(sid: str) -> dict:
+        """A session that passes freshness + cap, so its only failing leg is
+        transcript corroboration (used to drive the 'reseeded' arm).
+        """
+        return {
+            'session_id': sid,
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+
+    @staticmethod
     def _queue() -> MagicMock:
         q = MagicMock()
         q.has_open_l1 = MagicMock(return_value=False)
         q.make_id = MagicMock(return_value='sr-storm')
         return q
 
-    async def test_streak_files_one_l1_at_threshold(self, harness: Harness):
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+    @staticmethod
+    def _arm_synthetic_feeder(
+        harness: Harness, reasons: frozenset[str] = frozenset({'restore_failed'}),
+    ) -> None:
+        """Make every dispatch report *reasons*, standing in for ε's feeder.
+
+        After the 3728 carve-out no reason the real predicate can produce feeds
+        the streak, so the increment / threshold / filing path has no reachable
+        production input until PRD leaf ε (task 3733) adds one. Patching the
+        predicate is the narrowest injection point that still exercises the
+        REAL caller, the REAL streak, the REAL dedup and the REAL filer — and
+        it states ε's extension contract executably: a reason absent from
+        ``_BY_DESIGN_SESSION_RESUME_REASONS`` feeds the storm with no second
+        edit anywhere.
+
+        ``restore_failed`` is deliberately the name ε is expected to use.
+        """
+        def _reasons(session: dict, config_dir: str | None) -> frozenset[str]:
+            return reasons
+
+        harness._session_resume_reasons = _reasons  # type: ignore[method-assign]
+
+    # ── NEGATIVE half: no by-design outcome can trip the escape ──────────────
+
+    @pytest.mark.parametrize(
+        'reason', ['stale', 'no_transcript', 'reseeded', 'capped'],
+    )
+    async def test_by_design_reasons_never_file_l1(
+        self, harness: Harness, tmp_path: Path, reason: str,
+    ):
+        """EVERY by-design outcome is excluded from the streak by construction
+        (task 3728 D4), however many of them arrive.
+
+        threshold=1 makes the very first GENUINE fallback fire, so a zero
+        submit count across four dispatches proves the reason does not feed the
+        streak at all. ``stale`` and ``no_transcript`` are the two this task
+        RECLASSIFIED — they used to file the L1 that told operators to check
+        NTP; ``reseeded`` and ``capped`` were already excluded (task 3256 /
+        2774) and are re-asserted here under the new set-based feeder.
+
+        The telemetry channel must SURVIVE the carve-out: this is noise
+        suppression of the ESCALATION, never of the event. One event per
+        dispatch, carrying the reason, exactly as before.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, max_resumes_per_task=3,
+        )
         harness._escalation_queue = self._queue()
 
-        for i in range(3):
-            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
+        expect_capped = reason == 'capped'
+        for i in range(4):
+            sid = f'uuid-bd-{reason}-{i}'
+            if reason == 'stale':
+                # Corroborated dir, so staleness is the SOLE reason.
+                session, cfg = self._stale_session(sid), _make_transcript(tmp_path, sid)
+            elif reason == 'no_transcript':
+                # The dir SURVIVES but holds no transcript for this session.
+                session = self._fresh_session(sid)
+                cfg = tmp_path / f'empty-{i}'
+                (cfg / 'projects').mkdir(parents=True)
+            elif reason == 'reseeded':
+                session = self._fresh_session(sid)
+                cfg = tmp_path / f'gone{i}' / 'claude-config-x'
+            else:  # capped
+                session = self._fresh_session(sid) | {'resume_count': 3}
+                cfg = _make_transcript(tmp_path, sid)
 
-        assert harness._escalation_queue.submit.call_count == 1
-        esc = harness._escalation_queue.submit.call_args.args[0]
-        assert esc.level == 1
-        assert 'resume' in esc.summary.lower()
+            await _drive_session_slot(harness, f'bd{i}', session, config_dir=cfg)
+            # Asserted INSIDE the loop: the counter must never transiently
+            # rise, not merely end at 0.
+            assert harness._session_resume_fallback_streak == 0
+            assert harness._escalation_queue.submit.call_count == 0
 
-    async def test_dedup_no_second_submit_when_l1_open(self, harness: Harness):
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-        harness._escalation_queue = self._queue()
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 4
+        for et, kwargs in emits:
+            if expect_capped:
+                assert et == EventType.session_resume_capped
+            else:
+                assert et == EventType.session_resume_fallback
+                assert kwargs['data']['reasons'] == [reason]
 
-        for i in range(3):
-            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
-        assert harness._escalation_queue.submit.call_count == 1
+    async def test_by_design_constant_classifies_every_producible_reason(self):
+        """``_BY_DESIGN_SESSION_RESUME_REASONS`` covers EXACTLY the vocabulary
+        ``_session_resume_reasons`` can currently produce.
 
-        # L1 now open → further fallbacks must NOT re-submit (has_open_l1 dedup).
-        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        for i in range(3, 6):
-            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
-        assert harness._escalation_queue.submit.call_count == 1
+        The classification defaults to GENUINE — a reason absent from the
+        constant feeds the storm — which is the fail-LOUD direction, but it
+        makes "forgot to think about it" and "deliberately genuine"
+        indistinguishable at the constant. This row closes that: the producible
+        vocabulary is read structurally out of the predicate's own source, so
+        adding a reason without classifying it fails HERE.
 
-    async def test_streak_is_consecutive_reset_by_eligible(
+        The read is deliberately FAIL-CLOSED, and that is the whole design of
+        it. An earlier version collected only string constants sitting inside
+        ``set.add(...)`` / ``frozenset(...)`` calls, which failed OPEN for
+        every other spelling: ``reasons |= {'x'}``, ``reasons.update({'x'})``
+        and a reason routed through a module constant were all invisible, so a
+        new unclassified reason would have slipped past this row and gone
+        straight onto the INV-4 storm feeder as escalation noise. So instead of
+        guessing which syntax introduces a reason, this collects EVERY string
+        literal in the method (docstrings excluded) plus any module-global the
+        method references that is itself a string or a collection of strings,
+        and requires the total to partition exactly into declared non-reasons
+        and classified reasons.
+
+        The cost of fail-closed is that an unrelated new literal — say a fourth
+        sidecar key — also fails this row. That is intended: the fix is one
+        line in ``non_reason_literals`` below, and it forces a human to state
+        which kind of string was just added. Fail-open, by contrast, is silent.
+
+        ε (task 3733) is EXPECTED to trip this when it adds ``restore_failed``.
+        The correct resolution is almost certainly to extend the expected
+        vocabulary here, NOT the constant: a restore failure is a genuine
+        feeder, which is the whole point of ε.
+        """
+        import ast  # noqa: PLC0415 — structural read of one method's source
+        import inspect  # noqa: PLC0415
+        import textwrap  # noqa: PLC0415
+
+        import orchestrator.harness as harness_mod  # noqa: PLC0415
+        from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
+
+        # Strings the method uses that are NOT reasons. Every one is a key read
+        # off the recovered-session sidecar dict; nothing here reaches the
+        # returned set.
+        non_reason_literals = {'started_at', 'resume_count', 'session_id'}
+
+        fn = ast.parse(
+            textwrap.dedent(inspect.getsource(Harness._session_resume_reasons))
+        ).body[0]
+
+        # Docstrings are string constants too — identify them by position (the
+        # first statement of any scope) and skip exactly those nodes.
+        docstrings = {
+            id(scope.body[0].value)
+            for scope in ast.walk(fn)
+            if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+            and scope.body
+            and isinstance(scope.body[0], ast.Expr)
+            and isinstance(scope.body[0].value, ast.Constant)
+            and isinstance(scope.body[0].value.value, str)
+        }
+        strings: set[str] = {
+            node.value
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        }
+        # ...and any module-level constant the method reads that could CARRY a
+        # reason, so routing one through an indirection does not hide it.
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Name):
+                continue
+            value = getattr(harness_mod, node.id, None)
+            if isinstance(value, str):
+                strings.add(value)
+            elif isinstance(value, set | frozenset | tuple | list) and all(
+                isinstance(item, str) for item in value
+            ):
+                strings |= set(value)
+
+        producible = strings - non_reason_literals
+        assert producible == {'disabled', 'stale', 'capped', 'no_transcript',
+                              'reseeded'}, (
+            'the string literals in _session_resume_reasons no longer partition '
+            'into the declared non-reasons and the known reason vocabulary. If '
+            'you added a REASON, classify it in '
+            '_BY_DESIGN_SESSION_RESUME_REASONS (or deliberately leave it out, '
+            'making it a genuine storm feeder) and extend this assertion; if '
+            'you added a non-reason string, add it to non_reason_literals '
+            f'above. Saw: {sorted(producible)}'
+        )
+        assert producible == _BY_DESIGN_SESSION_RESUME_REASONS
+
+    async def test_reseeded_fallbacks_never_file_l1(
         self, harness: Harness, tmp_path: Path
     ):
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        """Reseed-explained fallbacks are EXPECTED and must never trip the
+        storm escape, however many of them arrive (task 3256).
+
+        threshold=1 makes the very first genuine fallback fire, so a zero
+        submit count across three reseeded dispatches proves they do not feed
+        the streak at all. The telemetry channel must SURVIVE the downgrade:
+        this is noise suppression of the ESCALATION, not of the event.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
         harness._escalation_queue = self._queue()
 
-        # 2 stale fallbacks (streak=2)...
-        for i in range(2):
-            await _drive_session_slot(harness, f'a{i}', self._stale_session(f'uuid-a{i}'))
-        # ...then an ELIGIBLE resume resets the streak to 0.
-        cfg = _make_transcript(tmp_path, 'uuid-ok')
-        await _drive_session_slot(
-            harness, 'ok1',
-            {
-                'session_id': 'uuid-ok', 'role': 'implementer',
-                'started_at': datetime.now(UTC).isoformat(),
-                'resume_count': 0,
-            },
-            config_dir=cfg,
-        )
-        # 2 more stale after the reset → streak=2 (<3) → still no L1.
-        for i in range(2):
-            await _drive_session_slot(harness, f'b{i}', self._stale_session(f'uuid-b{i}'))
-        assert harness._escalation_queue.submit.call_count == 0
+        for i in range(3):
+            await _drive_session_slot(
+                harness, f'rs{i}', self._fresh_session(f'uuid-rs{i}'),
+                config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
+            )
 
-        # A 3rd consecutive stale AFTER the reset reaches threshold → fires once,
-        # proving the streak resumed from 0 (consecutive, not cumulative).
-        await _drive_session_slot(harness, 'b2', self._stale_session('uuid-b2'))
-        assert harness._escalation_queue.submit.call_count == 1
+        assert harness._escalation_queue.submit.call_count == 0
+        assert harness._session_resume_fallback_streak == 0
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 3
+        for et, kwargs in emits:
+            assert et == EventType.session_resume_fallback
+            assert kwargs['data']['reasons'] == ['reseeded']
 
     async def test_capped_does_not_feed_streak(self, harness: Harness, tmp_path: Path):
         """resume_count-capped degradations are by-design throttling and must
@@ -2032,16 +2793,435 @@ class TestSessionResumeStorm:
             )
         assert harness._escalation_queue.submit.call_count == 0
 
+    # ── POSITIVE half: the RETAINED mechanism, driven by ε's stand-in ────────
+
+    async def test_genuine_feeder_files_one_l1_at_threshold(self, harness: Harness):
+        """A reason OUTSIDE the by-design vocabulary reaches the threshold and
+        files exactly one L1 — the mechanism is retained, not deleted (F3).
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        for i in range(3):
+            await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
+
+        assert harness._session_resume_fallback_streak == 3
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'resume' in esc.summary.lower()
+        # The telemetry rides the same emit, carrying the unclassified reason.
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 3
+        for et, kwargs in emits:
+            assert et == EventType.session_resume_fallback
+            assert kwargs['data']['reasons'] == ['restore_failed']
+
+    async def test_dedup_no_second_submit_when_l1_open(self, harness: Harness):
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        for i in range(3):
+            await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # L1 now open → further fallbacks must NOT re-submit (has_open_l1 dedup).
+        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        for i in range(3, 6):
+            await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+    async def test_a_by_design_reason_cannot_launder_a_genuine_one(
+        self, harness: Harness
+    ):
+        """D4 ∧ D5 — a MIXED set still feeds the streak.
+
+        This is the conjunction that makes the carve-out safe. Under first-match
+        reporting a session that was BOTH stale and (say) restore-failed
+        reported only ``stale``; carving ``stale`` out of the feeder on top of
+        that would have SILENCED the genuine failure entirely — a by-design
+        reason laundering a real one, which is strictly worse than the
+        misdirection this task set out to fix. Because the caller subtracts the
+        by-design SET from the full reason set, what is left is non-empty and
+        the streak feeds exactly as it would on the genuine reason alone.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=2)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness, frozenset({'stale', 'restore_failed'}))
+
+        for i in range(2):
+            await _drive_session_slot(harness, f'mx{i}', self._fresh_session(f'uuid-mx{i}'))
+
+        assert harness._session_resume_fallback_streak == 2
+        assert harness._escalation_queue.submit.call_count == 1
+        # ...and BOTH reasons are on the wire, so the operator sees the
+        # by-design co-occurrence rather than inferring it.
+        et, kwargs = _session_resume_emits(harness)[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['restore_failed', 'stale']
+
+    async def test_storm_l1_directs_the_operator_at_the_reason_set(
+        self, harness: Harness
+    ):
+        """The filed L1 must send the operator to the EVIDENCE first.
+
+        Its detail used to name ``stale`` and ``no_transcript`` as the only
+        surviving causes and send the operator to check NTP FIRST. After D4
+        those are excluded by construction, so that text would be a confident
+        instruction to investigate a population that provably did not
+        contribute — the exact misdirection this task exists to remove, now
+        printed on the escalation itself.
+
+        Stated POSITIVELY rather than as blanket "word X is absent" pins. The
+        earlier form asserted ``'stale' not in text`` and three siblings, which
+        pinned cosmetic phrasing instead of behaviour: they also forbid
+        'staleness', and they would fail a strictly BETTER detail that names
+        the excluded by-design reasons explicitly ("a stale sidecar is excluded
+        by construction and did not contribute") — plausible operator guidance,
+        and closer to what this escalation is for. The real contract is that
+        the L1 is filed at level 1 and its FIRST directive is to read the
+        reason sets off the events rather than to start from a guess, so that
+        is what is asserted; the wording around it stays free to improve.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        await _drive_session_slot(harness, 'p1', self._fresh_session('uuid-p1'))
+
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        # The detail hands over the exact query, keyed on the composite field
+        # this task put on the wire — not on the retired first-match scalar.
+        assert "json_extract(data,'$.reasons')" in esc.detail
+        assert "'$.reason'" not in esc.detail
+        # ...and the FIRST thing the operator is told to do is run it. Scoped
+        # to the opening directive, so the rest of suggested_action can say
+        # whatever later turns out to help.
+        first_directive = esc.suggested_action.split('.')[0].lower()
+        assert 'query' in first_directive
+
+    async def test_genuine_failures_still_file_l1_across_by_design(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A by-design fallback neither counts toward NOR resets the genuine
+        streak (task 3256's anti-masking rule, generalised by 3728).
+
+        Interleaving reseeds between ``threshold`` genuine fallbacks must still
+        file exactly one L1: a drip of by-design outcomes cannot mask a genuine
+        systematic failure hiding between them. The genuine half now comes from
+        the synthetic feeder, since stale no longer qualifies — so the
+        interleaving is driven by swapping the predicate rather than by two
+        different fixtures.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        for i in range(3):
+            self._arm_synthetic_feeder(harness)
+            await _drive_session_slot(harness, f'g{i}', self._fresh_session(f'uuid-g{i}'))
+            # A by-design reseed between each genuine failure.
+            self._arm_synthetic_feeder(harness, frozenset({'reseeded'}))
+            await _drive_session_slot(harness, f'ir{i}', self._fresh_session(f'uuid-ir{i}'))
+
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'resume' in esc.summary.lower()
+
+    async def test_streak_is_consecutive_reset_by_eligible(
+        self, harness: Harness, tmp_path: Path
+    ):
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        # 2 genuine fallbacks (streak=2)...
+        for i in range(2):
+            await _drive_session_slot(harness, f'a{i}', self._fresh_session(f'uuid-a{i}'))
+        # ...then an ELIGIBLE resume resets the streak to 0. The real predicate
+        # has to be back in place for a resume to BE eligible.
+        del harness._session_resume_reasons
+        cfg = _make_transcript(tmp_path, 'uuid-ok')
+        await _drive_session_slot(
+            harness, 'ok1', self._fresh_session('uuid-ok'), config_dir=cfg,
+        )
+        # 2 more genuine after the reset → streak=2 (<3) → still no L1.
+        self._arm_synthetic_feeder(harness)
+        for i in range(2):
+            await _drive_session_slot(harness, f'b{i}', self._fresh_session(f'uuid-b{i}'))
+        assert harness._escalation_queue.submit.call_count == 0
+
+        # A 3rd consecutive genuine fallback AFTER the reset reaches threshold →
+        # fires once, proving the streak resumed from 0 (consecutive, not
+        # cumulative).
+        await _drive_session_slot(harness, 'b2', self._fresh_session('uuid-b2'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+    async def test_streak_decays_after_storm_window(self, harness: Harness):
+        """A gap of >= storm_window_secs between two genuine fallbacks decays
+        the streak to 0, so an isolated drip can never accumulate into a false
+        storm (task 3256 — the addendum's second defect).
+
+        The clock is advanced by rewinding the harness's own monotonic stamp,
+        NOT by monkeypatching time.monotonic globally: the rewind is
+        deterministic and perturbs no unrelated timer.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        # Two genuine fallbacks inside the window → streak=2.
+        for i in range(2):
+            await _drive_session_slot(harness, f'd{i}', self._fresh_session(f'uuid-d{i}'))
+        assert harness._session_resume_fallback_streak == 2
+
+        # ...then the clock jumps past the window before the 3rd arrives.
+        # (The assert also pins that a genuine fallback stamped the chain point.)
+        assert harness._last_session_resume_fallback_at is not None
+        harness._last_session_resume_fallback_at -= 120
+
+        await _drive_session_slot(harness, 'd2', self._fresh_session('uuid-d2'))
+
+        # Decayed to 0, then re-incremented — NOT 3, so no L1.
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_window_retires_the_run_on_a_by_design_dispatch(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The counter must be correct when READ, not merely when incremented
+        (task 3256's addendum defect, in scope for 3728).
+
+        The decay is only meaningful if the passage of the window RETIRES a run
+        — but it is computed inside the increment branch, so with no genuine
+        feeder arriving the counter holds its last value indefinitely and any
+        other reader sees a run that ended long ago. ε's re-armed feeder makes
+        that reader real; today it is already a lie about state.
+
+        Drive threshold-1 genuine failures, let the window pass, then dispatch
+        ONE ordinary by-design (stale) session: the run must be gone — streak 0
+        AND the chain's comparison stamp cleared — even though that dispatch
+        contributed nothing itself.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        self._arm_synthetic_feeder(harness)
+        for i in range(2):  # threshold - 1
+            await _drive_session_slot(harness, f'rq{i}', self._fresh_session(f'uuid-rq{i}'))
+        assert harness._session_resume_fallback_streak == 2
+        assert harness._last_session_resume_fallback_at is not None
+
+        # The clock passes the window with no further genuine failure.
+        harness._last_session_resume_fallback_at -= 120
+
+        # A perfectly ordinary by-design dispatch (real predicate, corroborated
+        # dir, aged sidecar → {'stale'}) is enough to observe the expiry.
+        del harness._session_resume_reasons
+        cfg = _make_transcript(tmp_path, 'uuid-rq-stale')
+        await _drive_session_slot(
+            harness, 'rq-stale', self._stale_session('uuid-rq-stale'), config_dir=cfg,
+        )
+
+        assert harness._session_resume_fallback_streak == 0
+        assert harness._last_session_resume_fallback_at is None
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_by_design_dispatch_inside_the_window_decays_nothing(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """...and evaluating the decay per dispatch must not become a RESET per
+        dispatch.
+
+        The same interleaving WITHOUT the clock passing leaves both the counter
+        and the stamp exactly as they were: a by-design outcome still neither
+        FEEDS the streak nor RESETS it (task 3256's anti-masking rule — a drip
+        of expected fallbacks must not launder a genuine systematic failure
+        interleaved between them), and it still does not refresh the chain
+        stamp, which would keep a run alive across an arbitrarily long gap.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        self._arm_synthetic_feeder(harness)
+        for i in range(2):
+            await _drive_session_slot(harness, f'nw{i}', self._fresh_session(f'uuid-nw{i}'))
+        stamp = harness._last_session_resume_fallback_at
+        assert harness._session_resume_fallback_streak == 2
+        assert stamp is not None
+
+        del harness._session_resume_reasons
+        cfg = _make_transcript(tmp_path, 'uuid-nw-stale')
+        await _drive_session_slot(
+            harness, 'nw-stale', self._stale_session('uuid-nw-stale'), config_dir=cfg,
+        )
+
+        assert harness._session_resume_fallback_streak == 2
+        assert harness._last_session_resume_fallback_at == stamp
+
+        # And the run is still live: one more genuine failure reaches the
+        # threshold, so the per-dispatch decay did not quietly neuter INV-4.
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'nw2', self._fresh_session('uuid-nw2'))
+        assert harness._session_resume_fallback_streak == 3
+        assert harness._escalation_queue.submit.call_count == 1
+
+    async def test_by_design_fallbacks_do_not_refresh_the_chain_stamp(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A by-design fallback must leave ``_last_session_resume_fallback_at``
+        untouched, not just the streak counter (task 3256 amendment).
+
+        The stamp is the chain's comparison point, so refreshing it on a
+        by-design outcome would keep the chain alive across an arbitrarily long
+        drip: two genuine failures hours apart could then still chain into a
+        false storm, re-opening the exact hole the decay window closes.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=2, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        # One genuine fallback opens the chain: streak=1, stamp set.
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'cs0', self._fresh_session('uuid-cs0'))
+        assert harness._session_resume_fallback_streak == 1
+        stamp = harness._last_session_resume_fallback_at
+        assert stamp is not None
+
+        # A drip of REAL by-design reseeds moves NEITHER the counter nor the
+        # stamp (real predicate, so this is not an artifact of the stand-in).
+        del harness._session_resume_reasons
+        for i in range(3):
+            await _drive_session_slot(
+                harness, f'csr{i}', self._fresh_session(f'uuid-csr{i}'),
+                config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
+            )
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._last_session_resume_fallback_at == stamp
+
+        # So when the clock passes the window, the NEXT genuine fallback is
+        # measured against the first one and decays — reaching 1, not the
+        # threshold of 2.
+        harness._last_session_resume_fallback_at = stamp - 120
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'cs1', self._fresh_session('uuid-cs1'))
+
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_streak_survives_within_storm_window(self, harness: Harness):
+        """The decay must NOT neuter INV-4: a genuine tight burst still reaches
+        the threshold and files exactly one L1 (task 3256).
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        # Three back-to-back fallbacks — no rewind, so all chain inside the window.
+        for i in range(3):
+            await _drive_session_slot(harness, f'w{i}', self._fresh_session(f'uuid-w{i}'))
+
+        assert harness._session_resume_fallback_streak == 3
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+
+    async def test_eligible_resume_clears_fallback_timestamp(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """An eligible resume clears the chain's comparison point as well as
+        the streak, so the next fallback starts a fresh run rather than
+        chaining off a pre-reset stamp (task 3256).
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'ts0', self._fresh_session('uuid-ts0'))
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._last_session_resume_fallback_at is not None
+
+        del harness._session_resume_reasons  # a resume must be genuinely eligible
+        cfg = _make_transcript(tmp_path, 'uuid-ts-ok')
+        await _drive_session_slot(
+            harness, 'ts-ok', self._fresh_session('uuid-ts-ok'), config_dir=cfg,
+        )
+
+        assert harness._session_resume_fallback_streak == 0
+        assert harness._last_session_resume_fallback_at is None
+
     async def test_no_escalation_queue_never_raises(self, harness: Harness):
         """A bare harness (no escalation queue) must never raise on a fallback
         that would otherwise trip the storm filer (fail-safe totality, I3).
         """
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
         harness._escalation_queue = None
+        self._arm_synthetic_feeder(harness)
 
-        # threshold=1 → the very first fallback trips the filer, which must
-        # early-return on the absent queue rather than raising.
-        await _drive_session_slot(harness, 'x1', self._stale_session('uuid-x1'))
+        # threshold=1 → the very first genuine fallback trips the filer, which
+        # must early-return on the absent queue rather than raising.
+        await _drive_session_slot(harness, 'x1', self._fresh_session('uuid-x1'))
+
+
+@pytest.mark.asyncio
+class TestMarkInProgressDoneRecoveryStateCleanup:
+    """_mark_in_progress_done must drop ALL THREE parallel recovery stashes for
+    the task it terminates, not just two of them (task 3256).
+
+    Why this matters now: ``_recovered_session_config_dirs`` was left behind
+    while ``_recovered_plans`` / ``_recovered_sessions`` were popped. BEFORE the
+    'reseeded' split that orphan was at worst a harmless mis-corroboration that
+    still emitted a LOUD fallback. AFTER it, a stale stash pointing at a
+    long-deleted path classifies as ``reason='reseeded'`` and is SILENTLY
+    suppressed — the leak turns from benign into a silent-degradation path,
+    against the repo's loud-over-silent / no-silent-fail-soft invariants. So
+    closing it is a correctness PRECONDITION for the downgrade being sound.
+    """
+
+    async def test_mark_in_progress_done_clears_recovered_session_config_dir(
+        self, harness: Harness, tmp_path: Path
+    ):
+        tid = '9256'
+        harness._recovered_plans[tid] = _make_plan(3, 5, tid)
+        harness._recovered_sessions[tid] = {
+            'session_id': 'uuid-leak', 'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0,
+        }
+        harness._recovered_session_config_dirs[tid] = str(
+            tmp_path / 'long-deleted' / 'claude-config-x'
+        )
+
+        harness.scheduler.mark_done = AsyncMock()
+        harness.git_ops.release_lane_for_terminal_task = AsyncMock()
+        # Resolve to a path that does NOT exist, so the cleanup_worktree branch
+        # is skipped and this stays a pure recovery-state assertion.
+        harness._resolve_task_worktree = MagicMock(return_value=tmp_path / 'nope')
+
+        marked = await harness._mark_in_progress_done(
+            tid, sha='deadbeef', note='test-leak', reason='found-on-main',
+        )
+
+        assert marked is True
+        harness.scheduler.mark_done.assert_awaited_once()
+        assert tid not in harness._recovered_plans
+        assert tid not in harness._recovered_sessions
+        assert tid not in harness._recovered_session_config_dirs, (
+            'the config-dir stash must be dropped in lockstep with its session '
+            "— a surviving orphan would later classify as 'reseeded' and be "
+            'silently suppressed instead of surfacing'
+        )
 
 
 class TestCrashRecoveryPromptNote:
@@ -2128,3 +3308,525 @@ class TestCrashRecoveryPromptNote:
         )
         assert seen['prompt'] == real
         assert seen['prompt'] != CRASH_RECOVERY_RESUME_PROMPT
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksC2Namespace:
+    """C2 namespace invariant in _recover_crashed_tasks (task 2925, beta).
+
+    PRD: docs/prds/merge-worktree-lifecycle-integrity.md §4 Contract C2.
+
+    The crash-recovery sweep must classify each non-lane worktree_base entry
+    by the positive-match namespace rule (classify_worktree_entry) BEFORE the
+    no-plan cleanup heuristic: `_merge-*` is REPORTED to the merge reaper
+    (never removed by the sweep — the 2026-07-22 task/5326 incident, where a
+    persistent `_merge-verify` with a LIVE verify lease was force-removed 21s
+    after a verify was dispatched into it), every other `_`/`.`-prefixed
+    entry is left to its owner, and only a task-id-shaped entry is subject to
+    the existing plan.json/cleanup logic.
+    """
+
+    async def test_infra_and_merge_survive_sweep_only_task_shaped_cleaned(
+        self, harness: Harness, caplog,
+    ):
+        base = harness.git_ops.worktree_base
+
+        # ── Merge band: plant `_merge-verify` (persistent) + `_merge-<uuid>`
+        # each with a LIVE merge-verify lease, faithfully replaying the 5326
+        # timing (a verify holds the lease while the sweep runs). C2 skips
+        # them by NAME, but the live lease future-proofs against any impl
+        # that also consults the lease.
+        merge_verify = base / '_merge-verify'
+        merge_verify.mkdir()
+        merge_uuid = base / '_merge-ba97f10a'
+        merge_uuid.mkdir()
+
+        # ── Infra band: plain infra dirs the sweep must leave to their owner.
+        # `.lane-state`/`.task-meta` are the durable-state dirs whose former
+        # dedicated per-name skip is now SUBSUMED by C2's `.`-prefix rule —
+        # planted here as the regression guard for that removal.
+        infra_dirs = {
+            name: (base / name)
+            for name in (
+                '.reseed-trash', '_mainprobe-x', '.lane-state',
+                '.task-meta', '_offline-deep',
+            )
+        }
+        for d in infra_dirs.values():
+            d.mkdir()
+
+        # ── Task band (positive control): a task-id-shaped PLANLESS dir must
+        # still be cleaned. An inert sweep that skips everything fails HERE.
+        wt_task = base / '999'
+        wt_task.mkdir()
+
+        fd_verify = acquire_merge_verify_flock(lane_lock_path(merge_verify), 5.0)
+        fd_uuid = acquire_merge_verify_flock(lane_lock_path(merge_uuid), 5.0)
+        assert fd_verify is not None and fd_uuid is not None, (
+            'test setup: must be able to acquire both merge-verify leases'
+        )
+        write_lock_holder_pgid(base, os.getpgrp())
+        try:
+            with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+                await harness._recover_crashed_tasks()
+        finally:
+            release_merge_verify_flock(fd_verify)
+            release_merge_verify_flock(fd_uuid)
+            remove_lock_holder_pgid(base)
+
+        # Positive control: the task-shaped planless dir WAS cleaned — and it
+        # is the ONLY cleanup_worktree call (any infra/merge cleanup would
+        # push the count past one, the 5326 "Cleaned up worktree _merge-verify"
+        # regression).
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt_task, '999')  # type: ignore[attr-defined]
+
+        # Explicit regression guard on the cleaned set: no merge/infra path.
+        cleaned_paths = {
+            c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+        }
+        protected = {merge_verify, merge_uuid, *infra_dirs.values()}
+        assert cleaned_paths.isdisjoint(protected), (
+            f'C2 violated — sweep cleaned protected entries: '
+            f'{cleaned_paths & protected}'
+        )
+        # All merge/infra dirs still on disk.
+        for d in protected:
+            assert d.exists(), f'{d.name} must survive the recovery sweep'
+
+        # Skip disposition OBSERVED (not silence): every protected entry is
+        # named in an explicit INFO record, per PRD §1 (operators must see a
+        # skip/report line instead of the 5326 "Cleaned up worktree
+        # _merge-verify" signature). We assert the STABLE structured signal —
+        # an INFO record mentions the entry name — NOT the exact human-facing
+        # prose of the disposition lines, which may be reworded without any
+        # change to the disposition. (The classifier's task/merge/infra
+        # verdict is unit-pinned in test_worktree_namespace_c2.py.)
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.INFO
+        ]
+        for name in ('_merge-verify', '_merge-ba97f10a', '_mainprobe-x',
+                     '_offline-deep', '.reseed-trash', '.lane-state',
+                     '.task-meta'):
+            assert any(name in m for m in info_messages), (
+                f'missing explicit skip/report line naming {name}'
+            )
+
+
+# ── archive_available instrumentation helpers (task 3727) ────────────────────
+# A lane-encoded project dir DELIBERATELY unlike any config dir these tests
+# build, so a passing lookup proves the encoded-cwd component was globbed
+# rather than reconstructed from the caller's own cwd (I-B).
+_ARCHIVE_ENC = '-home-leo-src-dark-factory--worktrees-9999'
+
+
+def _make_archive(project_root: Path, task_id: str, session_id: str) -> Path:
+    """Lay down one archived transcript at the real producer layout.
+
+    ``<project_root>/<TranscriptArchiveConfig.root>/<task_id>/<enc>/
+    <session_id>.jsonl.gz`` — the path shared.transcript_archive._archive_one
+    writes and durable_archive_path globs.
+
+    The root is READ OFF the config default rather than hardcoded: a change to
+    ``TranscriptArchiveConfig.root`` would otherwise silently desynchronise
+    this helper from the lookup under test, and every row here would fail as a
+    baffling ``archive_available is False`` instead of at the seam that moved.
+    """
+    dest = (
+        project_root
+        / TranscriptArchiveConfig().root
+        / task_id
+        / _ARCHIVE_ENC
+        / f'{session_id}.jsonl.gz'
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b'archived-transcript-bytes')
+    return dest
+
+
+@pytest.mark.asyncio
+class TestSessionResumeArchiveAvailable:
+    """archive_available on session_resume_fallback (task 3727, PRD §8).
+
+    Every fallback emit reports whether that session was actually RECOVERABLE
+    from the durable transcript archive — the measurement task 3619 will move
+    and leaf δ may later gate on. It is instrumentation ONLY (D8 / INV-3
+    instrument-before-acting): it must never change what dispatches, so every
+    assertion here also pins that the reasons, the resume decision and the
+    storm streak are exactly what they would be without the field. (Task 3728
+    later reclassified which reasons FEED that streak; the point these rows
+    make — that the instrument itself moves nothing — is unaffected.)
+    """
+
+    async def test_no_transcript_reports_archive_present(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Archive PRESENT under a foreign lane → archive_available is True.
+
+        The recoverable population: the transcript is gone from the live
+        config dir but survives in the durable archive, under an encoded-cwd
+        dir belonging to no lane this test uses.
+        """
+        session = {
+            'session_id': 'uuid-arch-yes',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-yes'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar1', 'uuid-arch-yes')
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar1', session, config_dir=empty_cfg
+        )
+
+        # D8: the resume decision and the reason are untouched.
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript']
+        # `is True`, not truthy: the field must be a real JSON bool for
+        # json_extract(data, '$.archive_available') to be queryable in runs.db.
+        assert kwargs['data']['archive_available'] is True
+        # D8: the instrument still perturbs NOTHING — asserted here because the
+        # streak is the one piece of guard state a filesystem-touching
+        # instrument could plausibly disturb. The expected value is 0 rather
+        # than 1 since task 3728 carved 'no_transcript' (and every other
+        # by-design reason) out of the feeder; α's field is unchanged either
+        # way, which is exactly what this row exists to show.
+        assert harness._session_resume_fallback_streak == 0
+
+    async def test_no_transcript_reports_archive_absent(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Empty archive root → archive_available is False."""
+        session = {
+            'session_id': 'uuid-arch-no',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-no'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar2', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript']
+        assert kwargs['data']['archive_available'] is False
+        assert harness._session_resume_fallback_streak == 0  # by design (3728)
+
+    async def test_stale_also_carries_the_field(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """reason == 'stale' carries it too — it rides the BRANCH, not one reason."""
+        real = SessionResumeConfig()
+        stale_at = datetime.now(UTC) - timedelta(seconds=2 * real.freshness_window_secs)
+        session = {
+            'session_id': 'uuid-arch-stale',
+            'role': 'implementer',
+            'started_at': stale_at.isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-arch-stale')
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar3', 'uuid-arch-stale')
+
+        resume_id = await _drive_session_slot(harness, 'ar3', session, config_dir=cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['stale']
+        assert kwargs['data']['archive_available'] is True
+        assert harness._session_resume_fallback_streak == 0  # by design (3728)
+
+    async def test_reseeded_also_carries_the_field(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The OTHER fallback emit carries it too (task 3256 split it in two).
+
+        This is the branch where the field matters MOST: a reseeded lane is
+        precisely the population task 3619 will move, so it has to be
+        measurable from day one. Wiring only one of the two emit sites would
+        half-ship the signal AND bias it.
+        """
+        session = {
+            'session_id': 'uuid-arch-reseed',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        gone = tmp_path / 'gone-arch' / 'claude-config-x'
+        assert not gone.exists()  # the reseed already swept the lane
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar4', 'uuid-arch-reseed')
+
+        resume_id = await _drive_session_slot(harness, 'ar4', session, config_dir=gone)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['reseeded']
+        assert kwargs['data']['archive_available'] is True
+        # D8: 'reseeded' still does NOT feed the storm streak.
+        assert harness._session_resume_fallback_streak == 0
+
+    async def test_reseeded_reports_absent_archive(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Same branch, empty archive root → False."""
+        session = {
+            'session_id': 'uuid-arch-reseed-no',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        gone = tmp_path / 'gone-arch-no' / 'claude-config-x'
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(harness, 'ar5', session, config_dir=gone)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['reseeded']
+        assert kwargs['data']['archive_available'] is False
+
+    async def test_unconfigured_transcript_archive_degrades_to_false(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """FAIL-SAFE: a config regression must not become a dispatch fault.
+
+        ``transcript_archive`` is left as the bare spec_set MagicMock the
+        conftest fixture yields (it never assigns the field). _run_slot must
+        still complete, the fallback must still be emitted with its correct
+        reason, and the instrument must read False — never propagate.
+
+        MECHANISM, measured rather than assumed (and NOT the one the original
+        plan rationale asserted): ``project_root / <MagicMock>.root`` does not
+        raise. ``MagicMock`` implements ``__fspath__``, so the composition
+        succeeds into a nonsense-but-well-formed path
+        (``<project_root>/MagicMock/mock.root/<id>``) that simply matches
+        nothing, and the lookup returns None. The genuinely-raising composition
+        is pinned separately by the ``project_root = None`` rows in
+        :meth:`test_archive_available_is_total_against_broken_config` and
+        :meth:`test_instrument_fault_is_reported_loudly_exactly_once`. Both
+        routes have to land on False, which is what this row and those rows
+        together establish.
+        """
+        session = {
+            'session_id': 'uuid-arch-mock',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-mock'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        # DELIBERATELY not assigning harness.config.transcript_archive.
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar6', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript']
+        assert kwargs['data']['archive_available'] is False
+
+    async def test_archive_available_is_total_against_broken_config(
+        self, harness: Harness
+    ):
+        """The helper itself is total, called directly, on a broken config."""
+        # Bare conftest MagicMock for transcript_archive: composes (MagicMock is
+        # os.PathLike) into a path that matches nothing — no raise, still False.
+        assert harness._archive_available('42', 'sid') is False
+
+        # project_root = None: the composition itself raises TypeError. THIS is
+        # the row that exercises the guard, not the MagicMock one above.
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        harness.config.project_root = None  # type: ignore[assignment]
+        assert harness._archive_available('42', 'sid') is False
+
+    async def test_instrument_fault_is_reported_loudly_exactly_once(
+        self, harness: Harness, caplog
+    ):
+        """A faulted instrument must not be indistinguishable from an empty archive.
+
+        False-on-fault is the right DISPATCH behaviour, but reporting it
+        silently is the silent degradation INV-2/INV-4 forbid: "no archive" and
+        "the lookup is broken" would both read ``archive_available: false``, so
+        a config regression would render the measurement this task exists to
+        produce as a confident "0% recoverable" with nothing above DEBUG
+        dissenting — on the very signal task 3619 is judged by.
+
+        The faults reaching this handler are the ones durable_archive_path
+        CANNOT log (it logs its own at WARNING): they fail before the lookup, in
+        the archive-root composition, and are persistent rather than transient.
+        Hence loud, and hence rate-limited to once per process — a persistent
+        fault fires on every dispatch, and a fallback storm must not become a
+        log flood.
+        """
+        # A project_root the composition genuinely cannot divide. MEASURED, not
+        # assumed: the bare conftest MagicMock does NOT fault here (see
+        # test_unconfigured_transcript_archive_degrades_to_false), so using it
+        # would make this test vacuous.
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        harness.config.project_root = None  # type: ignore[assignment]
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'):
+            assert harness._archive_available('42', 'sid-1') is False
+            assert harness._archive_available('42', 'sid-2') is False
+            assert harness._archive_available('42', 'sid-3') is False
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'archive_available' in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f'expected exactly one WARNING across 3 faults, got {len(warnings)}'
+        )
+        # It has to be actionable on its own: name the field so an operator
+        # greps it, and say the reported rate is not to be trusted.
+        msg = warnings[0].getMessage()
+        assert 'archive_available' in msg
+        assert 'sid-1' in msg  # the FIRST fault is the one that speaks
+        assert warnings[0].exc_info is not None  # the traceback is retained
+
+        # The suppressed repeats are still recoverable at DEBUG, not dropped.
+        debugs = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG and 'archive_available' in r.getMessage()
+        ]
+        assert len(debugs) == 2
+
+    async def test_disabled_archival_still_reports_an_existing_archive(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The FILESYSTEM is the source of truth, not ``transcript_archive.enabled``.
+
+        Pins the docstring's explicit design decision, which nothing else
+        covered: adding an ``if not ...enabled: return False`` short-circuit
+        looks like a free optimisation and would still leave the whole suite
+        green, while silently inverting the contract. Turning archival OFF
+        today does not un-archive what was written while it was ON, and those
+        sessions are exactly the recoverable population this instrument exists
+        to count — a config-derived answer would bias the measurement toward
+        "nothing is recoverable" and mislead an operator triaging the storm L1.
+        """
+        session = {
+            'session_id': 'uuid-arch-disabled',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-disabled'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig(enabled=False)
+        _make_archive(harness.config.project_root, 'ar11', 'uuid-arch-disabled')
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar11', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript']
+        assert kwargs['data']['archive_available'] is True
+
+    async def test_null_session_id_reports_false_without_raising(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A recovered session with no session_id still emits, reporting False."""
+        session = {
+            'session_id': None,
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-unrelated')
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(harness, 'ar7', session, config_dir=cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript']
+        assert kwargs['data']['archive_available'] is False
+
+    async def test_eligible_and_capped_events_do_not_carry_the_field(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """D8 blast radius: the instrument went onto EXACTLY one event.
+
+        event_store.py's documented ratio recipe reads attempts as the sum of
+        the three outcome events; session_resume and session_resume_capped
+        must stay byte-identical so that denominator keeps its meaning — and
+        so neither path pays for a filesystem glob it does not use.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        # Eligible → session_resume.
+        elig = {
+            'session_id': 'uuid-arch-elig',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-arch-elig')
+        _make_archive(harness.config.project_root, 'ar8', 'uuid-arch-elig')
+        assert await _drive_session_slot(harness, 'ar8', elig, config_dir=cfg) is elig
+
+        # Capped → session_resume_capped.
+        real = SessionResumeConfig()
+        capped = {
+            'session_id': 'uuid-arch-capped',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': real.max_resumes_per_task,
+        }
+        cfg2 = _make_transcript(tmp_path, 'uuid-arch-capped')
+        _make_archive(harness.config.project_root, 'ar9', 'uuid-arch-capped')
+        assert await _drive_session_slot(harness, 'ar9', capped, config_dir=cfg2) is None
+
+        emits = _session_resume_emits(harness)
+        assert [et for et, _ in emits] == [
+            EventType.session_resume,
+            EventType.session_resume_capped,
+        ]
+        for _et, kwargs in emits:
+            assert 'archive_available' not in kwargs['data']

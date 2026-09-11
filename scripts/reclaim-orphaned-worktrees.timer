@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly timer for the .worktrees-orphaned/ parking reclaim sweep (task 2980)
+
+[Timer]
+# Nightly at 04:00 local time (offset from the flag-marker sweep's 03:30 so the
+# two nightly maintenance jobs don't contend); Persistent=true catches up a
+# missed night (laptop asleep/offline at 04:00) on next boot/login instead of
+# silently skipping it. A small randomized delay avoids thundering-herd with
+# other timers firing at the same instant.
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

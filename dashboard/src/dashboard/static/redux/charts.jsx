@@ -2,12 +2,45 @@
 
 const { useRef, useEffect, useState, useMemo } = React;
 
+// The scale+path math for every chart primitive here lives in the plain-JS
+// sibling /static/redux/spark_path.js, where it is behaviourally testable under
+// `node --test` (dashboard/tests/js/spark_path.test.mjs) — this file is JSX
+// behind CDN Babel with no node_modules, so nothing in it can be executed by a
+// test. spark_path.js is also what makes a MISSING sample stay missing instead
+// of being drawn as a measured zero: the two sparklines since task 3436, and
+// LineChart/StackedAreaChart/BarChart/HistBar since task 3489.
+//
+// Destructured, with no `|| {}` fallback, deliberately: if spark_path.js is
+// missing or 404s this throws at load with a clear message, rather than
+// deferring to a TypeError inside a render or silently degrading into charts
+// that draw nothing. Matches the DF_GRAPH_LAYOUT / DF_RUNTIME_FMT precedent.
+// index.html loads that classic script before this file; test_index_html.py
+// pins both the load order and that it is actually served — and the shared
+// `?v=` cache-buster is bumped whenever this destructure reaches for a name a
+// cached copy of spark_path.js would not have.
+const {
+  sparkPaths: sparkSmoothPaths,
+  stepPaths: sparkStepPaths,
+  plottableMax,
+  axisY,
+  formatCountTick,
+  axisPaths,
+  barFractions,
+  stackedAreaPaths,
+} = window.DF_SPARK_PATH;
+
 const PALETTE = {
   accent:  'oklch(0.72 0.14 230)',
   accent2: 'oklch(0.62 0.12 200)',
   ok:      'oklch(0.74 0.14 155)',
   warn:    'oklch(0.80 0.14 80)',
   bad:     'oklch(0.68 0.18 25)',
+  // In-progress work with no live claimant. Named rather than inlined so the
+  // burndown stack and its legend cannot drift apart. Magenta because the
+  // band sits between `accent` (live, 230) and `bad` (blocked, 25) in the
+  // status-mix stack: reusing either would make the split unreadable, and a
+  // strand is a different failure from a block, not a worse one.
+  stranded: 'oklch(0.66 0.19 330)',
   info:    'oklch(0.62 0.20 305)',
   fg2:     'oklch(0.66 0.012 250)',
   fg3:     'oklch(0.50 0.012 250)',
@@ -41,21 +74,15 @@ const PALETTE = {
 
 function Sparkline({ values, width = 100, height = 28, area = true, color = PALETTE.accent, strokeWidth = 1.5 }) {
   if (!values || values.length === 0) return null;
-  const max = Math.max(...values, 1);
-  const min = Math.min(...values, 0);
-  const range = max - min || 1;
-  const stepX = width / Math.max(values.length - 1, 1);
-  const points = values.map((v, i) => {
-    const x = i * stepX;
-    const y = height - ((v - min) / range) * height;
-    return [x, y];
-  });
-  const linePath = points.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ');
-  const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  const { line, area: areaPath } = sparkSmoothPaths(values, width, height);
+  // No plottable samples at all (an all-hole series) — draw NOTHING rather
+  // than a flat line along the chart floor, which would assert measurements
+  // that were never taken.
+  if (!line) return null;
   return (
     <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ width: '100%', height: '100%', display: 'block' }}>
-      {area && <path d={areaPath} fill={color} fillOpacity={0.15} />}
-      <path d={linePath} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
+      {area && areaPath && <path d={areaPath} fill={color} fillOpacity={0.15} />}
+      <path d={line} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
     </svg>
   );
 }
@@ -65,39 +92,38 @@ function Sparkline({ values, width = 100, height = 28, area = true, color = PALE
 // state transitions are visible as sharp steps rather than smoothed lines.
 function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, strokeWidth = 1.5, area = false }) {
   if (!values || values.length === 0) return null;
-  const max = Math.max(...values, 1);
-  const min = Math.min(...values, 0);
-  const range = max - min || 1;
-  const stepX = width / Math.max(values.length - 1, 1);
-  const points = values.map((v, i) => {
-    const x = i * stepX;
-    const y = height - ((v - min) / range) * height;
-    return [x, y];
-  });
-  // Build horizontal-then-vertical path: move to each x at the PREVIOUS y,
-  // then drop/rise to the new y — this creates sharp step edges.
-  const parts = [`M${points[0][0]},${points[0][1]}`];
-  if (points.length === 1) {
-    // Single data point: draw a full-width horizontal tick so something is visible.
-    // Without this, the path contains only a Move command and renders nothing.
-    parts.push(`L${width},${points[0][1]}`);
-  }
-  for (let i = 1; i < points.length; i++) {
-    // Horizontal segment to the new x, keeping old y
-    parts.push(`L${points[i][0]},${points[i - 1][1]}`);
-    // Vertical segment to the new y
-    parts.push(`L${points[i][0]},${points[i][1]}`);
-  }
-  const linePath = parts.join(' ');
-  const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  // The horizontal-then-vertical edge construction — and the single-data-point
+  // full-width tick, which exists because a path holding only a Move command
+  // renders nothing — now live in spark_path.js, reproduced there exactly.
+  const { line, area: areaPath } = sparkStepPaths(values, width, height);
+  if (!line) return null;
   return (
     <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ width: '100%', height: '100%', display: 'block' }}>
-      {area && <path d={areaPath} fill={color} fillOpacity={0.15} />}
-      <path d={linePath} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="square" />
+      {area && areaPath && <path d={areaPath} fill={color} fillOpacity={0.15} />}
+      <path d={line} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="square" />
     </svg>
   );
 }
 
+// NOTE — this formatY default deliberately does NOT round, while
+// StackedAreaChart's below does. Both hand formatY the RAW tick; only the
+// DEFAULTS differ, and that asymmetry is now a decision on the record rather
+// than an accident.
+//
+// Task 4232 ran the caller audit task 4059 deferred. Eight call sites; four
+// pass no formatY and rely on this default. THREE of those are integer counts
+// (memory reads/writes per hour, merge attempts per 15-minute bucket,
+// escalation re-filings per day) — but the FOURTH,
+// tab_escalation_analytics.jsx's escalations-per-done chart, plots
+// `filings / done` (escalation_analytics.py::_esc_per_done), a genuine
+// fraction. Rounding by default would collapse that ratio axis exactly the way
+// pre-4059 pre-rounding collapsed WorkflowPanel's 100%-normalized stack — i.e.
+// it would re-file its own predecessor's defect one primitive over.
+//
+// So the default stays `(v) => String(v)`, and the three count callers opt in
+// explicitly with `formatY={formatCountTick}` (spark_path.js, where its
+// blank-don't-round rule is behaviourally tested). Do not "align" these two
+// defaults without redoing that audit.
 function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -111,18 +137,43 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
   const all = series.flatMap(s => s.values);
-  const maxV = Math.max(...all, 1);
+  // Hole-excluding fold (task 3489): one undefined/NaN sample used to poison
+  // maxV to NaN, `range = NaN - NaN || 1` silently fell back to 1, and every y
+  // became NaN — a single NaN token invalidates the whole `d` attribute, so SVG
+  // dropped the ENTIRE path. The `1` seed is preserved deliberately, as is
+  // minV = 0: switching to a `Math.min(...)` fold would newly bring negative
+  // samples in-range and silently re-frame every LineChart on the dashboard.
+  // This is a null-handling fix, not a re-scaling.
+  const maxV = plottableMax(all, 1);
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
-  const stepX = chartW / Math.max(n - 1, 1);
+  // The plot box every value is scaled into. `count` is the LABEL count, so a
+  // series shorter than the label row stops at its own last x rather than being
+  // stretched across the full width.
+  const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n, min: minV, range };
+  // One subpath per run of consecutive real samples, so the line is genuinely
+  // discontinuous across a hole and no fill is painted under a slot that holds
+  // no measurement (the pre-fix area closed at the full chart width regardless).
+  //
+  // Built HERE rather than inline in the series map so the LABEL ROW below can
+  // take its x from the same call that positions the marks. A second copy of
+  // `chartW / Math.max(n - 1, 1)` at the call site would silently desynchronise
+  // the labels from the marks the first time the x-mapping changes, and a chart
+  // whose labels no longer line up with its marks renders as a plausible chart
+  // rather than an error.
+  const built = series.map(s => axisPaths(s.values, geom));
+  // The axes and label row render even with no series at all (an empty frame
+  // reads as "no data in this window"), so the x-mapping is taken from a builder
+  // call either way — never recomputed here.
+  const { stepX } = built[0] ?? axisPaths([], geom);
   const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
   return (
     <div ref={ref} style={{ width: '100%', height }}>
       <svg viewBox={`0 0 ${w} ${height}`} style={{ width: '100%', height: '100%', display: 'block' }}>
         {yTicks.map((t, i) => {
-          const y = padT + chartH - ((t - minV) / range) * chartH;
+          const y = axisY(t, geom);
           return (
             <g key={i}>
               <line x1={padL} y1={y} x2={padL + chartW} y2={y} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
@@ -139,17 +190,17 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
         })}
         {series.map((s, si) => {
           const color = s.color || PALETTE.accent;
-          const pts = s.values.map((v, i) => {
-            const x = padL + i * stepX;
-            const y = padT + chartH - ((v - minV) / range) * chartH;
-            return [x, y];
-          });
-          const linePath = pts.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ');
-          const areaPath = `${linePath} L${padL + chartW},${padT + chartH} L${padL},${padT + chartH} Z`;
+          const { line, area } = built[si];
+          // Skips THIS SERIES only, when it has no plottable sample at all.
+          // The axes, gridlines and tick labels below are structural facts
+          // about the requested window rather than measurements, so they keep
+          // rendering — an empty frame reads as "no data in this window",
+          // where no chart at all reads as "nothing was asked for".
+          if (!line) return null;
           return (
             <g key={si}>
-              {s.fill !== false && <path d={areaPath} fill={color} fillOpacity={0.10} />}
-              <path d={linePath} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
+              {s.fill !== false && area && <path d={area} fill={color} fillOpacity={0.10} />}
+              <path d={line} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
             </g>
           );
         })}
@@ -158,7 +209,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   );
 }
 
-function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(v), formatX = v => v }) {
+function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v }) {
   // stacks: [{ key, color, values }]
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -171,44 +222,61 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
   const n = labels.length;
-  const stepX = chartW / Math.max(n - 1, 1);
-  const totals = labels.map((_, i) => stacks.reduce((s, st) => s + (st.values[i] || 0), 0));
-  const maxV = Math.max(...totals, 1);
+  // One polygon per layer, plus the axis maximum they were all scaled against
+  // (task 3489). The column totals and both cumulative folds used to scrub
+  // every sample through `(st.values[i] || 0)`, which fabricated a zero-height
+  // band at a hole — indistinguishable from a measured zero — AND fed that
+  // hole-as-zero PARTIAL SUM to the axis maximum, understating the scale every
+  // other band was drawn against. The builder instead carries a hole as
+  // unknown: layer li is drawn at column i only if every layer BELOW it is
+  // measured there (its base is their sum), while the bands below keep drawing
+  // truthfully.
+  //
+  // `stepX` comes back from the builder rather than being recomputed for the
+  // label row: one x-mapping, so the labels can never drift out of line with
+  // the bands they name.
+  const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n };
+  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom);
 
-  // build cumulative stacks
-  const cumLayers = stacks.map((_, li) =>
-    labels.map((_, i) => stacks.slice(0, li + 1).reduce((s, st) => s + (st.values[i] || 0), 0))
-  );
-  const baseLayers = stacks.map((_, li) =>
-    labels.map((_, i) => stacks.slice(0, li).reduce((s, st) => s + (st.values[i] || 0), 0))
-  );
+  // The value axis the builder scaled every band against: 0..maxV.
+  const tickGeom = { y0: padT, height: chartH, min: 0, range: maxV };
 
-  const yToPx = v => padT + chartH - (v / maxV) * chartH;
-
+  // Each tick is handed to formatY RAW (fractional), because a caller's own
+  // formatter is the only thing that knows the axis UNITS. The Workflow panel
+  // (tab_escalation_analytics.jsx:494) plots a 100%-normalized stack and
+  // multiplies by 100, so pre-rounding the tick to an integer collapsed
+  // 0/0.25/0.5/0.75/1.0 to 0/0/1/1/1 and rendered "0% / 0% / 100% / 100% /
+  // 100%". The rounding is NOT deleted — it moved into the formatY default
+  // above, so the three callers that pass no formatter (tabs.jsx:1259,
+  // tabs.jsx:1329, tab_escalation_analytics.jsx:244) keep byte-identical
+  // integer count axes instead of gaining 2.5 / 7.5 labels. LineChart
+  // already passed the raw tick and is deliberately left alone (see the note
+  // at its signature: only the two formatY DEFAULTS differ).
   const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => (maxV * i) / ticks);
 
   return (
     <div ref={ref} style={{ width: '100%', height }}>
       <svg viewBox={`0 0 ${w} ${height}`} style={{ width: '100%', height: '100%', display: 'block' }}>
-        {yTicks.map((t, i) => (
-          <g key={i}>
-            <line x1={padL} y1={yToPx(t)} x2={padL + chartW} y2={yToPx(t)} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
-            <text x={padL - 6} y={yToPx(t) + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(Math.round(t))}</text>
-          </g>
-        ))}
+        {yTicks.map((t, i) => {
+          const y = axisY(t, tickGeom);
+          return (
+            <g key={i}>
+              <line x1={padL} y1={y} x2={padL + chartW} y2={y} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
+              <text x={padL - 6} y={y + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(t)}</text>
+            </g>
+          );
+        })}
         {labels.map((lab, i) => {
           if (n > 8 && i % Math.ceil(n / 6) !== 0 && i !== n - 1) return null;
           const x = padL + i * stepX;
           return <text key={i} x={x} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{formatX(lab)}</text>;
         })}
         {stacks.map((st, li) => {
-          const top = cumLayers[li];
-          const base = baseLayers[li];
-          const points = [];
-          for (let i = 0; i < n; i++) points.push([padL + i * stepX, yToPx(top[i])]);
-          for (let i = n - 1; i >= 0; i--) points.push([padL + i * stepX, yToPx(base[i])]);
-          const d = points.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ') + ' Z';
+          const d = paths[li];
+          // A layer with nothing plottable draws nothing — not a band pinned to
+          // the floor. The axes and tick labels above still render.
+          if (!d) return null;
           return <path key={st.key} d={d} fill={st.color} fillOpacity={0.85} stroke={st.color} strokeWidth={0.5} />;
         })}
       </svg>
@@ -227,7 +295,12 @@ function BarChart({ labels, values, height = 160, color = PALETTE.accent, format
   const padL = 30, padR = 8, padT = 8, padB = 22;
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
-  const max = Math.max(...values, 1);
+  // Hole-excluding fold, then one fraction per slot — `null` where there is no
+  // measurement (task 3489). Pre-fix, one undefined poisoned max to NaN and
+  // emitted height="NaN" on EVERY rect, and a null gave a zero-height bar
+  // indistinguishable from a measured zero. The `1` seed is preserved.
+  const max = plottableMax(values, 1);
+  const { fractions } = barFractions(values, max);
   const bw = chartW / values.length;
   return (
     <div ref={ref} style={{ width: '100%', height }}>
@@ -242,13 +315,19 @@ function BarChart({ labels, values, height = 160, color = PALETTE.accent, format
             </g>
           );
         })}
-        {values.map((v, i) => {
-          const h = (v / max) * chartH;
+        {fractions.map((f, i) => {
+          const h = f === null ? null : f * chartH;
           const x = padL + i * bw + 2;
-          const y = padT + chartH - h;
           return (
             <g key={i}>
-              <rect x={x} y={y} width={Math.max(bw - 4, 2)} height={h} fill={color} rx={2} />
+              {/* No measurement here -> NO rect at all, while the category
+                  label and the slot's x position stay. An absent bar in a
+                  labelled slot reads as "not measured"; a zero-height one
+                  reads as a measured zero, which is what the pre-fix code
+                  drew. A real 0 still gets its honest zero-height rect. */}
+              {h !== null && (
+                <rect x={x} y={padT + chartH - h} width={Math.max(bw - 4, 2)} height={h} fill={color} rx={2} />
+              )}
               <text x={padL + i * bw + bw / 2} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{labels[i]}</text>
             </g>
           );
@@ -260,24 +339,87 @@ function BarChart({ labels, values, height = 160, color = PALETTE.accent, format
 
 function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, formatVal = v => v, height }) {
   // rows: [{ label, total, ...segments? }]; segments: [{ key, color, label }]
-  const max = Math.max(...rows.map(r => r[valueKey]), 1);
+  //
+  // The only primitive here whose input is rows of OBJECTS, so the values are
+  // PROJECTED out from behind the valueKey indirection ONCE, above the map, and
+  // then handed to the same plottableMax + barFractions pair BarChart and
+  // HistBar already use — no key-projecting export of its own (task 3681).
+  //
+  // Pre-fix this folded `Math.max(...rows.map(r => r[valueKey]), 1)` over the
+  // RAW rows, so ONE row missing the key poisoned max to NaN and every row's
+  // width became "NaN%" — an invalid CSS length, so ALL the bars vanished
+  // silently, not just the missing one — and then scaled each row with
+  // `(r[valueKey] / max) * 100`, which rendered a null as a zero-width bar
+  // indistinguishable from a measured zero.
+  //
+  // The `1` seed is preserved verbatim from that fold: this is a null-handling
+  // fix, not a re-scaling, exactly as LineChart/BarChart record for their seeds.
+  const values = rows.map(r => r[valueKey]);
+  const max = plottableMax(values, 1);
+  const { fractions } = barFractions(values, max);
+
+  // ONE hole decision per row: the value text and the bar both branch on the
+  // SAME barFractions null, so they can never disagree about whether the row
+  // was measured — a divergence would render as a plausible chart rather than
+  // as an error.
+  //
+  // What is load-bearing is not the placeholder but that `formatVal` is never
+  // INVOKED on a hole. This component's contract PERMITS a row that lacks the
+  // key — it reads rows through a caller-supplied `valueKey` and cannot know
+  // which keys a caller's rows carry — and both live call sites pass
+  // ``v => `$${v.toFixed(2)}``` (tabs.jsx), which throws on a missing value,
+  // during render, so React drops the whole Costs tab rather than one bar.
+  // No payload does that TODAY: redux_api.py's shape_costs builds every
+  // by_project/by_role row with an explicit `total`. So this hardens an input
+  // the contract allows, rather than fixing an observed outage — the reason a
+  // throw is worth guarding anyway is that a blank bar degrades and a throw
+  // does not.
+  //
+  // Branching on the fraction is EXACT, not approximate: `max` is
+  // `plottableMax(values, 1)`, always finite and >= 1, so barFractions'
+  // degenerate-max path is unreachable from here and `fraction === null` is
+  // precisely `!isPlottable(r[valueKey])`. That is why the decision needs no
+  // `isPlottable` — a name the DF_SPARK_PATH destructure above does not bind,
+  // and binding it would force an index.html cache-buster bump.
+  //
+  // Closes over `formatVal` rather than taking it as an argument: it is in
+  // lexical scope at both call sites, and one formatter per component is part
+  // of what keeps those two sites structurally identical.
+  const valueText = (fraction, value) => (fraction === null ? '—' : formatVal(value));
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       {rows.map((r, i) => {
-        const w = (r[valueKey] / max) * 100;
+        const f = fractions[i];
         if (segments) {
-          let cum = 0;
+          // Each segment scaled against the SAME max, through the same helper,
+          // so a key the payload never asserted a value for stays MISSING
+          // instead of being scrubbed to a measured zero by `(r[s.key] || 0)` —
+          // the last hole-as-zero scrub in this file, and character-for-
+          // character the one banned for StackedAreaChart. The live case is
+          // real: tabs.jsx unions model keys across all rows, so a project that
+          // never used a model simply lacks that key.
+          const segFractions = barFractions(segments.map(s => r[s.key]), max).fractions;
           return (
             <div key={i}>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
                 <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
-                <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+                <span className="mono" style={{ color: 'var(--fg-2)' }}>{valueText(f, r[valueKey])}</span>
               </div>
               <div style={{ display: 'flex', height: 14, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
-                {segments.map(s => {
-                  const segW = ((r[s.key] || 0) / max) * 100;
-                  cum += segW;
-                  return <div key={s.key} title={`${s.label}: ${formatVal(r[s.key] || 0)}`} style={{ width: `${segW}%`, background: s.color }} />;
+                {segments.map((s, si) => {
+                  const sf = segFractions[si];
+                  // No measurement for this key -> no <div> at all. A rendering
+                  // no-op today (a 0%-width div is invisible and has no hover
+                  // target); what it removes is the scrub.
+                  //
+                  // The tooltip goes through the same guard as the value cell.
+                  // On this branch `sf` cannot be null — a holed segment never
+                  // gets here — so what this buys is the two formatVal call
+                  // sites staying structurally IDENTICAL: that is what stops
+                  // the raw call being reintroduced here by the next edit.
+                  return sf === null ? null : (
+                    <div key={s.key} title={`${s.label}: ${valueText(sf, r[s.key])}`} style={{ width: `${sf * 100}%`, background: s.color }} />
+                  );
                 })}
               </div>
             </div>
@@ -287,10 +429,16 @@ function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, for
           <div key={i}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
               <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
-              <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+              <span className="mono" style={{ color: 'var(--fg-2)' }}>{valueText(f, r[valueKey])}</span>
             </div>
             <div style={{ height: 6, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
-              <div style={{ width: `${w}%`, height: '100%', background: PALETTE.accent }} />
+              {/* No measurement here -> NO fill div, while the row keeps its
+                  label, its value cell and its background track. An absent bar
+                  in a labelled row reads as "not measured"; a zero-width one
+                  reads as a measured zero, which is what the pre-fix code drew.
+                  A real 0 still gets its honest zero-width fill. Mirrors
+                  BarChart's absent-rect guard above. */}
+              {f !== null && <div style={{ width: `${f * 100}%`, height: '100%', background: PALETTE.accent }} />}
             </div>
           </div>
         );
@@ -359,11 +507,32 @@ function Heatmap({ rows, cols, getCell }) {
 }
 
 function HistBar({ values, maxOverride, height = 50, color = PALETTE.accent }) {
-  const max = maxOverride ?? Math.max(...values, 1);
+  // The `maxOverride ?? ...` precedence is preserved by passing whichever max
+  // wins through as barFractions' explicit argument, so the override and the
+  // derived-max paths run the same arithmetic (task 3489).
+  const max = maxOverride ?? plottableMax(values, 1);
+  const { fractions } = barFractions(values, max);
   return (
     <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height }}>
-      {values.map((v, i) => (
-        <div key={i} style={{ flex: 1, height: `${(v / max) * 100}%`, background: color, borderRadius: '2px 2px 0 0', minHeight: 1 }} />
+      {/* A hole keeps its flex slot — so the bars either side stay in their own
+          positions — but draws NOTHING: no height, no background, no floor.
+          The 1px floor used to apply to every slot, which turned a hole into a
+          visible stub: a fabricated measurement at a fixed size no data
+          produced.
+
+          It stays on the MEASURED branch, though, and that is deliberate. A
+          measured 0 renders `height: 0%`, which paints no pixels — so without a
+          floor a real zero and a hole would be indistinguishable again, the
+          exact conflation this component was fixed to end (and any sub-pixel
+          nonzero value would vanish with it). Floored, a measurement reads as a
+          drawn-but-empty bar and a hole as no bar at all. */}
+      {fractions.map((f, i) => (
+        <div
+          key={i}
+          style={f === null
+            ? { flex: 1 }
+            : { flex: 1, height: `${f * 100}%`, background: color, borderRadius: '2px 2px 0 0', minHeight: 1 }}
+        />
       ))}
     </div>
   );
@@ -415,4 +584,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };
+window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };

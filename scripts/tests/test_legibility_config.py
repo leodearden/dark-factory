@@ -18,9 +18,8 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
-
 from legibility import config as mod
+from pydantic import ValidationError
 
 MINIMAL_YAML = textwrap.dedent("""\
     project_id: dark_factory
@@ -109,6 +108,51 @@ class TestNestedDefaults:
         assert cfg.models.census_miner == 'sonnet'
         assert cfg.models.census_verify == 'sonnet'
         assert cfg.models.census_synthesis == 'fable'
+
+
+class TestTimeouts:
+    """The ``timeouts:`` block — per-census-stage claude-CLI subprocess
+    budgets (census_mining_secs / census_verify_secs / census_synthesis_secs).
+
+    An omitted block loads with all three defaults (120/900/1800), so an
+    existing legibility.yaml that predates this block keeps working
+    unchanged — the driving acceptance criterion of the fix that gave
+    verify/synthesis their own budgets after the shared 120s coder default
+    killed the first dark_factory census.
+    """
+
+    def test_timeouts_defaults_when_block_omitted_entirely(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert isinstance(cfg.timeouts, mod.Timeouts)
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_timeouts_defaults_when_block_present_but_empty(self, tmp_path):
+        text = MINIMAL_YAML + 'timeouts: {}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_partial_timeouts_block_keeps_other_defaults(self, tmp_path):
+        # Only census_verify_secs is overridden; mining and synthesis must
+        # still default rather than becoming required or vanishing.
+        text = MINIMAL_YAML + 'timeouts: {census_verify_secs: 1200}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_verify_secs == 1200
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_full_timeouts_override_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + (
+            'timeouts: {census_mining_secs: 60, census_verify_secs: 1200, '
+            'census_synthesis_secs: 2400}\n'
+        )
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_mining_secs == 60
+        assert cfg.timeouts.census_verify_secs == 1200
+        assert cfg.timeouts.census_synthesis_secs == 2400
 
 
 class TestFullConfigOverridesDefaults:
@@ -204,6 +248,109 @@ class TestMalformedConfigRaises:
             mod.load_config(_write(tmp_path, text))
 
 
+class TestProjectRootAbsoluteness:
+    """``project_root`` must be an absolute path — a relative value fails
+    loudly at ``load_config`` rather than letting each consumer resolve it
+    against its own process cwd (task 3702, reviewer suggestion #1 on task
+    3269's ambient-cwd fix)."""
+
+    def test_dot_project_root_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: .
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        # Matches on 'absolute' — the token that pins the *behavior* under
+        # test — not 'project_root', which pydantic prints in the error
+        # header for ANY project_root-level failure (missing field, wrong
+        # type, ...) and would pass even if this validator were replaced by
+        # an unrelated constraint on the same field.
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_relative_dotdot_project_root_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: ../foo
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_empty_string_project_root_raises(self, tmp_path):
+        # os.path.isabs('') is False — an accidentally-blanked required
+        # field is the likeliest real-world malformed value, so it must
+        # fail the same way as an explicit relative path rather than
+        # slipping through some falsy-value special case.
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: ''
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_tilde_project_root_raises(self, tmp_path):
+        # os.path.isabs('~/src/foo') is False — tilde expansion is NOT
+        # performed before the absoluteness check, so a tilde-prefixed
+        # value is rejected today. Pinned here as a deliberate decision
+        # rather than left as an untested accident.
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: ~/src/foo
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_absolute_project_root_still_loads(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert cfg.project_root == '/home/leo/src/dark-factory'
+
+
+class TestCwdPrefixesAbsoluteness:
+    """Every ``cwd_prefixes`` entry must be an absolute path too —
+    ``inventory.is_member()`` matches each prefix against an absolute
+    session cwd, so a relative entry never matches anything and the
+    sampler/census would silently enumerate an empty corpus rather than
+    failing at config-load time (task 3702 amendment, reviewer suggestion
+    #1: the same silent-degradation defect the project_root check above
+    was added to prevent). ``agent_transcript_roots`` is deliberately
+    project_root-relative and is exercised separately in
+    TestAgentTranscriptRoots — it must stay exempt from this check.
+    """
+
+    def test_single_relative_cwd_prefix_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes: [.]
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_one_relative_entry_among_absolute_ones_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes:
+              - /home/leo/src/dark-factory
+              - src/foo
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_absolute_cwd_prefixes_still_load(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert cfg.cwd_prefixes == ['/home/leo/src/dark-factory']
+
+
 class TestShippedDarkFactoryConfig:
     """The committed docs/legibility/legibility.yaml — dark_factory's own
     per-project §7.4 config — loads and validates through config.load_config.
@@ -236,6 +383,22 @@ class TestShippedDarkFactoryConfig:
         assert cfg.models.census_miner
         assert cfg.models.census_verify
         assert cfg.models.census_synthesis
+
+    def test_shipped_config_timeouts_set_live(self):
+        # The per-census-stage claude-CLI budgets are pinned EXPLICITLY in the
+        # shipped config, not merely riding the schema defaults, so a future
+        # change to Timeouts' defaults cannot silently alter dark_factory's
+        # census budgets. The raw-text assertion is load-bearing: the schema
+        # defaults happen to equal these values, so without an explicit
+        # ``timeouts:`` block the loaded-value asserts alone would pass on
+        # defaults — the text check is what pins the block's in-file presence.
+        raw = self.SHIPPED_CONFIG_PATH.read_text(encoding='utf-8')
+        assert 'timeouts:' in raw, 'shipped config must carry an explicit timeouts: block'
+
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
 
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):

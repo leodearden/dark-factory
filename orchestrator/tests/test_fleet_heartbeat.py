@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from orchestrator.fleet_heartbeat import (
     DEFAULT_FLEET_DIR,
     build_heartbeat_payload,
@@ -184,18 +186,174 @@ class TestWriteHeartbeat:
 
         assert result == tmp_path / 'orchestrator-reify.service.json'
 
-    def test_empty_unit_falls_back_to_deterministic_filename(self, tmp_path):
-        """unit='' never produces a file literally named '.json'; falls back deterministically."""
-        payload = build_heartbeat_payload(
-            unit='',
+
+class TestMalformedUnitIsRefused:
+    """A malformed unit name must never produce a heartbeat file (task 3951).
+
+    The unit-level half of one behaviour; the producer-level half is
+    ``test_harness_merge_heartbeat.py``'s ``test_empty_unit_writes_nothing_and_
+    is_logged_not_raised``.
+
+    ONE RULE, TWO REJECTIONS.  The unit name is the heartbeat's identity AND is
+    interpolated straight into the destination path, so it must be a non-blank,
+    single path component:
+
+    BLANK replaces the former ``unknown-unit.json`` fallback, which was written
+    to make an unresolved unit produce a deterministic filename rather than a
+    file literally named ``.json``.  That trade was wrong in the direction it
+    chose: nothing READS ``unknown-unit.json`` (``scripts/drain_check.py``
+    addresses heartbeats BY NAME via ``heartbeat_path(fleet_dir, unit)`` and
+    never enumerates the directory), so the fallback bought no consumer
+    anything while quietly turning "this writer has no unit name" — a real
+    misconfiguration — into a plausible-looking file in a machine-global,
+    cross-project directory.  Raising makes the next unnamed writer loud at the
+    moment it appears.
+
+    NOT-A-BARE-FILENAME is the same defect class one degree worse: the value
+    reaches this function from the ambient environment (measured during this
+    task as inherited, and sometimes wrong), and a ``..`` component or an
+    absolute path does not merely mislabel a file inside the fleet dir — it
+    writes clean outside it.
+
+    Matched on ``unit name``, deliberately NOT on ``ORCH_UNIT``:
+    ``write_heartbeat`` never reads that variable (its caller does), and this
+    module is the shared on-disk contract for future producers that may resolve
+    their unit from config instead.
+
+    Every case asserts the fleet dir was never CREATED, not merely left empty —
+    the guard has to run before ``safe_io.atomic_write_text(..., mkdir=True)``,
+    and directory-absence is the one assertion that catches a guard which moved
+    after it.  It also subsumes the final name, the retired
+    ``unknown-unit.json``, and any ``.json.tmp`` residue from a partial write.
+    """
+
+    @staticmethod
+    def _payload(unit: str):
+        return build_heartbeat_payload(
+            unit=unit,
             merge_idle=True,
             depth=0,
             queue_empty=True,
             ts_epoch=555.0,
         )
 
-        result = write_heartbeat(tmp_path, '', payload)
+    def test_empty_unit_raises_and_writes_nothing(self, tmp_path):
+        """unit='' raises ValueError naming the unit name, and creates NO file."""
+        fleet_dir = tmp_path / 'fleet'
 
-        assert result.name != '.json'
-        assert result.exists()
-        assert result == tmp_path / 'unknown-unit.json'
+        with pytest.raises(ValueError, match='unit name'):
+            write_heartbeat(fleet_dir, '', self._payload(''))
+
+        assert not fleet_dir.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_whitespace_only_unit_raises_and_writes_nothing(self, tmp_path):
+        """unit='   ' is the same defect: rejected, never stripped into a name.
+
+        ``unit if unit else …`` treated a whitespace-only unit as truthy and
+        would have written a file literally named ``   .json`` — an equally
+        corrupt artifact in the same directory, from the same defect class (a
+        writer that reached production without a real unit set).  Silently
+        repairing it into a plausible name is the silent-degradation this guard
+        exists to end; the caller learns its unit name is malformed instead.
+        """
+        fleet_dir = tmp_path / 'fleet'
+
+        with pytest.raises(ValueError, match='unit name'):
+            write_heartbeat(fleet_dir, '   ', self._payload('   '))
+
+        assert not fleet_dir.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        'unit',
+        [
+            'a/b',
+            '../escaped',
+            '../../tmp/x',
+            '/abs/unit',
+            '.',
+            '..',
+        ],
+    )
+    def test_unit_that_is_not_a_bare_filename_raises_and_writes_nothing(
+        self, tmp_path, unit
+    ):
+        """A separator, a traversal or an absolute unit escapes the fleet dir.
+
+        ``fleet_dir / f'{unit}.json'`` is plain interpolation, VERIFIED:
+        ``'../escaped'`` lands one level ABOVE the fleet dir and ``'/abs/unit'``
+        discards *fleet_dir* entirely, yielding ``/abs/unit.json``
+        (``Path.__truediv__`` with an absolute right operand).  ``'.'``/``'..'``
+        are the degenerate spellings caught by the same rule — both have an
+        empty ``Path.name`` — and would write the hidden, unattributable
+        ``<fleet_dir>/..json`` / ``<fleet_dir>/...json``.
+        """
+        fleet_dir = tmp_path / 'fleet'
+
+        with pytest.raises(ValueError, match='unit name'):
+            write_heartbeat(fleet_dir, unit, self._payload(unit))
+
+        assert not fleet_dir.exists()
+        # Covers the sibling-escape target too: '../escaped' would have landed
+        # at tmp_path/'escaped.json', outside fleet_dir but inside tmp_path.
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``fleet_heartbeat.write_heartbeat`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``,
+    which also gives this site a unique-per-writer temp name in place of the old
+    fixed ``<dest>.json.tmp`` (two concurrent writers used to share it).
+    ``mode`` must stay at the umask default: this file is read by other
+    processes (the dashboard, the gamma/epsilon watchers, scripts/drain_check.py),
+    so narrowing it to 0o600 is the specific silent regression this task avoids.
+    """
+
+    @staticmethod
+    def _recorder(monkeypatch):
+        import shared.safe_io as _safe_io
+
+        calls = []
+        real = _safe_io.atomic_write_text
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+            return real(path, text, **kwargs)
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+        return calls
+
+    @staticmethod
+    def _assert_common(kwargs):
+        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert kwargs.get('mode') is None, (
+            'umask default, NOT 0o600 — this file is read by other processes'
+        )
+
+    def test_delegates_with_preserved_semantics(self, tmp_path: Path, monkeypatch) -> None:
+        calls = self._recorder(monkeypatch)
+        write_heartbeat(tmp_path / 'fleet', 'orchestrator-df.service', {'ts': 1})
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        self._assert_common(calls[0][2])
+
+    def test_on_disk_mode_matches_write_text_reference(self, tmp_path: Path) -> None:
+        reference = tmp_path / 'reference.json'
+        reference.write_text('ref', encoding='utf-8')
+        path = write_heartbeat(tmp_path, 'orchestrator-df.service', {'ts': 1})
+        assert path.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
+
+    def test_oserror_still_propagates(self, tmp_path: Path, monkeypatch) -> None:
+        """This site propagates — it has no fail-open boundary."""
+        import shared.safe_io as _safe_io
+
+        def boom(*_a, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', boom)
+        with pytest.raises(OSError, match='disk full'):
+            write_heartbeat(tmp_path, 'orchestrator-df.service', {'ts': 1})

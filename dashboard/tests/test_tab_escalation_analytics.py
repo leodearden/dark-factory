@@ -12,52 +12,9 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
-import pytest
-from starlette.testclient import TestClient
-
-# ---------------------------------------------------------------------------
-# Module-scoped fixtures (static data.js content) — mirrors test_tab_escalations.py
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def data_js_body(_client):
-    return _client.get('/static/redux/data.js').text
-
-
-@pytest.fixture(scope='module')
-def tab_analytics_jsx_body(_client):
-    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def shell_jsx_body(_client):
-    return _client.get('/static/redux/shell.jsx').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
-
-
-@pytest.fixture(scope='module')
-def charts_jsx_body(_client):
-    return _client.get('/static/redux/charts.jsx').text
-
+from _dashboard_helpers import extract_function_body
 
 # ---------------------------------------------------------------------------
 # Helper: extract a named seed block from window.DF_DATA (brace-aware).
@@ -90,47 +47,6 @@ def _extract_df_data_block(src: str, key: str) -> str:
 # specific function body rather than searching the entire file (which would
 # give false confidence when a token appears in an unrelated context).
 # ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
-    named ``function`` declarations — not arrow functions or class methods.
-    Returns the empty string if the function is not found.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +236,17 @@ class TestEscalationAnalyticsRoute:
             'matching the ESCALATIONS/CURATOR_STATE/SCHEDULER envelope precedent.'
         )
         analytics = body['ESCALATION_ANALYTICS']
-        assert set(analytics) == {'generated_at', 'parse_failures', 'regime_markers', 'per_project'}
+        assert set(analytics) == {
+            'generated_at', 'parse_failures', 'regime_markers', 'per_project',
+            # The two archive-reach signals, and the only fields that can tell
+            # an absent archive from an empty one: ``archives_present`` (all)
+            # is the completeness diagnostic, ``archives_reached`` (any) is the
+            # route's cacheability predicate.
+            'archives_present', 'archives_reached',
+        }
         assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
+        assert analytics['archives_present'] is True
+        assert analytics['archives_reached'] is True
         assert analytics['parse_failures'] == 0
         assert isinstance(analytics['regime_markers'], list)
         assert len(analytics['per_project']) == 1
@@ -375,14 +300,224 @@ class TestEscalationAnalyticsRoute:
         assert resp2.json()['ESCALATION_ANALYTICS']['parse_failures'] >= 1
 
 
+def _analytics_payload(**overrides):
+    """A builder-shaped analytics payload, overridable one key at a time.
+
+    Shaped exactly as ``build_escalation_analytics`` returns it, so a stub
+    standing in for the builder cannot hand the route something the real
+    builder never would.
+    """
+    payload = {
+        'generated_at': '2026-07-16T18:00:00+00:00',
+        'parse_failures': 0,
+        'regime_markers': [],
+        'per_project': [],
+        'archives_present': True,
+        'archives_reached': True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestEscalationAnalyticsCacheability:
+    """A scan that reached NO archive must not be pinned for the TTL.
+
+    Same rule the memory-evals route follows, applied here because the two
+    routes are written as one idiom and a fix to only one of them would leave
+    them silently divergent.  The signal differs — memory-evals already
+    carried ``root_present``, analytics needed ``archives_reached`` added —
+    but the reasoning is identical: an archive that was never reached is O(1)
+    to re-check (one negative ``is_dir`` stat per project), so re-checking
+    every poll costs nothing, while caching it keeps the tab reporting an
+    empty archive for a full TTL window after the volume mounts.
+
+    A PARTIAL scan IS cached, and that distinction is the whole point.  Keyed
+    on ``archives_present`` (``all``) instead, this cache would be dead in the
+    installed config: measured 2026-08-01 against the unit's own
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (9 roots), 2 roots have no
+    ``data/escalations`` dir while the other 7 hold ~9.1k records, so ``all``
+    is permanently False, nothing is ever stored, and every 3s poll re-runs
+    the whole multi-second walk.  A root that has simply never escalated must
+    not delete the cache in front of the other seven.
+
+    The trade-off actually being accepted: an archive that disappears
+    mid-life leaves that project's panel up to one TTL window stale.  That is
+    the right side of it — the alternative costs the full re-walk on every
+    poll, forever, for every ordinary multi-project config.
+    """
+
+    def test_a_reached_archive_is_served_from_cache(self, client, monkeypatch, tmp_path):
+        """Gating the cache must not disable it — the ordinary payload still caches."""
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        # SYNC, not AsyncMock: the route calls the builder through
+        # asyncio.to_thread, which hands it a plain callable.
+        build = MagicMock(return_value=_analytics_payload())
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
+        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
+
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
+
+    def test_a_partial_scan_is_still_cached(self, client, monkeypatch, tmp_path):
+        """THE regression test: one archive-less root must not defeat the cache.
+
+        A real two-root config in the production shape — the primary root has
+        ``data/escalations`` on disk, the secondary has never escalated and so
+        has no such dir.  That is the installed 9-root config in miniature (2
+        archive-less roots, 7 holding ~9.1k records between them; measured
+        2026-08-01).  Keyed on ``archives_present``, the second GET re-walks;
+        keyed on ``archives_reached``, it is served from cache — which is the
+        difference between a working 60s cache and none at all.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        primary = tmp_path / 'primary'
+        secondary = tmp_path / 'secondary'
+        (primary / 'data' / 'escalations').mkdir(parents=True)
+        secondary.mkdir()
+
+        client.app.state.config = _make_config(primary, known_project_roots=[secondary])
+        _analytics_cache_clear()
+        build = MagicMock(
+            return_value=_analytics_payload(archives_present=False, archives_reached=True),
+        )
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        r1 = client.get('/api/v2/dashboard/escalation-analytics')
+        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert r1.status_code == r2.status_code == 200
+        assert r2.json()['ESCALATION_ANALYTICS']['archives_present'] is False
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
+
+    def test_an_unreached_archive_is_not_pinned_for_the_ttl(self, client, monkeypatch, tmp_path):
+        """``archives_reached: False`` is re-checked every poll.
+
+        The rationale the ``all``-keyed predicate had right, preserved intact:
+        a build that walked nothing is free to redo and must not pin an empty
+        view past the moment the archive appears.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        build = MagicMock(
+            return_value=_analytics_payload(archives_present=False, archives_reached=False),
+        )
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        r1 = client.get('/api/v2/dashboard/escalation-analytics')
+        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert r1.status_code == r2.status_code == 200
+        assert r2.json()['ESCALATION_ANALYTICS']['archives_reached'] is False
+        assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
+
+    def test_a_payload_without_the_signal_is_not_cached(self, client, monkeypatch, tmp_path):
+        """An older-shaped or partially-built payload degrades to "re-derive".
+
+        The predicate runs inside the cache WRITE path, so the failure mode to
+        avoid is not just a wrong answer but a raise — which would surface as
+        a 500 on a 3s poll.  Missing key means don't cache, don't raise.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        payload = _analytics_payload()
+        del payload['archives_reached']
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        build = MagicMock(return_value=payload)
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        r1 = client.get('/api/v2/dashboard/escalation-analytics')
+        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert r1.status_code == r2.status_code == 200
+        assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
+
+    def test_parse_failures_alone_never_defeats_the_cache(self, client, monkeypatch, tmp_path):
+        """The whole reason the predicate is not keyed on ``parse_failures``.
+
+        A corrupt record is permanent, so gating on it would re-run a ~10k
+        record walk on every poll, forever, to rediscover the same bad file.
+        The archive WAS reached; that is the question the cache asks.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        build = MagicMock(return_value=_analytics_payload(parse_failures=7))
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
+        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert r2.json()['ESCALATION_ANALYTICS']['parse_failures'] == 7
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
+
+    def test_real_builder_partial_scan_is_cached_end_to_end(self, client, tmp_path):
+        """The binding test: NO stub anywhere, real builder through the real route.
+
+        Every other test in this class hands the route a MagicMock payload, so
+        all of them would keep passing if the builder's ``any`` semantics and
+        the route's predicate drifted apart — a stub cannot notice that the
+        producer stopped producing what the consumer reads.  This one wires
+        them together: a real two-root tmp config (primary has a real, empty
+        ``data/escalations`` dir; secondary has none) driven through the real
+        ``build_escalation_analytics``.
+
+        Cache-hit proof without a spy: the builder stamps ``generated_at`` from
+        the live clock on every build (``resolve_now(None)`` ->
+        ``datetime.now(UTC)``, microsecond resolution), so two GETs that return
+        the SAME ``generated_at`` cannot be two builds — a re-walk would carry
+        a later stamp.
+        """
+        from dashboard.app import _analytics_cache_clear
+
+        primary = tmp_path / 'primary'
+        secondary = tmp_path / 'secondary'
+        (primary / 'data' / 'escalations').mkdir(parents=True)
+        secondary.mkdir()
+
+        client.app.state.config = _make_config(primary, known_project_roots=[secondary])
+        _analytics_cache_clear()
+
+        r1 = client.get('/api/v2/dashboard/escalation-analytics')
+        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert r1.status_code == r2.status_code == 200
+        first = r1.json()['ESCALATION_ANALYTICS']
+        second = r2.json()['ESCALATION_ANALYTICS']
+
+        # The producer really does distinguish the two questions over a real tree.
+        assert first['archives_present'] is False
+        assert first['archives_reached'] is True
+        # ...and the consumer really does cache on the second one.
+        assert second['generated_at'] == first['generated_at'], (
+            'second GET re-ran the builder — the route predicate and the '
+            'builder signal have drifted apart'
+        )
+
+
 # ---------------------------------------------------------------------------
 # task 2659 (delta) — tab_escalation_analytics.jsx UI wiring
 # ---------------------------------------------------------------------------
 #
-# The fixtures/helpers above (tab_analytics_jsx_body, app_jsx_body,
-# shell_jsx_body, index_html_body, _extract_function_body,
-# _ScriptTagCollector, _find_script_position, _assert_script_loads_before)
-# were scaffolded in prereq-1; the tests below consume them.
+# The tests below consume the served-asset fixtures (tab_analytics_jsx_body,
+# app_jsx_body, shell_jsx_body, index_html_body) that now live in conftest.py
+# and `extract_function_body` from _dashboard_helpers (task 3549), plus the
+# load-order helpers still local to this file (_ScriptTagCollector,
+# _find_script_position, _assert_script_loads_before).
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +538,7 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
     (f) fold state is persisted via useOpenSet( referencing 'df.open.escanalytics'.
 
     (d)-(f) are scoped to the extracted `EscalationAnalyticsTab` function body
-    via `_extract_function_body`, and (c)'s export check requires the actual
+    via `extract_function_body`, and (c)'s export check requires the actual
     `=` assignment syntax rather than a bare dotted-path substring — this
     file's own header comment mentions "window.DF_TABS.EscalationAnalyticsTab"
     in prose, so an unscoped raw substring check would still pass even if the
@@ -418,11 +553,7 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
         'tab_escalation_analytics.jsx does not define `function EscalationAnalyticsTab(` — '
         'the component must be declared as a named function for the export to work.'
     )
-    tab_body = _extract_function_body(body, 'EscalationAnalyticsTab')
-    assert tab_body, (
-        'Could not locate the `function EscalationAnalyticsTab(` body in '
-        'tab_escalation_analytics.jsx.'
-    )
+    tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
     # Additive export — must NOT clobber window.DF_TABS = {...} and must assign
     # EscalationAnalyticsTab. Requires the assignment's `=` (not just the
     # dotted path) so a prose mention in a comment cannot satisfy the check.
@@ -470,8 +601,13 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
 def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> None:
     """index.html must include tab_escalation_analytics.jsx, loaded AFTER
     data.js, shell.jsx, and tabs.jsx and BEFORE app.jsx; must be a classic
-    synchronous script (no defer/async/type=module); and all
-    /static/redux/*?v= cache-busters must share a single version >= 30.
+    synchronous script (no defer/async/type=module); and every
+    /static/redux/*?v= cache-buster must be at or past this tab's floor of 30.
+
+    Check (g) is an ANTI-REVERT PIN, not a live bump check: index.html is far
+    past 30 today, so it fails only if someone rolls the cache-busters back
+    below what this tab needed. Whether the versions are UNIFORM, and whether
+    the newest bump landed, are both asserted in test_index_html.py.
 
     Checks:
     (a) tab_escalation_analytics.jsx script tag exists.
@@ -480,7 +616,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     (d) Loads after tabs.jsx.
     (e) Loads before app.jsx.
     (f) Not deferred/async/module.
-    (g) All /static/redux/ v= cache-busters share one version >= 30.
+    (g) Every /static/redux/ v= cache-buster is >= 30.
     """
     _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
@@ -545,15 +681,15 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
         'tab_escalation_analytics.jsx must load before app.jsx so EscalationAnalyticsTab is set on window.DF_TABS.',
     )
 
-    # (g) All /static/redux/ v= cache-busters share one version >= 30
-    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
-        'bump all of them uniformly to the same value.'
+    # (g) floor only — uniformity lives in test_index_html.py (see docstring).
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 30, (
-        f'index.html cache-buster version is {v}, expected >= 30.'
+    assert min(versions) >= 30, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 30 (the floor tab_escalation_analytics.jsx landed at).'
     )
 
 
@@ -665,11 +801,7 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
     body = tab_analytics_jsx_body
 
     # (a) Window toggle, scoped to EscalationAnalyticsTab's own body.
-    tab_body = _extract_function_body(body, 'EscalationAnalyticsTab')
-    assert tab_body, (
-        'Could not locate the `function EscalationAnalyticsTab(` body in '
-        'tab_escalation_analytics.jsx.'
-    )
+    tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
     assert re.search(
         r"usePersistedState\(\s*['\"]df\.escanalytics\.window['\"]\s*,\s*['\"]28d['\"]\s*\)",
         tab_body,
@@ -699,8 +831,7 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         'tab_escalation_analytics.jsx does not define `function windowCutoffDate(` — '
         'add the helper that computes the window cutoff relative to generated_at.'
     )
-    cutoff_body = _extract_function_body(body, 'windowCutoffDate')
-    assert cutoff_body, 'Could not locate the windowCutoffDate( function body.'
+    cutoff_body = extract_function_body(body, 'windowCutoffDate')
     assert 'generatedAt' in cutoff_body, (
         'windowCutoffDate does not reference its generatedAt parameter — the window '
         'cutoff must be anchored to the payload clock, not the browser clock.'
@@ -759,8 +890,7 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
         'tab_escalation_analytics.jsx does not define `function OriginPanel(` — '
         'add the Origin panel component.'
     )
-    origin_body = _extract_function_body(body, 'OriginPanel')
-    assert origin_body, 'Could not locate the OriginPanel( function body.'
+    origin_body = extract_function_body(body, 'OriginPanel')
 
     # (a) StackedAreaChart over daily_by_source, long tail folded into 'other'.
     assert 'daily_by_source' in origin_body, (
@@ -849,8 +979,7 @@ def test_tab_analytics_lifespan_panel(tab_analytics_jsx_body: str) -> None:
         'tab_escalation_analytics.jsx does not define `function LifespanPanel(` — '
         'add the Lifespan panel component.'
     )
-    lifespan_body = _extract_function_body(body, 'LifespanPanel')
-    assert lifespan_body, 'Could not locate the LifespanPanel( function body.'
+    lifespan_body = extract_function_body(body, 'LifespanPanel')
 
     # (a) StatTile percentiles keyed by level from percentiles_by_level.
     assert 'percentiles_by_level' in lifespan_body, (
@@ -937,8 +1066,7 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'tab_escalation_analytics.jsx does not define `function WorkflowPanel(` — '
         'add the Workflow panel component.'
     )
-    workflow_body = _extract_function_body(body, 'WorkflowPanel')
-    assert workflow_body, 'Could not locate the WorkflowPanel( function body.'
+    workflow_body = extract_function_body(body, 'WorkflowPanel')
 
     # (a) 100%-normalized StackedAreaChart of tier absorption from tier_weekly.
     assert 'tier_weekly' in workflow_body, (
@@ -1001,6 +1129,73 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
     )
 
 
+def test_esc_per_done_chart_does_not_compact_its_series(tab_analytics_jsx_body: str) -> None:
+    """A null-ratio day keeps its x-axis slot instead of being dropped (task 3489).
+
+    ``esc_per_done_daily[].ratio`` is null on days where done == 0 — the ONLY
+    consumer in the dashboard that originates a real hole.  This panel used to
+    drop those rows entirely::
+
+        const epdRows = escPerDoneDaily.filter(row => row.ratio != null);
+        const epdDates = epdRows.map(row => row.date);
+
+    which is worse than it looks: the filter removes the day from the LABEL row
+    as well as from the values, so the series is COMPACTED and every surviving
+    sample is silently redated — a Tuesday reading slides into Monday's slot.
+    That is the precise hazard spark_path.js's header names, and it was only
+    ever a workaround for LineChart having no gap support.  LineChart now
+    breaks its line across a hole (task 3489), so the workaround is obsolete
+    AND actively wrong.
+
+    Asserted structurally rather than by comment wording: the dates and the
+    values must come from the SAME row list, and that list must be the windowed
+    rows themselves, not a filtered copy.
+    """
+    workflow_body = extract_function_body(tab_analytics_jsx_body, 'WorkflowPanel')
+
+    filter_on_ratio = re.search(r'\.filter\([^)]*\bratio\b[^)]*\bnull\b', workflow_body)
+    assert filter_on_ratio is None, (
+        'WorkflowPanel still filters rows on a null `ratio`: '
+        f'`{filter_on_ratio.group(0) if filter_on_ratio else ""}`. Dropping the '
+        'row removes its date from the label row too, compacting the x-axis and '
+        'redating every surviving sample. Pass the null through instead — '
+        'LineChart draws it as a gap.'
+    )
+
+    date_sources = set(
+        re.findall(r'(\w+)\s*\.map\(\s*\(?\s*\w+\s*\)?\s*=>\s*\w+\.date\b', workflow_body)
+    )
+    ratio_sources = set(
+        re.findall(r'(\w+)\s*\.map\(\s*\(?\s*\w+\s*\)?\s*=>\s*\w+\.ratio\b', workflow_body)
+    )
+    assert date_sources, (
+        'WorkflowPanel derives no `.date` label row via a `.map(row => row.date)` '
+        '— the esc-per-done chart needs one label per row.'
+    )
+    assert ratio_sources, (
+        'WorkflowPanel derives no `.ratio` series via a `.map(row => row.ratio)` '
+        '— the esc-per-done chart must plot the ratios.'
+    )
+    assert date_sources == ratio_sources, (
+        f'the esc-per-done labels come from {sorted(date_sources)} but the values '
+        f'from {sorted(ratio_sources)}. Both must be derived from the SAME row '
+        f'list, or a dropped/added row shifts the labels out of step with the '
+        f'samples and silently redates the series.'
+    )
+
+    source = next(iter(ratio_sources))
+    assignment = re.search(rf'\b(?:const|let|var)\s+{re.escape(source)}\s*=\s*([^;]+);', workflow_body)
+    assert assignment is not None, (
+        f'could not find where `{source}` (the row list feeding the esc-per-done '
+        f'chart) is assigned in WorkflowPanel.'
+    )
+    assert '.filter(' not in assignment.group(1), (
+        f'`{source}` is assigned from a filtered list: `{assignment.group(1).strip()}`. '
+        f'The esc-per-done chart must be fed the windowed rows themselves, so a '
+        f'day with no measurement keeps its slot and renders as a gap.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # amendment: pin charts.jsx's chart padding to the value RegimeMarkers assumes
 # ---------------------------------------------------------------------------
@@ -1024,8 +1219,7 @@ def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: st
     requiring charts.jsx to export anything.
     """
     for fn_name in ('LineChart', 'StackedAreaChart'):
-        fn_body = _extract_function_body(charts_jsx_body, fn_name)
-        assert fn_body, f'Could not locate the {fn_name}( function body in charts.jsx.'
+        fn_body = extract_function_body(charts_jsx_body, fn_name)
         assert re.search(r'padL\s*=\s*38\b', fn_body), (
             f'charts.jsx {fn_name} no longer declares padL = 38 — '
             'tab_escalation_analytics.jsx hardcodes _CHART_PAD_L = 38 for its '

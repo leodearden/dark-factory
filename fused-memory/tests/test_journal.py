@@ -449,6 +449,303 @@ async def test_stats(journal):
     assert stats['runs_count'] == 1
 
 
+class TestStatsPhantomVerdicts:
+    """get_stats must not count PHANTOM verdicts as genuine reviews.
+
+    A phantom is the placeholder ``Judge._parse_verdict`` fabricates when it
+    could not parse its own model output — no review happened.  Measured on
+    the live DB (task 3287): of the ten ``severity='serious'`` rows, NINE are
+    phantoms from the 2026-07-20..29 cap-storm resume failures, so any stats
+    window starting after 2026-04-19 reports serious reviews that never
+    occurred.
+
+    The contract is SUBTRACT-AND-NAME, not hide: every row removed from
+    ``verdicts`` is reported in the parallel ``phantom_verdicts`` bucket, and
+    the two dicts sum to the old total.  Nothing vanishes unnamed.
+    """
+
+    @staticmethod
+    async def _seed_verdict(journal, *, severity, findings, reviewed_at, action):
+        """Start one run and attach one verdict to it.
+
+        One run per verdict because ``judge_verdicts.run_id`` is the PK and
+        get_stats joins ``runs`` for project scoping — a second verdict on the
+        same run would collide rather than accumulate.
+        """
+        run_id = str(uuid.uuid4())
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=reviewed_at,
+                status=RunStatus.running,
+            )
+        )
+        await journal.complete_run(run_id, 'completed')
+        await journal.add_verdict(
+            JudgeVerdict(
+                run_id=run_id,
+                reviewed_at=reviewed_at,
+                severity=severity,
+                findings=findings,
+                action_taken=action,
+            )
+        )
+        return run_id
+
+    @staticmethod
+    def _genuine_serious_findings():
+        """The bc9459b8 shape: five substantive findings, no marker."""
+        return [
+            {
+                'issue': f'Substantive content issue #{i}',
+                'severity': 'serious',
+                'recommendation': f'Fix issue #{i}',
+            }
+            for i in range(5)
+        ]
+
+    @staticmethod
+    def _marked_phantom_findings():
+        """Post-2947 shape: the structured ``code`` marker."""
+        return [
+            {
+                'code': 'unparseable_judge_response',
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+            }
+        ]
+
+    @staticmethod
+    def _legacy_phantom_findings():
+        """Pre-2947 shape: no ``code`` key at all (rows e87d8e4a, 09d14a75)."""
+        return [
+            {
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+            }
+        ]
+
+    async def _seed_genuine_serious(self, journal, now):
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._genuine_serious_findings(),
+            reviewed_at=now,
+            action=VerdictAction.rollback,
+        )
+
+    async def _seed_both_phantoms(self, journal, now):
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._marked_phantom_findings(),
+            reviewed_at=now,
+            action=VerdictAction.halt,
+        )
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._legacy_phantom_findings(),
+            reviewed_at=now,
+            action=VerdictAction.halt,
+        )
+
+    async def _seed_ordinary(self, journal, now):
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.ok,
+            findings=[],
+            reviewed_at=now,
+            action=VerdictAction.none,
+        )
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.minor,
+            findings=[{'issue': 'minor drift in entity summary wording'}],
+            reviewed_at=now,
+            action=VerdictAction.none,
+        )
+
+    @pytest.mark.asyncio
+    async def test_phantoms_are_split_out_of_the_genuine_counts(self, journal):
+        """(a)(b) One genuine serious + two phantoms → serious: 1, phantom: 2."""
+        now = datetime.now(UTC)
+        await self._seed_genuine_serious(journal, now)
+        await self._seed_both_phantoms(journal, now)
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {'serious': 1, 'ok': 1, 'minor': 1}
+        assert stats['phantom_verdicts'] == {'serious': 2}
+
+    @pytest.mark.asyncio
+    async def test_severity_dropping_to_zero_leaves_verdicts_but_is_still_named(
+        self, journal
+    ):
+        """(c) With no genuine serious row, 'serious' leaves ``verdicts`` entirely.
+
+        Matches GROUP BY's absent-key convention — a severity with no rows
+        simply has no key, so consumers need no new special case.  This is not
+        silent degradation: both phantoms are still reported by name in
+        ``phantom_verdicts``.
+        """
+        now = datetime.now(UTC)
+        await self._seed_both_phantoms(journal, now)
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert 'serious' not in stats['verdicts']
+        assert stats['verdicts'] == {'ok': 1, 'minor': 1}
+        assert stats['phantom_verdicts'] == {'serious': 2}
+
+    @pytest.mark.asyncio
+    async def test_no_phantoms_leaves_verdicts_byte_identical(self, journal):
+        """(d) With no phantom rows, the genuine counts are exactly today's output."""
+        now = datetime.now(UTC)
+        await self._seed_genuine_serious(journal, now)
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {'serious': 1, 'ok': 1, 'minor': 1}
+        assert stats['phantom_verdicts'] == {}
+
+    @pytest.mark.asyncio
+    async def test_runs_count_and_duration_are_unaffected(self, journal):
+        """(e) The phantom split touches only the verdict buckets."""
+        now = datetime.now(UTC)
+        await self._seed_genuine_serious(journal, now)
+        await self._seed_both_phantoms(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['runs_count'] == 3
+        assert 'avg_duration_seconds' in stats
+
+    @pytest.mark.asyncio
+    async def test_verdict_outside_the_window_counts_in_neither_bucket(self, journal):
+        """(f) The ``since`` window applies to phantoms exactly as to genuine rows."""
+        now = datetime.now(UTC)
+        long_ago = now - timedelta(days=30)
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._marked_phantom_findings(),
+            reviewed_at=long_ago,
+            action=VerdictAction.halt,
+        )
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._genuine_serious_findings(),
+            reviewed_at=long_ago,
+            action=VerdictAction.rollback,
+        )
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {}
+        assert stats['phantom_verdicts'] == {}
+
+    # --- the SQL candidate prefilter's two disjuncts, exercised separately ---
+    #
+    # The prefilter is `(jv.severity = 'serious' OR jv.findings LIKE ?)`.  Every
+    # case above seeds its phantoms at severity=serious, so the FIRST disjunct
+    # alone satisfies all of them and the LIKE half is never exercised: if its
+    # pattern were wrong (wildcards dropped, constant mis-spelled, parameters
+    # swapped) every one of those tests would still pass.  The two cases below
+    # are the ones with teeth on it.
+
+    @pytest.mark.asyncio
+    async def test_marked_phantom_below_serious_is_caught_by_the_like_disjunct(
+        self, journal
+    ):
+        """(g) A marker-stamped phantom at a NON-serious severity is still split out.
+
+        `has_unparseable_marker` is documented as deliberately severity-agnostic
+        — the structured marker is ground truth about how the row was produced,
+        so a producer that stamps it at some severity other than `serious` is
+        still writing a phantom.  Reaching such a row requires the `findings
+        LIKE ?` disjunct: `severity = 'serious'` cannot match it.  This is the
+        only case in the class that fails if that pattern is broken.
+        """
+        now = datetime.now(UTC)
+        await self._seed_both_phantoms(journal, now)
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.moderate,
+            findings=self._marked_phantom_findings(),
+            reviewed_at=now,
+            action=VerdictAction.halt,
+        )
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['phantom_verdicts'] == {'serious': 2, 'moderate': 1}
+        # 'moderate' had exactly one row and it was phantom, so — like
+        # 'serious' in case (c) — the key leaves `verdicts` entirely rather
+        # than sitting at zero.  Nothing vanishes unnamed: it is reported
+        # above.
+        assert 'moderate' not in stats['verdicts']
+        assert stats['verdicts'] == {'ok': 1, 'minor': 1}
+
+    @pytest.mark.asyncio
+    async def test_genuine_row_mentioning_the_marker_string_stays_genuine(
+        self, journal
+    ):
+        """(h) The prefilter is a CANDIDATE filter, never the verdict.
+
+        The converse of (g): a real multi-finding serious review whose issue
+        prose merely MENTIONS `unparseable_judge_response` matches the LIKE
+        disjunct and is fetched — then correctly rejected in Python by
+        `is_phantom_verdict_row`, because it carries no `code` marker and has
+        more than one finding.  Widening the prefilter must never widen the
+        classification.
+        """
+        now = datetime.now(UTC)
+        mentions_marker = [
+            {
+                'issue': (
+                    'Nine judge verdicts in the 2026-07 window carry '
+                    'code=unparseable_judge_response and were never reviewed; '
+                    'the resume path needs a cap-storm guard.'
+                ),
+                'severity': 'serious',
+                'recommendation': 'Add a resume guard',
+            },
+            {
+                'issue': 'Entity resolution dropped two candidate merges',
+                'severity': 'serious',
+                'recommendation': 'Re-run resolution',
+            },
+        ]
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=mentions_marker,
+            reviewed_at=now,
+            action=VerdictAction.rollback,
+        )
+        await self._seed_both_phantoms(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {'serious': 1}
+        assert stats['phantom_verdicts'] == {'serious': 2}
+
+
 @pytest.mark.asyncio
 async def test_get_nonexistent_run(journal):
     result = await journal.get_run('nonexistent-id')

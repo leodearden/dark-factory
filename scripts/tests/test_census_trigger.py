@@ -13,15 +13,15 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import yaml
-
 from legibility import census_trigger as ct
 from legibility.config import Census as LegibilityCensus
 
-NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +57,123 @@ def test_census_config_from_mapping_none_returns_defaults():
 
 def test_census_config_from_mapping_empty_dict_returns_defaults():
     assert ct.CensusConfig.from_mapping({}) == ct.CensusConfig()
+
+
+# ---------------------------------------------------------------------------
+# task 4085 (amendment pass, review finding #1): the `census:` block is
+# hand-edited -- the same operator-authored-input class as the hand-seeded
+# `last_census_done_count` baseline this task hardens -- so an unusable
+# threshold VALUE is an expected input. Unvalidated, a quoted `'10'` reaches
+# `evaluate()`'s `days_since >= config.max_interval_days` and raises
+# TypeError straight out of `load_census_config` and `decide_for_project`,
+# both of which document a never-raises contract, and into `census.main`,
+# which calls the latter unguarded.
+#
+# Same rule as the baseline guard: VALIDATE, never coerce. `int('10')` would
+# silently bless a malformed config and could arm a ~$100 census on an
+# unaudited number.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "field,key,mapping_key",
+    [
+        ("max_interval_days", "max_interval_days", None),
+        ("tasks_landed_threshold", "tasks_landed_threshold", None),
+        ("tasks_landed_min_days", "tasks_landed_min_days", None),
+        ("floor_days", "floor_days", None),
+        ("novelty_spike_count", "count", "novelty_spike"),
+        ("novelty_spike_window_hours", "window_hours", "novelty_spike"),
+    ],
+)
+@pytest.mark.parametrize("bad", ["10", "", 10.0, 1.5, True, False, -1, None, [10], {"n": 10}])
+def test_census_config_from_mapping_rejects_unusable_threshold_values(
+    field, key, mapping_key, bad, caplog
+):
+    """Each of the six §7.4 thresholds falls back to its OWN default, alone,
+    with one WARNING naming the value and its type. `True`/`False` are in the
+    parameter list deliberately: `bool` is an `int` subclass, so an unquoted
+    YAML `true` would otherwise mean 1 -- a daily census -- in total silence.
+    A negative is definitionally impossible for a day/count threshold."""
+    override = {key: bad} if mapping_key is None else {mapping_key: {key: bad}}
+
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping(override)
+
+    # The bad field fell back; nothing else moved.
+    assert config == ct.CensusConfig()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert key in message
+    assert type(bad).__name__ in message
+
+
+def test_census_config_from_mapping_rejects_a_non_mapping_novelty_spike(caplog):
+    """`census: {novelty_spike: [4, 72]}` used to raise AttributeError from
+    the `.get` on a list -- a raise from inside the config reader, which is
+    the one place that must not have one."""
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping({"novelty_spike": [4, 72], "floor_days": 3})
+
+    assert config.novelty_spike_count == ct.CensusConfig().novelty_spike_count
+    assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
+    # ...and the sibling override alongside it is still honoured.
+    assert config.floor_days == 3
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "novelty_spike" in warnings[0].getMessage()
+
+
+def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplog):
+    """Per-FIELD fallback, per-BLOCK warning. The six thresholds are
+    independent, so one typo must not disarm the other five; but a single
+    hand-edited block is a single operator fault, and this WARNING is one
+    nightly journal line, so all of them are named in one message."""
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping(
+            {
+                "max_interval_days": "10",
+                "floor_days": -1,
+                "tasks_landed_threshold": 200,  # the one good override
+                "novelty_spike": {"window_hours": None},
+            }
+        )
+
+    assert config.tasks_landed_threshold == 200
+    assert config.max_interval_days == ct.CensusConfig().max_interval_days
+    assert config.floor_days == ct.CensusConfig().floor_days
+    assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    for named in ("max_interval_days", "floor_days", "window_hours"):
+        assert named in message
+    assert "tasks_landed_threshold" not in message
+
+
+def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
+    """Over-rejection guard. `0` is aggressive but legal (fire every day) and
+    must not be mistaken for a missing value, and there is no upper bound."""
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping(
+            {
+                "max_interval_days": 0,
+                "floor_days": 0,
+                "tasks_landed_threshold": 10_000,
+                "novelty_spike": {"count": 0, "window_hours": 1},
+            }
+        )
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    assert config.max_interval_days == 0
+    assert config.floor_days == 0
+    assert config.tasks_landed_threshold == 10_000
+    assert config.novelty_spike_count == 0
+    assert config.novelty_spike_window_hours == 1
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +399,8 @@ def test_load_census_state_valid_file_is_ok_with_no_warning(tmp_path, caplog):
         status, data = ct.load_census_state(path)
 
     assert status == "ok"
+    # tuple[str, dict | None] — None only for the missing/malformed statuses.
+    assert data is not None
     assert data["last_census_at"] == "2026-07-01T00:00:00+00:00"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-01.md"
     assert data["last_census_done_count"] == 500
@@ -433,20 +552,548 @@ def test_compute_tasks_landed_missing_baseline_returns_none_with_one_warning(cap
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
-def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(tmp_path):
+# ---------------------------------------------------------------------------
+# task 3291: extract_done_count() — the ONE place a get_statuses payload
+# becomes a number, and the one place the silent-zero hole is closed.
+#
+# The idiom this replaces -- `(payload.get("statuses") or {})`, duplicated at
+# census_trigger.compute_tasks_landed and census.run_census -- coerced EVERY
+# unusable payload to a done-count of 0 with no warning and no exception.
+# That is how a fabricated 0 was persisted as a real census baseline on
+# 2026-07-24 and again on 2026-07-31.
+#
+# Be precise about the harm, because the arithmetic matters: while the fetch
+# was also broken the poisoned baseline was self-cancelling (`current_done`
+# was zeroed by the same defect, so the delta was `0 - 0` and condition (b)
+# did NOT fire -- measured by replaying the 2026-07-31 decision against the
+# pre-task code). It is unsound because it ARMS (b) with a delta of ~2872,
+# ~24x its 120 threshold, the instant the fetch is repaired. Which is why
+# the payload guard, the absolute-project_root fix and the on-disk baseline
+# repair all had to land together. See census_trigger's module docstring.
+# ---------------------------------------------------------------------------
+
+# fused-memory's `_normalize_project_root` hard-rejects a relative path with
+# exactly this payload. Verified live against localhost:8002 with
+# `{"project_root": "."}` -- and critically, the JSON-RPC envelope carries
+# `isError: false`, so `_extract_tool_result` unwraps this dict as though it
+# were a genuine tool result and hands it straight to the caller.
+_TOOL_ERROR_ENVELOPE = {
+    "error": "project_root must be a non-empty absolute path, got: '.'",
+    "error_type": "ValidationError",
+}
+
+
+def test_extract_done_count_counts_done_values():
+    assert ct.extract_done_count({"statuses": {"1": "done", "2": "done", "3": "pending"}}) == 2
+
+
+def test_extract_done_count_empty_statuses_is_a_valid_zero():
+    """A project with zero done tasks is a real, expected state and MUST stay
+    distinguishable from a failed call -- it is precisely the case
+    `advance_census_state`'s "0 is never dropped as falsy" contract exists
+    for. The distinction that matters is presence-of-shape, not
+    emptiness-of-content."""
+    assert ct.extract_done_count({"statuses": {}}) == 0
+
+
+def test_extract_done_count_raises_on_fused_memory_tool_error_envelope():
+    """The regression that poisoned the live baseline. `@mcp_tool_errors`
+    returns this dict with `isError: false` at the JSON-RPC layer, so
+    `_extract_tool_result` unwraps it happily; the old
+    `(payload.get("statuses") or {})` idiom then read it as a done-count of
+    0 -- silently, with no warning and no exception."""
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count(_TOOL_ERROR_ENVELOPE)
+
+    # structured-facts-at-failure: the operator must see the REAL cause, not
+    # a generic shape complaint, so the server's own error text is quoted.
+    assert "project_root must be a non-empty absolute path" in str(excinfo.value)
+
+
+def test_extract_done_count_raises_when_statuses_key_absent():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count({})
+
+    assert "statuses" in str(excinfo.value)
+
+
+def test_extract_done_count_prefers_a_present_statuses_key_over_an_error_key():
+    """Pin the documented precedence of the error-envelope guard: it is
+    conditioned on `"statuses" not in payload`, so a payload that DOES carry a
+    real status snapshot is counted even if some stray `error` key rides along.
+    Untested, a future reorder of the two guards would flip this silently --
+    and the wrong direction (rejecting a usable snapshot) reintroduces exactly
+    the never-observable baseline this module exists to avoid."""
+    assert ct.extract_done_count({"statuses": {"1": "done"}, "error": "x"}) == 1
+
+
+def test_extract_done_count_raises_when_statuses_is_not_a_mapping():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count({"statuses": ["1", "2"]})
+
+    # The message must name the offending shape, not just that something failed.
+    assert "statuses" in str(excinfo.value)
+    assert "list" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("payload", [None, [], "oops", 0])
+def test_extract_done_count_raises_on_non_dict_payload(payload):
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count(payload)
+
+    assert type(payload).__name__ in str(excinfo.value)
+
+
+def test_compute_tasks_landed_tool_error_envelope_returns_none_with_one_warning(caplog):
+    """Before task 3291 this returned `0 - 500 == -500` with ZERO warnings --
+    a silent negative delta from a payload that was never a status snapshot
+    at all. A shape failure must land in the same "one WARNING, return None"
+    fail-safe branch as an unreachable server."""
+    state = {"last_census_done_count": 500}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=lambda: _TOOL_ERROR_ENVELOPE
+        )
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_payload_without_statuses_returns_none_with_one_warning(caplog):
+    state = {"last_census_done_count": 500}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=lambda: {})
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_empty_project_computes_a_real_zero_delta(caplog):
+    """Regression guard in the OPPOSITE direction: collapsing "empty result"
+    into "failed call" would break the first baseline of a newly-onboarded
+    project with no done tasks. A real 0 baseline against a real empty
+    snapshot is a real delta of 0, not a fail-safe None, and warns nothing."""
+    state = {"last_census_done_count": 0}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=_wrapped_fetcher({}))
+
+    assert result == 0
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
+# task 4085: the BASELINE side of the same fail-safe contract.
+#
+# task 3291 (above) made an unusable get_statuses PAYLOAD fail safe. The other
+# input to the same subtraction -- the `last_census_done_count` baseline read
+# off disk -- was left unvalidated, and it is the one an operator hand-edits
+# (skills/census/SKILL.md documents seeding it by hand), so malformed values
+# are an expected input rather than a hypothetical. Three measured behaviours,
+# all from the single unguarded `current_done - baseline`:
+#
+#   * `"2872"` (a quoted JSON int) raises TypeError out of a function whose
+#     docstring promises a fail-safe None. Via the `evaluate` CLI, main()'s
+#     catch-all swallows it into NO-FIRE + exit 0, which discards the ENTIRE
+#     evaluation -- so conditions (a) max-interval and (c) novelty-spike are
+#     suppressed by a fault in (b), taking out the very backstop that exists
+#     to survive a broken (b);
+#   * `true` returns `current_done - 1` with ZERO warnings, because
+#     `isinstance(True, int)` is True in Python -- arming (b) with essentially
+#     every done task ever. Strictly more dangerous than the crash: nothing
+#     signals it at all;
+#   * `1.5` returns a fractional delta that flows into evaluate()'s
+#     `>= threshold` comparison as a real number.
+#
+# The contract pinned here: a baseline that is not a non-negative int fails
+# SAFE (return None, condition (b) inert, (a)/(c) unaffected) with exactly one
+# WARNING naming the value and its type. VALIDATE, never coerce -- `int("2872")`
+# would silently bless a malformed state file and arm a ~$100 census run on an
+# unaudited number, which is precisely the defect class task 3291 closed on the
+# fetch side.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "baseline",
+    ["2872", "", 2872.0, 1.5, True, False, [2872], {"n": 2872}, object()],
+    ids=["str-int", "str-empty", "float-whole", "float-frac", "bool-true", "bool-false",
+         "list", "dict", "object"],
+)
+def test_compute_tasks_landed_non_int_baseline_fails_safe_with_one_warning(baseline, caplog):
+    """Every non-int baseline lands in the same "one WARNING, return None"
+    branch the fetch and payload faults already use.
+
+    `True`/`False`/`2872.0` are the interesting parameters: they are not
+    TypeErrors, they are SILENT wrong answers today (`True` == 1, so the delta
+    is `current_done - 1`), which is why a bare `except TypeError` would not
+    have been a fix."""
+    state = {"last_census_done_count": baseline}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(3000))
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # Both facts, because either alone is ambiguous in a journal line: the
+    # repr says WHICH value is wrong, the type name says WHY it is wrong
+    # (`"2872"` and `2872` are visually near-identical without it).
+    assert repr(baseline) in message
+    assert type(baseline).__name__ in message
+
+
+def test_compute_tasks_landed_negative_baseline_fails_safe_with_one_warning(caplog):
+    """A done-count cannot be negative. Today `-5` silently inflates the delta
+    in the FIRE-ward direction (`current_done + 5`), so it belongs in the same
+    guard as the type faults rather than being treated as a usable int."""
+    state = {"last_census_done_count": -5}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(600))
+        )
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_bad_baseline_warns_before_touching_the_fetcher(caplog):
+    """Pins the guard's POSITION, not just its existence.
+
+    The baseline is a state-side fault and must be reported BEFORE the
+    `status_fetcher is None` branch and before any fetch. That ordering is what
+    makes a mis-seeded baseline visible on the DEFAULT nightly trickle wiring,
+    where `run_nightly` passes `status_fetcher=None` (nightly.py) and the
+    fetcher guard would otherwise return first -- leaving a corrupt state file
+    unreported in total silence for as long as it sits there."""
+    calls = []
+
+    def _recording_fetcher():
+        calls.append(1)
+        return {"statuses": {"1": "done"}}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": "2872"}, status_fetcher=_recording_fetcher
+        )
+
+    assert result is None
+    assert calls == []
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+    # ...and with no fetcher at all, the single warning is still the specific
+    # baseline complaint, not the generic "no status_fetcher configured" one.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": "2872"}, status_fetcher=None
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "last_census_done_count" in warnings[0].getMessage()
+
+
+def test_compute_tasks_landed_bad_baseline_warning_is_bounded(caplog):
+    """The WARNING is re-emitted into the nightly systemd journal as ONE line,
+    and census-state.json is hand-editable, so an arbitrarily large value must
+    not dump itself into the log (`_bounded_repr`'s whole reason to exist)."""
+    state = {"last_census_done_count": "9" * 5000}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(10))
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert "repr truncated" in message
+
+
+@pytest.mark.parametrize("baseline,expected", [(0, 600), (500, 100), (2872, -2272)])
+def test_compute_tasks_landed_int_baseline_still_computes_delta(baseline, expected, caplog):
+    """Over-rejection guard: a real non-negative int -- including a real 0 and a
+    baseline larger than the current count -- still computes its delta and warns
+    nothing. Complements
+    `test_compute_tasks_landed_empty_project_computes_a_real_zero_delta`, which
+    pins the same property from the payload side."""
+    state = {"last_census_done_count": baseline}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(600))
+        )
+
+    assert result == expected
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
+# task 4085: `_bounded_repr` / `_bounded_keys` — direct coverage.
+#
+# CHARACTERIZATION, with no paired implementation change: both helpers are
+# already correct. They had no direct tests at all (exercised only indirectly
+# through `extract_done_count`'s messages), and the baseline guard above
+# promotes `_bounded_repr` from an incidental helper to the mechanism that
+# keeps a malformed hand-seeded baseline -- an arbitrarily large hand-edited
+# value -- to ONE nightly journal line.
+#
+# Scope, per the amendment pass (review finding #3): these pin the PROPERTY
+# each helper exists for -- output stays bounded, the elision is marked, and
+# the true size is still reported -- not the exact wording of a private
+# format string, and not the `<=`/`>` boundary arithmetic, which would only
+# re-derive the implementation. The end-to-end guarantee that a malformed
+# baseline cannot dump itself into a journal line is pinned separately and
+# behaviourally by
+# `test_compute_tasks_landed_bad_baseline_warning_is_bounded` above; these
+# three are the unit-level backstop for the helpers it leans on.
+#
+# The two constants are read from the module rather than hard-coded, so
+# retuning 200/20 does not produce a false failure here.
+# ---------------------------------------------------------------------------
+
+def test_bounded_repr_bounds_an_arbitrarily_large_value():
+    """The point of the helper: census-state.json and a get_statuses payload
+    are both arbitrarily large, and neither may dump itself into a journal
+    line. A value small enough to print in full is left alone."""
+    assert "repr truncated" not in ct._bounded_repr({"n": 1})
+
+    value = "x" * 100_000
+    result = ct._bounded_repr(value)
+
+    # Bounded, marked as elided, and the TRUE size still stated -- that number
+    # is how an operator tells "slightly over" from "a whole payload".
+    assert len(result) < ct._MAX_REPR_CHARS + 100
+    assert "repr truncated" in result
+    assert str(len(repr(value))) in result
+
+
+def test_bounded_keys_bounds_an_arbitrarily_wide_mapping():
+    """Same property for the key list: a get_statuses payload over a big
+    project has thousands of keys, and the shape is all diagnosis needs."""
+    count = ct._MAX_REPORTED_KEYS + 5
+    mapping = {f"k{i:02d}": i for i in range(count)}
+
+    result = ct._bounded_keys(mapping)
+
+    shown = sum(1 for i in range(count) if f"'k{i:02d}'" in result)
+    assert shown == ct._MAX_REPORTED_KEYS
+    # The suffix reports the TRUE key count, not the number shown.
+    assert str(count) in result
+
+
+def test_bounded_keys_survives_mixed_type_keys():
+    """The invariant the `key=str` sort exists to protect. A bare
+    `sorted({1: ..., "b": ..., None: ...})` raises TypeError comparing int to
+    str -- i.e. the error path would fail while reporting a failure, which is
+    the worst possible place for it. get_statuses payloads are server-supplied,
+    so a mixed-key dict is exactly the malformed shape this reports on."""
+    result = ct._bounded_keys({1: "a", "b": "c", None: "d"})
+
+    assert "1" in result
+    assert "'b'" in result
+    assert "None" in result
+
+
+def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
+    tmp_path, install_fake_httpx
+):
+    """An unreachable endpoint must surface as StatusFetchUnavailable, never
+    as a raw transport exception.
+
+    The transport failure is INJECTED rather than relied upon. This test
+    originally passed on two ambient premises, both of which are now false:
+    that httpx was not importable here (so the lazy-import ImportError branch
+    fired), and that nothing listened on the default FUSED_MEMORY_MCP_URL
+    (http://localhost:8002). httpx is installed today, and a real fused-memory
+    MCP server listens on :8002 on any machine running the stack -- so the
+    test flapped pass/fail with that live server's connection state instead of
+    testing this module. Injecting a failing `httpx` module (via the shared
+    `install_fake_httpx` fixture, as
+    test_default_status_fetcher_sends_streamable_http_accept_headers below
+    also does) makes the "unreachable" premise true by construction.
+    """
+    def _fake_post(url, **kwargs):
+        raise OSError("[Errno 111] Connection refused")
+
+    install_fake_httpx(_fake_post)
+
     fetcher = ct.default_status_fetcher(tmp_path)
 
-    with pytest.raises(ct.StatusFetchUnavailable):
+    # match + __cause__ pin the network-failure branch specifically --
+    # StatusFetchUnavailable also wraps an absent httpx (ImportError), a
+    # non-2xx response, and an _extract_tool_result parse failure, so
+    # asserting only the exception type would still pass if the fake ever
+    # stopped exercising the network path. The fake above raises OSError
+    # (not the narrower ConnectionError -- OSError is what a real errno-111
+    # connection refusal actually is), so pin __cause__ to that.
+    with pytest.raises(ct.StatusFetchUnavailable, match="unreachable at") as excinfo:
         fetcher()
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
+class _FakeHttpxResponse:
+    """A 200/`application/json` `httpx.Response` stand-in for the
+    `default_status_fetcher` tests.
+
+    `status_code` and `headers` were added in the task-3644 amendment pass:
+    `default_status_fetcher._fetch` no longer hand-rolls its own POST, it
+    routes through `post_mcp_tool_call` like the other three legibility MCP
+    consumers -- which reads `status_code` (to detect a stateful server's 400
+    "Missing session ID") and `headers` (to pick the JSON vs SSE decoder).
+    The values pin the STATELESS fused-memory shape this fetcher actually
+    talks to, so these tests keep exercising the single-POST fast path.
+    """
+
+    def __init__(self, payload):
+        self.status_code = 200
+        self.headers = {"content-type": "application/json"}
+        self.text = ""
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_default_status_fetcher_sends_streamable_http_accept_headers(
+    tmp_path, install_fake_httpx
+):
+    """Task 2953: the streamable-HTTP MCP transport 406s
+    ("Not Acceptable: Client must accept application/json") any tools/call
+    POST whose Accept header doesn't include both application/json and
+    text/event-stream -- verified live against a local MCP /mcp endpoint.
+    default_status_fetcher's httpx import is lazy, but httpx is genuinely
+    available here: a DIRECT dependency of `shared` (shared/pyproject.toml,
+    `httpx>=0.27`, task 2965), not a transitive one. So the real POST would
+    actually go out; the shared `install_fake_httpx` fixture substitutes a
+    stub to capture the outbound call without a network, and without
+    depending on whatever is listening on localhost:8002."""
+    captured_kwargs = {}
+    rpc_response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"structuredContent": {"statuses": {"1": "done"}}},
+    }
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse(rpc_response)
+
+    install_fake_httpx(_fake_post)
+
+    fetcher = ct.default_status_fetcher(tmp_path)
+    result = fetcher()
+
+    assert result == {"statuses": {"1": "done"}}
+    headers = captured_kwargs.get("headers") or {}
+    assert "application/json" in headers.get("Accept", "")
+    assert "text/event-stream" in headers.get("Accept", "")
+    # Content-Type is part of the same transport contract -- pin it too so a
+    # future edit dropping it can't pass on the Accept assertions alone.
+    assert headers.get("Content-Type") == "application/json"
+    # The JSON-RPC tools/call body must still ride along on the same call.
+    envelope = captured_kwargs.get("json") or {}
+    assert envelope.get("method") == "tools/call"
+    assert envelope.get("params", {}).get("name") == "get_statuses"
+
+
+def _capture_get_statuses_project_root(install_fake_httpx, project_root):
+    """Drive `default_status_fetcher(project_root)` against a fake httpx and
+    return the `project_root` argument it actually put on the wire. Reuses
+    the `_FakeHttpxResponse` + shared `install_fake_httpx` harness above (the
+    `import httpx` inside `_fetch` is lazy precisely so this works).
+
+    Takes the fixture as a parameter rather than requesting it: this is a
+    plain helper, not a test, so pytest will not inject fixtures into it."""
+    captured_kwargs = {}
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse(
+            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"statuses": {}}}}
+        )
+
+    install_fake_httpx(_fake_post)
+
+    ct.default_status_fetcher(project_root)()
+    return captured_kwargs["json"]["params"]["arguments"]["project_root"]
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_dot(
+    tmp_path, monkeypatch, install_fake_httpx
+):
+    """Task 3291 root cause. fused-memory's `_normalize_project_root` hard-
+    rejects ANY relative path -- verified live against localhost:8002, which
+    answered `{"project_root": "."}` with
+    `{"error": "project_root must be a non-empty absolute path, got: '.'",
+      "error_type": "ValidationError"}`.
+
+    In production that call ALWAYS carried a relative path: census.py's CLI
+    defaults `--project-root` to `"."`, and `nightly._default_census_launcher`
+    (nightly.py:521) launches census.py with no arguments at all. The MCP
+    argument is resolved by the SERVER's cwd, not the client's, so a relative
+    path is meaningless over the wire."""
+    monkeypatch.chdir(tmp_path)
+
+    sent = _capture_get_statuses_project_root(install_fake_httpx, ".")
+
+    assert sent == str(tmp_path.resolve())
+    assert Path(sent).is_absolute()
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
+    tmp_path, monkeypatch, install_fake_httpx
+):
+    """Second case so the fix cannot pass by special-casing `"."` alone."""
+    (tmp_path / "sub" / "dir").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    sent = _capture_get_statuses_project_root(install_fake_httpx, "sub/dir")
+
+    assert sent == str((tmp_path / "sub" / "dir").resolve())
+    assert Path(sent).is_absolute()
+
+
+def test_default_status_fetcher_leaves_absolute_project_root_unchanged(
+    tmp_path, monkeypatch, install_fake_httpx
+):
+    """The other half of the contract: an ALREADY-absolute root must cross the
+    wire byte-for-byte unchanged. Both tests above start from a relative path,
+    so on their own they would not notice a "fix" that mangles absolute inputs.
+
+    This matters concretely because fused-memory keys its `_MAIN_CHECKOUT_CACHE`
+    on the path it is handed: if `resolve()` were ever to rewrite an operator's
+    configured root (a symlinked home, say `/home/leo` -> elsewhere), the cache
+    key would silently stop matching the configured one. Pinning pass-through
+    for the already-absolute case is what keeps this fix a normalisation of
+    relative paths rather than a rewrite of every path."""
+    monkeypatch.chdir(tmp_path)
+    absolute_root = str(tmp_path)
+
+    sent = _capture_get_statuses_project_root(install_fake_httpx, absolute_root)
+
+    assert sent == absolute_root
 
 
 # ---------------------------------------------------------------------------
 # amendment pass (review findings #1/#2): _extract_tool_result() unwraps the
-# real MCP tools/call JSON-RPC envelope. httpx is not installed in this test
-# env (see test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
-# above -- default_status_fetcher's ImportError branch is the only reachable
-# path here), so default_status_fetcher's HTTP round-trip itself cannot be
-# driven end-to-end; these tests instead exercise the envelope parser
+# real MCP tools/call JSON-RPC envelope. default_status_fetcher's HTTP
+# round-trip is never driven against a real endpoint here -- the tests above
+# inject a fake `httpx` module instead, since anything else makes them depend
+# on whether a live fused-memory MCP server happens to be listening on the
+# default URL; these tests instead exercise the envelope parser
 # directly against realistic tools/call response shapes, and then bridge its
 # output into compute_tasks_landed to pin the exact contract between them.
 # ---------------------------------------------------------------------------
@@ -587,7 +1234,8 @@ def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
         last_census_report="plans/confusion-census-prior.md",
         last_census_done_count=500,
     )
-    fetcher = lambda: {"statuses": _done_statuses(550)}  # delta 50 < 120
+    def fetcher():  # delta 50 < 120
+        return {"statuses": _done_statuses(550)}
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
 
@@ -602,7 +1250,8 @@ def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
         last_census_report="plans/confusion-census-prior.md",
         last_census_done_count=500,
     )
-    fetcher = lambda: {"statuses": _done_statuses(630)}  # delta 130 >= 120
+    def fetcher():  # delta 130 >= 120
+        return {"statuses": _done_statuses(630)}
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
 
@@ -651,6 +1300,136 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
+def test_decide_for_project_survives_a_raising_compute_tasks_landed(
+    tmp_path, caplog, monkeypatch
+):
+    """`decide_for_project` must never propagate — and must degrade condition
+    (b) ALONE, keeping (a) and (c) alive.
+
+    The callee is monkeypatched to raise rather than fed a bad baseline, and
+    that is deliberate: a bad baseline no longer raises, so a state-file-driven
+    test would silently become a duplicate of the compute_tasks_landed tests
+    above and this guard would ship untested. Injecting a raising callee pins
+    the contract independently of which inner fault happens to be possible
+    today.
+
+    The stakes are in the degradation granularity. Today the whole call chain
+    is unguarded, so via the `evaluate` CLI a single fault in (b) is caught only
+    by main()'s outermost catch-all, which discards the ENTIRE evaluation — the
+    max-interval backstop that exists precisely to survive a broken (b) is taken
+    out by the same fault."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=9)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+
+    def _boom(*, state, status_fetcher):
+        raise RuntimeError("baseline exploded")
+
+    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert isinstance(decision, ct.Decision)
+    assert decision.fire is False
+
+    # Degraded to a fail-safe None delta, NOT to a fabricated number: this is
+    # the exact line evaluate() emits for `tasks_landed=None`.
+    assert any("tasks-landed: delta unavailable" in r for r in decision.reasons)
+    # ...while conditions (a) and (c) still evaluated — the whole point of
+    # degrading (b) alone.
+    assert any("max-interval" in r for r in decision.reasons)
+    assert any("novelty-spike" in r for r in decision.reasons)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert "baseline exploded" in warnings[0].getMessage()
+
+
+def test_decide_for_project_survives_a_quoted_max_interval_days(tmp_path, caplog):
+    """task 4085 (amendment): the end-to-end pin for the config guard, and the
+    one that shows why per-field fallback is the right degradation.
+
+    `census: {max_interval_days: '10'}` in a hand-edited legibility.yaml used
+    to reach `evaluate()`'s `days_since >= config.max_interval_days` and raise
+    `TypeError: '>=' not supported between instances of 'float' and 'str'`
+    straight out of this function -- verified live before the fix -- defeating
+    its documented never-raises contract and, via the `evaluate` CLI's
+    outermost catch-all, discarding the WHOLE evaluation.
+
+    Here the state is day-11, so with the rejected field back at its default
+    of 10 the (a) max-interval backstop still FIRES. That is the property that
+    matters: a typo in one threshold must not disarm the backstop that exists
+    precisely to survive everything else being broken."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=11)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+    (tmp_path / "docs" / "legibility" / "legibility.yaml").write_text(
+        "census:\n  max_interval_days: '10'\n", encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert isinstance(decision, ct.Decision)
+    assert decision.fire is True
+    assert any("max-interval" in r for r in decision.reasons)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "max_interval_days" in message
+    assert "str" in message
+
+
+def test_decide_for_project_bounds_a_huge_tasks_landed_failure(
+    tmp_path, caplog, monkeypatch
+):
+    """task 4085 (amendment): the guard above must keep this module's
+    one-WARNING-one-line discipline. A `StatusFetchUnavailable` chained from a
+    big get_statuses payload carries an arbitrarily large message, and this
+    WARNING lands in the nightly journal as a single line."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=9)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+
+    def _boom(*, state, status_fetcher):
+        raise ct.StatusFetchUnavailable("payload " + "x" * 50_000 + "\nsecond line")
+
+    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert decision.fire is False
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert "\n" not in message
+    assert "StatusFetchUnavailable" in message
+    assert "repr truncated" in message
+
+
 # ---------------------------------------------------------------------------
 # step-19: RED — CLI `evaluate` subcommand (always exits 0, fail-safe)
 # ---------------------------------------------------------------------------
@@ -669,7 +1448,7 @@ def test_cli_evaluate_dark_factory_like_project_prints_no_fire_and_exits_0(tmp_p
 
 
 def test_cli_evaluate_fire_inducing_fixture_prints_fire_and_exits_0(tmp_path, capsys):
-    twelve_days_ago = (datetime.now(timezone.utc) - timedelta(days=12)).strftime("%Y-%m-%d")
+    twelve_days_ago = (datetime.now(UTC) - timedelta(days=12)).strftime("%Y-%m-%d")
     _write_codebook(
         tmp_path,
         entries=[
@@ -704,3 +1483,720 @@ def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "DECISION:" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# task 3644: post_mcp_tool_call — the MCP streamable-HTTP session handshake
+# ---------------------------------------------------------------------------
+#
+# The escalation MCP server (:8103) is a STATEFUL FastMCP streamable-HTTP
+# server; the fused-memory one (:8002) is STATELESS. All four legibility MCP
+# consumers used to bare-POST `tools/call` at both, which the stateful one
+# rejects at the TRANSPORT layer -- before the tool ever runs -- with
+# (captured verbatim from a live probe against :8103 on 2026-08-05):
+#
+#     HTTP/1.1 400 Bad Request
+#     mcp-session-id: 93599e03ba3b4baeb5bd0d2b6b399ddd
+#     {"jsonrpc":"2.0","id":"server-error",
+#      "error":{"code":-32600,"message":"Bad Request: Missing session ID"}}
+#
+# so every legibility fail-loud escalation was silently swallowed. These tests
+# pin the adaptive fix: POST session-less first, and ONLY on a 400 perform the
+# handshake and retry once, so the stateless path stays exactly one POST.
+
+_SESSION_REQUIRED_400_BODY = {
+    "jsonrpc": "2.0",
+    "id": "server-error",
+    "error": {"code": -32600, "message": "Bad Request: Missing session ID"},
+}
+
+# The live 400 carries an `mcp-session-id` RESPONSE header of its own (see the
+# probe above). It is NOT a usable session -- a client that scrapes it and
+# replays it gets 404 "Session not found". The fakes below hand back this
+# sentinel so a test fails loudly if the implementation ever reuses it instead
+# of running the real `initialize` handshake.
+_UNUSABLE_SESSION_FROM_400 = "sid-scraped-off-the-400-do-not-reuse"
+
+
+class _FakeMcpResponse:
+    """An `httpx.Response` stand-in exposing exactly what the MCP transport
+    helper is allowed to touch: `status_code`, `headers`, `text`, `json()` and
+    `raise_for_status()`.
+
+    Deliberately a separate class from `_FakeHttpxResponse` above rather than
+    an extension of it: that one models only a 200/JSON reply, and widening it
+    with transport states would silently change the premise of every existing
+    test that uses it.
+    """
+
+    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # A plain RuntimeError, NOT httpx.HTTPStatusError: the shared
+            # `install_fake_httpx` stub exposes only `post` and `pytest.fail`s
+            # on any other attribute, so neither the code under test nor this
+            # test may name an httpx exception type (task 3376's constraint).
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("response has no JSON body")
+        return self._payload
+
+
+def _stateful_mcp_post(recorded, *, session_id="sid-abc", tool_result=None):
+    """Build a fake `httpx.post` behaving like the STATEFUL escalation server.
+
+    `tools/call` without a valid `mcp-session-id` request header -> 400
+    "Missing session ID"; `initialize` -> 200 carrying the server-ASSIGNED id
+    as a response header; `notifications/initialized` -> 202 with no body;
+    `tools/call` WITH the assigned header -> 200 + a normal JSON-RPC envelope.
+    Every request is appended to *recorded* as `(url, kwargs)`.
+    """
+    tool_result = {"id": "esc-42"} if tool_result is None else tool_result
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        method = envelope.get("method")
+        if method == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"mcp-session-id": session_id,
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": envelope.get("id"), "result": {}},
+            )
+        if method == "notifications/initialized":
+            return _FakeMcpResponse(status_code=202, headers={}, text="")
+        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
+            return _FakeMcpResponse(
+                status_code=400,
+                headers={"content-type": "application/json",
+                         "mcp-session-id": _UNUSABLE_SESSION_FROM_400},
+                payload=_SESSION_REQUIRED_400_BODY,
+                # The real 400 carries this body as TEXT too; the transport
+                # keeps it so a 400 that was NOT about a missing session can
+                # still be diagnosed from the resulting error message.
+                text=json.dumps(_SESSION_REQUIRED_400_BODY),
+            )
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": envelope.get("id"),
+                     "result": {"structuredContent": tool_result}},
+        )
+
+    return _post
+
+
+def _recording_delete(deleted):
+    """Build a fake `httpx.delete` recording each MCP session-termination call.
+
+    `post_mcp_envelope` DELETEs the endpoint after a handshake so the server
+    does not leak one session (a `_server_instances` entry + a live per-session
+    anyio task) per legibility escalation. The stub is OPT-IN, so every test
+    that reaches a handshake must supply one -- which is the point: a test that
+    forgets lands in `install_fake_httpx`'s loud-miss `pytest.fail` rather than
+    silently exercising a different path.
+    """
+    def _delete(url, **kwargs):
+        deleted.append((url, kwargs))
+        return _FakeMcpResponse(status_code=200, headers={}, text="")
+
+    return _delete
+
+
+def _methods(recorded):
+    """The ordered list of JSON-RPC `method`s actually put on the wire."""
+    return [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
+
+
+def test_post_mcp_tool_call_handshakes_when_the_server_demands_a_session(
+    install_fake_httpx
+):
+    """A stateful server's 400 must trigger initialize -> notifications/
+    initialized -> retry, with the SERVER-assigned session id."""
+    recorded = []
+    deleted = []
+    install_fake_httpx(_stateful_mcp_post(recorded), delete=_recording_delete(deleted))
+
+    result = ct.post_mcp_tool_call(
+        "http://localhost:8103/mcp",
+        "escalate_info",
+        {"task_id": "legibility-census-dark_factory", "summary": "s"},
+    )
+
+    # The unwrapped TOOL result, not the JSON-RPC envelope.
+    assert result == {"id": "esc-42"}
+
+    assert _methods(recorded) == [
+        "tools/call",            # session-less first attempt -> 400
+        "initialize",            # handshake
+        "notifications/initialized",
+        "tools/call",            # retried with the session header
+    ]
+
+    headers = [kwargs.get("headers") or {} for _url, kwargs in recorded]
+
+    # `initialize` MUST be session-less. A client that invents (or scrapes)
+    # its own id here gets 404 "Session not found" from a stateful server --
+    # the trap documented in fused-memory/scripts/cgl_eta_scheduler_gate.py's
+    # McpClient (task 2491).
+    assert "mcp-session-id" not in headers[1]
+
+    # ...and the id used afterwards is the one `initialize` assigned, never
+    # the unusable one the 400 response carried.
+    assert headers[2].get("mcp-session-id") == "sid-abc"
+    assert headers[3].get("mcp-session-id") == "sid-abc"
+
+    # The task-2953 Accept/Content-Type contract still rides on EVERY request,
+    # handshake requests included -- a 406 there would be just as fatal.
+    for sent in headers:
+        assert sent.get("Accept") == ct.MCP_STREAMABLE_HTTP_HEADERS["Accept"]
+        assert sent.get("Content-Type") == ct.MCP_STREAMABLE_HTTP_HEADERS["Content-Type"]
+
+    # The retry re-sends the ORIGINAL call, not a rebuilt/mangled one.
+    retried = (recorded[3][1].get("json") or {})["params"]
+    assert retried["name"] == "escalate_info"
+    assert retried["arguments"]["task_id"] == "legibility-census-dark_factory"
+
+    # ...and the session we opened is RELEASED. Without the DELETE the
+    # long-lived escalation server accumulates one `_server_instances` entry
+    # plus one live per-session anyio task per escalation, for ever.
+    assert len(deleted) == 1, f"expected exactly one session DELETE, got {deleted}"
+    delete_url, delete_kwargs = deleted[0]
+    assert delete_url == "http://localhost:8103/mcp"
+    assert (delete_kwargs.get("headers") or {}).get("mcp-session-id") == "sid-abc"
+
+
+def test_post_mcp_tool_call_makes_exactly_one_post_against_a_stateless_server(
+    install_fake_httpx
+):
+    """Regression guard for the fused-memory submit_task path.
+
+    :8002 is STATELESS -- a bare `tools/call` POST returns 200 with
+    `content-type: application/json` and no session id -- and
+    `census.default_submit_fn` files every curator task through it today. The
+    handshake must therefore be ADAPTIVE: no 400, no extra round trips, so
+    this fix cannot regress task filing.
+    """
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"task_id": "3644"}}},
+        )
+
+    install_fake_httpx(_post)
+
+    result = ct.post_mcp_tool_call(
+        "http://localhost:8002/mcp", "submit_task", {"title": "t"},
+    )
+
+    assert result == {"task_id": "3644"}
+    assert _methods(recorded) == ["tools/call"]
+    assert "mcp-session-id" not in (recorded[0][1].get("headers") or {})
+
+
+def test_post_mcp_tool_call_does_not_retry_a_non_400_failure(install_fake_httpx):
+    """A real server failure must propagate, never be masked by a handshake.
+
+    Only 400 means "missing session ID". Retrying a 500 would double-send a
+    side-effecting tools/call and bury the actual fault under handshake noise.
+    """
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeMcpResponse(
+            status_code=500,
+            headers={"content-type": "application/json"},
+            payload={"error": "boom"},
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    assert _methods(recorded) == ["tools/call"]
+
+
+# ---------------------------------------------------------------------------
+# task 3644: post_mcp_tool_call — SSE body decoding
+# ---------------------------------------------------------------------------
+#
+# The second half of the same defect. Once a session EXISTS, the stateful
+# escalation server answers `tools/call` with an SSE-framed body, not JSON
+# (captured verbatim from the live probe against :8103 on 2026-08-05):
+#
+#     HTTP/1.1 200 OK
+#     content-type: text/event-stream
+#
+#     event: message
+#     data: {"jsonrpc":"2.0","id":1,"result":{...}}
+#
+# `response.json()` raises a JSONDecodeError on that body, so even a perfectly
+# handshaken client still drops the escalation. The fakes below make `json()`
+# raise exactly as httpx would, so a test cannot pass by accidentally taking
+# the JSON path on an SSE response.
+
+
+class _FakeSseResponse(_FakeMcpResponse):
+    """A 200 `text/event-stream` response whose `json()` raises, exactly as
+    `httpx.Response.json()` does on an SSE body."""
+
+    def __init__(self, text, *, status_code=200):
+        super().__init__(
+            status_code=status_code,
+            headers={"content-type": "text/event-stream"},
+            text=text,
+        )
+
+    def json(self):
+        raise json.JSONDecodeError("Expecting value", self.text or "", 0)
+
+
+def _sse_body(payload) -> str:
+    """Frame *payload* the way the escalation server frames a tools/call
+    reply: an `event:` line, a `data:` line, and a blank terminator."""
+    return f"event: message\ndata: {json.dumps(payload)}\n\n"
+
+
+def test_post_mcp_tool_call_decodes_an_sse_tools_call_response(install_fake_httpx):
+    """The post-handshake retry's SSE body must be parsed off its `data:`
+    line -- the JSON path is never taken for an SSE response."""
+    recorded = []
+    deleted = []
+    stateful = _stateful_mcp_post(recorded)
+
+    def _post(url, **kwargs):
+        response = stateful(url, **kwargs)
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "tools/call" and response.status_code == 200:
+            return _FakeSseResponse(_sse_body(
+                {"jsonrpc": "2.0", "id": 1,
+                 "result": {"structuredContent": {"id": "esc-77", "level": 0}}},
+            ))
+        return response
+
+    install_fake_httpx(_post, delete=_recording_delete(deleted))
+
+    result = ct.post_mcp_tool_call(
+        "http://localhost:8103/mcp", "escalate_info", {"summary": "s"},
+    )
+
+    assert result == {"id": "esc-77", "level": 0}
+    assert _methods(recorded)[-1] == "tools/call"
+    assert len(deleted) == 1
+
+
+def test_post_mcp_tool_call_decodes_an_sse_response_without_a_handshake(
+    install_fake_httpx
+):
+    """SSE framing is a property of the RESPONSE, not of the handshake: a
+    server that answers the first (session-less) POST with an SSE body must
+    decode identically, with no extra round trips."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeSseResponse(_sse_body(
+            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}},
+        ))
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
+        "ok": True
+    }
+    assert _methods(recorded) == ["tools/call"]
+
+
+def test_post_mcp_tool_call_still_decodes_a_plain_json_response(install_fake_httpx):
+    """Regression guard: the stateless fused-memory shape
+    (`content-type: application/json`) must keep decoding via `json()`
+    unchanged -- SSE support is additive, not a replacement."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"task_id": "3644"}}},
+        )
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {}) == {
+        "task_id": "3644"
+    }
+    assert _methods(recorded) == ["tools/call"]
+
+
+def test_post_mcp_tool_call_fails_loud_on_an_sse_body_with_no_data_line(
+    install_fake_httpx
+):
+    """A malformed stream must raise a bounded, diagnosable error rather than
+    degrade to `{}` -- a silently-empty result is exactly the green-on-paper
+    failure this task exists to close."""
+    def _post(url, **kwargs):
+        return _FakeSseResponse("event: message\n: keep-alive comment\n\n")
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(Exception, match="no SSE data line") as excinfo:
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    # The offending body is reported at all...
+    assert "keep-alive" in str(excinfo.value)
+
+
+def test_post_mcp_tool_call_bounds_the_reported_sse_body(install_fake_httpx):
+    """...and reported BOUNDED. Separated from the test above deliberately:
+    "the marker text appears" passes identically for an unbounded
+    `repr(response.text)`, so on its own it asserts nothing about boundedness
+    and a refactor swapping `_bounded_repr` for a raw f-string would stay
+    green while re-introducing the multi-kilobyte-log-line problem this module
+    documents at `_MAX_REPR_CHARS`.
+
+    Every one of these messages is re-emitted verbatim into the nightly
+    systemd journal by `compute_tasks_landed` / `run_census`, one line each.
+    """
+    oversized = "event: message\n: " + ("x" * 5000) + "\n\n"
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(oversized)
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(Exception, match="no SSE data line") as excinfo:
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    message = str(excinfo.value)
+    assert "repr truncated" in message
+    # Bounded to roughly `_MAX_REPR_CHARS` plus the surrounding prose -- the
+    # 5000-char body must NOT be in there. A generous ceiling: the assertion
+    # under test is "orders of magnitude smaller than the body", not an exact
+    # length.
+    assert len(message) < ct._MAX_REPR_CHARS + 300, (
+        f"error message is {len(message)} chars for a {len(oversized)}-char "
+        f"body -- the bounded repr is not being applied"
+    )
+
+
+def test_post_mcp_envelope_tolerates_an_empty_202_body(install_fake_httpx):
+    """`notifications/initialized` answers 202 with no body at all; decoding
+    must yield `{}` rather than raising on the absent JSON."""
+    def _post(url, **kwargs):
+        return _FakeMcpResponse(status_code=202, headers={}, text="")
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_envelope(
+        "http://localhost:8103/mcp",
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+    ) == {}
+
+
+def test_post_mcp_tool_call_skips_sse_notification_frames(install_fake_httpx):
+    """A notification frame ahead of the response must be SKIPPED, not
+    mistaken for it.
+
+    FastMCP streams progress/log notifications over the same `tools/call` SSE
+    stream whenever a tool takes a `Context`. Returning the first `data:` line
+    would hand `_extract_tool_result` a notification and raise "malformed MCP
+    response (no result)" on a call that SUCCEEDED server-side -- a transport
+    bug in appearance, re-opening exactly this investigation.
+    """
+    body = (
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","method":"notifications/progress",'
+        '"params":{"progress":1}}\n'
+        '\n'
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","id":1,'
+        '"result":{"structuredContent":{"id":"esc-99"}}}\n'
+        '\n'
+    )
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(body)
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
+        "id": "esc-99"
+    }
+
+
+def test_post_mcp_tool_call_joins_multiline_sse_data_fields(install_fake_httpx):
+    """Per the SSE spec a single event's `data` field may span several `data:`
+    lines, which must be newline-JOINED before parsing. Parsing only the first
+    would feed `json.loads` a fragment and raise on a well-formed response."""
+    body = (
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","id":1,\n'
+        'data:  "result":{"structuredContent":{"id":"esc-split"}}}\n'
+        '\n'
+    )
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(body)
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
+        "id": "esc-split"
+    }
+
+
+def test_post_mcp_tool_call_fails_loud_on_a_notification_only_sse_stream(
+    install_fake_httpx
+):
+    """Data frames that carry no JSON-RPC result/error at all are a real
+    fault, not an empty success."""
+    body = (
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n'
+        '\n'
+    )
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(body)
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(Exception, match="no MCP result/error frame"):
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+
+# ---------------------------------------------------------------------------
+# task 3644 (amendment pass): a 200 carrying a TOOL-LEVEL failure is not a
+# success
+# ---------------------------------------------------------------------------
+#
+# `nightly.post_escalation` and `check_transcript_persistence.post_findings`
+# discard the decoded body and report True on "no exception raised", so an
+# `isError: true` (or a JSON-RPC `error`) envelope read as a landed escalation
+# -- the same green-on-paper/nothing-filed failure this task exists to close,
+# one layer up from the transport.
+
+
+# A realistic `tools/call` envelope for the transport-level tests below, so
+# `_methods()` sees the method actually being retried rather than a bare stub.
+_ESCALATE_ENVELOPE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {"name": "escalate_info", "arguments": {"summary": "s"}},
+}
+
+def test_post_mcp_envelope_raises_on_a_tool_error_envelope(install_fake_httpx):
+    """`result.isError: true` -- FastMCP's shape for a raised ToolError."""
+    def _post(url, **kwargs):
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "unknown category 'nope'"}],
+            }},
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(ct.StatusFetchUnavailable, match="MCP tool reported an error"):
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+
+def test_post_mcp_envelope_raises_on_a_jsonrpc_error_envelope(install_fake_httpx):
+    """A JSON-RPC-level `error` (the request never reached a tool) on a 200."""
+    def _post(url, **kwargs):
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "error": {"code": -32602, "message": "Unknown tool"}},
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(ct.StatusFetchUnavailable, match="JSON-RPC error"):
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+
+# ---------------------------------------------------------------------------
+# task 3644 (amendment pass): the handshake's own failure paths
+# ---------------------------------------------------------------------------
+#
+# These are the paths an operator actually hits when the server is
+# misconfigured or rejects the protocol version -- and an unexercised error
+# path in this transport is precisely how the original defect survived. Each
+# also pins that the ORIGINAL 400's body is carried into the message, so a 400
+# that was NOT about a missing session is still diagnosable instead of being
+# replaced by a misleading session-protocol complaint.
+
+
+def test_post_mcp_envelope_raises_when_initialize_assigns_no_session_id(
+    install_fake_httpx
+):
+    """A stateless server answering a genuinely-bad request with 400 answers
+    `initialize` with 200 and NO session id. That must name the ORIGINAL 400's
+    reason, not just complain about the session protocol -- and must not go on
+    to send a doomed retry."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"content-type": "application/json"},  # no session id
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        return _FakeMcpResponse(
+            status_code=400,
+            headers={"content-type": "application/json"},
+            text='{"error":{"message":"category must be one of ..."}}',
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(RuntimeError, match="assigned no mcp-session-id") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8002/mcp", _ESCALATE_ENVELOPE)
+
+    # The server's OWN stated reason survives into the message.
+    assert "category must be one of" in str(excinfo.value)
+    # No `notifications/initialized`, no retry: the handshake stopped dead.
+    assert _methods(recorded) == ["tools/call", "initialize"]
+
+
+def test_post_mcp_envelope_raises_when_initialize_itself_fails(install_fake_httpx):
+    """A non-2xx `initialize` (protocol version rejected, server wedged) must
+    surface with its status AND the original 400, and must not retry."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "initialize":
+            return _FakeMcpResponse(status_code=500, headers={}, text="boom")
+        return _FakeMcpResponse(
+            status_code=400, headers={},
+            text='{"error":{"message":"Missing session ID"}}',
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(RuntimeError, match="HTTP 500") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+    assert "failed at initialize" in str(excinfo.value)
+    assert "Missing session ID" in str(excinfo.value)
+    assert _methods(recorded) == ["tools/call", "initialize"]
+
+
+def test_post_mcp_envelope_raises_when_notifications_initialized_fails(
+    install_fake_httpx
+):
+    """A failing `notifications/initialized` must abort before the retry --
+    and still release the session it already opened."""
+    recorded = []
+    deleted = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        method = envelope.get("method")
+        if method == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"mcp-session-id": "sid-abc",
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        if method == "notifications/initialized":
+            return _FakeMcpResponse(status_code=500, headers={}, text="boom")
+        return _FakeMcpResponse(
+            status_code=400, headers={},
+            text='{"error":{"message":"Missing session ID"}}',
+        )
+
+    install_fake_httpx(_post, delete=_recording_delete(deleted))
+
+    with pytest.raises(RuntimeError, match="HTTP 500") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+    assert "failed at notifications/initialized" in str(excinfo.value)
+    assert _methods(recorded) == [
+        "tools/call", "initialize", "notifications/initialized",
+    ]
+    # The session existed by then, so it is released on the failure path too.
+    assert [(kw.get("headers") or {}).get("mcp-session-id") for _u, kw in deleted] == [
+        "sid-abc"
+    ]
+
+
+def test_post_mcp_envelope_raises_when_the_retry_still_fails(install_fake_httpx):
+    """A 400 that was never about the session: the retry fails the same way,
+    and the message must say so rather than blame the handshake."""
+    recorded = []
+    deleted = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"mcp-session-id": "sid-abc",
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        if envelope.get("method") == "notifications/initialized":
+            return _FakeMcpResponse(status_code=202, headers={}, text="")
+        return _FakeMcpResponse(
+            status_code=400, headers={},
+            text='{"error":{"message":"task_id must be a non-empty string"}}',
+        )
+
+    install_fake_httpx(_post, delete=_recording_delete(deleted))
+
+    with pytest.raises(RuntimeError, match="still rejected the envelope") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+    assert "task_id must be a non-empty string" in str(excinfo.value)
+    # Exactly ONE retry -- never a loop.
+    assert _methods(recorded).count("tools/call") == 2
+    assert len(deleted) == 1
+
+
+def test_post_mcp_envelope_never_lets_a_failing_session_delete_propagate(
+    install_fake_httpx
+):
+    """Session tidy-up is best-effort by design: the envelope has ALREADY been
+    delivered by the time the DELETE runs, so a failure to release the session
+    must never turn a landed escalation into a reported failure."""
+    recorded = []
+
+    def _exploding_delete(url, **kwargs):
+        raise OSError("[Errno 111] Connection refused")
+
+    install_fake_httpx(_stateful_mcp_post(recorded), delete=_exploding_delete)
+
+    assert ct.post_mcp_tool_call(
+        "http://localhost:8103/mcp", "escalate_info", {"summary": "s"},
+    ) == {"id": "esc-42"}

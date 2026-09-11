@@ -48,7 +48,8 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import config, inventory, sampling  # noqa: E402
+from legibility import census_trigger, config, inventory, sampling  # noqa: E402
+
 from orchestrator import session_registry  # noqa: E402
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
@@ -201,7 +202,7 @@ def _first_user_turn(path: Path) -> dict[str, Any] | None:
     ``except OSError`` contract.
     """
     try:
-        for record in inventory._iter_json_lines(path):
+        for record in inventory.iter_json_lines(path):
             if (
                 record.get('type') == 'user'
                 and not record.get('isSidechain')
@@ -239,8 +240,22 @@ def find_matching_transcript(
     """Find the transcript file under *projects_root* that belongs to *record*, or None.
 
     The expected dir is ``projects_root/<encoded-cwd>`` (via
-    ``inventory.encode_cwd`` — the same lossy ``/``/``.`` -> ``-`` encoding
-    Claude Code itself uses). Missing dir -> ``None``.
+    ``inventory.encode_cwd`` — the same lossy ``/``/``.``/``_`` -> ``-``
+    encoding Claude Code itself uses). Missing dir -> ``None``.
+
+    THIS IS THE ONE CONSUMER THAT USES ``encode_cwd`` AS A DIRECT LOOKUP KEY.
+    Everywhere else in ``inventory.py`` the encoding is only a cheap superset
+    pre-filter over a directory listing, re-checked against the session's real
+    ``cwd`` by ``inventory.is_member``; here there is no such backstop. An
+    encoder that renders even one character differently from Claude Code
+    resolves to a directory that does not exist, this function returns
+    ``None``, and :func:`find_missing_transcripts` emits a FALSE-POSITIVE
+    "session ran, no transcript" finding — which escalates — naming an
+    ``expected_dir`` that was never going to exist. That is why the encoder
+    must be exact, and why it is pinned to real on-disk dir names by
+    ``test_legibility_inventory.py``'s ``TestEncoderLockstep`` (task 3272,
+    which found the ``_`` rule missing and this detector alarming on
+    dark-factory's own ``.eval-worktrees/df_task_<N>/`` sessions).
 
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
     headless-agent transcripts share the encoded-cwd dir):
@@ -362,18 +377,40 @@ def find_missing_transcripts(
 # ---------------------------------------------------------------------------
 
 _FORCE_PERSISTENCE_RE = re.compile(
-    r'^[ \t]*(?:export[ \t]+)?CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=(["\']?)1\1(?![0-9])',
+    r'(?:^[ \t]*(?:export[ \t]+)?'
+    r'|(?<=[;{}])[ \t]*export[ \t]+)'
+    r'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=(["\']?)1\1(?![0-9])',
     re.MULTILINE,
 )
 """Matches ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` set to ``1`` in
 ``export VAR=1`` / plain ``VAR=1`` / quoted ``VAR="1"`` forms, while rejecting
 ``=0`` and any longer number (``=10``) via the closing backreference +
-no-trailing-digit lookahead. Anchored to an ASSIGNMENT context (line start,
-optional indentation, optional ``export`` prefix) so a commented-out or
-documentary reference (``# do NOT set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``)
-or the token embedded in a larger identifier (``FOO_CLAUDE_..._PERSISTENCE=1``)
-does NOT falsely report the preventer as present. No ``\\s*`` after ``=`` — a
-space there (``VAR= 1``) is not a valid shell assignment."""
+no-trailing-digit lookahead.
+
+Two ASSIGNMENT-context alternatives, so a commented-out or documentary
+reference (``# do NOT set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``) or the
+token embedded in a larger identifier (``FOO_CLAUDE_..._PERSISTENCE=1``) does
+NOT falsely report the preventer as present:
+
+1. Line start (optional indentation, optional ``export`` prefix) — the
+   original anchored form, for a script that sets the var on its own line.
+2. Mid-line, immediately after a ``;``, ``{``, or ``}`` boundary (optional
+   indentation), with a MANDATORY ``export`` keyword — covers a payload
+   built by string concatenation, e.g. ``skills/spawn/spawn-claude.sh``'s
+   ``${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd ...``
+   (task 2923), where the real export is neither at line start nor preceded
+   by whitespace. Requiring ``export`` (not optional, unlike alternative 1)
+   on this branch keeps a bare mid-line ``VAR=1`` embedded in prose from
+   matching, and the explicit boundary-char lookbehind keeps a ``# ...``
+   comment continuation from matching (a space is not a boundary char).
+   ``"``/``'`` are deliberately EXCLUDED from the boundary set — including
+   them would match a merely-quoted/echoed token, e.g.
+   ``echo "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"``, as if it were
+   a real export (reviewer_comprehensive/robustness, task 2923 amendment);
+   the shipped ``spawn-claude.sh`` payload only ever needs ``;``/``{``/``}``.
+
+No ``\\s*`` after ``=`` — a space there (``VAR= 1``) is not a valid shell
+assignment."""
 
 
 def payload_exports_force_persistence(script_text: str) -> bool:
@@ -459,16 +496,28 @@ def _build_escalation_arguments(
 
 
 def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
+    """Post *envelope* to *url* over the MCP streamable-HTTP transport.
 
-    ``httpx`` is imported lazily since it is not a ``scripts/`` dependency —
-    mirrors ``nightly._default_poster``. Raises on any network/HTTP failure;
-    :func:`post_findings` wraps this best-effort.
+    Delegates to ``census_trigger.post_mcp_envelope``, which single-sources
+    the whole transport contract for this subsystem: the required
+    Accept/Content-Type pair, the session handshake, and response-body
+    decoding. Raises on any network/HTTP failure; :func:`post_findings`
+    wraps this best-effort.
+
+    Why this is not a bare POST any more (task 3644): the escalation server
+    is a STATEFUL streamable-HTTP server. A session-less ``tools/call`` is
+    rejected at the transport layer, before the tool ever runs, with
+    ``400 Bad Request`` / ``"Missing session ID"`` -- and with
+    :func:`post_findings` swallowing that best-effort, the transcript-loss
+    alarm never reached anyone. ``post_mcp_envelope`` performs the
+    ``initialize`` -> ``notifications/initialized`` handshake on that 400 and
+    retries once, and decodes the SSE-framed reply that server then sends.
+
+    Keeps returning None and discarding the decoded body: the caller only
+    needs "did it land", and preserving the ``(url, envelope) -> None`` seam
+    signature keeps every injected ``poster=`` in the test suite working.
     """
-    import httpx
-
-    response = httpx.post(url, json=envelope, timeout=10.0)
-    response.raise_for_status()
+    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
 
 
 def post_findings(

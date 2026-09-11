@@ -896,6 +896,18 @@ def _make_workflow(
     scheduler = MagicMock()
     scheduler.get_statuses = AsyncMock(return_value=get_statuses_return)
     scheduler.mark_done = AsyncMock()
+    # Task 3057: the train-member done-flip now reads the member's row to
+    # check its declared delivered_checks before stamping, so the double must
+    # answer get_task. A row carrying no 'delivered_checks' leaves the guard
+    # inert — these scenarios assert merge/flip mechanics, not capability
+    # verification, so they keep their pre-3057 behaviour. Without this stub
+    # the MagicMock attribute is un-awaitable and every flip fail-safes into
+    # withholding.
+    scheduler.get_task = AsyncMock(
+        side_effect=lambda tid, **_kw: {
+            "id": tid, "title": tid, "status": "in-progress", "metadata": {},
+        },
+    )
     scheduler.tasks_by_train = AsyncMock(
         return_value=(tasks_by_train_return or [])
     )

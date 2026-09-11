@@ -193,3 +193,33 @@ class TestRecoverPendingMergesDelegates:
             f'branch_prefix should be {h.config.git.branch_prefix!r}; '
             f'got {kw.get("branch_prefix")!r}'
         )
+
+    async def test_delegation_forwards_inflight_registry(
+        self, mock_orch_config, tmp_path: Path
+    ):
+        """_recover_pending_merges forwards the harness's SHARED in-flight
+        registry so the recovery path collapses per-branch duplicates through
+        the SAME InFlightMergeRegistry the live submit path uses (task 2926 γ).
+
+        RED until step-6 makes the wrapper pass
+        ``registry=self._merge_inflight_registry``.
+        """
+        h = _build_harness(mock_orch_config)
+        h.event_store = None
+
+        with patch('orchestrator.harness.recover_pending_merges',
+                   new=AsyncMock(return_value={
+                       'recovered': 0, 'dropped': 0, 'coalesced': 0, 'requests': [],
+                   }),
+                   ) as mock_recover:
+            await h._recover_pending_merges()
+
+        assert mock_recover.called, (
+            '_recover_pending_merges did not call recover_pending_merges'
+        )
+        kw = mock_recover.call_args.kwargs
+        assert kw.get('registry') is h._merge_inflight_registry, (
+            'wrapper must forward registry=self._merge_inflight_registry (the '
+            'shared in-flight registry the live submit path uses); '
+            f'got {kw.get("registry")!r}'
+        )

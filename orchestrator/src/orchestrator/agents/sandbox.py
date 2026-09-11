@@ -68,7 +68,39 @@ def build_bwrap_command(
     - --tmpfs /tmp — writable tmp
     - --dev /dev — device nodes
     - --proc /proc — proc filesystem
-    - --bind $HOME/.claude — Claude Code config/OAuth (writable for session state)
+    - / is read-only; ~/.claude is read-only too except for whatever
+      subpaths are supplied here via writable_extras (e.g.
+      ~/.claude/fleet/, as computed by
+      orchestrator.agents.write_set.compute_write_set), so
+      ~/.claude/settings.json stays read-only (PRD
+      deny-write-to-settings.json property).
+
+    CALLER OBLIGATION — CLAUDE_CONFIG_DIR must be granted, not assumed:
+    this function binds exactly the module dirs, <worktree>/.task, /tmp
+    (tmpfs), /dev, /proc, and each writable_extra. Whoever redirects the
+    CLI's OAuth/session state to a per-task CLAUDE_CONFIG_DIR MUST ALSO
+    pass that directory in writable_extras. The orchestrator satisfies
+    this via the .task bind; reconciliation — which lands on THIS branch
+    whenever Landlock is unavailable — satisfies it via a per-run computed
+    extra in cli_stage_runner.run_stage_via_cli, machine-checked by
+    sandbox_guard.resolve_recon_sandbox_wrap. That check exists because the
+    obligation went silently unmet from 2026-07-18 (task 2744) to
+    2026-08-11 (task 4003): recon's config dir sat under
+    <data_dir>/recon-config/, outside every bind above, so every recon
+    stage was told where to write its transcript and then denied the write.
+    Note this branch drops a writable_extra that is not an existing dir
+    (see below), so a mistimed grant is vacuous here too — logged, not
+    silent, and landlock_exec._add_path now prints the same signal for its
+    --writable list, so the two backends degrade equally loudly.
+
+    ALSO NOTE `--tmpfs /tmp` below: unlike the Landlock branch, which grants
+    the HOST /tmp blanket, this branch replaces /tmp with a fresh empty
+    tmpfs before binding anything. A CLAUDE_CONFIG_DIR under host /tmp is
+    therefore NOT reachable here just by living there — its pre-spawn
+    .credentials.json is invisible and its session JSONL lands in a tmpfs
+    the parent can never read. It must be named in writable_extras, which
+    is bound over the tmpfs. sandbox_guard._writable_roots excludes /tmp
+    from its containment roots for exactly this reason.
     """
     cmd = [
         'bwrap',
@@ -92,16 +124,24 @@ def build_bwrap_command(
     os.makedirs(task_dir, exist_ok=True)
     cmd.extend(['--bind', task_dir, task_dir])
 
-    # Claude Code config/OAuth
-    claude_dir = os.path.join(os.path.expanduser('~'), '.claude')
-    if os.path.isdir(claude_dir):
-        cmd.extend(['--bind', claude_dir, claude_dir])
-
     # Extra writable directories
     if writable_extras:
         for extra in writable_extras:
             if os.path.isdir(extra):
                 cmd.extend(['--bind', extra, extra])
+            else:
+                # bwrap cannot --bind a nonexistent path, and compute_write_set
+                # is intentionally pure (no makedirs) — existence/creation is
+                # the backend's job, but this backend does not create extras
+                # (unlike the writable_modules/.task loops above, which do).
+                # Silently dropping the bind would let a requested writable
+                # path (e.g. ~/.claude/fleet on first run) go missing with no
+                # signal, contrary to the loud-over-silent-degradation norm —
+                # so surface it instead of degrading silently.
+                logger.warning(
+                    'build_bwrap_command: writable extra %r is not a directory '
+                    '— skipping bind (path missing or not created yet)', extra,
+                )
 
     cmd.append('--')
     cmd.extend(inner_cmd)

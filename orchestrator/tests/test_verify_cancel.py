@@ -12,6 +12,8 @@ Steps covered:
   13 (test) real-process capstone: setsid + start_new_session escape tree reaped
 """
 
+import errno
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -278,6 +280,164 @@ class TestCancelRequest:
 
 
 # ---------------------------------------------------------------------------
+# Task 3186 (PRD δ) step-21: `killed_pgid_out` — what cancel_request ACTUALLY
+# killed, as distinct from what it returned.
+#
+# THE STAKE.  `cancel_request` returns 0 for FOUR distinct cases and only ONE
+# of them killed anything: a successful kill, `FileNotFoundError`,
+# corrupt/unparseable content, and `pgid <= 0`.  Its sole production caller
+# (`cli.py:cancel_verify`) must clear the SHARED fixed-key holder rendezvous
+# ONLY when the key names the process it actually SIGKILLed — and rc alone
+# cannot tell it that.  cli.py:607-622 shows the key's owner writes it only
+# when it won the build-lane flock and clears it only in its own `finally`, so
+# the key routinely names a DIFFERENT, live verify; clearing it then makes
+# `GitOps._merge_verify_lease_active` fail-OPEN (`read_lock_holder_pgid` ->
+# None -> "not held"), losing `reset_persistent_merge_worktree`'s typed
+# `MergeVerifyLeaseHeld` diagnosis and making DF-3071's admission guard read
+# `_merge-verify` as IDLE while a verify is live — so the fleet redeploys over
+# it instead of deferring.
+#
+# The reporting channel follows the established `failed_pids_out` out-param
+# idiom, and is additive + keyword-only so every existing caller stays
+# source-compatible (test_cli.py's `fake_cancel_request(path, **kwargs)`
+# absorbs it; its rc=42 never reaches the clear).
+# ---------------------------------------------------------------------------
+
+
+class TestCancelRequestReportsWhatItKilled:
+    """`killed_pgid_out` reports on the kill path only — rc == 0 does not."""
+
+    def _run(self, path, ppid_map, *, kill_side_effects=None, out=None, failed_out=None):
+        """Run cancel_request with declawed kill/killpg and the new out-param."""
+        from orchestrator.verify_cancel import cancel_request
+
+        def _kill(pid, sig):
+            if kill_side_effects and kill_side_effects.get(pid) is not None:
+                raise kill_side_effects[pid]
+
+        rc = cancel_request(
+            path,
+            ppid_map_provider=lambda: ppid_map,
+            kill=_kill,
+            killpg=lambda pgid, sig: None,
+            failed_pids_out=failed_out,
+            killed_pgid_out=out,
+        )
+        return rc
+
+    def test_success_path_reports_the_killed_pgid(self, tmp_path):
+        """(a) The one return-0 path that killed something reports it."""
+        from orchestrator.verify_cancel import pgid_file, write_pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-killed')
+        write_pgid_file(path, 4242)
+        out: list[int] = []
+        failed: list[int] = []
+
+        rc = self._run(path, {900: 4242}, out=out, failed_out=failed)
+
+        assert rc == 0
+        assert out == [4242], (
+            'the caller can only gate its shared-key clear on identity if the '
+            'pgid that was swept is reported back'
+        )
+        assert failed == []
+        assert not path.exists()
+
+    def test_absent_file_reports_nothing(self, tmp_path):
+        """(b) `FileNotFoundError` -> rc 0, nothing killed, nothing reported.
+
+        The COMMON case: a verify-merge that completes normally removes its own
+        per-request pgid file in its finally, so a cancel racing normal
+        completion lands here.
+        """
+        from orchestrator.verify_cancel import pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-absent')
+        out: list[int] = []
+
+        assert self._run(path, {}, out=out) == 0
+        assert out == []
+
+    def test_corrupt_content_reports_nothing(self, tmp_path):
+        """(c) Unparseable content -> rc 0, file removed, nothing reported."""
+        from orchestrator.verify_cancel import pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-corrupt')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('not-an-int')
+        out: list[int] = []
+
+        assert self._run(path, {}, out=out) == 0
+        assert out == []
+        assert not path.exists()
+
+    def test_nonsensical_pgid_reports_nothing(self, tmp_path):
+        """(d) `pgid <= 0` -> rc 0, treated as corrupt, nothing reported."""
+        from orchestrator.verify_cancel import pgid_file
+
+        for i, raw in enumerate(('0', '-1')):
+            path = pgid_file(tmp_path / 'wt', f'req-nonsense-{i}')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw)
+            out: list[int] = []
+
+            assert self._run(path, {}, out=out) == 0, raw
+            assert out == [], f'{raw!r} kills nothing, so it reports nothing'
+            assert not path.exists()
+
+    def test_permission_error_path_reports_nothing(self, tmp_path):
+        """(e) rc == 1 -> a LIVE process refused SIGKILL; report nothing.
+
+        The victim plausibly still holds both lease axes, so the caller must
+        stay fail-closed and leave the rendezvous alone.  `failed_pids_out`
+        keeps its existing behaviour on this same path.
+        """
+        from orchestrator.verify_cancel import pgid_file, write_pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-refused')
+        write_pgid_file(path, 4242)
+        out: list[int] = []
+        failed: list[int] = []
+
+        rc = self._run(
+            path, {}, kill_side_effects={4242: PermissionError()},
+            out=out, failed_out=failed,
+        )
+
+        assert rc == 1
+        assert out == [], 'a refused SIGKILL killed nothing — report nothing'
+        assert failed == [4242], 'the existing out-param is unchanged'
+        assert path.exists()
+
+    def test_out_param_is_optional_and_keyword_only(self, tmp_path):
+        """(f) Every existing call site stays source-compatible.
+
+        `cancel_request(path)` with no out-params must still work, and the new
+        parameter must be keyword-only so no positional caller can bind it by
+        accident.
+        """
+        import inspect
+
+        from orchestrator.verify_cancel import cancel_request, pgid_file, write_pgid_file
+
+        params = inspect.signature(cancel_request).parameters
+        assert params['killed_pgid_out'].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params['killed_pgid_out'].default is None
+
+        path = pgid_file(tmp_path / 'wt', 'req-nokwargs')
+        write_pgid_file(path, 4242)
+        rc = cancel_request(
+            path,
+            ppid_map_provider=dict,
+            kill=lambda pid, sig: None,
+            killpg=lambda pgid, sig: None,
+        )
+        assert rc == 0
+        assert not path.exists()
+
+
+# ---------------------------------------------------------------------------
 # Step-7: start_own_process_group — setsid + fallback
 # ---------------------------------------------------------------------------
 
@@ -396,6 +556,988 @@ class TestAcquireReleaseMergeVerifyFlock:
 
 
 # ---------------------------------------------------------------------------
+# Task 3081 step-1 (D8 / B13): lane_lock_holder_pids — kernel flock-holder probe.
+#
+# PRD: plans/warm-lane-infra-repatriation-prd.md §D8.  Incident anchor: reify
+# esc-5548-5, whose forensics read /proc/locks and inode-matched
+# `FLOCK ADVISORY WRITE 588232 07:1d:4300647613` against `_merge-verify.lock`.
+#
+# The holder-pgid rendezvous below CANNOT see that incident: an orphaned acquire
+# never reaches write_lock_holder_pgid (git_ops.py calls it only AFTER the
+# acquire returns), so the rendezvous is empty in exactly the leak case.  Kernel
+# truth is the only evidence available, hence this probe.
+#
+# Row shape verified live on this host:
+#     '82: FLOCK  ADVISORY  WRITE 1553455 103:08:14958524 0 EOF'
+# i.e. `<id>: <TYPE> <MODE> <RW> <PID> <MAJ:MIN:INO> <START> <END>`, where
+# MAJ/MIN are HEX and the inode is DECIMAL.  A process BLOCKED waiting on the
+# same inode appears as a distinct `-> FLOCK` row and is NOT a holder:
+#     '82: -> FLOCK  ADVISORY  WRITE 1555037 103:08:14958524 0 EOF'
+# ---------------------------------------------------------------------------
+
+
+def _locks_row(
+    lock_path: Path,
+    pid: int,
+    *,
+    row_id: int = 308,
+    kind: str = 'FLOCK',
+    waiter: bool = False,
+) -> str:
+    """Render one /proc/locks row for *lock_path*'s real device+inode.
+
+    Deriving MAJ:MIN:INO from a genuine ``os.stat`` (rather than hardcoding a
+    triple) is what makes the synthetic fixtures test the SAME matching the
+    kernel-truth cases exercise — a parser that mis-reads the hex/decimal split
+    cannot pass both.
+    """
+    import os as _os
+
+    st = _os.stat(lock_path)
+    triple = f'{_os.major(st.st_dev):02x}:{_os.minor(st.st_dev):02x}:{st.st_ino}'
+    arrow = '-> ' if waiter else ''
+    return f'{row_id}: {arrow}{kind}  ADVISORY  WRITE {pid} {triple} 0 EOF'
+
+
+class _ChunkedLocksPath(Path):
+    """A ``locks_path`` serving SCRIPTED snapshots, one per ``read_text()`` call.
+
+    Makes the measured ``/proc/locks`` CHUNKED-READ SKIP deterministic.  The
+    kernel serves that seq_file one PAGE per ``read(2)`` regardless of the
+    caller's buffer (measured on this host: 4 ``read(2)`` calls returning
+    4049/4087/4083/3536 bytes for a 15755-byte table against a 1 MiB request),
+    and each read restarts the per-CPU lock-list walk from a POSITIONAL index —
+    so a lock released at an earlier position between chunks shifts every later
+    record down and ours is skipped outright.  The result is a read that
+    SUCCEEDS and returns a table missing a record: no ``OSError``, nothing for
+    an errno-keyed retry to notice, and a confident wrong answer at the caller.
+    Reproduced at 1.54% of reads (144/9337) against a real held flock with 24
+    concurrent churners — which is why it is invisible in isolation and red
+    only under a full parallel suite.
+
+    A ``pathlib.Path`` SUBCLASS rather than a duck-typed fake: it is
+    ``isinstance(..., Path)``, so it satisfies the reader's ``locks_path: Path``
+    annotation pyright-clean, and it drives the parser through the EXISTING
+    ``locks_path=`` keyword that :data:`PROC_LOCKS_PATH`'s own comment already
+    blesses — no new production seam.  Monkeypatching ``PROC_LOCKS_PATH``
+    instead would be INERT: both reader variants consume it as a DEF-TIME
+    default (esc-3604-1, recorded at
+    ``orchestrator/tests/test_lane_lock_leak_guard.py::test_an_unreadable_lock_table_is_not_silently_no_holders``).
+
+    Snapshots are served in order and STICK on the last one, so a scripted list
+    bounds only the LOSSY PREFIX and never the read count — a reader free to
+    take one more read than the script anticipated still gets a well-defined
+    table.  An entry may be an ``OSError`` INSTANCE to raise instead of text,
+    which is how the first-read-vs-later-read failure asymmetry is driven.
+    ``reads`` records how many reads the caller actually took.
+    """
+
+    def __init__(
+        self, *args, snapshots: Sequence[str | OSError] = (), **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._snapshots: list[str | OSError] = list(snapshots)
+        self.reads: int = 0
+
+    def read_text(self, *args, **kwargs) -> str:  # noqa: ARG002 -- signature parity
+        self.reads += 1
+        if not self._snapshots:
+            raise AssertionError(
+                '_ChunkedLocksPath was constructed with no snapshots — the '
+                'fixture would be staging nothing at all'
+            )
+        entry = self._snapshots[min(self.reads - 1, len(self._snapshots) - 1)]
+        if isinstance(entry, OSError):
+            raise entry
+        return entry
+
+
+class TestLaneLockHolderPids:
+    """lane_lock_holder_pids reports the pids holding an flock on a lock file."""
+
+    def test_synthetic_row_reports_holder_pid(self, tmp_path: Path):
+        """The verified real row shape parses to its pid, matched by dev+inode."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(_locks_row(lock_path, 4242) + '\n')
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_blocked_waiter_rows_are_not_holders(self, tmp_path: Path):
+        """A `-> FLOCK` row is a process BLOCKED on the lock, not an owner.
+
+        Reporting a waiter as a holder would libel every process merely
+        contending for the lane lock — including, on the leak path, ourselves.
+        """
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, waiter=True)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_non_flock_rows_on_same_inode_ignored(self, tmp_path: Path):
+        """POSIX/OFDLCK records do not conflict with flock(2), so they are not holders."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 5150, kind='POSIX')
+            + '\n'
+            + _locks_row(lock_path, 5151, kind='OFDLCK')
+            + '\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_rows_on_other_inodes_and_devices_ignored(self, tmp_path: Path):
+        """Only the probed file's own (dev, inode) counts — never another lane's."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')  # distinct inode on the same device
+        locks = tmp_path / 'locks'
+
+        import os as _os
+
+        st = _os.stat(lock_path)
+        other_device = (
+            f'{_os.major(st.st_dev) + 1:02x}:{_os.minor(st.st_dev):02x}:{st.st_ino}'
+        )
+        locks.write_text(
+            _locks_row(other, 6001)
+            + '\n'
+            + f'310: FLOCK  ADVISORY  WRITE 6002 {other_device} 0 EOF\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_malformed_rows_are_tolerated(self, tmp_path: Path):
+        """A row this parser cannot understand is skipped, never raised on.
+
+        This probe runs inside acquire-timeout paths; a procfs shape change must
+        degrade to "no known holders", not break a merge.
+        """
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            '\n'
+            'garbage\n'
+            '311: FLOCK  ADVISORY  WRITE notapid 103:08:zzz 0 EOF\n'
+            '312: FLOCK\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_missing_locks_path_returns_empty(self, tmp_path: Path):
+        """A non-Linux host (no /proc/locks) yields no known holders, not an error."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        assert lane_lock_holder_pids(lock_path, locks_path=tmp_path / 'nope') == []
+
+    def test_missing_lock_file_returns_empty(self, tmp_path: Path):
+        """A lock file that does not exist has no inode to match, hence no holders."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        locks = tmp_path / 'locks'
+        locks.write_text('313: FLOCK  ADVISORY  WRITE 4242 103:08:1 0 EOF\n')
+
+        assert lane_lock_holder_pids(tmp_path / 'absent.lock', locks_path=locks) == []
+
+    def test_duplicate_holder_pids_deduplicated_in_first_seen_order(self, tmp_path: Path):
+        """Repeated pids collapse; order is first-seen so the message reads stably."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, row_id=309)
+            + '\n'
+            + _locks_row(lock_path, 4242, row_id=310)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242, 4243]
+
+    def test_kernel_truth_real_flock_reports_this_process(self, tmp_path: Path):
+        """KERNEL TRUTH: against the DEFAULT /proc/locks, a real flock names us.
+
+        The synthetic cases above pin the parse; this one pins that the parse
+        actually agrees with the running kernel — the property the whole B13
+        detector rests on.
+        """
+        import fcntl
+        import os
+
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert os.getpid() in lane_lock_holder_pids(lock_path)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+        assert os.getpid() not in lane_lock_holder_pids(lock_path)
+
+    def test_kernel_truth_thread_taken_flock_reports_the_process_tgid(
+        self, tmp_path: Path
+    ):
+        """A flock taken on a WORKER THREAD is reported against the process tgid.
+
+        This is the decisive property: the B12 orphan is acquired inside
+        ``asyncio.to_thread``, i.e. on a worker thread whose ``native_id`` is
+        NOT ``os.getpid()``.  If /proc/locks reported the thread id instead, the
+        leak would be invisible to this probe and B13 would be unimplementable.
+        """
+        import fcntl
+        import os
+        import threading
+
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        observed: dict[str, object] = {}
+        holding = threading.Event()
+        release = threading.Event()
+
+        def _hold() -> None:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed['native_id'] = threading.get_native_id()
+                holding.set()
+                release.wait(timeout=10)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+        worker = threading.Thread(target=_hold)
+        worker.start()
+        try:
+            assert holding.wait(timeout=10), 'worker thread never took the flock'
+            assert observed['native_id'] != os.getpid(), (
+                'the worker ran on the main thread, so this test would prove '
+                'nothing about thread-taken flocks'
+            )
+            assert os.getpid() in lane_lock_holder_pids(lock_path)
+        finally:
+            release.set()
+            worker.join(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Task 3604: `lane_lock_holder_pids_strict` — the same parse, without the
+# fail-safe swallowing.
+#
+# The wrapper above answers "no known holders" for THREE different situations:
+# nobody holds it, the lock file is gone, and the lock table could not be read.
+# That is right for its production callers (git_ops.py's acquire-timeout paths,
+# where an exception turns a diagnosable stall into a broken merge) and WRONG
+# for a caller asserting a NEGATIVE — "the lane is free" — because two of those
+# three situations mean the caller could not tell, and rendering them as
+# "nobody holds it" makes a leak assertion pass vacuously.
+#
+# Every case below is written as an explicit A/B against the fail-safe wrapper,
+# because the divergence is the thing under test, not either behaviour alone.
+# ---------------------------------------------------------------------------
+
+
+class TestLaneLockHolderPidsStrict:
+    """lane_lock_holder_pids_strict parses identically but never swallows an OSError."""
+
+    def test_missing_lock_file_raises_instead_of_returning_empty(self, tmp_path: Path):
+        """An absent lock file is UNKNOWN to the strict variant, not "no holders".
+
+        The wrapper's ``[]`` here is indistinguishable from "nobody holds it",
+        which is exactly what let a genuinely-leaked lane read as free: with
+        the lock file unlinked underneath a still-held fd, ``os.stat`` fails,
+        the read yields ``[]``, and the caller concludes the lane is nobody's.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        absent = tmp_path / 'absent.lock'
+        locks = tmp_path / 'locks'
+        locks.write_text('313: FLOCK  ADVISORY  WRITE 4242 103:08:1 0 EOF\n')
+
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(absent, locks_path=locks)
+
+        assert lane_lock_holder_pids(absent, locks_path=locks) == [], (
+            'the fail-safe wrapper must keep its production contract unchanged'
+        )
+
+    def test_unreadable_locks_table_raises_instead_of_returning_empty(
+        self, tmp_path: Path
+    ):
+        """An unreadable kernel lock table means NO rows were examined at all.
+
+        The resulting ``[]`` carries no information whatsoever about the target
+        inode, so the strict variant refuses to render it as an answer.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        missing_locks = tmp_path / 'nope'
+
+        with pytest.raises(OSError):
+            lane_lock_holder_pids_strict(lock_path, locks_path=missing_locks)
+
+        assert lane_lock_holder_pids(lock_path, locks_path=missing_locks) == [], (
+            'the fail-safe wrapper must keep its production contract unchanged'
+        )
+
+    def test_parses_identically_to_the_fail_safe_wrapper(self, tmp_path: Path):
+        """ANTI-FORK PIN: the wrapper must not grow a second copy of the parse.
+
+        The parse is the delicate part (hex MAJ:MIN vs decimal inode, ``->``
+        waiter rows, thread-flocks reported against the tgid) and was
+        established by hand-verified forensics from reify ``esc-5548-5``. Two
+        independently-maintained copies would drift, and the test module would
+        then be modelling a parse no production caller uses.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')  # distinct inode on the same device
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, row_id=309, waiter=True)
+            + '\n'
+            + _locks_row(lock_path, 5150, row_id=310, kind='POSIX')
+            + '\n'
+            + _locks_row(other, 6001, row_id=311)
+            + '\n'
+        )
+
+        strict = lane_lock_holder_pids_strict(lock_path, locks_path=locks)
+        assert strict == lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_malformed_rows_are_still_tolerated(self, tmp_path: Path):
+        """Per-ROW tolerance is deliberately UNCHANGED by the strict variant.
+
+        ``/proc/locks`` is a system-wide table. A row this parser cannot
+        understand belonging to some unrelated process does not make THIS
+        caller's answer about THIS inode unknown, so raising on it would couple
+        every lane-lock check to arbitrary system state. The line the strict
+        variant draws is between "this ROW is odd" (skip) and "the whole ANSWER
+        is unknown" (raise) — the latter being the only case where no rows were
+        examined at all.
+        """
+        from orchestrator.verify_cancel import lane_lock_holder_pids_strict
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            '\n'
+            'garbage\n'
+            '311: FLOCK  ADVISORY  WRITE notapid 103:08:zzz 0 EOF\n'
+            '312: FLOCK\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == [4242]
+
+    def test_git_ops_binds_the_fail_safe_wrapper_not_the_strict_core(self):
+        """STRUCTURAL PIN: production imports the wrapper, never the strict core.
+
+        The module now exports two names one word apart, and only the
+        fail-safe one is safe in :mod:`orchestrator.git_ops`: all four call
+        sites there sit on acquire-timeout paths, where an ``OSError`` would
+        convert a diagnosable stall into a broken merge — precisely the outcome
+        both docstrings warn about.
+
+        Nothing else pins that. An autocomplete slip importing the ``_strict``
+        variant into ``git_ops`` would type-check, pass every case in this file
+        unchanged, and surface only as an unhandled
+        ``FileNotFoundError``/``PermissionError`` mid-merge on a host where the
+        lock file was cleaned or ``/proc/locks`` is unreadable — the worst
+        possible place to discover it. Same class of guard as
+        ``test_reset_acquires_through_the_shared_guarded_seam``: assert on the
+        BINDING, because the defect is which name got imported, not what any
+        one function does.
+        """
+        import orchestrator.git_ops as git_ops_mod
+        import orchestrator.verify_cancel as verify_cancel_mod
+
+        assert (
+            git_ops_mod.lane_lock_holder_pids
+            is verify_cancel_mod.lane_lock_holder_pids
+        ), (
+            'git_ops must bind the FAIL-SAFE wrapper — binding the strict core '
+            'would make a missing lock file or an unreadable /proc/locks raise '
+            'from inside an acquire-timeout path'
+        )
+        assert (
+            git_ops_mod.lane_lock_holder_pids
+            is not verify_cancel_mod.lane_lock_holder_pids_strict
+        ), (
+            'the wrapper must not have been aliased to the strict core — that '
+            'would satisfy the identity check above while silently deleting '
+            'the fail-safe policy every git_ops call site depends on'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 4227: the CHUNKED-READ skip — a read that SUCCEEDS and is still wrong.
+#
+# Task 3604 drew the line between "this ROW is odd" (skip) and "the whole
+# ANSWER is unknown" (raise).  There is a THIRD case neither variant handled:
+# "this READ was SHORT".  `/proc/locks` is a seq_file served one page per
+# `read(2)`, and each read restarts the per-CPU walk from a positional index,
+# so a lock released at an earlier position between chunks shifts every later
+# record down and ours is dropped.  Nothing raises, so `require_lane_lock_
+# holders`' OSError-keyed retry never fires; both variants render it as a
+# confident, WRONG answer.
+#
+# Every case is an explicit A/B: the SAME staging read with the confirm loop
+# and with `confirm_reads=1`, which reproduces the pre-fix one-shot behaviour
+# exactly.  The divergence is the thing under test, and the control arm is
+# what stops these cases from passing vacuously if the staging stops biting.
+# ---------------------------------------------------------------------------
+
+
+#: One row for an inode that is never any lock file (inode 1 is not a regular
+#: file), present in EVERY scripted snapshot of the chunk-skip staging below.
+UNRELATED_LOCKS_ROW = '309: FLOCK  ADVISORY  WRITE 6001 103:08:1 0 EOF\n'
+
+
+def chunk_skipped_locks(lock_path: Path, pid: int) -> _ChunkedLocksPath:
+    """A table whose FIRST read drops *lock_path*'s row, then settles.
+
+    THE shared staging for the measured defect, module-level and public-ish so
+    ``test_lane_lock_leak_guard`` builds its end-to-end arms from this ONE
+    definition rather than a second copy.  Two copies could drift, and a later
+    "fix" to one (say, to an empty first snapshot) would leave the other
+    silently modelling a different defect while still passing.
+
+    The unrelated row is present throughout: a chunk-skip drops OUR record
+    while the rest of a system-wide table reads normally, so a fixture that
+    served an empty first snapshot would be modelling a different (and easier)
+    defect than the measured one.
+    """
+    ours = _locks_row(lock_path, pid) + '\n'
+    return _ChunkedLocksPath(
+        lock_path.parent / 'locks',
+        snapshots=[UNRELATED_LOCKS_ROW, UNRELATED_LOCKS_ROW + ours],
+    )
+
+
+class TestChunkedLocksReadIsToleratedByTheReader:
+    """A record dropped by one chunked read must not read as "no holder"."""
+
+    def test_a_record_dropped_by_the_first_read_is_recovered(self, tmp_path: Path):
+        """THE root-cause case: the holder is reported despite a lossy read.
+
+        A confirm read costs microseconds (procfs, no sleep) and can only ADD
+        an attribution that was true of the kernel at some instant — the defect
+        is FALSE-NEGATIVE-ONLY, since a chunked read can DROP a record but
+        never INVENT one.  Both variants must recover it: the read policy lives
+        in the strict core precisely so the wrapper cannot grow its own.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        strict_locks = chunk_skipped_locks(lock_path, 4242)
+        strict = lane_lock_holder_pids_strict(lock_path, locks_path=strict_locks)
+        assert strict == [4242], (
+            f'a holder dropped by ONE chunked read must still be reported — '
+            f'rendering it as "nobody holds it" is what misclassifies a '
+            f'self-owned B13 leak as foreign contention; got {strict!r} after '
+            f'{strict_locks.reads} read(s)'
+        )
+        assert strict_locks.reads > 1, (
+            f'the answer must have come from a CONFIRM read, not from the '
+            f'staging failing to bite; the reader took {strict_locks.reads} '
+            f'read(s)'
+        )
+
+        wrapper_locks = chunk_skipped_locks(lock_path, 4242)
+        assert lane_lock_holder_pids(lock_path, locks_path=wrapper_locks) == [4242], (
+            'ANTI-FORK: the fail-safe wrapper must inherit the read policy '
+            'from the strict core, never carry a second copy of it'
+        )
+
+    def test_confirm_reads_one_reproduces_the_pre_fix_miss(self, tmp_path: Path):
+        """THE defect, pinned beside the fix on IDENTICAL staging.
+
+        ``confirm_reads=1`` is the pre-fix one-shot read exactly.  Pinning it
+        is what makes the case above legible (it shows what the confirm loop
+        buys) and what keeps it honest (if the chunked staging ever stops
+        biting, this arm fails rather than the other passing vacuously).
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        strict_locks = chunk_skipped_locks(lock_path, 4242)
+        strict = lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks, confirm_reads=1,
+        )
+        assert strict == [], (
+            f'a single read of this staging MUST miss the holder, or the '
+            f'fixture is not reproducing the defect; got {strict!r}'
+        )
+        assert strict_locks.reads == 1, (
+            f'confirm_reads=1 must take exactly one read — otherwise it is '
+            f'not the pre-fix behaviour it claims to reproduce; took '
+            f'{strict_locks.reads}'
+        )
+
+        wrapper_locks = chunk_skipped_locks(lock_path, 4242)
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks, confirm_reads=1,
+        ) == [], (
+            'the wrapper must diverge from the strict core ONLY on OSError '
+            'policy — the read count is core behaviour and must track it'
+        )
+
+
+class TestChunkedConfirmLoopContract:
+    """What the confirm loop must NOT change, on either side of the fix.
+
+    A fix for a 1.54% loss is only worth having if it leaves task 3604's raise
+    contract bit-for-bit intact and returns the SAME answer on the
+    overwhelmingly common non-lossy path.  Both are easy to break silently
+    here: K reads give a previously-single-read function K chances to raise,
+    and a union across snapshots could quietly reorder or invent a holder.
+    """
+
+    @staticmethod
+    def _mixed_table(lock_path: Path, other: Path) -> str:
+        """The full parse-exercising table: holder, waiter, POSIX, foreign, junk."""
+        return (
+            'garbage\n'
+            '311: FLOCK  ADVISORY  WRITE notapid 103:08:zzz 0 EOF\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, row_id=309, waiter=True)
+            + '\n'
+            + _locks_row(lock_path, 5150, row_id=310, kind='POSIX')
+            + '\n'
+            + _locks_row(other, 6001, row_id=311)
+            + '\n'
+            + _locks_row(lock_path, 4242, row_id=312)
+            + '\n'
+        )
+
+    def test_a_first_read_failure_still_propagates_unchanged(self, tmp_path: Path):
+        """(a) Task 3604's contract, bit-for-bit: read #1 failing means UNKNOWN.
+
+        A first read that fails means NO rows were examined at all, so the
+        answer carries no information about the target inode and the strict
+        variant must still raise — with errno AND filename intact, which
+        ``require_lane_lock_holders``' deliberate ``!s``-not-``!r`` message
+        depends on to name the path that could not be read.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        denied = PermissionError(
+            errno.EACCES, 'Permission denied', str(tmp_path / 'locks'),
+        )
+        good = _locks_row(lock_path, 4242) + '\n'
+
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[denied, good],
+        )
+        with pytest.raises(PermissionError) as excinfo:
+            lane_lock_holder_pids_strict(lock_path, locks_path=strict_locks)
+
+        assert excinfo.value.errno == errno.EACCES
+        assert str(tmp_path / 'locks') in str(excinfo.value), (
+            f'the filename must survive to the message — a confirm loop that '
+            f're-raised a bare OSError would leave the operator without the '
+            f'path that could not be read; got {str(excinfo.value)!r}'
+        )
+        assert strict_locks.reads == 1, (
+            f'a failed FIRST read must not be retried past: the confirm reads '
+            f'exist to enrich an answer, and there is no answer yet; took '
+            f'{strict_locks.reads} read(s)'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[denied, good],
+        )
+        assert lane_lock_holder_pids(lock_path, locks_path=wrapper_locks) == [], (
+            'the fail-safe wrapper must keep its production contract unchanged'
+        )
+
+    def test_a_missing_lock_file_raises_before_any_read_is_taken(
+        self, tmp_path: Path,
+    ):
+        """(a) The stat stays ONCE, outside the loop — no stat-per-read.
+
+        Task 3604's headline case is a held lane whose lock file was unlinked:
+        ``os.stat`` fails and the answer is unknown having examined no rows.
+        Asserting ZERO reads is what pins the stat OUTSIDE the confirm loop —
+        a stat moved inside would still raise, so the raise alone cannot tell
+        the two structures apart.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        absent = tmp_path / 'absent.lock'
+        locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=['313: FLOCK  ADVISORY  WRITE 4242 103:08:1 0 EOF\n'],
+        )
+
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(absent, locks_path=locks)
+        assert locks.reads == 0, (
+            f'a structurally-unknown answer must cost no procfs I/O at all; '
+            f'the lock table was read {locks.reads} time(s)'
+        )
+        assert lane_lock_holder_pids(absent, locks_path=locks) == []
+
+    def test_a_missing_locks_table_still_raises_on_the_first_read(
+        self, tmp_path: Path,
+    ):
+        """(a) The plain existing seam: an absent ``/proc/locks`` is still UNKNOWN."""
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        missing = tmp_path / 'nope'
+
+        with pytest.raises(OSError):
+            lane_lock_holder_pids_strict(lock_path, locks_path=missing)
+        assert lane_lock_holder_pids(lock_path, locks_path=missing) == []
+
+    def test_a_later_confirm_read_failure_is_best_effort(self, tmp_path: Path):
+        """(b) A LATER read failing must not subtract information.
+
+        The confirm reads exist only to RECOVER a possibly-dropped record, so
+        failing to obtain an EXTRA one cannot make the answer less known than
+        the first read already made it.  Letting it raise would take a reader
+        that previously raised on 1-in-N reads and hand it K chances to raise —
+        manufacturing a NEW failure class out of a fix, on precisely the
+        acquire-timeout paths whose documented reason for using the fail-safe
+        wrapper is that an exception there converts a diagnosable stall into a
+        broken merge.  The wrapper's degradation is the sharper half: a
+        perfectly good answer would become ``[]``, which is the very
+        "nobody holds it" this task exists to stop rendering.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        good = _locks_row(lock_path, 4242) + '\n'
+        denied = PermissionError(
+            errno.EACCES, 'Permission denied', str(tmp_path / 'locks'),
+        )
+
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[good, denied],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks,
+        ) == [4242], (
+            'read #1 already answered the question — a failed CONFIRM read '
+            'must end the loop, not propagate'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[good, denied],
+        )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks,
+        ) == [4242], (
+            'the fail-safe wrapper must not degrade a known holder set to [] '
+            'because an EXTRA read it did not need happened to fail'
+        )
+
+    def test_the_union_never_fabricates_a_holder(self, tmp_path: Path):
+        """(c) The union may only ADD what the kernel actually reported.
+
+        The defect being fixed is false-negative-only, and the fix must stay
+        that way: a pid in no snapshot must never appear, and a target row
+        absent from EVERY snapshot must still read as ``[]`` — otherwise a
+        genuine RELEASE would stop reading as released, which is the opposite
+        (and louder) error.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')  # distinct inode on the same device
+
+        foreign = _locks_row(other, 6001) + '\n'
+        released = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[foreign, foreign, foreign],
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=released) == [], (
+            'a lock genuinely released must still read as released — the union '
+            'is a recovery mechanism, not a source of holders'
+        )
+        assert released.reads > 1, (
+            'staging error: the empty answer must have survived the WHOLE '
+            'confirm loop, not been returned before it ran'
+        )
+
+        mixed = _ChunkedLocksPath(
+            tmp_path / 'locks',
+            snapshots=[foreign, foreign + _locks_row(lock_path, 4242) + '\n'],
+        )
+        assert lane_lock_holder_pids(lock_path, locks_path=mixed) == [4242], (
+            'only the target inode\'s holders may appear: a foreign row read '
+            'K times must not leak into the answer'
+        )
+
+    def test_reading_a_static_table_k_times_yields_the_pre_fix_answer(
+        self, tmp_path: Path,
+    ):
+        """(d) STATIC EQUIVALENCE: the non-lossy path answers exactly as before.
+
+        The overwhelmingly common case is a table that reads correctly every
+        time.  Reading it K times must be bit-for-bit the one-read answer —
+        de-duplicated, first-seen order preserved, ``-> FLOCK`` waiters and
+        ``POSIX`` rows still excluded, malformed rows still tolerated — for
+        BOTH variants.  Without this pin the union could quietly change the
+        answer everywhere in exchange for fixing 1.54% of reads.
+
+        Also pins the READ COUNT on that path, so the loop's cost is a STATED
+        one rather than an accident: all K reads are taken even once read #1
+        has named a holder.  The reader deliberately does NOT break out early
+        there — see its "WHY ALL K READS ALWAYS" note — because the shortcut
+        is sound only under the callers' ``LOCK_EX`` invariant, which this
+        reader neither states nor enforces, and would truncate a shared-lock
+        answer.  If that decision is ever revisited, this assertion is what
+        makes the change visible instead of silent.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')
+        locks = tmp_path / 'locks'
+        locks.write_text(self._mixed_table(lock_path, other))
+
+        one_shot = lane_lock_holder_pids_strict(
+            lock_path, locks_path=locks, confirm_reads=1,
+        )
+        assert one_shot == [4242], (
+            f'staging error: the fixture must exercise waiter/POSIX/foreign/'
+            f'malformed exclusion in ONE read; got {one_shot!r}'
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == one_shot
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == one_shot
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=locks, confirm_reads=1,
+        ) == one_shot
+
+        # The stated cost: K reads, even though read #1 already named a holder.
+        import orchestrator.verify_cancel as vc_mod
+
+        static = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[self._mixed_table(lock_path, other)],
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=static) == one_shot
+        assert static.reads == vc_mod._LOCKS_CONFIRM_READS, (
+            f'the confirm loop must take all {vc_mod._LOCKS_CONFIRM_READS} '
+            f'reads on the non-lossy path — an early break on a non-empty read '
+            f'#1 is correct only under the callers\' LOCK_EX invariant, which '
+            f'this reader does not enforce, and would truncate a shared-lock '
+            f'answer; took {static.reads}'
+        )
+        control = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[self._mixed_table(lock_path, other)],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=control, confirm_reads=1,
+        ) == one_shot
+        assert control.reads == 1, (
+            f'confirm_reads=1 must be exactly the pre-fix one-shot read, or '
+            f'every control arm in this module is measuring something else; '
+            f'took {control.reads}'
+        )
+
+    def test_a_sub_one_read_count_is_floored_at_one_read(self, tmp_path: Path):
+        """Zero reads is not reachable — the STRICT contract survives any count.
+
+        ``confirm_reads=0`` (or a ``_LOCKS_CONFIRM_READS`` monkeypatched to 0)
+        would make ``range(reads)`` empty and return ``[]`` having examined NO
+        rows: a silent fail-soft that converts the STRICT variant into the
+        fail-safe one, and hands back the one answer that VACUOUSLY satisfies
+        the negative-asserting callers this variant exists for
+        (``require_lane_lock_holders``, ``lane_is_free``).  Both knobs are
+        floored at one read, so an unreadable table still RAISES.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        holder = _locks_row(lock_path, 4242) + '\n'
+
+        for count in (0, -3):
+            locks = _ChunkedLocksPath(tmp_path / 'locks', snapshots=[holder])
+            assert lane_lock_holder_pids_strict(
+                lock_path, locks_path=locks, confirm_reads=count,
+            ) == [4242], (
+                f'confirm_reads={count} must still take the FIRST read, not '
+                f'silently answer "nobody holds it" having read nothing'
+            )
+            assert locks.reads == 1, (
+                f'confirm_reads={count} must floor to exactly one read; took '
+                f'{locks.reads}'
+            )
+
+        missing = _ChunkedLocksPath(
+            tmp_path / 'locks',
+            snapshots=[FileNotFoundError(errno.ENOENT, 'No such file', 'locks')],
+        )
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(
+                lock_path, locks_path=missing, confirm_reads=0,
+            )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=missing, confirm_reads=0,
+        ) == [], 'the fail-safe wrapper still degrades, whatever the count'
+
+    def test_the_global_read_count_is_also_floored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The floor covers the MONKEYPATCH seam, not just the keyword.
+
+        ``confirm_reads`` resolves from the module global at CALL time, which
+        is the documented tuning seam.  A global set to 0 must be floored the
+        same way — otherwise the loudest reader in the module could be
+        silenced by a one-line config change with no error anywhere.
+        """
+        import orchestrator.verify_cancel as vc_mod
+        from orchestrator.verify_cancel import lane_lock_holder_pids_strict
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        monkeypatch.setattr(vc_mod, '_LOCKS_CONFIRM_READS', 0)
+        locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[_locks_row(lock_path, 4242) + '\n'],
+        )
+
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == [4242]
+        assert locks.reads == 1, (
+            f'a zero global must floor to one read, not zero; took {locks.reads}'
+        )
+
+    def test_first_seen_order_is_preserved_across_reads(self, tmp_path: Path):
+        """(e) The ordering contract survives the union.
+
+        The docstring promises first-seen order, and with more than one read
+        "first seen" spans them: a holder observed only in read #2 must sort
+        AFTER one observed in read #1, even though the settled table lists it
+        first.  Sorting by the final table's textual order instead would be a
+        different, undocumented contract.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        first = _locks_row(lock_path, 4242) + '\n'
+        second = _locks_row(lock_path, 4243, row_id=309) + '\n'
+
+        # Read #1 shows only 4243; read #2 shows the settled table, which lists
+        # 4242 FIRST.  First-seen-across-reads therefore means [4243, 4242].
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[second, first + second],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks,
+        ) == [4243, 4242], (
+            'first-seen order must be taken across the whole confirm loop, '
+            'not re-derived from the last snapshot read'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[second, first + second],
+        )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks,
+        ) == [4243, 4242]
+
+
+# ---------------------------------------------------------------------------
 # Task 2306 step-7: LOCK_HOLDER_PGID_KEY + write/read/remove_lock_holder_pgid —
 # fixed-key holder-pgid rendezvous.  A waiter cannot know the holder's
 # per-dispatch --request-id, so this uses a request-id-independent fixed key
@@ -506,27 +1648,79 @@ time.sleep(300)
 
 
 def _is_running(pid: int) -> bool:
-    """Return True if *pid* is still alive (os.kill(pid, 0) succeeds)."""
+    """Return True if *pid* is alive AND not a zombie.
+
+    ``os.kill(pid, 0)`` succeeding is not enough: it also returns success for
+    zombies (state 'Z') and for processes that were just SIGKILLed but not
+    yet torn down — both are still visible in /proc even though they have
+    already been killed. SIGKILL delivery, orphan reparenting, and the final
+    reap are all asynchronous, so treating a zombie as "alive" turns this
+    check into a wall-clock race under host load rather than a test of
+    whether reaping actually happened. A zombie has already been killed; its
+    lingering /proc entry just means its parent hasn't called wait() yet.
+    """
     import os
     try:
         os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, OSError):
+    except OSError:
+        # Covers ProcessLookupError (no such pid) — a subclass of OSError —
+        # alongside PermissionError and friends.
         return False
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        # Format: "pid (comm) state ...". comm may itself contain ')' or
+        # spaces, so split on the LAST ')' to reliably find the state field.
+        state = stat.rsplit(')', 1)[1].split()[0]
+    except (OSError, IndexError):
+        # Vanished between kill(0) and reading /proc (FileNotFoundError is
+        # itself an OSError subclass), or /proc unreadable — either way it
+        # is not confirmed running.
+        return False
+    return state != 'Z'
 
 
-def _wait_for_file(path, timeout=10.0, interval=0.1):
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
+def _poll_until(predicate, timeout, interval=0.1):
+    """Poll *predicate* (a zero-arg callable) until truthy, or *timeout* expires.
+
+    Checks immediately, then every *interval* seconds; returns True the
+    moment *predicate()* is truthy, False once *timeout* elapses first. This
+    is the one poll/backoff primitive for the module — both
+    :func:`_wait_for_file` and :func:`_wait_until_all_dead` are expressed in
+    terms of it, rather than each hand-rolling its own deadline loop (the
+    same shape recurs as ``_wait_until`` in test_harness_resume_scheduler.py
+    and ``wait_until`` in test_lane_lock_leak_guard.py).
+    """
     import time
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if path.exists():
+        if predicate():
             return True
         time.sleep(interval)
     return False
 
 
-@pytest.mark.timeout(30)
+def _wait_for_file(path, timeout=10.0, interval=0.1):
+    """Poll until *path* exists or *timeout* expires. Return True if found."""
+    return _poll_until(path.exists, timeout, interval)
+
+
+def _wait_until_all_dead(pids, timeout=5.0, interval=0.02):
+    """Poll until every pid in *pids* is dead per :func:`_is_running`.
+
+    Returns whatever pids are still alive once *timeout* expires (empty if
+    all died sooner). Used instead of a fixed sleep so the check only waits
+    as long as the async SIGKILL/reparent/reap sequence actually takes on
+    this host, while still failing loudly if a pid never dies: a genuinely
+    un-reaped ``start_new_session`` escapee keeps sleeping (state 'S'/'R')
+    and will still be in the returned list at the deadline.
+    """
+    _poll_until(
+        lambda: not any(_is_running(pid) for pid in pids), timeout, interval
+    )
+    return [pid for pid in pids if _is_running(pid)]
+
+
+@pytest.mark.timeout(60)
 def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     """cancel_request reaps root AND start_new_session-escaped descendants.
 
@@ -569,24 +1763,31 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     # Run cancel_request (uses real /proc walk internally)
     rc = cancel_request(pgid_file_path)
 
-    # Allow a brief window for processes to be reaped
-    time.sleep(0.5)
-
     assert rc == 0, f'cancel_request returned {rc}, expected 0'
     assert not pgid_file_path.exists(), 'pgid file must be removed on success'
 
-    # Reap root_proc zombie BEFORE checking alive status.
-    # cancel_request kills root with SIGKILL, which makes it a zombie (state 'Z')
-    # until its parent (this test process) calls wait().  os.kill(pid, 0) returns
-    # success for zombies — they are still in /proc — so the alive check below
-    # would incorrectly report root as alive if we don't wait first.
+    # Reap the root zombie so this pytest process doesn't leak a child entry,
+    # and to confirm root actually exited (rather than merely left the
+    # tracked-pid set for some other reason). Note this is no longer
+    # load-bearing for the alive check below: _is_running already treats
+    # state 'Z' as dead, so a not-yet-reaped root zombie wouldn't be
+    # misreported as alive even without this wait.
     root_proc.wait(timeout=5)
 
-    # All tracked pids (including start_new_session escapes) must be dead
-    still_alive = [pid for pid in all_pids if _is_running(pid)]
+    # Poll (rather than sleep a fixed amount) until every tracked pid is
+    # confirmed dead. SIGKILL delivery, orphan reparenting to init, and the
+    # final reap are all asynchronous — a fixed sleep races host scheduling
+    # load, while a bounded poll only waits as long as actually needed and
+    # still fails loudly if a pid is never reaped (see _wait_until_all_dead).
+    # timeout is intentionally left at _wait_until_all_dead's own default
+    # (single source of truth) rather than repeated here.
+    still_alive = _wait_until_all_dead(all_pids)
     assert still_alive == [], (
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
-        f'{still_alive}'
+        f'{still_alive}. (On the off chance one of these pid numbers was '
+        f'recycled by the host to an unrelated process during the poll '
+        f'window rather than being a genuine escapee, cross-check it '
+        f'against read_ppid_map() output captured around this time.)'
     )
 
 

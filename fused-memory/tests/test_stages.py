@@ -4,6 +4,7 @@ import json
 import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +18,7 @@ from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
+    DISALLOW_ESCALATION_READS,
     DISALLOW_MEMORY_WRITES,
     DISALLOW_TASK_WRITES,
     STAGE1_DISALLOWED,
@@ -29,6 +31,12 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.prompts import (
+    ESCALATION_BOUNDARY_NOTE,
+    render_escalation_boundary_note,
+)
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -37,6 +45,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
+    _git_show_name_only,
     _needs_hint_conversion,
     _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
@@ -80,6 +89,31 @@ def _scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
+def _mock_stage_deps() -> dict:
+    """Keyword deps for constructing any stage subclass in a unit test.
+
+    THE construction for the plain default case — no pre-configured mock returns,
+    no ``tmp_path`` root, the ``test_project`` / ``/tmp/test`` scope.  Every
+    ``mock_deps`` fixture in this module that wanted exactly that dict now returns
+    this helper, so a change to BaseStage's constructor signature lands in one
+    place for all of them.
+
+    Fixtures that legitimately differ still build their own dict and are NOT
+    covered by that claim: the ones that stub ``memory_service`` return values
+    (``count_memories_by_metadata``, ``delete_memory``, ``search``), the ones that
+    root ``explore_codebase_root`` at a ``tmp_path``, and the ones that need a
+    non-default scope (``reify``, ``origin``).  Reach for this helper when the
+    plain construction is what you want; don't bend a variant fixture into it.
+    """
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': AsyncMock(),
+        'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+        'scope': _scope('test_project', '/tmp/test'),
+    }
+
+
 def make_configured_task_knowledge_sync_stage(
     deps: dict, *, project_id: str, project_root: str, run_id: str = 'test-run'
 ) -> "TaskKnowledgeSync":
@@ -110,6 +144,9 @@ def make_configured_task_knowledge_sync_stage(
     return stage
 
 
+_TKS_LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+
 class TestMockTypesConstant:
     """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
 
@@ -117,6 +154,47 @@ class TestMockTypesConstant:
         assert isinstance(_MOCK_TYPES, tuple)
         assert AsyncMock in _MOCK_TYPES
         assert MagicMock in _MOCK_TYPES
+
+
+# Tools registered by the SHARED escalation.server.create_server that a recon
+# stage may hold. Reviewed for task 3023: none of them READS per-task escalation
+# state, so none can hand a stage a categorical [] to misread as proof that an
+# orchestrator record was never written.
+#
+#   - escalate_blocker / escalate_info — WRITES to the reconciliation store,
+#     which is the correct destination. escalate_blocker is Stage 2's sanctioned
+#     FIX D path; denying it would break FIX D (see render_escalation_boundary_note).
+#   - resolve_issue / stamp_triage / promote_to_l2 — act on an escalation the
+#     caller already has an id for; they answer no existence question.
+#   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
+#     reload_config / get_task_runtime_state — orchestrator control-plane and
+#     merge-lane surface, unrelated to the escalation-record question.
+#
+# This is the reviewed-safe half of the classification asserted by
+# test_every_escalation_server_tool_is_classified; the denied half is
+# DISALLOW_ESCALATION_READS. Adding a name here is a decision that the tool
+# cannot mislead a stage about the reconciliation queue — not a formality.
+_REVIEWED_STAGE_SAFE = {
+    'mcp__escalation__claim_warm_worktree',
+    'mcp__escalation__escalate_blocker',
+    'mcp__escalation__escalate_info',
+    'mcp__escalation__get_merge_halt_status',
+    'mcp__escalation__get_merge_queue',
+    'mcp__escalation__get_task_runtime_state',
+    'mcp__escalation__halt_merge_queue',
+    'mcp__escalation__halt_scheduler',
+    'mcp__escalation__merge_cancel',
+    'mcp__escalation__merge_request',
+    'mcp__escalation__merge_status',
+    'mcp__escalation__promote_to_l2',
+    'mcp__escalation__release_warm_worktree',
+    'mcp__escalation__release_workflow',
+    'mcp__escalation__reload_config',
+    'mcp__escalation__resolve_issue',
+    'mcp__escalation__resume_scheduler',
+    'mcp__escalation__stamp_triage',
+    'mcp__escalation__unhalt_merge_queue',
+}
 
 
 class TestDisallowedToolLists:
@@ -130,19 +208,81 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_MEMORY_WRITES:
             assert tool not in STAGE1_DISALLOWED
 
-    def test_stage2_disallows_builtins_only(self):
-        """STAGE2_DISALLOWED must equal DISALLOW_BUILTIN.
+    def test_stage2_disallows_builtins_and_retains_write_access(self):
+        """Built-ins are blocked in Stage 2, and Stage 2 keeps memory + task writes.
 
-        Stage 2 has full memory + task access; only built-ins are blocked.
+        Named for what it asserts and nothing more: the Stage-2 half of the
+        escalation-read denial is pinned by
+        ``test_escalation_reads_denied_in_all_three_stages`` below, which is where
+        that property belongs (all three stages, one loop).  This test does not
+        restate it — a name promising coverage its body does not carry is how a
+        deleted guard goes unnoticed.
+
+        RETIRED ASSERTION: this test used to read ``STAGE2_DISALLOWED ==
+        DISALLOW_BUILTIN``.  That exact equality asserted the absence of EVERY
+        future denial class in Stage 2, and it is precisely the shape that kept
+        the ``mcp__escalation__*`` read gap invisible here — PRD §4 names
+        ``STAGE2_DISALLOWED = DISALLOW_BUILTIN`` as the mechanism of the bug
+        (task 3163).  The contract Stage 2 actually needs is now asserted
+        positively: built-ins denied, full memory + task access retained, so an
+        additive denial can land without failing the build for the right change.
         add_subtask was previously in a separate DISALLOW_SUBTASK_CREATE list,
         but the tool has been removed (DF-D).
         """
-        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN
+        assert set(DISALLOW_BUILTIN).issubset(set(STAGE2_DISALLOWED))
+        for tool in DISALLOW_MEMORY_WRITES + DISALLOW_TASK_WRITES:
+            assert tool not in STAGE2_DISALLOWED, f'Stage 2 must retain write access to {tool}'
 
     def test_stage3_disallows_all_writes(self):
         assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE3_DISALLOWED))
         assert set(DISALLOW_MEMORY_WRITES).issubset(set(STAGE3_DISALLOWED))
         assert set(DISALLOW_BUILTIN).issubset(set(STAGE3_DISALLOWED))
+
+    def test_consolidate_memories_is_classified_as_a_memory_write(self):
+        """`consolidate_memories` (task 3133) must ship CLASSIFIED.
+
+        Recon gating is DENY-LIST ONLY: a tool named in no list is silently
+        callable in Stage 3's read-only integrity mode. That is not a
+        hypothetical — it is the documented `update_memory` incident recorded
+        in the comment block above `DISALLOW_MEMORY_WRITES`
+        (cli_stage_runner.py), where an in-place silent-rewrite primitive
+        shipped in NO list and was denied by neither this gate nor the
+        mem0_update authz gate, whose default allowlist admits every recon
+        stage's own `recon-stage-{id}` agent_id.
+
+        `consolidate_memories` is strictly more destructive than the tool
+        that incident was about: one call writes a canonical, patches N
+        retained peers, re-homes their children and DELETES its supersedes.
+        Shipping it unclassified would repeat the incident verbatim, with a
+        larger blast radius.
+        """
+        assert 'mcp__fused-memory__consolidate_memories' in DISALLOW_MEMORY_WRITES
+        # ...which is what carries it into Stage 3, the read-only stage.
+        assert 'mcp__fused-memory__consolidate_memories' in STAGE3_DISALLOWED
+
+    def test_consolidate_memories_is_denied_to_the_dry_run_unblocker(self):
+        """The other deny-list-only gate, in the orchestrator.
+
+        `_DISALLOWED_TOOLS` already names `delete_memory`; a dry run must not
+        be able to reach a tool that deletes N records and patches M more.
+        The whole premise of a dry run is that it observes without mutating,
+        so an unclassified destructive tool there does not degrade the run —
+        it falsifies it.
+
+        Asserted from here, beside the Stage-3 half, because both answer ONE
+        question — is this tool classified everywhere gating is deny-list
+        only — and a future destructive memory tool needs to meet both
+        reminders together. Cross-package import guarded per the
+        `orchestrator.agents.landlock` precedent in
+        `tests/reconciliation/test_recon_sandbox_guard.py`: fused-memory must
+        stay installable without the orchestrator.
+        """
+        dry_run_unblock = pytest.importorskip('orchestrator.dry_run_unblock')
+
+        assert (
+            'mcp__fused-memory__consolidate_memories'
+            in dry_run_unblock._DISALLOWED_TOOLS
+        )
 
     def test_all_disallowed_have_mcp_prefix(self):
         """All MCP tools in disallowed lists should use the mcp__ naming convention."""
@@ -202,26 +342,293 @@ class TestDisallowedToolLists:
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
 
+    def test_escalation_reads_constant_is_exactly_the_per_task_read_tools(self):
+        """DISALLOW_ESCALATION_READS names the escalation READ tools, nothing more.
+
+        Scoped deliberately tight: the denial exists because a per-task read
+        cannot be answered from a stage, not because the escalation surface is
+        off limits wholesale.  Anything broader would sweep up the sanctioned
+        write path (Stage 2 FIX D).
+
+        ``get_task_escalations`` joined the set in task 3023: it is registered
+        on the SHARED ``escalation.server.create_server``, which backs the
+        reconciliation queue as well as the orchestrator one, so leaving it out
+        exposed an archive-inclusive per-task lookup — pointed at the wrong
+        store — to all three stages.
+
+        ``get_task_escalation_history`` joined it in task 3164 — the same hazard
+        one degree worse.  It delegates to ``get_task_escalations``, so it is the
+        identical archive-inclusive cross-store read, but it wraps the result in
+        an envelope that echoes ``task_id`` and ``level_filter`` back.  Against
+        the reconciliation queue that makes a categorical ``count: 0`` read as an
+        attributable, query-specific answer — "no record was ever filed for this
+        task at this level" — when it is only the artefact of asking the wrong
+        store.  A bare ``[]`` at least looks anonymous; a self-describing zero
+        invites being believed.
+
+        The name is count-agnostic on purpose: it was renamed here from
+        ``..._the_three_read_tools`` when the fourth member landed, and a name
+        that promises a count forces a rename on every accession (and reads as a
+        lie in between — see the RETIRED ASSERTION note above).
+        """
+        assert set(DISALLOW_ESCALATION_READS) == {
+            'mcp__escalation__get_pending_escalations',
+            'mcp__escalation__get_escalation',
+            'mcp__escalation__get_task_escalations',
+            'mcp__escalation__get_task_escalation_history',
+        }
+        assert len(DISALLOW_ESCALATION_READS) == 4, 'no duplicate entries'
+
+    def test_every_escalation_server_tool_is_classified(self):
+        """Every tool the SHARED escalation server registers is denied or reviewed.
+
+        The stage gating is a DENY list only — there is no allow-list — so any
+        tool added to ``escalation.server.create_server`` becomes visible and
+        callable from Stage 1/2/3 the moment it is registered, against the
+        RECONCILIATION queue.  That is how ``get_task_escalations`` shipped
+        reachable from exactly the three agents that must not have it (task
+        3023 review).  A constant-only test cannot catch that: it pins what the
+        list says, not what the server exposes.
+
+        So enumerate the live tool surface and require every name to be
+        classified — either denied in every stage, or explicitly listed below
+        as reviewed-and-safe.  A new tool fails here until a human decides
+        which bucket it belongs in.  Adding a name to ``_REVIEWED_STAGE_SAFE``
+        is that decision; it is not a formality.
+        """
+        pytest.importorskip(
+            'escalation.server',
+            reason='sibling escalation package not installed (standalone checkout)',
+        )
+        import asyncio
+        import tempfile
+
+        from escalation.queue import EscalationQueue
+        from escalation.server import create_server
+
+        server = create_server(
+            EscalationQueue(Path(tempfile.mkdtemp())), startup_sweep=False
+        )
+        registered = {
+            f'mcp__escalation__{tool.name}'
+            for tool in asyncio.run(server.list_tools())
+        }
+
+        unclassified = registered - set(DISALLOW_ESCALATION_READS) - _REVIEWED_STAGE_SAFE
+        assert not unclassified, (
+            'These escalation-server tools are reachable from every recon stage '
+            f'and have not been classified: {sorted(unclassified)}. Either add each '
+            'to DISALLOW_ESCALATION_READS (cli_stage_runner.py) if a stage must not '
+            'call it — the default for anything that READS per-task escalation state, '
+            'since a stage is wired to the reconciliation queue and would read a '
+            'categorical [] as proof of absence — or add it to _REVIEWED_STAGE_SAFE '
+            'here once you have confirmed it is harmless against that store.'
+        )
+
+        # The denial must name tools that actually exist, or it is decoration.
+        stale = set(DISALLOW_ESCALATION_READS) - registered
+        assert not stale, (
+            f'DISALLOW_ESCALATION_READS names tools the server no longer registers: '
+            f'{sorted(stale)}. Remove them, or fix the rename.'
+        )
+
+    def test_escalation_reads_denied_in_all_three_stages(self):
+        """Every stage must deny the escalation read tools (task 3163).
+
+        A recon stage's ``escalation`` MCP connection is wired to the
+        RECONCILIATION escalation queue, never to a project's queue, so a
+        per-task read from a stage returns ``[]`` CATEGORICALLY — not as a race.
+        Three incidents read that ``[]`` as proof that no escalation was ever
+        filed.  Stage 2 was the gap: ``STAGE2_DISALLOWED = DISALLOW_BUILTIN``
+        denied nothing else at all.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage_list)), (
+                f'{name} must deny the escalation read tools'
+            )
+
+    def test_escalate_blocker_stays_allowed_in_every_stage(self):
+        """The escalation WRITE path must never be swept up by the read denial.
+
+        ``escalate_blocker`` is the sole sanctioned recon escalation use — the
+        Stale Flag Escalation (FIX D) path in Stage 2 (prompts/stage2.py).
+        Over-denying breaks FIX D outright, so this is the anti-over-denial
+        guard, structurally identical to the read-tool carve-outs above.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert 'mcp__escalation__escalate_blocker' not in stage_list, (
+                f'{name} must keep the sanctioned escalation write path'
+            )
+
+    def test_stage_hooks_return_lists_covering_escalation_reads(self):
+        """Pin the ``get_disallowed_tools()`` hook, not just the module constants.
+
+        The hook (stages/base.py) is what actually reaches ``--disallowed-tools``
+        on the spawned CLI, so a constant that no stage returns would deny
+        nothing in production.
+        """
+        deps = _mock_stage_deps()
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            stage = cls(stage_id, **deps)
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage.get_disallowed_tools())), (
+                f'{cls.__name__}.get_disallowed_tools() must cover the escalation reads'
+            )
+
+
+class TestEscalationBoundaryNote:
+    """The escalation-store boundary note: one shared core, three consumers.
+
+    Companion to the DISALLOW_ESCALATION_READS denial (task 3163).  Denying the
+    read tools removes the false ``[]`` answer, but ``--disallowed-tools`` OMITS
+    a denied tool from the agent's listing rather than rejecting the call — so
+    without this paragraph the agent simply finds the tool gone, with no
+    explanation, and may conclude the escalation surface does not exist or route
+    around it.  The note is what converts a silent absence into an understood
+    boundary, which makes it load-bearing rather than decorative.
+
+    The note is a stage-agnostic core (``ESCALATION_BOUNDARY_NOTE``) plus a
+    per-stage *sanctioned-action* clause selected by
+    ``render_escalation_boundary_note(can_escalate=...)``: Stage 2 holds the
+    FIX D escalate_blocker path, Stage 1 and Stage 3 hold no sanctioned
+    escalation action at all.
+
+    These are wiring/invariant and tool-name-capability assertions, deliberately
+    not a prose pin.
+    """
+
+    def test_boundary_note_rendered_verbatim_into_all_three_stage_prompts(self):
+        """One constant, three consumers, no per-stage paste (INV-5).
+
+        Exactly-once, not merely present: a second copy would mean a stage
+        interpolated it twice or someone pasted the prose alongside the
+        constant, which is the drift this shared-constant shape exists to stop.
+
+        Also subsumes the type/non-emptiness of the constant, so no separate
+        tautology test guards that: ``str.count('')`` is ``len(s) + 1``, so an
+        empty or non-string ``ESCALATION_BOUNDARY_NOTE`` fails right here.
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (build_stage2_system_prompt('dark_factory'), 'STAGE2_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert ESCALATION_BOUNDARY_NOTE in prompt, f'{name} must render the boundary note'
+            assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{name} must render the boundary note exactly once'
+            )
+
+    def test_boundary_note_present_on_the_autopilot_video_stage2_path(self):
+        """The conditional guardrail-injection branch must not drop or duplicate it.
+
+        build_stage2_system_prompt takes a different code path for
+        autopilot_video (it splices the contamination guardrail in at the
+        '## Available Tools' sentinel), so the note is pinned on that branch too.
+        """
+        prompt = build_stage2_system_prompt('autopilot_video')
+        assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1
+
+    def test_boundary_note_does_not_contain_the_stage2_injection_sentinel(self):
+        """The note must not carry the '## Available Tools' heading.
+
+        Load-bearing: build_stage2_system_prompt raises RuntimeError unless that
+        sentinel appears EXACTLY once in STAGE2_SYSTEM_PROMPT.  A note carrying
+        the heading would make it appear twice and hard-fail Stage 2 prompt
+        construction for autopilot_video.
+        """
+        assert '## Available Tools' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_boundary_note_core_is_stage_agnostic(self):
+        """The shared core must not name a write path only one stage may use.
+
+        A TOOL-NAME capability assertion, not a wording pin: this constant is
+        rendered into ALL THREE stage prompts, so anything it names is named to
+        every stage.  ``escalate_blocker`` is a Stage-2-only mechanism (FIX D),
+        so it belongs in the per-stage clause, never in the shared core.
+
+        The constant's own comment used to claim it was "Identical for all three
+        stages — no per-stage parameters", which is exactly what hid the
+        mismatch: its final sentence licensed an escalation write in Stage 1 and
+        Stage 3 too.
+        """
+        assert 'escalate_blocker' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_render_escalation_boundary_note_varies_the_sanctioned_action(self):
+        """The renderer swaps only the sanctioned-action clause, never the core.
+
+        Mirrors the ``render_source_completion_section(*, can_file_tasks=...)``
+        precedent (recon_self_model.py): one shared body, one capability-gated
+        clause, keyword-only flag.  INV-5 is preserved — the shared core still
+        appears exactly once in either rendering.
+        """
+        allowed = render_escalation_boundary_note(can_escalate=True)
+        denied = render_escalation_boundary_note(can_escalate=False)
+
+        assert 'mcp__escalation__escalate_blocker' in allowed, (
+            'can_escalate=True must name the sanctioned FIX D write path'
+        )
+        assert 'escalate_blocker' not in denied, (
+            'can_escalate=False must not name a tool the stage is not sanctioned to use'
+        )
+        for rendered, label in ((allowed, 'can_escalate=True'), (denied, 'can_escalate=False')):
+            assert rendered.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{label} must carry the shared core exactly once'
+            )
+            assert '## Available Tools' not in rendered, (
+                f'{label} must not carry the build_stage2_system_prompt sentinel'
+            )
+
+    def test_stage1_and_stage3_prompts_never_name_the_escalation_write_tool(self):
+        """A stage with no sanctioned escalation action must not be told about one.
+
+        The durable end-state assertion: it pins the property at the CONSUMER,
+        independent of how the note is assembled.  Stage 3 declares "You do NOT
+        have write or mutation tools" (prompts/stage3.py) — and because
+        ``escalate_blocker`` is deliberately absent from every disallow list
+        (see TestDisallowedToolLists above), the tool really is callable, so a
+        licensing sentence there points at a real durable write to the
+        reconciliation escalation queue.  Stage 1 has no FIX D mechanism either
+        (FIX D lives in TaskKnowledgeSync, not IntegrityCheck).
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert 'escalate_blocker' not in prompt, (
+                f'{name} must not name the escalation write tool — that stage has no '
+                'sanctioned escalation action'
+            )
+
+    def test_stage2_prompt_still_names_the_escalation_write_tool(self):
+        """Anti-over-correction guard: FIX D must survive the fix.
+
+        Stage 2 IS sanctioned to call escalate_blocker for the Stale Flag
+        Escalation (FIX D) case, on both the plain and the autopilot_video
+        guardrail-injection branches of build_stage2_system_prompt.
+        """
+        for project_id in ('dark_factory', 'autopilot_video'):
+            assert 'mcp__escalation__escalate_blocker' in build_stage2_system_prompt(project_id), (
+                f'Stage 2 prompt for {project_id} must keep the FIX D escalation write path'
+            )
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
 
     @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-        )
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+    def mock_deps(self):
+        return _mock_stage_deps()
 
     def test_memory_consolidator_disallowed(self, mock_deps):
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
@@ -387,14 +794,7 @@ class TestPerStageReportSchema:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_integrity_check_returns_stage3_schema(self, mock_deps):
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
@@ -656,14 +1056,7 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -874,14 +1267,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -1004,6 +1390,113 @@ class TestDoneProvenanceSection:
             check=True, capture_output=True, text=True,
         ).stdout.strip()
 
+    @staticmethod
+    def _init_repo_with_merge(path):
+        """Build a repo with a single-parent commit, a clean --no-ff merge,
+        and a --no-ff merge that resolves a real conflict.
+
+        Commit graph on ``main``:
+
+          1. ``single`` — adds a.txt + b.txt (a genuine single-parent commit,
+             used to pin ``--first-parent -m`` as a no-op on non-merge commits).
+          2. a ``feature`` branch off commit 1 adds feature.py plus
+             extra_1.py..extra_4.py (five files total, so max_files
+             truncation is reachable for merge provenance — see
+             test_merge_commit_file_list_respects_max_files_truncation);
+             main then merges it via ``git merge --no-ff`` — recorded as
+             ``merge``. Plain ``git show --name-only`` reports NOTHING for
+             this commit (git's combined diff is empty for a clean merge);
+             this is the fixture that reproduces the Stage-2 provenance bug.
+          3. a ``conflict`` branch off commit 1 edits a.txt and adds
+             conflict_only.py; main separately edits a.txt after ``merge``.
+             Merging ``conflict`` into main therefore CONFLICTS on a.txt —
+             resolved by hand and committed, recorded as ``conflict_merge``.
+             This pins the OTHER, worse symptom the task's analysis found:
+             plain ``git show --name-only`` on a merge that resolved a
+             conflict reports ONLY the conflict-resolution file(s), silently
+             omitting every non-conflicting file the branch also brought in
+             (measured on this repo's own history: commit a75568bd11 showed
+             1 file under the bare invocation vs. 6 real first-parent files,
+             none of which was that 1 file — see
+             test_merge_commit_with_resolved_conflict_reports_full_first_parent_file_list).
+             ``conflict_only.py`` deliberately does NOT reuse the
+             feature/extra_* names from scenario 2: this branch forks off
+             ``single`` (before the feature merge), so those names are free
+             to reuse on disk, but doing so would make feature.py conflict
+             too (both sides would have independently "added" it), muddying
+             the one conflict this scenario needs.
+
+        Mirrors the branch/merge sequence in
+        fused-memory/tests/test_audit_found_on_main_provenance.py::_build_test_repo,
+        including its defensive ``commit.gpgsign false`` + ``--no-verify`` on
+        every commit, so a developer's global gpgsign setting or a stray hook
+        can't hang or fail this throwaway repo.
+
+        Returns a dict of full 40-char SHAs:
+        ``{'single': ..., 'merge': ..., 'conflict_merge': ...}``.
+        Does NOT modify ``_init_repo`` — five pre-existing tests depend on its
+        exact linear shape and single-SHA return value.
+        """
+        import subprocess
+
+        def _git(*args):
+            return subprocess.run(
+                ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+        _git('config', 'user.email', 't@e.example')
+        _git('config', 'user.name', 'T')
+        _git('config', 'commit.gpgsign', 'false')
+
+        (path / 'a.txt').write_text('a\n')
+        (path / 'b.txt').write_text('b\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: ship a + b')
+        single = _git('rev-parse', 'HEAD')
+
+        _git('checkout', '-q', '-b', 'feature')
+        (path / 'feature.py').write_text('feature = 1\n')
+        for i in range(1, 5):
+            (path / f'extra_{i}.py').write_text(f'extra_{i} = 1\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: add feature')
+        _git('checkout', '-q', 'main')
+        _git('merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
+        merge = _git('rev-parse', 'HEAD')
+
+        # A second branch that edits a.txt independently of main's own later
+        # edit of the same file — merging it conflicts, exercising the
+        # (worse) symptom where a bare `git show` on a resolved-conflict
+        # merge reports only the conflicted path and hides everything else.
+        _git('checkout', '-q', '-b', 'conflict', single)
+        (path / 'a.txt').write_text('a-conflict-branch\n')
+        (path / 'conflict_only.py').write_text('conflict_only = 1\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: edit a.txt on conflict branch')
+        _git('checkout', '-q', 'main')
+        (path / 'a.txt').write_text('a-main-edit\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'chore: edit a.txt on main after feature merge')
+
+        # Deliberately not using `_git` (check=True): a real conflict makes
+        # `git merge` exit 1 and leave conflict markers instead of a commit.
+        conflict_result = subprocess.run(
+            ['git', '-C', str(path), 'merge', '--no-ff', '--no-verify', '-q',
+             '-m', 'Merge conflict into main', 'conflict'],
+            capture_output=True, text=True,
+        )
+        assert conflict_result.returncode != 0, (
+            'expected a.txt to conflict (both branches edited it since the '
+            'common ancestor); merge unexpectedly succeeded cleanly'
+        )
+        (path / 'a.txt').write_text('a-resolved\n')
+        _git('add', 'a.txt')
+        _git('commit', '-q', '--no-verify', '-m', 'Merge conflict into main (resolved)')
+        conflict_merge = _git('rev-parse', 'HEAD')
+
+        return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
+
     @pytest.mark.asyncio
     async def test_commit_provenance_renders_file_list(self, mock_deps, tmp_path):
         """Task with commit provenance → git show file list injected."""
@@ -1087,6 +1580,337 @@ class TestDoneProvenanceSection:
         # git show failed → no files line
         assert 'files:' not in section
 
+    @pytest.mark.asyncio
+    async def test_merge_commit_reports_first_parent_file_list(self, tmp_path):
+        """Merge commits must report the files they actually brought in.
+
+        Plain ``git show --name-only`` on a merge commit shows git's COMBINED
+        diff, which lists only paths differing from ALL parents — empty for a
+        clean (conflict-free) merge. Measured against five real merge commits
+        in this repo's own history: bare ``git show --name-only`` returns 0
+        files where ``git show --name-only --first-parent -m`` returns the
+        real count:
+
+            47780f693d (Merge task/2737 into main): 0 vs 13
+            ca7459b0a9 (Merge task/4293 into main): 0 vs 23
+            c7dcc4f9d4 (Merge task/3543 into main): 0 vs 47
+            24a8729c5f (Merge task/4097 into main): 0 vs 9
+            3765f4587d (Merge task/3369 into main): 0 vs 8
+
+        This matters because the Stage-2 prompt
+        (fused_memory/reconciliation/prompts/stage2.py) gates
+        '"Task N shipped via <file>"' edges on exactly this ``files:`` list —
+        a blind list means Stage-2 either authors no shipped-via edges for a
+        merge, or (worse, when the merge resolved a conflict) authors them
+        against a misleading conflict-only subset naming files the task
+        never actually touched.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
+        )
+
+        assert 'feature.py' in block
+        assert 'files:' in block
+        after_label = block.split('files:', 1)[1]
+        file_lines = [
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        ]
+        # Exact set, not just a membership/lower-bound check — the fixture's
+        # merge brings in exactly these five files, and a partial-list
+        # regression (e.g. a future --diff-filter or path-limiting flag that
+        # silently drops extra_*.py) must fail this test.
+        assert sorted(file_lines) == [
+            'extra_1.py', 'extra_2.py', 'extra_3.py', 'extra_4.py', 'feature.py',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_with_resolved_conflict_reports_full_first_parent_file_list(
+        self, tmp_path,
+    ):
+        """Pins the WORSE symptom the task's analysis found: a merge that
+        resolved a conflict, not just a clean merge with nothing to resolve.
+
+        Plain ``git show --name-only`` on a merge commit shows git's combined
+        diff — for a clean merge that's empty (see
+        test_merge_commit_reports_first_parent_file_list), but for a merge
+        that resolved a conflict it is NOT empty: it contains exactly the
+        conflict-resolution file(s), silently omitting every non-conflicting
+        file the branch also brought in. Measured on this repo's own
+        history: commit a75568bd11 (task 3368) showed 1 file under the bare
+        invocation (plans/resume-charter-loss-remediation-prd.md) vs. 6 real
+        first-parent files — none of which was that PRD. That mismatch is
+        precisely how a false "Task 3368 shipped via
+        plans/resume-charter-loss-remediation-prd.md" edge got authorised.
+
+        A suite that only exercised the CLEAN-merge case would not catch a
+        regression that fixed clean merges but reintroduced conflict-only
+        reporting — e.g. a future swap of ``--first-parent -m`` for
+        ``--diff-merges=combined``, which looks correct and passes every
+        clean-merge assertion while silently resurrecting this exact
+        under-report on any merge that resolved a conflict.
+
+        The fixture's ``conflict`` branch edits a.txt (which conflicts with
+        main's own later edit of the same file) and adds conflict_only.py
+        (which does not conflict). The first-parent file list for the
+        resolved merge must contain BOTH — not just the conflicted a.txt.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['conflict_merge'], max_files=50, max_chars=2000,
+        )
+
+        after_label = block.split('files:', 1)[1]
+        file_lines = sorted(
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        )
+        assert file_lines == ['a.txt', 'conflict_only.py']
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_header_emitted_once_and_never_leaks_into_file_list(self, tmp_path):
+        """Pins the --first-parent + -m INTERACTION, not either flag alone.
+
+        ``-m`` alone splits a merge into one diff PER PARENT, which would
+        repeat the ``%H%n%ai%n%s`` header once per parent and interleave it
+        with each parent's file list — the downstream parser takes
+        ``lines[:3]`` as the header and everything after as files, so a
+        repeated header would get parsed as bogus file paths and could
+        authorise garbage "shipped via" edges. ``--first-parent`` is what
+        restricts output back down to a single diff (against the first
+        parent only), so the header is emitted exactly once. Verified on git
+        2.43.0 against a real 2-parent merge: header count is exactly 1
+        (grep count 1 of 17 total output lines) under ``--first-parent -m``.
+
+        This is a GREEN pin (not a RED/regression test): it exists to fail
+        loudly if a future edit ever drops ``--first-parent`` while keeping
+        ``-m``, which is exactly the change that would reintroduce
+        per-parent diffs and duplicate/bogus paths.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
+        )
+
+        assert block.count(shas['merge']) == 1
+
+        lines = block.splitlines()
+        header = lines[:3]
+        assert lines[3] == 'files:'
+        files = [
+            ln.strip() for ln in lines[4:]
+            if ln.strip() and not ln.strip().startswith('...')
+        ]
+        for header_value in header:
+            assert header_value not in files
+        assert len(files) == len(set(files))
+
+    @pytest.mark.asyncio
+    async def test_single_parent_commit_file_list_unchanged_by_flag(self, tmp_path):
+        """--first-parent -m is a documented, empirically-verified no-op for an
+        ordinary single-parent commit — which is what makes adding the flags
+        a strict improvement rather than a behaviour trade-off for non-merge
+        provenance citations.
+
+        Asserts the claim through the module under test:
+        _git_show_name_only on the single-parent commit lists exactly a.txt
+        and b.txt under ``files:``, unchanged by the flags. (The byte-for-byte
+        raw-git no-op claim itself was verified by hand during planning —
+        identical md5 for bare vs. ``--first-parent -m`` output, on both this
+        repo's real history and a scratch fixture repo — but is deliberately
+        not re-pinned here as a second, hand-rolled invocation of the argv:
+        that duplicated the helper's own command literal without being
+        derived from it, so it kept passing regardless of what the helper's
+        actual argv was and pinned nothing about the implementation.)
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['single'], max_files=50, max_chars=2000,
+        )
+        after_label = block.split('files:', 1)[1]
+        file_lines = sorted(
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        )
+        assert file_lines == ['a.txt', 'b.txt']
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_provenance_renders_real_file_list_in_briefing(self, mock_deps, tmp_path):
+        """End-to-end: a done task citing a MERGE commit shows that merge's
+        real file list in the Stage-2 briefing — the artefact the Stage-2 LLM
+        actually reads and gates "shipped via" edge-writing on.
+
+        Integration-level companion to
+        test_merge_commit_reports_first_parent_file_list (which calls the
+        helper directly). Before the argv fix, this section rendered
+        `commit: <sha>` with no `files:` entries at all for a clean merge.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{
+                'id': 13, 'status': 'done', 'title': 'Ship feature via merge',
+                'metadata': {'done_provenance': {'commit': shas['merge']}},
+            }],
+        }
+
+        payload = await stage.assemble_payload([], Watermark(project_id='p'), [])
+
+        assert '### Done-task Provenance' in payload
+        assert f'commit: {shas["merge"]}' in payload
+        assert 'feature.py' in _extract_section(payload, '### Done-task Provenance')
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_commit_returns_empty_string_and_never_raises(self, tmp_path):
+        """Never-raises contract, pinned directly on the helper's return value.
+
+        Existing coverage (test_invalid_commit_gracefully_omits_file_list)
+        asserts this only indirectly, at the briefing level, via the absence
+        of a `files:` line. This pins it directly: adding argv flags is
+        exactly the kind of change that can turn a graceful-degradation path
+        into a raise, and the helper's docstring promises '' so one broken
+        ref never aborts a whole Stage-2 briefing. Any exception here fails
+        the test naturally — no pytest.raises is used because none should
+        ever fire.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+        bad_sha = 'deadbeef' * 5  # 40 chars but not a real SHA
+
+        # rc != 0 path — well-formed but unresolvable commit against a real repo.
+        result = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), bad_sha, max_files=50, max_chars=2000,
+        )
+        assert result == ''
+
+        # git itself fails — a bad -C root.
+        result = await _git_show_name_only(
+            ProjectRoot(str(tmp_path / 'nonexistent')), shas['merge'], max_files=50, max_chars=2000,
+        )
+        assert result == ''
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_file_list_respects_max_files_truncation(self, tmp_path):
+        """max_files truncation, now REACHABLE for merge commits for the
+        first time — previously a merge yielded zero files, so max_files /
+        max_chars could never fire for one. Real merges are large enough to
+        matter (c7dcc4f9d4 brings 47 files against the caller's defaults of
+        max_files_per_task=50 / max_chars_per_task=2000,
+        _render_done_provenance_section), so the truncation path is now
+        genuinely live for merge provenance and must keep working.
+
+        The merge fixture brings in 5 files (feature.py + extra_1..4.py).
+        With a deliberately small max_files=2, exactly 2 entries must be
+        listed and the block must end with a correctly-counted
+        `... (N more)` marker — pinning that the marker isn't silently
+        dropped now that it can actually fire for a merge.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=2, max_chars=2000,
+        )
+
+        after_label = block.split('files:', 1)[1]
+        raw_lines = [ln.strip() for ln in after_label.splitlines() if ln.strip()]
+        more_markers = [ln for ln in raw_lines if ln.startswith('...')]
+        file_lines = [ln for ln in raw_lines if not ln.startswith('...')]
+
+        assert len(file_lines) == 2
+        assert more_markers == ['... (3 more)']
+
+    @pytest.mark.asyncio
+    async def test_section_under_budget_no_truncation_warning(self, caplog):
+        """A handful of small note-only tasks stay well under the default
+        20_000-char section budget — no truncation footer, no warning.
+
+        No git repo needed: note-only provenance never calls
+        _git_show_name_only, so this exercises the section-level budget in
+        isolation from per-task git truncation.
+        """
+        done_tasks = [
+            {
+                'id': i, 'title': f'Task {i}', 'status': 'done',
+                'metadata': {'done_provenance': {'note': f'short note {i}'}},
+            }
+            for i in range(5)
+        ]
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            section = await _render_done_provenance_section(done_tasks, None)
+
+        assert '... and ' not in section, (
+            f'Unexpected truncation footer in section; got:\n{section}'
+        )
+        assert not any(
+            rec.levelno == logging.WARNING and rec.name == _TKS_LOGGER
+            for rec in caplog.records
+        ), (
+            'Expected no WARNING for 5 small note-only tasks; '
+            f'got: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_section_over_budget_truncates_with_footer_and_warning(self, caplog):
+        """Many tasks with long notes exceed a deliberately small section
+        budget: rendering stops early, a truncation footer names the
+        remaining count, and a structured WARNING is logged — mirroring
+        _format_flagged's char-budget pattern (TestFormatFlaggedCharBudget).
+
+        Guards the amendment that gives '### Done-task Provenance' a total
+        char budget: before task 4702's argv fix, a done task citing a merge
+        commit contributed ~0 file lines (git's combined diff is empty for a
+        clean merge), so this section could never grow large in practice.
+        Now a merge can contribute up to max_files_per_task/max_chars_per_task
+        each, times up to MAX_DONE_TASKS_RETAINED (30) done tasks, so an
+        unbounded section could silently crowd out the rest of the Stage-2
+        prompt — this pins that the degradation is loud and bounded instead.
+        """
+        done_tasks = [
+            {
+                'id': i, 'title': f'Task {i}', 'status': 'done',
+                'metadata': {'done_provenance': {'note': 'x' * 200}},
+            }
+            for i in range(20)
+        ]
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            section = await _render_done_provenance_section(
+                done_tasks, None, section_budget_chars=500,
+            )
+
+        assert 'truncated: section char budget' in section, (
+            f'Expected truncation footer in section; got:\n{section}'
+        )
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == _TKS_LOGGER
+            and rec.message == 'reconciliation.done_provenance_section_truncated'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 truncation WARNING; got {len(warning_records)}: '
+            f'{[(r.message, getattr(r, "__dict__", {})) for r in warning_records]}'
+        )
+        rec = warning_records[0]
+        for key in ('total', 'rendered', 'dropped', 'section_budget_chars'):
+            assert hasattr(rec, key), (
+                f'Expected extra key {key!r} on WARNING record; record __dict__: {rec.__dict__}'
+            )
+        assert rec.total == 20, f'total must be 20, got {rec.total}'
+        assert rec.total == rec.rendered + rec.dropped, (
+            f'total={rec.total} must equal rendered={rec.rendered} + dropped={rec.dropped}'
+        )
+        assert rec.rendered > 0, f'rendered must be > 0, got {rec.rendered}'
+        assert rec.dropped > 0, f'dropped must be > 0, got {rec.dropped}'
+        assert rec.section_budget_chars == 500, (
+            f'section_budget_chars must be 500, got {rec.section_budget_chars}'
+        )
+        assert f'... and {rec.dropped} more (truncated: section char budget)' in section
+
 
 class BaseStageValidationTest:
     """Shared infrastructure for stage validation test classes.
@@ -1113,14 +1937,7 @@ class BaseStageValidationTest:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _patch_stage(self, stage, cli_side_effect=None):
         """Return a context manager that patches assemble_payload and run_stage_via_cli.
@@ -1231,6 +2048,26 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # (reviewer finding observability, task 2229 amendment pass round 2)
             # — the key now makes explicit that it tracks the ledger write only.
             'stage1_cycle_summary_ledger_written': 1,
+            # Always present on BOTH the full and remediation paths (task 2978,
+            # hoisted by 2979): verify_cited_memories now runs inside
+            # BaseStage.run()'s shared items_flagged assembly — so these counters
+            # are merged into report.stats before any subclass post-processing,
+            # including Stage 1's remediation early-return. All 0 here — no
+            # findings were flagged.
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+            # Always present (task 3084), set before the remediation early-return
+            # beside the task-2312/2229 pre-inits above. All three stay 0 here:
+            # this stage's filtered_task_tree is unset, so the
+            # resolved-curator-gate sweep never runs and no stat is overwritten.
+            # _errors joined the pair in the task-3084 amendment pass (reviewer
+            # finding "observability"): without it, a cycle in which every gate
+            # failed its Qdrant read is byte-identical here to a clean cycle
+            # that found nothing.
+            'curator_gate_resolution_scanned': 0,
+            'curator_gate_resolution_flags_emitted': 0,
+            'curator_gate_resolution_errors': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -1339,6 +2176,26 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # (reviewer finding observability, task 2229 amendment pass round 2)
             # — the key now makes explicit that it tracks the ledger write only.
             'stage1_cycle_summary_ledger_written': 1,
+            # Always present on BOTH the full and remediation paths (task 2978,
+            # hoisted by 2979): verify_cited_memories now runs inside
+            # BaseStage.run()'s shared items_flagged assembly — so these counters
+            # are merged into report.stats before any subclass post-processing,
+            # including Stage 1's remediation early-return. All 0 here — no
+            # findings were flagged.
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+            # Always present (task 3084), set before the remediation early-return
+            # beside the task-2312/2229 pre-inits above. All three stay 0 here:
+            # this stage's filtered_task_tree is unset, so the
+            # resolved-curator-gate sweep never runs and no stat is overwritten.
+            # _errors joined the pair in the task-3084 amendment pass (reviewer
+            # finding "observability"): without it, a cycle in which every gate
+            # failed its Qdrant read is byte-identical here to a clean cycle
+            # that found nothing.
+            'curator_gate_resolution_scanned': 0,
+            'curator_gate_resolution_flags_emitted': 0,
+            'curator_gate_resolution_errors': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -1449,14 +2306,7 @@ class TestProactiveSampling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2009,14 +2859,7 @@ class TestStage2NoTaskIdCeiling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_high_task_ids_do_not_block_task_writes(self, mock_deps):
@@ -2370,14 +3213,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2523,29 +3359,19 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
     async def test_stage_does_not_apply_second_slice_on_done_tasks(
         self, mock_deps, watermark
     ):
-        """Stage must NOT apply a second done_tasks slice on top of filter_task_tree's cap.
+        """Exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear in Recently Completed.
 
-        Two assertions:
-        (1) Source-level guard: assemble_payload source must not contain a slice on
-            done_tasks (e.g. ``done_tasks[:30]``).  This is a tripwire — it fires the
-            moment someone re-introduces a hardcoded re-slice that duplicates the cap
-            already enforced by filter_task_tree.
-        (2) Behavioral guard: exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear
-            in the Recently Completed section — the stage must not silently trim them.
+        At the cap boundary the stage must not silently trim: filter_task_tree has already
+        enforced MAX_DONE_TASKS_RETAINED, so every task it hands over has to survive
+        assemble_payload's rendering.
+
+        Scope note: this feeds *exactly* MAX_DONE_TASKS_RETAINED tasks, so a re-introduced
+        ``done_tasks[:30]`` re-slice passes all 30 through unchanged and would keep this
+        test green.  The oversized-tree case that actually detects a redundant re-slice
+        lives in ``test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree``
+        (which also replaced the inspect.getsource source-text tripwire this test used to
+        carry as its first assertion — see task 3351).
         """
-        import inspect
-        import re
-
-        # (1) Source-level tripwire: assemble_payload must not slice done_tasks.
-        source = inspect.getsource(TaskKnowledgeSync.assemble_payload)
-        assert not re.search(r'done_tasks\[.*:.*\]', source), (
-            "assemble_payload contains a slice on done_tasks (e.g. done_tasks[:30]). "
-            "This is dead code — filter_task_tree already caps done_tasks at "
-            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}. "
-            "Remove the slice; filter_task_tree is the single source of truth."
-        )
-
-        # (2) Behavioral guard: all MAX_DONE_TASKS_RETAINED tasks pass through uncut.
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
@@ -2569,6 +3395,59 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f"Tasks {missing} missing from Recently Completed section. "
             f"The stage may be applying a redundant slice that trims "
             f"filter_task_tree's already-capped output.\n"
+            f"Section content:\n{section}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree(
+        self, mock_deps, watermark
+    ):
+        """assemble_payload must render EVERY done task it is handed — no second truncation.
+
+        Asserts on RENDERED OUTPUT (the '### Recently Completed Tasks' section), not on
+        source text.  The tree is deliberately OVERSIZED
+        (``MAX_DONE_TASKS_RETAINED + 5`` — a state ``filter_task_tree`` can never produce)
+        and injected through the ``stage.filtered_task_tree`` seam that ``assemble_payload``
+        honours ahead of its ``filter_task_tree`` fallback, because the sibling
+        ``test_stage_does_not_apply_second_slice_on_done_tasks`` sits exactly at the cap
+        where a re-introduced ``done_tasks[:30]`` passes all 30 through and stays green.
+
+        The size of ``done_tasks`` is the ONLY deliberate anomaly: every other field of the
+        injected tree is populated consistently with it.
+        """
+        n_done = MAX_DONE_TASKS_RETAINED + 5
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        done_tasks = [self._make_task(i, 'done') for i in range(1, n_done + 1)]
+        # done_count == len(done_tasks) keeps _check_filtered_tree_invariant quiet;
+        # all_done_tasks (read by the since-boundary completion-memory audit) and
+        # max_task_id are populated to match, so the oversized done_tasks list is the
+        # only way this tree differs from a filter_task_tree output.
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=done_tasks,
+            all_done_tasks=list(done_tasks),
+            done_count=n_done,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=n_done,
+            max_task_id=n_done,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, '### Recently Completed Tasks')
+        assert section, "Payload missing '### Recently Completed Tasks' section"
+
+        missing = [tid for tid in range(1, n_done + 1) if f'- [{tid}] ' not in section]
+        assert not missing, (
+            f"Task ids {missing} were dropped from the Recently Completed section. "
+            f"assemble_payload was handed {n_done} done tasks and must render all of them. "
+            f"filter_task_tree is the single source of truth for the "
+            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED} cap, so any truncation "
+            f"inside the stage is a redundant re-slice — remove it.\n"
             f"Section content:\n{section}"
         )
 
@@ -2723,14 +3602,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3039,14 +3911,7 @@ class TestInvariantAfterTask643:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3087,14 +3952,14 @@ class TestInvariantAfterTask643:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             payload = await stage.assemble_payload([], watermark, [])
 
         # The warning must be emitted…
         assert any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'cancelled_count' in rec.message
             and 'cancelled_tasks' in rec.message
             for rec in caplog.records
@@ -3140,13 +4005,13 @@ class TestInvariantAfterTask643:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await stage.assemble_payload([], watermark, [])
 
         assert any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'done_count' in rec.message
             and 'done_tasks' in rec.message
             for rec in caplog.records
@@ -3178,7 +4043,7 @@ class TestInvariantAfterTask643:
         )
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             stage._check_filtered_tree_invariant(violating_tree)
 
@@ -3208,7 +4073,7 @@ class TestInvariantAfterTask643:
         )
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             stage._check_filtered_tree_invariant(violating_tree)
 
@@ -3237,13 +4102,12 @@ class TestInvariantAfterTask643:
             other_count=0,
             total_count=2,
         )
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             stage._check_filtered_tree_invariant(ok_tree)
 
-        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+        assert not any(
+            rec.name == _TKS_LOGGER and rec.levelno >= logging.WARNING for rec in caplog.records
+        )
 
     def test_check_filtered_tree_invariant_no_warning_when_ok(self, mock_deps, caplog):
         """Unit test for _check_filtered_tree_invariant: no warning when invariant holds."""
@@ -3257,13 +4121,12 @@ class TestInvariantAfterTask643:
             other_count=0,
             total_count=1,
         )
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             stage._check_filtered_tree_invariant(ok_tree)
 
-        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+        assert not any(
+            rec.name == _TKS_LOGGER and rec.levelno >= logging.WARNING for rec in caplog.records
+        )
 
     def test_filter_task_tree_invariant_cancelled_count_and_cancelled_tasks_populated_together(self):
         """Regression guard: filter_task_tree() sets cancelled_count>0 ↔ cancelled_tasks non-empty.
@@ -3500,13 +4363,13 @@ class TestFormatFlaggedCharBudget:
         items = [{'description': f'small-{i}', 'severity': 'minor'} for i in range(10)]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             _format_flagged(items)
 
         assert not any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             for rec in caplog.records
         ), (
             'Expected no WARNING for 10 small items; '
@@ -3542,14 +4405,14 @@ class TestFormatFlaggedCharBudget:
         items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             _format_flagged(items)  # result not needed here; warning is what we check
 
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1, (
             f'Expected exactly 1 WARNING; got {len(warning_records)}: '
@@ -3595,7 +4458,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         items = [{'description': 'y' * 50_000, 'severity': 'critical'}]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             text = _format_flagged(items)
 
@@ -3615,7 +4478,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1, (
             f'Expected exactly 1 WARNING for oversized single item; got {len(warning_records)}'
@@ -3630,7 +4493,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             text = _format_flagged(items)
 
@@ -3649,14 +4512,14 @@ class TestFormatFlaggedFirstItemEdgeCase:
         items = [{'description': 'y' * 50_000, 'severity': 'critical'}]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             _format_flagged(items)
 
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and rec.message == 'reconciliation.flagged_items_truncated'
         ]
         assert len(warning_records) == 1, (
@@ -3684,7 +4547,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             text = _format_flagged(items)
 
@@ -3696,7 +4559,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and rec.message == 'reconciliation.flagged_items_truncated'
         ]
         assert len(warning_records) == 1
@@ -3745,14 +4608,7 @@ class TestStage2HandoffShortfallWarning:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3772,7 +4628,7 @@ class TestStage2HandoffShortfallWarning:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await stage.assemble_payload([], watermark, [stage1_report])
 
@@ -3780,7 +4636,7 @@ class TestStage2HandoffShortfallWarning:
         truncation_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'reconciliation.flagged_items_truncated' in rec.getMessage()
             and getattr(rec, 'run_stage', None) == 'stage2'
         ]
@@ -3822,14 +4678,14 @@ class TestStage2HandoffShortfallWarning:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await stage.assemble_payload([], watermark, [stage1_report])
 
         truncation_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'flagged_items_truncated' in rec.getMessage()
             and getattr(rec, 'run_stage', None) == 'stage2'
         ]
@@ -3942,7 +4798,7 @@ class TestBriefingKnownGapsRefresh:
 
         with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
@@ -3950,7 +4806,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         # The warning must use the canonical message key and carry the exit code in extra.
@@ -4132,7 +4988,7 @@ class TestBriefingKnownGapsRefresh:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             await stage.run(
@@ -4239,7 +5095,7 @@ class TestBriefingKnownGapsRefresh:
             ),
             caplog.at_level(
                 logging.WARNING,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -4254,7 +5110,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
             and 'briefing_refresh_hook_failed' in r.getMessage()
         ]
         assert len(warning_records) == 1
@@ -4285,7 +5141,7 @@ class TestBriefingKnownGapsRefresh:
             side_effect=TimeoutError,
         ), caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
@@ -4294,7 +5150,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_known_gaps_script_timeout' in warning_records[0].getMessage()
@@ -4322,7 +5178,7 @@ class TestBriefingKnownGapsRefresh:
             return_value=mock_proc,
         ), caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
@@ -4330,7 +5186,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_known_gaps_script_bad_json' in warning_records[0].getMessage()
@@ -4352,7 +5208,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -4362,7 +5218,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_refresh_add_task_failed' in warning_records[0].getMessage()
@@ -4396,7 +5252,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.INFO,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -4410,7 +5266,7 @@ class TestBriefingKnownGapsRefresh:
 
         our_records = [
             r for r in caplog.records
-            if r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            if r.name == _TKS_LOGGER
         ]
         failed_warnings = [
             r for r in our_records
@@ -4471,7 +5327,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -4485,7 +5341,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_refresh_add_task_unexpected_shape' in warning_records[0].getMessage()
@@ -4520,7 +5376,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -4553,14 +5409,7 @@ class TestMemoryConsolidatorFlagDedup:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
@@ -4666,14 +5515,7 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_cancelled_task_stale_metadata_absent_from_flagged_items(self, mock_deps):
@@ -4761,6 +5603,130 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
 
 
 # ---------------------------------------------------------------------------
+# Task 3007 — filter_stale_bulk_get_statuses_flags wired before dedup_flags
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
+    """filter_stale_bulk_get_statuses_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 3007).
+
+    A stale_bulk_get_statuses_recurrence flag whose live bulk and scoped
+    get_statuses now AGREE on the cited task is dropped before dedup_flags, the
+    stale_bulk_get_statuses_flags_dropped stat is recorded via the same
+    before/after length-diff idiom as stale_count_snapshot_corrections_dropped,
+    and the dropped flag is reclaimed via acknowledge_resolved_flags (no
+    surviving stage1_flag_marker for it).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        return _mock_stage_deps()
+
+    @pytest.mark.asyncio
+    async def test_agreeing_flag_dropped_stat_set_and_reclaimed(self, mock_deps):
+        """A stale_bulk_get_statuses_recurrence flag whose live bulk/scoped reads
+        agree is dropped before dedup_flags, counted in
+        report.stats['stale_bulk_get_statuses_flags_dropped'], and forwarded to
+        acknowledge_resolved_flags(mode='delete') for marker reclaim.
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', stage.scope.project_root)
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.scope = _scope(stage.scope.project_id, '/proj')
+
+        stale_flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[stale_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        # Live bulk (ids=None) and scoped (ids=[tid]) get_statuses AGREE on 2992,
+        # so the alleged capture-time divergence does not reproduce → DROP.
+        def _statuses(project_root_arg, ids=None, tag=None):
+            return {'2992': 'done'}
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_statuses = AsyncMock(side_effect=_statuses)
+        # active_flag is stale_metadata; keep its task non-terminal so it survives
+        # filter_terminal_metadata_flags cleanly and is the sole survivor.
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+
+        dedup_call_args: list = []
+
+        async def _dedup_spy(**kwargs):
+            dedup_call_args.append(kwargs.get('flags', []))
+            return kwargs.get('flags', [])
+
+        ack_mock = AsyncMock(return_value=1)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=_dedup_spy,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        # (a) the stale flag must be dropped from the final items_flagged
+        assert stale_flag not in (report.items_flagged or []), (
+            'stale_bulk_get_statuses_recurrence flag must be dropped when the live '
+            'bulk and scoped get_statuses agree on the cited task'
+        )
+        assert active_flag in (report.items_flagged or []), (
+            'the unrelated survivor flag must remain in items_flagged'
+        )
+
+        # (b) the drop must be counted in report.stats (before/after length diff)
+        assert report.stats.get('stale_bulk_get_statuses_flags_dropped') == 1, (
+            'exactly one stale_bulk_get_statuses flag must be counted as dropped'
+        )
+
+        # (c) it must be dropped BEFORE dedup_flags (no marker write/delete churn)
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert stale_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags — dropping it before dedup '
+            'stops the phantom-investigation marker churn'
+        )
+        assert active_flag in dedup_call_args[0], (
+            'the survivor flag must still reach dedup_flags'
+        )
+
+        # (d) the dropped flag must be reclaimed via acknowledge_resolved_flags
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [stale_flag], (
+            'exactly the dropped stale flag (and only it) must be forwarded to '
+            'acknowledge_resolved_flags so its stage1_flag_marker is reclaimed; got '
+            f'{call_kwargs.get("resolved_flags")!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2029 scenario (a) — MemoryConsolidator acknowledges flags dropped by
 # the Stage-1 filter chain via acknowledge_resolved_flags(mode='delete').
 #
@@ -4776,14 +5742,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_dropped_flag_acknowledged_and_stat_set(self, mock_deps):
@@ -4978,7 +5937,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
         ack_mock = AsyncMock(return_value=0)
 
-        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags, **_kwargs):
             # Simulate dedup_flags' internal filter_suppressed dropping
             # suppressed_flag before the signature-dedup loop runs.  Filters by
             # content (not object identity): StageReport is a pydantic model,
@@ -5066,7 +6025,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
         ack_mock = AsyncMock(return_value=1)
 
-        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags, **_kwargs):
             # By the time dedup_flags runs, filter_terminal_metadata_flags has
             # already dropped terminal_flag (real implementation, driven by
             # the taskmaster mock above) — so `flags` here is only
@@ -5117,14 +6076,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_base_report(self, items_flagged=None):
         return StageReport(
@@ -5440,12 +6392,12 @@ class TestQueryStage2Flags:
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
         assert stale_missing_ids == []
         assert stale_mismatched_ids == []
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_calls_search_with_project_id(self):
@@ -5582,7 +6534,7 @@ class TestQueryStage2Flags:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await _query_stage2_flags(memory_service, 'reify', 'r-now')
 
@@ -5617,7 +6569,7 @@ class TestQueryStage2Flags:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await _query_stage2_flags(memory_service, 'reify', 'r-now')
 
@@ -5974,7 +6926,7 @@ class TestQueryStage2Flags:
             ),
         ]
         with caplog.at_level(logging.INFO,
-                             logger='fused_memory.reconciliation.stages.task_knowledge_sync'):
+                             logger=_TKS_LOGGER):
             await _query_stage2_flags(
                 memory_service, 'reify', 'r-current', run_window_start=run_window_start
             )
@@ -6460,16 +7412,16 @@ class TestSweepStalePersistenceMarkers:
         )
         memory_service.delete_memory = AsyncMock(return_value=None)
 
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _sweep_stale_persistence_markers(memory_service, 'reify', run_id='r1')
 
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        warning_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert len(warning_records) == 1
 
     @pytest.mark.asyncio
     async def test_empty_enumeration_returns_zero_and_no_deletes(self):
@@ -6511,16 +7463,16 @@ class TestSweepStalePersistenceMarkers:
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(side_effect=[RuntimeError('boom'), None])
 
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _sweep_stale_persistence_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now,
             )
 
         assert result == 1
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        warning_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
         assert len(warning_records) == 1
         assert 'bad' in warning_records[0].getMessage()
 
@@ -6547,16 +7499,65 @@ class TestSweepStalePersistenceMarkers:
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             await _sweep_stale_persistence_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
             )
 
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        warning_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert len(warning_records) == 1
+
+    @pytest.mark.asyncio
+    async def test_kind_only_member_emits_no_drift_warning_single_variant_pool(self, caplog):
+        """The under-tagged-marker drift diagnostic (task 3915 step-8) is
+        gated to `len(filter_variants) > 1` so the two single-dict callers
+        keep byte-for-byte unchanged log output — this pool
+        (_sweep_stale_persistence_markers, enum_filters=None) is one of
+        them. A member carrying only 'kind' with no 'source' key is exactly
+        the drifted shape the diagnostic looks for on the multi-variant
+        stage1_flag_marker pool, but here — reached via the single
+        {'source': 'stage2_persistence_marker'} filter, meaning a real
+        Qdrant scroll could never have returned it in the first place — no
+        drift WARNING must fire regardless. A future refactor that dropped
+        the multi-variant gate would leave the two existing drift tests on
+        TestSweepStaleMem0FlagMarkers green while silently changing this
+        sweep's log output; this test pins that it does not."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'kind-only',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage2_persistence_marker', 'flag_id': 'f1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_persistence_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        # The member is still deleted normally (age-GC does not consult
+        # 'source'/'kind' at all) — only the drift diagnostic is at issue.
+        assert result == 1
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'under-tagged' in rec.message.lower()
+            for rec in caplog.records
+        )
 
 
 class TestSweepStaleMem0FlagMarkers:
@@ -6631,10 +7632,15 @@ class TestSweepStaleMem0FlagMarkers:
             assert kwargs.get('causation_id') == 'r1'
             assert kwargs.get('_source') == _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE
 
-        memory_service.get_memories_by_metadata.assert_awaited_once()
-        call = memory_service.get_memories_by_metadata.call_args
-        filters = call.kwargs.get('filters') or {}
-        assert filters == {'source': 'stage1_flag_marker'}
+        # task 3915: enumeration now probes BOTH key spellings — one await
+        # per filter variant, not a single {'source': ...}-only scroll.
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        scrolled_filters = [
+            call.kwargs.get('filters') or {}
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in scrolled_filters
+        assert {'kind': 'stage1_flag_marker'} in scrolled_filters
 
         # Deterministic scroll only — semantic search must never be used for GC.
         memory_service.search.assert_not_awaited()
@@ -6785,16 +7791,16 @@ class TestSweepStaleMem0FlagMarkers:
         )
         memory_service.delete_memory = AsyncMock(return_value=None)
 
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _sweep_stale_mem0_flag_markers(memory_service, 'reify', run_id='r1')
 
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        warning_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert len(warning_records) == 1
 
     @pytest.mark.asyncio
     async def test_empty_enumeration_returns_zero_and_no_deletes(self):
@@ -6836,16 +7842,16 @@ class TestSweepStaleMem0FlagMarkers:
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(side_effect=[RuntimeError('boom'), None])
 
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _sweep_stale_mem0_flag_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now,
             )
 
         assert result == 1
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        warning_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
         assert len(warning_records) == 1
         assert 'bad' in warning_records[0].getMessage()
 
@@ -6872,15 +7878,27 @@ class TestSweepStaleMem0FlagMarkers:
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             await _sweep_stale_mem0_flag_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
             )
 
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # >= 1, not == 1: _sweep_stale_mem0_flag_markers scrolls TWO filter
+        # variants ({'source': ...} and {'kind': ...}, task 3915), each with
+        # its own scroll_limit budget. This test's mock returns the same
+        # `members` list regardless of which filter was passed, so BOTH
+        # variants see 3-of-3 and independently trip the scroll-cap warning
+        # — 2 real records from this same logger, not 1 (task 4329 follow-up:
+        # the == 1 tightening was measured against the single-variant
+        # persistence-markers sweep and didn't hold for this multi-variant
+        # one). The precise one-warning-per-variant behavior is already
+        # pinned by test_scroll_cap_warning_emitted_once_per_variant_naming_its_filter
+        # below, with a filter-aware mock; this test only needs "at least
+        # one scroll-cap warning fires", per its docstring.
+        warning_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
         assert len(warning_records) >= 1
 
     @pytest.mark.asyncio
@@ -6901,9 +7919,15 @@ class TestSweepStaleMem0FlagMarkers:
         result = await _sweep_stale_mem0_flag_markers(memory_service, 'reify', run_id='r1')
 
         assert result == 0
-        memory_service.count_memories_by_metadata.assert_awaited_once()
-        call = memory_service.count_memories_by_metadata.call_args
-        assert call.kwargs.get('filters') == {'source': 'stage1_flag_marker'}
+        # task 3915: short-circuit requires EVERY variant to confirm zero —
+        # one probe per filter variant, not a single {'source': ...}-only probe.
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        probed_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in probed_filters
+        assert {'kind': 'stage1_flag_marker'} in probed_filters
         memory_service.get_memories_by_metadata.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -6936,7 +7960,8 @@ class TestSweepStaleMem0FlagMarkers:
         )
 
         assert result == 1
-        memory_service.get_memories_by_metadata.assert_awaited_once()
+        # task 3915: the fail-open scroll still runs once per filter variant.
+        assert memory_service.get_memories_by_metadata.await_count == 2
 
     @pytest.mark.asyncio
     async def test_persistence_markers_sweep_never_probes_count(self):
@@ -6959,6 +7984,1010 @@ class TestSweepStaleMem0FlagMarkers:
         assert result == 0
         memory_service.count_memories_by_metadata.assert_not_awaited()
         memory_service.get_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_kind_only_marker_without_source_is_enumerated_and_deleted(self):
+        """Regression pin for task 3915 (measured root cause C): the live
+        leaked marker a5732b3b carries metadata.kind='stage1_flag_marker'
+        with NO 'source' key at all — written by an LLM recon add_memory
+        call that omitted 'source' (the canonical retired writer,
+        flag_dedup.py:849-856, always set BOTH keys; this record did not go
+        through it). Pre-fix, this sweep enumerates ONLY
+        {'source': 'stage1_flag_marker'}, which matches zero records for
+        this marker in know_live; combined with count_short_circuit=True,
+        the scroll never even runs, so the record is invisible forever —
+        present-and-zero, indistinguishable from a clean pool. Fixed
+        behaviour must ALSO probe {'kind': 'stage1_flag_marker'} and delete
+        what it finds there. Uses the exact measured live record shape
+        (memory_id, metadata, 37-day age) from get_memory_by_id."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        live_marker = {
+            'id': 'a5732b3b-801d-4113-b9e3-ca67f72c822b',
+            'created_at': (fixed_now - timedelta(days=37)).isoformat(),
+            'metadata': {
+                'kind': 'stage1_flag_marker',
+                'task_id': 'dark_factory:1943',
+                'flag_type': 'stale_flag_marker_cleanup',
+                'confidence': 'verified',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+            },
+        }
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [live_marker]
+            return []
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return 1
+            return 0
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'know_live', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        memory_service.delete_memory.assert_awaited_once()
+        call = memory_service.delete_memory.call_args
+        assert call.kwargs.get('memory_id') == 'a5732b3b-801d-4113-b9e3-ca67f72c822b'
+        assert call.kwargs.get('store') == 'mem0'
+        assert call.kwargs.get('causation_id') == 'r1'
+        assert call.kwargs.get('_source') == _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE
+
+        scrolled_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert {'kind': 'stage1_flag_marker'} in scrolled_filters
+
+    @pytest.mark.asyncio
+    async def test_marker_carrying_both_source_and_kind_is_deleted_exactly_once(self):
+        """Union de-duplication pin (task 3915): the canonical flag_dedup
+        writer shape (flag_dedup.py:849-856) sets BOTH 'source' and 'kind'
+        to 'stage1_flag_marker' on the same record, so it is returned by
+        BOTH filter variants' scrolls under the SAME id. The merge must be
+        a union keyed on id — this member must be deleted exactly once, not
+        once per matching variant, or stale_mem0_flag_markers_gc_swept
+        would over-count and the delete/tombstone path would double-fire
+        for the entire pre-2406 canonical (both-keys-present) cohort."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        both_keys_member = {
+            'id': 'canonical-both-keys',
+            'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': 't1',
+                'run_id': 'prior-run',
+            },
+        }
+        memory_service = AsyncMock()
+        # Both filter variants match this record (it carries both keys), so
+        # every scroll call — regardless of which variant's filter it was
+        # issued with — returns the SAME member/id.
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[both_keys_member])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 1
+        assert memory_service.delete_memory.await_count == 1
+        tombstone.assert_awaited_once()
+        assert tombstone.await_args is not None
+        victims = tombstone.await_args.args[2]
+        assert len(victims) == 1
+        assert victims[0]['id'] == 'canonical-both-keys'
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_only_when_all_variants_count_zero(self):
+        """dark_factory steady state: once BOTH key spellings are confirmed
+        empty, the sweep must short-circuit cheaply — one count probe per
+        variant, no scroll at all — so a fully-drained pool doesn't
+        re-scroll forever every cycle."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(memory_service, 'dark_factory', run_id='r1')
+
+        assert result == 0
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        probed_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in probed_filters
+        assert {'kind': 'stage1_flag_marker'} in probed_filters
+
+    @pytest.mark.asyncio
+    async def test_no_short_circuit_when_any_variant_counts_nonzero(self):
+        """The exact know_live state that leaked marker a5732b3b: the
+        'source' probe confirms zero but the 'kind' probe reports 1 — the
+        short circuit must NOT fire, and the scroll must run for BOTH
+        variants so the kind-only marker is found and deleted."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        kind_only_member = {
+            'id': 'kind-only-stale',
+            'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+            'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't1'},
+        }
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'kind': 'stage1_flag_marker'} else 0
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return [kind_only_member] if filters == {'kind': 'stage1_flag_marker'} else []
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'know_live', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        memory_service.delete_memory.assert_awaited_once()
+        assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'kind-only-stale'
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_fails_open_when_a_variant_probe_raises(self):
+        """A probe exception on ONE variant must fall through to the full
+        scroll for BOTH variants, never be misread as a confirmed-empty
+        pool — the short circuit may only ever skip work the scroll would
+        itself have found empty."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                raise RuntimeError('qdrant down')
+            return 0
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        assert memory_service.get_memories_by_metadata.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_kind_only_members_emit_metadata_drift_warning(self, caplog):
+        """Task 3915 step-8: the union filter now REACHES kind-only,
+        source-less members (root cause C) — records written before (or
+        outside) the task-2596 add_memory gate that now rejects that exact
+        shape for 'recon-stage-*' agent_ids (server/tools.py:2978-2993).
+        Mirroring _warn_on_flag_for_stage2_type_drift's posture (task 2966),
+        the sweep must emit exactly ONE loud, purely-diagnostic WARNING
+        naming the count of under-tagged members and the log_name, so any
+        residual non-'recon-stage-*' writer surfaces instead of silently
+        refilling the pool the fix just drained. The warning must never
+        affect the sweep's own delete/return behaviour — all three members
+        here are stale and unprotected, so all three must still be
+        deleted. get_memories_by_metadata is filter-aware (side_effect)
+        so this pins that the `kind`-only members are actually surfaced by
+        the `{'kind': ...}` variant's scroll, not just present in an
+        unrealistic filter-blind mock return."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'canonical-both-keys',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': 't1',
+                },
+            },
+            {
+                'id': 'kind-only-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+            {
+                'id': 'kind-only-2',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't3'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'kind': 'stage1_flag_marker'} else 0
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('source') == 'stage1_flag_marker']
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('kind') == 'stage1_flag_marker']
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            result = await _sweep_stale_mem0_flag_markers(
+                memory_service, 'know_live', run_id='r1', now=fixed_now,
+            )
+
+        # Purely diagnostic: normal age-filter/delete behaviour is unaffected —
+        # all three members are stale and none are protected-mirror records,
+        # so all three are still deleted regardless of the drift warning.
+        assert result == 3
+        assert memory_service.delete_memory.await_count == 3
+
+        drift_warnings = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and '_sweep_stale_mem0_flag_markers' in rec.message
+            and 'kind' in rec.message
+            and 'source' in rec.message
+        ]
+        assert len(drift_warnings) == 1, (
+            f'expected exactly one drift WARNING, got: '
+            f'{[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+        assert '2' in drift_warnings[0].message
+
+    @pytest.mark.asyncio
+    async def test_all_source_tagged_members_emit_no_drift_warning(self, caplog):
+        """Complementary case (task 3915 step-7): when every enumerated
+        member carries 'source', there is no under-tagged cohort and the
+        drift WARNING must stay silent — the diagnostic must not fire on
+        the canonical, correctly-tagged shape. get_memories_by_metadata is
+        filter-aware (side_effect) so canonical-2 (source only, no 'kind'
+        key) is returned ONLY by the {'source': ...} variant's scroll —
+        the same realistic per-filter shape a live Qdrant scroll would
+        produce — rather than an unrealistic mock that would return it
+        from a {'kind': ...} filter it could never actually match."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'canonical-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': 't1',
+                },
+            },
+            {
+                'id': 'canonical-2',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'source': 'stage1_flag_marker'} else 0
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('source') == 'stage1_flag_marker']
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('kind') == 'stage1_flag_marker']
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            result = await _sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 2
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'under-tagged' in rec.message.lower()
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_falsy_id_members_are_skipped_and_do_not_mask_across_variants(self):
+        """The merge loop skips a member with a falsy id BEFORE checking
+        seen_ids (task 3915), so a None/'' id surfaced by one variant's
+        scroll can never occupy the seen-ids set and mask a DIFFERENT
+        id-less member surfaced by the other variant. Here each variant
+        contributes one falsy-id member (empty string from 'source', None
+        from 'kind') alongside one validly-id'd member; only the two
+        validly-id'd members must be deleted, and neither falsy-id member
+        may block or be conflated with the other."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        source_members = [
+            {
+                'id': '',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't-empty'},
+            },
+            {
+                'id': 'valid-source',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        kind_members = [
+            {
+                'id': None,
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't-none'},
+            },
+            {
+                'id': 'valid-kind',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+        ]
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return source_members
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return kind_members
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        assert result == 2
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'valid-source', 'valid-kind'}
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_warning_emitted_once_per_variant_naming_its_filter(self, caplog):
+        """Each filter variant has its own scroll_limit budget (task 3915):
+        when BOTH variants independently hit the cap, two separate
+        scroll-cap WARNINGs must be emitted — one per variant — each
+        naming that variant's own filter dict, so an operator can tell
+        which key spelling is backlogged rather than seeing one
+        undifferentiated warning (or a warning naming the wrong filter)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        scroll_limit = 2
+        source_members = [
+            {
+                'id': f'src-{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': f's{i}'},
+            }
+            for i in range(scroll_limit)
+        ]
+        kind_members = [
+            {
+                'id': f'kind-{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': f'k{i}'},
+            }
+            for i in range(scroll_limit)
+        ]
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return source_members
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return kind_members
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            await _sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=scroll_limit,
+            )
+
+        scroll_cap_warnings = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING and 'scroll cap reached' in rec.message
+        ]
+        assert len(scroll_cap_warnings) == 2, (
+            f'expected one scroll-cap WARNING per variant, got: '
+            f'{[r.message for r in scroll_cap_warnings]}'
+        )
+        messages = [rec.message for rec in scroll_cap_warnings]
+        assert any("{'source': 'stage1_flag_marker'}" in m for m in messages)
+        assert any("{'kind': 'stage1_flag_marker'}" in m for m in messages)
+
+
+class TestSweepStaleMem0FlagForStage2Markers:
+    """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
+    flag_for_stage2 Stage-1 -> Stage-2 relay pool (task 2966).
+
+    flag_for_stage2 markers are written ONLY to Mem0 by the Stage-1
+    flag_dedup/LLM add_memory path (metadata.flag_for_stage2=true); no code
+    path upserts a flag_for_stage2 row into recon_ledger, so
+    ReconLedgerStore.gc()'s record_kind IN (...) clause never matches it —
+    the identical declared-vs-actual gap already documented for
+    stage2_persistence_marker (task 2228 W5-κ). This helper closes that gap
+    by delegating to the shared _sweep_stale_mem0_pool skeleton with a
+    DISTINCT enumeration/count filter: the boolean payload key
+    {'flag_for_stage2': True}, not a {'source': ...} filter (these markers
+    carry no source field) and not the string 'true' (Qdrant payload
+    filters are type-sensitive; live verification found the stored value is
+    boolean True).
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_markers_deleted_fresh_marker_kept(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'stale-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't1', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'stale-2',
+                'created_at': (fixed_now - timedelta(days=30)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't2', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'fresh-1',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't3', 'run_id': 'prior-run',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+            # Every fixture task_id is terminal, so the AGE CUTOFF remains the
+            # only discriminator and this test keeps its original meaning.
+            terminal_task_ids={'t1', 't2', 't3'},
+        )
+
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 2
+
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-1', 'stale-2'}
+        assert 'fresh-1' not in deleted_ids
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r1'
+            assert kwargs.get('_source') == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        call = memory_service.get_memories_by_metadata.call_args
+        filters = call.kwargs.get('filters') or {}
+        assert filters == {'flag_for_stage2': True}
+
+        # Deterministic scroll only — semantic search must never be used for GC.
+        memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_skips_scroll_when_count_is_zero(self):
+        """When count_memories_by_metadata reports an exact 0, the scroll is
+        skipped entirely — mirrors the stage1_flag_marker short circuit
+        (task 2853 review), applied here with the boolean flag_for_stage2
+        filter instead of a source filter.
+
+        The wrapper also issues a second, supplementary count call — the
+        string-variant type-drift probe (task 2966 amendment, reviewer
+        finding; see TestWarnOnFlagForStage2TypeDrift) — after the primary
+        sweep completes. Both calls return 0 here, so no drift is present
+        and the scroll still never runs.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', terminal_task_ids={'t1'},
+        )
+
+        assert result == 0
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        filters_seen = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': True} in filters_seen
+        assert {'flag_for_stage2': 'true'} in filters_seen
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_fails_open_to_scroll_on_error(self):
+        """A count_memories_by_metadata failure must fall through to the
+        normal scroll path unchanged, not skip the sweep — the short circuit
+        may only ever skip work the scroll would itself have found empty."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'flag_for_stage2': True, 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down'),
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+            # 't1' is the fixture member's task_id: the gate must not be what
+            # keeps it, or this test would pass for the wrong reason.
+            terminal_task_ids={'t1'},
+        )
+
+        assert result == 1
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_wrapper_surfaces_type_drift_warning(self, caplog):
+        """End-to-end: when the string-'true' variant probe is positive, the
+        wrapper logs a loud WARNING (task 2966 amendment, reviewer finding).
+
+        _query_stage2_flags' consumer-side check is a plain truthy check
+        that accepts both boolean True and the string 'true', but the GC
+        filter above is type-exact (boolean True only) — so a string-typed
+        marker is consumed/rendered normally but invisible to this sweep and
+        would accumulate forever. This is the reviewer's stated minimum
+        floor: surface that drift loudly rather than growing unbounded and
+        silent.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        async def _count_side_effect(*, project_id, filters):
+            if filters == {'flag_for_stage2': 'true'}:
+                return 5
+            return 0  # boolean-filter probe: primary pool short-circuits empty
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_side_effect)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger=_TKS_LOGGER,
+        ):
+            result = await _sweep_stale_mem0_flag_for_stage2_markers(
+                memory_service, 'reify', run_id='r1', terminal_task_ids={'t1'},
+            )
+
+        # Diagnostic-only: the drift warning must never affect the sweep's
+        # own return value (the primary boolean pool was genuinely empty).
+        assert result == 0
+        drift_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == _TKS_LOGGER
+            and 'flag_for_stage2' in rec.getMessage()
+            and "'true'" in rec.getMessage()
+        ]
+        assert len(drift_records) == 1, (
+            f'Expected exactly one type-drift WARNING; got: '
+            f'{[(r.levelno, r.message) for r in caplog.records]}'
+        )
+        assert '5' in drift_records[0].getMessage()
+
+    # --- Composite AND contract (task 4375) ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_ids_is_a_required_keyword(self):
+        """A caller who forgets the gate must fail LOUDLY, never silently.
+
+        Any default would be wrong in a dangerous direction: None would revert
+        to exactly the unconditional age-only deletion this task exists to
+        remove (permanent, unrecoverable loss that surfaces only as missing
+        records weeks later), and [] would silently disable the sweep and hide
+        an unbounded pool. A missing argument is therefore a TypeError at call
+        time — the loud-over-silent-degradation invariant applied to an API
+        boundary rather than to a log line.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+
+        with pytest.raises(TypeError):
+            # The omitted keyword IS the assertion — the type error is expected.
+            await _sweep_stale_mem0_flag_for_stage2_markers(  # type: ignore[call-arg]
+                memory_service, 'reify', 'r1',
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_four_cell_matrix_proves_AND_not_OR(self):
+        """Retirement requires BOTH gates to allow it; either one alone keeps.
+
+        Cell 2 is the measured incident: all 40 destroyed cadence_check records
+        had exactly this shape from the sweep's point of view — full relay
+        contract, task 452 non-terminal ('deferred'). Cell 4 is the only cell
+        that retires, which is what proves the sweep is not merely disabled.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            # 1. audit kind + terminal task => KEPT by Part B alone (the
+            #    residual intersection Part B exists to cover).
+            {'id': 'audit-terminal', 'created_at': stale,
+             'metadata': {'kind': 'cadence_check', 'flag_for_stage2': True,
+                          'task_id': 't-done', 'flag_type': 'x', 'run_id': 'r'}},
+            # 2. relay shape + open task => KEPT by Part A alone.
+            {'id': 'relay-open', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-open',
+                          'flag_type': 'x', 'run_id': 'r'}},
+            # 3. audit kind + open task => KEPT by both.
+            {'id': 'audit-open', 'created_at': stale,
+             'metadata': {'kind': 'cadence_check', 'flag_for_stage2': True,
+                          'task_id': 't-open', 'flag_type': 'x', 'run_id': 'r'}},
+            # 4. relay shape + terminal task => the ONLY cell that retires.
+            {'id': 'relay-terminal', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-done',
+                          'flag_type': 'x', 'run_id': 'r'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=len(members))
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'autopilot_video', run_id='r1', now=fixed_now,
+            terminal_task_ids={'t-done'},
+        )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'relay-terminal'}
+        assert result == 1
+        # The delete audit tag is unchanged by the new gating.
+        for call in memory_service.delete_memory.call_args_list:
+            assert call.kwargs.get('_source') == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_mirror_still_protected_even_when_it_clears_the_terminal_gate(self):
+        """Verification requirement 2: no task-3041 regression.
+
+        A cycle_summary mirror citing a TERMINAL task passes the Part A gate,
+        so only the mirror guard can save it. It must.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {'id': 'mirror-terminal',
+             'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp',
+                          'flag_for_stage2': True, 'task_id': 't-done'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'dark_factory', run_id='r1', now=fixed_now,
+            terminal_task_ids={'t-done'},
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_type_drift_probe_still_runs_after_the_gated_sweep(self):
+        """_warn_on_flag_for_stage2_type_drift still runs, still cannot affect
+        the count — including when the gate withheld every member."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {'id': 'relay-open',
+             'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-open'}},
+        ]
+
+        async def _count_side_effect(*, project_id, filters):
+            return 7 if filters == {'flag_for_stage2': 'true'} else 1
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_side_effect)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+            terminal_task_ids={'t-done'},
+        )
+
+        assert result == 0
+        # The string-variant drift probe ran despite the gate withholding all.
+        drift_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': 'true'} in drift_filters
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_for_the_one_real_victim(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {'id': 'relay-terminal', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-done'}},
+            {'id': 'audit-terminal', 'created_at': stale,
+             'metadata': {'kind': 'cadence_check', 'flag_for_stage2': True,
+                          'task_id': 't-done'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_flag_for_stage2_markers(
+                memory_service, 'autopilot_video', run_id='r1', now=fixed_now,
+                terminal_task_ids={'t-done'},
+            )
+
+        assert result == 1
+        assert tombstone.await_args is not None
+        assert [v['id'] for v in tombstone.await_args.args[2]] == ['relay-terminal']
+
+
+class TestWarnOnFlagForStage2TypeDrift:
+    """_warn_on_flag_for_stage2_type_drift: best-effort boolean/string
+    type-drift diagnostic for the flag_for_stage2 GC sweep (task 2966
+    amendment, reviewer finding).
+
+    _query_stage2_flags' consumer-side check (``meta.get('flag_for_stage2')``)
+    is a plain truthy check that accepts both the boolean ``True`` and the
+    string ``'true'``, but _sweep_stale_mem0_flag_for_stage2_markers' GC
+    filter is type-exact (boolean ``True`` only, since Qdrant payload
+    filters are type-sensitive). A marker written with the string variant
+    would be consumed/rendered normally by Stage 2 but invisible to the GC
+    filter — an unbounded, silent leak. This helper probes for that
+    condition and must log loudly when found, while never raising or
+    otherwise affecting the caller.
+    """
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_when_string_variant_present(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=3)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger=_TKS_LOGGER,
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        call = memory_service.count_memories_by_metadata.call_args
+        assert call.kwargs.get('project_id') == 'reify'
+        assert call.kwargs.get('filters') == {'flag_for_stage2': 'true'}
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == _TKS_LOGGER
+        ]
+        assert len(warning_records) == 1
+        assert '3' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_string_variant_absent(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger=_TKS_LOGGER,
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == _TKS_LOGGER
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_exception_is_swallowed_but_logged(self, caplog):
+        """A count_memories_by_metadata failure must never raise (this probe
+        is purely diagnostic and best-effort), but the swallowed exception is
+        logged at WARNING with exc_info so it surfaces loudly rather than
+        silently — required by the repo-wide silent-fallthrough gate."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down'),
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger=_TKS_LOGGER,
+        ):
+            # Must not raise.
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        probe_warnings = [
+            rec
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == _TKS_LOGGER
+        ]
+        # Exactly one fail-safe warning naming the swallowed probe failure;
+        # the string-variant drift warning must NOT fire (the probe never
+        # produced a count).
+        assert len(probe_warnings) == 1
+        assert 'probe raised' in probe_warnings[0].getMessage()
+        assert probe_warnings[0].exc_info is not None
+
+    @pytest.mark.asyncio
+    async def test_non_int_result_is_treated_as_nothing_to_report(self, caplog):
+        """A non-int return (unexpected backend shape) must not crash log
+        formatting — treated as fail-safe "nothing to report", not a warning."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger=_TKS_LOGGER,
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == _TKS_LOGGER
+            for rec in caplog.records
+        )
 
 
 class TestComputeStaleFlags:
@@ -7073,11 +9102,11 @@ class TestTrackFlagPersistence:
         memory_service.count_memories_by_metadata.side_effect = RuntimeError('Mem0 down')
         memory_service.add_memory.return_value = {'memory_ids': []}
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _track_flag_persistence(memory_service, 'proj', 'run-4', ['flag-D'])
 
         assert result == {'flag-D': 1}
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_add_memory_failure_still_returns_count(self, caplog):
@@ -7088,11 +9117,11 @@ class TestTrackFlagPersistence:
         memory_service.count_memories_by_metadata.return_value = 1
         memory_service.add_memory.side_effect = RuntimeError('write failed')
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _track_flag_persistence(memory_service, 'proj', 'run-5', ['flag-E'])
 
         assert result == {'flag-E': 2}  # 1 prior + 1
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_empty_flag_ids_returns_empty_no_calls(self):
@@ -7139,13 +9168,13 @@ class TestFilterAlreadyEscalatedFlags:
         memory_service = AsyncMock()
         memory_service.count_memories_by_metadata.side_effect = RuntimeError('Mem0 down')
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             newly, already = await _filter_already_escalated_flags(
                 memory_service, 'proj', ['flag-X'],
             )
         assert newly == ['flag-X']
         assert already == []
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestWriteEscalationMarkers:
@@ -7178,10 +9207,10 @@ class TestWriteEscalationMarkers:
         memory_service = AsyncMock()
         memory_service.add_memory.side_effect = RuntimeError('write down')
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             await _write_escalation_markers(memory_service, 'proj', 'run-8', ['flag-Z'])
 
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestTaskKnowledgeSyncActiveQueryFlags:
@@ -7725,6 +9754,11 @@ class TestReconMarkersGcSweptStat:
         mock_gc.assert_awaited_once_with(
             mock_deps['memory_service'], mock_deps['taskmaster'],
             _scope('reify', '/home/leo/src/reify'), 'test-run',
+            # run() now hoists terminal-id resolution once per cycle and shares
+            # the list with the Mem0 flag_for_stage2 sweep (task 4375). The
+            # fixture's taskmaster resolves to [], and _gc_recon_markers'
+            # None-default still self-resolves for every other caller.
+            terminal_task_ids=[],
         )
         for retired_key in (
             'stale_fixc_markers_swept',
@@ -8069,6 +10103,308 @@ class TestTaskKnowledgeSyncStaleMem0FlagMarkersGcSweptStat:
 
         assert 'stale_mem0_flag_markers_gc_swept' in report.stats
         assert report.stats['stale_mem0_flag_markers_gc_swept'] == 0
+
+
+class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
+    """TaskKnowledgeSync.run() sets
+    report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] after
+    super().run() (task 2966).
+
+    Monkeypatches the module-level _sweep_stale_mem0_flag_for_stage2_markers
+    helper rather than arranging real Mem0 flag_for_stage2 state — the
+    helper's own behavior is covered exhaustively by
+    TestSweepStaleMem0FlagForStage2Markers; these tests verify only that
+    run() calls it and threads its count into report.stats. Also patches the
+    three sibling GC helpers (_gc_recon_markers, _sweep_stale_persistence_markers,
+    _sweep_stale_mem0_flag_markers) purely for hermetic isolation — this
+    class's assertions are about the NEW stat only, but all four GC passes
+    run back-to-back in run() and an unpatched real _gc_recon_markers would
+    otherwise touch memory_service.recon_ledger/taskmaster attributes this
+    fixture does not configure.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_stat_set_after_run(self, mock_deps):
+        """run() calls _sweep_stale_mem0_flag_for_stage2_markers(self.memory,
+        self.project_id, run_id) exactly once and injects its return value
+        into report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'],
+        coexisting with the three sibling GC stats (none overwrites another)."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=5),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=4),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=3),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=7),
+            ) as mock_sweep,
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stale_mem0_flag_for_stage2_markers_gc_swept') == 7
+        assert mock_sweep.await_args is not None
+        # The gate is threaded through, not omitted (task 4375). Asserted
+        # against the CONCRETE expected value — the fixture's taskmaster
+        # resolves to [] — matching the mock_gc precedent above. It previously
+        # read the value back out of `mock_sweep.await_args.kwargs` and
+        # compared it to itself, which could never fail (amendment pass,
+        # reviewer finding test-quality).
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run',
+            terminal_task_ids=[],
+        )
+
+        # The sibling GC passes are independent and all run every cycle —
+        # none overwrites another in report.stats.
+        assert report.stats.get('recon_markers_gc_swept') == 5
+        assert report.stats.get('stale_persistence_markers_gc_swept') == 4
+        assert report.stats.get('stale_mem0_flag_markers_gc_swept') == 3
+
+    @pytest.mark.asyncio
+    async def test_stat_explicit_zero(self, mock_deps):
+        """When nothing is stale, the stat is 0 — explicitly set, not absent — so
+        downstream consumers never need a .get(..., 0) fallback."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=0),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert 'stale_mem0_flag_for_stage2_markers_gc_swept' in report.stats
+        assert report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] == 0
+
+    # --- Shared once-per-cycle terminal-id resolution (task 4375) -----------
+
+    @staticmethod
+    def _stage(mock_deps):
+        from datetime import UTC, datetime
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', '/home/leo/src/reify')
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[], stats={}, llm_calls=0, tokens_used=0,
+        )
+        return stage, base_report
+
+    @pytest.mark.asyncio
+    async def test_terminal_ids_resolved_once_and_shared_with_both_consumers(
+        self, mock_deps,
+    ):
+        """ONE bulk get_statuses read serves the ledger GC pass AND the Mem0 sweep.
+
+        _resolve_terminal_task_ids is left UNPATCHED so the single-call
+        assertion is meaningful — the assertion is on the get_statuses mock,
+        which is the actual round-trip being saved. Sharing one list also
+        guarantees both passes see the same view of terminality within a
+        cycle, so a task transitioning mid-cycle cannot be terminal for the
+        ledger arm and open for the Mem0 arm.
+        """
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage, base_report = self._stage(mock_deps)
+        mock_deps['taskmaster'].get_statuses = AM(return_value={
+            't-done': 'done', 't-open': 'pending', 't-cancelled': 'cancelled',
+        })
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=0),
+            ) as mock_gc,
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=0),
+            ) as mock_sweep,
+        ):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='test-run',
+            )
+
+        # Sorted, terminal-only — i.e. it really came from
+        # _resolve_terminal_task_ids and was not re-derived or hard-coded.
+        assert mock_sweep.await_args is not None
+        assert mock_gc.await_args is not None
+        assert mock_sweep.await_args.kwargs['terminal_task_ids'] == [
+            't-cancelled', 't-done',
+        ]
+        # ONE bulk read for the whole GC block, not one per pass.
+        assert mock_deps['taskmaster'].get_statuses.await_count == 1
+        # _gc_recon_markers receives the SAME pre-resolved list, so the two
+        # passes cannot drift onto different views of terminality.
+        assert mock_gc.await_args.kwargs['terminal_task_ids'] == [
+            't-cancelled', 't-done',
+        ]
+        assert (
+            mock_gc.await_args.kwargs['terminal_task_ids']
+            == mock_sweep.await_args.kwargs['terminal_task_ids']
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_failure_degrades_to_a_full_keep_cycle(self, mock_deps):
+        """FAIL-SAFE end-to-end: run() completes, the stat is still recorded,
+        and the sweep receives [] — gate active, nothing terminal."""
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage, base_report = self._stage(mock_deps)
+        mock_deps['taskmaster'].get_statuses = AM(
+            side_effect=RuntimeError('taskmaster down'),
+        )
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=0),
+            ) as mock_sweep,
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='test-run',
+            )
+
+        assert report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] == 0
+        assert mock_sweep.await_args is not None
+        assert mock_sweep.await_args.kwargs['terminal_task_ids'] == []
 
 
 class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
@@ -8620,14 +10956,7 @@ class TestStage3PayloadIncludesProjectRoot:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_integrity_check_payload_emits_use_project_root_directive(self, mock_deps):
@@ -8855,14 +11184,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_cli_result(self, flagged_items: list[dict]) -> MagicMock:
         """Return a fake StageResult-like object for patching run_stage_via_cli."""
@@ -8920,7 +11242,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -8978,7 +11300,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -9025,7 +11347,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -9075,7 +11397,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -9138,7 +11460,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -9514,14 +11836,7 @@ class TestBaseStageEscalationQueueAttribute:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_escalation_queue_initialised_to_none(self, mock_deps):
         """(a) Fresh MemoryConsolidator has _escalation_queue == None."""
@@ -9699,14 +12014,7 @@ class TestStage2HintConversionDetection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -10220,14 +12528,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -10669,6 +12970,373 @@ class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
         assert result == ''
 
 
+class TestRenderLiveWorkflowSectionCorroborationGate:
+    """_render_live_workflow_section threads per-task corroboration into
+    detect_live_workflow for IN-PROGRESS tasks (task 2963 step-8).
+
+    Scenario: an in-progress task whose ONLY live signals are a lingering
+    registered worktree and the project-wide orchestrator lock (no
+    recent_commit) — the fleet-redeploy false positive. The renderer must
+    require at least one FRESH per-task corroborating signal (a live
+    claimant/heartbeat, a scheduler holder/park entry, or a routing decision
+    stamped after the orchestrator's last restart). With none present the task
+    is downgraded to indeterminate (is_live=False) and dropped from the
+    section; any one fresh signal keeps it listed. The gate is
+    in-progress-only.
+
+    Direct-call harness (mirrors TestRenderLiveWorkflowSectionEmptyTasksNoOp)
+    plus real on-disk orchestrator.lock / scheduler_state.json fixtures so the
+    renderer's hoisted orchestrator_started_at + read_scheduler_state reads
+    exercise the true files.
+
+    RED until step-8 wires corroboration_for_task + orchestrator_started_at +
+    read_scheduler_state into the renderer (only case (a) fails today — the
+    renderer does not yet compute/pass ``corroborated``, so the task is listed;
+    cases (b)-(e) are GREEN-trivial now and pin the keep-listed behavior after
+    step-8).
+    """
+
+    _NOW = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
+    # Orchestrator last (re)started 1h before _NOW.
+    _STARTED = datetime(2026, 7, 24, 11, 0, 0, tzinfo=UTC)
+    _TASK_ID = 2763
+    _BRANCH = 'task/2763'
+
+    # ----- on-disk fixtures -----
+
+    def _write_lock(self, tmp_path, started):
+        lock_dir = tmp_path / 'data' / 'orchestrator'
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'orchestrator.lock').write_text(
+            f'PID 12345 started {started.isoformat()}\n', encoding='utf-8'
+        )
+
+    def _write_scheduler_state(self, tmp_path, *, parks=None, current_holders=None):
+        state_dir = tmp_path / 'data' / 'orchestrator'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state = {'parks': parks or {}, 'current_holders': current_holders or {}}
+        (state_dir / 'scheduler_state.json').write_text(
+            json.dumps(state), encoding='utf-8'
+        )
+
+    # ----- git signals: worktree_registered=True, recent_commit=False, non-bare -----
+
+    def _git_side_effect(self):
+        """Drive worktree_registered=True for task/2763, a NON-bare branch
+        (rev-list=3, so rule 4 cannot interfere), and an OLD tip timestamp
+        (48h — older than the 6h recency window) so recent_commit=False. The
+        only signals asserting liveness are the lingering worktree + the
+        (monkeypatched) project-wide orchestrator lock.
+        """
+        import subprocess  # noqa: PLC0415 — module-local per this file's convention
+
+        old_ts = (self._NOW - timedelta(hours=48)).isoformat()
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=(
+                        'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                        f'worktree /project-2763\nHEAD def5678\n'
+                        f'branch refs/heads/{self._BRANCH}\n\n'
+                    ),
+                    stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr=''
+                )
+            # git log tip timestamp
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=old_ts, stderr=''
+            )
+
+        return side_effect
+
+    def _routing_metadata(self, decided_at):
+        """A well-formed metadata.routing whose latest decision is stamped at
+        *decided_at* (so RoutingState.from_metadata parses it cleanly)."""
+        return {
+            'routing': {
+                'latest': {
+                    'role': 'implementer',
+                    'model': 'claude-sonnet-4',
+                    'effort': 'medium',
+                    'budget_usd': 5.0,
+                    'max_turns': 40,
+                    'source_layer': 'role_default',
+                    'decided_at': decided_at.isoformat(),
+                }
+            }
+        }
+
+    def _render(self, tmp_path, task, monkeypatch):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        # Project-wide orchestrator lock reports live (a real PID check would
+        # fail against the fake PID in the lock file — orchestrator_started_at
+        # only parses the `started` token and needs no live PID).
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        with patch('subprocess.run', side_effect=self._git_side_effect()):
+            return _render_live_workflow_section(
+                [task], ProjectRoot(str(tmp_path)), now=self._NOW
+            )
+
+    # ----- cases -----
+
+    def test_uncorroborated_in_progress_task_is_dropped(self, tmp_path, monkeypatch):
+        """(a) No fresh claimant, absent from scheduler_state, routing decision
+        BEFORE the restart => indeterminate => task/2763 NOT listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)  # empty parks/current_holders
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            # no claimant_run_id => no live claimant
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH not in result, (
+            f"Expected {self._BRANCH} DROPPED (worktree+orchestrator-only, no "
+            f"corroboration => indeterminate); got:\n{result!r}"
+        )
+
+    def test_fresh_claimant_keeps_task_listed(self, tmp_path, monkeypatch):
+        """(b) A fresh claimant_run_id + recent heartbeat corroborates => listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-abc',
+            'heartbeat_at': (self._NOW - timedelta(minutes=2)).isoformat(),
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} LISTED (fresh claimant/heartbeat "
+            f"corroborates); got:\n{result!r}"
+        )
+
+    def test_scheduler_holder_keeps_task_listed(self, tmp_path, monkeypatch):
+        """(c) task_id present in scheduler_state current_holders => listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(
+            tmp_path, current_holders={'implement': str(self._TASK_ID)}
+        )
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} LISTED (scheduler holder corroborates); "
+            f"got:\n{result!r}"
+        )
+
+    def test_post_restart_routing_keeps_task_listed(self, tmp_path, monkeypatch):
+        """(d) routing.latest.decided_at AFTER the restart => listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            'metadata': self._routing_metadata(self._STARTED + timedelta(minutes=30)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} LISTED (post-restart routing decision "
+            f"corroborates); got:\n{result!r}"
+        )
+
+    def test_gate_is_in_progress_only(self, tmp_path, monkeypatch):
+        """(e) A non-in-progress task (review) with the same worktree+
+        orchestrator-only signals and NO corroboration is still listed — the
+        corroboration gate is in-progress-only."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)
+        task = {
+            'id': self._TASK_ID,
+            'status': 'review',
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} (status=review) STILL listed — the "
+            f"corroboration gate is in-progress-only; got:\n{result!r}"
+        )
+
+
+class TestRenderLiveWorkflowSectionPendingPureGate:
+    """_render_live_workflow_section drops the bare project-wide orchestrator
+    signal for a PENDING deterministic PURE GATE (task 3751 step-9/10).
+
+    The observed Stage-2 symptom: dark_factory task 3845 — a pending
+    ``always_escalates`` deterministic gate with NO ``before_done`` — was listed
+    under Live-Workflow Signals with ONLY the bare ``orchestrator`` signal for 3+
+    consecutive reconciliation cycles (runs 0e98f0ac, f112de8), which blocked its
+    disposition. Such a task never acquires a worktree or branch, and its entire
+    DeterministicRunner run is "file escalation, stamp gate_escalated_at, set
+    blocked" — no script, no systemd, no git_ops — so the project-wide lock is
+    never task-specific evidence for it.
+
+    Direct-call harness copied from TestRenderLiveWorkflowSectionCorroborationGate;
+    only the git side_effect (no worktree / no commit) and the task metadata differ.
+    The corroboration gate (task 2963) is inert here because it is in-progress-only.
+
+    RED until step-10 computes and passes ``pure_gate`` — only case (a) fails
+    today; (b)-(d) are the narrowing controls and pin the keep-listed behavior.
+    """
+
+    _NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+    _TASK_ID = 3845
+    _BRANCH = 'task/3845'
+
+    # dark_factory task 3845's real metadata, verified first-hand. The
+    # `operational_mode`/`execution_class` labels are incidental — the
+    # classification keys on (always_escalates, before_done), the pair
+    # DeterministicRunner itself branches on.
+    _PURE_GATE_METADATA = {
+        'task_kind': 'deterministic',
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        'always_escalates': True,
+    }
+
+    def _git_side_effect(self, *, worktree_for_branch: str | None = None):
+        """Drive worktree_registered=False, recent_commit=False, and an UNKNOWN
+        (not zero) own-commit count.
+
+        A failing ``rev-list`` yields an unknown count, so ``branch_bare`` is
+        False and task 2767's rule 4 cannot mask the result — the ONLY signal
+        left is the project-wide orchestrator lock, which is exactly what rule 5
+        must drop. Pass *worktree_for_branch* to additionally register a live
+        worktree for that branch.
+        """
+        import subprocess  # noqa: PLC0415 — module-local per this file's convention
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                stdout = 'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                if worktree_for_branch is not None:
+                    stdout += (
+                        f'worktree /project-{self._TASK_ID}\nHEAD def5678\n'
+                        f'branch refs/heads/{worktree_for_branch}\n\n'
+                    )
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=stdout, stderr='',
+                )
+            # rev-list AND git log both fail: unknown commit count (=> not
+            # bare) and no tip timestamp (=> recent_commit False).
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr='fatal: bad revision',
+            )
+
+        return side_effect
+
+    def _render(self, tmp_path, task, monkeypatch, *, worktree_for_branch=None):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        with patch(
+            'subprocess.run',
+            side_effect=self._git_side_effect(worktree_for_branch=worktree_for_branch),
+        ):
+            return _render_live_workflow_section(
+                [task], ProjectRoot(str(tmp_path)), now=self._NOW
+            )
+
+    # ----- cases -----
+
+    def test_pending_pure_gate_is_dropped(self, tmp_path, monkeypatch):
+        """(a) THE SYMPTOM — task 3845's exact shape is dropped entirely."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': dict(self._PURE_GATE_METADATA),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH not in result, (
+            f"Expected {self._BRANCH} DROPPED (pending deterministic pure gate, "
+            f"orchestrator-only signal); got:\n{result!r}"
+        )
+        assert result == '', (
+            f"Expected an EMPTY section (the only task was dropped); got:\n{result!r}"
+        )
+
+    def test_pending_before_done_deterministic_is_still_listed(self, tmp_path, monkeypatch):
+        """(b) NARROWING — a pending deterministic task WITH before_done may be
+        mid-deploy inside DeterministicRunner, so its signal is kept."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': {
+                **self._PURE_GATE_METADATA,
+                'before_done': {'kind': 'predicate'},
+            },
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert f'- {self._BRANCH}: orchestrator' in result, (
+            f"Expected {self._BRANCH} STILL listed with the orchestrator signal "
+            f"(before_done disqualifies the pure-gate shape); got:\n{result!r}"
+        )
+
+    def test_pending_normal_task_is_still_listed(self, tmp_path, monkeypatch):
+        """(c) Ordinary pending tasks are completely unaffected."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': {'task_kind': 'normal'},
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert f'- {self._BRANCH}: orchestrator' in result, (
+            f"Expected pending NORMAL task {self._BRANCH} STILL listed — rule 5 is "
+            f"deterministic-only; got:\n{result!r}"
+        )
+
+    def test_pure_gate_with_registered_worktree_is_still_listed(self, tmp_path, monkeypatch):
+        """(d) Per-task evidence wins — only the bare project-wide orchestrator
+        signal is suppressed, never a real worktree."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': dict(self._PURE_GATE_METADATA),
+        }
+
+        result = self._render(
+            tmp_path, task, monkeypatch, worktree_for_branch=self._BRANCH
+        )
+
+        assert f'- {self._BRANCH}: worktree' in result, (
+            f"Expected {self._BRANCH} listed via its REGISTERED WORKTREE (and "
+            f"WITHOUT the suppressed orchestrator signal); got:\n{result!r}"
+        )
+
+
 class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
     """TaskKnowledgeSync._maybe_queue_briefing_refresh_tasks retains its
     taskmaster-None no-op (task 2150 step-3/4): the falsy-``project_root``
@@ -10681,14 +13349,7 @@ class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_no_taskmaster_no_ops_without_invoking_briefing_script(self, mock_deps):
@@ -11778,6 +14439,125 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
         )
         assert '### Per-Cycle Summary Nonce' not in prompt
 
+    # -- task 3732: the extracted write_stage2_cycle_summary wrapper --------
+    #
+    # Stage 2's write was inlined at a single call site inside run(). The
+    # harness-level backstop (task 3732) is a SECOND call site, so the five
+    # bound Stage-2 values are factored into one wrapper — exactly what
+    # write_stage1_cycle_summary does for Stage 1 (task 2440), and for the
+    # same reason: a future change to any of them can never silently diverge
+    # between the two call sites.
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_lands_a_real_ledger_row(
+        self, mock_deps, ledger_store,
+    ):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-row'
+        report = self._base_report(run_id)
+        report.llm_calls = 7
+        report.tokens_used = 777
+
+        written = await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id,
+        )
+
+        assert written is True
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['stage'] == 'task_knowledge_sync'
+        assert payload['llm_calls'] == 7
+        assert payload['tokens_used'] == 777
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_binds_the_stage2_constants(
+        self, mock_deps,
+    ):
+        """Pins the binding the wrapper exists to centralise."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+            _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            STAGE2_CYCLE_SUMMARY_POOL_CAP,
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-binding'
+        report = self._base_report(run_id)
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=True),
+        ) as mock_write:
+            await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report, run_id,
+            )
+
+        mock_write.assert_awaited_once()
+        assert mock_write.await_args is not None
+        kwargs = mock_write.await_args.kwargs
+        assert kwargs['stage'] == 'task_knowledge_sync'
+        assert kwargs['recon_pool'] == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+        assert kwargs['trim_source'] == _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE
+        assert kwargs['cap'] == STAGE2_CYCLE_SUMMARY_POOL_CAP
+        # Defaults to a full cycle unless the caller says otherwise.
+        assert kwargs['remediation'] is False
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_forwards_remediation(
+        self, mock_deps, ledger_store,
+    ):
+        """`remediation` is the one keyword Stage 1's wrapper does not need —
+        Stage 2's write is unconditional and fires on remediation passes too
+        (task_knowledge_sync.py's "Do not 'fix' this to mirror Stage 1's
+        full-cycle-only gating" note), and get_cycle_summary_presence reads
+        payload['remediation'] to disambiguate expected-missing rows."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-remediation'
+        report = self._base_report(run_id)
+
+        await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id, remediation=True,
+        )
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        assert json.loads(record.payload_json)['remediation'] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('returned', [True, False])
+    async def test_write_stage2_cycle_summary_returns_verbatim(
+        self, mock_deps, returned,
+    ):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        report = self._base_report('run-3732-wrapper-return')
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=returned),
+        ):
+            result = await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report,
+                'run-3732-wrapper-return',
+            )
+
+        assert result is returned
+
 
 # ---------------------------------------------------------------------------
 # Task 2029 scenario (b) — TaskKnowledgeSync acknowledges Stage-1
@@ -12433,6 +15213,822 @@ class TestGcReconMarkers:
 
         assert result == 3
         ledger.gc.assert_awaited_once_with(scope.project_id, ANY, [])
+
+    # --- Pre-resolved terminal_task_ids efficiency hoist (task 4375) --------
+    #
+    # The run()-level test asserts get_statuses is awaited exactly once, but it
+    # patches _gc_recon_markers OUT, so the real function's
+    # `if terminal_task_ids is None` branch never executes there and the whole
+    # justification for the parameter — skipping a duplicate bulk round-trip on
+    # the cycle's critical path — went unpinned (amendment pass, reviewer
+    # finding test-coverage). These two tests exercise the real function on
+    # both sides of that branch.
+
+    @pytest.mark.asyncio
+    async def test_supplied_terminal_task_ids_skips_the_internal_resolve(self):
+        """A pre-resolved list is used VERBATIM — no second get_statuses.
+
+        Also pins that the supplied list still goes through the marker_task_ids
+        bounding intersection: the hoist is an efficiency change only, and must
+        not smuggle an unbounded id list past the bound that keeps gc()'s
+        bind-parameter count tied to ledger occupancy.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        memory_service = AsyncMock()
+        ledger = AsyncMock()
+        # 't-absent' is terminal but has no marker row: the bound must drop it.
+        ledger.marker_task_ids = AsyncMock(return_value={'t-done'})
+        ledger.gc = AsyncMock(return_value=2)
+        memory_service.recon_ledger = ledger
+        taskmaster = AsyncMock()
+        # Would resolve to something DIFFERENT if it were consulted, so a
+        # regression that re-resolves fails on the forwarded value too, not
+        # only on the await_count.
+        taskmaster.get_statuses = AsyncMock(return_value={'t-other': 'done'})
+        scope = _scope('reify', '/home/leo/src/reify')
+
+        result = await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+            terminal_task_ids=['t-done', 't-absent'],
+        )
+
+        assert result == 2
+        # The saved round-trip — the entire point of the parameter.
+        taskmaster.get_statuses.assert_not_awaited()
+        # The caller's list reached gc(), bounded by ledger occupancy.
+        ledger.gc.assert_awaited_once_with(scope.project_id, ANY, ['t-done'])
+
+    @pytest.mark.asyncio
+    async def test_none_terminal_task_ids_still_resolves_internally(self):
+        """The preserved default: None => this function resolves them itself.
+
+        Companion to the test above — together they pin BOTH arms of the
+        `if terminal_task_ids is None` branch, so dropping either one fails.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        memory_service = AsyncMock()
+        ledger = AsyncMock()
+        ledger.marker_task_ids = AsyncMock(return_value={'t-done'})
+        ledger.gc = AsyncMock(return_value=1)
+        memory_service.recon_ledger = ledger
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'t-done': 'done', 't-open': 'pending'},
+        )
+        scope = _scope('reify', '/home/leo/src/reify')
+
+        result = await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert result == 1
+        taskmaster.get_statuses.assert_awaited_once()
+        # Terminal-only, and the open task never reaches gc().
+        ledger.gc.assert_awaited_once_with(scope.project_id, ANY, ['t-done'])
+
+
+class TestSweepStaleMem0PoolProtectsMirrorRecords:
+    """_sweep_stale_mem0_pool never deletes a cycle_summary ledger mirror (task 3041).
+
+    Recon gate 165 (esc-165-1) reported cycle_summary Mem0 anchors vanishing
+    with no audit trail. The adjacent precision defect the finding asked us to
+    audit is real and structurally reachable: _FLAG_FOR_STAGE2_ENUM_FILTERS is
+    ``{'flag_for_stage2': True}`` with NO kind/source/record_type
+    discriminator, and ``flag_for_stage2`` is an LLM-supplied metadata key that
+    nothing at the add_memory boundary stops a cycle_summary write from also
+    carrying. No amount of payload-filter tightening fixes that, so the guard
+    lives at the ONE choke point all three marker sweeps already funnel
+    through — this skeleton — and every current and future caller inherits it.
+
+    A skipped mirror logs a WARNING rather than being silently kept: an
+    over-broad filter must become VISIBLE, per the project's
+    loud-over-silent-degradation / no-silent-fail-soft invariant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_protected_mirror_skipped_ordinary_marker_still_deleted(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-marker',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'r1',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-marker'}
+        assert 'protected-mirror' not in deleted_ids
+        # The skip is EXCLUDED from the count, not silently counted as a delete.
+        assert result == 1
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'protected-mirror' in message
+        assert 'cycle_summary' in message
+        assert 'ledger_stamp' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+
+    @pytest.mark.asyncio
+    async def test_mirror_protected_even_when_only_kind_is_present(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'kind-only-mirror',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'cycle_summary', 'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_pool(
+            memory_service,
+            'dark_factory',
+            'r1',
+            source='stage1_flag_marker',
+            gc_sweep_source='stage1_flag_marker_gc_sweep',
+            max_age_days=14,
+            log_name='_sweep_stale_mem0_flag_markers',
+            now=fixed_now,
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_over_broad_flag_for_stage2_sweep_cannot_take_a_mirror(self):
+        """The concrete over-broad predicate this task was asked to audit.
+
+        _FLAG_FOR_STAGE2_ENUM_FILTERS matches ANY record carrying
+        flag_for_stage2=True — including a cycle_summary mirror, since stage
+        metadata is LLM-supplied and nothing constrains extra keys.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-relay-marker',
+                'created_at': stale,
+                'metadata': {'flag_for_stage2': True, 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                    'flag_for_stage2': True,
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'dark_factory', run_id='r1', now=fixed_now,
+            # The relay marker's task_id, so the terminal gate is NOT what
+            # spares the mirror — the task-3041 guard is, which is the whole
+            # point of this test.
+            terminal_task_ids={'t1'},
+        )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-relay-marker'}
+        assert result == 1
+
+
+class TestSweepStaleMem0PoolProtectsAuditRecords:
+    """_sweep_stale_mem0_pool never deletes a permanent audit record (task 4375).
+
+    MEASURED harm, not hypothetical: 40 ``kind='cadence_check'`` Mem0 records in
+    autopilot_video were destroyed by ``flag_for_stage2_gc_sweep``, every one
+    with deleted_at minus created_at of exactly 14 days — i.e. pure age-GC,
+    nothing about the record itself. Their surviving siblings carry the ENTIRE
+    Stage-1 relay contract (flag_for_stage2, flag_type, run_id, source,
+    task_id), so they are indistinguishable from a genuine relay marker by
+    every field except ``kind``. Narrowing the payload filter cannot help: of
+    the 288 records this sweep destroyed, 165 carried no ``kind`` key at all
+    and 248 no ``source``, so no positive allowlist can enumerate the genuine
+    pool. The discrimination therefore lives in the eligibility predicate at
+    this one choke point, beside the task-3041 mirror guard.
+
+    Each guard keeps its OWN, distinguishable diagnostic: a skipped audit
+    record must never be reported as a skipped cycle_summary mirror, or an
+    operator reading the log is sent to tighten the wrong thing. The SHAPES
+    differ deliberately (amendment pass) — the mirror skip is a rare accident
+    and warns per member, the audit skip is the documented steady state of
+    this pool and is aggregated into one WARNING per sweep, with per-record
+    ids demoted to DEBUG.
+    """
+
+    # The exact live metadata shape measured on the surviving autopilot_video
+    # records — full relay contract, distinguishable only by ``kind``.
+    _LIVE_CADENCE_CHECK = {
+        'kind': 'cadence_check',
+        'flag_for_stage2': True,
+        'flag_type': 'task452_cadence_check_reminder',
+        'run_id': 'r-victim',
+        'source': 'recon-stage-memory_consolidator',
+        'task_id': '452',
+    }
+
+    @pytest.mark.asyncio
+    async def test_audit_record_skipped_genuine_relay_marker_still_deleted(self, caplog):
+        """Both directions in ONE test, so a disabled sweep cannot pass it."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {'id': 'audit-record', 'created_at': stale,
+             'metadata': dict(self._LIVE_CADENCE_CHECK)},
+            # The 57%-majority genuine-relay shape: no ``kind`` key at all.
+            {'id': 'genuine-relay', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't1',
+                          'flag_type': 'y', 'run_id': 'r1'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone, caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'autopilot_video',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=fixed_now,
+                enum_filters={'flag_for_stage2': True},
+            )
+
+        deleted_ids = [
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        ]
+        assert deleted_ids == ['genuine-relay']
+        assert memory_service.delete_memory.await_count == 1
+        # The skip is EXCLUDED from the count, not silently counted as a delete.
+        assert result == 1
+
+        # A tombstone must never claim a live record.
+        assert tombstone.await_count == 1
+        assert tombstone.await_args is not None
+        victims = tombstone.await_args.args[2]
+        assert [v['id'] for v in victims] == ['genuine-relay']
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        # ONE aggregate line, not one per skipped member (amendment pass): this
+        # cohort is permanent and recurs every cycle, so a per-member WARNING
+        # would be a forever-firing signal with no operator action behind it.
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'RETAINED 1 protected audit record(s)' in message
+        # The distinct kinds are the actionable part — they name WHICH audit
+        # vocabulary this pool's filter collides with.
+        assert 'cadence_check' in message
+        assert '_sweep_stale_mem0_flag_for_stage2_markers' in message
+        # DISTINCT from the task-3041 mirror WARNING: misattributing this skip
+        # as a cycle_summary mirror skip would send an operator to inspect the
+        # wrong pool.
+        assert 'cycle_summary' not in message
+        # The per-record identity is DEMOTED, not lost.
+        assert 'audit-record' not in message
+
+    @pytest.mark.asyncio
+    async def test_many_audit_records_yield_one_warning_and_per_record_debug(self, caplog):
+        """The audit-skip diagnostic does NOT scale with the cohort size.
+
+        Pins the amendment-pass shape directly: N protected audit records
+        produce exactly ONE WARNING carrying the count, and N DEBUG lines each
+        naming its own memory_id. Measured motivation — autopilot_video holds 7
+        live kind='cadence_check' records carrying flag_for_stage2=True
+        (2026-09-02), all permanent, so the per-member WARNING this replaces
+        would have fired 7 times per cycle forever with no operator action
+        behind it.
+
+        Also pins that a BRAND-NEW audit record is counted: the guard sits
+        before the age test by design (an over-broad filter must degrade to a
+        loud skip, not to collateral loss), so age is irrelevant to this branch
+        — which is precisely why aggregation, not re-ordering, is the fix.
+        """
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        fresh = (fixed_now - timedelta(hours=1)).isoformat()
+        members = [
+            {'id': f'audit-{n}', 'created_at': created,
+             'metadata': dict(self._LIVE_CADENCE_CHECK)}
+            for n, created in enumerate((stale, stale, fresh))
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.DEBUG, logger=_TKS_LOGGER):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'autopilot_video',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=fixed_now,
+                enum_filters={'flag_for_stage2': True},
+            )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert 'RETAINED 3 protected audit record(s)' in warnings[0].getMessage()
+        assert 'kinds=cadence_check' in warnings[0].getMessage()
+
+        debugs = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.DEBUG
+            and 'protected audit record' in r.getMessage()
+        ]
+        assert len(debugs) == 3
+        assert {r.__dict__['memory_id'] for r in debugs} == {
+            'audit-0', 'audit-1', 'audit-2',
+        }
+
+    @pytest.mark.asyncio
+    async def test_mirror_branch_message_unchanged_by_the_new_guard(self, caplog):
+        """No task-3041 regression: a mirror still takes the MIRROR branch."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'protected-mirror',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp',
+                             'flag_for_stage2': True},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=fixed_now,
+                enum_filters={'flag_for_stage2': True},
+            )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'SKIPPING protected cycle_summary mirror' in message
+        assert 'ledger_stamp' in message
+        assert 'task 3041' in message
+
+
+class TestSweepStaleMem0PoolTerminalClosureGate:
+    """_sweep_stale_mem0_pool's opt-in terminal-task-closure gate (task 4375, Part A).
+
+    THE PRIMARY correctness gate, and the reason Part B's kind denylist is only
+    defence in depth. Measured: all 40 destroyed cadence_check records cite
+    autopilot_video task 452, whose status is 'deferred' — not in
+    TERMINAL_STATUSES ({'done','cancelled'}). This gate alone would have
+    preserved every one of them, because it demands POSITIVE evidence that the
+    record's cited task has closed. That makes it structurally opt-IN: an
+    audit-log kind nobody remembered to register in PROTECTED_AUDIT_KINDS is
+    still protected for as long as its task stays open.
+
+    The ``None``-vs-``[]`` sentinel distinction is load-bearing.
+    ``_resolve_terminal_task_ids`` is fail-safe to ``[]`` on a falsy taskmaster,
+    a raising get_statuses, or an unexpected result shape. Collapsing the two
+    would make a Taskmaster outage read as "no gate" and resume unconditional
+    age-deletion during exactly the window in which nothing can be verified.
+    """
+
+    _NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+
+    @classmethod
+    def _member(cls, mid, metadata):
+        return {
+            'id': mid,
+            'created_at': (cls._NOW - timedelta(days=20)).isoformat(),
+            'metadata': metadata,
+        }
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @classmethod
+    async def _sweep(cls, memory_service, caplog=None, **kwargs):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'autopilot_video',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=cls._NOW,
+                enum_filters={'flag_for_stage2': True},
+                **kwargs,
+            )
+        return result, tombstone
+
+    @staticmethod
+    def _deleted(memory_service):
+        return {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+
+    @pytest.mark.asyncio
+    async def test_gate_omitted_leaves_the_age_only_siblings_byte_for_byte_unchanged(self):
+        """Default None => NO gate. Pins the two age-only sibling sweeps' contract."""
+        members = [
+            self._member('open-task', {'flag_for_stage2': True, 'task_id': 't-open'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service)
+
+        assert self._deleted(memory_service) == {'open-task', 'no-task-id'}
+        assert result == 2
+
+    @pytest.mark.asyncio
+    async def test_gate_active_deletes_only_members_citing_a_terminal_task(self):
+        members = [
+            self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            self._member('open', {'flag_for_stage2': True, 'task_id': 't-open'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+            self._member('empty-task-id', {'flag_for_stage2': True, 'task_id': ''}),
+        ]
+        memory_service = self._service(members)
+
+        result, tombstone = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert self._deleted(memory_service) == {'terminal'}
+        assert result == 1
+        # Withheld members must never reach the tombstone writer.
+        assert tombstone.await_args is not None
+        assert [v['id'] for v in tombstone.await_args.args[2]] == ['terminal']
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_task_id_is_kept_even_when_every_cited_id_is_terminal(self):
+        """The exact-string-match KEEP precedent _gc_recon_markers already documents."""
+        members = [
+            self._member('comma-joined',
+                         {'flag_for_stage2': True, 'task_id': 't-done,t-other'}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(
+            memory_service, terminal_task_ids={'t-done', 't-other'},
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_is_normalized_to_str_before_the_membership_test(self):
+        """LLM writers emit both spellings; _resolve_terminal_task_ids returns str."""
+        members = [self._member('int-id', {'flag_for_stage2': True, 'task_id': 452})]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service, terminal_task_ids={'452'})
+
+        assert self._deleted(memory_service) == {'int-id'}
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_non_taskmaster_pseudo_id_is_kept(self):
+        """Observed live: a task_id no get_statuses will ever return."""
+        members = [
+            self._member('pseudo',
+                         {'flag_for_stage2': True,
+                          'task_id': 'graphiti_index_health_falkordb'}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_list_means_gate_active_nothing_terminal_so_nothing_is_deleted(self):
+        """FAIL-SAFE: a degraded _resolve_terminal_task_ids => a full-KEEP cycle.
+
+        This is the None-vs-[] distinction. [] must NOT be read as "no gate".
+        """
+        members = [
+            self._member('would-have-died', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service, terminal_task_ids=[])
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_aggregate_warning_names_the_retained_count(self, caplog):
+        """The KEEP-direction leak is surfaced, not hidden — once per sweep."""
+        members = [
+            self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            self._member('open', {'flag_for_stage2': True, 'task_id': 't-open'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+        ]
+        memory_service = self._service(members)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert result == 1
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert '2' in message
+        assert '_sweep_stale_mem0_flag_for_stage2_markers' in message
+
+    @pytest.mark.asyncio
+    async def test_young_members_are_not_counted_into_the_retained_tally(self, caplog):
+        """The retained count must mean "old enough to retire, but cannot be".
+
+        A marker younger than max_age_days citing an open task is the NORMAL,
+        healthy steady state of a live relay pool — it is not retirement-
+        eligible yet for a reason that has nothing to do with this gate.
+        Counting it would make the WARNING fire every cycle for every healthy
+        project (measured: 10 live flag_for_stage2 markers in dark_factory, 15
+        in autopilot_video), which is exactly the log noise that trains an
+        operator to ignore the signal. The number whose growth is meaningful
+        is the age-stale-but-unretireable backlog, and only that.
+        """
+        members = [
+            self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            {
+                'id': 'young-and-open',
+                'created_at': (self._NOW - timedelta(days=1)).isoformat(),
+                'metadata': {'flag_for_stage2': True, 'task_id': 't-open'},
+            },
+        ]
+        memory_service = self._service(members)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert self._deleted(memory_service) == {'terminal'}
+        assert result == 1
+        assert [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ] == []
+
+    @pytest.mark.asyncio
+    async def test_no_aggregate_warning_when_nothing_is_withheld(self, caplog):
+        members = [self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'})]
+        memory_service = self._service(members)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert result == 1
+        assert [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ] == []
+
+
+class TestSweepStaleMem0PoolTombstones:
+    """Every recon-initiated Mem0 delete leaves a queryable tombstone (task 3041).
+
+    The defining signature of the recon-gate-165 / esc-165-1 finding was "no
+    audit trail": an auditor holding a memory uuid had no reachable path to
+    "who deleted it and why", so a designed eviction was indistinguishable
+    from silent data loss. The tombstone is written from the SUCCESS branch
+    only, so a tombstone always means "really gone".
+    """
+
+    @staticmethod
+    def _stale_members(fixed_now):
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        return [
+            {
+                'id': 'deleted-ok',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1',
+                             'run_id': 'run-victim'},
+            },
+            {
+                'id': 'delete-fails',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2',
+                             'run_id': 'run-victim'},
+            },
+        ]
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+
+        async def _delete(**kwargs):
+            if kwargs.get('memory_id') == 'delete-fails':
+                raise RuntimeError('mem0 delete exploded')
+            return None
+
+        memory_service.delete_memory = AsyncMock(side_effect=_delete)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_only_for_the_successful_delete(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = self._stale_members(fixed_now)
+        memory_service = self._service(members)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        # ONE batch call for the whole sweep — not one fsync'd ledger commit
+        # per victim (task 3041 amendment pass).
+        assert tombstone.await_count == 1
+        call = tombstone.await_args
+        assert call is not None
+        assert call.args[1] == 'dark_factory'
+        # A tombstone must never claim a record that is still alive: the
+        # failed delete is absent from the batch.
+        assert call.args[2] == [members[0]]
+        assert call.kwargs['deleter'] == 'stage1_flag_marker_gc_sweep'
+        assert call.kwargs['deleting_run_id'] == 'run-deleter'
+
+        # Tombstone writing does not perturb the existing accounting.
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_tombstone_helper_cannot_propagate_or_change_the_count(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        memory_service = self._service(self._stale_members(fixed_now))
+
+        with patch.object(
+            tks,
+            'record_mem0_deletion_tombstones',
+            new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
+        ):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_tombstone_when_nothing_was_deleted(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'fresh',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=0)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 0
+        tombstone.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

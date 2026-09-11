@@ -1,0 +1,1006 @@
+"""Tests for harvest_production_queries.py — the production query set (task 4004).
+
+The harvester reads the live reconciliation write journal READ-ONLY and
+samples the query shapes that actually reach `search` in production, so the
+read transforms can be scored on real traffic rather than only on the
+blind-authored E2 query set.
+
+Every test here builds a SYNTHETIC SQLite DB in ``tmp_path`` with the real
+``write_ops`` column shape.  No test in this file may open the live journal:
+it is a ~10 GB file the running fused-memory server is writing to, and a test
+that opened it would be measuring a moving target under xdist.
+
+The script is loaded via ``fused-memory/tests/_fm_helpers.py``
+``::load_script_module`` so it can be tested without sys.path pollution: that
+helper reuses an already-loaded module for the same file instead of
+re-executing it under the same key.  It is invoked lazily.
+
+LANE DISCIPLINE — READ BEFORE ADDING A TEST
+-------------------------------------------
+Every test in this file must be free of network, Qdrant and OPENAI_API_KEY.
+If a live test is ever added it carries its markers PER-TEST
+(``@pytest.mark.integration`` + ``@pytest.mark.timeout(N)`` +
+``qdrant_skipif()`` + an OPENAI_API_KEY skipif), never via a module-level
+``pytestmark``: ``fused-memory/pyproject.toml`` sets
+``addopts = "-n auto --dist loadgroup -m 'not integration'"``, so a
+module-level integration marker would deselect every pure test in this file
+from the merge lane too — see the same warning at
+``test_bake_off_storage_shape.py:9-24``.
+"""
+from __future__ import annotations
+
+import functools
+import types
+from pathlib import Path
+
+import pytest
+from _fm_helpers import load_script_module
+
+SCRIPT_PATH = (
+    Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
+)
+
+FIXTURES_DIR = Path(__file__).parent / 'fixtures'
+
+
+def _load_module() -> types.ModuleType:
+    """Load harvest_production_queries.py from its file path.
+
+    The module is registered in sys.modules under its bare name so that
+    @dataclass and other reflection-based decorators work correctly (they
+    call sys.modules.get(cls.__module__)).
+
+    A named seam rather than a direct call at each use site, so the
+    load-once property has something uncached to assert against.
+    """
+    return load_script_module(SCRIPT_PATH, mod_name='harvest_production_queries')
+
+
+@functools.cache
+def _mod() -> types.ModuleType:
+    return _load_module()
+
+
+class TestTheScriptIsLoadedOnceNotReExecuted:
+    """The local loader seam must DELEGATE to the shared helper rather than
+    re-execute the script.
+
+    Narrower than the bake-off module's version of this test, and
+    deliberately so: the hazard THAT one names —
+    ``scripts/read_transform_selection.py::_load_script`` serving
+    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check — cannot
+    reach this key at all, because that bootstrap is only ever called via
+    ``bake_off()`` with the name ``'bake_off_storage_shape'``.
+
+    What is real here is smaller: TWO test modules register
+    ``'harvest_production_queries'`` for the same file — this module's
+    ``_load_module()`` and ``test_read_transform_selection.py``'s
+    ``_load_script(HARVEST_PATH, ...)``.  An unconditional re-exec in either
+    mints a SECOND module object under that shared key and whichever loader
+    ran last wins; ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto
+    --dist loadgroup"``, so which one that is is not stable.  Both now route
+    through ``load_script_module``, which serves the already-loaded module
+    for the same path — so the two registrations cooperate instead of
+    racing.  This test is what holds that delegation in place.
+
+    The UNCACHED seam is what this calls: ``_mod()`` is ``functools.cache``d
+    and would pass vacuously.
+    """
+
+    def test_the_script_is_loaded_once_not_re_executed(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_module()
+        second = _load_module()
+        assert first is second
+        assert sys.modules['harvest_production_queries'] is first
+
+
+# ---------------------------------------------------------------------------
+# Synthetic journal builder
+# ---------------------------------------------------------------------------
+# The real `write_ops` DDL, copied from the live journal (read-only inspection
+# at plan time). Only the columns the harvester reads are load-bearing, but the
+# full shape is kept so a schema drift in the real journal surfaces here.
+WRITE_OPS_DDL = """
+CREATE TABLE write_ops (
+    id TEXT PRIMARY KEY,
+    causation_id TEXT,
+    source TEXT,
+    provenance TEXT DEFAULT 'original',
+    operation TEXT,
+    project_id TEXT,
+    agent_id TEXT,
+    session_id TEXT,
+    kind TEXT NOT NULL DEFAULT 'write',
+    params TEXT DEFAULT '{}',
+    result_summary TEXT,
+    success INTEGER DEFAULT 1,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    terminal_status TEXT,
+    terminal_at TEXT,
+    terminal_error TEXT
+)
+"""
+
+OVERVIEW = 'project overview architecture goals'
+CONVENTIONS = 'coding conventions and project norms'
+DECISIONS = 'recent decisions and rationale'
+TASK_TEMPLATE = 'task {task_id} context and related decisions'
+
+
+def _build_journal(
+    path: Path,
+    rows: list[tuple[str, str, str]],
+) -> Path:
+    """Write a synthetic journal at `path`. Rows are (operation, kind, params)."""
+    import sqlite3  # noqa: PLC0415
+
+    con = sqlite3.connect(str(path))
+    try:
+        con.execute(WRITE_OPS_DDL)
+        for i, (operation, kind, params) in enumerate(rows):
+            con.execute(
+                'INSERT INTO write_ops (id, operation, kind, params, created_at)'
+                ' VALUES (?, ?, ?, ?, ?)',
+                (f'op-{i:06d}', operation, kind, params, '2026-08-12T00:00:00Z'),
+            )
+        con.commit()
+    finally:
+        con.close()
+    return path
+
+
+def _search_rows(text: str, n: int, *, limit: int = 5) -> list[tuple[str, str, str]]:
+    import json  # noqa: PLC0415
+
+    params = json.dumps({'query': text, 'limit': limit})
+    return [('search', 'read', params)] * n
+
+
+def _standard_journal(tmp_path: Path) -> Path:
+    """A journal whose shares are hand-computable.
+
+    200 search ops total:
+      overview      60  -> 30%
+      conventions   40  -> 20%
+      decisions     20  -> 10%
+      task {id}     40  -> 20%   (across 4 distinct task ids, 10 each)
+      long tail     40  -> 20%   (40 distinct one-off queries)
+    Plus 25 non-search ops that must be ignored entirely.
+    """
+    rows: list[tuple[str, str, str]] = []
+    rows += _search_rows(OVERVIEW, 60)
+    rows += _search_rows(CONVENTIONS, 40)
+    rows += _search_rows(DECISIONS, 20)
+    for task_id in ('4004', '3560', '3111', '3.1'):
+        rows += _search_rows(TASK_TEMPLATE.format(task_id=task_id), 10)
+    for i in range(40):
+        rows += _search_rows(f'one off question number {i:02d}', 1)
+    # Noise that must never be counted.
+    rows += [('add_memory', 'write', '{"content": "not a query"}')] * 20
+    rows += [('get_task', 'read', '{"task_id": "4004"}')] * 5
+    return _build_journal(tmp_path / 'journal.db', rows)
+
+
+# ---------------------------------------------------------------------------
+# Read-only connection proxies
+# ---------------------------------------------------------------------------
+# Inert scaffolding: these classes carry NO assertions of their own.  They are
+# an injection seam that lets a test observe HOW `harvest()` consumes its scan
+# cursor, or make ONE specific statement fail while every other statement runs
+# for real against the synthetic journal.
+#
+# `_connect_readonly` is already treated as a public-to-tests seam by
+# `TestReadOnlyAccess`, which calls it directly, so patching it introduces no
+# new coupling.
+
+
+class _CursorProxy:
+    """A real cursor with `fetchall()` forbidden and iteration left intact.
+
+    `fetchone` DELEGATES rather than raising, deliberately: the schema probe
+    in `harvest()` legitimately calls it.  Blocking everything would drag the
+    probe into the streaming contract this exists to pin, so the guard names
+    exactly one property -- the SCAN is streamed -- and nothing more.
+
+    `fail_after_rows` is the MID-ITERATION seam: the cursor yields that many
+    real rows and then raises `exc` from the NEXT `next()`.  An `execute()`
+    failure cannot reach that path at all -- no row has been yielded yet --
+    so it is the only way to pin a failure that surfaces mid-scan.
+    """
+
+    def __init__(
+        self,
+        cursor,
+        *,
+        fail_after_rows: int | None = None,
+        exc: BaseException | None = None,
+    ):
+        self._cursor = cursor
+        self._fail_after_rows = fail_after_rows
+        self._exc = exc
+
+    def __iter__(self):
+        if self._fail_after_rows is None:
+            return iter(self._cursor)
+        return self._iter_then_fail()
+
+    def _iter_then_fail(self):
+        # Raises UNCONDITIONALLY once the row budget is spent OR the real rows
+        # run out, so a short journal cannot silently skip the injection.
+        assert self._exc is not None, 'fail_after_rows requires exc'
+        budget = self._fail_after_rows
+        assert budget is not None
+        for yielded, row in enumerate(self._cursor):
+            if yielded >= budget:
+                break
+            yield row
+        raise self._exc
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        raise AssertionError('harvest must stream the scan cursor, not materialize it')
+
+
+class _ConnectionProxy:
+    """A real connection that hands out `_CursorProxy` cursors.
+
+    `fail_on` is an optional predicate over the SQL string; when it matches,
+    `exc` is raised INSTEAD of executing.  That is what lets a test fail
+    exactly one statement -- the `write_ops` scan -- while the schema probe
+    and every PRAGMA still run for real.
+
+    `fail_after_rows` moves that same injection from `execute()` to the
+    matched statement's ITERATION: the statement succeeds and `exc` lands
+    mid-scan instead, after the given number of real rows.
+    """
+
+    def __init__(
+        self,
+        con,
+        *,
+        fail_on=None,
+        exc: BaseException | None = None,
+        fail_after_rows: int | None = None,
+    ):
+        self._con = con
+        self._fail_on = fail_on
+        self._exc = exc
+        self._fail_after_rows = fail_after_rows
+
+    def execute(self, *args, **kwargs):
+        if self._fail_on is not None and args and self._fail_on(args[0]):
+            # `fail_on` is never passed without `exc`; the check narrows
+            # `_exc` for the type checker rather than adding a contract.
+            assert self._exc is not None, 'fail_on requires exc'
+            if self._fail_after_rows is None:
+                raise self._exc
+            return _CursorProxy(
+                self._con.execute(*args, **kwargs),
+                fail_after_rows=self._fail_after_rows,
+                exc=self._exc,
+            )
+        return _CursorProxy(self._con.execute(*args, **kwargs))
+
+    def close(self):
+        self._con.close()
+
+
+def _patch_connect(monkeypatch, mod, factory):
+    """Route `mod._connect_readonly` through `factory(real_connection)`.
+
+    monkeypatch restores the real callable on teardown, so the seam is not
+    left patched for the next test in the worker.
+    """
+    real = mod._connect_readonly
+
+    def _connect(db_path, *args, **kwargs):
+        return factory(real(db_path, *args, **kwargs))
+
+    monkeypatch.setattr(mod, '_connect_readonly', _connect)
+
+
+class TestHarvestSelectsOnlySearchOps:
+    """Only `operation='search'` rows carrying query text are counted."""
+
+    def test_non_search_operations_are_ignored(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        # 200 search ops, not 225.
+        assert result.total_search_ops == 200
+
+    def test_search_ops_without_query_text_are_excluded_from_the_denominator(
+        self, tmp_path
+    ):
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += [('search', 'read', '{"limit": 5}')] * 7 # no `query` key
+        rows += [('search', 'read', 'not json at all')] * 3
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+        assert result.total_search_ops == 10
+        assert result.unparsed_search_ops == 10 # 7 keyless + 3 malformed
+
+    def test_query_text_is_parsed_out_of_the_params_json(self, tmp_path):
+        mod = _mod()
+        db = _build_journal(tmp_path / 'j.db', _search_rows(OVERVIEW, 3))
+        result = mod.harvest(db)
+        assert [t.text for t in result.templates if t.observed_count] == [OVERVIEW]
+
+
+class TestTemplateClassification:
+    """The four briefing-assembler templates, three literal and one parameterized."""
+
+    def test_the_three_literals_are_classified(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        by_text = {t.text: t for t in result.templates}
+        assert by_text[OVERVIEW].observed_count == 60
+        assert by_text[CONVENTIONS].observed_count == 40
+        assert by_text[DECISIONS].observed_count == 20
+        for text in (OVERVIEW, CONVENTIONS, DECISIONS):
+            assert by_text[text].match == 'literal'
+
+    def test_the_task_family_is_matched_as_a_template_not_a_literal(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        family = [t for t in result.templates if t.match == 'parameterized']
+        assert len(family) == 1, 'exactly one parameterized family'
+        fam = family[0]
+        # All four distinct task ids collapse into ONE class.
+        assert fam.observed_count == 40
+        assert fam.distinct_instances == 4
+        assert fam.template == TASK_TEMPLATE
+
+    def test_a_parameterized_instance_is_not_counted_in_the_long_tail(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        tail_texts = {r['text'] for r in result.rows if r['source'] == 'production_tail'}
+        assert not any(t.startswith('task ') for t in tail_texts)
+
+    def test_a_near_miss_does_not_join_the_family(self, tmp_path):
+        mod = _mod()
+        rows = _search_rows(TASK_TEMPLATE.format(task_id='4004'), 5)
+        rows += _search_rows('task context and related decisions', 5) # no id
+        rows += _search_rows('task 4004 context and related choices', 5) # wrong tail
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+        fam = next(t for t in result.templates if t.match == 'parameterized')
+        assert fam.observed_count == 5
+        assert result.tail_count == 10
+
+
+class TestTrafficShares:
+    """Each class's share, and the residual long tail, are reported."""
+
+    def test_shares_are_reported_per_class(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        by_text = {t.text: t.traffic_share for t in result.templates}
+        assert by_text[OVERVIEW] == 0.30
+        assert by_text[CONVENTIONS] == 0.20
+        assert by_text[DECISIONS] == 0.10
+
+    def test_the_three_literals_and_the_family_are_reported_separately(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        assert result.literal_share == 0.60 # 120/200
+        assert result.family_share == 0.80 # 160/200
+
+    def test_the_residual_long_tail_share_is_reported(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        assert result.tail_share == 0.20
+        assert result.tail_distinct == 40
+        assert result.tail_count == 40
+
+    def test_the_shares_partition_the_traffic(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        total = sum(t.traffic_share for t in result.templates) + result.tail_share
+        assert abs(total - 1.0) < 1e-9
+
+    def test_an_empty_journal_reports_no_share_rather_than_a_zero_share(self, tmp_path):
+        """No traffic is no measurement — never a measured 0.0 share."""
+        mod = _mod()
+        db = _build_journal(tmp_path / 'j.db', [])
+        result = mod.harvest(db)
+        assert result.total_search_ops == 0
+        assert result.tail_share is None
+        assert all(t.traffic_share is None for t in result.templates)
+
+
+class TestDeterministicTailSample:
+    """The tail sample is regenerable: same DB + same args => same bytes."""
+
+    def test_harvesting_twice_yields_identical_rows(self, tmp_path):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        first = mod.harvest(db, tail_sample=10, seed=4004)
+        second = mod.harvest(db, tail_sample=10, seed=4004)
+        assert first.rows == second.rows
+
+    def test_the_frequency_led_portion_is_seed_independent(self, tmp_path):
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        # A tail with an unambiguous frequency order.
+        for i in range(20):
+            rows += _search_rows(f'tail query {i:02d}', 20 - i)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        a = mod.harvest(db, tail_sample=8, tail_top=4, seed=1)
+        b = mod.harvest(db, tail_sample=8, tail_top=4, seed=2)
+        top_a = [r['text'] for r in a.rows if r.get('tail_rank') is not None][:4]
+        top_b = [r['text'] for r in b.rows if r.get('tail_rank') is not None][:4]
+        assert top_a == top_b == [f'tail query {i:02d}' for i in range(4)]
+
+    def test_the_tail_sample_is_bounded_by_tail_sample(self, tmp_path):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        result = mod.harvest(db, tail_sample=7)
+        tail_rows = [r for r in result.rows if r['source'] == 'production_tail']
+        assert len(tail_rows) == 7
+
+    def test_the_emitted_rows_are_sorted_deterministically(self, tmp_path):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        rows = mod.harvest(db, tail_sample=10).rows
+        tail = [r['text'] for r in rows if r['source'] == 'production_tail']
+        assert tail == sorted(tail)
+
+
+class TestFixtureRowShape:
+    """Production queries are UNLABELED by construction."""
+
+    REQUIRED = ('query_id', 'text', 'source', 'observed_count', 'traffic_share')
+
+    def test_every_row_carries_the_required_fields(self, tmp_path):
+        mod = _mod()
+        rows = mod.harvest(_standard_journal(tmp_path), tail_sample=5).rows
+        assert rows
+        for row in rows:
+            for field in self.REQUIRED:
+                assert field in row, f'{field} missing from {row}'
+
+    def test_no_row_carries_expects_claim_ids(self, tmp_path):
+        """A labeled column here would be fabricated ground truth."""
+        mod = _mod()
+        rows = mod.harvest(_standard_journal(tmp_path), tail_sample=5).rows
+        for row in rows:
+            assert 'expects_claim_ids' not in row
+            assert 'expects_topic' not in row
+
+    def test_query_ids_are_unique_and_stable(self, tmp_path):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        first = mod.harvest(db, tail_sample=5)
+        second = mod.harvest(db, tail_sample=5)
+        ids = [r['query_id'] for r in first.rows]
+        assert len(ids) == len(set(ids))
+        assert ids == [r['query_id'] for r in second.rows]
+
+    def test_the_four_briefing_rows_are_sourced_as_templates(self, tmp_path):
+        mod = _mod()
+        rows = mod.harvest(_standard_journal(tmp_path), tail_sample=3).rows
+        briefing = [r for r in rows if r['source'] == 'briefing_template']
+        assert len(briefing) == 4
+
+    def test_rows_record_the_limit_the_journal_actually_recorded(self, tmp_path):
+        """`observed_limit` is a READING, not the briefing constant.
+
+        In the standard journal every op happens to run at 5, so every row
+        reports 5 — but it reports it because that is what was measured.
+        """
+        mod = _mod()
+        rows = mod.harvest(_standard_journal(tmp_path), tail_sample=3).rows
+        assert all(r['observed_limit'] == 5 for r in rows)
+        assert all(r['observed_limits'] == {'5': r['observed_count']}
+                   for r in rows if r['source'] == 'production_tail')
+
+    def test_a_tail_row_is_not_stamped_with_the_briefing_limit(self, tmp_path):
+        """The regression: briefing.py:1376 governs the briefing family ONLY.
+
+        A tail query fired by some other caller at limit=20 must report 20.
+        Stamping BRIEFING_SEARCH_LIMIT on it published a number nothing
+        observed, under a field named `observed_limit`, into the artifact a
+        selection gate reads.
+        """
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('a tail query some other caller fires', 7, limit=20)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        harvested = mod.harvest(db, tail_sample=3).rows
+        tail = [r for r in harvested if r['source'] == 'production_tail']
+        assert len(tail) == 1
+        assert tail[0]['observed_limit'] == 20
+        assert tail[0]['observed_limit'] != mod.BRIEFING_SEARCH_LIMIT
+        assert tail[0]['observed_limits'] == {'20': 7}
+
+    def test_a_query_whose_instances_disagree_reports_no_single_limit(self, tmp_path):
+        """Disagreement is None — never a modal pick, never a default.
+
+        The full histogram rides alongside, so a reader who wants a modal
+        value takes it from the measurement and owns that choice explicitly.
+        """
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('mixed limit tail query', 6, limit=10)
+        rows += _search_rows('mixed limit tail query', 2, limit=50)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        tail = [r for r in mod.harvest(db, tail_sample=3).rows
+                if r['source'] == 'production_tail']
+        assert len(tail) == 1
+        assert tail[0]['observed_limit'] is None
+        assert tail[0]['observed_limits'] == {'10': 6, '50': 2}
+
+    def test_the_sidecar_reports_the_scored_limit_as_a_choice(self, tmp_path):
+        """The scoring window is named a choice and sits beside the readings."""
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('a tail query', 4, limit=30)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        prov = mod.harvest(db, tail_sample=3).provenance()
+        assert prov['scored_limit'] == mod.BRIEFING_SEARCH_LIMIT
+        assert prov['scored_limit_is_a_choice'] is True
+        assert 'CHOICE' in prov['scored_limit_basis']
+        assert prov['briefing_observed_limits'] == {'5': 10}
+        assert prov['tail_observed_limits'] == {'30': 4}
+
+    def test_an_op_with_no_usable_limit_is_bucketed_not_defaulted(self, tmp_path):
+        """A missing limit is `unspecified`, not silently the scoring window."""
+        import json  # noqa: PLC0415
+
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += [('search', 'read', json.dumps({'query': 'no limit recorded'}))] * 3
+        db = _build_journal(tmp_path / 'j.db', rows)
+        tail = [r for r in mod.harvest(db, tail_sample=3).rows
+                if r['source'] == 'production_tail']
+        assert tail[0]['observed_limits'] == {mod.UNSPECIFIED_LIMIT: 3}
+        assert tail[0]['observed_limit'] is None
+
+
+class TestPinnedTail:
+    """A pinned harvest re-measures without re-drawing the query set.
+
+    The journal is appended to by a running server, so an unpinned
+    re-harvest draws different tail queries — every one a miss in the
+    committed fetch cache, i.e. correcting one field would demand a paid
+    re-seed. Pinning holds WHICH queries are emitted fixed while every
+    count, share and limit is measured fresh.
+    """
+
+    def test_a_pin_holds_the_tail_query_set_fixed(self, tmp_path):
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('pinned tail query', 4, limit=10)
+        rows += _search_rows('newly arrived tail query', 9, limit=8)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        pinned = mod.harvest(db, tail_sample=5, pin_tail_texts=['pinned tail query'])
+        tail = [r for r in pinned.rows if r['source'] == 'production_tail']
+        assert [r['text'] for r in tail] == ['pinned tail query']
+        # ...and the retained row is still MEASURED, not copied forward.
+        assert tail[0]['observed_limit'] == 10
+        assert tail[0]['observed_count'] == 4
+
+    def test_pinning_to_a_query_the_journal_lacks_raises(self, tmp_path):
+        """Emitting a pinned row with no observations would fabricate it."""
+        mod = _mod()
+        db = _build_journal(tmp_path / 'j.db', _search_rows(OVERVIEW, 10))
+        with pytest.raises(mod.EmptyHarvestError, match='pinned tail'):
+            mod.harvest(db, pin_tail_texts=['a query nobody ever ran'])
+
+
+class TestTheScanIsStreamed:
+    """The `write_ops` scan is consumed row-by-row, never materialized.
+
+    Not a style preference -- a measured cost.  The module docstring frames
+    the journal as multi-gigabyte (measured at 15,422,816,256 bytes) and the
+    committed sidecar records 431,621 search ops, so a `.fetchall()` on the
+    scan is a multi-hundred-MB peak allocation for a stream of `params` JSON
+    blobs that is consumed exactly once, into a Counter.  Nothing downstream
+    ever indexes the list.
+
+    "Consumed streaming, never materialized" has no direct observable in the
+    result value, and a memory-watermark assertion would be flaky under
+    `-n auto --dist loadgroup`.  So the property is pinned behaviourally:
+    forbid `.fetchall()` on the scan cursor while still requiring the harvest
+    to measure correctly.
+    """
+
+    def test_the_search_scan_is_streamed_not_materialized(self, tmp_path, monkeypatch):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        _patch_connect(monkeypatch, mod, _ConnectionProxy)
+
+        # The AssertionError from `_CursorProxy.fetchall` is not a
+        # `sqlite3.Error`, so it propagates rather than being swallowed and
+        # relabelled by the scan's error handler.
+        result = mod.harvest(db, tail_sample=5)
+
+        # Streaming must not cost accuracy: the same hand-computable shares
+        # `_standard_journal` is built for.
+        assert result.total_search_ops == 200
+        assert result.literal_share == 0.60
+        assert result.tail_share == 0.20
+        tail_rows = [r for r in result.rows if r['source'] == 'production_tail']
+        assert len(tail_rows) == 5
+
+
+class TestReadOnlyAccess:
+    """The live journal is a 10 GB file a running server is writing to."""
+
+    def test_the_connection_is_opened_read_only(self, tmp_path):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        con = mod._connect_readonly(db)
+        try:
+            assert con.execute('PRAGMA query_only').fetchone()[0] == 1
+        finally:
+            con.close()
+
+    def test_the_read_only_connection_carries_an_explicit_busy_timeout(self, tmp_path):
+        """A read that WAITS beats a read that refuses.
+
+        The journal is a live multi-gigabyte file a running fused-memory
+        server is appending to, so lock contention is the expected case, not
+        an exceptional one.  The busy timeout is what makes the reader wait
+        out a writer's lock instead of refusing -- and, before this change
+        set, `database is locked` was reported as a missing table.
+
+        The `> 5000` assertion is load-bearing and must not be dropped: 5000
+        is sqlite3's IMPLICIT default (measured on the pre-change code), so a
+        constant of 5.0 would let the equality assertion pass without any
+        `timeout=` ever being passed.
+        """
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        con = mod._connect_readonly(db)
+        try:
+            busy_timeout = con.execute('PRAGMA busy_timeout').fetchone()[0]
+            assert busy_timeout == int(mod.JOURNAL_CONNECT_TIMEOUT * 1000)
+            assert busy_timeout > 5000
+        finally:
+            con.close()
+
+    def test_a_write_attempt_raises(self, tmp_path):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        con = mod._connect_readonly(db)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                con.execute("INSERT INTO write_ops (id, created_at) VALUES ('x', 'y')")
+        finally:
+            con.close()
+
+    def test_harvesting_does_not_modify_the_journal(self, tmp_path):
+        import hashlib  # noqa: PLC0415
+
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        before = hashlib.sha256(db.read_bytes()).hexdigest()
+        mod.harvest(db)
+        assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+
+
+class TestTheJournalPathIsRepoRelative:
+    """A published artifact must not name somebody's home directory.
+
+    An absolute checkout path is neither reproducible nor readable by anyone
+    else, and it leaks the worktree the run happened in -- the rule
+    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
+    already states.
+
+    Both tests patch `mod._REPO_ROOT`, a module global `_repo_relative` reads
+    at call time, so the property is pinned without depending on the
+    filesystem layout the suite happens to run under.
+    """
+
+    def test_a_journal_under_the_repo_root_is_recorded_repo_relative(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        # Move it under a `data/` subdir so the relative value has structure.
+        nested = tmp_path / 'data'
+        nested.mkdir()
+        db = db.rename(nested / 'j.db')
+        # Resolve BOTH sides: `_repo_relative` resolves its input, so an
+        # unresolved anchor would spuriously fail behind a symlinked tmpdir.
+        monkeypatch.setattr(mod, '_REPO_ROOT', tmp_path.resolve())
+
+        result = mod.harvest(db, tail_sample=5)
+
+        assert result.journal_path == 'data/j.db'
+        assert not Path(result.journal_path).is_absolute()
+        # The sidecar is what actually gets published, so pin it too.
+        assert result.provenance()['journal_path'] == 'data/j.db'
+
+    def test_a_journal_genuinely_outside_the_repo_root_stays_absolute(
+        self, tmp_path, monkeypatch
+    ):
+        """The fallback is ABSOLUTE, not a bare filename.
+
+        This is the regression guard against over-relativizing: a journal
+        parked outside the tree is genuinely checkout-independent and must
+        stay identifiable.  It distinguishes the census-shaped helper (which
+        this uses) from the bake-off one, whose fallback is `resolved.name`.
+        """
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        monkeypatch.setattr(mod, '_REPO_ROOT', (tmp_path / 'somewhere_else').resolve())
+
+        result = mod.harvest(db, tail_sample=5)
+
+        assert Path(result.journal_path).is_absolute()
+        assert Path(result.journal_path).name == 'journal.db'
+
+
+class TestTheCommittedArtifactsCarryNoAbsolutePath:
+    """The published artifacts must not name anyone's home directory either.
+
+    NEW coverage: nothing anywhere read
+    `fixtures/production_query_sample.provenance.json` from disk, so the leak
+    was entirely unguarded.  Pure file reads -- no network, no Qdrant, no
+    OPENAI_API_KEY -- so this stays inside the lane discipline stated in this
+    module's header docstring.
+    """
+
+    def test_the_committed_sidecar_records_a_repo_relative_journal_path(self):
+        import json  # noqa: PLC0415
+
+        sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
+        value = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
+
+        assert not Path(value).is_absolute()
+        assert '/home/' not in value
+        # So the guard cannot be satisfied by blanking the field.
+        assert value.endswith('write_journal.db')
+
+    def test_the_committed_selection_report_carries_the_same_relative_path(self):
+        """Pins the PROPAGATION path, which is otherwise invisible.
+
+        `read_transform_selection.py` copies sidecar keys into
+        `block['harvest']` through a key-name whitelist guarded by
+        `if key in sidecar`, so a silent divergence between the two committed
+        artifacts would produce no error anywhere.
+
+        The report's absence is ASSERTED, not skipped: it is tracked in the
+        repo and present in every normal checkout, so a skip would let the
+        guard evaporate silently the moment the artifact is deleted, renamed
+        or moved -- the silently-empty measurement this module's header
+        docstring ("READ-ONLY, LOUDLY") rejects everywhere else.
+        """
+        import json  # noqa: PLC0415
+
+        report = Path(__file__).parents[2] / 'plans' / 'read-transform-selection-report.json'
+        assert report.exists(), f'published selection report is missing: {report}'
+        sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
+
+        expected = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
+        published = json.loads(report.read_text(encoding='utf-8'))
+        assert published['production_queries']['harvest']['journal_path'] == expected
+
+
+class TestLoudDegradation:
+    """An unreadable journal is a named error, never an empty sample."""
+
+    def test_an_absent_journal_raises_a_named_error(self, tmp_path):
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        missing = tmp_path / 'nope.db'
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(missing)
+        assert 'nope.db' in str(exc.value)
+
+    def test_a_journal_without_write_ops_raises_rather_than_returning_empty(
+        self, tmp_path
+    ):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        db = tmp_path / 'wrong.db'
+        con = sqlite3.connect(str(db))
+        con.execute('CREATE TABLE other (id TEXT)')
+        con.commit()
+        con.close()
+        with pytest.raises(mod.JournalUnavailableError):
+            mod.harvest(db)
+
+    def test_no_fixture_is_written_when_the_journal_is_unavailable(self, tmp_path):
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        out = tmp_path / 'production_query_sample.jsonl'
+        with pytest.raises(mod.JournalUnavailableError):
+            mod.main(['--journal', str(tmp_path / 'nope.db'), '--out', str(out)])
+        assert not out.exists()
+
+    def test_an_empty_journal_writes_no_fixture_either(self, tmp_path):
+        """Zero traffic must not silently become an empty-but-valid fixture."""
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        db = _build_journal(tmp_path / 'j.db', [])
+        out = tmp_path / 'sample.jsonl'
+        with pytest.raises(mod.EmptyHarvestError):
+            mod.main(['--journal', str(db), '--out', str(out)])
+        assert not out.exists()
+
+
+class TestTheRefusalNamesTheRealFailure:
+    """A refusal must be named ACCURATELY, not merely loudly.
+
+    This module's whole posture is that an unreadable journal raises a NAMED
+    error rather than returning an empty sample (module docstring, "READ-ONLY,
+    LOUDLY").  Yet every `sqlite3.Error` from the scan was relabelled as a
+    schema fault: `database is locked` -- the single most likely failure
+    against a journal a running server is writing to -- was reported as
+    `has no readable write_ops table`, sending an operator to diagnose a
+    missing table that is right there.
+
+    These tests close that contradiction from both sides: the injected
+    failures must stop claiming a schema fault, and a GENUINELY absent
+    `write_ops` table must still say so.
+    """
+
+    # The scan is the only statement that reads FROM write_ops; the schema
+    # probe reads FROM sqlite_master, so this predicate fails exactly the
+    # scan and lets every other statement run for real.
+    _SCAN = staticmethod(lambda sql: 'FROM write_ops' in sql)
+
+    def _harvest_with_scan_error(self, tmp_path, monkeypatch, exc, *, after_rows=None):
+        import functools  # noqa: PLC0415
+
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        _patch_connect(
+            monkeypatch,
+            mod,
+            functools.partial(
+                _ConnectionProxy,
+                fail_on=self._SCAN,
+                exc=exc,
+                fail_after_rows=after_rows,
+            ),
+        )
+        return mod, db
+
+    def test_a_lock_contention_error_is_not_reported_as_a_missing_table(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('database is locked')
+        mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'database is locked' in msg
+        # The load-bearing assertion: the pre-change message satisfied the
+        # first one too, as `<path> has no readable write_ops table: database
+        # is locked`.
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_disk_io_error_is_not_reported_as_a_missing_table(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('disk I/O error')
+        mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'disk I/O error' in msg
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_disk_io_error_MID_SCAN_is_still_named(self, tmp_path, monkeypatch):
+        """The guard must wrap the LOOP, not just the `execute()` call.
+
+        Streaming MOVED the point of failure, which is the whole reason
+        `harvest()` keeps `except sqlite3.Error` around the entire scan loop:
+        a `disk I/O error` can now surface on any `next()`, after rows have
+        already been consumed.  Both sibling tests raise from `execute()`,
+        i.e. before the first row, so narrowing the guard to the `execute()`
+        call alone would leave them GREEN while letting a mid-scan sqlite
+        failure escape raw and unnamed -- verified: that narrowing passes the
+        whole file without this test.
+
+        Same three assertions as its `execute()`-time sibling, from
+        mid-iteration instead.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('disk I/O error')
+        mod, db = self._harvest_with_scan_error(
+            tmp_path, monkeypatch, injected, after_rows=1
+        )
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'disk I/O error' in msg
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_genuinely_absent_write_ops_table_still_says_so(self, tmp_path):
+        """Pins the wording that must SURVIVE.
+
+        Without this, the two tests above could be greened by simply deleting
+        the schema-fault message -- trading one inaccurate refusal for
+        another.  The cause chain is `None` here because nothing raised: an
+        empty probe is a READING, not a failure.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        db = tmp_path / 'wrong.db'
+        con = sqlite3.connect(str(db))
+        con.execute('CREATE TABLE other (id TEXT)')
+        con.commit()
+        con.close()
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'write_ops' in msg
+        assert str(db) in msg
+        assert exc.value.__cause__ is None
+
+
+class TestFixtureWrite:
+    """The committed fixture is JSONL plus a provenance sidecar."""
+
+    def test_main_writes_jsonl_rows_and_a_sidecar(self, tmp_path):
+        import json  # noqa: PLC0415
+
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        out = tmp_path / 'production_query_sample.jsonl'
+        mod.main(['--journal', str(db), '--out', str(out), '--tail-sample', '5'])
+        lines = [json.loads(x) for x in out.read_text().splitlines() if x.strip()]
+        assert len(lines) == 9 # 4 briefing templates + 5 tail
+        sidecar = out.with_suffix('.provenance.json')
+        assert sidecar.exists()
+        prov = json.loads(sidecar.read_text())
+        assert prov['total_search_ops'] == 200
+        assert prov['literal_share'] == 0.60
+        assert prov['family_share'] == 0.80
+        assert prov['tail_share'] == 0.20
+        assert prov['tail_distinct'] == 40
+        assert 'harvested_at' in prov
+        # The scoring window is published as a CHOICE, beside the readings —
+        # there is no bare `search_limit` a reader could mistake for one.
+        assert 'search_limit' not in prov
+        assert prov['scored_limit'] == 5
+        assert prov['scored_limit_is_a_choice'] is True
+        assert prov['briefing_observed_limits'] == {'5': 160}
+        assert prov['tail_observed_limits'] == {'5': 40}
+
+    def test_the_written_fixture_round_trips_through_the_reader(self, tmp_path):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        out = tmp_path / 'sample.jsonl'
+        mod.main(['--journal', str(db), '--out', str(out), '--tail-sample', '5'])
+        rows = mod.read_fixture(out)
+        assert len(rows) == 9
+        assert all('expects_claim_ids' not in r for r in rows)

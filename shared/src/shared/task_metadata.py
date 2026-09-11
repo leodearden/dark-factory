@@ -24,6 +24,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 __all__ = [
+    'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
+    'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'BeforeDone',
     'DoneProvenance',
@@ -31,10 +33,12 @@ __all__ = [
     'MemoryHints',
     'MergeRetryPending',
     'Milestone',
+    'Recurrence',
     'RetryLedger',
     'RoutingDecisionMirror',
     'RoutingState',
     'SchemaWarning',
+    'SubmodelCardinality',
     'TaskMetadata',
     'apply_migrations',
     'parse_metadata',
@@ -67,20 +71,57 @@ __all__ = [
 # never match at resolve time. Authors pinning a model override MUST use
 # the full role_name (see orchestrator.agents.roles.ROLES), not the
 # collapsed config key.
-KNOWN_ROLE_NAMES: frozenset[str] = frozenset({
-    'architect',
-    'implementer',
-    'debugger',
-    'reviewer',
-    'reviewer_comprehensive',
-    'merger',
-    'steward',
-    'triage',
-    'module_tagger',
-    'deep_reviewer',
-    'judge',
-    'simple_task',
-})
+KNOWN_ROLE_NAMES: frozenset[str] = frozenset(
+    {
+        'architect',
+        'implementer',
+        'debugger',
+        'reviewer',
+        'reviewer_comprehensive',
+        'merger',
+        'steward',
+        'triage',
+        'module_tagger',
+        'deep_reviewer',
+        'judge',
+        'simple_task',
+    }
+)
+
+
+# The human-curator-gate marker (task 3341), read by
+# TaskMetadata._deterministic_invariants below and blessed in
+# _BLESSED_METADATA_KEYS. It is an ``extra='allow'`` metadata key, NOT a typed
+# TaskMetadata field, and is deliberately kept that way (task 3369): a typed
+# ``bool`` would COERCE the fail-closed string 'true' to True in pydantic's
+# non-strict mode -- silently rewriting an author's value in the one direction
+# that makes it look intentional, breaking I1 -- and a concrete default would
+# add ``human_curator_gate: false`` noise to every task's model_dump(), the
+# same objection already documented for merge_retry_pending.
+#
+# This is the key's SINGLE definition codebase-wide (exported via __all__):
+# orchestrator.deterministic_runner — the only other module that acts on the
+# key — imports it from here rather than restating the literal, so the write
+# boundary's rejection and the runner's dispatch-time guard cannot drift apart.
+HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
+
+# The human-curator-gate contract's STAMP half (task 3341): the ISO-8601 stamp
+# that proves a human actually performed the per-entry content review the
+# marker above demands. Blessed in _BLESSED_METADATA_KEYS alongside the
+# marker. No validator here reads it today (3369 only reads the marker), but
+# it is still declared here as this key's SINGLE definition codebase-wide
+# (task 3420) — orchestrator.deterministic_runner imports it rather than
+# restating the literal, for the same drift reason as the marker above.
+#
+# A fork of either key is caught BEHAVIOURALLY, by tests that stamp/pass the
+# BARE WIRE SPELLING and then drive real code: this package's parse_metadata
+# blessed-key tests, and TestHumanCuratorGateAdjudicationGuard in
+# orchestrator/tests/test_deterministic_runner.py.  Those bare literals are
+# load-bearing, not sloppiness — do not "clean them up" into imports of these
+# constants, which would rename the test in lockstep with a forked constant and
+# delete the only detector.  An in-process `is`/`id()` check cannot substitute:
+# CPython interns identifier-shaped literals, so it passes either way.
+HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
 
 
 def validate_model_overrides(value: object) -> None:
@@ -142,6 +183,26 @@ class DoneProvenance(BaseModel):
     ``kind`` is the *only* place the valid-kinds vocabulary is declared;
     fused-memory's ``_VALID_PROVENANCE_KINDS`` is retired in favour of
     importing this model (see PRD §5, I2).
+
+    ``stamped_at`` (task 3576) is the dedicated stamp-*write* timestamp
+    (ISO-8601 UTC) for ``kind='found_on_main'``. It is written SERVER-SIDE
+    by fused-memory's ``_validate_done_provenance`` chokepoint and is never
+    supplied by a caller — a caller-supplied value is discarded with a
+    warning. It exists because ``updatedAt`` is bumped by *any* later write
+    to the task (a re-tag, an audit annotation, a dependency edit), so it
+    cannot answer "when was this attribution asserted?"; the found_on_main
+    soak-gate predicate needs that question answered to distinguish a
+    genuinely new spurious stamp from legacy backlog.
+
+    It is deliberately OPTIONAL rather than conditionally-required for
+    ``found_on_main`` (i.e. ``_check_conditional_requirements`` is
+    deliberately NOT extended) for two reasons: ~193 historical stamps
+    predate the field and must keep validating at read time, and — more
+    importantly — its ABSENCE is itself load-bearing signal. Because every
+    write after task 3576 lands populates it at the chokepoint, a blob
+    lacking it provably predates that landing, which is exactly how
+    ``fused-memory/scripts/check_found_on_main_spurious_rate.py`` separates
+    legacy backlog from new stamps.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -161,6 +222,9 @@ class DoneProvenance(BaseModel):
     unit: str | None = None
     active_enter_timestamp: str | None = None
     escalation_id: str | None = None
+    # Server-written; see the class docstring. Optional by design — absence
+    # means "predates task 3576", which the soak-gate predicate relies on.
+    stamped_at: str | None = None
 
     @model_validator(mode='after')
     def _check_conditional_requirements(self) -> DoneProvenance:
@@ -235,6 +299,36 @@ _FILE_LINE_RE = re.compile(
     r':\d+(:\d+)?\b'
 )
 _WHITESPACE_RE = re.compile(r'\s+')
+
+# The kebab-case shape of a recurrence chain key (task 4676, PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4). Kept as a pattern STRING
+# because it is handed to pydantic's Field(pattern=...) rather than used via
+# re.match. Deliberately MIRRORS fused_memory.topic_slug::TOPIC_SLUG_RE
+# instead of importing it: `shared` is the base package fused-memory depends
+# on, so the reverse import would be a layering violation.
+#
+# The one intentional difference from that mirror is the END anchor's CASE:
+# TOPIC_SLUG_RE is a compiled *Python* regex and spells it `\Z`, whereas
+# pydantic v2 compiles Field(pattern=...) with the Rust regex crate, which
+# rejects `\Z` outright ("unrecognized escape sequence") and spells the same
+# end-of-haystack anchor `\z`. Both reject a trailing newline, which is the
+# property TOPIC_SLUG_RE's own comment says the anchor exists for — `$` would
+# NOT, under a Python-engine fallback.
+_RECURRENCE_KEY_RE_STR = r'^[a-z0-9]+(?:-[a-z0-9]+)*\z'
+
+# The length cap that COMPLETES the topic-slug mirror above. The regex
+# alone accepts an arbitrarily long key; every real consumer of
+# TOPIC_SLUG_RE pairs it with TOPIC_SLUG_MAX_LEN instead
+# (fused_memory.topic_slug::is_valid_topic_slug, memory_metadata's `topic`
+# check, config.schema::ProceduralTopicCluster), so mirroring the pattern
+# without the cap would leave `key` a weaker shape than the one its
+# comment — and docs/task-authoring.md §6.1 — advertise it as.
+#
+# Copied as a literal for the same layering reason as the pattern:
+# `shared` is the base package fused-memory depends on. Kept numerically
+# EQUAL to TOPIC_SLUG_MAX_LEN so "safe as a slug" stays true of a chain
+# key, which doubles as a grep anchor and (R-D5) a gauge group key.
+_RECURRENCE_KEY_MAX_LEN = 100
 
 
 class RetryLedger(BaseModel):
@@ -346,6 +440,62 @@ class Milestone(BaseModel):
             if self.at is not None:
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
+
+
+class Recurrence(BaseModel):
+    """``metadata.recurrence`` — one link of a recurring deterministic chain.
+
+    Task 4676 / PRD ``docs/prds/recurring-deterministic-tasks.md`` decision
+    R-D4. A recurring job is modelled as a CHAIN of ``task_kind='deterministic'``
+    predicate tasks rather than as a single self-rescheduling task, so every
+    run, failure and overdue-ness is visible in the task tree.
+
+    ``key`` is the stable chain id shared by every link of one chain —
+    kebab-case so it is safe as a slug and as a grep anchor. The pattern AND
+    the length cap deliberately MIRROR ``fused_memory.topic_slug``'s
+    ``TOPIC_SLUG_RE``/``TOPIC_SLUG_MAX_LEN`` pair rather than importing them,
+    because ``shared`` is the base package fused-memory depends on and the
+    reverse import would be a layering violation. Both halves are copied
+    because that module's own consumers always apply both — the regex alone
+    would accept an unbounded key.
+
+    ``interval_secs`` (> 0) is the cadence, measured from the predecessor's
+    TERMINAL time — never from a missed slot, so a late or long-running link
+    shifts the chain forward instead of accruing catch-up runs (contract
+    C-6).
+
+    ``minted_from`` is the predecessor's task id: an author omits it on the
+    seed link, and r2's mint stamps it on every successor. It is typed
+    ``str`` because task ids are ``str`` codebase-wide (the SQLite task
+    backend's signatures, ``ExternalDep.task_id``).
+
+    The seed-vs-successor DISCRIMINATOR is the VALUE — ``minted_from is
+    None`` — never key presence. The field is declared with a ``None``
+    default, so any round-trip through ``parse_metadata`` + ``model_dump``
+    materialises an explicit ``'minted_from': None`` on a seed link an author
+    wrote without one. A consumer that tests ``'minted_from' in rec`` would
+    therefore classify every round-tripped seed as a minted successor;
+    ``rec.get('minted_from') is None`` is the check that holds on both the
+    as-authored and the round-tripped form.
+
+    ``extra='allow'`` matches the Milestone/routing/merge_retry_pending
+    precedent, so a later writer's field survives round-trip untouched (I1).
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    key: str = Field(
+        min_length=1, max_length=_RECURRENCE_KEY_MAX_LEN, pattern=_RECURRENCE_KEY_RE_STR
+    )
+    # strict=True, not merely gt=0: pydantic's LAX int coercion accepts
+    # `True` (-> 1), `'86400'` and `86400.0`, so a stray boolean would mint a
+    # chain with a ONE-SECOND cadence against a contract scoped to
+    # hours-to-days. That is the same silent-wrong-value class the sibling
+    # guard already defends against with its `always_escalates is True`
+    # identity check. A cadence arrives from JSON, where an int is an int, so
+    # nothing legitimate needs the coercion.
+    interval_secs: int = Field(gt=0, strict=True)
+    minted_from: str | None = None
 
 
 class RoutingDecisionMirror(BaseModel):
@@ -467,6 +617,14 @@ class TaskMetadata(BaseModel):
     key this schema does not yet know about — a newer writer's field, a
     caller-private ``x_``-namespaced value — survives untouched through
     :func:`parse_metadata` rather than being silently dropped.
+
+    :meth:`_deterministic_invariants`' curator-gate clause is the *write-time*
+    counterpart to ``DeterministicRunner``'s dispatch WARNING (task 3341):
+    that WARNING fires when a record carrying both markers has already reached
+    the runner, whereas this rejects the record at the ``submit_task`` /
+    ``update_task`` boundary so it never lands (task 3369). The runner's
+    WARNING is deliberately retained as a defence-in-depth backstop for
+    records that did not pass through that boundary.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -511,6 +669,32 @@ class TaskMetadata(BaseModel):
             raise ValueError('deterministic task requires before_done or always_escalates')
         if self.before_done is not None and self.task_kind != 'deterministic':
             raise ValueError('before_done is only valid on deterministic tasks')
+        # Read the marker from model_extra, NOT getattr: it is an extra='allow'
+        # key (see HUMAN_CURATOR_GATE_KEY), and pydantic v2 populates
+        # __pydantic_extra__ before mode='after' validators run. `or {}` keeps
+        # the clause total if model_extra is ever None.
+        #
+        # LAST clause deliberately: pydantic stops at the first raise, so a
+        # blob that is also malformed more fundamentally (e.g. task_kind
+        # 'normal' with a before_done) still reports that error instead of
+        # this narrower one.
+        #
+        # Plain TRUTHINESS, not `is True` — same fail-CLOSED posture as
+        # orchestrator.deterministic_runner._is_human_curator_gate, and for the
+        # same reason: this is a SAFETY marker whose false NEGATIVE is the
+        # expensive direction. A truthy-but-not-True value (the string 'true'
+        # from a hand edit or a JSON round-trip) must still be rejected here,
+        # because the runner's own guard structurally cannot catch it on the
+        # act-then-ask path.
+        # Pinned by test_truthy_but_not_true_curator_marker_still_rejected.
+        if self.before_done is not None and (self.model_extra or {}).get(HUMAN_CURATOR_GATE_KEY):
+            raise ValueError(
+                'human_curator_gate is only valid on a pure gate: a curator gate '
+                'declares that only a human content judgement closes this task, '
+                'while before_done is a machine step that closes it. Drop '
+                'before_done to make this a real curator gate, or drop the marker '
+                'if the machine step is what closes the task.'
+            )
         return self
 
 
@@ -519,31 +703,109 @@ class TaskMetadata(BaseModel):
 # to know about it in advance. Keyed by the top-level metadata field name.
 _SUBMODEL_REGISTRY: dict[str, type[BaseModel]] = {}
 
+# The declared SHAPE of a registered slice's value: a single mapping
+# (``'dict'``) or a list of mappings (``'list'``).
+SubmodelCardinality = Literal['dict', 'list']
 
-def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
+# Cardinality lives in a PARALLEL dict rather than widening
+# _SUBMODEL_REGISTRY's value to a (model, cardinality) pair: six assertions
+# across four packages do `_SUBMODEL_REGISTRY[key] is SomeModel` identity
+# checks, and widening the value type would break all of them for zero
+# functional gain. The two dicts have exactly ONE writer
+# (register_metadata_submodel) so they cannot drift in normal use, and they
+# degrade in the SAFE direction if they ever do — see the read note in
+# register_metadata_submodel's docstring.
+_SUBMODEL_CARDINALITY: dict[str, SubmodelCardinality] = {}
+
+
+def register_metadata_submodel(
+    key: str,
+    model: type[BaseModel],
+    *,
+    cardinality: SubmodelCardinality = 'dict',
+) -> None:
     """Register ``model`` as the typed shape for ``metadata[key]``.
 
-    Idempotent when re-registering the *same* model object under the same
-    key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
-    *different* model is registered for a key that already has one — this is
-    a loud, fail-fast conflict intended to surface at import time.
+    ``cardinality`` declares the shape of the slice's VALUE: ``'dict'`` means
+    it must be a single mapping, ``'list'`` a list of mappings. It is enforced
+    by :func:`parse_metadata`, which emits a ``wrong_cardinality``
+    :class:`SchemaWarning` (fatal under ``write``+``enforce``) for a value of
+    the other shape.
+
+    ``'dict'`` is the DEFAULT because it is fail-closed: it restores the
+    behavior that held before parse_metadata grew its list branch, so an
+    existing or future dict-shaped registrant needs no change and only a
+    genuinely list-valued slice (currently just ``delivered_checks``) opts in.
+    An undeclared key therefore gets the STRICT shape, whose failure mode is a
+    spurious warning on a genuinely list-valued slice — loud and immediately
+    fixed — rather than a silently-accepted malformed one (task 4142).
+
+    A key present in ``_SUBMODEL_REGISTRY`` but missing from
+    ``_SUBMODEL_CARDINALITY`` reads as ``'dict'``: the two dicts have one
+    writer, so they only desync if something reaches past this function, and
+    that desync degrades safely (parse_metadata iterates the registry, so a
+    stale cardinality entry for an absent key is never read).
+
+    Idempotent when re-registering under the same key, provided the repeat
+    agrees on BOTH the model object and the cardinality (e.g. a module
+    reloaded/imported twice). Raises ``ValueError`` when a *different* model,
+    or a different cardinality, is registered for a key that already has one
+    — a loud, fail-fast conflict intended to surface at import time. Both
+    checks run BEFORE either dict is written, so a rejected call leaves the
+    registry and the cardinality map untouched (a partial write is the one
+    way the parallel-dict design could genuinely desync). Cardinality is
+    immutable for the same reason the model is: registration is a per-process,
+    import-order-driven side effect, so a silent last-writer-wins would make
+    the enforced shape depend on which module imported first.
+
+    Registry keys are OWNED by the module that registers them. Tests must
+    register test-only keys (``<name>_stub``) — never a key a production
+    module registers — or a cross-package pytest co-run pre-registers the real
+    model and the conflict raise below fires spuriously (task 3352).
+    ``shared/tests/test_task_metadata.py`` enforces that convention in its
+    autouse fixture's teardown, which asserts every key a test added ends in
+    ``_stub``.
     """
 
+    # Read both dicts and run every check before either assignment: a raise
+    # partway through would leave the registry and the cardinality map
+    # desynced, which is precisely the failure the parallel-dict design has
+    # to avoid.
     existing = _SUBMODEL_REGISTRY.get(key)
+    # Same fail-closed default the READ path uses (parse_metadata's
+    # `.get(key, 'dict')`), so this check agrees with the docstring's
+    # "missing from _SUBMODEL_CARDINALITY reads as 'dict'" invariant: were the
+    # two dicts ever to desync, a re-registration that AGREES with the
+    # documented default stays idempotent instead of raising over a `None`.
+    existing_cardinality = _SUBMODEL_CARDINALITY.get(key, 'dict')
     if existing is not None and existing is not model:
         raise ValueError(f'metadata sub-model already registered for {key!r}')
+    if existing is not None and existing_cardinality != cardinality:
+        raise ValueError(
+            f'metadata sub-model for {key!r} is already registered with '
+            f'cardinality {existing_cardinality!r}; cannot re-register it as '
+            f'{cardinality!r} (a key\'s declared shape is immutable — '
+            'registration is import-order-driven, so a silent overwrite would '
+            'make the enforced shape depend on which module imported first)'
+        )
     _SUBMODEL_REGISTRY[key] = model
+    _SUBMODEL_CARDINALITY[key] = cardinality
 
 
 # Milestone is the first real W10 registrant: registering at module-import
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
-register_metadata_submodel('milestone', Milestone)
+#
+# cardinality='dict' is stated explicitly on every registration below
+# even though it is the default: these are the load-bearing declarations the
+# task-4142 shape gate exists to make legible, and an explicit call site is
+# immune to a future flip of the default.
+register_metadata_submodel('milestone', Milestone, cardinality='dict')
 
 # routing (PRD γ, task 2533): registered the same way so 'routing' lands in
 # known_fields (no unknown_key census warning) and every parse_metadata
 # caller gets a validated, typed RoutingState slice.
-register_metadata_submodel('routing', RoutingState)
+register_metadata_submodel('routing', RoutingState, cardinality='dict')
 
 # merge_retry_pending (task 2795): registered like milestone/routing so the
 # orchestrator's durable merge-phase-resume stamp lands in known_fields (no
@@ -551,7 +813,16 @@ register_metadata_submodel('routing', RoutingState)
 # write boundary — while, as a registered sub-model rather than an optional
 # `| None = None` field, staying absent from model_dump() when unset (no
 # None-noise on every task).
-register_metadata_submodel('merge_retry_pending', MergeRetryPending)
+register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality='dict')
+
+# recurrence (PRD docs/prds/recurring-deterministic-tasks.md R-D4, task
+# 4676): registered at import time like milestone/routing/merge_retry_pending
+# so the slice is typed and validated before any of parse_metadata's
+# cross-package callers run, lands in known_fields (no unknown_key census
+# noise), stays absent from model_dump() when unset, and picks up the
+# task-4142 cardinality gate — so a list-shaped value is REJECTED under
+# write+enforce instead of silently validating element-wise.
+register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
@@ -623,9 +894,7 @@ def _migrate_v1_to_v2(blob: dict) -> dict:
     :func:`_migrate_v0_to_v1`: ``blob`` itself is never modified in place.
     """
     upgraded = dict(blob)
-    present = {
-        key: upgraded[key] for key in _LEGACY_RETRY_LEDGER_COUNTER_KEYS if key in upgraded
-    }
+    present = {key: upgraded[key] for key in _LEGACY_RETRY_LEDGER_COUNTER_KEYS if key in upgraded}
 
     existing_ledger = upgraded.get('retry_ledger')
     if isinstance(existing_ledger, dict):
@@ -696,59 +965,306 @@ class SchemaWarning(BaseModel):
 _WHOLE_METADATA_FIELD = '<metadata>'
 
 
-# Tier-A: the 34 load-bearing conventional metadata keys that real writers
+# Tier-A: the load-bearing conventional metadata keys that real writers
 # (orchestrator, curator, DeterministicRunner, escalation flows) already
 # depend on but that are not (yet) typed TaskMetadata fields. Skipped in
 # parse_metadata's unknown-key scan below so a deliberate, documented
 # convention doesn't manufacture unknown_key census noise — extra='allow'
-# still preserves each value byte-for-value (I1). None of these collide with
-# TaskMetadata.model_fields or _SUBMODEL_REGISTRY (only 'milestone' is
-# currently registered there). gate_escalated_at / before_done_ran_at /
-# before_done_verified_at / before_done_verified_pid are the
-# DeterministicRunner's own stamps (CLAUDE.md "Deterministic task kind").
+# still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
+# disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
+# field or a registered submodel already suppresses unknown_key via
+# known_fields, so blessing it too would be redundant. 'recurrence' is the
+# one deliberate overlap: task 4676 / PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4 specifies both, so the key
+# stays suppressed if its registration is ever moved or made lazy, and so
+# migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
+# for a submodel-backed key with live readers is the correct refusal.
 #
-# Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, related_task*) and
-# Tier-C ad-hoc/timestamped one-off keys are deliberately NOT included here
-# — they keep emitting unknown_key as a greppable drift signal; see
-# CLAUDE.md "Task metadata vocabulary & census" for the documented
-# consolidation convention.
-_BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
-    'source',
-    'modules',
-    'spawn_context',
-    'complexity',
-    'force_full_path',
-    'branch_base_sha',
-    '_causation_id',
-    'dry_run_proposals',
-    'reblock_guard',
-    'agent_id',
-    'escalation_id',
-    'suggestion_hash',
-    'prd_path',
-    'prd_task_label',
-    'user_observable_signal',
-    'consumer_ref',
-    'substrate_confirmed',
-    'human_decomposed',
-    'grammar_confirmed',
-    'invariants',
-    'optimistic_path',
-    'capability_manifest',
-    'curator_action',
-    'curator_justification',
-    'combined_at',
-    'gate_escalated_at',
-    'before_done_ran_at',
-    'before_done_verified_at',
-    'before_done_verified_pid',
-    'files_tagged_at',
-    'origin_finding_id',
-    'spawned_from',
-    'program',
-    'program_stream',
-    'stream',
-})
+# gate_escalated_at / before_done_ran_at / before_done_verified_at /
+# before_done_verified_pid are the DeterministicRunner's own stamps
+# (CLAUDE.md "Deterministic task kind").
+#
+# Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, and the three
+# `related_tasks` aliases — `related_task`, `related_df_tasks`,
+# `related_task_examples`) and Tier-C ad-hoc/timestamped one-off keys are
+# deliberately NOT included here — they keep emitting unknown_key as a
+# greppable drift signal; see docs/task-authoring.md §8 "Task metadata
+# vocabulary & census" for the documented consolidation convention. (That
+# section moved out of CLAUDE.md, which now only points at it; the newer
+# entries below already cite the new home.)
+#
+# That alias list is spelled key-exact rather than globbed. It carried a
+# `related_task*` wildcard until task 4303, which went false the moment
+# `related_tasks` was blessed below and was independently hazardous: the
+# glob also sweeps in `related_task_ids`, a DIFFERENT key with a live
+# reader in `fused-memory/scripts/audit_duplicate_memories.py::
+# liveness_snapshot_subject_task_ids`, and one that is MEMORY metadata
+# rather than task metadata.
+_BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        'source',
+        'modules',
+        'spawn_context',
+        'complexity',
+        'force_full_path',
+        'branch_base_sha',
+        '_causation_id',
+        'dry_run_proposals',
+        'reblock_guard',
+        'agent_id',
+        'escalation_id',
+        'suggestion_hash',
+        'prd_path',
+        'prd_task_label',
+        'user_observable_signal',
+        'consumer_ref',
+        'substrate_confirmed',
+        'human_decomposed',
+        'grammar_confirmed',
+        'invariants',
+        'optimistic_path',
+        'capability_manifest',
+        # AUTOMATED task-curator combine flow (fused_memory.task_interceptor).
+        # Distinct from the HUMAN content curator of the `human_curator_*` keys
+        # below — two unrelated actors, deliberately not sharing a prefix.
+        'curator_action',
+        'curator_justification',
+        'combined_at',
+        'gate_escalated_at',
+        'before_done_ran_at',
+        'before_done_verified_at',
+        'before_done_verified_pid',
+        'files_tagged_at',
+        # The module tagger's affirmative "no local file predicted" verdict,
+        # written unconditionally as a bool in the SAME payload and by the
+        # same line of code as the files_tagged_at sentinel above (task 3122).
+        # Tier-A rather than parked in the x_ forward-compat namespace for
+        # the same reason as that sibling: it is machine-written by an
+        # orchestrator stage, not an ad-hoc one-off.
+        #
+        # THE WRITE PATH IS INERT ON ARRIVAL. `_MODULE_TAGGER_ENABLED` is
+        # False (task 4523, commit bdcd9f5eff), guarding every production
+        # call site of `Harness._tag_task_modules`, so nothing writes this
+        # key: a fleet-wide census on 2026-08-28 found 0 records carrying it
+        # in any of the 9 project stores, against 325 dark_factory / 269
+        # reify carrying `files_tagged_at`. It is blessed, and lands, because
+        # plans/module-tagger-retirement-prd.md decision 4 (Leo, 2026-08-20)
+        # ratified this ordering -- 3122 lands the persistence, then task
+        # 4523 (pending, blocked on 3122) deletes the write path along with
+        # the tagger and re-annotates this entry historical beside
+        # `files_tagged_at` (PRD decision 5). Blessing it here leaves 4523's
+        # deletion diff unchanged and keeps the key from warning as
+        # `unknown_key` on any record written should the constant be flipped
+        # back before 4523 lands.
+        #
+        # There is no code READER either, and task 3121 is not one: it landed
+        # with deliberately no leg for the soft-signal marker -- see
+        # `orchestrator/src/orchestrator/cross_repo_gate.py::
+        # classify_cross_repo`.
+        'files_tagged_empty',
+        # Finding-provenance family (esc-3796-1, 2026-08-17). `source_finding_id`
+        # is the CANONICAL key naming the finding a task was spawned from;
+        # `stage1_finding_id` is a distinct canonical key naming a Stage-1
+        # finding specifically (NOT an alias of it); `origin_finding_id` is the
+        # RETIRED alias, kept in the set deliberately.
+        #
+        # Unusually for a Tier-A entry, this family has NO code reader and NO
+        # code writer — it is a pure LLM prose convention, blessed on
+        # corpus-dominance grounds (source=120 tasks, stage1=33, origin=30,
+        # source-x-origin overlap 0; 46 vs 2 writes since 2026-08-01). A future
+        # reader who greps for a writer, finds none, and concludes these
+        # entries are dead would be wrong: the corpus IS the usage. That also
+        # means `origin_finding_id` never met the "already relied on by real
+        # writers" criterion it was originally blessed under.
+        #
+        # Those figures are a point-in-time census (2026-08-17), not an
+        # invariant, so this comment is deliberately their SINGLE in-repo copy:
+        # docs/task-authoring.md §8 and the dedicated test's docstring cite
+        # esc-3796-1 instead of restating them. A re-census updates here and
+        # the ruling — nowhere else.
+        #
+        # The retired alias STAYS because 30 landed tasks carry it, most
+        # terminal and mechanically un-rewritable (task 3796 rejected data
+        # migration). Removing it would manufacture exactly the unknown_key
+        # census noise this change exists to eliminate. Blessing remains
+        # reversible if a later ruling consolidates the family (precedent:
+        # commit 84e3b4cd75).
+        'source_finding_id',
+        'stage1_finding_id',
+        'origin_finding_id',
+        # `related_memory_ids` is the memory-ids half of the SAME family
+        # (esc-3796-1, task 4373): where the id-trio above names WHICH finding
+        # a task came from, this names the memory ids that finding cites. Two
+        # facts carry the ruling. It already exists and co-occurs 100% with
+        # `source_finding_id` — task 3796 itself carries exactly that shape —
+        # so it is not a new invention; and the corpus had already forked into
+        # 10 plural memory-id spellings, so the remedy is to canonicalize the
+        # strongest EXISTING one rather than mint an 11th. `origin_memory_ids`
+        # was considered and rejected (one task, 3107, cancelled).
+        #
+        # Like the trio, it has NO code reader and NO code writer. After task
+        # 4373 the recon Stage 1/2 PROMPT is its writer — a future reader who
+        # greps for a code writer, finds none, and prunes the entry as dead
+        # would be wrong in the same way.
+        'related_memory_ids',
+        # `related_tasks` is the canonical Tier-B cross-reference spelling
+        # (task 4303). docs/task-authoring.md §8's Tier-B table already
+        # designates it the key authors migrate TOWARD, with `related_task`,
+        # `related_df_tasks` and `related_task_examples` as the warning
+        # aliases — but the canonical itself was unblessed, so an author who
+        # followed the documentation exactly still minted a `code=unknown_key`
+        # census line, and the drift signal could not discriminate "used an
+        # alias" from "used the canonical spelling". It was the SOLE violation
+        # of that invariant: prd_path, prd_task_label, invariants and
+        # source_finding_id — every other key in the table's Canonical column
+        # — were already blessed. The invariant is now machine-pinned by
+        # tests/scripts/test_task_authoring_tier_b_canonical_keys.py.
+        #
+        # THE READER VERDICT IS NEGATIVE, AND THE ENTRY IS BLESSED ANYWAY.
+        # There is no code reader, no code writer, and `git log -S` over every
+        # source tree shows the key has never existed in code in this repo's
+        # history. Unlike `related_memory_ids` above — whose writer is the
+        # recon Stage 1/2 PROMPT after task 4373 — no live prompt instructs it
+        # either. The empirical writer is an LLM prose convention; the corpus
+        # `source` values are review-suggestion-backfill 144,
+        # prd-decomposition 17, escalation-info 15, agent-followup 9,
+        # unblock-triage 8, escalation-watcher 7, reconciliation-stage2 6, with
+        # 162 carrying no `source` at all. As with the finding-provenance
+        # family above, a future reader who greps for a reader or a writer,
+        # finds none, and prunes this entry as dead would be WRONG: the corpus
+        # IS the usage. It is blessed on the esc-3796-1 corpus-dominance
+        # precedent, under which `source_finding_id` was blessed at 120 tasks.
+        #
+        # Census (2026-08-31, measured with the submodel registrations
+        # imported): 469 of 4748 dict-metadata tasks carry it — rank #1 among
+        # unknown_key spellings, against 209 for the next contributor
+        # (`merge_first_enqueued_at`). 326 of those carriers (69.5%) also carry
+        # `done_provenance`. Value shapes: 432 list, 37 bare str. Status split:
+        # done 328, cancelled 22, pending 94, deferred 15, in-progress 10.
+        # These are a point-in-time snapshot of a GROWING corpus, not an
+        # invariant — the count moved 437 (2026-08-16) -> 445 -> 469 across
+        # three measurements, and carriers were still being written on the day
+        # of the last one. As with the entries above, this comment is
+        # deliberately their SINGLE in-repo copy: the dedicated test's
+        # docstring and docs/task-authoring.md §8 cite it rather than restate
+        # the figures, because a measurement kept in three places ages into two
+        # stale copies.
+        #
+        # BLESSED RATHER THAN RETIRED, so the fork is not re-litigated. Two
+        # measured reasons beyond the precedent. (1) docs §8 designates this
+        # the canonical spelling authors migrate toward, so retiring it inverts
+        # live authoring guidance for four spellings at once and leaves the
+        # three aliases with nowhere to migrate. (2) Retirement is structurally
+        # impossible today: ~70% of carriers hold `done_provenance` and are
+        # unwritable under the presence-only write-authority floor until task
+        # 3777 lands, and sweeping only the writable remainder is exactly the
+        # vocabulary fork docs §8 already rules out for task 4302 as "a fifth
+        # of the benefit".
+        #
+        # BLESSED RATHER THAN PROMOTED TO A TYPED FIELD, which is the
+        # non-obvious half and the same argument that decided `execution_class`
+        # below. The corpus values are heterogeneous — 432 list against 37
+        # bare str — so a typed `list[str]` would raise on every metadata
+        # write to those 37 under direction='write', enforce=True, permanently,
+        # because most are terminal and unrepairable under the same
+        # `done_provenance` floor that blocks the retirement sweep.
+        #
+        # INTENDED CONSEQUENCE: `validate_migration_keys` in
+        # fused-memory/scripts/migrate_task_metadata_to_x_namespace.py refuses
+        # Tier-A blessed keys, so that script will now refuse to x_-namespace
+        # this key (--force overrides). Correct under this ruling — it closes
+        # the retirement path in code, not merely in prose.
+        'related_tasks',
+        'spawned_from',
+        'program',
+        'program_stream',
+        'stream',
+        # Cross-repo deliverable marker (task 3004): set by the fused-memory submit
+        # path when a task's metadata.files are ALL owned by one other registered
+        # project, read by the orchestrator pre-merge narrowing gate (routes to
+        # OutcomeKind.plan_files_cross_repo instead of flagging 'files not touched').
+        'cross_repo',
+        'cross_repo_project',
+        # Human-curator gate contract (task 3341): `human_curator_gate` marks a
+        # pure deterministic gate whose resolution requires human CONTENT
+        # adjudication, not merely a closed escalation record;
+        # `human_curator_adjudicated_at` is the ISO-8601 stamp that proves the
+        # per-entry review happened. Both are read by DeterministicRunner's
+        # pure-gate resume guard, which refuses to drive such a task to done
+        # when the marker is set and the stamp is absent or not a non-empty
+        # string (task 3181 is the incident: an auto-resolved gate escalation
+        # was treated as proof the curator work had been done).  The stamp
+        # carries the `human_curator_` prefix rather than the bare `curator_`
+        # one above precisely so the human content curator is not conflated
+        # with the automated task curator.
+        HUMAN_CURATOR_GATE_KEY,
+        HUMAN_CURATOR_ADJUDICATED_AT_KEY,
+        # Orchestrator block-stamp (task 3697): written by workflow.py
+        # `_mark_blocked` on every block, read by agents/briefing.py for the
+        # stale-briefing check; 78 tasks carry it (census 2026-08-06). The
+        # writer symbol is named because that is what a future reader greps
+        # for when deciding whether the key is still machine-written.
+        # Promoted rather than x_-renamed because it is machine-written
+        # against a live reader — renaming it on one task would fork the
+        # vocabulary and be re-added on the next block.
+        'last_blocked_at',
+        # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
+        # R-D4) is the ONE blessed key that is also a registered submodel — see
+        # the header note above on why the overlap is deliberate.
+        'recurrence',
+        # Recon-stage execution-class discriminator (task 3780): machine-read
+        # by live guards at the fused-memory submit boundary, with real
+        # dispatch consequences rather than decorative ones. Readers, named
+        # because that is what a future reader greps when deciding whether the
+        # key is still load-bearing (all re-verified 2026-08-18):
+        # `execution_class_guard.execution_class_error` (the recon-stage submit
+        # gate), `operational_routing_guard` (coerces 'operational'/'decision'
+        # to task_kind='deterministic' + always_escalates),
+        # `routing_intent_guard` / `operational_suggestion_guard`
+        # (`_EXEMPT_EXECUTION_CLASSES`), `operational_ask_registry`
+        # (`_BOUNDARY_OWNED_EXECUTION_CLASSES`), `task_interceptor`
+        # (`_GATE_MARKER_KEYS`, consumed by `_is_gate_metadata` /
+        # `_candidate_from_kwargs`) and `task_curator` (decision-cache key).
+        #
+        # Census (2026-08-18): 336 of 4204 dict-metadata tasks carry it —
+        # code_tdd 196, operational 126, decision 12, implementation 2. As with
+        # the finding-provenance entries above, this comment is deliberately
+        # the SINGLE in-repo copy of those figures: the dedicated test's
+        # docstring and docs/task-authoring.md §8 cite the reasoning and point
+        # here instead, so a re-census updates one place.
+        #
+        # BLESSED rather than promoted to a typed field, even though
+        # recon_self_model.EXECUTION_CLASSES looks like a closed vocabulary.
+        # Two reasons, and the next reader will re-litigate this without them.
+        # (1) The note on `operational_mode` above already records that
+        # execution_class is validated only by a guard conditional on
+        # recon-stage caller identity — logic a pydantic field validator cannot
+        # express — and contrasts operational_mode as the caller-INDEPENDENT
+        # rule a Literal can carry. (2) The vocabulary is not actually closed in
+        # the data: tasks 3623 and 3624 carry 'implementation', and both are
+        # `done` carrying done_provenance, so a Literal would raise on every
+        # metadata write to them (direction='write', enforce=True) and they are
+        # unrepairable until task 3777 lifts the presence-only write-authority
+        # floor.
+        'execution_class',
+    }
+)
+
+
+def _cardinality_mismatch_message(
+    key: str, cardinality: SubmodelCardinality, raw: object
+) -> str:
+    """Describe a registered slice whose value is the wrong SHAPE (task 4142).
+
+    Built once and used for both the ``TypeError`` raised under
+    ``write``+``enforce`` and the ``wrong_cardinality`` :class:`SchemaWarning`
+    otherwise, so the two can never drift.
+    """
+    expected = 'a single JSON object' if cardinality == 'dict' else 'a list of JSON objects'
+    return (
+        f'metadata.{key} is registered with cardinality {cardinality!r}, so its '
+        f'value must be {expected}; got {type(raw).__name__}'
+    )
 
 
 def parse_metadata(
@@ -769,7 +1285,13 @@ def parse_metadata(
     * ``blob`` is a dict -> migrated (:func:`apply_migrations`), any
       registered sub-model slice (:data:`_SUBMODEL_REGISTRY`) present in it
       is validated and swapped in as a typed instance, then the whole thing
-      is validated as :class:`TaskMetadata`.
+      is validated as :class:`TaskMetadata`. A slice's value must match the
+      shape its registration declared (``cardinality``, see
+      :func:`register_metadata_submodel`): a list for a ``'dict'`` slice, or
+      a non-list for a ``'list'`` slice, is a ``wrong_cardinality`` finding
+      rather than a validated value — reported under the same failure policy
+      as any other malformed slice, and distinct from ``invalid_submodel``
+      (which means the shape was right but an element/field failed).
 
     Failure policy (never the old silent-``{}`` discard — I4): ``write`` with
     ``enforce=True`` raises (``ValueError``/``ValidationError``) on malformed
@@ -825,16 +1347,53 @@ def parse_metadata(
         if key not in parsed:
             continue
         raw = parsed[key]
+        # The slice's DECLARED shape, fail-closed for a key that never
+        # declared one (register_metadata_submodel's 'dict' default).
+        cardinality = _SUBMODEL_CARDINALITY.get(key, 'dict')
+        if isinstance(raw, list) != (cardinality == 'list'):
+            # Task 4142: the slice's value is the wrong SHAPE for what its
+            # registration declared. Deliberately SYMMETRIC — both directions
+            # are the same silent-acceptance defect:
+            #
+            #  * a LIST for a 'dict' slice: the list arm below used to run for
+            #    EVERY registered key, so it validated element-wise into a
+            #    typed list and emitted NO warning — invisible to both the
+            #    `task_metadata.schema_warning` census and the enforce=True
+            #    write gate. The resulting non-dict metadata.milestone then
+            #    made scheduler._milestone_time_gated fail-safe-withhold the
+            #    task from dispatch indefinitely, with no escalation path.
+            #  * a NON-LIST for a 'list' slice: it validated quietly into a
+            #    SINGLE model instance, and delivered_checks' consumer
+            #    (verify_delivered_checks_on_main) ITERATES the value — so an
+            #    accepted dict iterates its string KEYS and yields garbage
+            #    checks against a mark-done gate.
+            #
+            # A shape violation is not an element failure, so it gets its own
+            # code rather than 'invalid_submodel'.
+            if direction == 'write' and enforce:
+                raise TypeError(_cardinality_mismatch_message(key, cardinality, raw))
+            warnings.append(
+                SchemaWarning(
+                    field=key,
+                    code='wrong_cardinality',
+                    message=_cardinality_mismatch_message(key, cardinality, raw),
+                )
+            )
+            # No reassignment of `parsed`: the raw value survives into
+            # model_extra so model_dump() re-emits it verbatim (I1) — the
+            # same retain-on-warn shape the invalid_submodel arm uses.
+            continue
         try:
             if isinstance(raw, list):
-                # A registered slice may itself be list-valued (e.g. a
-                # future metadata.delivered_checks) rather than a single
-                # mapping — validate each element independently and swap in
-                # the typed list. The comprehension raises on the first bad
-                # element (TypeError for a non-mapping item, ValidationError
-                # for a mapping that fails the model), which aborts before
-                # `parsed` is reassigned below, so a malformed list is
-                # retained wholesale — same as the dict path.
+                # A slice declared cardinality='list' (currently only
+                # capability_manifest's delivered_checks) is a list of
+                # mappings rather than a single mapping — validate each
+                # element independently and swap in the typed list. The
+                # comprehension raises on the first bad element (TypeError
+                # for a non-mapping item, ValidationError for a mapping that
+                # fails the model), which aborts before `parsed` is
+                # reassigned below, so a malformed list is retained
+                # wholesale — same as the dict path.
                 parsed = {**parsed, key: [submodel(**item) for item in raw]}
             else:
                 # `submodel(**raw)` raises TypeError (not ValidationError)

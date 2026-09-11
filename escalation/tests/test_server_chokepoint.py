@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
 import types
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -25,6 +26,12 @@ from escalation.dedupe import DedupeConfig
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
+
+if TYPE_CHECKING:
+    # Annotation-only (PEP 563 via `from __future__ import annotations`): the
+    # runtime import stays local to each helper, mirroring every other
+    # orchestrator reference in this file.
+    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -275,11 +282,17 @@ class TestTerminalAutoResolve:
 
     @pytest.mark.asyncio
     async def test_blocker_response_has_only_minimal_keys(self, tmp_path: Path):
-        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,action}.
+        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,level,action}.
 
         RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
         which is a 20-field Escalation dump. After step-2, the shape is normalized to
-        the minimal four-field contract plus 'action' from the blocker wrapper.
+        the minimal contract plus 'action' from the blocker wrapper.
+
+        Task 3236 adds exactly one field, 'level': the response contract
+        documents 'level' as the way a caller confirms its requested level
+        landed, so omitting it here would leave a caller written to that
+        contract with a KeyError on this branch.  The invariant this pin
+        actually guards — no full-record dump — is unchanged.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         lookup = await _make_lookup('done')
@@ -287,18 +300,20 @@ class TestTerminalAutoResolve:
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'action'}
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'level', 'action'}
         assert set(result.keys()) == expected_keys, (
             f"Expected minimal keys {expected_keys}, got: {set(result.keys())}"
         )
 
     @pytest.mark.asyncio
     async def test_info_response_has_only_minimal_keys(self, tmp_path: Path):
-        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by} (no 'action').
+        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by,level} (no 'action').
 
         RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
         which is a 20-field dump. After step-2, the shape is normalized to the minimal
-        four-field contract — no 'action' key (that is blocker-only).
+        contract — no 'action' key (that is blocker-only).  Task 3236 adds
+        'level' (see the blocker-side sibling for why); the no-full-dump
+        invariant this pin guards is unchanged.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         lookup = await _make_lookup('cancelled')
@@ -306,7 +321,7 @@ class TestTerminalAutoResolve:
 
         result = await _info(server, **_COMMON_KWARGS)
 
-        expected_keys = {'id', 'status', 'resolution', 'resolved_by'}
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'level'}
         assert set(result.keys()) == expected_keys, (
             f"Expected minimal keys {expected_keys} (no 'action'), got: {set(result.keys())}"
         )
@@ -820,6 +835,123 @@ class TestMergeRequestRequestId:
             f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
         )
 
+    async def test_submit_time_already_merged_patch_id_backstop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Rebased landing: branch tip is NOT an ancestor of main, but its
+        content is fully patch-id-contained in main (rebased / cherry-picked
+        landing).  merge_request must return {status:'already_merged', commit}
+        immediately via the patch_content_contained backstop — no enqueue, no
+        merge_queued event, same shape as the is_ancestor fast-path.
+
+        RED until the submit-guard impl: without the patch-id backstop the
+        non-ancestor tip falls through to coalesce/enqueue and blocks on the
+        future → asyncio.wait_for raises TimeoutError.  Covers the rebased-
+        landing blind spot (task 2945): is_ancestor misses a rebased landing,
+        so a duplicate/late resubmission would otherwise burn a head-of-line
+        verify on a no-op merge.
+        """
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        FAKE_TIP = 'deadbeef12345678'
+
+        # Recording event_store stub
+        class _RecordingEventStore:
+            def __init__(self):
+                self.events: list = []
+
+            def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+                self.events.append(event_type)
+
+        recording_event_store = _RecordingEventStore()
+
+        # git_ops stub: tip resolves, but is_ancestor MISSES (rebased landing).
+        resolve_calls: list[str] = []
+        ancestor_calls: list[tuple] = []
+
+        async def _resolve_branch_sha(name: str) -> str:
+            resolve_calls.append(name)
+            return FAKE_TIP
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            ancestor_calls.append((ancestor, descendant))
+            return False  # rebased landing: branch tip is NOT an ancestor of main
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        git_ops_stub = types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+        )
+        harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        # Spy the PUBLIC module-level patch_content_contained: record its
+        # (head, upstream, git_ops) args and return True (content fully
+        # contained via a rebased landing).  Monkeypatching the public helper
+        # is permitted — only `_`-private reach-backs are frozen.
+        patch_calls: list[tuple] = []
+
+        async def _patch_content_contained(head, upstream, git_ops):
+            patch_calls.append((head, upstream, git_ops))
+            return True
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            event_store=recording_event_store,
+            harness=harness_stub,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        # Same already_merged shape as the is_ancestor fast-path.
+        assert result == {
+            'status': 'already_merged',
+            'commit': FAKE_TIP,
+            'reason': '',
+            'conflict_details': '',
+            'push_status': None,
+        }, (
+            f"Expected already_merged via patch-id backstop, got: {result}"
+        )
+        assert mq.empty(), (
+            f"Expected empty queue (no enqueue on already_merged), qsize={mq.qsize()}"
+        )
+        assert EventType.merge_queued not in recording_event_store.events, (
+            f"Expected no merge_queued event, got: {recording_event_store.events}"
+        )
+        # is_ancestor missed (returned False), then the patch-id backstop fired
+        # exactly once with (resolved_tip, main_branch, git_ops_for_scan).
+        assert patch_calls == [(FAKE_TIP, 'main', git_ops_stub)], (
+            f"Expected patch_content_contained(FAKE_TIP, 'main', git_ops_stub) "
+            f"called once, got: {patch_calls}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Fast-path fall-through tests (suggestion 2 — test_coverage)
@@ -922,21 +1054,45 @@ class TestMergeRequestFastPathFallThrough:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
-    async def test_non_ancestor_tip_falls_through_to_enqueue(self, tmp_path: Path):
-        """resolve_branch_sha returns a SHA but is_ancestor returns False → enqueues.
+    async def test_non_ancestor_tip_falls_through_to_enqueue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """resolve_branch_sha returns a SHA but neither is_ancestor NOR the
+        patch-id backstop matches → enqueues.
 
-        When the branch exists but its tip is NOT yet an ancestor of main
-        (i.e. the branch has not been merged), is_ancestor returns False and
-        the fast-path condition is False, so the request proceeds to the normal
-        coalesce/enqueue path rather than returning already_merged.
+        When the branch exists but its tip is NOT an ancestor of main
+        (is_ancestor False) and its content is NOT patch-id-contained in main
+        (patch_content_contained False — genuinely unmerged), both fast-path
+        arms are False, so the request proceeds to the normal coalesce/enqueue
+        path rather than returning already_merged.
 
         A regression that skipped enqueue on any non-None tip would violate this.
+
+        patch_content_contained is monkeypatched to async False: the real
+        helper runs `git cherry` against git_ops.project_root, which the
+        SimpleNamespace stub lacks (would AttributeError), and False is the
+        semantically-correct value for a genuinely-unmerged branch anyway.
         """
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+
         FAKE_TIP = 'aabbccdd11223344'
         git_ops_stub, resolve_calls, ancestor_calls = self._make_git_ops_stub(
             tip_sha=FAKE_TIP, is_anc=False
         )
         harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        # Stub the patch-id backstop to False (branch genuinely not merged).
+        patch_calls: list[tuple] = []
+
+        async def _patch_content_contained(head, upstream, git_ops):
+            patch_calls.append((head, upstream, git_ops))
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -964,6 +1120,12 @@ class TestMergeRequestFastPathFallThrough:
             )
             assert ancestor_calls[0] == (FAKE_TIP, 'main'), (
                 f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
+            )
+            # patch-id backstop WAS called once after the is_ancestor miss,
+            # returned False, and the request still enqueued.
+            assert patch_calls == [(FAKE_TIP, 'main', git_ops_stub)], (
+                f"Expected patch_content_contained(FAKE_TIP, 'main', git_ops_stub) "
+                f"called once, got: {patch_calls}"
             )
         finally:
             task.cancel()
@@ -1684,10 +1846,19 @@ class TestMergeCancel:
         orch_config = _make_orch_config(tmp_path / 'repo')
         registry = _make_registry()
 
+        # ε: merge_cancel now retires-before-return, which yields the loop so the
+        # _waiters.pop done-callback fires during the FIRST cancel — the second
+        # cancel finds rec=None and must resolve via the durable tier.  Wire a
+        # real EventStore so _on_finalized's merge_finalized emit (fired during
+        # the retire yields) lets _durable_terminal_state Tier-3 report 'abandoned'.
+        from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
+        event_store = EventStore(db_path=tmp_path / 'dc-events.db', run_id='dc')
+
         server = create_server(
             esc_queue,
             merge_queue=mq,
             orch_config=orch_config,
+            event_store=event_store,
             merge_inflight_registry=registry,
         )
 
@@ -3266,7 +3437,7 @@ class TestMergeRequestTipRecency:
         )
 
     async def test_superset_tip_dispatches_not_coalesces(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """SUPERSET re-submission against in-flight slot → dispatched (not coalesced).
 
@@ -3276,6 +3447,7 @@ class TestMergeRequestTipRecency:
         RED until step-6: without classifier_git_ops wired the MCP path
         always coalesces → returns 'attached' instead of 'queued'.
         """
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
         )
@@ -3297,6 +3469,20 @@ class TestMergeRequestTipRecency:
 
         # Build git_ops stub: NEW_TIP is SUPERSET of OLD_TIP
         git_ops = self._make_tip_recency_git_ops(new_tip=NEW_TIP, old_tip=OLD_TIP)
+
+        # is_ancestor(new_tip, main) is stubbed False to reach the coalesce
+        # path; the task-2945 patch-id backstop then runs after that miss.  A
+        # SUPERSET carries genuinely novel content, so patch_content_contained
+        # is False — stub it (this SimpleNamespace git_ops' /fake/project has no
+        # real repo for `git cherry` to run against).
+        async def _patch_content_contained(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
 
         # Build server with the stub git_ops
         server, mq, _reg, _, _ = _build_merge_server(
@@ -3333,3 +3519,1116 @@ class TestMergeRequestTipRecency:
 
         # Clean up
         old_fut.cancel()
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestDuplicateInVerify — task 2927 step-7/8: C3 in-verify reject
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDuplicateInVerify:
+    """step-7 RED: the MCP-level structured duplicate_in_verify reject (PRD §5 D3).
+
+    A newer descendant SHA submitted while the branch's earlier SHA is IN VERIFY
+    (worker snapshot reports verify_started_at for the in-flight request_id) must
+    return the structured {error, code, existing_mr, existing_sha,
+    verify_age_secs, hint} envelope and leave the live in-flight entry
+    undisturbed.
+
+    RED until step-8 adds the ``if dispatch.rejected:`` branch to
+    server.merge_request: without it the rejected MergeDispatchResult falls
+    through to the dispatched path and returns status='queued' (no 'code' key).
+    """
+
+    def _make_verify_git_ops(
+        self, *, new_tip: str, old_tip: str, main_branch: str = 'main',
+    ) -> types.SimpleNamespace:
+        """git_ops stub: resolve_branch_sha→new_tip, SUPERSET classify, no disk wt."""
+        async def _resolve_branch_sha(branch: str) -> str | None:
+            return new_tip if branch == 'task/B' else None
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            if ancestor == new_tip and descendant == main_branch:
+                return False  # skip already_merged fast-path
+            return bool(ancestor == old_tip and descendant == new_tip)  # SUPERSET
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        return types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+            project_root='/fake/project',
+        )
+
+    async def test_newer_sha_in_verify_returns_structured_reject(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
+        )
+
+        OLD_TIP = 'aaaa0000deadbeef'
+        NEW_TIP = 'bbbb1111cafef00d'
+
+        registry = InFlightMergeRegistry()
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        ok = registry.acquire(
+            'B', 'task-old', old_fut, request_id='mr-old', snapshot_tip=OLD_TIP,
+        )
+        assert ok
+
+        # Worker snapshot reports mr-old IN VERIFY (verify_started_at set).
+        worker = _FakeMergeWorker()
+        worker.set_entries([{
+            'branch': 'B',
+            'request_id': 'mr-old',
+            'state': 'verifying',
+            'verify_started_at': 1000.0,
+            'verify_age_secs': 55.0,
+        }])
+
+        git_ops = self._make_verify_git_ops(new_tip=NEW_TIP, old_tip=OLD_TIP)
+
+        # is_ancestor(new_tip, main) is stubbed False to reach the coalesce/
+        # dispatch path; the task-2945 patch-id backstop then runs after that
+        # miss.  A newer descendant SHA carries genuinely novel content, so
+        # patch_content_contained is False — stub it (this SimpleNamespace
+        # git_ops' /fake/project has no real repo for `git cherry`).
+        async def _patch_content_contained(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
+        server, mq, _reg, _, _ = _build_merge_server(
+            tmp_path, registry=registry, git_ops=git_ops, worker=worker,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='task-new',
+                branch='B',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=0,
+            ),
+            timeout=5.0,
+        )
+
+        # Negative assertion: the reject must fire — a 'queued'/'attached'
+        # response (absence of the 'code' key) FAILS the test.
+        assert result.get('code') == 'duplicate_in_verify', (
+            f'expected a duplicate_in_verify reject; got {result}'
+        )
+        assert result.get('existing_mr') == 'mr-old'
+        assert result.get('existing_sha') == OLD_TIP
+        assert isinstance(result.get('verify_age_secs'), int)
+        assert result.get('hint') == 'merge_cancel then resubmit'
+        assert 'error' in result and result['error']
+
+        # Live verify entry UNDISTURBED — still in-flight, not cancelled, nothing enqueued.
+        entry = registry.entry('B')
+        assert entry is not None and entry.request_id == 'mr-old'
+        assert not old_fut.cancelled()
+        assert mq.empty()
+
+        old_fut.cancel()  # cleanup
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestRetentionParity — task 3021: thread retention= into
+# coalesce_or_enqueue_merge_request (Tier-2 TerminalOutcomeRetention parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestRetentionParity:
+    """The merge_request MCP path must populate the TerminalOutcomeRetention ring.
+
+    merge_request's coalesce_or_enqueue_merge_request call threads the
+    harness-mounted TerminalOutcomeRetention ring (harness._terminal_retention,
+    read via _get_terminal_retention) through to the dispatch and coalesce
+    arms, so:
+      - enqueue_merge_request's _on_finalized callback records a
+        TerminalOutcomeRecord for an MCP-dispatched merge once it finishes;
+      - the coalesce arm calls retention.record_alias for a coalesced
+        submission, so the coalesced request_id later resolves to the
+        primary's outcome;
+      - merge_status's Tier-2 read (_durable_terminal_state) can therefore
+        serve MCP-submitted merges even when every other tier misses.
+
+    All three tests below pin one invariant: there is no partial
+    implementation that satisfies one without the others, since a single
+    retention=... kwarg at the coalesce_or_enqueue_merge_request call site
+    is what makes all three true simultaneously.
+    """
+
+    async def test_dispatched_merge_records_terminal_outcome_in_ring(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeOutcome,
+            TerminalOutcomeRetention,
+        )
+
+        ring = TerminalOutcomeRetention()
+        server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-a',
+                branch='ret-a',
+                worktree=str(tmp_path / 'wt-ret-a'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result.get('status') == 'queued', f'Expected queued dispatch: {result}'
+        rid = result['request_id']
+
+        req = mq.get_nowait()
+        assert req.request_id == rid
+
+        req.result.set_result(MergeOutcome('done', merge_sha='ret-a-sha'))
+        await asyncio.sleep(0)  # let the _on_finalized done-callback run
+
+        rec = ring.get(rid)
+        assert rec is not None, (
+            f'Expected the retention ring to hold a terminal record for '
+            f'{rid!r} — the merge_request tool must thread retention=... '
+            'through to coalesce_or_enqueue_merge_request so the '
+            'enqueue_merge_request done-callback records it.'
+        )
+        assert rec.state == 'done', f'Expected state=done, got: {rec.state}'
+        assert rec.merge_sha == 'ret-a-sha', (
+            f'Expected merge_sha=ret-a-sha, got: {rec.merge_sha}'
+        )
+
+    async def test_coalesced_merge_registers_retention_alias(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeOutcome,
+            TerminalOutcomeRetention,
+        )
+
+        class _RecordingRetention(TerminalOutcomeRetention):
+            """Captures record_alias(alias, primary) args for assertion.
+
+            The 'attached' MCP response deliberately returns the PRIMARY
+            entry's request_id (server.py:1632-1634), so the coalesced
+            submission's own request_id is not observable from the tool
+            response — this subclass captures the record_alias args
+            instead of reaching into the ring's private _aliases state.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.alias_calls: list[tuple[str, str]] = []
+
+            def record_alias(self, alias_id: str, primary_request_id: str) -> None:
+                self.alias_calls.append((alias_id, primary_request_id))
+                super().record_alias(alias_id, primary_request_id)
+
+        ring = _RecordingRetention()
+        server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
+
+        result1 = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-b',
+                branch='ret-b',
+                worktree=str(tmp_path / 'wt-ret-b1'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result1.get('status') == 'queued', (
+            f'Expected first submission dispatched: {result1}'
+        )
+        primary_rid = result1['request_id']
+
+        result2 = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-b',
+                branch='ret-b',
+                worktree=str(tmp_path / 'wt-ret-b2'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result2.get('status') == 'attached', (
+            f'Expected second submission coalesced: {result2}'
+        )
+        # The 'attached' response's request_id IS the primary's id (D8) — the
+        # coalesced submission's own id is only observable via record_alias.
+        assert result2['request_id'] == primary_rid
+
+        assert len(ring.alias_calls) == 1, (
+            f'Expected exactly one record_alias call, got: {ring.alias_calls} — '
+            'the coalesce arm in coalesce_or_enqueue_merge_request only calls '
+            'retention.record_alias when retention is not None, which '
+            "requires merge_request's coalesce_or_enqueue_merge_request call "
+            'to pass retention=...'
+        )
+        coalesced_id, alias_primary = ring.alias_calls[0]
+        assert alias_primary == primary_rid, (
+            f'Expected the alias to point at the primary {primary_rid!r}, '
+            f'got: {alias_primary!r}'
+        )
+
+        # Resolve the PRIMARY's future for real, through the same production
+        # path as test_dispatched_merge_records_terminal_outcome_in_ring, so
+        # enqueue_merge_request's _on_finalized callback writes a genuine
+        # TerminalOutcomeRecord for primary_rid (only the first submission
+        # was ever enqueued — the coalesced one attached to it instead).
+        req = mq.get_nowait()
+        assert req.request_id == primary_rid
+        req.result.set_result(MergeOutcome('done', merge_sha='ret-b-sha'))
+        await asyncio.sleep(0)  # let the _on_finalized done-callback run
+
+        # The user-visible consequence: a caller polling merge_status with
+        # the COALESCED request_id (never itself enqueued) must resolve —
+        # via the record_alias entry asserted above — to the primary's real
+        # terminal outcome.
+        status = await asyncio.wait_for(
+            _call_merge_status(server, request_id=coalesced_id), timeout=2.0,
+        )
+        assert status.get('state') == 'done', (
+            f'Expected merge_status(request_id={coalesced_id!r}) to resolve '
+            f"'done' via the alias to primary {primary_rid!r}, got: {status}"
+        )
+
+    async def test_merge_status_resolves_mcp_submitted_merge_from_retention_tier(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeOutcome,
+            TerminalOutcomeRetention,
+        )
+
+        ring = TerminalOutcomeRetention()
+        # worker=None, event_store=None, git_ops=None (_build_merge_server's
+        # defaults) so Tier-1 (live snapshot), Tier-3 (event store), and
+        # Tier-3.5 (git authority) all miss — only Tier-2 (this ring) can
+        # possibly serve merge_status, making this the task's stated
+        # end-to-end consequence.
+        server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-c',
+                branch='ret-c',
+                worktree=str(tmp_path / 'wt-ret-c'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result.get('status') == 'queued', f'Expected queued dispatch: {result}'
+        rid = result['request_id']
+
+        req = mq.get_nowait()
+        req.result.set_result(MergeOutcome('done', merge_sha='ret-c-sha'))
+        await asyncio.sleep(0)
+
+        status = await asyncio.wait_for(
+            _call_merge_status(server, request_id=rid), timeout=2.0,
+        )
+        assert status.get('state') == 'done', (
+            "Expected merge_status to resolve 'done' from the retention "
+            f'tier (every other tier misses by construction), got: {status}'
+        )
+        assert status.get('outcome') == 'done', (
+            f'Expected outcome=done, got: {status}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestBoundary9CancelRetire — PRD §8 boundary #9 (task ε) step-5 RED / step-6 GREEN
+# ---------------------------------------------------------------------------
+
+
+class _B9GitOpsSpy:
+    """git_ops spy for the boundary #9 cancel-retire test.
+
+    Implements only the surface the merge_request dispatch + retirement touch:
+    ``resolve_branch_sha`` (fast-path tip), ``is_ancestor`` (always False so the
+    already_merged fast-path is skipped), ``find_inflight_merge_worktree``
+    (returns the planted path only WHILE it exists on disk, so a post-retire
+    re-scan finds nothing), and ``remove_merge_worktree_guarded`` (records the
+    call + reason and deletes the dir).
+    """
+
+    def __init__(self, branch: str, tip: str, scratch: Path) -> None:
+        self._branch_full = f'task/{branch}'
+        self._tip = tip
+        self._scratch = scratch
+        self.removed: list[tuple[Path, str]] = []
+        self.project_root = '/fake/project'
+
+    async def resolve_branch_sha(self, branch: str) -> str | None:
+        return self._tip if branch == self._branch_full else None
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:  # noqa: ARG002
+        return False  # never already-merged -> skip the fast-path
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+        if self._scratch.exists():
+            return self._scratch
+        return None
+
+    async def remove_merge_worktree_guarded(self, path: Path, *, reason: str) -> str:
+        self.removed.append((path, reason))
+        if path.exists():
+            shutil.rmtree(path)
+        return 'removed'
+
+
+@pytest.mark.asyncio
+class TestBoundary9CancelRetire:
+    """PRD §8 boundary #9 (task ε): merge_cancel FULLY RETIRES before returning.
+
+    A cancel on a live (in-verify) entry must, BEFORE returning, release the
+    branch slot, remove the in-flight worktree via the C1 primitive, and clear
+    the sticky retention result — so an IMMEDIATE resubmit (no intervening
+    awaited yields) gets a FRESH entry and never coalesces onto / observes the
+    cancelled corpse.
+
+    RED until step-6: today's merge_cancel returns before the async
+    done-callbacks release the slot / record 'abandoned', so the immediate
+    resubmit coalesces/attaches onto the still-held slot.
+    """
+
+    async def test_scenario_9_cancel_then_immediate_resubmit_fresh(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+        )
+
+        TIP = 'b9b9b9b9deadbeef'
+        # Planted AFTER the first dispatch (models the verify worktree the worker
+        # would create), so the first submit's disk-scan finds nothing.
+        wt_inflight = tmp_path / 'merge-b9'
+
+        registry = _make_registry()
+        retention = TerminalOutcomeRetention()
+        worker = _FakeMergeWorker()
+        spy = _B9GitOpsSpy('b9', TIP, wt_inflight)
+        event_store = EventStore(db_path=tmp_path / 'b9-events.db', run_id='b9')
+
+        server, mq, _reg, _es, _harness = _build_merge_server(
+            tmp_path,
+            worker=worker,
+            retention=retention,
+            event_store=event_store,
+            registry=registry,
+            git_ops=spy,
+        )
+
+        # Both submits drive is_ancestor->False (spy), so the task-2945 patch-id
+        # backstop runs after that miss.  Branch 'b9' is genuinely fresh content
+        # (cancel-then-resubmit), so patch_content_contained is False — stub it
+        # (the spy's /fake/project has no real repo for `git cherry` to run
+        # against; an unstubbed call raises WorktreeMissing).  Both submits must
+        # still fall through to a fresh dispatch (queued), never already_merged.
+        async def _patch_content_contained(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
+
+        # (1) First submit dispatches fresh (worktree not on disk yet) and
+        # acquires the 'b9' registry slot as rid_a.
+        result_a = await _call_merge_request(
+            server, task_id='b9', branch='b9',
+            worktree=str(tmp_path / 'wt-a'), wait_secs=0,
+        )
+        assert result_a['status'] == 'queued', f'first submit must be queued: {result_a}'
+        rid_a = result_a['request_id']
+        req_a = mq.get_nowait()  # drain: only the registry slot models in-flight now
+
+        # (2) Model the D3 in-verify precondition: plant the worktree, mark the
+        # slot verifying, report rid_a verifying in the worker snapshot, and seed
+        # the sticky per-task terminal result the retirement must clear.
+        wt_inflight.mkdir()
+        registry.set_verifying('b9')
+        worker.set_entries([{
+            'branch': 'b9', 'request_id': rid_a, 'state': 'verifying',
+            'verify_started_at': 1000.0, 'verify_age_secs': 42.0,
+        }])
+        retention.record(TerminalOutcomeRecord(
+            request_id=rid_a, branch='b9', task_id='b9', state='abandoned',
+        ))
+
+        # (3) Cancel rid_a — retirement must complete BEFORE the call returns.
+        cancel_result = await _call_merge_cancel(server, request_id=rid_a)
+        assert cancel_result.get('cancelled') is True, f'cancel must succeed: {cancel_result}'
+
+        # (i) slot released before return
+        entry = registry.entry('b9')
+        assert entry is None or entry.request_id != rid_a, (
+            f'slot must be released before merge_cancel returns: {entry!r}'
+        )
+        # (ii) sticky result cleared before return
+        assert retention.get_by_branch('b9') is None, 'sticky by-branch must be cleared'
+        assert retention.get_by_task('b9') is None, 'sticky by-task must be cleared'
+        # (iii) worktree reaped via the C1 primitive
+        assert (wt_inflight, 'merge_cancel_retire') in spy.removed, (
+            f'worktree must be reaped via C1 (reason=merge_cancel_retire): {spy.removed}'
+        )
+
+        # The verify was aborted by the cancel->worker seam; model the snapshot
+        # teardown so the immediate resubmit sees no stale in-flight snapshot entry.
+        worker.set_entries([])
+
+        # (4) IMMEDIATE resubmit — must dispatch a FRESH entry, not coalesce/attach.
+        result_b = await _call_merge_request(
+            server, task_id='b9', branch='b9',
+            worktree=str(tmp_path / 'wt-b'), wait_secs=0,
+        )
+        assert result_b['status'] == 'queued', (
+            f'resubmit must dispatch fresh, got: {result_b}'
+        )
+        assert result_b['request_id'] != rid_a, (
+            f'resubmit must get a FRESH request_id, not the cancelled one: {result_b}'
+        )
+
+        # Cleanup enqueued/cancelled futures.
+        req_a.result.cancel()
+        with contextlib.suppress(asyncio.QueueEmpty):
+            while True:
+                mq.get_nowait().result.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Task 3103 — the already_merged fast-path must decline a DEGENERATE branch
+# ---------------------------------------------------------------------------
+
+_DEGENERATE_TIP = 'a' * 40
+
+
+class _ExplodingMetadata:
+    """A task-metadata stand-in whose ``.get`` raises.
+
+    Models a malformed task record reaching the degeneracy probe: the server
+    reads ``task.get('metadata') or {}``, which passes any truthy non-dict
+    straight through to ``branch_is_degenerate``, where ``.get`` blows up
+    INSIDE the probe rather than inside ``_git_authority_task_metadata``'s
+    own handler.  That is the only way to reach merge_request's outer
+    fast-path ``except`` — see
+    ``test_probe_fault_inside_the_guard_preserves_the_fast_path``.
+    """
+
+    def get(self, *_args: object, **_kwargs: object) -> object:
+        raise RuntimeError('task store returned a malformed metadata record')
+
+
+async def _run_fast_path_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tip: str = _DEGENERATE_TIP,
+    is_ancestor_result: bool = True,
+    patch_contained: bool = False,
+    metadata: Any = None,
+    scheduler_raises: bool = False,
+    with_scheduler: bool = True,
+    worker_outcome: MergeOutcome | None = None,
+    task_id: str = '591',
+    branch: str = '591',
+    metadata_by_id: dict[str, Any] | None = None,
+    requested_ids: list[str] | None = None,
+) -> tuple[dict, asyncio.Queue, list]:
+    """Drive merge_request's submit-time fast path once.
+
+    Returns ``(result, mq, emitted_events)``.  A background worker resolves
+    the future so the fall-through path (no fast-path hit) terminates instead
+    of blocking, letting each test assert on the RESPONSE rather than on a
+    timeout.
+
+    ``worker_outcome`` is the ``MergeOutcome`` that fake worker delivers.  It
+    defaults to ``MergeOutcome('done', reason='test done')``, which is a
+    STAND-IN, not a claim about production: tests that assert on the
+    fall-through response must pass the outcome the real worker would produce
+    for their wiring, or they measure the fake instead of the code under test.
+    Tests that assert only on the fast path itself (which returns before any
+    worker runs) are unaffected by this value.
+
+    ``task_id`` / ``branch`` are the two independent merge_request parameters.
+    They default to the same value; pass differing ones (with
+    ``metadata_by_id``) to pin WHICH of them the degeneracy guard keys its
+    metadata lookup off.  ``requested_ids``, when supplied, is appended to
+    with every id ``scheduler.get_task`` is actually called with.
+    """
+    import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+    class _RecordingEventStore:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+            self.events.append(event_type)
+
+    recording_event_store = _RecordingEventStore()
+
+    async def _resolve_branch_sha(name: str) -> str:
+        return tip
+
+    async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+        return is_ancestor_result
+
+    async def _find_inflight_merge_worktree(branch: str):
+        return None
+
+    git_ops_stub = types.SimpleNamespace(
+        resolve_branch_sha=_resolve_branch_sha,
+        is_ancestor=_is_ancestor,
+        find_inflight_merge_worktree=_find_inflight_merge_worktree,
+    )
+    harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+    if with_scheduler:
+        async def _get_task(tid: str):
+            if requested_ids is not None:
+                requested_ids.append(tid)
+            if scheduler_raises:
+                raise RuntimeError('scheduler unreachable')
+            if metadata_by_id is not None:
+                return {'metadata': metadata_by_id.get(tid) or {}}
+            return {'metadata': metadata or {}}
+
+        harness_stub.scheduler = types.SimpleNamespace(get_task=_get_task)
+
+    async def _patch_content_contained(head, upstream, git_ops):
+        return patch_contained
+
+    monkeypatch.setattr(
+        orchestrator_merge_queue, 'patch_content_contained', _patch_content_contained,
+    )
+
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    mq: asyncio.Queue = asyncio.Queue()
+    server = create_server(
+        esc_queue,
+        merge_queue=mq,
+        orch_config=_make_orch_config(tmp_path / 'repo'),
+        event_store=recording_event_store,
+        harness=harness_stub,
+        merge_inflight_registry=_make_registry(),
+    )
+
+    async def _worker() -> None:
+        req = await mq.get()
+        req.result.set_result(
+            worker_outcome
+            if worker_outcome is not None
+            else MergeOutcome('done', reason='test done')
+        )
+        await mq.put(req)   # put it back so tests can assert the enqueue happened
+
+    worker_task = asyncio.create_task(_worker())
+    try:
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id=task_id,
+                branch=branch,
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=100,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+    return result, mq, recording_event_store.events
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDegenerateBranchFastPath:
+    """merge_request's already_merged fast-path must decline a zero-commit branch.
+
+    A degenerate branch is parked at an OLD main commit, so it IS an ancestor
+    of main — the fast-path's only guard — and answering
+    ``{status:'already_merged', commit:<that foreign SHA>}`` is a phantom done
+    on a WRITE path (the runbooks treat already_merged the same as done and
+    stamp done_provenance from ``result['commit']``).
+    """
+
+    async def test_degenerate_branch_does_not_short_circuit_as_already_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        result, mq, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+        )
+
+        # The guard controls SUBMIT-time behaviour only: the request is
+        # enqueued and audited instead of short-circuiting, and the parked
+        # foreign SHA never reaches the caller.  It does NOT control the final
+        # status — the worker still answers already_merged for this shape (its
+        # own ancestry short-circuit); see
+        # test_degenerate_branch_worker_path_answers_already_merged_with_no_commit.
+        assert not mq.empty(), 'Expected the request to be enqueued instead'
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+
+    async def test_degenerate_branch_also_skips_patch_id_backstop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The non-obvious case: the task-2945 backstop is vacuously True here.
+
+        ``patch_content_contained`` runs ``git cherry <main> <tip>`` and
+        returns True when no ``+`` lines appear — which for a ZERO-COMMIT
+        branch is true VACUOUSLY, because git emits nothing.  Gating only the
+        is_ancestor arm would leak the degenerate branch straight into the
+        backstop and still answer already_merged.  This test is the only
+        thing that catches that.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        result, mq, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+        )
+
+        # Submit-time facts only — the backstop was not consulted, so the
+        # request was enqueued and audited.  As above, the final status is the
+        # worker's to decide and remains a known residual.
+        assert not mq.empty(), 'Expected the request to be enqueued instead'
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+
+    async def test_degenerate_branch_worker_path_answers_already_merged_with_no_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The honest end-to-end pin: the worker STILL answers already_merged.
+
+        This is the REMAINING gap, not a guarantee this task closes.  Declining
+        the submit-time fast path only redirects a degenerate branch to the
+        worker, which reaches the same verdict by its own route:
+        ``_already_merged_is_genuine`` (merge_queue.py:5455) resolves
+        ``candidate_tip`` to the same parked base and returns True at its FIRST
+        ancestry check (merge_queue.py:5515 — the single fix point), so the
+        worker emits a terminal ``MergeOutcome('already_merged')``.  Follow-up:
+        tkt_0RSHM98C6F78MW4J0SK3S29YZG.
+
+        What this task's guard DOES buy, and what this test therefore pins:
+        the response no longer fabricates a ``commit`` (the parked foreign SHA
+        that skills/unblock/SKILL.md stamps verbatim into ``done_provenance``)
+        — it is None — and the submission leaves an auditable queue record (a
+        ``request_id`` plus a ``merge_queued`` event) instead of vanishing into
+        a silent submit-time short-circuit.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        result, _, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+            # Models merge_queue.py:5650 — the worker's terminal outcome for
+            # exactly this wiring (no merge_sha, hence commit=None).
+            worker_outcome=MergeOutcome('already_merged'),
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'The worker-side residual is already_merged, got: {result}'
+        )
+        assert result['commit'] is None, (
+            f'The worker path must not carry a fabricated commit SHA: {result}'
+        )
+        assert result['request_id'] is not None, (
+            f'The redirected submission must be an auditable queue record: {result}'
+        )
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event for the redirected request: {events}'
+        )
+
+    async def test_non_degenerate_ancestor_branch_still_already_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The task-1629 fast-path is preserved for a real merged branch."""
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': 'b' * 40},   # != tip → non-degenerate
+        )
+
+        assert result == {
+            'status': 'already_merged',
+            'commit': _DEGENERATE_TIP,
+            'reason': '',
+            'conflict_details': '',
+            'push_status': None,
+        }, f'Expected the unchanged already_merged shape, got: {result}'
+        assert mq.empty(), f'Expected no enqueue, qsize={mq.qsize()}'
+
+    async def test_rebased_branch_still_already_merged_via_patch_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The task-2945 backstop is preserved for a real rebased landing.
+
+        A rebased landing has commits beyond its base, so it is non-degenerate
+        by construction and the new guard never fires on it.
+        """
+        result, _, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'Rebased landing must still fast-path via patch-id, got: {result}'
+        )
+
+    async def test_scheduler_absent_preserves_legacy_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No .scheduler at all → metadata unavailable → guard skipped.
+
+        Pins the fail-soft direction, and guarantees the many existing
+        chokepoint tests whose harness stub is a bare
+        ``SimpleNamespace(git_ops=...)`` keep working.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True, with_scheduler=False,
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'A scheduler-less harness must keep the legacy fast-path: {result}'
+        )
+        assert mq.empty()
+
+    async def test_scheduler_get_task_raises_preserves_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A raising get_task degrades the guard, and merge_request does not raise.
+
+        NOTE this does NOT reach merge_request's own fast-path ``except``: the
+        RuntimeError is swallowed one level deeper, inside
+        ``_git_authority_task_metadata``'s handler, which returns ``{}`` — so
+        the probe then runs normally and reads "no degeneracy signal".  The
+        outer handler is covered by
+        ``test_probe_fault_inside_the_guard_preserves_the_fast_path`` below.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True, scheduler_raises=True,
+        )
+
+        assert isinstance(result, dict), 'merge_request must not raise'
+        assert result['status'] == 'already_merged', (
+            f'A scheduler fault must not break submission: {result}'
+        )
+        assert mq.empty()
+
+    async def test_probe_fault_inside_the_guard_preserves_the_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fault INSIDE branch_is_degenerate must not escape merge_request.
+
+        Unlike merge_status, merge_request has no enclosing fire-safe wrapper —
+        the fast path's own ``try/except`` is the only thing between a probe
+        fault and an exception propagating out of a WRITE-path MCP tool.  A
+        malformed metadata record is the reachable way to trigger it: the
+        server passes any truthy ``task['metadata']`` through verbatim, so a
+        non-dict raises on ``.get`` inside the probe, PAST
+        ``_git_authority_task_metadata``'s own handler.
+
+        Fail-soft direction: the fault degrades the guard (treat as
+        non-degenerate) and the legacy fast path answers, rather than the
+        submission blowing up.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata=_ExplodingMetadata(),
+        )
+
+        assert isinstance(result, dict), (
+            f'A probe fault must not propagate out of merge_request: {result!r}'
+        )
+        assert result['status'] == 'already_merged', (
+            f'A degraded guard must fall back to the legacy fast path: {result}'
+        )
+        assert mq.empty()
+
+    async def test_guard_keys_metadata_off_the_branch_not_the_task_id_param(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task_id and branch are independent params; the guard must use branch.
+
+        The tip the arms test is resolved from ``branch``, so the
+        ``branch_base_sha`` it is compared against has to come from the SAME
+        branch's task.  Keying off the caller-supplied ``task_id`` instead
+        would compare task X's recorded base against task Y's tip on any
+        mismatched submission and silently disable the guard.
+
+        Wiring: task '591' (the ``task_id`` param) is recorded NON-degenerate,
+        task '777' (the branch) IS degenerate.  Reading the wrong one lets the
+        fast path answer already_merged — so the enqueue is the behavioural
+        discriminator, not just the recorded lookup id.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        requested: list[str] = []
+        result, mq, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            task_id='591', branch='777',
+            metadata_by_id={
+                '591': {'branch_base_sha': 'b' * 40},          # non-degenerate
+                '777': {'branch_base_sha': _DEGENERATE_TIP},   # degenerate
+            },
+            requested_ids=requested,
+        )
+
+        assert requested == ['777'], (
+            f'The guard must look up the id derived from the branch, got: {requested}'
+        )
+        assert not mq.empty(), (
+            f'The branch is degenerate, so the fast path must decline: {result}'
+        )
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+
+    async def test_guard_probes_at_most_once_across_both_arms(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The probe is memoized, and is not paid when no arm hits.
+
+        The guard's only power is to SUPPRESS an already_merged return, so it
+        runs after an arm tests positive — never on the common
+        not-yet-merged submission, where it would add a scheduler round-trip
+        (a Taskmaster MCP dispatch with an internal timeout=15) to the submit
+        path for no possible effect.  When an arm does hit, the two arms share
+        one lookup.
+        """
+        # Neither arm hits → the probe must not run at all.
+        quiet: list[str] = []
+        await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=False,
+            metadata={'branch_base_sha': 'b' * 40}, requested_ids=quiet,
+        )
+        assert quiet == [], (
+            f'A plain not-yet-merged submission must not consult the task '
+            f'store at all, got: {quiet}'
+        )
+
+        # The patch-id arm hits (is_ancestor misses first) → exactly one lookup.
+        once: list[str] = []
+        await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP}, requested_ids=once,
+        )
+        assert once == ['591'], (
+            f'Both arms must share one memoized probe, got: {once}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestHonestResponseContract: the response reports OBSERVED state, not intent
+# (task 3236)
+# ---------------------------------------------------------------------------
+
+
+class _RaceQueue(EscalationQueue):
+    """An EscalationQueue where an external resolver wins the same-instant race.
+
+    ``submit()`` writes the record normally and then immediately dismisses it,
+    exactly as a concurrent level=0 dismissal sweep would.  The filing is
+    therefore already non-pending by the time the tool shapes its response —
+    the race the incident behind task 3236 exhibited.
+    """
+
+    def submit(self, escalation: Escalation) -> str:
+        esc_id = super().submit(escalation)
+        self.resolve(
+            esc_id,
+            'Auto-dismissed: stale L0 swept on requeue',
+            dismiss=True,
+            resolved_by='orchestrator-auto-dismiss',
+        )
+        return esc_id
+
+
+class TestHonestResponseContract:
+    """A filing that is not pending after the write must never report 'queued'.
+
+    ``dedupe.submit_or_dedupe`` returned a hardcoded ``{'status': 'queued'}``
+    with no re-read, so the response reported write INTENT rather than
+    observed post-write state.  When a concurrent sweep dismissed the record
+    in the same instant, the filer was told 'queued' for a record that was
+    already dismissed — it had no way to learn its escalation had been
+    swallowed.  The honest response is the shape ``escalate_blocker``'s own
+    docstring already promises: ``{id, status, resolution, resolved_by,
+    action}``.
+    """
+
+    # -- Vector (i): the existing terminal-task chokepoint -------------------
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_reports_resolved_not_queued(self, tmp_path: Path):
+        """CONTROL: the already-honest terminal-task path keeps its shape."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] != 'queued', f'Reported write intent: {result}'
+        for key in ('id', 'status', 'resolution', 'resolved_by', 'action'):
+            assert key in result, f'Missing {key!r} in documented shape: {result}'
+
+    # -- Vector (ii): the same-instant sweep race ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_swept_filing_reports_dismissed_not_queued(self, tmp_path: Path):
+        """A record dismissed in the same instant reports 'dismissed', not 'queued'."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        persisted = queue.get(result['id'])
+        assert persisted is not None
+        assert persisted.status == 'dismissed', 'test setup: record should be dismissed'
+        assert result['status'] == 'dismissed', (
+            f'Response reported write intent for a dismissed record: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_swept_filing_returns_documented_shape(self, tmp_path: Path):
+        """The swept response carries the documented {id, status, resolution, resolved_by, action}."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        for key in ('id', 'status', 'resolution', 'resolved_by', 'action'):
+            assert key in result, f'Missing {key!r} in: {result}'
+        assert result['resolution'] == 'Auto-dismissed: stale L0 swept on requeue'
+        assert result['resolved_by'] == 'orchestrator-auto-dismiss'
+        assert result['action'] == 'terminate_cleanly'
+
+    @pytest.mark.asyncio
+    async def test_swept_info_filing_also_reports_dismissed(self, tmp_path: Path):
+        """escalate_info shares the same submit path and gets the same honesty."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'dismissed', f'Reported write intent: {result}'
+        assert result['resolved_by'] == 'orchestrator-auto-dismiss'
+
+    @pytest.mark.asyncio
+    async def test_swept_born_at_l2_filing_reports_dismissed(self, tmp_path: Path):
+        """The born-at-L2 bypass branch does not route through dedupe — fix it too."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        assert result['status'] == 'dismissed', f'Reported write intent: {result}'
+        assert result['resolved_by'] == 'orchestrator-auto-dismiss'
+
+    # -- The response must echo the persisted level -------------------------
+
+    @pytest.mark.asyncio
+    async def test_queued_response_echoes_persisted_level0(self, tmp_path: Path):
+        """A normal queued filing echoes level=0 so the caller can verify it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued'
+        assert result.get('level') == 0, f"No persisted level echoed: {result}"
+
+    @pytest.mark.asyncio
+    async def test_queued_response_echoes_persisted_level1(self, tmp_path: Path):
+        """A level=1 re-escalation echoes level=1 — the caller can confirm it landed."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result.get('level') == 1, f"Requested level did not land: {result}"
+        esc = queue.get(result['id'])
+        assert esc is not None and esc.level == 1
+
+    @pytest.mark.asyncio
+    async def test_born_at_l2_response_echoes_persisted_level2(self, tmp_path: Path):
+        """The L2 bypass branch echoes the level actually stamped on disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        assert result.get('level') == 2, f"No persisted level echoed: {result}"
+
+    # -- Fail-open: a bookkeeping read must never lose a filing -------------
+
+    @pytest.mark.asyncio
+    async def test_unreadable_reread_falls_back_to_queued(self, tmp_path: Path):
+        """A re-read returning None falls back to 'queued' rather than raising."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert 'id' in result
+
+    @pytest.mark.asyncio
+    async def test_raising_reread_falls_back_to_queued(self, tmp_path: Path):
+        """A re-read that RAISES falls back to 'queued' and does not propagate."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        def _boom(escalation_id: str):
+            raise OSError('simulated unreadable escalation file')
+
+        queue.get = _boom  # type: ignore[method-assign]
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert 'id' in result

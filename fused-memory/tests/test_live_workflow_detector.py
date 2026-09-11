@@ -6,6 +6,7 @@ Step-3 adds the orchestrator_live signal, OR-aggregation, and the convenience wr
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -15,8 +16,15 @@ import pytest
 # RED in step-1: module does not exist yet; import will fail until step-2.
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
+    DEFAULT_HEARTBEAT_TTL,
+    DEFAULT_MAX_WORKTREE_AGE_HOURS,
     WorkflowLiveness,
+    _routing_decided_after_restart,
+    _task_in_scheduler_holders_or_parks,
+    corroboration_for_task,
     detect_live_workflow,
+    has_live_workflow_corroboration,
+    is_pure_gate_metadata,
     is_workflow_live_for_task,
 )
 
@@ -61,6 +69,52 @@ def _worktree_porcelain_prunable(branch: str, path: str = '/tmp/gone') -> str:
         'prunable gitdir file points to non-existent location\n'
         '\n'
     )
+
+
+def _git_side_effect(
+    *,
+    worktree_stdout: str,
+    log_rc: int = 0,
+    log_stdout: str = '',
+    log_raises: bool = False,
+    revlist_stdout: str = '3',
+    revlist_rc: int = 0,
+    revlist_raises: bool = False,
+):
+    """Build a three-way `subprocess.run` side_effect: porcelain / rev-list / git log.
+
+    Shared by the `worktree_stale` test classes (TestWorktreeStaleSignal,
+    TestWorktreeStaleBareBranchGuard, TestWorktreeStaleGate), which all drive
+    the same three git legs independently and previously each carried a
+    private ~30-line copy of this dispatch.
+
+    Returns ``(side_effect, calls)`` where ``calls`` is a dict mutated in
+    place with a ``'rev_list'`` counter incremented on every rev-list
+    invocation — used by tests pinning the memoization/deferred-call
+    invariants. Callers that don't need the counter unpack it as ``_``.
+    """
+    calls = {'rev_list': 0}
+
+    def side_effect(args, **kwargs):
+        if '--porcelain' in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=worktree_stdout, stderr='',
+            )
+        if 'rev-list' in args:
+            calls['rev_list'] += 1
+            if revlist_raises:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+            return subprocess.CompletedProcess(
+                args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr='',
+            )
+        # git log call
+        if log_raises:
+            raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+        return subprocess.CompletedProcess(
+            args=args, returncode=log_rc, stdout=log_stdout, stderr='',
+        )
+
+    return side_effect, calls
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +809,237 @@ class TestBlockedNormalOrchestratorSuppression:
 
 
 # ---------------------------------------------------------------------------
+# Pure-gate metadata classifier (task 3751)
+# ---------------------------------------------------------------------------
+
+
+class TestIsPureGateMetadata:
+    """is_pure_gate_metadata identifies the DeterministicRunner PURE-GATE shape.
+
+    A pure gate is `always_escalates` truthy AND `before_done` absent/falsy — the
+    same two metadata fields DeterministicRunner itself branches on. Its whole
+    execution is "file one born-at-L2 escalation, stamp metadata.gate_escalated_at,
+    set status blocked": no script, no systemd, no git_ops. A truthy `before_done`
+    DISQUALIFIES the shape because that path runs a blocking deploy/predicate
+    script while the task's status is still 'pending'.
+
+    Fail-safe direction: only POSITIVE evidence of the shape returns True. Any
+    non-Mapping input (None, a string, an int, a list) returns False, so an
+    absent/unparseable metadata blob leaves the task live.
+    """
+
+    def test_always_escalates_alone_is_a_pure_gate(self):
+        """`always_escalates` truthy with `before_done` absent entirely => True.
+
+        This is dark_factory task 3845's exact metadata shape (verified by a
+        direct get_task read): no `before_done` key at all.
+        """
+        assert is_pure_gate_metadata({'always_escalates': True}) is True
+
+    def test_explicit_none_before_done_is_a_pure_gate(self):
+        """An explicit `before_done: None` is equivalent to the key being absent."""
+        assert is_pure_gate_metadata({'always_escalates': True, 'before_done': None}) is True
+
+    def test_truthy_before_done_disqualifies(self):
+        """A before_done deploy/predicate task is NOT a pure gate.
+
+        `Harness._run_deterministic_slot` never flips the task to 'in-progress',
+        so such a task stays 'pending' for the entire duration of a blocking
+        script run — recon must not treat it as provably-idle.
+        """
+        metadata = {
+            'always_escalates': True,
+            'before_done': {'kind': 'predicate', 'script': 'x.sh'},
+        }
+        assert is_pure_gate_metadata(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'always_escalates': False},
+            {},
+            {'task_kind': 'deterministic'},
+        ],
+        ids=['always_escalates_false', 'empty', 'task_kind_only'],
+    )
+    def test_missing_or_falsy_always_escalates_is_not_a_pure_gate(self, metadata):
+        """Without truthy `always_escalates` there is no positive evidence of the shape."""
+        assert is_pure_gate_metadata(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [None, 'not-a-dict', 42, []],
+        ids=['none', 'str', 'int', 'list'],
+    )
+    def test_non_mapping_input_is_not_a_pure_gate(self, metadata):
+        """Fail-safe toward live: anything that is not a Mapping returns False."""
+        assert is_pure_gate_metadata(metadata) is False
+
+    def test_truthiness_not_identity(self):
+        """A truthy-but-not-`True` value still qualifies.
+
+        Task metadata round-trips through JSON, so the classifier must use
+        truthiness rather than `is True`.
+        """
+        assert is_pure_gate_metadata({'always_escalates': 'true'}) is True
+
+
+# ---------------------------------------------------------------------------
+# Pending-deterministic pure-gate orchestrator_live suppression (task 3751)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingDeterministicPureGateOrchestratorSuppression:
+    """detect_live_workflow(status='pending', task_kind='deterministic', pure_gate=True)
+    suppresses the project-wide orchestrator_live signal — rule 5, task 3751.
+
+    A PURE GATE (`always_escalates` truthy, `before_done` absent) never acquires a
+    worktree/branch and its whole DeterministicRunner run is "file escalation, stamp
+    gate_escalated_at, set blocked" — no script, no systemd, no git_ops. So the bare
+    project-wide orchestrator lock is not task-specific evidence for it while pending.
+
+    This is the direct sibling of TestBlockedDeterministicOrchestratorSuppression
+    (task 2067's blocked case) and is deliberately NARROWER than adding 'pending' to
+    ORCH_LIVE_INELIGIBLE_STATUSES: a pending deterministic task WITH `before_done`
+    may be mid-deploy inside DeterministicRunner (Harness._run_deterministic_slot
+    never flips it to 'in-progress'), and it has no git evidence to reveal that.
+    """
+
+    def _no_worktree_no_commit_side_effect(self):
+        """subprocess.run side_effect driving both git signals False."""
+        def side_effect(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+        return side_effect
+
+    def test_pending_deterministic_pure_gate_suppresses_orchestrator_signal(self, tmp_path):
+        """THE REGRESSION — status='pending' + deterministic + pure_gate forces
+        orchestrator_live False.
+
+        This is dark_factory task 3845's exact shape (verified first-hand:
+        `always_escalates=True` with no `before_done`), which stalled 3+ consecutive
+        reconciliation cycles showing ONLY the bare `orchestrator` signal. Both git
+        signals are False, so is_live=False proves the project-wide lock is not being
+        consulted at all for this combination.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.is_live is False
+
+    def test_pending_deterministic_without_pure_gate_preserves_signal(self, tmp_path):
+        """NARROWING — pure_gate=False keeps the orchestrator signal for a pending
+        deterministic task.
+
+        Such a task carries a `before_done` deploy/predicate and may be mid-run inside
+        DeterministicRunner with zero git evidence to reveal it; recon must not race it.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=False,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize('task_kind', ['normal', None], ids=['normal', 'absent'])
+    def test_non_deterministic_task_kind_preserves_signal(self, tmp_path, task_kind):
+        """task_kind guard — rule 5 requires task_kind == 'deterministic'.
+
+        An ordinary pending task is dispatch-eligible, so the project-wide lock stays
+        real evidence for it regardless of any pure_gate value.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind=task_kind, pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize('status', ['in-progress', 'review', 'merge-deferred'])
+    def test_non_pending_status_preserves_signal(self, tmp_path, status):
+        """status guard — only 'pending' joins 'blocked' for the deterministic rules."""
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status=status, task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_pure_gate_omitted_is_inert(self, tmp_path):
+        """DEFAULT INERTNESS — omitting pure_gate entirely preserves today's behavior.
+
+        Byte-for-byte backward compatibility for every existing caller that does not
+        pass the new kwarg.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_pure_gate_does_not_suppress_worktree_signal(self, tmp_path):
+        """PER-TASK EVIDENCE WINS — a pending pure gate with a REGISTERED worktree is
+        still live, even though the bare orchestrator signal is suppressed.
+
+        Mirrors task 2067's test_blocked_deterministic_does_not_suppress_worktree_signal.
+        This is also what satisfies the "never dispatched / no worktree ever created"
+        framing without needing a separate branch-absence condition.
+        """
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_with_branch(_BRANCH), stderr=''
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+    def test_is_workflow_live_for_task_forwards_pure_gate(self, tmp_path):
+        """is_workflow_live_for_task forwards pure_gate through **kwargs."""
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert live is False
+
+
+# ---------------------------------------------------------------------------
 # reify#5245 hardening: reaped-worktree / bare-branch / stranded-orchestrator
 # false-positive (task 2767)
 # ---------------------------------------------------------------------------
@@ -1040,3 +1325,897 @@ class TestBareStrandedOrchestratorSuppression:
 
         assert result.orchestrator_live is True
         assert result.is_live is True
+
+
+class TestWorktreeStaleSignal:
+    """detect_live_workflow.worktree_stale (task 3947) — a companion signal that
+    fires ONLY on positive evidence that a registered worktree's branch has
+    gone stale: no recent commit, and the branch's newest commit predates
+    `max_worktree_age_hours`. `worktree_registered` itself is never rewritten —
+    it keeps reporting exactly what `git worktree list --porcelain` says;
+    staleness is a separate, policy-thresholded judgement about the branch.
+    """
+
+    _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
+
+    def test_stale_fires_on_old_tip_with_registered_worktree(self, tmp_path):
+        """A 30-day-old tip on a registered worktree => worktree_stale True, with
+        the raw worktree_registered/recent_commit/last_commit_at signals
+        preserved (not rewritten by the new companion signal)."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is True
+        assert result.worktree_registered is True
+        assert result.recent_commit is False
+        assert result.last_commit_at is not None
+
+    def test_fresh_tip_not_stale(self, tmp_path):
+        """A 1-hour-old tip is well within any staleness window."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_tip_older_than_recent_commit_threshold_not_yet_stale(self, tmp_path):
+        """A 10-hour-old tip is older than the 6h recent-commit threshold (so
+        recent_commit is False) but far newer than the 168h staleness default —
+        the two thresholds are independent."""
+        ts = (self._NOW - timedelta(hours=10)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+        assert result.worktree_stale is False
+
+    def test_tip_exactly_at_threshold_not_stale(self, tmp_path):
+        """The comparison is strict (`>`), mirroring _check_recent_commit's `<=`
+        boundary: a tip exactly `max_worktree_age_hours` old is not yet
+        considered stale. Guards against an accidental flip to `>=`, which
+        the 10h/30d-only coverage elsewhere in this class would not catch."""
+        ts = (self._NOW - timedelta(hours=DEFAULT_MAX_WORKTREE_AGE_HOURS)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_no_worktree_registered_not_stale(self, tmp_path):
+        """Staleness is a statement ABOUT a registered worktree — with none
+        registered, worktree_stale is False regardless of tip age."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_no_branch(),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_prunable_worktree_not_stale(self, tmp_path):
+        """A prunable (reaped) worktree registration is already handled by task
+        2767's worktree_registered=False; it must not ALSO be double-reported
+        as stale."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_prunable(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_registered is False
+        assert result.worktree_stale is False
+
+    def test_threshold_disabled_via_none(self, tmp_path):
+        """max_worktree_age_hours=None is the explicit opt-out."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
+            )
+
+        assert result.worktree_stale is False
+
+    @pytest.mark.parametrize('threshold', [0, 0.0, -1.0])
+    def test_non_positive_threshold_is_inert(self, tmp_path, threshold):
+        """A non-positive threshold would mark every registered worktree stale
+        instantly; treat it as disabled — fail-safe toward live."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=threshold,
+            )
+
+        assert result.worktree_stale is False
+
+    @pytest.mark.parametrize(
+        'log_rc, log_stdout, log_raises',
+        [
+            (1, '', False),  # branch missing / git log error
+            (0, '', False),  # empty stdout
+            (0, 'not-a-timestamp', False),  # unparseable
+            (0, '', True),  # subprocess.TimeoutExpired
+        ],
+    )
+    def test_unknown_tip_age_never_stale(self, tmp_path, log_rc, log_stdout, log_raises):
+        """An unknown tip age (missing branch, empty/unparseable output, or a
+        raised TimeoutExpired) is never positive evidence of staleness."""
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=log_rc, log_stdout=log_stdout, log_raises=log_raises,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_default_field_value_on_plain_live_result(self, tmp_path):
+        """A plain live result (registered worktree, fresh tip) has
+        worktree_stale default False."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+
+class TestWorktreeStaleBareBranchGuard:
+    """worktree_stale additionally requires POSITIVE evidence that the branch
+    carries its own task work (task 3947).
+
+    `last_commit_at` is the branch TIP timestamp. For a bare branch (created
+    from `base_branch`, zero own commits) that tip IS the base-branch commit,
+    so its age describes `main`, not this worktree. In a low-traffic repo an
+    old `main` tip would make a just-created worktree look instantly stale.
+    Only `git rev-list --count <base>..<branch> > 0` proves the age belongs
+    to this task's own work.
+    """
+
+    _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
+
+    def test_bare_branch_not_stale(self, tmp_path):
+        """A branch with zero own commits: the ancient tip is the base commit,
+        not task work -- worktree_stale stays False even at a 30-day-old tip."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='0', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_branch_with_own_commits_is_stale(self, tmp_path):
+        """A branch with own commits beyond base_branch: the old tip is genuine
+        task-work evidence -- worktree_stale fires."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is True
+
+    @pytest.mark.parametrize(
+        'revlist_rc, revlist_stdout, revlist_raises',
+        [
+            (1, '', False),  # rev-list error
+            (0, 'not-a-number', False),  # unparseable
+            (0, '', True),  # subprocess.TimeoutExpired
+        ],
+    )
+    def test_unknown_own_commit_count_fails_safe(
+        self, tmp_path, revlist_rc, revlist_stdout, revlist_raises
+    ):
+        """An unknown own-commit count (`_branch_own_commit_count` returns
+        None) is never positive evidence of staleness."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+            revlist_rc=revlist_rc, revlist_stdout=revlist_stdout,
+            revlist_raises=revlist_raises,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_at_most_one_revlist_call(self, tmp_path):
+        """The own-commit-count confirmation is memoized: at most one rev-list
+        subprocess call per detect_live_workflow invocation, guarding against
+        the memo being dropped and a second subprocess call being added to
+        the recon fan-out path."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert calls['rev_list'] == 1
+
+    def test_revlist_skipped_when_threshold_disabled(self, tmp_path):
+        """The rev-list confirmation is deferred behind the cheap age test: with
+        max_worktree_age_hours=None disabling the check outright, rev-list is
+        never consulted at all -- even with a registered worktree and a
+        30-day tip that would otherwise be a stale candidate.
+
+        (Contrast: a FRESH 1-hour tip still triggers a rev-list call today,
+        via the pre-existing branch_bare short-circuit at lines 402-406 --
+        that call predates this task and is not exercised by this test.)
+        """
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
+            )
+
+        assert result.worktree_stale is False
+        assert calls['rev_list'] == 0
+
+    def test_branch_bare_rule_unaffected_by_new_revlist_call(self, tmp_path):
+        """A registered LIVE worktree pins branch_bare False via the
+        pre-existing short-circuit (lines 402-403) regardless of what the new
+        worktree_stale rev-list confirmation finds -- _orchestrator_signal_
+        ineligible's rule 4 (which requires `not worktree_registered`) stays
+        inert, so the orchestrator_live signal is reported honestly."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='0', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+
+
+# ---------------------------------------------------------------------------
+# Corroboration helpers (task 2963)
+# ---------------------------------------------------------------------------
+
+_CORROB_NOW = datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC)
+_CORROB_TASK_ID = '2763'
+
+
+def _routing_metadata(decided_at: str | None) -> dict:
+    """Build a task ``metadata`` dict with a valid ``routing.latest`` mirror.
+
+    Supplies all RoutingDecisionMirror-required fields so ``.latest`` is
+    non-None; ``decided_at`` is the only field the corroboration path reads.
+    """
+    return {
+        'routing': {
+            'latest': {
+                'role': 'implementer',
+                'model': 'claude',
+                'effort': 'high',
+                'budget_usd': 1.0,
+                'max_turns': 10,
+                'source_layer': 'default',
+                'decided_at': decided_at,
+            }
+        }
+    }
+
+
+class TestTaskInSchedulerHoldersOrParks:
+    """_task_in_scheduler_holders_or_parks: task_id in parks-keys OR holders-values."""
+
+    def test_true_when_task_id_is_parks_key(self):
+        state = {'parks': {_CORROB_TASK_ID: {'reason': 'x'}}, 'current_holders': {}}
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+
+    def test_true_when_task_id_is_current_holders_value(self):
+        # current_holders is {module: task_id}; the task_id is a VALUE, not a key.
+        state = {'parks': {}, 'current_holders': {'reconciliation': _CORROB_TASK_ID}}
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+
+    def test_false_when_in_neither(self):
+        state = {'parks': {'9999': {}}, 'current_holders': {'mod': '9999'}}
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is False
+
+    def test_no_raise_when_state_none(self):
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, None) is False
+
+    def test_no_raise_when_keys_missing(self):
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, {}) is False
+
+    def test_int_task_id_coerced_to_str(self):
+        # scheduler_state keys/values are strings (JSON); an int task_id still matches.
+        state = {'parks': {'2763': {}}, 'current_holders': {}}
+        assert _task_in_scheduler_holders_or_parks(2763, state) is True
+
+
+class TestRoutingDecidedAfterRestart:
+    """_routing_decided_after_restart: decided_at strictly newer than started."""
+
+    _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
+
+    def test_true_when_decided_after_started(self):
+        assert _routing_decided_after_restart('2026-07-23T11:00:00Z', self._STARTED) is True
+
+    def test_false_when_decided_before_started(self):
+        assert _routing_decided_after_restart('2026-07-23T09:00:00Z', self._STARTED) is False
+
+    def test_false_when_decided_equals_started(self):
+        assert _routing_decided_after_restart('2026-07-23T10:00:00Z', self._STARTED) is False
+
+    def test_false_when_decided_none(self):
+        assert _routing_decided_after_restart(None, self._STARTED) is False
+
+    def test_false_when_decided_unparseable(self):
+        assert _routing_decided_after_restart('not-a-time', self._STARTED) is False
+
+    def test_false_when_started_none(self):
+        # Cannot prove post-restart without a restart boundary.
+        assert _routing_decided_after_restart('2026-07-23T11:00:00Z', None) is False
+
+
+class TestHasLiveWorkflowCorroboration:
+    """has_live_workflow_corroboration: OR of the three per-task signals."""
+
+    _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
+
+    def test_true_when_claimant_live_short_circuits(self):
+        # Even with empty scheduler state and no routing, a live claimant suffices.
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=True,
+            scheduler_state=None,
+            routing_latest_decided_at=None,
+            orchestrator_started_at=None,
+        ) is True
+
+    def test_true_via_scheduler_only(self):
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=False,
+            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            routing_latest_decided_at=None,
+            orchestrator_started_at=None,
+        ) is True
+
+    def test_true_via_routing_only(self):
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=False,
+            scheduler_state=None,
+            routing_latest_decided_at='2026-07-23T11:00:00Z',
+            orchestrator_started_at=self._STARTED,
+        ) is True
+
+    def test_false_when_all_absent(self):
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=False,
+            scheduler_state={'parks': {}, 'current_holders': {}},
+            routing_latest_decided_at='2026-07-23T09:00:00Z',  # before started
+            orchestrator_started_at=self._STARTED,
+        ) is False
+
+
+class TestCorroborationForTask:
+    """corroboration_for_task: assembles the three signals from a task dict."""
+
+    _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
+
+    def test_default_heartbeat_ttl_is_ten_minutes(self):
+        assert timedelta(minutes=10) == DEFAULT_HEARTBEAT_TTL
+
+    def test_fresh_heartbeat_true(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/sess-1/pid=42',
+            'heartbeat_at': (_CORROB_NOW - timedelta(minutes=1)).isoformat(),
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is True
+
+    def test_stale_heartbeat_no_other_signal_false(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/sess-1/pid=42',
+            # 30 min old > 10 min ttl → stale → not a live claimant.
+            'heartbeat_at': (_CORROB_NOW - timedelta(minutes=30)).isoformat(),
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state={'parks': {}, 'current_holders': {}},
+            orchestrator_started_at=self._STARTED,
+        ) is False
+
+    def test_routing_after_started_true(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            # No fresh claimant.
+            'claimant_run_id': None,
+            'metadata': _routing_metadata('2026-07-23T11:00:00Z'),  # after started
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=self._STARTED,
+        ) is True
+
+    def test_routing_before_started_false(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': None,
+            'metadata': _routing_metadata('2026-07-23T09:00:00Z'),  # before started
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=self._STARTED,
+        ) is False
+
+    def test_missing_metadata_no_raise_relies_on_other_signals(self):
+        # No metadata, no claimant, but present in scheduler parks → True (no raise).
+        task = {'id': _CORROB_TASK_ID, 'status': 'in-progress', 'claimant_run_id': None}
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            orchestrator_started_at=self._STARTED,
+        ) is True
+
+    def test_empty_metadata_no_raise_all_absent_false(self):
+        task = {
+            'id': _CORROB_TASK_ID, 'status': 'in-progress',
+            'claimant_run_id': None, 'metadata': {},
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is False
+
+
+class TestCorroborationGate:
+    """detect_live_workflow's in-progress corroboration gate + the new
+    WorkflowLiveness.indeterminate field (task 2963)."""
+
+    _NOW = datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC)
+
+    def _side_effect(
+        self,
+        *,
+        worktree_branch: bool = True,
+        log_rc: int = 1,
+        log_stdout: str = '',
+        revlist_stdout: str = '1',
+        revlist_rc: int = 0,
+    ):
+        """Drive the three git subprocess signals independently.
+
+        ``worktree_branch``: whether the porcelain output lists ``task/<id>``
+        (a LIVE, non-prunable worktree). ``log_rc``/``log_stdout``: the git-log
+        recent-commit probe. ``revlist_stdout``: the branch's own-commit count
+        (``'1'`` = non-bare, keeps rule-4 inert so the orchestrator signal is
+        reported honestly).
+        """
+        worktree_stdout = (
+            _worktree_porcelain_with_branch(_BRANCH)
+            if worktree_branch
+            else _worktree_porcelain_no_branch()
+        )
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=worktree_stdout, stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=log_rc, stdout=log_stdout, stderr='',
+            )
+
+        return side_effect
+
+    def test_gate_fires_worktree_only_uncorroborated(self, tmp_path):
+        """in-progress, worktree-only (recent_commit False), corroborated=False
+        → is_live False, indeterminate True, raw signals preserved."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert result.worktree_registered is True  # raw detection preserved
+        assert result.recent_commit is False
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_gate_fires_orchestrator_only_uncorroborated(self, tmp_path):
+        """in-progress, orchestrator-lock-only (no worktree, non-bare branch),
+        corroborated=False → is_live False, indeterminate True, orchestrator
+        signal still reported honestly."""
+        side = self._side_effect(worktree_branch=False, log_rc=1, revlist_stdout='1')
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', _orchestrator_live=True, corroborated=False,
+            )
+        assert result.worktree_registered is False
+        assert result.orchestrator_live is True  # raw detection preserved
+        assert result.recent_commit is False
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_gate_inert_when_corroborated_true(self, tmp_path):
+        """corroborated=True keeps the task live (indeterminate False)."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=True,
+            )
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_gate_inert_when_corroborated_none_default(self, tmp_path):
+        """corroborated=None (default) is backward-compatible — existing behavior."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, status='in-progress',
+            )
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_recent_commit_exempt_from_gate(self, tmp_path):
+        """A recent commit is genuine per-task evidence — gate does not fire."""
+        recent_ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side = self._side_effect(
+            worktree_branch=False, log_rc=0, log_stdout=recent_ts, revlist_stdout='1',
+        )
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert result.recent_commit is True
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    @pytest.mark.parametrize('status', ['pending', 'review', 'merge-deferred'])
+    def test_gate_is_in_progress_only(self, tmp_path, status):
+        """Non-in-progress statuses are never gated, even worktree-only + corroborated=False."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status=status, corroborated=False,
+            )
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
+        """All signals False (nothing to downgrade) → is_live False AND indeterminate
+        False — distinct from the gated indeterminate case."""
+        side = self._side_effect(worktree_branch=False, log_rc=1, revlist_stdout='1')
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+        assert result.indeterminate is False
+
+    def test_is_workflow_live_for_task_forwards_corroborated(self, tmp_path):
+        """The convenience wrapper threads corroborated through **kwargs."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert live is False
+
+    def test_indeterminate_defaults_false_on_normal_live(self, tmp_path):
+        """A normal live result (no status/corroborated) has indeterminate False."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+
+class TestWorktreeStaleGate:
+    """detect_live_workflow's is_live downgrade gate for a stale worktree
+    registration (task 3947) -- the behaviour that actually closes the
+    reported gap: `worktree_registered` alone can never expire (only
+    `git worktree remove`/prune clears it), so a standing policy waiting for
+    it to resolve on its own could wait forever. `worktree_stale AND NOT
+    orchestrator_live AND corroborated is not True` closes that gap: a stale
+    registration downgrades `is_live` to False and flags `indeterminate`
+    True, exactly mirroring the task-2963 corroboration gate's semantics (a
+    signal existed but was not trustworthy evidence of liveness) -- the two
+    gates are ORed together and cannot conflict, since both produce
+    identical (is_live=False, indeterminate=True) output. The
+    `corroborated is not True` conjunct additionally guards against the
+    stale gate overriding a caller-supplied POSITIVE corroboration (see
+    test_corroborated_true_prevents_stale_downgrade below).
+    """
+
+    _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
+
+    def test_gate_fires_when_stale_is_sole_signal(self, tmp_path):
+        """A stale worktree with no live orchestrator downgrades is_live to
+        False and flags indeterminate True; the raw signals are preserved."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_registered is True
+        assert result.worktree_stale is True
+        assert result.recent_commit is False
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_live_orchestrator_lock_overrides_staleness(self, tmp_path):
+        """A stale worktree never overrides a live project-wide orchestrator
+        lock -- the signal is still reported honestly, but is_live stays
+        True and indeterminate stays False."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True,
+            )
+
+        assert result.worktree_stale is True
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_corroborated_true_prevents_stale_downgrade(self, tmp_path):
+        """A caller-supplied corroborated=True (fresh per-task evidence -- a
+        live claimant heartbeat, a scheduler holder/park, or a post-restart
+        routing decision) must not be overridden by branch age alone: the
+        stale gate honors the same 'any one fresh per-task signal keeps it
+        live' contract the 2963 gate already does. Without the
+        `corroborated is not True` conjunct this would incorrectly downgrade
+        a task an in-progress caller just vouched for."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=True,
+            )
+
+        assert result.worktree_stale is True
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_deferred_task_with_stale_worktree_finally_resolves(self, tmp_path):
+        """The know_live-598 deferral shape: a deferred task with a lingering
+        worktree registration and old commits under a (still-running) live
+        orchestrator. _orchestrator_signal_ineligible rule 1 zeroes
+        orchestrator_live for a deferred status, so the stale gate then
+        fires -- this is the exact gap the task closes. The companion
+        max_worktree_age_hours=None assertion shows the signal could never
+        resolve on its own without this task's threshold."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='deferred', _orchestrator_live=True,
+            )
+            result_disabled = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='deferred', _orchestrator_live=True, max_worktree_age_hours=None,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_stale is True
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+        assert result_disabled.is_live is True
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    def test_done_and_cancelled_tasks_with_stale_worktree_resolve(self, tmp_path, status):
+        """Rule 1 of _orchestrator_signal_ineligible covers deferred/done/
+        cancelled alike, and a lingering worktree on a done/cancelled task --
+        the most common lingering-registration shape after a merge -- is the
+        case whose is_live now flips from True to False for
+        recon_write_policy Gate 2. Mirrors
+        test_deferred_task_with_stale_worktree_finally_resolves for the
+        other two ineligible statuses."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status=status, _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_stale is True
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_fresh_worktree_stays_live(self, tmp_path):
+        """A 1-hour-old tip is well within any staleness window."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_tip_inside_staleness_window_stays_live(self, tmp_path):
+        """Regression guard: the 6h recent-commit threshold must not leak
+        into the 168h staleness threshold."""
+        ts = (self._NOW - timedelta(hours=10)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+        assert result.worktree_stale is False
+        assert result.is_live is True
+
+    def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
+        """Preserves the task-2963 semantic distinction between 'never had a
+        signal' and 'had a signal that was downgraded'."""
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_no_branch(),
+            log_rc=1, log_stdout='', revlist_stdout='1',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert result.indeterminate is False
+        assert result.worktree_stale is False
+
+    def test_coexists_with_corroboration_gate(self, tmp_path):
+        """Both gates agree on a stale, uncorroborated in-progress task --
+        ORing them together must not produce a contradiction."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_corroboration_gate_fires_without_staleness(self, tmp_path):
+        """Pins that the pre-existing task-2963 gate is untouched: with
+        staleness disabled and no tip at all, it alone still downgrades
+        is_live."""
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=1, log_stdout='',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False, max_worktree_age_hours=None,
+            )
+
+        assert result.is_live is False
+        assert result.indeterminate is True
+        assert result.worktree_stale is False
+
+    def test_wrapper_passthrough(self, tmp_path):
+        """The convenience wrapper threads max_worktree_age_hours through
+        **kwargs."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            live = is_workflow_live_for_task(_TASK_ID, str(tmp_path), now=self._NOW)
+            live_disabled = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
+            )
+
+        assert live is False
+        assert live_disabled is True
+
+    def test_stale_downgrade_logs_at_info(self, tmp_path, caplog):
+        """The stale gate firing is observable via logs (loud-over-silent-
+        degradation norm): every other fail-safe branch in this module logs
+        at debug, but this is the one path that flips a signal AGAINST
+        liveness, so an operator debugging why a task vanished from the
+        Live-Workflow Signals section has something to grep for."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = _git_side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with (
+            caplog.at_level(logging.INFO, logger='fused_memory.services.live_workflow_detector'),
+            patch('subprocess.run', side_effect=side_effect),
+        ):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert 'stale-worktree downgrade' in caplog.text

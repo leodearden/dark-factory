@@ -17,6 +17,24 @@
 // `const { computeTiers, partitionComponents, orderRows } = window.DF_GRAPH_LAYOUT;`
 // destructure. tab_tasks.jsx has no inline copy of any of these functions —
 // this module is their sole implementation.
+//
+// MODULE-UNIQUE TOP-LEVEL NAMES. Every classic (non-module) <script> tag on
+// index.html shares ONE global lexical scope for its top-level
+// `const`/`let`/`class` bindings. A name declared by two of them kills the
+// SECOND script to declare it — "Identifier 'X' has already been declared",
+// thrown at declaration-instantiation time, before a single statement of its
+// body runs, so its trailing `window.DF_* = ...` assignment never happens and
+// its consumers' top-level destructures silently get `undefined`. This file's
+// export const is therefore GRAPH_LAYOUT_API, matching DF_DATA_LOADER_API /
+// PRD_GROUPING_API / RUNTIME_FORMAT_API / ORCH_FILTER_API / ESC_FLOW_LAYOUT_API.
+// The rule is stated here specifically because this file is the boilerplate
+// the other classic scripts were copied from: it once exported a bare `API`,
+// esc_flow_layout.js was written "mirroring graph_layout.js" and copied it,
+// and the resulting collision silently broke the escalation-analytics
+// Workflow panel. Enforced by dashboard/tests/js/classic_script_scope.test.mjs,
+// which loads every classic script into one shared node:vm context and asserts
+// none throws, each sets its window.DF_* global, and no bare `API` binding
+// exists afterwards.
 
 // ── Compute dep tiers for a task list (Kahn's algorithm style; tier = max(deps' tier)+1) ──
 function computeTiers(tasks) {
@@ -365,11 +383,13 @@ function focusSubset(tasks, selectedId) {
   return tasks.filter(t => nb.has(t.id));
 }
 
-const API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset };
+// Named GRAPH_LAYOUT_API, never a bare `API` — see the module-unique-const
+// convention in this file's header comment.
+const GRAPH_LAYOUT_API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset };
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = API;
+  module.exports = GRAPH_LAYOUT_API;
 }
 if (typeof window !== 'undefined') {
-  window.DF_GRAPH_LAYOUT = API;
+  window.DF_GRAPH_LAYOUT = GRAPH_LAYOUT_API;
 }

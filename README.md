@@ -132,7 +132,7 @@ graphiti/, mem0/     # git submodules (upstream Graphiti, Mem0)
 | `docs/task-authoring.md` | Task metadata: cross-project deps, delivered-check gates, deterministic tasks, milestones, model pins |
 | `DESIGN.md` | Fused Memory system design — Graphiti + Mem0 dual-store, write routing, category taxonomy |
 | `RECONCILIATION_PLAN.md` | Three-stage sleep-mode reconciliation between memory and tasks |
-| `docs/legibility/design-invariants.md` | Five checkable design invariants gating `/prd` decompose and `/review` phase 2 |
+| `docs/legibility/design-invariants.md` | Checkable design invariants gating `/prd` decompose and `/review` phase 2 |
 
 ## Status & known limitations
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import logging
 import os
 import sys
 import types
@@ -40,6 +42,8 @@ _mod = _load_module()
 parse_since = _mod.parse_since
 find_spurious_since = _mod.find_spurious_since
 format_summary = _mod.format_summary
+gating_offenders = _mod.gating_offenders
+classify_sub_patterns = _mod.classify_sub_patterns
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +61,37 @@ def _report(tasks: list[dict], ref: str = 'main') -> dict:
 
 def _task(task_id: str, updated_at: str) -> dict:
     return {'id': task_id, 'updatedAt': updated_at}
+
+
+def _stamped_task(
+    task_id: str,
+    updated_at: str,
+    stamped_at: str | None,
+    *,
+    commit: str = 'a' * 40,
+    as_json: bool = False,
+) -> dict:
+    """A raw task dict carrying a found_on_main done_provenance blob.
+
+    ``stamped_at=None`` models a legacy (pre-3576) stamp: the key is absent
+    from the blob entirely, which is the load-bearing "predates the field"
+    signal. ``as_json`` renders metadata as a JSON string rather than a
+    dict — both shapes reach this code in practice and parse_metadata
+    accepts either.
+    """
+    provenance: dict = {
+        'kind': 'found_on_main',
+        'commit': commit,
+        'note': f'sibling landed this for {task_id}',
+    }
+    if stamped_at is not None:
+        provenance['stamped_at'] = stamped_at
+    metadata: dict = {'done_provenance': provenance}
+    return {
+        'id': task_id,
+        'updatedAt': updated_at,
+        'metadata': json.dumps(metadata) if as_json else metadata,
+    }
 
 
 SINCE = datetime(2026, 7, 16, 0, 0, 0, tzinfo=UTC)
@@ -169,6 +204,327 @@ class TestFindSpuriousSince:
         assert [o['task_id'] for o in offenders] == ['3']
 
 
+class TestFreshnessKeyedOffStampedAt:
+    """Freshness comes from ``done_provenance.stamped_at`` when present.
+
+    This is the whole point of task 3576: ``updatedAt`` is bumped by ANY
+    write to the task, so an old stamp touched later for an unrelated
+    reason (a re-tag, the audit's own --apply annotation, a dependency
+    edit) re-enters the window forever — the mechanical loop that keeps the
+    2683 soak gate at EXIT 1 on every re-run.
+    """
+
+    def test_old_stamp_touched_after_since_is_excluded(self):
+        # THE regression this task exists to kill: updatedAt says "fresh",
+        # stamped_at says the attribution was asserted months ago.
+        report = _report([_detail('300', 'misattributed')])
+        tasks = [_stamped_task('300', AFTER_SINCE, BEFORE_SINCE)]
+        assert find_spurious_since(report, tasks, SINCE) == []
+
+    def test_fresh_stamp_on_otherwise_untouched_task_is_included(self):
+        # The converse: the stamp itself is new even though updatedAt
+        # (whatever bumped it) reads as older.
+        report = _report([_detail('301', 'misattributed')])
+        tasks = [_stamped_task('301', BEFORE_SINCE, AFTER_SINCE)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['301']
+
+    def test_legacy_blob_without_stamped_at_falls_back_to_updated_at(self):
+        # Back-compat: ~193 historical stamps carry no stamped_at at all.
+        report = _report([_detail('302', 'misattributed')])
+        tasks = [_stamped_task('302', AFTER_SINCE, None)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['302']
+
+    def test_unparseable_stamped_at_falls_back_to_updated_at(self):
+        # The never-raises contract: a corrupt stamp degrades to the old
+        # behaviour rather than blowing up the predicate. It is classed
+        # 'corrupt', NOT 'legacy' — see TestCorruptStampedAtStillGates.
+        report = _report([_detail('303', 'misattributed')])
+        tasks = [_stamped_task('303', AFTER_SINCE, 'not-a-timestamp')]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['303']
+        assert offenders[0]['stamp_class'] == 'corrupt'
+
+    def test_unparseable_stamped_at_with_old_updated_at_still_excluded(self):
+        report = _report([_detail('304', 'misattributed')])
+        tasks = [_stamped_task('304', BEFORE_SINCE, 'not-a-timestamp')]
+        assert find_spurious_since(report, tasks, SINCE) == []
+
+    def test_metadata_as_json_string_is_handled(self):
+        # get_tasks() hands back metadata as a JSON string in some paths;
+        # parse_metadata accepts both shapes and so must this.
+        report = _report([_detail('305', 'misattributed')])
+        tasks = [_stamped_task('305', AFTER_SINCE, BEFORE_SINCE, as_json=True)]
+        assert find_spurious_since(report, tasks, SINCE) == []
+
+    def test_malformed_metadata_does_not_raise(self):
+        report = _report([_detail('306', 'misattributed')])
+        tasks = [{'id': '306', 'updatedAt': AFTER_SINCE, 'metadata': '{not json'}]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['306']
+
+    def test_stamped_at_exactly_at_since_is_excluded(self):
+        # Strictly-after semantics, matching the existing updatedAt path.
+        report = _report([_detail('307', 'misattributed')])
+        tasks = [_stamped_task('307', AFTER_SINCE, '2026-07-16T00:00:00Z')]
+        assert find_spurious_since(report, tasks, SINCE) == []
+
+
+class TestStampClassAndGatingOffenders:
+    """The fresh/legacy split, and what it gates.
+
+    Legacy offenders are still RETURNED (and still printed) — only the
+    exit-code gate is narrowed to fresh ones. Dropping them outright would
+    make the gate structurally blind to any future write path that bypasses
+    _validate_done_provenance: an unstamped-but-new blob would be classed
+    legacy and never gate, silently.
+    """
+
+    def test_stamp_class_fresh_when_keyed_off_stamped_at(self):
+        report = _report([_detail('400', 'misattributed')])
+        tasks = [_stamped_task('400', BEFORE_SINCE, AFTER_SINCE)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['fresh']
+
+    def test_stamp_class_legacy_when_fell_back_to_updated_at(self):
+        report = _report([_detail('401', 'misattributed')])
+        tasks = [_stamped_task('401', AFTER_SINCE, None)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['legacy']
+
+    def test_stamp_class_legacy_for_task_with_no_metadata_at_all(self):
+        report = _report([_detail('402', 'misattributed')])
+        tasks = [_task('402', AFTER_SINCE)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['legacy']
+
+    def test_every_record_carries_a_stamp_class(self):
+        report = _report([
+            _detail('403', 'misattributed'),
+            _detail('404', 'deliverable_absent'),
+        ])
+        tasks = [
+            _stamped_task('403', BEFORE_SINCE, AFTER_SINCE),
+            _stamped_task('404', AFTER_SINCE, None),
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert len(offenders) == 2
+        assert all('stamp_class' in o for o in offenders)
+
+    def test_gating_offenders_keeps_only_fresh(self):
+        report = _report([
+            _detail('405', 'misattributed'),
+            _detail('406', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('405', BEFORE_SINCE, AFTER_SINCE),  # fresh
+            _stamped_task('406', AFTER_SINCE, None),          # legacy
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['405', '406']
+        assert [o['task_id'] for o in gating_offenders(offenders)] == ['405']
+
+    def test_all_legacy_backlog_yields_empty_gating_list_but_is_still_reported(self):
+        # The 13 known offenders, modelled: every one legacy, every one
+        # still returned by find_spurious_since so it stays printable.
+        report = _report([_detail(str(500 + i), 'misattributed') for i in range(13)])
+        tasks = [_stamped_task(str(500 + i), AFTER_SINCE, None) for i in range(13)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert len(offenders) == 13
+        assert gating_offenders(offenders) == []
+
+    def test_gating_offenders_on_empty_list(self):
+        assert gating_offenders([]) == []
+
+    def test_gating_offenders_preserves_sort_order(self):
+        report = _report([
+            _detail('200', 'misattributed'),
+            _detail('50', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('200', BEFORE_SINCE, AFTER_SINCE),
+            _stamped_task('50', BEFORE_SINCE, AFTER_SINCE),
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in gating_offenders(offenders)] == ['50', '200']
+
+    def test_gating_offenders_does_not_mutate_input(self):
+        report = _report([_detail('407', 'misattributed')])
+        tasks = [_stamped_task('407', AFTER_SINCE, None)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        gating_offenders(offenders)
+        assert len(offenders) == 1, 'the helper must be a pure filter'
+
+
+class TestCorruptStampedAtStillGates:
+    """ABSENT and PRESENT-BUT-UNPARSEABLE are different signals.
+
+    The soundness argument for not gating a `legacy` record is specifically
+    "ABSENCE of stamped_at proves the stamp predates task 3576, because
+    every write through the server chokepoint since then populates it".
+    That argument does not cover a stamp that is PRESENT but corrupt: such
+    a blob provably came from a post-3576 write and only its freshness is
+    unreadable. Collapsing it into `legacy` would be a silent fail-open in
+    exactly the direction this predicate exists to catch.
+    """
+
+    def test_corrupt_stamp_is_classed_corrupt_not_legacy(self):
+        report = _report([_detail('420', 'misattributed')])
+        tasks = [_stamped_task('420', AFTER_SINCE, 'not-a-timestamp')]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['corrupt']
+
+    def test_absent_stamp_is_classed_legacy_not_corrupt(self):
+        # The contrasting branch, pinned alongside so the two can never
+        # silently converge again.
+        report = _report([_detail('421', 'misattributed')])
+        tasks = [_stamped_task('421', AFTER_SINCE, None)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['legacy']
+
+    def test_corrupt_stamp_gates(self):
+        report = _report([_detail('422', 'misattributed')])
+        tasks = [_stamped_task('422', AFTER_SINCE, 'not-a-timestamp')]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in gating_offenders(offenders)] == ['422']
+
+    def test_corrupt_stamp_is_logged_not_silently_demoted(self, caplog):
+        # Loud over silent: the degradation must be visible in the log.
+        report = _report([_detail('423', 'misattributed')])
+        tasks = [_stamped_task('423', AFTER_SINCE, 'not-a-timestamp')]
+        with caplog.at_level(logging.WARNING):
+            find_spurious_since(report, tasks, SINCE)
+        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        matching = [m for m in warnings if 'stamped_at' in m]
+        assert matching, f'expected a corrupt-stamp warning, got: {warnings}'
+        assert '423' in matching[0], 'warning must name the task id'
+
+    def test_corrupt_stamp_warns_even_when_timing_excludes_the_record(self, caplog):
+        # The warning fires at detection, BEFORE the since-filter, so a
+        # corrupt stamp on an otherwise-stale task is still surfaced rather
+        # than swallowed by the timing exclusion.
+        report = _report([_detail('424', 'misattributed')])
+        tasks = [_stamped_task('424', BEFORE_SINCE, 'not-a-timestamp')]
+        with caplog.at_level(logging.WARNING):
+            offenders = find_spurious_since(report, tasks, SINCE)
+        assert offenders == []
+        assert [r for r in caplog.records if 'stamped_at' in r.message]
+
+    def test_absent_stamp_does_not_warn(self, caplog):
+        # The ordinary legacy-backlog path (193 historical stamps) stays
+        # quiet — otherwise the warning would be pure noise.
+        report = _report([_detail('425', 'misattributed')])
+        tasks = [_stamped_task('425', AFTER_SINCE, None)]
+        with caplog.at_level(logging.WARNING):
+            find_spurious_since(report, tasks, SINCE)
+        assert not [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'stamped_at' in r.message
+        ]
+
+    def test_mixed_legacy_and_corrupt_gates_only_the_corrupt_one(self):
+        report = _report([
+            _detail('426', 'misattributed'),
+            _detail('427', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('426', AFTER_SINCE, None),               # legacy
+            _stamped_task('427', AFTER_SINCE, 'not-a-timestamp'),  # corrupt
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['426', '427']
+        assert [o['task_id'] for o in gating_offenders(offenders)] == ['427']
+
+
+class TestSubPatternClassification:
+    """Commit fan-out separates the two structurally distinct failure classes.
+
+    Recon found 13 offenders splitting into two sub-patterns: 8 where
+    several unrelated tasks all cite ONE bare 'Merge task/X into main'
+    commit (spurious sharing), and 5 where one task cites one named
+    sibling's commit (legitimate attribution). A timestamp cannot tell
+    these apart — they differ in citation SHAPE, not in time; two stamps
+    written in the same second can be one legitimate and one spurious.
+    Fan-out measures exactly the difference. So stamped_at does freshness
+    (which gates) and fan-out does the A/B split (which reports) — the two
+    signals are orthogonal and both are delivered.
+
+    Naming: the fan-out-1 bucket is `sole_citer`, not `named_sibling`.
+    Fan-out of 1 measures "no other audited task cites this commit" — it
+    does NOT establish legitimacy (a lone task citing a bare merge commit
+    lands here too), and the label is operator-facing on the stdout triage
+    line. Fan-out >= 2 keeps `shared_bare_merge`: sharing IS positive
+    evidence, since one commit cannot be several unrelated tasks'
+    deliverable.
+    """
+
+    SHARED = 'e' * 40
+    SOLO = 'f' * 40
+
+    def test_commit_cited_by_two_tasks_is_shared_bare_merge(self):
+        report = _report([
+            _detail('600', 'misattributed', commit=self.SHARED),
+            _detail('601', 'misattributed', commit=self.SHARED),
+        ])
+        assert classify_sub_patterns(report) == {self.SHARED: 'shared_bare_merge'}
+
+    def test_commit_cited_by_one_task_is_sole_citer(self):
+        report = _report([_detail('602', 'misattributed', commit=self.SOLO)])
+        assert classify_sub_patterns(report) == {self.SOLO: 'sole_citer'}
+
+    def test_fanout_one_label_does_not_claim_legitimacy(self):
+        # Regression guard on the naming itself: a lone task citing a bare
+        # merge commit is 'not shared', not 'known good'. The label must
+        # describe the measurement, never assert a verdict an operator
+        # would read off the triage line.
+        report = _report([_detail('610', 'misattributed', commit=self.SOLO)])
+        assert classify_sub_patterns(report)[self.SOLO] == 'sole_citer'
+        assert 'sibling' not in classify_sub_patterns(report)[self.SOLO]
+
+    def test_fanout_counts_distinct_task_ids_not_repeated_entries(self):
+        # The same task appearing twice is fan-out of 1, not 2.
+        report = _report([
+            _detail('603', 'misattributed', commit=self.SHARED),
+            _detail('603', 'deliverable_absent', commit=self.SHARED),
+        ])
+        assert classify_sub_patterns(report) == {self.SHARED: 'sole_citer'}
+
+    def test_fanout_computed_over_full_report_not_just_flagged_subset(self):
+        # A spurious task sharing a commit with an `ok` task is STILL
+        # shared_bare_merge — the sharing is the signal, regardless of the
+        # sibling's verdict. Computing fan-out over only the flagged subset
+        # would misclassify this as sole_citer.
+        report = _report([
+            _detail('604', 'misattributed', commit=self.SHARED),
+            _detail('605', 'ok', commit=self.SHARED),
+        ])
+        assert classify_sub_patterns(report)[self.SHARED] == 'shared_bare_merge'
+
+    def test_offender_records_carry_sub_pattern(self):
+        report = _report([
+            _detail('606', 'misattributed', commit=self.SHARED),
+            _detail('607', 'ok', commit=self.SHARED),
+            _detail('608', 'misattributed', commit=self.SOLO),
+        ])
+        tasks = [
+            _stamped_task('606', AFTER_SINCE, None, commit=self.SHARED),
+            _stamped_task('607', AFTER_SINCE, None, commit=self.SHARED),
+            _stamped_task('608', AFTER_SINCE, None, commit=self.SOLO),
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        by_id = {o['task_id']: o for o in offenders}
+        assert by_id['606']['sub_pattern'] == 'shared_bare_merge'
+        assert by_id['608']['sub_pattern'] == 'sole_citer'
+
+    def test_empty_report_classifies_to_empty_mapping(self):
+        assert classify_sub_patterns(_report([])) == {}
+
+    def test_detail_without_commit_is_skipped(self):
+        report = _report([{'task_id': '609', 'verdict': 'misattributed', 'reasons': []}])
+        assert classify_sub_patterns(report) == {}
+
+
 # ===========================================================================
 # format_summary — one line per offender
 # ===========================================================================
@@ -186,6 +542,26 @@ class TestFormatSummary:
         assert 'task_id=3' in lines[0]
         assert f'commit={"c" * 40}' in lines[0]
         assert 'flag_class=misattributed' in lines[0]
+
+    def test_line_carries_stamp_class_and_sub_pattern(self):
+        offenders = [{
+            'task_id': '3',
+            'commit': 'c' * 40,
+            'verdict': 'misattributed',
+            'stamp_class': 'legacy',
+            'sub_pattern': 'shared_bare_merge',
+        }]
+        lines = format_summary(offenders)
+        assert 'stamp_class=legacy' in lines[0]
+        assert 'sub_pattern=shared_bare_merge' in lines[0]
+        # Existing fields and their order are preserved.
+        assert lines[0].startswith(f'task_id=3 commit={"c" * 40} flag_class=misattributed')
+
+    def test_missing_annotations_render_without_raising(self):
+        # format_summary is triage output, never a source of exceptions.
+        lines = format_summary([{'task_id': '4', 'commit': None, 'verdict': 'misattributed'}])
+        assert len(lines) == 1
+        assert 'task_id=4' in lines[0]
 
 
 # ===========================================================================
@@ -298,7 +674,12 @@ class TestRunCliWiring:
         self, monkeypatch, capsys,
     ):
         report = _report([_detail('8888', 'misattributed', commit='d' * 40)])
-        tasks = [_task('8888', AFTER_SINCE)]  # stamp is fresh
+        # Stamp is fresh. Post-3576 that must be asserted with an actual
+        # stamped_at: a task carrying no done_provenance blob is `legacy`
+        # by construction (absence == predates the field), and legacy
+        # records report without gating — so a bare `_task` here would no
+        # longer be testing the exit-1 path it names.
+        tasks = [_stamped_task('8888', AFTER_SINCE, AFTER_SINCE, commit='d' * 40)]
         _install_fake_audit_module(monkeypatch, report)
         monkeypatch.setattr(
             'fused_memory.config.schema.FusedMemoryConfig',
@@ -323,6 +704,218 @@ class TestRunCliWiring:
         assert 'task_id=8888' in captured.out
         assert f'commit={"d" * 40}' in captured.out
         assert 'flag_class=misattributed' in captured.out
+
+    async def test_exit_zero_when_only_legacy_offenders_despite_fresh_updated_at(
+        self, monkeypatch, capsys,
+    ):
+        """THE task-2683 regression: a backlog of legacy stamps whose
+        updatedAt keeps getting bumped must stop forcing EXIT 1 forever.
+
+        Exit 0 here means "the freshness window no longer re-admits legacy
+        rows", NOT "the backlog was corrected" — which is why every one of
+        them is still printed.
+        """
+        report = _report([_detail(str(700 + i), 'misattributed') for i in range(3)])
+        tasks = [_stamped_task(str(700 + i), AFTER_SINCE, None) for i in range(3)]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 0
+        # Loud, not silent: every legacy offender is still on stdout with
+        # its class, so an operator sees the backlog in the log.
+        captured = capsys.readouterr()
+        for i in range(3):
+            assert f'task_id={700 + i}' in captured.out
+        assert captured.out.count('stamp_class=legacy') == 3
+
+    async def test_exit_one_when_a_genuinely_fresh_stamp_is_flagged(
+        self, monkeypatch, capsys,
+    ):
+        """A stamp written after --since still gates — that is the whole
+        point of the soak gate."""
+        report = _report([_detail('800', 'misattributed', commit='d' * 40)])
+        tasks = [_stamped_task('800', BEFORE_SINCE, AFTER_SINCE, commit='d' * 40)]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert 'task_id=800' in captured.out
+        assert 'stamp_class=fresh' in captured.out
+
+    async def test_mixed_fresh_and_legacy_gates_on_the_fresh_one_and_prints_both(
+        self, monkeypatch, capsys,
+    ):
+        report = _report([
+            _detail('900', 'misattributed'),
+            _detail('901', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('900', BEFORE_SINCE, AFTER_SINCE),  # fresh -> gates
+            _stamped_task('901', AFTER_SINCE, None),          # legacy -> reported
+        ]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert 'task_id=900' in captured.out
+        assert 'task_id=901' in captured.out
+        assert 'stamp_class=fresh' in captured.out
+        assert 'stamp_class=legacy' in captured.out
+
+    async def test_last_stdout_line_is_json_on_the_legacy_only_exit_zero_path(
+        self, monkeypatch, capsys,
+    ):
+        """The FINAL stdout line must always be a parseable JSON counts object.
+
+        DeterministicRunner._summarize_predicate_output folds a passing
+        predicate's output into done_provenance.note (which reconciliation
+        then ingests into Mem0). Its tier-1 extractor — the only tier with a
+        structural guarantee — takes a trailing JSON block; tier 2 otherwise
+        keeps the last non-log-shaped line. Offender lines carry neither a
+        timestamp nor a level token, so without this trailing object a
+        PASSING run would stamp the self-contradictory note
+        'predicate check passed (rc=0): task_id=... stamp_class=legacy',
+        naming whichever offender happened to sort last.
+        """
+        report = _report([_detail(str(700 + i), 'misattributed') for i in range(3)])
+        tasks = [_stamped_task(str(700 + i), AFTER_SINCE, None) for i in range(3)]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 0
+        out_lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        payload = json.loads(out_lines[-1])
+        assert payload['gating'] == 0
+        assert payload['legacy'] == 3
+        assert payload['total_flagged'] == 3
+        assert payload['stamp_classes'] == {'legacy': 3}
+        # The offender lines are still there, ahead of it — the summary
+        # supplements the triage output, it does not replace it.
+        assert any('task_id=700' in ln for ln in out_lines[:-1])
+
+    async def test_last_stdout_line_is_json_when_there_are_no_offenders(
+        self, monkeypatch, capsys,
+    ):
+        """Printed unconditionally, so the note shape never depends on the
+        result — a clean run's note is the same structured object."""
+        _install_fake_audit_module(monkeypatch, _report([]))
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, [])
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 0
+        out_lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        payload = json.loads(out_lines[-1])
+        assert payload == {
+            'gating': 0, 'legacy': 0, 'total_flagged': 0,
+            'stamp_classes': {}, 'sub_patterns': {},
+        }
+
+    async def test_last_stdout_line_is_json_on_the_exit_one_path_too(
+        self, monkeypatch, capsys,
+    ):
+        report = _report([
+            _detail('900', 'misattributed'),
+            _detail('901', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('900', BEFORE_SINCE, AFTER_SINCE),  # fresh -> gates
+            _stamped_task('901', AFTER_SINCE, None),          # legacy
+        ]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 1
+        out_lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        payload = json.loads(out_lines[-1])
+        assert payload['gating'] == 1
+        assert payload['legacy'] == 1
+        assert payload['total_flagged'] == 2
+        assert payload['stamp_classes'] == {'fresh': 1, 'legacy': 1}
+        assert payload['sub_patterns'] == {'shared_bare_merge': 2}
+
+    async def test_exit_one_when_only_corrupt_stamps_are_flagged(
+        self, monkeypatch, capsys,
+    ):
+        """A present-but-unparseable stamp gates: it proves a post-3576
+        write, so the 'predates the field' exemption does not apply."""
+        report = _report([_detail('950', 'misattributed')])
+        tasks = [_stamped_task('950', AFTER_SINCE, 'not-a-timestamp')]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 1
+        out_lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert any('stamp_class=corrupt' in ln for ln in out_lines)
+        payload = json.loads(out_lines[-1])
+        assert payload['gating'] == 1
+        # Corrupt is NOT folded into the legacy count — deriving legacy as
+        # (total - gating) would silently relabel it.
+        assert payload['legacy'] == 0
+        assert payload['stamp_classes'] == {'corrupt': 1}
 
     async def test_missing_taskmaster_config_returns_1_without_creating_backend(
         self, monkeypatch,

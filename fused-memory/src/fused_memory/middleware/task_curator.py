@@ -47,10 +47,13 @@ from shared.cli_invoke import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
+from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
+from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId
@@ -111,7 +114,15 @@ class CuratorFailureError(RuntimeError):
         self.cost_usd = cost_usd
 
 
-Action = Literal['drop', 'combine', 'create', 'route_deterministic']
+# 'drop', 'combine' and 'create' are the only actions the LLM may request — see
+# CURATOR_OUTPUT_SCHEMA / CURATOR_BATCH_OUTPUT_SCHEMA below, whose enums stay
+# exactly those three. 'route_deterministic' and 'refuse' are DETERMINISTIC-ONLY
+# verdicts, reachable solely from a `_maybe_*` guard backed by an
+# operator-curated YAML registry; the model must never be able to emit either.
+# 'refuse' in particular means "this candidate's premise is dead — create
+# NOTHING", which is deliberately distinct from 'drop' ("fold into existing
+# target task N", which requires a target).
+Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse']
 
 _STATUS_RANK = {
     'pending': 0,
@@ -595,6 +606,15 @@ class TaskCurator:
         # only the YAML load itself is cached for the instance lifetime.
         self._premise_registry: list | None = None
         self._premise_registry_load_attempted: bool = False
+        # Guards the one-shot lazy load above. Needed because the load is
+        # offloaded via asyncio.to_thread: the await point means a concurrent
+        # caller could otherwise observe load_attempted=True with
+        # _premise_registry still None and silently fail the guard open. One
+        # TaskCurator instance is shared across projects while the
+        # interceptor's curator lock is per-project, so concurrent entry is
+        # reachable. asyncio.Lock() is loop-agnostic at construction on
+        # Python 3.13, so building it here in __init__ is safe.
+        self._premise_registry_load_lock = asyncio.Lock()
         # Operational-ask registry (filing-policy gate) — lazy-loaded on first
         # curate() call, same shape as _blocklist above. A match routes the
         # candidate straight to a deterministic PURE-GATE instead of the LLM;
@@ -603,8 +623,9 @@ class TaskCurator:
         self._operational_registry: list | None = None
         self._operational_registry_load_attempted: bool = False
         # Consecutive-ZOT circuit breaker (task 1743).
-        # Counts CONSECUTIVE zero-output/full-timeout curator LLM failures;
-        # reset to 0 on any real LLM success or non-ZOT failure.
+        # Counts zero-output/full-timeout curator LLM failures since the
+        # last real LLM success; a non-ZOT failure neither increments nor
+        # resets it.
         self._consecutive_zero_output_timeouts: int = 0
         # monotonic() time until which the breaker is open (None = closed).
         self._zero_output_breaker_open_until: float | None = None
@@ -871,7 +892,14 @@ class TaskCurator:
     async def _maybe_blocklist_drop(
         self, candidate: CandidateTask, payload_hash: str,
     ) -> CuratorDecision | None:
-        """Return a drop decision if the candidate matches the cancelled-premise blocklist.
+        """Return a REFUSAL decision if the candidate matches the cancelled-premise blocklist.
+
+        The returned decision is ``action='refuse'`` — a deterministic verdict
+        that creates NOTHING. It is deliberately not ``action='drop'``: a drop
+        means "fold this into existing target task N" and carries a
+        ``target_id``, so a targetless drop is inert at the dispatch chokepoint
+        (``TaskInterceptor._dispatch_ticket_decision``) and fails open into
+        creating the very candidate this guard exists to reject.
 
         Lazy-loads the blocklist from ``self._config.curator.cancelled_premise_blocklist_path``
         on the first call and caches it for the lifetime of this :class:`TaskCurator`
@@ -919,7 +947,7 @@ class TaskCurator:
             return None
 
         decision = CuratorDecision(
-            action='drop',
+            action='refuse',
             target_id=None,
             target_fingerprint=None,
             rewritten_task=None,
@@ -929,7 +957,8 @@ class TaskCurator:
         )
         self._store_cache(payload_hash, decision)
         logger.info(
-            'task_curator: blocklist drop entry=%s candidate=%r',
+            'task_curator: blocklist refusal (no task will be created) '
+            'entry=%s candidate=%r',
             entry.name, candidate.title,
         )
         return decision
@@ -937,7 +966,11 @@ class TaskCurator:
     async def _maybe_premise_refuted_drop(
         self, candidate: CandidateTask, payload_hash: str,
     ) -> CuratorDecision | None:
-        """Return a drop decision if the candidate's premise is refuted by live source.
+        """Return a REFUSAL decision if the candidate's premise is refuted by live source.
+
+        The returned decision is ``action='refuse'`` — a deterministic verdict
+        that creates NOTHING (see :meth:`_maybe_blocklist_drop` for why this is
+        not ``action='drop'``).
 
         Lazy-loads the registry from
         ``self._config.curator.recon_code_fix_premise_registry_path`` on the first
@@ -945,29 +978,70 @@ class TaskCurator:
         :class:`TaskCurator` instance (no hot-reload; a server restart is required
         to pick up YAML changes). The live source/test re-verification itself is
         NOT cached — it re-reads the cited files on every call, so the guard is
-        self-correcting. Unlike ``_maybe_blocklist_drop``, the resulting drop
+        self-correcting. Unlike ``_maybe_blocklist_drop``, the resulting REFUSAL
         DECISION is also deliberately NOT written to the idempotency cache
-        (``self._decision_cache``): caching it would let a stale drop resurface
+        (``self._decision_cache``): caching it would let a stale refusal resurface
         via ``_check_cache`` for up to ``idempotency_ttl_seconds`` after the
         cited source stops refuting the premise, silently suppressing a
         genuinely-fixed bug-fix task. ``payload_hash`` is accepted only for
         signature symmetry with ``_maybe_blocklist_drop`` and is unused here.
 
+        Both blocking halves of this method run off the event-loop thread
+        (task 4201, 2026-08-29): the one-shot registry load and the
+        per-match live-source re-verification are each dispatched via
+        ``asyncio.to_thread``. The textual match (``match_candidate``) is
+        deliberately kept ON the loop — it is pure string work with no I/O,
+        so the common case of a non-matching candidate pays no thread-pool
+        dispatch. Measured on the shipped registry: registry load ~9.9ms
+        (8.15ms of it ``yaml.safe_load``, only 21us the ``read_text``);
+        worst per-match verification 1.2ms warm / 6.2ms cold on a 664 KB
+        cited file; thread-dispatch overhead ~67us. This resolves an
+        instance of INV-8 ``loop-thread-occupancy-bounded``
+        (docs/legibility/design-invariants.md), mirroring the offload
+        pattern already used by :meth:`_maybe_flag_unverified_claims` and
+        the claim-verification block in :meth:`curate_batch_prepared`.
+
+        This bounds the loop stall for THIS guard only. The two sibling
+        one-shot lazy loads invoked earlier in the same :meth:`curate` /
+        :meth:`curate_batch_prepared` sequence — :meth:`_maybe_blocklist_drop`
+        loading ``cancelled_premise_blocklist_path`` (2.2 KB) and
+        :meth:`_maybe_route_deterministic` loading
+        ``operational_ask_registry_path`` (6.7 KB, ~60% the size of this
+        guard's own 11 KB registry) — still run synchronously on the loop, so
+        the first-submission loop stall under the per-project curator write
+        lock is reduced by this change, not bounded by it. Left as-is here
+        (task 4201 scope); tracked as a follow-up to either extend the
+        offload to those two sites or fold all three into one shared
+        lazy-load helper so the idiom exists once.
+
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
-        - The registry file is missing, unreadable, or unparseable (one WARNING logged).
+        - The registry file is missing, unreadable, or unparseable, or the
+          offloaded load raised — for example a registry file that is not
+          valid UTF-8 (one WARNING logged; the guard then stays disabled for
+          this TaskCurator instance rather than retrying per call). This is
+          deliberate even for a cause that is transient in principle (a
+          partially-written file observed mid-deploy, a momentary worker
+          thread I/O error): the load's ``except Exception`` below does not
+          distinguish exception type, so any raise latches the same as a
+          permanently-malformed file, and a process restart is the recovery
+          path. Only ``asyncio.CancelledError`` is excluded from the latch
+          (see the comment on that except block) — every other exception is
+          treated as permanent by design, not oversight.
         - The registry is empty.
         - No entry textually matches the candidate.
         - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
           premise cannot be verified.
         - The candidate matches an entry, but the live source no longer refutes
           its premise.
+        - The offloaded live-source verification raised (one WARNING logged).
 
         Never raises.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import (
             load_premise_registry,
-            premise_refuted_entry,
+            match_candidate,
+            verify_premise_refuted,
         )
 
         cfg_path = self._config.curator.recon_code_fix_premise_registry_path
@@ -983,24 +1057,98 @@ class TaskCurator:
             )
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
+        # Lazy load — run at most once per TaskCurator instance. Offloaded:
+        # measured 9.9ms for the shipped 11 KB registry, of which 8.15ms is
+        # pure-Python yaml.safe_load (not the 21us read_text) — the largest
+        # single event-loop stall in this method, paid on the first task
+        # submission per process while the per-project curator write lock is
+        # held.
+        #
+        # Double-checked lock: the await point inside the offloaded load
+        # means a concurrent second caller could otherwise observe
+        # load_attempted=True while self._premise_registry is still None and
+        # silently fail the guard open. The outer unlocked check keeps the
+        # steady-state path (every call after the first) lock-free; the
+        # inner re-check under the lock is what makes concurrent first calls
+        # correct. The flag is set only AFTER the assignment so nobody can
+        # observe the attempted-but-unassigned window.
         if not self._premise_registry_load_attempted:
-            self._premise_registry_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                raw_path = self._cwd / raw_path
-            self._premise_registry = load_premise_registry(raw_path)
+            async with self._premise_registry_load_lock:
+                if not self._premise_registry_load_attempted:
+                    raw_path = Path(cfg_path)
+                    if not raw_path.is_absolute():
+                        raw_path = self._cwd / raw_path
+                    try:
+                        self._premise_registry = await asyncio.to_thread(
+                            load_premise_registry, raw_path,
+                        )
+                    except Exception as exc:
+                        # load_premise_registry documents "never raises" and,
+                        # since task 4483, actually honours it for the whole
+                        # read/parse path (FileNotFoundError, OSError,
+                        # UnicodeDecodeError, yaml.YAMLError all degrade to []).
+                        # This wrapper is still required: asyncio.to_thread is a
+                        # raise path of its own (thread-pool failure/shutdown)
+                        # that the guard module's internal excepts cannot cover.
+                        # Fail OPEN (guard disabled) rather than escaping into
+                        # curate()/curate_batch_prepared, which call this
+                        # unguarded — an escape fails the whole task submission.
+                        logger.warning(
+                            'task_curator: recon-premise registry load errored for %s, '
+                            'failing open (guard disabled): %s',
+                            raw_path, exc,
+                        )
+                        self._premise_registry = None
+                    # Settled outcome (loaded, or failed open) — latch the
+                    # one-shot contract. Deliberately NOT a `finally`:
+                    # asyncio.CancelledError is a BaseException, so it bypasses
+                    # the except above, and latching in a `finally` would
+                    # permanently disable the guard because an unrelated caller
+                    # was cancelled mid-load. Leaving the flag clear on
+                    # cancellation lets the next call retry.
+                    self._premise_registry_load_attempted = True
 
         entries = self._premise_registry
         if not entries:
             return None
 
-        entry = premise_refuted_entry(candidate, entries, self._cwd)
+        # Pure string ops over the registry, no I/O — deliberately kept ON the
+        # loop so the overwhelmingly common non-matching candidate never pays a
+        # thread-pool dispatch (measured 67us) nor extra curator-lock hold.
+        # premise_refuted_entry composes exactly these two halves and already
+        # short-circuits here; we split it so only the blocking half is offloaded.
+        entry = match_candidate(candidate, entries)
         if entry is None:
             return None
 
+        # Off the event loop: verify_premise_refuted re-reads EVERY cited file
+        # fresh on every call (that is what makes the guard self-correcting).
+        # Measured on the shipped registry: the stage2_flag_query entry cites
+        # tests/test_stages.py at 664 KB => 1.2 ms warm, 6.2 ms cold, 29 ms worst;
+        # the 3-assertion entry is 170 us warm. curate() reaches this on EVERY
+        # task submission while holding the per-project curator write lock
+        # (task_interceptor.py _curator_lock, held around curate() and
+        # curate_batch_prepared). Mirrors this file's claim-verification offloads.
+        try:
+            refuted = await asyncio.to_thread(verify_premise_refuted, entry, self._cwd)
+        except Exception as exc:
+            # Honour this method's documented "Never raises" contract. The guard
+            # module fails open internally on OSError, but asyncio.to_thread adds
+            # a raise path it cannot cover, and curate()/curate_batch_prepared
+            # call this unguarded — an escape would fail the whole submission.
+            # Fail OPEN: let the candidate reach the architect rather than
+            # silently refusing it on an unverified premise.
+            logger.warning(
+                'task_curator: recon-premise verification errored for entry=%s, '
+                'failing open (candidate not dropped): %s',
+                entry.name, exc,
+            )
+            return None
+        if not refuted:
+            return None
+
         decision = CuratorDecision(
-            action='drop',
+            action='refuse',
             target_id=None,
             target_fingerprint=None,
             rewritten_task=None,
@@ -1013,10 +1161,21 @@ class TaskCurator:
         # premise, so every call re-verifies live source rather than trusting a
         # cached decision for the idempotency TTL.
         logger.info(
-            'task_curator: recon-premise-refuted drop entry=%s candidate=%r',
+            'task_curator: recon-premise-refuted refusal (no task will be created) '
+            'entry=%s candidate=%r',
             entry.name, candidate.title,
         )
         return decision
+
+    @staticmethod
+    def _claim_verification_text(candidate: CandidateTask) -> str:
+        """Concatenated candidate text the claim-verification guard scans.
+
+        Single source of truth for both :meth:`_maybe_flag_unverified_claims`
+        (per-candidate extraction) and ``curate_batch_prepared``'s batch-level
+        "does any candidate carry a claim" pre-check, so the two never drift.
+        """
+        return f'{candidate.title}\n{candidate.description}\n{candidate.details}'
 
     async def _maybe_flag_unverified_claims(
         self, candidate: CandidateTask, probe: Callable[[str], bool] | None = None,
@@ -1036,6 +1195,13 @@ class TaskCurator:
         ``self._cwd`` via ``make_source_and_history_probe`` when not injected —
         tests inject a fake probe to stay git-free).
 
+        Claim extraction runs FIRST and is pure/sync/cheap (a regex scan, no
+        I/O): when *candidate* carries no attributed claim at all — the
+        overwhelmingly common case, since a claim requires a code token AND a
+        numbered task/ACTION/commit anchor within the co-occurrence window —
+        this returns ``[]`` before a probe is ever built or a worker thread is
+        ever spawned for it.
+
         Unlike :meth:`_maybe_premise_refuted_drop`, this hook NEVER drops the
         candidate or returns/mutates a :class:`CuratorDecision` — it only surfaces
         unverified claims via a grep-stable ``recon_claim_verification.unverified``
@@ -1050,6 +1216,9 @@ class TaskCurator:
           claim can be verified (one WARNING logged).
         - *candidate*'s title/description/details carry no attributed claims at all.
         - Every attributed claim's token verifies present (self-correcting).
+        - Probe construction or verification raises for any reason (one
+          WARNING logged) — this is an advisory backstop and must never fail
+          the task submission it rides along with.
 
         Never raises.
         """
@@ -1066,22 +1235,51 @@ class TaskCurator:
             return []
 
         from fused_memory.middleware.recon_claim_verification_guard import (
+            extract_attributed_claims,
             make_source_and_history_probe,
-            unverified_claims_in_text,
+            verify_attributed_claims,
         )
 
-        if probe is None:
-            probe = make_source_and_history_probe(self._cwd)
+        claims = extract_attributed_claims(self._claim_verification_text(candidate))
+        if not claims:
+            return []
 
-        text = f'{candidate.title}\n{candidate.description}\n{candidate.details}'
-        # Offload to a worker thread: probe (when not injected by a test) is
-        # make_source_and_history_probe's blocking git-subprocess adapter —
-        # git grep, and on a miss (always true for a fabricated token, the
-        # exact case this guard targets) a full-history `git log --all -S`
-        # pickaxe too, up to ~10s each. Running it inline here would stall
-        # the curator/reconciliation event loop for every other coroutine
-        # sharing it. unverified_claims_in_text itself stays pure/sync.
-        unverified = await asyncio.to_thread(unverified_claims_in_text, text, probe)
+        def _build_probe_and_verify(repo_root: Path) -> list[AttributedClaim]:
+            local_probe = make_source_and_history_probe(repo_root)
+            return verify_attributed_claims(claims, local_probe)
+
+        try:
+            if probe is None:
+                # Off the event loop, in a SINGLE thread-pool hop: construction
+                # resolves the git top level via _resolve_git_toplevel — a
+                # blocking `git rev-parse --show-toplevel` subprocess bounded
+                # only by a 10s timeout — and verification (git grep, and on a
+                # miss — always true for a fabricated token, the exact case
+                # this guard targets — a full-history `git log --all -S`
+                # pickaxe too, up to ~10s each) then runs against the
+                # freshly-built probe on that same worker thread. Only
+                # reached when `claims` above is non-empty, so a candidate
+                # with no attributed claim never pays for either. Mirrors
+                # curate_batch_prepared's construction (see the batch
+                # claim-verification block below), which likewise only
+                # builds a probe when at least one candidate in the batch
+                # carries a claim.
+                unverified = await asyncio.to_thread(_build_probe_and_verify, self._cwd)
+            else:
+                # probe was injected — curate_batch_prepared builds one probe
+                # per batch and shares it across candidates, or a test
+                # supplies a fake. Still offload: a real probe's git grep,
+                # and on a miss a full-history pickaxe, is blocking
+                # regardless of who built it.
+                unverified = await asyncio.to_thread(verify_attributed_claims, claims, probe)
+        except Exception as exc:
+            # Advisory backstop — must fail open rather than take the whole
+            # task submission down with it (see "Never raises" above).
+            logger.warning(
+                'recon_claim_verification: guard errored, failing open: %s', exc,
+            )
+            return []
+
         for claim in unverified:
             logger.warning(
                 'recon_claim_verification.unverified token=%s attribution=%s candidate=%r',
@@ -1544,6 +1742,38 @@ class TaskCurator:
         unique_indices = non_premise_unique
         # ── End premise-verification check ──────────────────────────────────────
 
+        # ── Propagate deterministic refusals to byte-identical duplicates ──────
+        # The pre-batch dedup above ran BEFORE the blocklist/premise guards, so a
+        # duplicate of a refused candidate was skipped by them entirely and still
+        # carries a synthetic batch_target_index drop.  At dispatch that drop
+        # resolves against a sibling with task_id=None (a refusal creates nothing),
+        # hits the 'sibling failed' branch, and fails OPEN to create — filing the
+        # very dead-premise task the guard just refused.  Identical payload_hash
+        # means an identical guard verdict by construction, so inherit the refusal.
+        # Only pre-batch-dedup drops are rewritten: an LLM-chosen
+        # batch_target_index still fails open, because that sibling is a DIFFERENT
+        # payload which the guards did check and did pass.
+        for i, dup_dec in list(pre_dedup_decisions.items()):
+            j = dup_dec.batch_target_index
+            if j is None:
+                # Unreachable in practice — every pre-dedup decision is minted
+                # with a batch_target_index above. Narrowing for the type
+                # checker, which types the field `int | None`.
+                continue
+            refusal = blocklist_decisions.get(j) or premise_decisions.get(j)
+            if refusal is not None:
+                # `replace` (not a fresh CuratorDecision) so the inherited
+                # refusal is FIELD-IDENTICAL to the one it copies — including
+                # the guards' pool_sizes={'anchor': 0, ...}/latency_ms=0
+                # observability shape. A byte-identical duplicate should not
+                # persist a differently-shaped row in tickets.db / the decision
+                # log than the twin it inherited from. Only batch_target_index
+                # is cleared: a refusal creates nothing, so it must carry no
+                # sibling-substitution target (the guards' own refusals never
+                # set one either).
+                pre_dedup_decisions[i] = replace(refusal, batch_target_index=None)
+        # ── End refusal propagation ───────────────────────────────────────────
+
         # ── Recon claim-verification advisory backstop (task 2438) ─────────────
         # For each still-live candidate, flag (never drop) any code-level claim
         # it attributes to a completed task/commit/ACTION whose token verifies
@@ -1552,21 +1782,32 @@ class TaskCurator:
         # surfacing is via the recon_claim_verification.unverified WARNING
         # census logged inside _maybe_flag_unverified_claims itself.
         #
-        # Build the probe ONCE for the whole batch — off the event loop, since
-        # construction resolves the git top level via a blocking subprocess
-        # call — and fan the per-candidate checks out concurrently instead of
-        # awaiting a freshly-built probe serially per candidate: a fabricated
-        # (i.e. actually-absent) token always runs the full
-        # git-grep-then-pickaxe path (up to ~10s), so a batch with several
-        # attributed tokens would otherwise serialize into tens of seconds of
-        # git work on the reconciliation path for a purely advisory check.
+        # Build the probe at most ONCE for the whole batch — off the event
+        # loop, since construction resolves the git top level via a blocking
+        # subprocess call — and only when at least one candidate actually
+        # attributes a code-level claim to prior work (extraction is
+        # pure/sync/cheap, so checking first costs nothing; a batch with no
+        # attributed claims at all, the common case, now skips the git
+        # subprocess entirely). When needed, fan the per-candidate checks out
+        # concurrently instead of awaiting a freshly-built probe serially per
+        # candidate: a fabricated (i.e. actually-absent) token always runs
+        # the full git-grep-then-pickaxe path (up to ~10s), so a batch with
+        # several attributed tokens would otherwise serialize into tens of
+        # seconds of git work on the reconciliation path for a purely
+        # advisory check.
         claim_probe: Callable[[str], bool] | None = None
         if self._config.curator.recon_claim_verification_enabled and self._cwd is not None:
             from fused_memory.middleware.recon_claim_verification_guard import (
+                extract_attributed_claims,
                 make_source_and_history_probe,
             )
 
-            claim_probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
+            any_claims = any(
+                extract_attributed_claims(self._claim_verification_text(candidates[i]))
+                for i in unique_indices
+            )
+            if any_claims:
+                claim_probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
         await asyncio.gather(
             *(
                 self._maybe_flag_unverified_claims(candidates[i], probe=claim_probe)
@@ -1633,6 +1874,11 @@ class TaskCurator:
         # intentional — opening sooner is harmless and simpler than trying to
         # normalise concurrent increments.  curate_batch_prepared need not
         # record separately; it relies on the per-size-1 accumulation.
+        # Conversely, a successful _call_llm_batch call resets the counter
+        # itself (see the success branch near its `return`, task 4143), so
+        # "consecutive" is measured across every real LLM success — batch
+        # and size-1 alike — not just the size-1 successes handled by
+        # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
             batch_breaker_now = time.monotonic()
             logger.warning(
@@ -2117,7 +2363,26 @@ class TaskCurator:
         project_root: str,
     ) -> tuple[list[_PoolEntry], dict[str, int]]:
         """Assemble the four-stream pool for the LLM prompt."""
-        lock_depth = self._config.curator.lock_depth
+        # Resolve lock_depth PER PROJECT, not from a single global scalar:
+        # fused-memory serves many projects and each orchestrator resolves its
+        # own depth (3..12 across the fleet). The scheduler snapshot already
+        # publishes the effective value, so we read it rather than
+        # reimplementing orchestrator.config's layering here. lock_depth is
+        # red-tier (changes only at orchestrator restart), so an hours-old
+        # snapshot still carries the correct depth. Absent/unreadable snapshot
+        # falls back COARSE (the config scalar) — see effective_lock_depth.
+        #
+        # Dispatched via to_thread because the underlying snapshot read is
+        # blocking, matching recon_write_policy's handling of the same file.
+        # Unlike that call site there is no existing thread hop to ride here
+        # (_build_corpus is awaited straight off the event loop), so this adds
+        # its own. It stays cheap because effective_lock_depth memoises per
+        # project — this runs once per candidate but only reaches the disk
+        # once per project per TTL, and the hop is noise next to the taskmaster
+        # and embedding round-trips below.
+        lock_depth = await asyncio.to_thread(
+            effective_lock_depth, project_root, self._config.curator.lock_depth,
+        )
         pool: list[_PoolEntry] = []
         seen_ids: set[str] = set()
 
@@ -2491,6 +2756,29 @@ class TaskCurator:
                 cost_usd=agent_result.cost_usd,
             )
 
+        # Success: a real LLM round-trip completed, so the service is not
+        # wedged — reset the consecutive-ZOT counter exactly as the
+        # single-item path does in task_curator.py::TaskCurator.curate.
+        # Without this, size-1 bisect ZOTs accumulate across arbitrarily
+        # many healthy BATCH calls in a batch-dominant deployment until
+        # threshold (default 2) trips the breaker and disables dedupe for
+        # the cooldown (default 600s) on a healthy service (task 4143).
+        # Keyed on agent_result.success, not on decision quality:
+        # _parse_batch_decisions degrades unparseable items to
+        # action='create' without raising, and a degraded decision is
+        # still evidence the CLI round-trip completed.
+        #
+        # This also closes an ALREADY-OPEN breaker/cooldown, not just the
+        # counter: _call_llm_batch_with_fallback's two bisect halves run
+        # concurrently under asyncio.gather, so a sibling half's size-1
+        # curate() ZOTs can open the breaker while this call is still in
+        # flight. A completed round-trip is still proof the backend isn't
+        # wedged, so letting it close an already-open cooldown early is a
+        # deliberate choice, not an oversight (see this task's plan design
+        # decision 3; pinned by
+        # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
+        self._reset_zero_output_breaker()
+
         return _parse_batch_decisions(
             agent_result,
             pools=pools,
@@ -2706,14 +2994,6 @@ def _task_files(task: dict) -> list[str]:
     return [str(f) for f in files if f]
 
 
-def _task_dependencies(task: dict) -> list[str]:
-    deps = task.get('dependencies') or []
-    if isinstance(deps, str):
-        # CSV fallback
-        return [d.strip() for d in deps.split(',') if d.strip()]
-    return [str(d) for d in deps if d]
-
-
 def _task_metadata_spawned_from(task: dict) -> str | None:
     meta = task.get('metadata') or {}
     if isinstance(meta, dict):
@@ -2721,6 +3001,26 @@ def _task_metadata_spawned_from(task: dict) -> str | None:
         if isinstance(v, str) and v:
             return v
     return None
+
+
+def is_combine_eligible_status(status: str) -> bool:
+    """Single source of truth for combine STATUS eligibility (task 4035).
+
+    Called from BOTH the curator's selection snapshot
+    (``_to_pool_entry.combine_eligible``) and the interceptor's
+    execution-time combine guard (``_execute_combine``). Keeping one
+    definition is the point: the two sites previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting 20.2% of combines
+    land on non-pending targets mid-planning.
+
+    Status ONLY. Liveness (``claimant_run_id``) is execution-side and
+    deliberately NOT part of this predicate — the selection snapshot cannot
+    observe it (D11).
+
+    Fails closed: anything outside the canonical vocabulary (an unknown
+    status, a blank, a case variant) is not eligible.
+    """
+    return status == TaskStatus.PENDING.value
 
 
 def _to_pool_entry(
@@ -2743,7 +3043,7 @@ def _to_pool_entry(
         status=status,
         priority=str(task.get('priority', DEFAULT_PRIORITY)),
         source=source,
-        combine_eligible=(status == 'pending'),
+        combine_eligible=is_combine_eligible_status(status),
     )
 
 

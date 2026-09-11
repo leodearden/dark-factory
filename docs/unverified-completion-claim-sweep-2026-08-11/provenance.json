@@ -1,0 +1,88 @@
+{
+  "task_id": "4230",
+  "escalation": "esc-3085-1",
+  "git_sha": "b543435a48184aa31bbf729250fc9fdb5ce97cfe",
+  "branch": "task/4230",
+  "swept_at": "2026-08-20T09:08:17.477070+00:00",
+  "started_at": "2026-08-20T09:07:56Z",
+  "finished_at": "2026-08-20T09:08:18Z",
+  "exit_code": 0,
+  "supersedes": {
+    "swept_at": "2026-08-15T16:45:04.875607+00:00",
+    "git_sha": "f7e9ed83d648d791acbedc45364b10acc07170e9",
+    "reason": "The 16:45 run enumerated a finding's derived edges in its read-from graph and its own group_id graph, and the latter only when that graph was among the swept --project graphs. That \"home pair\" rule cannot reach a THIRD swept graph at all, so 15 of the 21 cross-graph findings \u2014 12 read from reify and 3 from dark_factory whose group_id names an UNSWEPT graph (know_live 10, knowlive 4, solar_challenge_platform 1) \u2014 were asked in exactly ONE graph, and their empty edge lists were a measured zero over half the swept corpus rather than over all of it. Task 4230 re-keys enumeration on the EPISODE UUID across EVERY swept graph: all 204 findings in this run carry edges_enumerated_in == [dark_factory, reify]. Two new columns ship with it \u2014 derived_edges_by_graph (which graph held each edge) and edges_unqueried_in (which targeted graphs did not answer) \u2014 plus summary.edges_partial for the partial-coverage denominator. derived_edge_uuids keeps its meaning as the flat sorted union.",
+    "also_superseded": {
+      "swept_at": "2026-08-15T11:13:35.596476+00:00",
+      "git_sha": "64a9de0655cb1db78666d59e9a8254101116efdb",
+      "reason": "The 11:13 run enumerated derived edges ONLY in the graph each episode was read from, so the entire cross-graph population (21 findings whose graph_name differs from their group_id) shipped with an empty harm-artefact column \u2014 including 5 findings whose edges genuinely exist, in the other graph. The amendment pass batches the scan and asks the record's group_id graph too whenever that graph was swept; those 5 findings recovered 6-11 edges each (+41 edge uuids in total, 1116 -> 1157). Nothing was lost: every changed finding's edge set is a strict SUPERSET of the earlier one. No finding was added or dropped.",
+      "also_superseded": {
+        "swept_at": "2026-08-12T13:08:06.153106+00:00",
+        "git_sha": "a138751e80a95ad0d10d7cbf9b99bc70d246fdac",
+        "reason": "The pre-fix run resolved its derived-edge reader by the record's Graphiti group_id (finding.project_id) against a reader dict keyed by the --project GRAPH NAMES. Any episode whose group_id differed from the graph it was read from therefore resolved to the wrong reader, or to no reader at all, and the miss serialized as `derived_edge_uuids: []` \u2014 indistinguishable from a measured zero. Fixed in steps 16-19 (commits b3b1ff99fb, dcfedcccd6, 041b6277f1, 994e6667f4): the lookup is keyed on the `graph_name` field (WHICH GRAPH WAS QUERIED), and a genuinely un-enumerated edge list serializes as JSON `null` with `edges_unqueried: true` rather than as an empty list."
+      }
+    }
+  },
+  "cwd": "/home/leo/src/dark-factory/.worktrees/4230/fused-memory",
+  "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/audit_unverified_completion_claims.py",
+    "--project",
+    "dark_factory",
+    "--project",
+    "reify",
+    "--include-unverifiable"
+  ],
+  "env": {
+    "PROJECT_ROOT": "/home/leo/src/dark-factory",
+    "DASHBOARD_KNOWN_PROJECT_ROOTS": "/home/leo/src/dark-factory,/home/leo/src/reify",
+    "RECONCILIATION_DATA_DIR": "/home/leo/src/dark-factory/data/reconciliation"
+  },
+  "episodic_population": {
+    "dark_factory": {
+      "count_at_run": 3105,
+      "count_at_previous_run": 3043,
+      "previous_run_at": "2026-08-15T16:45Z",
+      "measured_via": "the sweep's own stderr: 'dark_factory: read 3105 episode(s)'"
+    },
+    "reify": {
+      "count_at_run": 4588,
+      "count_at_previous_run": 4553,
+      "previous_run_at": "2026-08-15T16:45Z",
+      "measured_via": "the sweep's own stderr: 'reify: read 4588 episode(s)'"
+    },
+    "total_at_run": 7693
+  },
+  "authorities_resolved": {
+    "task_status": {
+      "dark_factory": "/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db (sqlite mode=ro)",
+      "reify": "/home/leo/src/reify/.taskmaster/tasks/tasks.db (sqlite mode=ro)",
+      "unregistered": {
+        "know_live": "7 task claim(s) -> unverifiable"
+      }
+    },
+    "ticket_store": "/home/leo/src/dark-factory/data/reconciliation/tickets.db (sqlite mode=ro, read OK)",
+    "commit_probe": "git cat-file in the CLAIMED project's repo"
+  },
+  "notes": [
+    "report.json is byte-for-byte the script's stdout (cmp-verified against the captured stream). It was neither pretty-printed nor hand-edited. All logging went to stderr.",
+    "THIS RUN SUPERSEDES THE 2026-08-15T16:45 ONE (which superseded 11:13, which superseded 2026-08-12) \u2014 see `supersedes` above, where the whole chain is kept nested. No stale artifact was left in place and none was hand-patched to look fixed; the whole sweep was re-run against the live store with the same argv and env as the superseded run.",
+    "THE RULE CHANGE, AND WHAT IS MACHINE-CHECKABLE ABOUT IT: every one of the 204 findings now carries edges_enumerated_in == [\"dark_factory\", \"reify\"] and edges_unqueried_in == []. Under the superseded rule the distribution was (dark_factory,) 122 / (reify,) 69 / (reify, dark_factory) 6 \u2014 i.e. 191 of 197 findings were asked in exactly one graph. summary.edges_unqueried is 0 and summary.edges_partial is 0, and the sweep emitted no \"NOT enumerated\" and no \"scan failed\" warning, which together are the machine-checkable statement that no finding went un-enumerated or partially enumerated in this run.",
+    "DELTA ATTRIBUTABLE TO THIS CHANGE \u2014 EDGE COLUMNS ONLY, MEASURED finding-by-finding on (record_uuid, claim_kind, subject, ref): of the 184 findings common to both runs, 183 have an IDENTICAL edge set and 0 grew. Widening the target set from one graph to both recovered NO new edges: the 15 cross-graph findings whose group_id names an unswept graph were asked in the second swept graph for the first time and it genuinely holds nothing for them. That is a real result, not a null one \u2014 their empty lists are now measured over BOTH swept graphs instead of one, which is what the change bought. The 6 reify<-dark_factory findings keep the 5-with-edges / 1-empty split the previous run already had, because that population was the only one the old rule already asked in both.",
+    "THE ONE SHRINKING EDGE SET IS NOT ATTRIBUTABLE TO THIS CHANGE \u2014 IT IS THE MOVING CORPUS, AND IT WAS VERIFIED, NOT ASSUMED. Finding (16cc46d8-cf33-4557-93ce-f46ceb900487, filing_dispatch, task, 3910) went from 5 edge uuids to 4, losing f2dad7cc-15a0-4c3c-8962-06c0617d1eb8. Re-measured directly over GRAPH.RO_QUERY on 2026-08-20: that edge uuid returns count 0 in BOTH the dark_factory and the reify graph, so it no longer exists in the store; and the script's own join (MATCH ()-[r:RELATES_TO]->() WHERE '16cc46d8-...' IN r.episodes) returns exactly the 4 uuids the new report names. This change can only WIDEN the set of graphs asked, so it cannot subtract an edge that still exists \u2014 the edge was deleted from the live store in the ~5 days since the superseded run.",
+    "DELTA ATTRIBUTABLE TO THE MOVING CORPUS: 197 -> 204 findings (184 common, 20 added, 13 dropped); mismatch 167 -> 172, unverifiable 30 -> 32; total edge uuids 1157 -> 1213 and findings carrying at least one edge 181 -> 188, all of which comes from the 20 added findings rather than from any common finding. The corpus grew from 7596 to 7693 Episodic nodes (dark_factory 3043 -> 3105, reify 4553 -> 4588) over the ~4.7 days between runs. THE DENOMINATOR REMAINS A MOVING TARGET: the store is live and being written throughout, so 7693 is a snapshot at run time, not a fixed population.",
+    "THE 13 DROPPED FINDINGS ARE CAVEAT 1 FIRING LIVE, each verified individually against the claimed project's tasks.db over a mode=ro URI on 2026-08-20: every one of the 13 refs is now status=done, so the claim VERIFIES today and is correctly no longer a finding. dark_factory tasks 3622, 3980, 4027, 4181, 4183, 4184, 4185, 4186, 4187, 4190, 4192 and 3381 (this sweep's own predecessor task), plus reify task 5623. Nothing was suppressed: the sweep reads each authority TODAY, and a claim whose task has since gone terminal stops being a mismatch by construction.",
+    "THE 20 ADDED FINDINGS WERE ADJUDICATED, NOT COUNTED. 18 are mismatches on episodes created 2026-08-12..2026-08-19 whose claimed task is STILL non-terminal. THE CLASSIFICATION LIVES IN investigation.md, not here \u2014 this note records the measurement, that file records the adjudication, and a reader cross-checking the two must not be given two different class attributions for the same row. Its split, re-measured off this report.json's claim_kind column: 13 Class A (filing_dispatch \u2014 reify 6346, 6184, 6343, 6344, 6098, 6335, 6336, 5480 and dark_factory 3690, 4377, 4371, 4361, 3639) and 5 Class B (applied_work \u2014 reify 5467, 6077 (x2), 5480 and dark_factory 3589). reify 5480 is the ref appearing twice: it contributes one finding to each class. Each was re-checked against the CLAIMED project (claim_project_id, not the record's own group_id) and the live status agrees with the sweep's `observed` in all 18 cases. 2 are unverifiable on OLDER episodes (c8be5801 created 2026-06-25 ref dark_factory:4778; ca2820dd created 2026-07-28 ref dark_factory:5493): both refs are now ABSENT from dark_factory's tasks.db, and neither episode was a finding on 2026-08-15. Hypothesis: the task records were removed from the tree since, which flips those claims from verified to unverifiable \u2014 the \"UNVERIFIABLE INDICTS NOBODY\" caveat, whose stated mechanism is exactly \"a task deleted since\". No new false-positive class is needed for any of the 20.",
+    "ZERO VERDICT FLIPS among the 184 common findings: no finding changed between mismatch and unverifiable. The two buckets moved only by the added/dropped populations above.",
+    "NEW REPORT KEYS shipped by this run, all always-present: findings[].derived_edges_by_graph \u2014 {graph: [edge_uuid, ...]} for every ANSWERING graph in argv order with each slice sorted, [] for a graph that answered holding nothing, and null (never {}) when NO graph answered; findings[].edges_unqueried_in \u2014 the targeted graphs whose scan did not answer, [] when there is no hole; summary.edges_partial \u2014 the count of findings with a coverage hole that still measured something, disjoint from summary.edges_unqueried by construction. Both counters are 0 in this run. derived_edge_uuids is unchanged in meaning (the flat sorted union of derived_edges_by_graph), so existing consumers are unaffected.",
+    "WORKED EXAMPLE OF THE ATTRIBUTION, from this run's own report: finding f76ba492-fd19-460b-8983-44d0ea0dd80c (read from reify, group_id dark_factory) carries derived_edges_by_graph {\"dark_factory\": [9 uuids], \"reify\": []} \u2014 the node lives in reify and every one of its edges lives in dark_factory. That split was invisible in the superseded artifact, which reported only the merged 9-uuid union.",
+    "ZERO ticket-subject findings, unchanged across all four runs. summary.by_subject carries only commit (35) and task (169) \u2014 no ticket key at all. The ticket store WAS readable for this run (opened mode=ro, queried, no unavailability warning emitted), so this is a real negative, not an unavailability artifact.",
+    "PERFORMANCE: the derived-edge scan is still ONE batched query per graph \u2014 the scan COUNT is unchanged at len(--project), and only the $uuids parameter widened from a per-graph subset to all flagged uuids. MEASURED wall clock: 22s for this run (started_at 09:07:56Z, finished_at 09:08:18Z) over 7693 episodes, against ~6s recorded for 7596 episodes at 16:45. Hypothesis: the difference is dominated by the larger population and by ordinary variation in a live store, not by the widened $uuids parameter \u2014 but this run did not isolate those factors, so the 22s is a measurement and the attribution is not.",
+    "esc-3085-1 INSTANCE (2) WAS SWEPT AND CAME BACK CLEAN, unchanged from the earlier runs. Episode 02090224-7bc9-4485-9291-6748e1042ac9 is still present in the REIFY graph and appears in none of the 204 findings; ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376 DOES exist in tickets.db, so _verify_ticket correctly returns verified.",
+    "The 172 \"mismatch\" findings in report.json are the SCRIPT'S RAW VERDICTS, not adjudicated fabrications. See investigation.md for the class-by-class adjudication re-derived against THIS report. report.json is committed unedited precisely so that adjudication can be re-checked against the raw output.",
+    "Cross-repo commit verification (investigation.md class C) was performed OUT OF BAND for the 2026-08-12 run with `git cat-file -e <sha>^{commit}` run directly in /home/leo/src/dark-factory and /home/leo/src/reify. The commit-subject population is byte-identical across all four runs (35 findings), so that adjudication carries over unchanged and was NOT re-derived. The script itself never performs that cross-repo check; it probes only the claimed project.",
+    "INVARIANT HELD: this sweep invalidated nothing and deleted nothing. Every episode and edge the report names is left exactly as it was, for human adjudication. The script has no --apply/--invalidate/--delete/--repair path, an absence pinned by TestReadOnlyByConstruction, and reads the graph exclusively over GRAPH.RO_QUERY. Task 4230 added no CLI flag and no mutation path. The ad-hoc verification queries quoted in these notes were likewise issued as GRAPH.RO_QUERY, and the tasks.db re-checks over `file:...?mode=ro` URIs.",
+    "READ-ONLY COVERS THE SQLITE AUTHORITIES TOO, not just the graph: task statuses and tickets are both read over explicit `file:...?mode=ro` URIs closed in a finally, never through SqliteTaskBackend or TicketStore, whose read paths open READ/WRITE connections and apply schema work to whatever database the CLAIM names \u2014 for a cross-project claim, another project's live db while its own orchestrator is running."
+  ]
+}

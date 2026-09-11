@@ -36,7 +36,8 @@ merge-base, probe live infra, or call ``get_task``, so it can only require
 that the watcher QUOTED the proof, trusting the read-only watcher to have
 done the check. The denylist (``L2_AUTO_CLOSE_DENY_CATEGORIES`` /
 ``L2_AUTO_CLOSE_DENY_ROLES``) is applied BEFORE the allowlist, guaranteeing
-the born-at-L2 human gates (design_concern / milestone_gate categories, the
+the born-at-L2 human gates (the design_concern / milestone_gate /
+milestone_check_failed / curator_adjudication_missing categories, and the
 ``orchestrator-deterministic`` sentinel role) are never auto-closable even
 when a class predicate would otherwise match.
 """
@@ -81,9 +82,32 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # latter is also covered by L2_AUTO_CLOSE_DENY_ROLES below (both file under
 # agent_role='orchestrator-deterministic'), but is listed here too for
 # defense-in-depth so a future filing under a different role stays blocked.
+# 'curator_adjudication_missing' (filed by ``orchestrator.deterministic_runner``)
+# is the re-ask raised when a 'human_curator_gate' task resumes with no
+# 'human_curator_adjudicated_at' stamp; auto-closing it re-opens the task-3181
+# incident verbatim (esc-3181-1 was auto-resolved by the watcher whose own
+# resolution text said the curator work was "deliberately NOT executed"). Like
+# 'milestone_check_failed' it is ALSO covered today by L2_AUTO_CLOSE_DENY_ROLES
+# (it files under agent_role='orchestrator-deterministic'), and is listed here
+# for that same defense-in-depth reason.
+#
+# CROSS-LAYER PIN (reviewer amendment). The three RUNNER-FILED members below —
+# 'milestone_gate', 'milestone_check_failed', 'curator_adjudication_missing' —
+# are each duplicated from a named constant in
+# ``orchestrator.deterministic_runner`` (MILESTONE_GATE_CATEGORY /
+# MILESTONE_CHECK_FAILED_CATEGORY / CURATOR_ADJUDICATION_MISSING_CATEGORY) and
+# held in lockstep by the function-local orchestrator imports in
+# ``tests/test_authority.py``, per the layer-direction rule in this module's
+# docstring. 'design_concern' is NOT pinned that way, deliberately: it has no
+# single owning constant to import. It is filed as a bare literal from several
+# orchestrator call sites (twice in ``orchestrator.workflow``, once in
+# ``orchestrator.harness``) AND is a member of ``escalation.server``'s
+# operator-facing CATEGORIES vocabulary — a SHARED term, not one module's
+# duplicate, so there is no upstream definition a lockstep test could bind to.
 # Checked BEFORE the allowlist (denylist-first).
 L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset(
-    {'design_concern', 'milestone_gate', 'milestone_check_failed'}
+    {'design_concern', 'milestone_gate', 'milestone_check_failed',
+     'curator_adjudication_missing'}
 )
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —
@@ -142,12 +166,44 @@ class _L2CloseClass:
 #       (paused / ActiveState / MainPID / ActiveEnterTimestamp) — NOT an
 #       arbitrary "word=word" token, so incidental '='s in prose (e.g.
 #       'note=ok') can't satisfy the evidence requirement.
-#   (c) stale_task_scoped — mirrors harness._revalidate_open_l2: category-agnostic,
-#       requires a live get_task status citation showing the subject task went
-#       terminal / re-scoped / re-dispatched. The terminal-status alternative
-#       is anchored on a 'status=' / 'status:' citation shape, not a
-#       free-standing "is done" English phrase, so casual prose ("the work is
-#       done") can't satisfy it.
+#   (c) stale_task_scoped — category-agnostic, requires a live get_task
+#       citation showing the subject task went terminal / was re-scoped / was
+#       re-dispatched. All THREE alternatives are citation-anchored (task 4192):
+#       the terminal-status one on a 'status=' / 'status:' shape rather than a
+#       free-standing "is done" English phrase, and the two moved-on ones on an
+#       explicit preposition ('to'/'into'/'as' for re-scoped, 'as' only for
+#       re-dispatched) plus a task/run identifier. So neither "the work is
+#       done" nor "was rescoped last week" nor "re-dispatched it this morning"
+#       can satisfy it — the identity that writes this text is the LLM-driven
+#       watcher rotation, whose free-form close prose is exactly where such
+#       phrasing appears incidentally.
+#
+#       Precisely what the identifier requires, so the anchor is not read as
+#       stronger than it is: a token containing a DIGIT, optionally wrapped in
+#       '#' / quotes / backticks. It is not validated as a real task or run id,
+#       and a bare number counts — so count-shaped prose that happens to use
+#       the same preposition ("re-scoped into 2 subtasks") still matches. The
+#       load-bearing part is the preposition+token STRUCTURE, which the casual
+#       phrasing this anchor exists to reject never produces.
+#
+#       This class shares its INTENT with harness._revalidate_open_l2 — a
+#       subject that has gone terminal or moved on moots the escalation — but
+#       is NOT a mirror of it, in three ways (verified against harness.py
+#       _revalidate_open_l2 at main 6ee3eaec25):
+#         - Independent mechanism, no shared code: the harness sweep closes
+#           IN-PROCESS via self._escalation_queue.resolve(...) under the
+#           'harness-escalation-revalidation-sweep' role. It never issues an
+#           HTTP resolve_issue, so it never reaches l2_auto_close_class at all.
+#         - Strictly wider on CATEGORY: since task 2724 landed, the harness
+#           sweep is ALLOWLIST-gated on config.escalation_revalidation_allowlist
+#           (default {task_failure, stranded_blocked}); class (c) is
+#           category-AGNOSTIC modulo L2_AUTO_CLOSE_DENY_CATEGORIES.
+#         - Strictly wider on EVIDENCE: the harness closes only on a live batch
+#           get_statuses read showing the subject 'done'/'cancelled'; class (c)
+#           also accepts a cited re-scoped / re-dispatched citation, which the
+#           harness never checks.
+#       Class (c) is therefore the WIDEST auto-close door in this allowlist —
+#       weigh any further loosening of it against that.
 L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
     _L2CloseClass(
         name='superseded_main_sweep',
@@ -166,6 +222,15 @@ L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
             (r'\b(?:paused|ActiveState|MainPID|ActiveEnterTimestamp)\b\s*[=:>]\s*\S+',),
         ),
     ),
+    # FOLLOW-UP (open, deliberate — not an oversight): this class gates
+    # categories with a DENYLIST (L2_AUTO_CLOSE_DENY_CATEGORIES) while the
+    # harness revalidation sweep now gates with an ALLOWLIST
+    # (config.escalation_revalidation_allowlist, default
+    # {task_failure, stranded_blocked}). Task 2724 has landed on main, so that
+    # divergence is a fact today, not a future one. Aligning the two models is
+    # a behaviour change with its own blast radius — it would narrow which L2s
+    # the watcher can auto-close at all — and was scoped OUT of task 4192 by
+    # the 2026-08-12 operator ruling; it wants its own task and review.
     _L2CloseClass(
         name='stale_task_scoped',
         categories=None,
@@ -173,8 +238,15 @@ L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
         evidence=(
             (
                 r'status\s*[=:]\s*(done|cancelled)',
-                r're-?scoped',
-                r're-?dispatched',
+                # The optional [#`"'] wrappers admit the spellings this repo
+                # actually writes task references in — 'task #3821', a
+                # markdown-quoted `3821`, a quoted "task 3821" — which the
+                # as-ruled shapes rejected. They relax only the citation's
+                # PUNCTUATION, never its structure: an explicit preposition
+                # plus an identifier containing a digit is still required, so
+                # every casual-prose negative stays rejected.
+                r'''re-?scoped\s+(?:to|into|as)\s+[#`"']?(?:task\s+)?[#`"']?[a-z0-9_.:-]*\d''',
+                r'''re-?dispatched\s+as\s+[#`"']?(?:run|task)?[- ]?[#`"']?[a-z0-9_.:-]*\d''',
             ),
         ),
     ),

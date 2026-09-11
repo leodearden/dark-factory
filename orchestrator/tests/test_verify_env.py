@@ -9,6 +9,7 @@ orchestrator/src/orchestrator/verify.py: ``_VENV_ISOLATION_KEYS`` /
 """
 
 import os
+from pathlib import Path
 
 from orchestrator import verify
 from orchestrator.verify import (
@@ -101,6 +102,173 @@ class TestTargetSubprocessEnvScrub:
         env = _target_subprocess_env(None)
         assert env["PATH"] == "/home/leo/.cargo/bin:/usr/bin"
         assert env["PYTHONUNBUFFERED"] == "1"
+
+
+
+class TestRuffCacheIsWorktreeLocal:
+    """The ruff cache dir must terminate at the worktree boundary (task 3922).
+
+    ruff resolves BOTH its config and its cache by walking parent dirs up from
+    each linted file.  A task worktree whose own root declares no
+    ``[tool.ruff]`` therefore escapes: the walk reaches the PARENT checkout's
+    pyproject.toml and, with it, the parent's ``.ruff_cache`` — so a merge gate
+    running inside ``.worktrees/<id>`` reads and writes cache state shared with
+    every concurrently-verifying sibling and with the parent's UNCOMMITTED
+    working tree.
+
+    Measured on ruff 0.15.9 in exactly that geometry: setting
+    ``RUFF_CACHE_DIR`` redirects the reported ``cache_dir`` while leaving the
+    resolved ``Settings path`` AND the emitted rule codes byte-identical
+    ({I001, F401} both ways).  That rule-neutrality is what licenses applying
+    the lever UNCONDITIONALLY — to every worktree at any base age — instead of
+    a ``--config`` pin, which was measured to silently fall back to ruff's
+    built-in defaults ({F401} only) when aimed at a rule-less pyproject.
+    """
+
+    def test_worktree_local_ruff_cache_dir_is_injected(self, monkeypatch):
+        fake_environ = {
+            "VIRTUAL_ENV": ORCH_VENV,
+            "PATH": f"{ORCH_VENV}/bin:/usr/bin",
+            "HOME": "/home/leo",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None, worktree=Path("/w/.worktrees/77"))
+
+        assert env["RUFF_CACHE_DIR"] == "/w/.worktrees/77/.ruff_cache"
+        # the rest of the scrub is unchanged by the new parameter
+        assert env["PYTHONUNBUFFERED"] == "1"
+        assert "VIRTUAL_ENV" not in env
+
+    def test_caller_overlay_still_wins_over_injected_cache_dir(self, monkeypatch):
+        # An operator's `verify_env` (module or top-level, merged by
+        # _resolve_verify_env) must stay authoritative — same contract the
+        # CARGO_INCREMENTAL case above pins for os.environ.  This is what
+        # keeps the injection's POSITION (above `env.update(extra)`) load
+        # bearing: move it below and this assertion goes red.
+        fake_environ = {"PATH": "/usr/bin", "RUFF_CACHE_DIR": "/ambient/cache"}
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(
+            {"RUFF_CACHE_DIR": "/operator/chosen"},
+            worktree=Path("/w/.worktrees/77"),
+        )
+
+        assert env["RUFF_CACHE_DIR"] == "/operator/chosen"
+
+    def test_no_worktree_leaves_ruff_cache_dir_untouched(self, monkeypatch):
+        # BACK-COMPAT: non-verify callers (and the project_root path) pass no
+        # worktree, so nothing is injected and any ambient value is preserved
+        # verbatim — the injection must never be synthesised from os.getcwd().
+        fake_environ = {"PATH": "/usr/bin", "RUFF_CACHE_DIR": "/ambient/cache"}
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+        assert _target_subprocess_env(None)["RUFF_CACHE_DIR"] == "/ambient/cache"
+
+        bare_environ = {"PATH": "/usr/bin"}
+        monkeypatch.setattr(verify.os, "environ", bare_environ)
+        assert "RUFF_CACHE_DIR" not in _target_subprocess_env(None)
+
+class TestOrchEnvScrub:
+    """The orchestrator's ``ORCH_*`` control-plane namespace must not leak into
+    a TARGET verify/build/test subprocess.
+
+    ``OrchestratorConfig`` is a pydantic-settings ``BaseSettings`` whose
+    ``env_settings`` source reads the WHOLE ``ORCH_`` prefix as config
+    overrides, so any ambient ``ORCH_*`` var — especially the
+    ``load_config``-stamped ``ORCH_CONFIG_PATH`` — poisons a snapshot-era
+    env-sensitive test into loading the production
+    ``dark-factory-orchestrator.yaml`` instead of its defaults.  That is the
+    eval metric-collector ``metrics.tests_pass`` falsification (task 2957 /
+    ``plans/eval-metric-collector-orch-config-leak-rca-2026-07-22.md``): the
+    collector's post-hoc ``run_verification`` inherits the runner's leaked
+    ``ORCH_CONFIG_PATH`` and the whole-suite ``-x`` pytest aborts on
+    ``test_config.py::TestDefaults`` before the task's own tests run.  This
+    scrub isolates the ``ORCH_`` namespace one layer earlier than main's
+    autouse ``_isolate_orch_config`` fixture (at the subprocess-env layer), so
+    even snapshot-era source that predates that fixture runs hermetically.
+    """
+
+    def test_orch_prefixed_vars_scrubbed(self, monkeypatch):
+        fake_environ = {
+            "ORCH_CONFIG_PATH": (
+                "/home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
+            ),
+            "ORCH_LOCK_DEPTH": "3",
+            "ORCH_DEBUG_ASSERTS": "1",
+            "HOME": "/home/leo",
+            "PATH": "/usr/bin:/bin",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None)
+
+        # every ORCH_* control-plane var is gone
+        for key in ("ORCH_CONFIG_PATH", "ORCH_LOCK_DEPTH", "ORCH_DEBUG_ASSERTS"):
+            assert key not in env, f"{key} leaked into target subprocess env"
+
+        # non-ORCH vars pass through; PYTHONUNBUFFERED is set unconditionally
+        assert env["HOME"] == "/home/leo"
+        assert env["PYTHONUNBUFFERED"] == "1"
+
+    def test_orch_config_path_scrubbed_from_real_environ(self, monkeypatch):
+        # Mirror load_config's in-process ``os.environ['ORCH_CONFIG_PATH'] =
+        # ...`` mutation (config.py) — the eval leak path — against the REAL
+        # os.environ (not a synthetic dict).  It must not reach the target.
+        monkeypatch.setenv(
+            "ORCH_CONFIG_PATH",
+            "/home/leo/src/dark-factory/dark-factory-orchestrator.yaml",
+        )
+
+        env = _target_subprocess_env(None)
+
+        assert "ORCH_CONFIG_PATH" not in env
+
+    def test_orch_overlay_value_survives_scrub(self, monkeypatch):
+        # The scrub removes only AMBIENT-inherited ORCH_* vars; an ORCH_ var a
+        # caller intentionally injects via the overlay (_resolve_verify_env)
+        # still reaches the target and wins — env.update(extra) runs AFTER the
+        # base env-comprehension scrub, preserving the overlay-wins contract.
+        fake_environ = {
+            "ORCH_CONFIG_PATH": (
+                "/home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
+            ),
+            "PATH": "/usr/bin:/bin",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        overlay = {
+            "ORCH_CONFIG_PATH": "/custom/path.yaml",
+            "DF_VERIFY_ROLE": "merge",
+        }
+        env = _target_subprocess_env(overlay)
+
+        # the intentional overlay value survives the scrub and wins
+        assert env["ORCH_CONFIG_PATH"] == "/custom/path.yaml"
+        assert env["DF_VERIFY_ROLE"] == "merge"
+
+    def test_non_prefixed_lookalike_keys_survive(self, monkeypatch):
+        # Lock the scrub to the ``ORCH_`` PREFIX (``startswith``), NOT a
+        # substring match: a var that merely contains "ORCH", or starts with
+        # "ORCH" but not the "ORCH_" prefix, is a distinct namespace and must
+        # pass through untouched.  A future refactor to substring matching would
+        # silently over-scrub these — this test catches that regression.
+        fake_environ = {
+            "ORCH_CONFIG_PATH": "/prod.yaml",  # real ORCH_ prefix — scrubbed
+            "ORCHARD_HOME": "/orchard",  # "ORCH" but not the "ORCH_" prefix
+            "MY_ORCH_CONFIG": "/my",  # "ORCH_" only as a substring, not prefix
+            "FOO_ORCH": "1",  # "ORCH" only as a substring, not prefix
+            "PATH": "/usr/bin:/bin",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None)
+
+        # the genuine ORCH_-prefixed var is scrubbed ...
+        assert "ORCH_CONFIG_PATH" not in env
+        # ... but the non-prefixed lookalikes all survive
+        assert env["ORCHARD_HOME"] == "/orchard"
+        assert env["MY_ORCH_CONFIG"] == "/my"
+        assert env["FOO_ORCH"] == "1"
 
 
 class TestStripVenvBinFromPath:

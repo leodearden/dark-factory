@@ -7,8 +7,20 @@ known escalation URL concurrently and aggregate the results into a
 ``{project_label: {wired, halted, owner_esc_id, offline}}`` dict.
 
 The default ``mcp_tool_call`` timeout is 10s — too slow for a 3s polling
-loop. We wrap each call in ``asyncio.wait_for`` so worst-case latency is
-capped close to ``per_call_timeout`` even when every orchestrator is down.
+loop. The probe budget is bounded at **two complementary layers**, both
+required:
+
+1. **Per HTTP request** — ``per_call_timeout`` is threaded into
+   ``mcp_tool_call``, which hands it to ``client.post``. This bounds
+   connect/read/write *and pool acquisition*; without it a probe on a 2.0s
+   budget could still block up to httpx's 10s default waiting for a free
+   connection slot on the shared client.
+2. **Per whole operation** — each call stays wrapped in
+   ``asyncio.wait_for`` so worst-case latency is capped close to
+   ``per_call_timeout`` even when every orchestrator is down. Layer 1 alone
+   cannot deliver that: a *cold* session performs three posts (initialize,
+   notifications/initialized, tools/call), so a per-request bound of T
+   permits roughly 3T overall.
 """
 
 from __future__ import annotations
@@ -33,7 +45,9 @@ async def _probe_one(
 ) -> dict[str, Any]:
     try:
         result = await asyncio.wait_for(
-            mcp_tool_call(client, base_url, 'get_merge_halt_status', {}),
+            mcp_tool_call(
+                client, base_url, 'get_merge_halt_status', {}, timeout=timeout,
+            ),
             timeout=timeout,
         )
     except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:

@@ -1,0 +1,26 @@
+[Unit]
+Description=Nightly timer for reify's closure-staleness sweep + re-dispatch drain (task 3102)
+
+[Timer]
+# Nightly at 04:30 local time -- the next free slot in this machine's
+# deliberately-staggered nightly ladder:
+#
+#   03:00  legibility-trickle@
+#   03:30  fused-memory-flag-marker-sweep
+#   04:00  reclaim-orphaned-worktrees  AND  legibility-transcript-check@
+#   04:30  this job
+#
+# The stagger is deliberate: these jobs share a machine and, in two cases, the
+# same backing stores. See OPERATIONS.md for the ladder as a whole.
+#
+# Persistent=true catches up a night missed to a sleeping/offline laptop on the
+# next boot or login instead of silently skipping it -- which matters here more
+# than for most jobs, since a skipped night leaves stranded reify rows stranded
+# for another day. A small randomized delay avoids a thundering herd with other
+# timers firing at the same instant.
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

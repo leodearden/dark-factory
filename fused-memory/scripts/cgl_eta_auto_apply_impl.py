@@ -212,6 +212,41 @@ async def main() -> int:
             return 3
 
         # 5. apply
+        #
+        # This call is this script's ENTIRE mutation surface, and it is
+        # deliberately NOT separately guarded by
+        # assert_store_mutation_allowed (task 4293). It inherits
+        # migrate_cross_graph_leak's fail-closed store preflight: _load_migrate
+        # above EXECUTES that file via importlib.spec_from_file_location, so
+        # the probe in its run() runs for this call exactly as it does for the
+        # CLI.
+        #
+        # The COST of siting the only probe here is real and is stated rather
+        # than waved away: in a write-denied environment steps 2-4 above (a
+        # fresh full-graph census, the cross-target recovery dump, and a
+        # FalkorDB BGSAVE plus a docker cp of the whole RDB with up to a 120s
+        # poll) are all performed and then thrown away when the refusal
+        # finally arrives here. An early probe at the top of main() would cost
+        # one file create+unlink and would buy that back. It is not added
+        # because a single probe site keeps this script's guard exactly
+        # co-extensive with migrate's -- there is no second message to keep in
+        # sync, and no way for the two to disagree about what is allowed. If
+        # that trade is ever revisited, the early probe is the change to make;
+        # migrate's run() probe must stay the authoritative one either way.
+        #
+        # That inheritance is load-bearing and fragile, so two things must stay
+        # true (both pinned by tests/test_cgl_eta_auto_apply_impl.py):
+        #   * the guard must live in migrate's run(). This script has no
+        #     argparse at all -- it builds SimpleNamespace(apply=True)
+        #     unconditionally, right here -- so a guard moved to migrate's
+        #     main()/build_arg_parser() would be bypassed entirely, leaving the
+        #     one bulk-apply in the tree that applies with no flag as the only
+        #     unguarded one;
+        #   * reaching migrate any other way does not inherit it:
+        #     _load_migrate never registers the module in sys.modules, so a
+        #     sys.modules-based lookup or interception finds nothing.
+        # The dry-run census at step 2 above is correctly NOT probed -- it
+        # mutates nothing and returns before migrate's guard site.
         apply_args = types.SimpleNamespace(apply=True, manifest=str(man_path), page_size=1000, config=None)
         report = await migrate.run(apply_args, shim)
         rep_path = OUTDIR / f'apply-report-{STAMP}.json'

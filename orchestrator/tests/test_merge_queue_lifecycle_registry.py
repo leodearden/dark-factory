@@ -23,9 +23,12 @@ convention.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+import inspect
 import logging
+import textwrap
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -676,6 +679,565 @@ class TestRequeueToQueuedSites:
         assert worker._lifecycle.current(req.request_id) is None
         assert len(fake_eq.submitted) == 0, (
             f'unregistered requeue must stay silent: {fake_eq.submitted!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-5 PART 2 RED / step-6 GREEN: the on_requeued/_note_requeue
+# PAIRING INVARIANT.
+#
+# The canonical requeue recipe — named verbatim by the contended-lease
+# branch's own comment — is
+#   release_or_cleanup + put_nowait + on_requeued + _note_requeue + REQUEUED.
+# Four of the five requeue sites follow it; one (the dead-verify no-progress
+# abort) omits `_note_requeue`, and that omission is this task's defect. The
+# ledger half and the registry half must move together at EVERY site, so this
+# is pinned two ways: a RUNTIME spy-parity check over the drivable paths, and
+# an AST STRUCTURAL check over all five sites (including the two a unit test
+# cannot easily drive).
+#
+# Sibling task 3204 owns extracting the five-site recipe into one helper; this
+# task lands only the invariant.
+# ---------------------------------------------------------------------------
+
+
+async def _make_merged_item(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    filename: str,
+    content: str,
+):
+    """Create a merged ``RealMergeItem`` on a fresh branch (real git, no mocks).
+
+    Duplicated from test_merge_queue_request_liveness.py:621 (per-file
+    duplication convention — see this file's module docstring).
+    """
+    from orchestrator.merge_queue import RealMergeItem
+
+    wt = await _make_branch_with_file(git_ops, branch, filename, content)
+    req = _make_request(branch, branch, wt, config)
+    merge_result = await git_ops.merge_to_main(wt, branch)
+    assert merge_result.success and merge_result.merge_commit, f'{merge_result!r}'
+    assert merge_result.merge_worktree is not None
+    base_sha = await git_ops.get_main_sha()
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        base_sha=base_sha,
+        speculative=False,
+    )
+    return req, item
+
+
+async def _dead_gate_never_returns(*args: object, **kwargs: object) -> MagicMock:
+    """Simulates a dead/hung LOCAL verify: never returns, never writes.
+
+    Duplicated from test_merge_queue_request_liveness.py:1090 (per-file
+    duplication convention).
+    """
+    await asyncio.Event().wait()
+    raise AssertionError('unreachable — this Event is never set')  # pragma: no cover
+
+
+def _attr_calls(node: ast.AST, attr: str) -> list[ast.Call]:
+    """Every ``<something>.attr(...)`` call in *node*'s subtree."""
+    return [
+        n for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == attr
+    ]
+
+
+def _first_arg_src(call: ast.Call, aliases: dict[str, str] | None = None) -> str:
+    """The source text of *call*'s first positional argument ('' if none).
+
+    A bare ``Name`` argument is resolved through *aliases* (local
+    ``name = <expr>`` bindings) so a cosmetic ``rid = req.request_id`` beside
+    ``self._note_requeue(req.request_id, ...)`` still reads as the same
+    request_id rather than a spurious pairing failure (amendment review,
+    task 3082).
+    """
+    if not call.args:
+        return ''
+    src = ast.unparse(call.args[0])
+    if aliases and isinstance(call.args[0], ast.Name):
+        return aliases.get(src, src)
+    return src
+
+
+@pytest.mark.asyncio
+class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
+    """Every requeue site must move the ledger AND the lifecycle registry
+    together: an ``on_requeued(rid)`` call is only correct when a
+    ``_note_requeue(rid)`` call sits beside it (task 3082 step-5 RED / step-6
+    GREEN, requirement 3).
+
+    RED until step-6 adds the missing ``_note_requeue`` to the dead-verify
+    no-progress abort.
+    """
+
+    async def test_every_driven_requeue_moves_ledger_and_registry_together(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """RUNTIME spy parity: drive three requeue paths on ONE worker and
+        assert the recorded request_id MULTISETS are equal.
+
+        Two are known-good controls (the contended-lease defer and the
+        pre-dispatch operator halt) and one is the defect (the dead-verify
+        no-progress abort). Asserting equality against controls in the SAME
+        test is what makes this a parity check rather than a restatement of the
+        site-level test in test_merge_queue_request_liveness.py.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        ledger_rids: list[str] = []
+        registry_rids: list[str] = []
+        real_on_requeued = worker._request_ledger.on_requeued
+        real_note_requeue = worker._note_requeue
+
+        def _spy_on_requeued(rid: str, *a: Any, **k: Any) -> Any:
+            ledger_rids.append(rid)
+            return real_on_requeued(rid, *a, **k)
+
+        def _spy_note_requeue(rid: str, *a: Any, **k: Any) -> Any:
+            registry_rids.append(rid)
+            return real_note_requeue(rid, *a, **k)
+
+        worker._request_ledger.on_requeued = _spy_on_requeued  # type: ignore[method-assign]
+        worker._note_requeue = _spy_note_requeue  # type: ignore[method-assign]
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        async def _lease_contended(*_a: object, **_k: object) -> object:
+            raise MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
+
+        # ── CONTROL 1: contended-lease defer (merge_queue.py :13839/:13840) ──
+        req_cl, item_cl = await _make_merged_item(
+            git_ops, config, 'df3082-pair-contended', 'pc.py', 'c=1\n',
+        )
+        worker._register_owned_merge_worktree(item_cl.merge_wt)
+        worker._register_item(item_cl, initial=ItemLifecycleState.VERIFYING)
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _lease_contended):
+            vr_cl = await asyncio.wait_for(
+                worker._run_inflight_verify(item_cl, lease), timeout=15.0,
+            )
+        assert vr_cl.status == InflightStatus.REQUEUED, f'{vr_cl!r}'
+
+        # ── THE DEFECT: dead-verify no-progress abort (:13775/:13776) ────────
+        req_dv, item_dv = await _make_merged_item(
+            git_ops, config, 'df3082-pair-deadverify', 'pd.py', 'd=1\n',
+        )
+        worker._register_owned_merge_worktree(item_dv.merge_wt)
+        worker._register_item(item_dv, initial=ItemLifecycleState.VERIFYING)
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns,
+        ):
+            vr_dv = await asyncio.wait_for(
+                worker._run_inflight_verify(item_dv, lease), timeout=15.0,
+            )
+        assert vr_dv.status == InflightStatus.REQUEUED, f'{vr_dv!r}'
+
+        # ── CONTROL 2: pre-dispatch operator halt (:14727/:14730) ────────────
+        # LAST, because setting _operator_halt would otherwise route the two
+        # _run_inflight_verify drives above into the operator-halt abort
+        # (trigger 2) instead of the branches under test.
+        req_ph = _make_request('df3082-pair-halt', 'df3082-pair-halt', tmp_path, config)
+        item_ph = RealMergeItem(
+            request=req_ph, merge_result=MagicMock(),
+            merge_wt=tmp_path / 'merge_wt_ph', base_sha='deadbeef', speculative=False,
+        )
+        worker._register_item(item_ph, initial=ItemLifecycleState.DISPATCHING)
+        worker._operator_halt.set()
+        entry_ph = await worker._dispatch_item(item_ph)
+        assert entry_ph is not None
+        assert entry_ph.status == InflightStatus.REQUEUED_PREDISPATCH, f'{entry_ph!r}'
+
+        expected = {req_cl.request_id, req_dv.request_id, req_ph.request_id}
+        assert set(ledger_rids) == expected, (
+            f'all three drives must have hit the ledger requeue: {ledger_rids!r}'
+        )
+        assert sorted(registry_rids) == sorted(ledger_rids), (
+            f'every on_requeued must be paired with a _note_requeue at the same '
+            f'site — ledger={sorted(ledger_rids)!r} registry={sorted(registry_rids)!r}; '
+            f'unpaired={sorted(set(ledger_rids) - set(registry_rids))!r}'
+        )
+        for rid in expected:
+            assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED, (
+                f'{rid} must be left at QUEUED; reads {worker._lifecycle.current(rid)!r}'
+            )
+
+    async def test_every_on_requeued_call_site_has_a_sibling_note_requeue(self) -> None:
+        """STRUCTURAL parity over EVERY ``on_requeued`` site, via ``ast``.
+
+        Covers the site a unit test cannot easily drive (the head-failure
+        cascade's downstream self-requeue) and fails loudly if a future requeue
+        site forgets the call.
+
+        Keys on the enclosing function name and the argument EXPRESSION, never
+        on line numbers (they drift) and deliberately NOT on the site COUNT
+        (amendment review, task 3082: a count is a number, not an invariant —
+        task 3204's pending extraction of the recipe into one helper will
+        legitimately collapse it). Bare ``Name`` arguments are resolved through
+        their local binding so a cosmetic ``rid = req.request_id`` is not a
+        spurious failure. The pairing must be a sibling in the same statement
+        block — function-level scoping would be too weak, since
+        ``_run_inflight_verify`` contains both a correctly-paired requeue
+        branch and (before step-6) an unpaired one, both using
+        ``req.request_id``.
+        """
+        import orchestrator.merge_queue as _mq  # module-local import convention
+
+        source = Path(inspect.getfile(_mq)).read_text()
+        tree = ast.parse(source)
+
+        # id(node) -> parent node, and id(stmt) -> the statement list holding it.
+        parent: dict[int, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parent[id(child)] = node
+        owner: dict[int, list] = {}
+        for node in ast.walk(tree):
+            for field in ('body', 'orelse', 'finalbody'):
+                block = getattr(node, field, None)
+                if isinstance(block, list):
+                    for st in block:
+                        if isinstance(st, ast.stmt):
+                            owner[id(st)] = block
+
+        def _enclosing(node: ast.AST, kinds: tuple[type, ...]) -> ast.AST | None:
+            cur: ast.AST | None = node
+            while cur is not None and not isinstance(cur, kinds):
+                cur = parent.get(id(cur))
+            return cur
+
+        # Local `name = <expr>` bindings, so a bare Name argument at either call
+        # resolves to the same expression text (amendment review, task 3082).
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = ast.unparse(node.value)
+
+        sites = _attr_calls(tree, 'on_requeued')
+        assert sites, 'no on_requeued call sites found — the AST walk is mis-wired'
+
+        unpaired: list[str] = []
+        for call in sites:
+            stmt = _enclosing(call, (ast.stmt,))
+            assert stmt is not None
+            block = owner.get(id(stmt))
+            assert block is not None, f'on_requeued at line {call.lineno} has no block'
+            arg = _first_arg_src(call, aliases)
+            siblings = {
+                _first_arg_src(c, aliases)
+                for sib in block for c in _attr_calls(sib, '_note_requeue')
+            }
+            if arg not in siblings:
+                fn = _enclosing(call, (ast.FunctionDef, ast.AsyncFunctionDef))
+                unpaired.append(
+                    f'{getattr(fn, "name", "<module>")}:{call.lineno} '
+                    f'on_requeued({arg}) has no sibling _note_requeue({arg})'
+                )
+
+        assert unpaired == [], (
+            'every on_requeued call site must carry a sibling _note_requeue with the '
+            'SAME request_id expression (the canonical requeue recipe: '
+            'release_or_cleanup + put_nowait + on_requeued + _note_requeue + '
+            f'InflightStatus.REQUEUED). Unpaired: {unpaired!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3204 step-1 RED / step-2 GREEN: the requeue recipe has a single
+# CHOKEPOINT — `SpeculativeMergeWorker._requeue_request`.
+#
+# This is the strictly stronger, "preferred" form of the pairing invariant
+# that TestOnRequeuedIsAlwaysPairedWithNoteRequeue (above) asserts in its
+# weaker sibling form. Both are kept deliberately: after the extraction the
+# sibling test still holds (the helper body keeps the two calls as siblings in
+# one statement block), while sole-callership adds the property that makes
+# re-introducing task 3082's defect impossible to EXPRESS — an unpaired
+# requeue can no longer be written outside the helper at all.
+# ---------------------------------------------------------------------------
+
+_MQ_CHOKEPOINT_CLASS = 'SpeculativeMergeWorker'
+_MQ_REQUEUE_CHOKEPOINT = '_requeue_request'
+
+
+def _chokepoint_ranges(tree: ast.Module, cls_name: str, method_name: str) -> list[tuple[int, int]]:
+    """Line ranges of every *method_name* defined DIRECTLY on ``class cls_name``.
+
+    Copied from test_lock_release_single_writer_guard.py:134 (and the same
+    recursion in test_prune_chokepoint_guard.py) per the per-file duplication
+    convention for orchestrator test helpers — there is deliberately no shared
+    guard conftest.
+
+    Class-qualification matters: a plain name-only scan would also sanction a
+    same-named method on ANOTHER class, or a module-level function. The walk
+    tracks the nearest *directly enclosing* ClassDef and resets it to None
+    inside a function body, so a closure nested within a method does not
+    inherit the class qualification either.
+    """
+    ranges: list[tuple[int, int]] = []
+
+    def visit(node: ast.AST, enclosing_class: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.name == method_name and enclosing_class == cls_name:
+                    ranges.append((child.lineno, getattr(child, 'end_lineno', child.lineno)))
+                visit(child, None)
+            else:
+                visit(child, enclosing_class)
+
+    visit(tree, None)
+    return ranges
+
+
+def _requeue_chokepoint_offenders(source: str) -> list[str]:
+    """Every requeue-recipe call site in *source* OUTSIDE the chokepoint.
+
+    A "requeue-recipe call site" is a ``self._queue.put_nowait(...)`` (the
+    queue half) or any ``<something>.on_requeued(...)`` (the ledger half).
+    Both must live inside ``SpeculativeMergeWorker._requeue_request``, which is
+    what makes the two halves — plus the ``_note_requeue`` registry mirror the
+    helper also fires — impossible to separate.
+
+    Deliberately does NOT scan ``_note_requeue`` call sites: the invariant is
+    ONE-DIRECTIONAL (every ``on_requeued`` needs a ``_note_requeue``, not the
+    converse), and ``_finalize_inflight``'s sentinel chokepoint repair is a
+    legitimate unpaired ``_note_requeue``. Deliberately does NOT assert a site
+    COUNT either — see the :888 docstring above: a count is a number, not an
+    invariant.
+
+    Pure (takes source text, not a path) so the scanner self-tests below can
+    drive it on synthetic modules; :func:`_scan_merge_queue_requeue_sites` is
+    the thin read_text() wrapper. Returns ``[]`` rather than raising on a
+    source that cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    ranges = _chokepoint_ranges(tree, _MQ_CHOKEPOINT_CLASS, _MQ_REQUEUE_CHOKEPOINT)
+
+    parent: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[id(child)] = node
+
+    def _enclosing_fn(node: ast.AST) -> str:
+        cur: ast.AST | None = node
+        while cur is not None and not isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            cur = parent.get(id(cur))
+        return getattr(cur, 'name', '<module>')
+
+    # `put_nowait` is anchored on the `_queue` receiver: an unrelated
+    # `.put_nowait()` on some other queue is not a requeue. `on_requeued` needs
+    # no anchor — it exists solely for this recipe.
+    sites: list[ast.Call] = [
+        call for call in _attr_calls(tree, 'put_nowait')
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == '_queue'
+    ]
+    sites += _attr_calls(tree, 'on_requeued')
+
+    offenders = [
+        f'{_enclosing_fn(call)}:{call.lineno} {ast.unparse(call)}'
+        for call in sites
+        if not any(start <= call.lineno <= end for start, end in ranges)
+    ]
+    # ast.walk is breadth-first, so hits come out in tree-depth order rather
+    # than source order. Sort so the offender list reads top-to-bottom.
+    offenders.sort(key=lambda entry: int(entry.split(':', 1)[1].split(' ', 1)[0]))
+    return offenders
+
+
+def _scan_merge_queue_requeue_sites() -> list[str]:
+    """Thin read_text() wrapper around :func:`_requeue_chokepoint_offenders`."""
+    import orchestrator.merge_queue as _mq  # module-local import convention
+
+    return _requeue_chokepoint_offenders(Path(inspect.getfile(_mq)).read_text())
+
+
+class TestRequeueRecipeHasASingleChokepoint:
+    """``_requeue_request`` is the SOLE caller of both ``_queue.put_nowait``
+    and ``on_requeued`` (task 3204 requirement 3, "preferred" form).
+
+    RED until step-2 adds the helper and routes all five requeue sites
+    through it.
+    """
+
+    # ── scanner self-tests: the ratchet must never pass vacuously ──────────
+
+    def test_scanner_accepts_a_compliant_chokepoint(self) -> None:
+        """POSITIVE control: both halves inside the helper -> no offenders."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    def _requeue_request(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+            '        self._request_ledger.on_requeued(req.request_id)\n'
+            '        self._note_requeue(req.request_id, live_obj=req)\n'
+        )
+        assert _requeue_chokepoint_offenders(src) == []
+
+    def test_scanner_flags_a_bypass_outside_the_helper(self) -> None:
+        """SYNTHETIC BYPASS: a second method re-queuing by hand is flagged.
+
+        This is the whole point of the guard — without it the scanner could be
+        mis-wired and still report a green ratchet.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    def _requeue_request(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+            '        self._request_ledger.on_requeued(req.request_id)\n'
+            '\n'
+            '    def _sneaky(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+            '        self._request_ledger.on_requeued(req.request_id)\n'
+        )
+        offenders = _requeue_chokepoint_offenders(src)
+        assert len(offenders) == 2, offenders
+        assert all(entry.startswith('_sneaky:') for entry in offenders), offenders
+
+    def test_scanner_flags_a_same_named_method_on_another_class(self) -> None:
+        """CLASS-QUALIFICATION: a ``_requeue_request`` on some OTHER class does
+        not sanction its body — that is why the copied ``_chokepoint_ranges``
+        recursion tracks the nearest directly-enclosing ClassDef.
+        """
+        src = (
+            'class SomethingElse:\n'
+            '    def _requeue_request(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+        )
+        offenders = _requeue_chokepoint_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('_requeue_request:'), offenders
+
+    def test_scanner_ignores_docstring_and_comment_mentions(self) -> None:
+        """AST-not-regex: prose naming the guarded symbols is not a call site.
+
+        merge_queue.py genuinely contains several such mentions (the
+        ``_queue.put_nowait(req)`` re-arm narrative and the REQUEUED_PREDISPATCH
+        comment), so a grep-based guard would report them as offenders forever.
+        """
+        src = (
+            '"""A module whose docstring names on_requeued and\n'
+            'self._queue.put_nowait(req) purely as prose."""\n'
+            '\n'
+            '# self._queue.put_nowait(req) in a comment is not a call either.\n'
+            'X = 1\n'
+        )
+        assert _requeue_chokepoint_offenders(src) == []
+
+    def test_scanner_returns_empty_on_unparseable_source(self) -> None:
+        """SYNTAX ERROR: return [] rather than raising."""
+        assert _requeue_chokepoint_offenders('def broken(:\n') == []
+
+    # ── the ratchet ────────────────────────────────────────────────────────
+
+    def test_requeue_recipe_has_exactly_one_chokepoint(self) -> None:
+        """STRUCTURAL: no ``_queue.put_nowait`` / ``on_requeued`` call site in
+        merge_queue.py lives outside ``_requeue_request``.
+        """
+        offenders = _scan_merge_queue_requeue_sites()
+        assert offenders == [], (
+            'the requeue recipe must have exactly ONE chokepoint: every '
+            '`self._queue.put_nowait(...)` and `.on_requeued(...)` call site in '
+            'merge_queue.py must live inside '
+            f'`{_MQ_CHOKEPOINT_CLASS}.{_MQ_REQUEUE_CHOKEPOINT}`, which fires the '
+            'queue, the ledger and the lifecycle-registry re-arm together and '
+            'atomically. Route these sites through `self._requeue_request(req)` '
+            f'instead. Offenders: {offenders!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestRequeueRequestHelperContract:
+    """``_requeue_request`` moves the queue, the ledger and the registry
+    together, and is deliberately SYNCHRONOUS (task 3204 step-1 RED).
+    """
+
+    async def test_requeue_request_moves_queue_ledger_and_registry_together(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        worker = _make_worker(git_ops)
+        req = _make_request('df3204-helper', 'df3204-helper', tmp_path, config)
+        rid = worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
+        worker._request_ledger.on_dequeue(req, now=0.0)
+        assert rid in worker._request_ledger.open_request_ids()
+
+        worker._requeue_request(req)
+
+        assert worker._queue.qsize() == 1, 'the request must be back on _queue'
+        assert worker._queue.get_nowait() is req
+        assert rid not in worker._request_ledger.open_request_ids(), (
+            'the ledger entry must be removed so this parked request never ages out'
+        )
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED, (
+            f'registry must read QUEUED; reads {worker._lifecycle.current(rid)!r}'
+        )
+        # The OBJECT SWAP is what actually prevents a phantom finalize head:
+        # `_finalizing_head_entry()` only counts `isinstance(obj, InflightEntry)`.
+        assert worker._live_items[rid] is req, (
+            '_live_items must hold the MergeRequest, not the InflightEntry'
+        )
+
+    async def test_requeue_request_is_synchronous(self, git_ops: GitOps) -> None:
+        """The helper must be a plain ``def``, never ``async def``.
+
+        That is the property which makes the documented atomicity — no `await`
+        between the ``put_nowait`` and the registry re-arm, so the merger
+        loop's drain can never observe the request on ``_queue`` while the
+        registry still reads VERIFYING — STRUCTURAL rather than conventional.
+        """
+        worker = _make_worker(git_ops)
+        assert not inspect.iscoroutinefunction(worker._requeue_request), (
+            '_requeue_request must stay sync: an await between the put_nowait and '
+            'the _note_requeue re-opens exactly the window task 3082 closed'
+        )
+        # AST, not a substring grep: the docstring legitimately discusses
+        # `await`, and this repo's guard convention is against
+        # inspect.getsource substring tripwires as brittle.
+        body = ast.parse(
+            textwrap.dedent(inspect.getsource(type(worker)._requeue_request)),
+        )
+        suspend_points = [
+            node for node in ast.walk(body)
+            if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith))
+        ]
+        assert suspend_points == [], (
+            '_requeue_request must contain no suspension point: an await between '
+            'the put_nowait and the _note_requeue lets the merger loop drain a '
+            'request whose registry still reads VERIFYING — the exact window '
+            f'task 3082 closed. Found at lines {[n.lineno for n in suspend_points]}'
         )
 
 
@@ -1372,6 +1934,392 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         await worker.stop()
         await worker_task
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-1 RED / step-2 GREEN: a DROPPED/REQUEUED sentinel entry must
+# never be recorded as FINALIZING.
+#
+# ``_finalize_inflight``'s VERIFYING -> FINALIZING hop is guarded ONLY against
+# ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH, and it sits BEFORE the
+# DROPPED/REQUEUED sentinel check — so a requeued item reaches it and BOTH
+# dispositions are wrong:
+#   (B) registry still at VERIFYING (a requeue site that skipped
+#       ``_note_requeue``): the hop fires SILENTLY, records the requeued item
+#       as FINALIZING and swaps ``_live_items[rid]`` to the InflightEntry, so
+#       ``_finalizing_head_entry()`` returns a phantom head forever.
+#   (A) registry already bounced to QUEUED (the shape all four working
+#       requeue siblings produce): ``_advance_if_at`` neither fires nor
+#       tolerates QUEUED, falls through to ``_note_transition`` and fires a
+#       dedup'd ``merge_lifecycle_transition_rejected`` L1 on EVERY dead-verify
+#       abort — a legitimate, expected, recurring event.
+# Moving the hop below the sentinel check makes a DROPPED/REQUEUED item never
+# reach it at all: correct by construction in both directions.
+# ---------------------------------------------------------------------------
+
+
+async def _make_verifying_entry_with_sentinel(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    filename: str,
+    content: str,
+    *,
+    escalation_queue: Any,
+    status: Any,
+) -> tuple[Any, MergeRequest, Any]:
+    """Build ``(worker, req, entry)`` for a REAL merged item registered at
+    VERIFYING whose already-completed ``verify_task`` carries an
+    ``InflightVerifyResult`` with sentinel *status* (task 3082).
+
+    The shape mirrors
+    ``TestFinalizeInflightRegistersFinalizingAndTerminal::
+    test_live_items_holds_entry_during_finalizing_window`` (:1097) — a real
+    ``git_ops.merge_to_main`` + ``RealMergeItem`` + mocked host allocator —
+    differing only in that ``verify_task`` is a completed future carrying the
+    sentinel rather than ``None``.  Both task-3082 classes below need exactly
+    this fixture chain.
+
+    NOTE ``_register_item`` leaves ``_live_items[rid]`` holding the
+    ``RealMergeItem``, NOT the ``InflightEntry`` — production swaps it at
+    ``_inflight_append``.  That is deliberate here: it makes the ``live_obj``
+    swap performed by whichever registry hop actually runs directly
+    observable, which is the mechanism under test.
+    """
+    from orchestrator.merge_queue import (
+        InflightEntry,
+        InflightVerifyResult,
+        ItemLifecycleState,
+        RealMergeItem,
+        SpeculativeMergeWorker,
+    )
+    from orchestrator.verify_runner import HostLease
+
+    wt = await _make_branch_with_file(git_ops, branch, filename, content)
+    req = _make_request(branch, branch, wt, config)
+    merge_result = await git_ops.merge_to_main(wt, branch)
+    assert merge_result.success and merge_result.merge_commit, f'{merge_result!r}'
+    assert merge_result.merge_worktree is not None
+    base_sha = await git_ops.get_main_sha()
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        base_sha=base_sha,
+        speculative=False,
+    )
+
+    worker = SpeculativeMergeWorker(
+        git_ops, asyncio.Queue(), escalation_queue=escalation_queue,
+    )
+    mock_allocator = MagicMock()
+    mock_allocator.release = AsyncMock()
+    mock_allocator.cancel_and_release = AsyncMock()
+    worker._host_allocator = mock_allocator
+    worker._register_owned_merge_worktree(item.merge_wt)
+    worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+    async def _sentinel_result() -> InflightVerifyResult:
+        return InflightVerifyResult(outcome=None, merge_wt=None, status=status)
+
+    entry = InflightEntry(
+        item=item,
+        lease=HostLease(name='local', runner=MagicMock(), is_local=True),
+        verify_task=cast(Any, asyncio.ensure_future(_sentinel_result())),
+        merge_wt=item.merge_wt,
+        was_speculative=False,
+    )
+    return worker, req, entry
+
+
+def _rejected_transition_escalations(fake_eq: _FakeEscalationQueue) -> list:
+    """The ``merge_lifecycle_transition_rejected`` subset of *fake_eq*.
+
+    Category-specific assertion idiom, copied from
+    test_merge_queue_duplicate_submission.py:316/:341 (per-file duplication
+    convention).
+    """
+    return [e for e in fake_eq.submitted if e.category == 'merge_lifecycle_transition_rejected']
+
+
+@pytest.mark.asyncio
+class TestRequeuedSentinelNeverRecordedAsFinalizing:
+    """A ``_finalize_inflight`` drive whose verify returned the REQUEUED
+    sentinel must never leave the registry reading FINALIZING, and must never
+    fire a ``merge_lifecycle_transition_rejected`` escalation — regardless of
+    whether the requeue site already bounced the registry to QUEUED
+    (task 3082 step-1 RED / step-2 GREEN).
+
+    RED until step-2 relocates the VERIFYING -> FINALIZING hop below the
+    DROPPED/REQUEUED sentinel check.
+    """
+
+    async def test_requeued_sentinel_is_never_recorded_as_finalizing(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Today's trigger-3 shape: the requeue site put the request back on
+        ``_queue`` but never called ``_note_requeue``, so the registry still
+        reads VERIFYING when finalize runs.  The hop must NOT fire — a
+        requeued item is not finalizing.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeued-verifying', 'df3082_rv.py', 'x = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        current = worker._lifecycle.current(rid)
+        assert current != ItemLifecycleState.FINALIZING, (
+            f'a requeued item was recorded as FINALIZING (phantom finalize head); '
+            f'registry reads {current!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'requeued entry left as the finalize head: '
+            f'{worker._finalizing_head_entry()!r} (registry={current!r})'
+        )
+        assert not req.result.done(), (
+            'a requeued request must be left PENDING for its re-dispatch, not resolved'
+        )
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'a requeue must not escalate: {fake_eq.submitted!r}'
+        )
+
+    async def test_note_requeued_shaped_requeue_fires_no_rejected_transition_escalation(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The shape all four working requeue siblings produce (and the one
+        trigger 3 acquires at step-6): the site already bounced the registry
+        to QUEUED via ``_note_requeue`` before finalize ran.  The hop must not
+        fire a rejected-transition L1 for that legitimate, recurring event.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeued-queued', 'df3082_rq.py', 'y = 2\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        # What the requeue site itself does (merge_queue.py:13840 template).
+        worker._note_requeue(rid, live_obj=req)
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED
+
+        advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'a properly-requeued item must not fire a rejected-transition L1 on '
+            f'every dead-verify abort: {fake_eq.submitted!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.QUEUED, (
+            f'finalize must leave an already-requeued item at QUEUED so it can '
+            f're-enter through the drain; registry reads {current!r}'
+        )
+        assert worker._live_items[rid] is req, (
+            f'_live_items must hold the MergeRequest (the object swap is what '
+            f'clears the finalize head): {worker._live_items.get(rid)!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'requeued entry left as the finalize head: {worker._finalizing_head_entry()!r}'
+        )
+        assert not req.result.done(), (
+            'a requeued request must be left PENDING for its re-dispatch, not resolved'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-3 RED / step-4 GREEN: neither sentinel exit may leave
+# `_live_items` residue.
+#
+# The DROPPED/REQUEUED sentinel branch returns with no registry disposition at
+# all, so an InflightEntry that reached it stays in `_live_items` and
+# `_finalizing_head_entry()` keeps returning it — the phantom head, plus one
+# accreted 'extra InflightEntry object(s)' WARNING per occurrence. The two
+# sentinels need DIFFERENT dispositions: a DROPPED item's sole waiter is gone
+# and nothing will ever re-enter (retire), while a REQUEUED item is sitting on
+# `_queue` and MUST re-enter through the drain (bounce to QUEUED, never
+# retire).
+# ---------------------------------------------------------------------------
+
+
+def _accretion_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The ``_finalizing_head_entry`` at-most-one-mid-finalize accretion
+    WARNINGs in *caplog* (merge_queue.py:8005-8014) — the signal the field
+    journal emitted repeatedly while a phantom head sat in ``_live_items``.
+    """
+    return [
+        r.getMessage() for r in caplog.records
+        if 'Invariant violation:' in r.getMessage()
+        or 'extra InflightEntry object(s)' in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestSentinelExitLeavesNoLiveItemsResidue:
+    """``_finalize_inflight``'s DROPPED and REQUEUED sentinel exits must each
+    dispose of the entry explicitly — no ``_live_items`` residue, no phantom
+    finalize head, and no accretion WARNING (task 3082 step-3 RED / step-4
+    GREEN).
+
+    RED until step-4 gives the branch its two dispositions: DROPPED ->
+    ``_retire_item``, REQUEUED -> idempotent ``_note_requeue``.
+    """
+
+    async def test_dropped_sentinel_retires_the_entry(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The sole-waiter-gave-up exit: nothing will ever re-enter the
+        pipeline for this request_id, so TERMINAL + a ``_live_items`` pop is
+        the only correct end state.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-dropped', 'df3082_dr.py', 'd = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.DROPPED,
+        )
+        rid = req.request_id
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            advanced = await worker._finalize_inflight(entry)
+            head = worker._finalizing_head_entry()
+
+        assert advanced is False, f'a DROPPED sentinel must not advance main: {advanced!r}'
+        assert head is None, f'dropped entry left as the finalize head: {head!r}'
+        assert rid not in worker._live_items, (
+            f'dropped entry left in _live_items: {worker._live_items.get(rid)!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.TERMINAL, (
+            f'a dropped request must be retired to TERMINAL; registry reads {current!r}'
+        )
+        assert _accretion_warnings(caplog) == [], (
+            f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
+            f'{_accretion_warnings(caplog)!r}'
+        )
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'retiring a dropped request must not escalate: {fake_eq.submitted!r}'
+        )
+
+    async def test_requeued_sentinel_leaves_no_inflight_entry_residue(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A requeue site that skipped ``_note_requeue`` (today's trigger 3):
+        the chokepoint must repair it to QUEUED with the MergeRequest back in
+        ``_live_items`` — the object swap, not the state change, is what clears
+        the finalize head.  It must NOT retire: the request is on ``_queue``
+        and has to re-enter through the drain.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeued-residue', 'df3082_rr.py', 'r = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            advanced = await worker._finalize_inflight(entry)
+            head = worker._finalizing_head_entry()
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        assert head is None, f'requeued entry left as the finalize head: {head!r}'
+        assert worker._live_items[rid] is req, (
+            f'_live_items must hold the MergeRequest, not the InflightEntry: '
+            f'{worker._live_items.get(rid)!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.QUEUED, (
+            f'a requeued request must be left at QUEUED so _buffer_owned_request '
+            f'buffers it normally; registry reads {current!r}'
+        )
+        assert _accretion_warnings(caplog) == [], (
+            f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
+            f'{_accretion_warnings(caplog)!r}'
+        )
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'the chokepoint repair must not escalate: {fake_eq.submitted!r}'
+        )
+        assert not req.result.done(), (
+            'a requeued request must be left PENDING for its re-dispatch, not resolved'
+        )
+
+    async def test_correctly_wired_requeue_raced_by_the_drain_is_left_alone(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The chokepoint repair must NOT fire for a requeue that was already
+        wired correctly and then legitimately advanced past QUEUED while
+        ``_finalize_inflight`` was suspended at ``await entry.verify_task``.
+
+        ``_merger_loop``'s speculative look-ahead calls
+        ``_buffer_owned_request`` + ``_drain_queue_into_lanes`` while a
+        predecessor verify is in flight, so the requeued request can already
+        read LANE_BUFFERED by the time finalize resumes.  A merely-not-QUEUED
+        guard would then attempt LANE_BUFFERED -> QUEUED — not a legal edge —
+        and fire the exact ``merge_lifecycle_transition_rejected`` L1 this task
+        retires, on a legitimate, successful re-drain (amendment review,
+        task 3082).
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeue-raced', 'df3082_rq.py', 'q = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        # What the requeue SITE does (correctly wired, post step-6), then what
+        # the merger loop's look-ahead drain does before finalize resumes.
+        worker._queue.put_nowait(req)
+        worker._note_requeue(rid, live_obj=req)
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED
+        worker._drain_queue_into_lanes()
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.LANE_BUFFERED, (
+            f'the drain must have buffered the requeued request; registry reads '
+            f'{worker._lifecycle.current(rid)!r}'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'a correctly-wired requeue raced past QUEUED by the drain must not '
+            f'fire a rejected-transition escalation: {fake_eq.submitted!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.LANE_BUFFERED, (
+            f'the drain\'s legitimate progress must be left untouched; registry '
+            f'reads {current!r}'
+        )
+        assert worker._live_items[rid] is req, (
+            f'_live_items must still hold the MergeRequest the drain buffered: '
+            f'{worker._live_items.get(rid)!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'no phantom finalize head may survive: {worker._finalizing_head_entry()!r}'
+        )
+        assert _accretion_warnings(caplog) == [], (
+            f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
+            f'{_accretion_warnings(caplog)!r}'
+        )
+        assert not req.result.done(), (
+            'the buffered request must stay PENDING for its re-dispatch'
+        )
 
 
 # ---------------------------------------------------------------------------

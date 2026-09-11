@@ -9,6 +9,23 @@ Covers:
   step-09 RED  — HEADLINE property: in-flight immutable under suffix reorder;
                  recompute excludes frozen rids (exclusion filter)
   step-11 RED  — _warn_if_verify_base_not_frozen_tip log-only guard
+  3206 step-1  — the PRD §5.3 RE-MERGE CARVE-OUT at the dispatch guard:
+                 `_remerge` recovery items are exempt; the carve-out is
+                 narrow (an ordinary mismatch still warns exactly once).
+  3206 step-5  — the surviving WARNING keeps its CALL-TIME CONTEXT (task_id,
+                 request_id, both shas, verify_depth), which task 1999 records
+                 as available on no other §5.3 surface.  Data only: the
+                 message's wording is deliberately NOT pinned here.
+  3206 step-7d — FIVE-SITE PARITY: every `_remerge` return path stamps the
+                 recovery marker.
+
+CHARACTERIZATION-TEST NOTE (task 3206). The §5.3 verify-base rule is
+ADVISORY BY DECISION and is never promoted to hard control-flow enforcement
+(PRD §5.3 and §10; measured precision as an enforcement predicate was 0/4).
+The 3206 tests above are the executable half of that fence: they are expected
+to pass immediately, and their purpose is to make a future SILENT flip to
+enforcement impossible — each fails the moment the guard changes control
+flow. If they go red, re-derive the evidence in PRD §5.3 before "fixing" them.
 
 INVARIANT (§5.3): frozen prefix = {items currently verifying} ∪ {landed}.
 An item once it enters verify is immutable (never reordered / re-based out
@@ -769,6 +786,255 @@ class TestWarnIfVerifyBaseNotFrozenTip:
         assert worker.frozen_prefix_tip('main0') == pre_tip
 
 
+# ── task 3206 step-1 RED: §5.3 re-merge carve-out at the DISPATCH guard ──────
+
+
+def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
+    """Stamp the §5.3 re-merge recovery marker (task 3206) on *item*.
+
+    Deliberately uses ``dataclasses.replace`` rather than a new
+    ``_make_fake_item`` keyword so this is RED (TypeError: unexpected keyword
+    argument) ONLY inside the tests that opt in, leaving every other suite in
+    this module green until step-2 adds the field.
+
+    Mirrors what ``_remerge`` does in production: it is the single producer of
+    recovery items for all five consumer paths — ``_verifier_loop``'s
+    head-failure cascade, ``_void_and_remerge`` (INV-3 adoption-time void),
+    ``_finalize_inflight``'s RUNNER_UNAVAILABLE re-dispatch, and
+    ``_dispatch_item``'s dead-base-straggler and Mechanism-2 sites — so the
+    marker is set once at the producer rather than threaded through each
+    consumer.  (Named, not line-numbered: line numbers in this ~17k-line
+    module rot within a release; PRD §5.3 carries the numbered list and is
+    reconciled at close-out.)
+    """
+    return dataclasses.replace(item, remerge_recovery=True)
+
+
+@pytest.mark.asyncio
+class TestRemergeCarveOutAtDispatchGuard:
+    """§5.3 carves out `_remerge` recovery items from the dispatch-time guard.
+
+    ADJUDICATION (task 3206, PRD §5.3): items produced by ``_remerge`` are
+    RECOVERY re-merges that legitimately target real main rather than
+    ``frozen_prefix_tip()``.  Warning on them is crying wolf — this reproduces
+    the measured class-(b) shape: a dead-base straggler re-merged onto real
+    main while another item was frozen.  Under hard enforcement both measured
+    instances of it would have been REFUSED, and the tip they'd have been
+    forced onto can itself be the dead commit they exist to escape.  PRD §5.3
+    holds the dated instances; they are not duplicated here to rot.
+
+    The carve-out must be NARROW: it suppresses recovery items only, never a
+    genuine class-(d) violation.
+
+    RED until step-2 GREEN adds ``remerge_recovery`` and honours it here.
+    """
+
+    async def test_remerge_recovery_item_suppresses_warning(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CARVE-OUT: a recovery item with base != frozen tip logs NO warning."""
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        # A frozen predecessor exists, so frozen_prefix_tip('main0') == 'sha-Dc'
+        # — i.e. the guard would otherwise fire on the candidate below.
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        # Recovery re-merge: _remerge always sets base_sha=actual_main (here
+        # 'main0'), which is NOT the frozen tip 'sha-Dc'.  That is correct by
+        # construction, not a violation.
+        _, item_r = _make_fake_item(
+            't-recovery', base_sha='main0', merge_commit='sha-Rc',
+            config=config, git_repo=git_repo,
+        )
+        item_r = _mark_recovery(item_r)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._warn_if_verify_base_not_frozen_tip(item_r, 'main0')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 0, (
+            f'§5.3 re-merge carve-out (task 3206): a recovery item must not warn, '
+            f'got: {[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_non_recovery_item_still_warns(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CONTROL: the carve-out is narrow — an ordinary item still warns once.
+
+        Same base/tip mismatch as the carve-out test above, minus the marker.
+        Guards against the carve-out swallowing genuine class-(d) violations.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        _, item_e = _make_fake_item(
+            't-e', base_sha='main0', merge_commit='sha-Ec',
+            config=config, git_repo=git_repo,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, (
+            f'expected exactly 1 WARNING for a non-recovery mismatch, got '
+            f'{len(warnings)}: {[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_healthy_base_never_warns_regardless_of_marker(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CONTROL: base == frozen tip → no warning, marker or not (unchanged path)."""
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        for marked in (False, True):
+            caplog.clear()
+            _, item_e = _make_fake_item(
+                f't-e-{marked}', base_sha='sha-Dc', merge_commit='sha-Ec',
+                config=config, git_repo=git_repo,
+            )
+            if marked:
+                item_e = _mark_recovery(item_e)
+
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                assert worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0') is None
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 0, (
+                f'healthy base (marked={marked}) must never warn, got: '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+
+
+# ── task 3206: the surviving WARNING keeps its call-time context ─────────────
+
+
+@pytest.mark.asyncio
+class TestGuardWarningCarriesCallTimeContext:
+    """The §5.3 WARNING must keep its call-time context (task 3206).
+
+    Once the re-merge carve-out removes class (b), the only benign class left
+    is the class-(a) PHANTOM FROZEN TIP: a stranded finalize head makes
+    `frozen_prefix_tip()` return a dead merge commit, so a dispatch whose base
+    is perfectly correct still mismatches.  Triaging that from the log needs
+    the ids and both shas — which is what this class pins.
+
+    SCOPE — DATA, NOT PROSE.  Two sibling tests here previously asserted the
+    message's WORDING too (that it says 'stale'/'stranded'/'phantom', cites
+    3082, says 'advisory', cites 3206 / §5.3).  They were deleted on review:
+    they pinned cosmetic detail — a task number, an adjective — inside an
+    ~800-character log paragraph, went red on any harmless reword, and covered
+    no failure mode not already covered elsewhere.  Do not re-add them, and do
+    not reintroduce them as looser substring matching.
+
+    That narrative is NOT gone, it simply lives where it belongs: the
+    `logger.warning(...)` message itself, the `_warn_if_verify_base_not_frozen_tip`
+    docstring, and PRD §5.3 — all of which still carry it.  The enforcement
+    fence they were reaching for is held by CONTROL-FLOW assertions that go red
+    the moment the guard refuses a dispatch: `TestDispatchItemGuardWiring` and
+    `TestRemergeReturnPathParity` below, plus
+    `TestAdvisoryContractRegressionPins` (dispatch returns a live InflightEntry,
+    verify task launched, host lease not released — including the measured
+    phantom-tip 5687 / 5830 shape) in test_merge_queue_verify_base_invariant.py.
+    """
+
+    async def test_warning_carries_call_time_context(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(1) task_id, request_id, actual base, expected tip and verify_depth.
+
+        Task 1999 notes this call-time context is NOT available on the
+        invariant/snapshot surface — the dispatch guard is the only place it
+        can be captured, so it must not be dropped by a reword.
+
+        Every needle is DERIVED from the fixture's own request/item/worker
+        state rather than re-typed as a short literal, and verify_depth is
+        pinned as the RENDERED PAIR ``verify_depth=1``.  A bare ``'1'`` would
+        be satisfied vacuously — the message body itself contains 'ε=1890',
+        'task-3082' and 'task 3206' — so it would pin the label while letting
+        the %d argument be dropped or reordered against the other three.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        req_e, item_e = _make_fake_item(
+            't-e', base_sha='live-main-tip', merge_commit='sha-Ec',
+            config=config, git_repo=git_repo,
+        )
+
+        # Ground the expected verify_depth in the FIXTURE (exactly one frozen
+        # entry), not in the implementation, so the rendered pair asserted
+        # below is a genuine value pin.
+        assert len(worker.frozen_prefix()) == 1
+        expected_tip = worker.frozen_prefix_tip('main0')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        text = warnings[0].getMessage()
+
+        for needle, what in (
+            (item_e.request.task_id, 'task_id'),
+            (req_e.request_id, 'request_id'),
+            (item_e.base_sha, 'actual base'),
+            (expected_tip, 'expected frozen tip'),
+            ('verify_depth=1', 'verify_depth label AND value'),
+        ):
+            assert needle in text, (
+                f'WARNING lost its {what} ({needle!r}) — task 1999: this '
+                f'call-time context exists on NO other §5.3 surface. Got: {text!r}'
+            )
+
+
 # ── Amendment: _finalizing_head branch coverage (review suggestion) ───────────
 
 
@@ -1035,3 +1301,118 @@ class TestDispatchItemGuardWiring:
             result.verify_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await result.verify_task
+
+
+# ── task 3206 step-7(d): FIVE-SITE PARITY for the _remerge recovery marker ───
+
+
+class TestRemergeReturnPathParity:
+    """Every item `_remerge` can produce carries `remerge_recovery=True`.
+
+    CHARACTERIZATION / chokepoint pin (task regression item 3), modelled on
+    task 3082's on_requeued/_note_requeue pairing test and task 3204's
+    `_requeue_request` chokepoint parity test.
+
+    `_remerge` is the SINGLE PRODUCER of recovery items for all five consumer
+    paths (`_verifier_loop` head-failure cascade, `_void_and_remerge` INV-3
+    void, `_finalize_inflight` RUNNER_UNAVAILABLE, and `_dispatch_item`'s
+    dead-base-straggler and Mechanism-2 sites).  That is only true while EVERY
+    exit stamps the marker — an exit that escaped it would silently escape the
+    PRD §5.3 carve-out and start crying wolf again at both §5.3 surfaces.
+
+    MADE TRUE BY CONSTRUCTION, not pinned by shape (review remediation).  The
+    body's many early returns live in `_remerge_inner`; `_remerge` itself is a
+    wrapper with ONE exit that stamps the marker on whatever came back.  So
+    the test below is BEHAVIOURAL — it feeds `_remerge` an arbitrary unmarked
+    item (both union arms) and asserts the stamp — and holds for return paths
+    that do not exist yet.  It replaces an AST walk that asserted `_remerge`
+    contained exactly five `return <Ctor>(...)` nodes each with a literal
+    `remerge_recovery=True` keyword: that pinned implementation shape (a
+    harmless extract-a-local refactor turned it red) while still being unable
+    to catch a path returning a pre-built item.  Do not reinstate it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_remerge_stamps_the_marker_on_every_exit(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Whatever `_remerge_inner` returns, `_remerge` returns it MARKED.
+
+        Covers both arms of the item union — `_remerge` can return either —
+        and, because the stamp is unconditional at the single exit, covers
+        every present and future return path inside the body.
+        """
+        import unittest.mock as mock
+
+        worker = _make_worker(git_ops)
+
+        for label, merge_commit in (('real', 'sha-Rc'), ('decided', None)):
+            _, unmarked = _make_fake_item(
+                f't-recovery-{label}', base_sha='real-main',
+                merge_commit=merge_commit, config=config, git_repo=git_repo,
+            )
+            assert unmarked.remerge_recovery is False, 'fixture must start unmarked'
+
+            # Patch on the INSTANCE, not the class: an instance attribute is
+            # not re-bound, so `_item`'s default survives the call.
+            async def _body(_req: object, _mono: object, _item=unmarked) -> SpeculativeItem:
+                return _item
+
+            with mock.patch.object(worker, '_remerge_inner', _body):
+                out = await worker._remerge(unmarked.request, None)
+
+            assert out.remerge_recovery is True, (
+                f'§5.3 CARVE-OUT ESCAPE (task 3206): _remerge returned an '
+                f'UNMARKED {label} item. The single-exit chokepoint must stamp '
+                f'remerge_recovery on whatever the body returns — an unmarked '
+                f'recovery item re-introduces the class-(b) false positives at '
+                f'BOTH §5.3 surfaces. See PRD §5.3.'
+            )
+            # The stamp must be the ONLY difference: dataclasses.replace copies
+            # every other field, so a recovery item is otherwise byte-identical.
+            assert dataclasses.replace(out, remerge_recovery=False) == unmarked, (
+                f'_remerge altered the {label} item beyond the §5.3 marker'
+            )
+
+    def test_remerge_has_a_single_exit(self) -> None:
+        """The chokepoint above is only load-bearing while `_remerge` has ONE exit.
+
+        Deliberately the whole of the structural check (see the class
+        docstring): not what the exits construct, only that there is exactly
+        one, so no path can bypass the stamp.  If you need another return in
+        `_remerge`, put it in `_remerge_inner` instead.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        src = textwrap.dedent(inspect.getsource(SpeculativeMergeWorker._remerge))
+        returns = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Return)]
+
+        assert len(returns) == 1, (
+            f'_remerge must have exactly ONE exit — it is the single chokepoint '
+            f'that stamps the §5.3 remerge_recovery marker (task 3206); found '
+            f'{len(returns)}. Move the new return into _remerge_inner, or the '
+            f'marker stops holding by construction.'
+        )
+
+    def test_marker_defaults_false_on_both_item_variants(self) -> None:
+        """Only `_remerge` may produce recovery items.
+
+        The default must stay False so every OTHER construction site — and
+        every `dataclasses.replace` relabel/put-back, which copies all fields
+        — is unaffected by the carve-out. A default of True would exempt the
+        entire pipeline from §5.3 in one character.
+        """
+        from orchestrator.merge_types import DecidedItem as _DI
+        from orchestrator.merge_types import RealMergeItem as _RMI
+
+        for cls in (_RMI, _DI):
+            field = {f.name: f for f in dataclasses.fields(cls)}['remerge_recovery']
+            assert field.default is False, (
+                f'{cls.__name__}.remerge_recovery must default to False, got '
+                f'{field.default!r} — a True default would exempt every item '
+                f'from the §5.3 guard (task 3206).'
+            )

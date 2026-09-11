@@ -86,12 +86,16 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
 def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {})),
+        new=AsyncMock(return_value=([], [], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+    }
     assert 'FILE_LOCKS' not in body
     assert isinstance(body['ACTIVE_TASKS'], list)
     assert body['TASKS_OFFLINE'] is False
@@ -103,7 +107,7 @@ def test_tasks_endpoint_includes_done_counts(client):
     """DONE_COUNTS payload carries the per-project done count from collect_tasks_with_counts."""
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {'dark-factory': 7})),
+        new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -115,7 +119,7 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When the tasks collector reports offline projects, the payload sets ``offline=True``."""
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], ['dark-factory'], {})),
+        new=AsyncMock(return_value=([], ['dark-factory'], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -140,7 +144,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
         'status': 'pending',
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
-    mock = AsyncMock(return_value=([mock_row], [], {}))
+    mock = AsyncMock(return_value=([mock_row], [], {}, [], []))
 
     with patch('dashboard.app.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -160,7 +164,11 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     ]
 
     # (c) top-level key set unchanged
-    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+    }
 
 
 def test_tasks_endpoint_passes_max_cancelled_per_project(client):
@@ -170,15 +178,14 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     (a) max_cancelled_per_project == _MAX_CANCELLED_PER_PROJECT is passed in call kwargs
     (b) existing kwargs still present: max_done_per_project == _MAX_DONE_PER_PROJECT,
         resolve_external == True
-    (c) top-level payload key-set remains exactly
-        {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
-        (no new key added for cancelled)
+    (c) top-level payload key-set is unchanged BY THIS BEHAVIOUR — no new key
+        is added for cancelled (the set itself is stated in the assertion)
 
     RED today: app.py does not yet pass max_cancelled_per_project.
     """
     from dashboard.data.active_tasks import _MAX_CANCELLED_PER_PROJECT, _MAX_DONE_PER_PROJECT
 
-    mock = AsyncMock(return_value=([], [], {}))
+    mock = AsyncMock(return_value=([], [], {}, [], []))
 
     with patch('dashboard.app.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -203,7 +210,180 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     )
 
     # (c) payload key-set unchanged
-    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+    }
+
+
+# ---------------------------------------------------------------------------
+# /api/v2/dashboard/tasks — honest offline signal (task 3857 steps 15/16)
+# ---------------------------------------------------------------------------
+
+
+def _fake_roots(n):
+    """N distinct project roots, for patching ``app._all_project_roots``.
+
+    The route-level ``client`` fixture runs against a single isolated temp
+    root, so "k of N failed with k < N" is not expressible against the real
+    config at all. Patching the root enumerator is the seam ``api_tasks``
+    itself uses to learn N, so a test that patches it is asserting on the same
+    fact the handler reads — not on a parallel fixture that could drift.
+    """
+    from pathlib import Path
+
+    return [Path(f'/proj/p{i}') for i in range(n)]
+
+
+def _tasks_body(
+    client, *, offline_projects, degraded_projects=(),
+    count_unknown_projects=(), total_roots,
+):
+    """GET /api/v2/dashboard/tasks with a canned collector result and N roots."""
+    collector = AsyncMock(
+        return_value=(
+            [], list(offline_projects), {},
+            list(degraded_projects), list(count_unknown_projects),
+        )
+    )
+    with patch('dashboard.app.collect_tasks_with_counts', new=collector), patch(
+        'dashboard.app._all_project_roots', new=lambda config: _fake_roots(total_roots)
+    ):
+        resp = client.get('/api/v2/dashboard/tasks')
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_tasks_partial_outage_does_not_set_the_global_offline_flag(client):
+    """One failing root out of nine must not claim a total outage.
+
+    THE headline defect: ``TASKS_OFFLINE`` is ``bool(offline_projects)``, so a
+    single unreachable root raises a global "fused-memory offline — task data
+    unavailable" banner directly above eight other projects' rows, which are
+    on the wire and fine. The per-project list already carries the honest
+    fact; the boolean's job is the DIFFERENT fact of a total outage.
+    """
+    body = _tasks_body(client, offline_projects=['p3'], total_roots=9)
+
+    assert body['TASKS_OFFLINE'] is False, (
+        '1 of 9 roots failing is not a fused-memory outage — the other 8 '
+        "projects' rows are in this very payload"
+    )
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p3']
+
+
+def test_tasks_all_roots_offline_sets_the_global_flag(client):
+    """Every configured root failing IS the outage signal.
+
+    One fused-memory URL serves every root, so all-roots-failed is the
+    observable proxy for "every configured fused-memory URL is unreachable" —
+    the state the global banner's copy actually describes.
+    """
+    body = _tasks_body(
+        client, offline_projects=['p0', 'p1', 'p2'], total_roots=3,
+    )
+
+    assert body['TASKS_OFFLINE'] is True
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0', 'p1', 'p2']
+
+
+def test_tasks_no_offline_roots_leaves_the_global_flag_false(client):
+    body = _tasks_body(client, offline_projects=[], total_roots=4)
+
+    assert body['TASKS_OFFLINE'] is False
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+    assert body['TASKS_DEGRADED_PROJECTS'] == []
+
+
+def test_tasks_degraded_projects_surface_without_claiming_offline(client):
+    """Budget expiry is its own fact on the wire, and never an outage claim.
+
+    A project the handler ran out of budget for was never proven unreachable —
+    its state is UNKNOWN. Folding it into ``TASKS_OFFLINE`` (or into
+    ``TASKS_OFFLINE_PROJECTS``) would report a healthy fused-memory as down.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=[],
+        degraded_projects=['p2', 'p3'],
+        total_roots=4,
+    )
+
+    assert body['TASKS_DEGRADED_PROJECTS'] == ['p2', 'p3']
+    assert body['TASKS_OFFLINE'] is False, (
+        'a budget expiry is not a demonstrated outage'
+    )
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+
+
+def test_tasks_all_roots_degraded_is_still_not_an_outage(client):
+    """Even ALL roots degrading is not an outage — nothing was proven down.
+
+    Guards the fix against over-correcting into "any total failure sets the
+    flag": the global banner's copy says fused-memory is unreachable, a claim
+    a timeout does not license.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=[],
+        degraded_projects=['p0', 'p1'],
+        total_roots=2,
+    )
+
+    assert body['TASKS_OFFLINE'] is False
+    assert body['TASKS_DEGRADED_PROJECTS'] == ['p0', 'p1']
+
+
+def test_tasks_payload_carries_the_root_count_the_banner_denominates_with(client):
+    """The "k of N" denominator must come from the SAME population as its k.
+
+    The partial-outage notice reads "k of N projects". ``k`` counts entries in
+    ``TASKS_OFFLINE_PROJECTS`` — task project roots, from
+    ``active_tasks._all_project_roots``. ``N`` was
+    ``(DF_T.PROJECTS || []).length``, the ORCHESTRATOR-derived project list
+    from /api/v2/dashboard/orchestrators — a different population. A root with
+    no orchestrator, or an orchestrator with no task root, makes them diverge,
+    and the notice then prints "3 of 5" with nine roots actually configured.
+    ``countPhrase``'s ``n >= k`` guard prevents an outright "1 of 0" but
+    licenses every understatement below it.
+
+    The handler already computes exactly the right N — it needs it to decide
+    ``TASKS_OFFLINE`` at all — and then threw it away. Putting it on the wire
+    means numerator and denominator come from one enumerator, by construction.
+    """
+    body = _tasks_body(client, offline_projects=['p3'], total_roots=9)
+
+    assert body['TASKS_PROJECT_COUNT'] == 9, (
+        'the banner denominator must be the root count the handler itself '
+        f'fanned out over, got {body.get("TASKS_PROJECT_COUNT")!r}'
+    )
+    # The fact it denominates, in the same payload — so a future change that
+    # decouples them fails here rather than in a screenshot.
+    assert len(body['TASKS_OFFLINE_PROJECTS']) <= body['TASKS_PROJECT_COUNT']
+    assert body['TASKS_OFFLINE'] is False
+
+
+def test_tasks_project_count_is_zero_for_a_degenerate_no_roots_config(client):
+    """No configured roots is 0, not a crash and not a fabricated 1."""
+    body = _tasks_body(client, offline_projects=[], total_roots=0)
+
+    assert body['TASKS_PROJECT_COUNT'] == 0
+    assert body['TASKS_OFFLINE'] is False, (
+        'nothing configured to fail is not an outage'
+    )
+
+
+def test_tasks_payload_keeps_file_locks_out_and_carries_the_banner_facts(client):
+    """The payload carries every banner fact, and FILE_LOCKS stays gone."""
+    body = _tasks_body(client, offline_projects=[], total_roots=1)
+
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+    }
+    assert 'FILE_LOCKS' not in body
 
 
 def test_memory_returns_memory_status(client):
@@ -706,6 +886,154 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
     assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
 
 
+# ---------------------------------------------------------------------------
+# task-4788: _load_task_cards whole-operation budget
+#
+# ``fetch_tasks``' own *timeout* is a PER-HTTP-REQUEST budget: it bounds
+# connect/read/write and pool acquisition and nothing else. The incident that
+# motivated these two tests hung inside httpcore's connection lock, where no
+# outbound socket is ever opened and that timeout never fires — so
+# /api/v2/dashboard/escalations wedged for 19.8 h with the per-request budget
+# fully in place. Only an enclosing ``asyncio.wait_for`` cancels that wait.
+#
+# Both hang stubs are ``await asyncio.Event().wait()`` on an event nothing
+# ever sets, deliberately NOT a sleep: a sleep shorter than the budget passes
+# against the pre-fix code too and would prove nothing. Since that would
+# otherwise hang pytest forever, each call is wrapped in a TEST-SIDE
+# ``wait_for(2.0)`` — 40x the monkeypatched 0.05 s budget, so it can only trip
+# on a real regression, never on scheduling jitter.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
+    monkeypatch, dummy_client, dummy_config, caplog
+):
+    """A fetch that never returns degrades to [] — loudly, and uncached.
+
+    The WARNING is asserted, not incidental: ``[]`` is exactly what an
+    ordinary empty result looks like, so the log line is the ONLY thing that
+    distinguishes "this project has no task cards" from "we ran out of budget
+    and never found out". Without it a timeout is invisible to an operator,
+    which is the 19.8 h failure mode in miniature.
+    """
+    import asyncio
+    import logging
+
+    import dashboard.app as _app
+    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+
+    # A warm entry would be served without ever reaching the hang.
+    _task_cards_cache_clear()
+
+    call_count = 0
+
+    async def hang_fetch_tasks(client, config, project_root):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.Event().wait()  # nothing ever sets it
+
+    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', 0.05)
+
+    with (
+        patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks),
+        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+    ):
+        result = await asyncio.wait_for(
+            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
+            timeout=2.0,
+        )
+        assert result == [], (
+            'the shape _load_task_cards already promises for an offline '
+            'marker or MCP failure — the escalation tab renders cardless '
+            'rather than hanging'
+        )
+        assert call_count == 1
+
+        # A timeout must not pin an empty card list for the TTL window:
+        # nothing was written to the cache, so the next poll re-attempts.
+        await asyncio.wait_for(
+            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
+            timeout=2.0,
+        )
+    assert call_count == 2, (
+        'the second call must re-enter the stub — a timeout that cached its '
+        '[] would blank the tab for the whole TTL window'
+    )
+
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == 'dashboard.app'
+    ]
+    assert any('whole-operation budget' in m for m in warnings), (
+        f'no timeout WARNING was logged (records: {warnings}) — the returned '
+        '[] is indistinguishable from an ordinary empty result, so the log '
+        'line is the only operator-visible trace that the budget expired'
+    )
+    assert any('/proj/HANG' in m for m in warnings), (
+        f'the WARNING must name the project root that degraded: {warnings}'
+    )
+
+
+async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
+    monkeypatch, dummy_client, dummy_config
+):
+    """Both callers are bounded, not just the one that wins the lock.
+
+    This pins the wrap PLACEMENT, mirroring the merge_queue.load_task_titles
+    test. ``TTLCache.get_or_refresh`` serializes cold callers for one key
+    behind a per-key lock and runs the refresh WHILE HOLDING it, so an
+    inner-only wrap would leave caller B queued UNBOUNDED for caller A's whole
+    budget and then running its own full-budget refresh — the pair costs 2x
+    the budget and N waiters cost N x. The dashboard polls every 3 s, so
+    waiters are the routine case, not a corner.
+    """
+    import asyncio
+
+    import dashboard.app as _app
+    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+
+    _task_cards_cache_clear()
+
+    async def hang_fetch_tasks(client, config, project_root):
+        await asyncio.Event().wait()
+
+    budget = 0.5
+    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', budget)
+    loop = asyncio.get_running_loop()
+
+    with patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks):
+        started = loop.time()
+        results = await asyncio.wait_for(
+            asyncio.gather(*[
+                _load_task_cards(dummy_client, dummy_config, '/proj/SHARED')
+                for _ in range(2)
+            ]),
+            timeout=2.0,
+        )
+        elapsed = loop.time() - started
+
+    assert results == [[], []]
+    # The assertion is about SERIALIZATION, not merely about returning:
+    # an inner-only wrap costs 2 x budget here and scales with waiters.
+    #
+    # The budget is deliberately LARGE for a test whose subject is a timeout.
+    # It is not scaled because the operation needs 0.5 s — it is scaled so the
+    # assertion's ABSOLUTE jitter margin exceeds real-world event-loop
+    # scheduling, GC and pytest overhead. Correct behaviour (outer wrap) costs
+    # ~1x budget; the inner-only-wrap regression costs ~2x; 1.5x sits exactly
+    # midway, giving 0.25 s of slack on BOTH sides. At the original 0.05 s the
+    # discrimination was sound in ratio and worthless in absolute terms (50 ms
+    # of slack), and it flaked at ~4% per run. Do NOT shrink the budget back to
+    # "speed up the suite" — that silently reintroduces the flake.
+    assert elapsed < 1.5 * budget, (
+        f'two concurrent callers took {elapsed:.3f}s against a '
+        f'{1.5 * budget}s threshold (1.5 x the {budget}s per-call budget); '
+        f'the inner-only-wrap regression costs ~{2 * budget}s — that is the '
+        'serialized cost of an inner-only wrap; the wait_for must enclose '
+        'get_or_refresh so a caller QUEUED on the per-key lock is bounded too'
+    )
+
+
 def test_escalations_endpoint_multi_root_gather(client, tmp_path):
     """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
     from dashboard.app import _task_cards_cache_clear
@@ -922,3 +1250,68 @@ def test_merge_queue_fallback_path_when_unreachable(client):
         f'AC3: live entry 3112 must not appear in fallback path; got {task_ids}'
     )
     assert proj['active_approximate'] is True
+
+
+def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
+    """No root produced rows + at least one demonstrably failed IS the outage.
+
+    The handler's own budget caps how many roots can reach the offline state:
+    in a hang each root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before
+    ``wait_for`` cuts it, and a cut root lands in ``degraded``, not
+    ``offline``. A stricter ``len(offline) == total_roots`` test therefore
+    made this flag unreachable on a nine-root config for the most likely total
+    outage — the payload would say "unavailable for 2 of 9" plus "timed out
+    for 7 of 9" and never the thing that was true: nothing loaded.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=['p0', 'p1'],
+        degraded_projects=['p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p8'],
+        total_roots=9,
+    )
+
+    assert body['TASKS_OFFLINE'] is True, (
+        'no root produced rows and two demonstrably failed — that is the '
+        'outage the global banner copy describes'
+    )
+    # The separate lists stay separate: the flag is an ADDITIONAL fact, and
+    # collapsing degraded into offline would report a timeout as a proven
+    # outage on the per-project list too.
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0', 'p1']
+    assert len(body['TASKS_DEGRADED_PROJECTS']) == 7
+
+
+def test_tasks_one_healthy_root_vetoes_the_outage_flag(client):
+    """A single root that produced rows blocks the global claim, however bad the rest.
+
+    The flag's conjunct is "NO root produced rows" — a root missing from both
+    failure lists produced rows (the three lists are disjoint by
+    construction), so "task data unavailable" would be false.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        degraded_projects=['p1'],
+        total_roots=3,
+    )
+
+    assert body['TASKS_OFFLINE'] is False, (
+        'p2 produced rows — they are in this very payload'
+    )
+
+
+def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
+    """A count-unknown root produced current ROWS, so it is not an absence of data."""
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        degraded_projects=[],
+        count_unknown_projects=['p1'],
+        total_roots=2,
+    )
+
+    assert body['TASKS_OFFLINE'] is False, (
+        "p1's rows loaded fine — only its done count is unknown, which is a "
+        'different (and separately reported) fact from an outage'
+    )
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']

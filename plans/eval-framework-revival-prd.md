@@ -470,6 +470,55 @@ rebase churn.
   Depends **μ (2478)**. Consumer: the fable-architect-eval-admission PRD's
   campaign gate (τ1). Modules: orchestrator/evals/configs.py,
   orchestrator/tests.
+- **ρ (rho) — architect-fable-max effort-matched candidate** *(leaf;
+  instrument extension — added 2026-08-04 by paired edit, the ο/π precedent,
+  to serve `plans/fable-architect-trial-v2-prd.md`)*. Add
+  `EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max',
+  role='architect')` to `ARCHITECT_EVAL_CONFIGS` + extend the candidate-set
+  pin test; existing candidates byte-unchanged. This is exactly the variant
+  π anticipated "if the consumer's screen shows effort sensitivity" — now
+  measured: the opus high→max step is worth +0.0317 inside the v1 screen.
+  **Signal:** `get_config_by_name('architect-fable-max')` resolves; pin test
+  green. Depends **μ (2478)**. Consumer: fable-trial-v2 δ (stage-2 screen).
+  Modules: orchestrator/evals/configs.py, orchestrator/tests.
+- **σ (sigma) — reference back-fill + loud `judged_without_reference`
+  marker** *(leaf; instrument fix — paired edit 2026-08-04, serves
+  fable-trial-v2)*. Back-fill `reference` blocks (from each fixture's own
+  top-level `post_task_commit` SHA) on `reify_task_12`, `reify_task_27`,
+  `df_task_18` — half the v1 hard subset was judged on plausibility because
+  `runner.py` never falls back to `post_task_commit` — and add a structured
+  `judged_without_reference` marker on any plan_quality cell scored with an
+  empty `reference_diff`, aggregated per config in the report (the
+  cap_excluded precedent). **Signal:** a deterministic test materializes a
+  non-empty reference diff for each back-filled fixture (no LLM spend);
+  report schema carries the new count. Consumer: fable-trial-v2 γ1.
+  Modules: orchestrator/evals/{tasks/*.json,runner,metrics,report}.py,
+  orchestrator/tests.
+- **υ (upsilon) — record judge cost on architect cells** *(leaf; instrument
+  fix — paired edit 2026-08-04, serves fable-trial-v2)*. Populate
+  `metrics.judge_cost_usd` from the plan-judge invocation result in
+  `run_architect_eval` — it reads 0.00 across all 235 v1 architect cells, so
+  every v1 dollar figure understates absolute cost; the report layer already
+  aggregates and surfaces the field. **Signal:** unit test wiring a judge
+  result cost into the persisted cell; nonzero judge cost per cell in the
+  next campaign report. Consumer: fable-trial-v2 γ1. Modules:
+  orchestrator/evals/runner.py, orchestrator/tests.
+- **φ (phi) — UsageGate on `run_architect_eval`** *(leaf; instrument fix —
+  paired edit 2026-08-04, serves fable-trial-v2)*. Architect eval cells have
+  no account-cap failover (only `run_eval`/`run_end_to_end` build a
+  `UsageGate`) — the mechanism behind the ~40% cap-starved 2026-07-28 wave
+  and a differential-exclusion hazard (the costlier candidate is more
+  cap-exposed). Construct the gate as `run_eval` does (enabled-guarded,
+  warn-and-degrade) and swap the bare `invoke_agent` architect call for
+  `invoke_with_cap_retry` with eval-bounded patience (order 30–60 min /
+  small `max_cap_retries` — a fully-capped pool fails loud into the existing
+  `cap_tainted`/`cap_excluded` backstop, never hangs a campaign). The
+  scoring predicate `tainted = arch_unmeasurable and not
+  is_scorable_plan(plan)` and timeout-not-tainted semantics stay
+  byte-identical. **Signal:** unit test simulating a cap-hit shows failover
+  to a second account completing the cell; tainted-predicate tests
+  unchanged. Consumer: fable-trial-v2 γ1. Modules:
+  orchestrator/evals/runner.py, orchestrator/tests.
 
 **Phase 4 — candidate bundles (cross-PRD-gated)**
 

@@ -44,13 +44,23 @@ logger = logging.getLogger(__name__)
 def derive_modules(files: list, depth: int, *, task_id: str = '') -> list[str]:
     """Derive depth-coarsened module lock keys from *files*.
 
-    α strip: remove directory-shaped entries before lock derivation.  A
-    directory entry (no recognised file extension) would produce a
-    subtree-wide prefix lock that blocks every task touching any file under
-    that subtree (reify-3468).  Strip them so only real file siblings derive
-    locks.  When ALL entries are directories the stripped list is empty ->
-    ``files_to_modules`` returns ``[]`` -> callers fall through to their own
+    α strip: remove entries the α predicate (``shared.locking.is_file_path``)
+    classifies as DIRECTORIES before lock derivation.  A directory entry would
+    produce a subtree-wide prefix lock that blocks every task touching any file
+    under that subtree (reify-3468).  Strip them so only real file siblings
+    derive locks.  When ALL entries are directories the stripped list is empty
+    -> ``files_to_modules`` returns ``[]`` -> callers fall through to their own
     fallback (e.g. the task-<id> synthetic lock in ``Scheduler._get_modules``).
+
+    "No recognised file extension" is NOT the criterion, and has not been since
+    dark_factory #3248: an extension-less entry whose final segment is a
+    recognised name in ``shared.locking.EXTENSIONLESS_FILENAMES`` — the git
+    hooks, ``LICENSE``, ``Dockerfile`` — is a real tracked FILE and is RETAINED.
+    Previously every one of them was stripped, so a task declaring only such
+    paths derived an empty charter and silently took the synthetic fallback,
+    holding no lock on the file it was editing.  The criterion is now exactly
+    what the predicate says, which is why this docstring defers to it rather
+    than restating it.
 
     Emits one INFO diagnostic naming the stripped directory entries when any
     are found, so a run's logs can be grepped for pathologically wide

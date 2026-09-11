@@ -16,12 +16,13 @@ from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
 
 
-@pytest_asyncio.fixture
-async def integrated_service(mock_config):
-    """MemoryService with real DurableWriteQueue, mocked Graphiti/Mem0."""
-    svc = MemoryService(mock_config)
+def _mock_backends(svc: MemoryService) -> MemoryService:
+    """Stub Graphiti/Mem0 on *svc* so tests never hit real FalkorDB/Qdrant.
 
-    # Mock backends so we never hit real FalkorDB/Qdrant
+    THE single definition of what a mocked MemoryService looks like in this
+    module — every fixture below builds on it, so a backend that grows a new
+    method is taught about in exactly one place.
+    """
     svc.graphiti = MagicMock()
     svc.graphiti.initialize = AsyncMock()
     svc.graphiti.add_episode = AsyncMock(return_value=None)
@@ -33,6 +34,13 @@ async def integrated_service(mock_config):
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    return svc
+
+
+@pytest_asyncio.fixture
+async def integrated_service(mock_config):
+    """MemoryService with real DurableWriteQueue, mocked Graphiti/Mem0."""
+    svc = _mock_backends(MemoryService(mock_config))
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
@@ -680,3 +688,262 @@ class TestQueueStats:
             message='timed out waiting for all 15 items to complete',
         )
         assert stats['counts'].get('completed', 0) == 15
+
+
+@pytest.mark.asyncio
+async def test_durable_queue_wired_with_terminal_hook(integrated_service):
+    """The construction site actually passes the terminal write-back hook."""
+    svc = integrated_service
+    assert (
+        svc.durable_queue._on_terminal
+        == svc._record_queue_terminal_outcome
+    )
+
+
+# ---------------------------------------------------------------------------
+# Terminal queue outcome written back to write_ops (task 3582)
+#
+# Before this, `write_ops.success = 1` was stamped the instant enqueue()
+# committed, so a row for a write with a 0% landing rate was byte-for-byte
+# indistinguishable from a row for a write that landed. That is what made the
+# esc-3561-3 blast radius unknowable.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def journaled_service(mock_config, tmp_path):
+    """integrated_service + a real WriteJournal, wired in PRODUCTION order.
+
+    server/main.py calls initialize() before set_write_journal(), so the queue
+    (and its on_terminal hook) is built while the journal is still None.
+    """
+    from fused_memory.services.write_journal import WriteJournal
+
+    # Same mocked-backend definition as integrated_service — deliberately not a
+    # second copy of it.
+    svc = _mock_backends(MemoryService(mock_config))
+
+    await svc.initialize()
+
+    journal = WriteJournal(tmp_path / 'wj_e2e')
+    await journal.initialize()
+    svc.set_write_journal(journal)
+
+    yield svc, journal
+
+    await svc.close()
+    await journal.close()
+
+
+async def _sole_queue_write_op_id(svc) -> str:
+    """Recover the enqueued `_write_op_id` — the caller never sees it."""
+    import json
+
+    db = svc.durable_queue._db
+    async with db.execute('SELECT payload FROM write_queue ORDER BY id') as cursor:
+        rows = await cursor.fetchall()
+    ids = [
+        json.loads(r[0])['_write_op_id']
+        for r in rows
+        if '_write_op_id' in json.loads(r[0])
+    ]
+    assert len(ids) == 1, f'expected exactly one queued write, got {ids}'
+    return ids[0]
+
+
+async def _poll_dead(svc, expected: int = 1) -> None:
+    async def _dead():
+        s = await svc.durable_queue.get_stats()
+        return s['counts'].get('dead', 0) >= expected
+
+    await poll_until(
+        _dead, timeout=20.0, message='timed out waiting for the item to dead-letter'
+    )
+
+
+class TestTerminalOutcomeWrittenBack:
+    @pytest.mark.asyncio
+    async def test_dead_lettered_add_episode_row_shows_dead(self, journaled_service):
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_episode(content='an episode that never lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] is not None
+
+        await poll_until(
+            _stamped, timeout=20.0, message='terminal outcome never reached write_ops'
+        )
+
+        # THE acceptance signal: this row ALONE, no backend_ops join.
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'dead'
+        assert 'always fails' in row['terminal_error']
+        # ...and "the enqueue was accepted" is still recorded, unchanged.
+        assert row['success'] == 1
+
+    @pytest.mark.asyncio
+    async def test_dead_lettered_add_memory_graphiti_row_shows_dead(
+        self, journaled_service
+    ):
+        """Queue-wide, not add_episode-specific."""
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'dead'
+
+        await poll_until(
+            _stamped, timeout=20.0, message='terminal outcome never reached write_ops'
+        )
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'dead'
+        assert row['success'] == 1
+
+    @pytest.mark.asyncio
+    async def test_completed_write_row_shows_completed(self, journaled_service):
+        svc, journal = journaled_service
+
+        await svc.add_episode(content='an episode that lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        async def _completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(
+            _completed, timeout=20.0, message='write never stamped completed'
+        )
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'completed'
+        assert row['terminal_error'] is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_state_survives_dead_letter_deletion(
+        self, journaled_service
+    ):
+        """The precise failure mode from the esc-3561-3 triage.
+
+        26 of 28 dead queue rows had been removed by delete_dead_letters, so
+        write_queue.db alone reported a denominator of 2 instead of 28. The
+        journal must keep the truth after the queue row is gone.
+        """
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_episode(content='an episode that never lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'dead'
+
+        await poll_until(_stamped, timeout=20.0, message='never stamped dead')
+
+        dead = await svc.durable_queue.get_dead_items()
+        assert len(dead) == 1
+        result = await svc.durable_queue.delete_dead(
+            dead[0]['group_id'], [dead[0]['id']]
+        )
+        assert result['deleted'] == [dead[0]['id']]
+
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'dead'
+        assert 'always fails' in row['terminal_error']
+
+    @pytest.mark.asyncio
+    async def test_replayed_dead_letter_row_shows_completed(self, journaled_service):
+        """Last-write-wins is the correct final truth after a good replay."""
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_episode(content='an episode that eventually lands',
+                              project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped_dead():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'dead'
+
+        await poll_until(_stamped_dead, timeout=20.0, message='never stamped dead')
+
+        svc.graphiti.add_episode = AsyncMock(return_value=None)
+        assert await svc.durable_queue.replay_dead() >= 1
+
+        async def _stamped_completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(
+            _stamped_completed, timeout=20.0,
+            message='replayed write never re-stamped completed',
+        )
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'completed'
+        assert row['terminal_error'] is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_outcome_survives_an_arbitrarily_slow_producer(
+        self, journaled_service
+    ):
+        """The unbounded-window case, end to end.
+
+        add_memory enqueues the Graphiti leg immediately but journals its
+        Layer-1 write_ops row only after the SYNCHRONOUS Mem0 leg — a real
+        network/LLM round trip whose width is unbounded, and which routinely
+        outlasts the queue worker. Here Mem0 is held open until the terminal
+        write-back has provably landed, so the producer's row is written
+        strictly afterwards. A time-boxed retry ladder would drop the outcome
+        exactly in this case — the slow-producer case — which is precisely when
+        an operator most needs it.
+        """
+        svc, journal = journaled_service
+
+        stamped = asyncio.Event()
+        original_record = journal.record_terminal_outcome
+
+        async def _record_then_release(**kwargs):
+            result = await original_record(**kwargs)
+            stamped.set()
+            return result
+
+        journal.record_terminal_outcome = _record_then_release
+
+        async def _mem0_add_slower_than_the_queue(*_args, **_kwargs):
+            await asyncio.wait_for(stamped.wait(), timeout=20.0)
+            return {'results': [{'id': 'mem0-1'}]}
+
+        svc.mem0.add = AsyncMock(side_effect=_mem0_add_slower_than_the_queue)
+
+        await svc.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+            dual_write=True,
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        row = await journal.get_write_op(write_op_id)
+        assert row is not None
+        # The producer's Layer-1 fields landed...
+        assert row['operation'] == 'add_memory'
+        assert row['success'] == 1
+        # ...on top of a terminal outcome that got there first, without
+        # clobbering it.
+        assert row['terminal_status'] == 'completed'
+        assert row['terminal_error'] is None

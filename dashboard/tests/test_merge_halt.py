@@ -7,36 +7,12 @@ import json
 
 import httpx
 import pytest
-
-
-def _mcp_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _init_response(request_id: int = 1) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'protocolVersion': '2025-03-26',
-                'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'test', 'version': '0.1'},
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 
 class _PerPortHandler:
@@ -69,12 +45,12 @@ class _PerPortHandler:
         method = body.get('method', '')
         request_id = body.get('id', 1)
         if method == 'initialize':
-            return _init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+            return mcp_notify_response()
         # tools/call
         inner = self.responses.get(port, {'wired': False, 'halted': False})
-        return _mcp_response(inner, request_id)
+        return mcp_tool_response(inner, request_id)
 
 
 @pytest.fixture(autouse=True)
@@ -155,3 +131,39 @@ class TestGetMergeHaltStatus:
             result = await get_merge_halt_status(client, _urls(8100, 8102, 8105))
         # All projects must appear regardless of per-call failure.
         assert set(result) == {'proj8100', 'proj8102', 'proj8105'}
+
+
+class TestProbeOneTimeoutBudget:
+    """The probe's budget must reach client.post, not just the wait_for.
+
+    ``asyncio.wait_for`` bounds the operation as a whole, but the individual
+    posts underneath it were still issued with httpx's 10s default — which
+    also governs **pool acquisition**. Under a 2.0s probe budget that meant a
+    poll cycle could block on a connection slot for five times its own
+    deadline before wait_for finally cancelled it. This asserts the contract
+    only: budget in, same budget on every post. Nothing about sockets or
+    pool slots.
+
+    AsyncMock rather than MockTransport deliberately: MockTransport never
+    surfaces the ``timeout`` kwarg to its handler, so it cannot witness this.
+    """
+
+    async def test_budget_reaches_every_post(self):
+        from unittest.mock import AsyncMock
+
+        from dashboard.data.merge_halt import _probe_one
+
+        url = 'http://127.0.0.1:8100'
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cold_session_responses(
+            {'wired': True, 'halted': False}, url,
+        )
+
+        result = await _probe_one(mock_client, url, 0.05)
+
+        assert result['offline'] is False, f'probe should have succeeded: {result}'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [0.05, 0.05, 0.05], (
+            f'the probe budget must reach every post, not httpx\'s 10s '
+            f'default, got {timeouts}'
+        )

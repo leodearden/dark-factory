@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_transcript_check_liveness.sh"
@@ -176,7 +176,7 @@ def test_script_is_executable():
 
 
 def test_alive_exit0_within_window_exits_zero(tmp_path):
-    recent = datetime.now(timezone.utc) - timedelta(hours=2)
+    recent = datetime.now(UTC) - timedelta(hours=2)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -203,7 +203,7 @@ def test_alive_exit1_finding_within_window_exits_zero(tmp_path):
     lost-transcript FINDING (the detector fired and escalated) -- a healthy,
     expected run. The probe MUST treat it as ALIVE (exit 0), unlike the
     trickle probe which requires ExecMainStatus=0."""
-    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent = datetime.now(UTC) - timedelta(hours=1)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -221,7 +221,7 @@ def test_alive_exit1_finding_within_window_exits_zero(tmp_path):
 
 
 def test_older_than_window_exits_nonzero(tmp_path):
-    stale = datetime.now(timezone.utc) - timedelta(hours=48)
+    stale = datetime.now(UTC) - timedelta(hours=48)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -279,7 +279,7 @@ def test_abnormal_result_exits_nonzero(tmp_path):
     """A within-window run whose Result is abnormal (e.g. timeout / signal /
     core-dump) did NOT run to a clean exit, so it is NOT alive -- even with a
     fresh timestamp and an ExecMainStatus that looks benign."""
-    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent = datetime.now(UTC) - timedelta(hours=1)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -301,7 +301,7 @@ def test_exit_status_two_exits_nonzero(tmp_path):
     detector's normal exit-1 alarm -- it means the timer is genuinely broken,
     so the probe must FAIL even though Result=exit-code and the run is
     fresh."""
-    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent = datetime.now(UTC) - timedelta(hours=1)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
