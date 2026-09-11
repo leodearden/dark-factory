@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -99,3 +100,61 @@ def parse_merge_rr(data: bytes) -> ParsedMergeRr:
             ),
         )
     return ParsedMergeRr(records=tuple(records), unparsable=tuple(unparsable))
+
+
+@dataclass(frozen=True)
+class MergeRrScan:
+    """What one worktree's MERGE_RR says, and which of it resolves.
+
+    ``suspect`` is the single question a caller acts on: it is true when the
+    file names a conflict id with no backing rr-cache directory, OR when it
+    holds a record git itself would reject.  The two have different symptoms
+    and the same remedy, so they share one flag.
+    """
+
+    merge_rr_path: Path
+    records: tuple[MergeRrRecord, ...]
+    dangling: tuple[MergeRrRecord, ...]
+    unparsable: tuple[bytes, ...]
+
+    @property
+    def suspect(self) -> bool:
+        return bool(self.dangling or self.unparsable)
+
+
+def scan_merge_rr(*, git_dir: Path, common_dir: Path) -> MergeRrScan:
+    """Classify a worktree's MERGE_RR records against the shared rr-cache.
+
+    *git_dir* is the PER-WORKTREE git directory, where MERGE_RR lives.
+    *common_dir* is the shared one, where ``rr-cache`` lives — in a linked
+    worktree these differ, and resolving rr-cache under the per-worktree dir
+    would find nothing for every record, reporting healthy state as dangling.
+
+    The conflict id indexes ``rr-cache`` VERBATIM, variant suffix included:
+    ``<hex>`` and ``<hex>.1`` name different directories, and only one of them
+    exists in the case this guards.  An entry must be a directory, since that
+    is what git stores the preimage inside.
+
+    A missing MERGE_RR is the normal healthy state — most worktrees have none —
+    and yields an empty scan rather than an error.  Both arguments stay
+    explicit so the classifier is pure filesystem work, testable without a
+    repository; :func:`resolve_git_dirs` supplies them for real callers.
+    """
+    merge_rr_path = git_dir / 'MERGE_RR'
+    try:
+        data = merge_rr_path.read_bytes()
+    except FileNotFoundError:
+        data = b''
+
+    parsed = parse_merge_rr(data)
+    rr_cache = common_dir / 'rr-cache'
+    dangling = tuple(
+        record for record in parsed.records
+        if not (rr_cache / record.conflict_id).is_dir()
+    )
+    return MergeRrScan(
+        merge_rr_path=merge_rr_path,
+        records=parsed.records,
+        dangling=dangling,
+        unparsable=parsed.unparsable,
+    )
