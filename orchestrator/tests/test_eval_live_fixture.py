@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -627,11 +626,13 @@ class TestLiveStratum:
         assert repr('nope') in str(excinfo.value)
 
     def test_reads_only_the_record(self, tmp_path, monkeypatch):
-        # No project_root parameter to pass, and no subprocess to run: the
-        # stratum of a live cell is a property of the task record alone.
-        parameters = inspect.signature(live_stratum).parameters
-        assert list(parameters) == ['task', 'project']
-        assert parameters['project'].kind is inspect.Parameter.KEYWORD_ONLY
+        # No checkout to consult and no subprocess to run: the stratum of a
+        # live cell is a property of the task record alone. And `project` must
+        # be passed by keyword, so it can never be mistaken at a call site for
+        # the positional project_root this derivation deliberately has no room
+        # for.
+        with pytest.raises(TypeError):
+            live_stratum(live_task(), 'dark_factory')  # type: ignore[call-arg]
 
         monkeypatch.chdir(tmp_path)
 
