@@ -3262,6 +3262,137 @@ class TestQuotedSiblingTagIsNeverTruncated:
 
 
 # ---------------------------------------------------------------------------
+# task 5283 — the ACCEPTED self-name truncation, pinned as a deliberate choice.
+# ---------------------------------------------------------------------------
+
+#: A rationale that ends with its OWN closer and then only WHITESPACE. At read
+#: time this is indistinguishable from authored prose whose last words quote the
+#: field's own tag; it is truncated regardless, because that is the shape the
+#: 2026-08-25 census found 212 times and the cross-field shape zero times.
+_ACCEPTED_TRUNCATION = _SELF_NAME_RATIONALE_PROSE + _close('rationale') + '\n  '
+
+#: The same string with ONE name changed — a SIBLING parameter's closer instead
+#: of the field's own. Same field, same prose, same trailing whitespace, and the
+#: opposite outcome. The pair is what makes the asymmetry visible in the tests.
+_REFUSED_TRUNCATION = _SELF_NAME_RATIONALE_PROSE + _close('decision') + '\n  '
+
+
+class TestTheSelfNameTruncationIsAcceptedAndReconstructible:
+    """Prose ending in its own closer IS truncated on disk, and that is chosen.
+
+    ``repair``'s quotation guard accepts an empty tail when the closer echoes
+    the parameter being repaired (``name == param``) and refuses it otherwise,
+    so a ``rationale`` ending in its own tag loses that tag permanently while a
+    ``rationale`` ending in a sibling's keeps every byte. Nothing pinned the
+    accepted half, and an accepted trade-off with no test reads exactly like an
+    accident — which is the whole of the reviewer's point.
+
+    WHY IT IS ACCEPTABLE, and why the record matters more than the truncation:
+    the deleted span is RECONSTRUCTIBLE from the emitted fact alone, because
+    ``misclose`` names the tag that was removed. A reader who disagrees with the
+    repair can put the value back from the record; the loss is therefore
+    reportable rather than silent, which is the bar this surface sets.
+    """
+
+    @staticmethod
+    def _read_back(artifacts, value: str):
+        """Seed ``design_decisions[0].rationale`` = *value*, then read-repair.
+
+        Returns ``(on_disk_value, facts, bytes_before)`` — the value as
+        PERSISTED, not merely as returned, since durability is the half of the
+        contract a returned dict cannot show.
+        """
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = value
+        artifacts.write_plan(copy.deepcopy(plan))
+        before = (artifacts.root / 'plan.json').read_bytes()
+
+        plan_tools._read_plan_repaired(artifacts)
+
+        return _on_disk(artifacts)['design_decisions'][0]['rationale'], before
+
+    def test_the_field_is_truncated_to_its_prose_and_persisted_that_way(
+        self, plan_artifacts
+    ):
+        on_disk, _before = self._read_back(plan_artifacts, _ACCEPTED_TRUNCATION)
+
+        assert on_disk == _SELF_NAME_RATIONALE_PROSE
+
+    def test_the_trailing_whitespace_goes_WITH_the_tag(self, plan_artifacts):
+        """The full extent of the deletion, not just the visible part.
+
+        ``clean_value`` is the slice BEFORE the closer, so everything after it
+        goes too. Stating it here keeps the contract from being read as "the
+        tag is stripped" when it is "the value is cut at the tag".
+        """
+        on_disk, _before = self._read_back(plan_artifacts, _ACCEPTED_TRUNCATION)
+
+        assert not on_disk.endswith(('\n', ' '))
+        assert _ACCEPTED_TRUNCATION[len(on_disk):] == _close('rationale') + '\n  '
+
+    def test_the_fact_is_a_repair_that_recovered_NOTHING(self, plan_artifacts):
+        """PRD boundary row B4's last-parameter shape: nothing was absorbed."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = _ACCEPTED_TRUNCATION
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+
+        _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        (fact,) = facts
+        assert fact['outcome'] == 'repaired'
+        assert fact['recovered_params'] == []
+        assert fact['declined_params'] == []
+
+    def test_the_deleted_span_is_reconstructible_from_the_fact_alone(
+        self, plan_artifacts
+    ):
+        """``misclose`` names the tag, so the cut is reversible from the record.
+
+        Reversible up to the trailing whitespace, which the fact does not carry
+        and which holds no authored content — every CHARACTER OF TEXT the
+        truncation removed is named by ``misclose``.
+        """
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = _ACCEPTED_TRUNCATION
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+
+        _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        (fact,) = facts
+        assert fact['misclose'] == _close('rationale')
+        on_disk = _on_disk(plan_artifacts)['design_decisions'][0]['rationale']
+        assert on_disk + fact['misclose'] == _ACCEPTED_TRUNCATION.rstrip()
+
+    def test_the_CROSS_FIELD_counterpart_is_refused_byte_identically(
+        self, plan_artifacts
+    ):
+        """One name apart from the row above, and the opposite disposition.
+
+        plan-tools repairs a value it received as a NAMED PARAMETER of a known
+        tool, so the field's own closer is evidence about that parameter. A
+        sibling's closer is not, and the census puts that population at zero —
+        so the same empty tail is refused, reported, and left alone.
+        """
+        on_disk, before = self._read_back(plan_artifacts, _REFUSED_TRUNCATION)
+
+        assert on_disk == _REFUSED_TRUNCATION
+        assert (plan_artifacts.root / 'plan.json').read_bytes() == before
+
+    def test_the_refusal_is_reported_rather_than_swallowed(self, plan_artifacts):
+        """Byte-identical must not mean invisible, or the asymmetry hides."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = _REFUSED_TRUNCATION
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+
+        _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        (fact,) = facts
+        assert fact['outcome'] == 'unrepairable'
+        assert fact['misclose'] is None
+        assert fact['pattern'] == _close('decision')
+
+
+# ---------------------------------------------------------------------------
 # task 3957 step-7 — plan-tools persists a repaired plan THROUGH TaskArtifacts,
 # and keeps no second plan.json writer of its own.
 # ---------------------------------------------------------------------------
