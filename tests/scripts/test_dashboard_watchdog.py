@@ -2166,5 +2166,33 @@ def test_log_stderr_fallback_still_emits_when_stderr_is_healthy(monkeypatch, cap
     assert "hello" in captured.err, f"expected the message on stderr, got: {captured!r}"
 
 
+def test_log_bounds_systemd_cat_with_a_five_second_timeout(monkeypatch):
+    """log() must pass an explicit timeout=5 to its systemd-cat subprocess call.
+
+    The bound is load-bearing HERE in particular. ``dashboard-watchdog.timer``
+    is ``OnUnitActiveSec=30`` — twice as tight as orchestrator-watchdog's 60s —
+    and systemd disables ``TimeoutStartSec`` for ``Type=oneshot`` by default,
+    so an unbounded systemd-cat blocked on a stuck journald or a full /run
+    hangs the tick forever. Because the timer measures from this unit's LAST
+    ACTIVATION, it then never re-fires: supervision of the dashboard stops
+    entirely, with no signal, through the LOGGING path.
+    """
+    wdog = _load_watchdog()
+    seen_kwargs = []
+
+    def fake_run(argv, *args, **kwargs):
+        seen_kwargs.append(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    wdog.log("hello")
+
+    assert len(seen_kwargs) == 1, f"expected exactly one subprocess.run call: {seen_kwargs}"
+    assert seen_kwargs[0].get("timeout") == 5, (
+        f"log() must bound systemd-cat with timeout=5, got {seen_kwargs[0]!r}"
+    )
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
