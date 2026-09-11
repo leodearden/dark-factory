@@ -269,6 +269,26 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude backend binary resolution.
+#
+# WHY THIS EXISTS: argv[0] used to be the hardcoded bare PATH name 'claude',
+# resolved by the kernel against whatever PATH the spawning process happened
+# to inherit. On 2026-08-13→08-18 the fused-memory systemd user unit pinned no
+# Environment=PATH=, its inherited user-manager PATH lacked ~/.local/bin, and
+# so every curator LLM call raised FileNotFoundError for 80+ hours — with no
+# log line naming the binary that could not be found.
+#
+# _CLAUDE_BINARY_ENV_VAR is the operator escape hatch: an absolute path here
+# removes PATH from the equation entirely, and is the remediation the
+# unresolvable-binary escalation recommends.
+# ─────────────────────────────────────────────────────────────────────────────
+_CLAUDE_BINARY_ENV_VAR = 'CLAUDE_BINARY'
+# The historical argv[0]. Kept as the fallback so an environment that never
+# sets _CLAUDE_BINARY_ENV_VAR and does have `claude` on PATH is byte-identical
+# to the pre-task-4448 behaviour.
+_DEFAULT_CLAUDE_BINARY = 'claude'
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -300,6 +320,7 @@ __all__ = [
     'AllAccountsCappedException',
     'build_failure_message',
     'classify_agent_failure',
+    'claude_binary_spec',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'detect_resumable_progress',
@@ -313,9 +334,45 @@ __all__ = [
     'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'resolve_claude_binary',
     'resumable_progress_for_session',
     'transcript_exists',
 ]
+
+
+def claude_binary_spec() -> str:
+    """Return the Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
+
+    An empty ``CLAUDE_BINARY`` is treated as unset rather than as an empty
+    argv[0], so ``CLAUDE_BINARY=`` in a systemd unit or a shell profile
+    degrades to the default instead of producing an unspawnable command.
+
+    The spec may be a bare name (resolved against PATH) or an absolute path.
+    Setting it to an absolute path is the remediation for the 2026-08-13→08-18
+    incident, in which the bare name ``claude`` failed to resolve off an
+    unpinned inherited systemd PATH and silently degraded every curator
+    decision for 80+ hours.
+
+    Never raises.
+    """
+    return os.environ.get(_CLAUDE_BINARY_ENV_VAR) or _DEFAULT_CLAUDE_BINARY
+
+
+def resolve_claude_binary() -> str | None:
+    """Resolve :func:`claude_binary_spec` to an absolute path, or ``None``.
+
+    ``None`` means the spec names nothing executable on the current PATH —
+    precisely the 2026-08-13→08-18 condition, where a bare ``claude`` resolved
+    off an unpinned inherited systemd PATH. Returning the resolution instead of
+    deferring it to ``exec`` is what lets callers report the failure by name
+    (see ``build_claude_argv``'s warning and
+    ``TaskCurator.startup_self_check``) rather than surfacing a bare
+    ``FileNotFoundError`` from deep inside a spawn.
+
+    Never raises: several callers only assemble an argv and never spawn, so a
+    raising resolver would break them on any host without the CLI installed.
+    """
+    return shutil.which(claude_binary_spec())
 
 
 class AllAccountsCappedException(Exception):
