@@ -337,6 +337,15 @@ class _Finding:
     # standing_decision_id above: rows persisted before this field existed must
     # still hydrate via _Finding(**fd) with no migration.
     citation_failures: list[dict] = field(default_factory=list)
+    # Task 4653: the finding_id of the LATER finding that makes this one
+    # historical, or None. Written by add_finding's ``supersedes`` argument;
+    # cleared by _purge_finding when the superseder is itself retracted, so the
+    # pointer can never dangle. Defaults None for the same round-trip-safety
+    # reason as standing_decision_id/citation_failures above: recon_report_store
+    # holds entry_json as an opaque TEXT blob, so rows persisted before this
+    # field existed still hydrate via _Finding(**fd) with no schema change and
+    # no migration script.
+    superseded_by: str | None = None
 
 
 @dataclass
@@ -1108,6 +1117,7 @@ class ReconReportState:
         actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
+        supersedes: str | None = None,
     ) -> dict[str, Any]:
         """Append a finding to the current report entry, with in-run dedup.
 
@@ -1229,6 +1239,33 @@ class ReconReportState:
         surfaced verbatim in the assembled report; ``severity`` is left
         unbounded as it is expected to be a short enum-like label (see the
         module-level comment above ``_MAX_FINDING_TEXT_CHARS``).
+
+        ``supersedes`` (task-4653) names the finding_id of an EARLIER finding
+        in this run that the new one makes historical; on success the TARGET's
+        ``superseded_by`` is stamped with the NEW finding's id (a forward
+        pointer, never the reverse).  It exists because in-run dedup cannot
+        see the relationship: dedup keys on ``(task_id, flag_type)`` and a
+        finding that RESOLVES an earlier claim legitimately carries a
+        DIFFERENT flag_type (``memory_mechanism_contradiction`` vs
+        ``..._resolved``), so the claim and its own refutation both survive as
+        live rows.  Hence the key is an EXPLICIT finding_id and never a
+        ``(task_id, flag_type)`` heuristic, which would re-inherit exactly
+        that blind spot.
+
+        Supersession STAMPS, it does not purge — unlike
+        :meth:`delete_finding` / :meth:`_purge_finding`, which destroy the row
+        and its citations.  The superseded claim stays readable in
+        ``flagged_items`` carrying a forward pointer to its replacement, so
+        the record of what was believed and then retired survives.
+
+        Re-stamping an already-superseded target moves the pointer FORWARD to
+        the newest superseder (logged at INFO when overwriting a non-None
+        pointer): the most recent assertion about a claim is the one a reader
+        should follow.
+
+        The stamp is applied only after the new finding is successfully
+        allocated and appended, so a ``duplicate_finding`` return never
+        stamps anything.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1347,6 +1384,26 @@ class ReconReportState:
                 entry._deschash_to_finding[desc_hash] = finding_id
                 self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
         self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
+
+        # task-4653: stamp-late.  The new finding now exists, so the forward
+        # pointer we write onto the target resolves.  _resolve_finding is
+        # run-scoped and cross-stage, so a later stage can retire an earlier
+        # stage's claim; _persist_run below upserts EVERY entry of the run, so
+        # the stamp on the earlier stage's row is durably written.
+        if supersedes is not None:
+            resolved_target = self._resolve_finding(run_id, supersedes)
+            if resolved_target is not None:
+                _target_entry, target = resolved_target
+                if target.superseded_by is not None:
+                    logger.info(
+                        'recon_report: finding_id=%r was already superseded by %r; '
+                        'moving the pointer forward to %r (run_id=%r)',
+                        supersedes,
+                        target.superseded_by,
+                        finding_id,
+                        run_id,
+                    )
+                target.superseded_by = finding_id
 
         result: dict[str, Any] = {'finding_id': finding_id}
         if warnings:
