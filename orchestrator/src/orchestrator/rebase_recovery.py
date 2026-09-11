@@ -30,10 +30,13 @@ capability the remaining half never had.
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -351,9 +354,9 @@ def sweep_stale_locks(
 #: that means "do not proceed": something still holds a lock open, so the abort
 #: will hit git's "Another git process seems to be running" and a human has to
 #: decide what that process is.
-VERDICT_CLEAN = 'clean'
-VERDICT_REPAIRED = 'repaired'
-VERDICT_BLOCKED = 'blocked'
+VERDICT_CLEAN = 'clean'   # nothing needs attention
+VERDICT_REPAIRED = 'repaired'  # damage found and fixed; proceed
+VERDICT_BLOCKED = 'blocked'  # damage this run did not fix; do not proceed
 
 
 @dataclass(frozen=True)
@@ -369,8 +372,39 @@ class PreflightResult:
     resolved: bool = True
 
     @property
+    def unrepaired(self) -> tuple[str, ...]:
+        """Findings this run did NOT fix — the reason a caller must not proceed.
+
+        Two arms.  A lock with a live holder is a human's decision: something
+        is using it, and this module will not guess what.  A suspect MERGE_RR
+        with no backup means the damage is still in place — the ``report_only``
+        case, where leaving it is the whole point, and also a quarantine that
+        failed.
+        """
+        reasons = [
+            f'lock {finding.path} held by pids '
+            f'{", ".join(str(pid) for pid in finding.holder_pids)}'
+            for finding in self.locks_retained if finding.holder_pids
+        ]
+        if self.merge_rr_backup is None and (self.dangling or self.unparsable):
+            reasons.append(
+                'suspect MERGE_RR left in place — dangling rr-cache refs: ['
+                + ', '.join(record.conflict_id for record in self.dangling)
+                + f']; unparsable records: {len(self.unparsable)}',
+            )
+        return tuple(reasons)
+
+    @property
     def verdict(self) -> str:
-        if any(finding.holder_pids for finding in self.locks_retained):
+        """``clean`` means NOTHING NEEDS ATTENTION, not "I changed nothing".
+
+        The distinction only bites in ``report_only``, and that is exactly
+        where a caller acts on the answer: a verdict derived from what was
+        MUTATED would report ``clean`` for a worktree the same payload
+        describes as dangling, and a skill branching on it would proceed
+        unguarded into the state this exists to catch.
+        """
+        if self.unrepaired:
             return VERDICT_BLOCKED
         if self.merge_rr_backup is not None or self.locks_removed:
             return VERDICT_REPAIRED
@@ -380,6 +414,7 @@ class PreflightResult:
         """The CLI payload — structured values, never a rendered sentence."""
         return {
             'verdict': self.verdict,
+            'unrepaired': list(self.unrepaired),
             'worktree': str(self.worktree),
             'resolved': self.resolved,
             'dangling': [
@@ -487,3 +522,61 @@ def preflight_rebase_recovery(
         locks_removed=sweep.removed,
         locks_retained=sweep.retained,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog='python -m orchestrator.rebase_recovery',
+        description=(
+            'Make a git rebase/merge --abort safe to run: quarantine a MERGE_RR '
+            'whose rr-cache refs dangle, and clear abandoned *.lock files.'
+        ),
+    )
+    sub = p.add_subparsers(dest='verb', required=True)
+
+    preflight = sub.add_parser(
+        'preflight',
+        help='inspect and repair a worktree, emitting a JSON verdict',
+    )
+    preflight.add_argument('--worktree', required=True,
+                           help='path to the worktree to inspect')
+    preflight.add_argument(
+        '--lock-stale-after-seconds', type=float,
+        default=DEFAULT_LOCK_STALE_AFTER_SECONDS,
+        help=(
+            'age past which an UNHELD *.lock is removed '
+            f'(default: {DEFAULT_LOCK_STALE_AFTER_SECONDS:.0f}); a HELD lock is '
+            'retained at any age'
+        ),
+    )
+    preflight.add_argument(
+        '--report-only', action='store_true',
+        help='detect and report without moving or removing anything',
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point; returns an exit code.
+
+    Always 0 for a completed inspection, including the unresolved case: the
+    VERDICT carries the outcome, and a non-zero exit would make a skill treat a
+    guarded recovery as a failed one.
+    """
+    args = _build_parser().parse_args(argv)
+
+    result = preflight_rebase_recovery(
+        Path(args.worktree),
+        lock_stale_after_seconds=args.lock_stale_after_seconds,
+        report_only=args.report_only,
+    )
+    print(json.dumps(result.as_json()))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -966,3 +966,45 @@ class TestPreflightCli:
         assert code == 0
         assert payload['resolved'] is False
         assert payload['verdict'] == 'clean'
+
+    def test_report_only_never_calls_detected_damage_clean(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """`clean` must mean "nothing needs attention", not "I changed nothing".
+
+        The two coincide everywhere EXCEPT here, and this is the case a caller
+        acts on: report-only deliberately leaves the damage in place, so a
+        verdict derived purely from what was MUTATED reports `clean` for a
+        worktree it just described as dangling.  A skill branching on the
+        verdict — which is the whole point of the enum — would then proceed
+        unguarded into exactly the state the preflight exists to catch.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+
+        _, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+
+        assert payload['dangling'], 'fixture expected a detected dangling ref'
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert conflict_id in ' '.join(payload['unrepaired'])
+
+    def test_a_held_lock_blocks_even_when_everything_else_was_repaired(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """The other unrepaired arm: a live holder is a human's decision."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+
+        with lock.open('a'):
+            _, payload = self._run_cli(
+                capsys, 'preflight', '--worktree', str(repo),
+                '--lock-stale-after-seconds', '0',
+            )
+
+        assert payload['merge_rr_backup'] is not None, 'MERGE_RR was still repaired'
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(os.getpid()) in ' '.join(payload['unrepaired'])
