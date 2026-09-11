@@ -4631,6 +4631,199 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
         )
 
 
+# task 5198 (esc-5120-2) RED: TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise
+# ─────────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
+    """Regression-pin: the SHIPPED blocklist catches the refuted task-5120 premise.
+
+    Task 5120 claimed an agent guessed a wrong artifact name/location under
+    ``.task/verify/``, cascading a glob miss into an opaque JSONDecodeError.
+    Reading the raw transcript refuted both halves: the file existed under
+    exactly the guessed name, and the glob resolved against the wrong directory
+    only because the shell's cwd had drifted. The nightly census keeps
+    re-observing the symptom, so the anchor must catch the census generator's
+    own phrasings — while leaving real, separately-filed defects in the same
+    subject area fileable, which the three control fixtures below pin.
+    """
+
+    # Path to the shipped YAML, resolved relative to this test file.
+    BLOCKLIST_PATH = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "config"
+        / "cancelled_premise_blocklist.yaml"
+    )
+    ENTRY_NAME = "verify_summary_glob_jsondecodeerror_refuted"
+
+    # The refuted framing, spelled as the codebook entry and the census
+    # generator spell it. `build_task_payloads` prepends the census marker;
+    # a hand-filed twin would carry the bare title.
+    REFUTED_TITLE = (
+        "Verify-summary glob miss cascades into a generic JSONDecodeError "
+        "instead of a clear not-found"
+    )
+    CENSUS_TITLE = f"[legibility census] {REFUTED_TITLE}"
+
+    # Task 5120's own stored description — the shape `_cluster_description`
+    # emits: cluster summary, an "Evidence:" block of quoted lines, a tail.
+    CENSUS_DESCRIPTION = (
+        "Agent chained `ls -t .task/verify/*scripts.summary.json | head -1` into "
+        "`cat ... | python3 -c 'json.load(sys.stdin)'` to inspect its own verify "
+        "run's command list, assuming a specific summary-file naming/location "
+        "convention under `.task/verify/`. No file matched the glob, so `ls` "
+        "failed with 'No such file or directory' and the downstream "
+        "`cat`/`python3` received empty stdin, surfacing an opaque "
+        "`json.decoder.JSONDecodeError: Expecting value` rather than a direct "
+        "signal that the assumed artifact path/naming was wrong.\n"
+        "\n"
+        "Evidence:\n"
+        "- ls: cannot access '.task/verify/*scripts.summary.json': No such file "
+        "or directory ... json.decoder.JSONDecodeError: Expecting value: line 1 "
+        "column 1 (char 0)\n"
+        "\n"
+        "Observed in 1 sighting(s) (project: dark_factory)."
+    )
+
+    # Every phrasing the entry's `description_substrings` must cover, so a
+    # fixture claiming to isolate one can prove the other two are absent.
+    DESCRIPTION_PHRASINGS = ("scripts.summary.json", "JSONDecodeError", "cannot access")
+
+    def _load(self):
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+        entries = load_blocklist(self.BLOCKLIST_PATH)
+        assert entries, f"Shipped blocklist is empty — path: {self.BLOCKLIST_PATH}"
+        return entries
+
+    def _match(self, title, description):
+        """Run the SHIPPED blocklist over one candidate.
+
+        Returns ``(hit, names)`` — the matching entry or None, plus the names of
+        every loaded entry, so a failure message can say what was actually
+        consulted rather than only what was expected.
+        """
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+        candidate = CandidateTask(title=title, description=description)
+        return match_candidate(candidate, entries), [e.name for e in entries]
+
+    def test_census_shaped_refile_of_task_5120_matches(self):
+        """Task 5120's own title + description — what a re-file actually looks like."""
+        hit, names = self._match(self.CENSUS_TITLE, self.CENSUS_DESCRIPTION)
+        assert hit is not None, (
+            "Expected a blocklist hit for a census-shaped re-file of task 5120, "
+            f"got None. Entries: {names}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_bare_codebook_entry_title_without_census_marker_matches(self):
+        """A hand-filed twin carries no "[legibility census] " prefix."""
+        hit, names = self._match(self.REFUTED_TITLE, self.CENSUS_DESCRIPTION)
+        assert hit is not None, (
+            "Expected a blocklist hit for the bare codebook-entry title (no "
+            f"census marker), got None. Entries: {names}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    @pytest.mark.parametrize(
+        ("phrasing", "description"),
+        [
+            (
+                "scripts.summary.json",
+                "The `.task/verify/*scripts.summary.json` glob matched nothing, so "
+                "the downstream parse read empty stdin instead of the run's "
+                "command list.",
+            ),
+            (
+                "JSONDecodeError",
+                "Artifact discovery under the verify directory surfaced "
+                "json.decoder.JSONDecodeError: Expecting value: line 1 column 1 "
+                "(char 0) rather than a direct not-found signal.",
+            ),
+            (
+                "cannot access",
+                "ls: cannot access '.task/verify/*.summary.json': No such file or "
+                "directory — the chained parse then read empty stdin.",
+            ),
+        ],
+    )
+    def test_each_description_phrasing_independently_matches(self, phrasing, description):
+        """One fixture per `description_substrings` phrasing, each carrying only
+        its own — so a phrasing is genuinely pinned, not incidentally covered
+        by a sibling that happens to mention all three."""
+        bleed = [
+            other
+            for other in self.DESCRIPTION_PHRASINGS
+            if other != phrasing and other.lower() in description.lower()
+        ]
+        assert bleed == [], (
+            f"fixture for {phrasing!r} also carries {bleed} — it can no longer "
+            "show that phrasing matches on its own"
+        )
+
+        hit, names = self._match(self.CENSUS_TITLE, description)
+        assert hit is not None, (
+            f"Expected a blocklist hit for the {phrasing!r} phrasing alone, got "
+            f"None. Entries: {names}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_control_this_remediation_task_does_not_match(self):
+        """ANCHOR SAFETY: task 5198 itself must stay fileable.
+
+        Its description quotes all three `description_substrings` verbatim, so a
+        pass here proves the TITLE gate carries the safety rather than a lucky
+        description miss.
+        """
+        hit, names = self._match(
+            "Suppress the refuted task-5120 premise: blocklist entry + codebook "
+            "amendment FIRST, cancel 5120 LAST (esc-5120-2, Leo ruled b)",
+            "description_substrings: AT LEAST ONE must appear. Include the "
+            "scripts.summary.json path substring, plus the JSONDecodeError text "
+            "and the \"cannot access\" glob-miss text, so the census generator's "
+            "own phrasings are all covered.",
+        )
+        assert hit is None, (
+            "This remediation task must stay fileable, but the blocklist matched "
+            f"it via entry {hit.name!r}. Entries: {names}"
+        )
+
+    def test_control_archive_gap_task_5199_does_not_match(self):
+        """ANCHOR SAFETY: the real, measured verify-summary ARCHIVE GAP defect
+        (task 5199) is in the same subject area and must stay fileable. Its
+        title carries "verify" but neither "glob" nor "jsondecodeerror"."""
+        hit, names = self._match(
+            "Task-path verify summary JSON is never archived — "
+            "_persist_attempt_logs excludes it from its return value, so it dies "
+            "with the worktree",
+            "orchestrator/src/orchestrator/verify.py::_persist_attempt_logs "
+            "writes the task-path summary to "
+            "<worktree>/.task/verify/attempt-{N}[.{prefix}].summary.json and then "
+            "deliberately omits it from what it returns, so the summary path is "
+            "never among the files copied to data/verify-logs/<task_id>/.",
+        )
+        assert hit is None, (
+            "The archive-gap task 5199 must stay fileable, but the blocklist "
+            f"matched it via entry {hit.name!r}. Entries: {names}"
+        )
+
+    def test_control_true_cause_entry_framing_does_not_match(self):
+        """ANCHOR SAFETY: the TRUE cause's framing — the live codebook entry
+        `entry-cand-20260729-4`, which owns the phenomenon 5120 mis-attributed
+        — must remain fileable."""
+        hit, names = self._match(
+            "Bash cwd persists across turns, causing relative-path git commit "
+            "--only pathspec failures on PRD doc commits",
+            "The shell's working directory carries over between turns, so a "
+            "worktree-relative path resolves against whatever directory a prior "
+            "turn left it in.",
+        )
+        assert hit is None, (
+            "The true-cause framing must stay fileable, but the blocklist "
+            f"matched it via entry {hit.name!r}. Entries: {names}"
+        )
+
+
 # step-9 RED: TestZeroOutputBreakerBatchPath
 # ──────────────────────────────────────────────────────────────────────────────
 
