@@ -1760,11 +1760,38 @@ def test_non_convergence_is_counted_at_the_cli_and_forces_a_non_zero_exit(
 
 
 def test_the_lane_flag_narrows_the_sweep(sweep_root, capsys):
-    """--lane lets an operator run one corpus at a time."""
-    _c, plans_only = _run_json(capsys, '--root', str(sweep_root), '--lane', 'plans')
-    _c2, esc_only = _run_json(capsys, '--root', str(sweep_root), '--lane', 'escalations')
+    """--lane lets an operator run one corpus at a time — every lane, via argv.
+
+    All three lanes go through ``_run_json`` -> ``sweep.main(argv)``, which is
+    the argparse path an operator's cron actually takes. ``meta-plans`` is here
+    because it is the lane the periodic check is documented to use, and until
+    this row its ONLY argv-level coverage was
+    ``sweep.LANE_META_PLANS in sweep._LANE_CHOICES`` — an assertion against a
+    private constant, which cannot tell a selectable lane from a lane the
+    parser rejects. The exit code is asserted rather than discarded for the
+    same reason: an operator reads the status, not the JSON.
+    """
+    plans_code, plans_only = _run_json(
+        capsys, '--root', str(sweep_root), '--lane', 'plans'
+    )
+    esc_code, esc_only = _run_json(
+        capsys, '--root', str(sweep_root), '--lane', 'escalations'
+    )
+    meta_code, meta_only = _run_json(
+        capsys, '--root', str(sweep_root), '--lane', 'meta-plans'
+    )
+
     assert plans_only['files_scanned'] == 2
     assert esc_only['files_scanned'] == 4
+    assert meta_only['files_scanned'] == 1, (
+        'the one `.worktrees/.task-meta/9002/plan.json` the fixture holds — '
+        'and NOT the `.worktrees-orphaned` symlink that points at it, which '
+        'belongs to the plans lane'
+    )
+
+    assert (plans_code, esc_code, meta_code) == (
+        sweep.EXIT_REPAIRABLE_REMAINS,
+    ) * 3, 'every lane of this fixture has repairable work pending'
 
 
 def test_the_script_source_spells_no_raw_envelope_literal():
@@ -2355,8 +2382,11 @@ def test_the_meta_plans_lane_selects_the_same_files_as_all(meta_plans_root):
     """(a, continued) ``--lane meta-plans`` and ``--lane all`` agree here.
 
     This root holds nothing but meta-root plans, so the two runs must produce
-    identical summaries. A lane constant that discovery tagged but the CLI
-    could not select would be a lane in name only.
+    identical summaries. Scoped to what it calls: ``run_sweep(lane=...)``
+    directly, so this row pins the SELECTION, not the CLI — whether the lane
+    the operator's ``--lane meta-plans`` resolves to is argparse-reachable at
+    all is pinned by ``test_the_lane_flag_narrows_the_sweep``, which goes
+    through ``sweep.main(argv)``.
     """
     scoped, _ = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
     everything, _ = sweep.run_sweep(meta_plans_root, lane='all')
