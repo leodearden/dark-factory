@@ -683,14 +683,16 @@ class MarkupGuardMiddleware(Middleware):
           hint telling it to set a flag it had already set.
         * The tool declares NO ``metadata`` — strip the flag (it is
           write-time-only control, never payload) and drop the key when that
-          empties it. MEASURED: most tools this
-          guard sits in front of take none — ``escalate_info``,
-          ``escalate_blocker``, ``add_reuse_item`` and most of the
-          escalation/orchestrator surface. Forwarding ``metadata`` to one of
-          those turns the documented remediation into ``ToolError: Unexpected
-          keyword argument``: an agent quoting envelope markup in an escalation
-          summary — a very likely topic, given DF 3083 — would land in a second,
-          more confusing error with no working way out. That failure, and only
+          empties it. MEASURED, and re-scoped by task 5283: the ESCALATION
+          surface still takes none — ``escalate_info`` and ``escalate_blocker``
+          declare no such parameter — while plan-tools and verdict-tools have
+          moved to the forward branch by DECLARING it through
+          :func:`accepts_markup_override`. Forwarding ``metadata`` to a tool
+          that does not declare it turns the documented remediation into
+          ``ToolError: Unexpected keyword argument``: an agent quoting envelope
+          markup in an escalation summary — a very likely topic, given DF 3083
+          — would land in a second, more confusing error with no working way
+          out. That failure, and only
           that failure, is what the drop exists to fix, so anything the caller
           sent BESIDES the flag is left in place, in its original shape: on a
           tool with no ``metadata`` parameter that residue is the caller's own

@@ -512,16 +512,18 @@ class TestTheDeclarationIsMachineChecked:
 
 
 # ---------------------------------------------------------------------------
-# (h) — the deliberate-quoting override on a metadata-less tool.
+# (h) — the deliberate-quoting override, on the tool that now DECLARES it.
 # ---------------------------------------------------------------------------
 
 
 class TestDeliberateQuotingOverride:
     """An architect planning a task ABOUT this leak has to be able to say so.
 
-    ``add_design_decision`` declares no ``metadata`` parameter, so this
-    exercises ``_apply_override``'s DROP branch: the flag is stripped before
-    dispatch rather than forwarded as an unexpected argument.
+    Since task 5283 ``add_design_decision`` DECLARES ``metadata`` — every tool
+    on this server does, through ``accepts_markup_override`` — so this
+    exercises ``_apply_override``'s FORWARD branch: the map travels to the
+    tool unchanged and the decorator consumes it there. What the caller sees
+    is unchanged, and these rows are what says so rather than assuming it.
     """
 
     #: The rationale every row below sends alongside its decision. Clean, so
@@ -620,7 +622,7 @@ class TestDeliberateQuotingOverride:
     ):
         """(e) The sharp edge the declaration removes.
 
-        On a metadata-less tool ``_apply_override`` strips the flag and leaves
+        Before the declaration ``_apply_override`` stripped the flag and left
         whatever else the caller sent, so a second key reached pydantic as an
         unexpected argument and the caller was bounced a second time, with no
         working way out. A declared parameter accepts the whole map.

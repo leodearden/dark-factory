@@ -1701,10 +1701,14 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     #   tool has searching for envelope literals as its job, the way
     #   fused-memory's scan_memory_content does. An architect legitimately
     #   QUOTING the literals — planning a task about this very leak — uses the
-    #   deliberate-quoting override instead, which works here even though no
-    #   plan-tools tool declares a `metadata` parameter: the middleware drops
-    #   the flag before dispatch rather than forwarding it as an unexpected
-    #   argument.
+    #   deliberate-quoting override instead, which every tool on this server
+    #   DECLARES (task 5283): `accepts_markup_override` appends the `metadata`
+    #   parameter to each registered signature, so the remediation the
+    #   rejection hint gives is part of the advertised contract rather than a
+    #   client that happens to send an undeclared argument. The middleware
+    #   therefore takes `_apply_override`'s FORWARD branch here, and the
+    #   decorator — not the middleware — is what consumes the flag: no tool
+    #   body ever sees it, so it cannot reach plan.json.
     #
     # THE ESCALATION SINK IS WIRED, and that is not optional here. Contract C2
     # is explicit that unrepairable input is refused AND its full raw payload
