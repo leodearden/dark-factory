@@ -1211,6 +1211,21 @@ class CensusOutcome:
     cap interrupted, which is what makes a defer legible next to an
     ordinary run in which the verifier genuinely rejected everything."""
 
+    unresolved_verdicts: int = 0
+    """How many verify verdicts this run PAID FOR resolved to no pending
+    candidate and were dropped (``status == "done"`` runs only).
+
+    NOT a loss of persisted state -- the codebook is correct either way. The
+    standing prior verdict holding is the CORRECT outcome; the merger is
+    right not to fabricate a pending twin over an adjudicated record (task
+    4144). It sizes the adjudication effort that went nowhere. Carried as a
+    FIELD, not just a log line, so it is assertable structurally rather than
+    by log-scraping, exactly like ``unverified_clusters`` above.
+
+    A recurring non-zero count is the operator's cue that a title keeps
+    being re-mined and re-verified against a verdict that will never change
+    without a hand re-open."""
+
 
 def _defer(
     stage: str,
@@ -1653,6 +1668,11 @@ def run_census(
     for record in mining_result.records:
         updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
 
+    # ONE counter for every verdict this run paid for and dropped, shared by
+    # both adjudication loops below -- a per-loop name would fork the tally
+    # permanently.
+    unresolved_verdicts = 0
+
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
@@ -1684,6 +1704,7 @@ def run_census(
             # verdict. Skipping it is still correct -- announcing it is what
             # was missing. The three branches differ in what an operator must
             # DO, which is the only thing that justifies separate messages.
+            unresolved_verdicts += 1
             standing = _find_adjudicated_candidate(updated_codebook, cluster.get("title"))
             if standing is None:
                 logger.warning(
@@ -1717,6 +1738,20 @@ def run_census(
 
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
+
+    # ONE run-summary line, emitted only when there is something to say --
+    # silence on a clean run keeps the line informative rather than
+    # skimmable. The per-cluster warnings above say WHICH titles; this says
+    # how much of the run went nowhere.
+    if unresolved_verdicts:
+        logger.warning(
+            "census: %d unresolved verdict(s) -- verdicts that found no pending "
+            "candidate and were dropped. These were PAID FOR and went nowhere: a "
+            "prior adjudication of the same title is standing and only a hand "
+            "re-open will change it. See the per-cluster warnings above for which "
+            "titles.",
+            unresolved_verdicts,
+        )
 
     validation_errors = codebook.validate(updated_codebook)
     if validation_errors:
@@ -1895,6 +1930,7 @@ def run_census(
         filed_task_ids=filed_task_ids,
         stop_reason=mining_result.stop_reason,
         dry_run=dry_run_filing,
+        unresolved_verdicts=unresolved_verdicts,
     )
 
 
@@ -2805,9 +2841,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    # Appended ONLY when non-zero, so a normal run's summary line stays
+    # byte-identical: the clause appears exactly when it carries information.
+    # Same reasoning as render_report's coverage-shortfall gating -- a line
+    # trained to be ignored is a line that will be ignored.
+    unresolved = (
+        f" unresolved_verdicts={outcome.unresolved_verdicts}"
+        if outcome.unresolved_verdicts else ""
+    )
     print(
         f"census: done -- report={outcome.report_path} "
-        f"filed_tasks={len(outcome.filed_task_ids)} stop_reason={outcome.stop_reason}"
+        f"filed_tasks={len(outcome.filed_task_ids)} "
+        f"stop_reason={outcome.stop_reason}{unresolved}"
     )
     return 0
 
