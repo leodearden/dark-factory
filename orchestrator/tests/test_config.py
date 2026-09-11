@@ -1851,8 +1851,18 @@ class TestStarvationWatchdogConfig:
           block is loaded via load_config and all three fields adopt the override values.
       (c) partial override — overriding only `enabled: false` keeps skip_threshold and
           idle_secs at their defaults (deep-merge / no clobber).
+
+    Every (a)-shaped test here carries @pytest.mark.usefixtures('code_default_config'),
+    without exception: the autouse _isolate_orch_config pins ORCH_CONFIG_PATH at the
+    operational dark-factory-orchestrator.yaml, which now carries a starvation_watchdog
+    block (a47b5a506e), so ANY leaf an operator parks in it bleeds into a bare
+    OrchestratorConfig() and reddens the default that leaf overrides.  Which leaves are
+    currently parked is not a property this class may depend on.  (b)/(c) build through
+    load_config and isolate themselves with monkeypatch.delenv('ORCH_CONFIG_PATH')
+    instead; they need no fixture.
     """
 
+    @pytest.mark.usefixtures('code_default_config')
     def test_defaults(self):
         """Bare OrchestratorConfig() exposes starvation_watchdog with correct defaults."""
         from orchestrator.config import StarvationWatchdogConfig
