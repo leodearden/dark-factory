@@ -198,6 +198,29 @@ ENVELOPE_LITERALS: tuple[str, ...] = tuple(
 _ENVELOPE_RE = re.compile('|'.join(re.escape(literal) for literal in ENVELOPE_LITERALS))
 
 
+# A pseudo-parameter NAME as the harness emits it. Deliberately narrow: a tag
+# whose name is not an identifier is not a dropped parameter, it is prose.
+#
+# ONE grammar, bounding BOTH halves of the gate/repairer pair. :data:`_CLOSER_RE`
+# builds the repairer's candidate matcher from it, so a mis-close whose name
+# falls outside this shape can never be QUALIFIED for repair; :func:`_extra_names`
+# applies it to the gate's widening vocabulary for exactly that reason, so the
+# gate cannot spell a needle the repairer standing behind it could never act on.
+# Keeping the two aligned is what stops a widened detection from routing
+# authored text into the human queue for nothing — the mirror image of the
+# schema-aware-repairer-behind-a-schema-blind-detector asymmetry this module's
+# docstring identifies as the original silent write path.
+_TAG_NAME = r'[A-Za-z_]\w*'
+
+#: :data:`_TAG_NAME` as a whole-string test, for callers holding a NAME rather
+#: than scanning text for one.
+_TAG_NAME_RE = re.compile(_TAG_NAME + r'\Z')
+
+#: The canonical empty widening set, so the overwhelmingly common
+#: "no schema in hand" call shape reuses one object instead of building one.
+_NO_NAMES: frozenset[str] = frozenset()
+
+
 def detect(value: object) -> str | None:
     """Return the earliest :data:`ENVELOPE_LITERALS` member occurring in *value*.
 
@@ -253,6 +276,43 @@ def _widened_re(extra_names: frozenset[str]) -> re.Pattern[str]:
     return re.compile('|'.join(re.escape(literal) for literal in literals))
 
 
+@lru_cache(maxsize=512)
+def _extra_names(param: str, schema_params: frozenset[str]) -> frozenset[str]:
+    """The widening vocabulary for one ``(param, schema_params)`` pair.
+
+    CACHED, because :func:`detect_for` sits on a per-tool-call boundary and
+    answers ``None`` for 99.7% of the values it sees — so on the dominant path
+    its whole cost is setup that finds nothing. The distinct pairs a running
+    server produces are bounded by its tool table, not by its traffic, so the
+    normalization is genuinely a once-per-pair computation that was being
+    redone per call.
+
+    Both arguments are pre-coerced by the caller and HASHABLE: *param* is a
+    ``str`` (``''`` when the caller had none) and *schema_params* a frozenset,
+    produced by the same fail-safe :func:`_as_name_set` :func:`repair` uses, so
+    the cache key can never be the caller's own mutable object.
+
+    Two names are dropped, for two different reasons:
+
+    * one whose closer is ALREADY in :data:`ENVELOPE_LITERALS` — re-adding it
+      would enumerate a literal twice (INV-5) and change nothing;
+    * one outside the :data:`_TAG_NAME` shape — see that constant. The gate's
+      widening vocabulary is held exactly equal to the repairer's candidate
+      grammar, so a needle can never be spelled for a name :func:`repair` would
+      refuse to qualify. It also bounds what a caller-controlled *param* can
+      turn into a cache key: ``_first_markup_argument`` passes each key of the
+      caller's argument mapping straight through.
+    """
+    names = set(schema_params)
+    if param:
+        names.add(param)
+    return frozenset(
+        name
+        for name in names
+        if _TAG_NAME_RE.match(name) and closer_for(name) not in ENVELOPE_LITERALS
+    )
+
+
 def detect_for(
     value: object,
     param: object,
@@ -276,7 +336,8 @@ def detect_for(
     NO NEW LITERAL IS ENUMERATED (INV-5). Every added needle is built by
     :func:`closer_for`, the one place a closing tag is spelled; a name whose
     closer is already in :data:`ENVELOPE_LITERALS` is dropped rather than
-    re-added.
+    re-added, and so is a name outside the :data:`_TAG_NAME` shape the
+    repairer's own candidate grammar accepts.
 
     Total, on the same terms as :func:`detect` and for the same reason — the
     gates that call it must need no pre-validation. A *value* that is not a
@@ -286,28 +347,26 @@ def detect_for(
     *schema_params* that is not a collection of names — including a bare
     ``str``, which would iterate into CHARACTERS and manufacture one-letter
     needles — contributes nothing, via the same fail-safe :func:`repair` uses.
+
+    COST on the clean path: the widening is normalized once per distinct
+    ``(param, schema_params)`` pair by :func:`_extra_names` and compiled once
+    per distinct result by :func:`_widened_re`, so a repeat call is two cache
+    lookups and one scan of *value*. The no-schema shape — every middleware
+    call site — reuses :data:`_NO_NAMES` and allocates nothing at all.
     """
     if not value or not isinstance(value, str):
         return None
-    extra = _as_name_set(schema_params)
-    if isinstance(param, str) and param:
-        extra = extra | {param}
-    extra = frozenset(
-        name
-        for name in extra
-        if name and closer_for(name) not in ENVELOPE_LITERALS
+    names = _extra_names(
+        param if isinstance(param, str) else '',
+        _as_name_set(schema_params),
     )
-    match = _widened_re(extra).search(value)
+    match = _widened_re(names).search(value)
     return match.group(0) if match is not None else None
 
 
 # ---------------------------------------------------------------------------
 # Repair — recovering the parameters the harness parser silently dropped.
 # ---------------------------------------------------------------------------
-
-# A pseudo-parameter NAME as the harness emits it. Deliberately narrow: a tag
-# whose name is not an identifier is not a dropped parameter, it is prose.
-_TAG_NAME = r'[A-Za-z_]\w*'
 
 # Candidate mis-close positions, and the closing half of a pseudo-parameter
 # pair. The trailing ``"?`` is the DIALECT BLEND tolerance: PRD section 2.1's
@@ -381,9 +440,17 @@ def _as_name_set(names: object) -> frozenset[str]:
     It is defined here rather than beside :func:`detect_for` because
     :func:`repair` was its first consumer and this is where its fail-safe
     direction is argued.
+
+    An empty or unusable collection yields the canonical :data:`_NO_NAMES`
+    object rather than a fresh empty frozenset. That is the overwhelmingly
+    common shape — every middleware call site passes no schema at all — and it
+    is on :func:`detect_for`'s 99.7%-clean path, where building a set to hold
+    nothing was measurably the largest remaining per-call allocation.
     """
     if isinstance(names, (str, bytes)) or not isinstance(names, Iterable):
-        return frozenset()
+        return _NO_NAMES
+    if not names:
+        return _NO_NAMES
     return frozenset(name for name in names if isinstance(name, str))
 
 

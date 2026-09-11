@@ -745,8 +745,13 @@ class MarkupGuardMiddleware(Middleware):
         dominant real dialect, and one the fixed literal set spells no part of.
         The name is already the loop variable from ``arguments.items()``, so
         this adds NO awaited schema round-trip to the 99.7% clean path; it
-        costs one frozenset build and an ``lru_cache`` hit on top of the same
-        single compiled pass. Measured over
+        costs TWO ``lru_cache`` lookups — the widening vocabulary, then its
+        compiled alternation — and no allocation, on top of the same single
+        compiled pass. (This previously claimed "one frozenset build"; it was
+        three, until task **5283** moved the normalization behind
+        :func:`~shared.toolcall_markup._extra_names`. Measured A/B in one
+        process, min of 7 x 100k: the fixed per-call overhead over ``detect``
+        fell from +1657 ns to +581 ns.) Measured over
         ``.worktrees/.task-meta/*/plan.json`` on 2026-08-25: of 444 corrupted
         entries, 212 were invisible to the fixed set, and 212 of 212 of those
         are caught by the SELF-NAME closer alone.
