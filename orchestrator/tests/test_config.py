@@ -1917,6 +1917,7 @@ class TestStarvationWatchdogConfig:
             f'got {cfg.starvation_watchdog.idle_secs!r}'
         )
 
+    @pytest.mark.usefixtures('code_default_config')
     def test_idle_only_secs_default(self):
         """Bare OrchestratorConfig() exposes idle_only_secs == 259200.0 (== idle_secs default).
 
