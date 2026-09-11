@@ -1409,6 +1409,174 @@ class TestBuildReport:
 
 
 # ---------------------------------------------------------------------------
+# The two enumeration halves, which are different KINDS of thing: the cluster is
+# a named manifest where an unresolved path IS the finding and must be shown by
+# name; the test tree is an open sweep of other people's files where only the
+# coverage ratio is meaningful. Keeping them apart in the data structure is what
+# lets the baseline store one and merely report the other.
+
+
+class TestReportEnumerationSplitsTheTwoHalves:
+    @pytest.fixture()
+    def enumeration(self, live_report: dict) -> dict:
+        return live_report['enumeration']
+
+    def test_the_key_set_is_exactly_the_five(self, enumeration: dict) -> None:
+        # EXACT, not a floor: a sixth key reaching the report is a deliberate
+        # act, because it also has to be decided whether it reaches the file.
+        assert set(enumeration) == {
+            'requested',
+            'resolved',
+            'test_tree',
+            'unreadable',
+            'complete',
+        }
+
+    def test_the_cluster_half_stays_verbatim_paths(self, enumeration: dict) -> None:
+        # The cluster half is PATHS, glob literals included -- those literals are
+        # the SPOT record of PRD Appendix A and an unexpectedly-missing one IS
+        # the finding, so a count could not express it.
+        assert enumeration['requested'] == list(metrics.CLUSTER_PATHS)
+
+    def test_no_test_tree_path_list_survives_anywhere_in_the_block(
+        self, enumeration: dict
+    ) -> None:
+        # THE HEADLINE PROPERTY, executably: the only orchestrator/tests paths
+        # left in any list are CLUSTER_PATHS literals. Measured today: exactly
+        # the 3 that live there (conftest.py, _merge_queue_harness.py,
+        # _serial_merge_worker.py).
+        cluster = set(metrics.CLUSTER_PATHS)
+        for key, value in enumeration.items():
+            if not isinstance(value, list):
+                continue
+            strays = [
+                entry for entry in value
+                if isinstance(entry, str)
+                and entry.startswith('orchestrator/tests/')
+                and entry not in cluster
+            ]
+            assert strays == [], f'{key} still carries per-path test-tree entries'
+
+    def test_the_test_tree_half_is_two_integer_counts(self, enumeration: dict) -> None:
+        test_tree = enumeration['test_tree']
+        assert set(test_tree) == {'requested', 'resolved'}
+        for name, value in test_tree.items():
+            # bool is an int subclass, so exclude it explicitly -- a count that
+            # collapsed to True/False would otherwise pass as an integer.
+            assert isinstance(value, int) and not isinstance(value, bool), name
+
+    def test_the_denominator_covers_the_whole_tree(self, enumeration: dict) -> None:
+        # One-sided FLOOR, measured 568 .py files under orchestrator/tests: this
+        # number is reported, never ratcheted, so it must survive attrition.
+        assert enumeration['test_tree']['requested'] >= 400
+
+    def test_the_numerator_is_exactly_the_measured_test_count(
+        self, live_report: dict
+    ) -> None:
+        # THE SPOT RELATION that makes storing this number redundant: it is
+        # len(report['tests']), already in the baseline line-locally.
+        assert live_report['enumeration']['test_tree']['resolved'] == len(
+            live_report['tests']
+        )
+
+    def test_completeness_is_carried_verbatim(self, enumeration: dict) -> None:
+        # INV-11: the split narrows nothing about completeness.
+        assert enumeration['unreadable'] == []
+        assert enumeration['complete'] is True
+
+
+class TestTestTreeSweep:
+    """`_sweep_test_tree` in isolation -- no complexipy, so this runs in ms."""
+
+    @staticmethod
+    def _tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        tests = tmp_path / 'orchestrator' / 'tests'
+        tests.mkdir(parents=True)
+        (tests / 'test_lane.py').write_text(
+            'from orchestrator import merge_queue\n\n'
+            'def test_x():\n'
+            '    assert merge_queue._worker is None\n',
+            encoding='utf-8',
+        )
+        (tests / 'test_unrelated.py').write_text(
+            'import json\n\ndef test_y():\n    assert json\n', encoding='utf-8'
+        )
+        (tests / 'test_broken.py').write_text('def (:\n', encoding='utf-8')
+        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        return tmp_path
+
+    def test_counts_are_integers_not_path_lists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The sweep's contract: 3 files asked for, 1 measured, as COUNTS.
+        root = self._tree(tmp_path, monkeypatch)
+        tests, unreadable, coverage = metrics._sweep_test_tree(root)
+        assert coverage.requested == 3
+        assert coverage.resolved == 1
+        assert list(tests) == ['orchestrator/tests/test_lane.py']
+
+    def test_the_unparseable_file_is_named_and_only_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # INV-11 POLARITY at the sweep boundary: the skip is fail-SOFT per file
+        # (an unrelated mid-edit test must not redden the lane's ratchet) but the
+        # RECORD is not -- the path is named verbatim.
+        root = self._tree(tmp_path, monkeypatch)
+        _tests, unreadable, _coverage = metrics._sweep_test_tree(root)
+        assert list(unreadable) == ['orchestrator/tests/test_broken.py']
+
+    def test_a_skipped_file_marks_the_composed_block_incomplete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The seam that makes check_against_baseline REFUSE to compare: the
+        # sweep's soft skip must still reach `complete` in the report block.
+        root = self._tree(tmp_path, monkeypatch)
+        _tests, unreadable, coverage = metrics._sweep_test_tree(root)
+        cluster = metrics.Enumeration(
+            requested=('a.py',), resolved=('a.py',), unreadable=(), complete=True
+        )
+        block = metrics._report_enumeration(cluster, unreadable, coverage)
+        assert block['complete'] is False
+        assert 'orchestrator/tests/test_broken.py' in block['unreadable']
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics._require_complete_enumeration({'enumeration': block})
+        assert 'orchestrator/tests/test_broken.py' in str(excinfo.value)
+
+    def test_a_clean_sweep_composes_a_complete_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The other polarity, so the test above cannot pass vacuously.
+        tests_dir = tmp_path / 'orchestrator' / 'tests'
+        tests_dir.mkdir(parents=True)
+        (tests_dir / 'test_ok.py').write_text('import json\n', encoding='utf-8')
+        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        _tests, unreadable, coverage = metrics._sweep_test_tree(tmp_path)
+        cluster = metrics.Enumeration(
+            requested=('a.py',), resolved=('a.py',), unreadable=(), complete=True
+        )
+        block = metrics._report_enumeration(cluster, unreadable, coverage)
+        assert block['complete'] is True
+        assert block['unreadable'] == []
+        assert block['test_tree'] == {'requested': 1, 'resolved': 0}
+
+    def test_an_unreadable_cluster_path_is_not_masked_by_a_clean_sweep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Both halves' unreadable paths travel verbatim in ONE top-level list --
+        # the cluster half's finding must not be diluted or dropped.
+        tests_dir = tmp_path / 'orchestrator' / 'tests'
+        tests_dir.mkdir(parents=True)
+        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        _tests, unreadable, coverage = metrics._sweep_test_tree(tmp_path)
+        cluster = metrics.Enumeration(
+            requested=('a.py',), resolved=(), unreadable=('a.py',), complete=False
+        )
+        block = metrics._report_enumeration(cluster, unreadable, coverage)
+        assert block['unreadable'] == ['a.py']
+        assert block['complete'] is False
+
+
+# ---------------------------------------------------------------------------
 # Baseline serialization, and the per-path LINE LOCALITY that makes ten
 # parallel gamma branches rebase without conflicting.
 
