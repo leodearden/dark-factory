@@ -809,6 +809,10 @@ class TestGitOpsGuardedAbort:
             [*rebase_recovery.RECOVERY_GIT, 'merge', '--abort'],
         ]
 
+
+class TestGitOpsAbortUniformity:
+    """SPOT, enforced against the FILE rather than against known call sites."""
+
     def test_no_unguarded_abort_vector_survives_anywhere_in_git_ops(self) -> None:
         """SPOT, enforced against the file rather than against known call sites.
 
