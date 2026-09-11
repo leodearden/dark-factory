@@ -26,7 +26,10 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.config import load_config
+from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import ShadowShape, build_live_fixture
+from orchestrator.evals.runner import build_eval_orch_config, load_task
 from orchestrator.evals.task_sampler import default_verify_commands
 
 
@@ -434,3 +437,106 @@ class TestBuildLiveFixtureIsArgumentPure:
         )
         assert fixture['plan'] == plan
         assert fixture['plan'] is not plan
+
+
+def _base_config(tmp_path: Path):
+    """A deterministic pure-code-default base config via the REAL load_config().
+
+    Copied from ``test_eval_driver._base_config``: a minimal YAML setting only
+    project_root, layered over the packaged defaults.yaml by the real
+    production config-load entry point — never a hand-built OrchestratorConfig,
+    so a leaf that regresses to a pydantic default is visible here.
+    """
+    cfg_path = tmp_path / 'orchestrator.yaml'
+    cfg_path.write_text(f'project_root: {tmp_path}\n')
+    return load_config(cfg_path)
+
+
+class TestLiveFixtureRoundTrip:
+    """The PRD's β signal: the emitted dict survives the REAL consumers.
+
+    Exercises ``runner.load_task`` and ``build_eval_orch_config`` rather than
+    re-pinning a key list — a fixture that satisfies the key surface but dies
+    at ``json.dump`` or at ``load_task``'s ``raw_root.startswith(...)`` would
+    pass the former and fail the campaign.
+    """
+
+    def _round_trip(self, tmp_path) -> dict:
+        checkout = tmp_path / 'checkout'
+        checkout.mkdir()
+        fixture = build_live_fixture(
+            live_task(),
+            base_sha=BASE_SHA,
+            project_root=checkout,
+            plan=live_plan(),
+            verify_commands=default_verify_commands('df'),
+            shape=ShadowShape.IMPLEMENTER,
+            cell_id='01JCELL',
+        )
+        fixture_path = tmp_path / 'shadow.json'
+        fixture_path.write_text(json.dumps(fixture))
+        return load_task(fixture_path)
+
+    def test_survives_json_dump_and_load_task_untouched(self, tmp_path):
+        loaded = self._round_trip(tmp_path)
+        assert loaded['id'] == 'shadow_5383_01JCELL'
+        assert loaded['pre_task_commit'] == BASE_SHA
+        # The path exists, so neither load_task rewrite branch fires and the
+        # cell's own checkout stands.
+        assert loaded['project_root'] == str(tmp_path / 'checkout')
+
+    def test_project_root_is_a_str(self, tmp_path):
+        # load_task:234 calls raw_root.startswith(...) — a Path or a null is an
+        # AttributeError there, so the string form is load-bearing.
+        loaded = self._round_trip(tmp_path)
+        assert isinstance(loaded['project_root'], str)
+
+    def test_derived_orch_config_runs_the_fixtures_gates(self, tmp_path):
+        loaded = self._round_trip(tmp_path)
+        orch = build_eval_orch_config(
+            EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max'),
+            loaded,
+            base_config=_base_config(tmp_path),
+        )
+        gates = default_verify_commands('df')
+        assert orch.test_command == gates['test']
+        assert orch.lint_command == gates['lint']
+        assert orch.type_check_command == gates['typecheck']
+        assert orch.project_root == tmp_path / 'checkout'
+
+    def test_omitted_knobs_land_on_the_documented_runner_defaults(self, tmp_path):
+        # The deliberate omissions resolve to the eval standard the INCUMBENT
+        # is also measured under — not to something surprising.
+        orch = build_eval_orch_config(
+            EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max'),
+            self._round_trip(tmp_path),
+            base_config=_base_config(tmp_path),
+        )
+        assert orch.max_execute_iterations == 20
+        assert orch.max_review_cycles == 1
+        assert orch.judge_after_each_iteration is True
+
+    def test_task_assignment_inputs_resolve_to_the_emitted_values(self, tmp_path):
+        # The exact reads run_eval performs to build its TaskAssignment. The
+        # `name`-synthesised fallback must NOT fire: it would drop `details`
+        # from the brief and hand the shadow agent less than production got.
+        loaded = self._round_trip(tmp_path)
+        task = live_task()
+        fallback = {
+            'title': loaded.get('name', loaded['id']),
+            'description': loaded.get('name', ''),
+        }
+        task_def = loaded.get('task_definition', fallback)
+        assert task_def != fallback
+        assert task_def == {
+            'title': task['title'],
+            'description': task['description'],
+            'details': task['details'],
+        }
+        assert loaded.get('modules', []) == task['metadata']['modules']
+
+    def test_the_plan_survives_the_round_trip(self, tmp_path):
+        # run_eval refuses a falsy plan (runner.py:529) AFTER creating the
+        # worktree, so the plan reaching it intact is the whole point.
+        loaded = self._round_trip(tmp_path)
+        assert loaded.get('plan') == live_plan()
