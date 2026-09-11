@@ -3071,6 +3071,111 @@ _QUOTED_SIBLING_PROSE = (
 )
 
 
+#: ``how`` closed with its own tag, then the swallowed ``where`` in the
+#: CANONICAL dialect. A genuine repair — ``where`` really is recovered — so this
+#: is the arm that HAS a ``Repair`` to read a pattern off. The self-name closer
+#: leads and the fixed literal trails it, which is what makes the two
+#: derivations disagree.
+_MIXED_HOW = (
+    _SELF_NAME_HOW_PROSE
+    + _close('how')
+    + '\n'
+    + _open_param('where')
+    + 'plan_tools'
+    + _close('parameter')
+)
+
+#: The SAME leak head on the SAME field, in a shape ``repair`` refuses: the
+#: tail leads with an invoke closer so no candidate parses. Its only purpose is
+#: to drive the OTHER arm of ``_repair_one_field`` for one field.
+_UNREPAIRABLE_HOW = (
+    _SELF_NAME_HOW_PROSE
+    + _close('how')
+    + '\n'
+    + _INVOKE_CLOSER
+    + '\n'
+    + _open_param('how')
+    + 'again'
+)
+
+
+class TestOneSemanticsPerFieldOnBothArms:
+    """``_repair_one_field``'s two arms publish ``pattern`` from two sources.
+
+    The UNREPAIRABLE arm publishes the gate's ``detect_for(value, field,
+    schema_params)`` — the value the in-file comment above the gate already
+    claims "names the tag actually seen instead of whatever fixed literal
+    happens to trail the leak". The REPAIRED arm publishes ``result.pattern``,
+    derived from the blanket, param-free ``detect``. So one fact stream carries
+    two semantics, and which one a reader gets depends on whether the repair
+    happened to succeed.
+
+    MEASURED at HEAD on ``reuse[0].how``, before the fix::
+
+        repaired arm      '\\x3cparameter name='   (the literal TRAILING it)
+        unrepairable arm  the ``how`` closer       (the HEAD of the leak)
+
+    Both specimens below leak from the same field with the same head, so the
+    disagreement is not about the input.
+    """
+
+    def test_the_two_specimens_share_a_leak_head(self):
+        """The premise. Without it these rows would compare two different leaks."""
+        for value in (_MIXED_HOW, _UNREPAIRABLE_HOW):
+            assert value.index(_close('how')) == len(_SELF_NAME_HOW_PROSE)
+        assert detect(_MIXED_HOW) == _LT + 'parameter name='
+        assert detect(_UNREPAIRABLE_HOW) == _INVOKE_CLOSER
+
+    def test_the_repaired_arm_names_the_head_of_the_leak(self, plan_artifacts):
+        """(3) The repaired arm, which is the one that goes red today."""
+        plan = corrupt_plan()
+        plan['reuse'][0]['how'] = _MIXED_HOW
+        # A HOLE for the recovery to fill: an authored sibling counts as
+        # supplied, and repair() refuses a tail that collides with one.
+        plan['reuse'][0]['where'] = ''
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+
+        repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        (fact,) = facts
+        assert fact['outcome'] == 'repaired'
+        assert fact['field'] == 'how'
+        assert fact['pattern'] == _close('how')
+        assert fact['misclose'] == _close('how')
+        # The diagnostic changed; the repair did not.
+        assert repaired['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
+        assert repaired['reuse'][0]['where'] == 'plan_tools'
+        assert fact['recovered_params'] == ['where']
+
+    def test_both_arms_name_the_same_literal_for_the_same_field(
+        self, plan_artifacts
+    ):
+        """One field, one semantics — whichever way the repair goes.
+
+        This is the property the fix delivers BY CONSTRUCTION rather than by
+        convention: both arms become the same expression over the same
+        ``(value, param, schema_params)`` triple, so they cannot drift apart
+        again without someone editing one of them on purpose.
+        """
+        patterns = {}
+        for outcome, value, where in (
+            ('repaired', _MIXED_HOW, ''),
+            ('unrepairable', _UNREPAIRABLE_HOW, 'plan_tools'),
+        ):
+            plan = corrupt_plan()
+            plan['reuse'][0]['how'] = value
+            plan['reuse'][0]['where'] = where
+            plan_artifacts.write_plan(copy.deepcopy(plan))
+
+            _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+            (fact,) = facts
+            assert fact['outcome'] == outcome, 'the two arms really were driven'
+            patterns[outcome] = fact['pattern']
+
+        assert patterns['repaired'] == patterns['unrepairable'] == _close('how')
+
+
 class TestQuotedSiblingTagIsNeverTruncated:
     """A plan that TALKS ABOUT the markup must not be rewritten by the reader.
 
