@@ -38,9 +38,16 @@ fixed, named cluster where a path it cannot read IS the finding. Concretely:
   ``check_against_baseline`` REFUSES to compare an incomplete enumeration.
 
 That last clause is what makes "a partial enumeration is distinguishable from a
-complete one in the RESULT, not only in a log line" true rather than aspirational:
-``{requested, resolved, unreadable, complete}`` travels in the report AND in the
-committed baseline, and ``--report`` prints it as a row.
+complete one in the RESULT, not only in a log line" true rather than aspirational.
+The block carrying it is split by KIND, and the two halves are stored
+differently. ``unreadable`` (both halves, by name) and ``complete`` travel in
+the report AND in the committed baseline, as do the cluster's ``requested`` and
+``resolved`` paths -- that is the named manifest where a path the instrument
+cannot read IS the finding. The test tree's breadth travels as ``test_tree``'s
+two counts in the report ONLY: it is reported by ``--report`` and ``--json``,
+never ratcheted, because ``check_against_baseline`` reads completeness from the
+CURRENT report and freezing a number nothing enforces would only churn the file
+on every unrelated test file the repo gains (esc-5021-7).
 
 Exit codes
 ----------
@@ -165,6 +172,25 @@ class Enumeration:
             'unreadable': list(self.unreadable),
             'complete': self.complete,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class TestTreeCoverage:
+    """How many .py files the test-tree sweep asked for, and how many it measured.
+
+    The test tree's counterpart to ``Enumeration``, and deliberately NOT more
+    fields on it: the cluster is a named manifest where an unresolved path IS
+    the finding and must be shown by name, while this is an open sweep of other
+    people's files where only the coverage ratio carries information. The
+    ``unreadable`` paths of BOTH halves still travel by name -- that is INV-11's
+    payload and it is never reduced to a count.
+    """
+
+    requested: int
+    resolved: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {'requested': self.requested, 'resolved': self.resolved}
 
 
 def resolve_cluster_paths(root: Path) -> Enumeration:
@@ -876,7 +902,7 @@ def build_report(root: Path) -> dict[str, object]:
         for qualname, score in cognitive.per_function.items():
             functions[f'{relpath}::{qualname}'] = score
 
-    tests, test_enumeration = _sweep_test_tree(root)
+    tests, test_unreadable, coverage = _sweep_test_tree(root)
 
     return {
         'schema_version': SCHEMA_VERSION,
@@ -886,15 +912,23 @@ def build_report(root: Path) -> dict[str, object]:
             'file_line_ceiling': FILE_LINE_CEILING,
             'new_function_cognitive_ceiling': NEW_FUNCTION_COGNITIVE_CEILING,
         },
-        'enumeration': _merge_enumerations(enumeration, test_enumeration).to_dict(),
+        'enumeration': _report_enumeration(enumeration, test_unreadable, coverage),
         'files': dict(sorted(files.items())),
         'functions': dict(sorted(functions.items())),
         'tests': dict(sorted(tests.items())),
     }
 
 
-def _sweep_test_tree(root: Path) -> tuple[dict[str, object], Enumeration]:
+def _sweep_test_tree(
+    root: Path,
+) -> tuple[dict[str, object], tuple[str, ...], TestTreeCoverage]:
     """Measure every lane-importing file under ``orchestrator/tests``.
+
+    Returns the measures, the paths SKIPPED (by name, verbatim), and how broad
+    the sweep was as counts. The swept paths themselves are deliberately not
+    accumulated: the caller has no use for a 568-entry manifest of other
+    people's test files, and building one is how it ended up frozen in the
+    committed baseline (esc-5021-7).
 
     THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
     unrelated mid-edit test file must not redden the ratchet, which is the
@@ -906,11 +940,11 @@ def _sweep_test_tree(root: Path) -> tuple[dict[str, object], Enumeration]:
     mid-edit".
     """
     tests: dict[str, object] = {}
-    requested: list[str] = []
+    requested = 0
     unreadable: list[str] = []
     for path in sorted((root / TESTS_ROOT).rglob('*.py')):
         relpath = path.relative_to(root).as_posix()
-        requested.append(relpath)
+        requested += 1
         try:
             source = path.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError):
@@ -923,21 +957,39 @@ def _sweep_test_tree(root: Path) -> tuple[dict[str, object], Enumeration]:
             continue
         if measures is not None:
             tests[relpath] = measures
-    return tests, Enumeration(
-        requested=tuple(requested),
-        resolved=tuple(sorted(tests)),
-        unreadable=tuple(unreadable),
-        complete=not unreadable,
+    return (
+        tests,
+        tuple(unreadable),
+        TestTreeCoverage(requested=requested, resolved=len(tests)),
     )
 
 
-def _merge_enumerations(cluster: Enumeration, tests: Enumeration) -> Enumeration:
-    return Enumeration(
-        requested=cluster.requested + tests.requested,
-        resolved=cluster.resolved + tests.resolved,
-        unreadable=cluster.unreadable + tests.unreadable,
-        complete=cluster.complete and tests.complete,
-    )
+def _report_enumeration(
+    cluster: Enumeration,
+    test_unreadable: tuple[str, ...],
+    coverage: TestTreeCoverage,
+) -> dict[str, object]:
+    """The report's enumeration block: cluster paths, test-tree counts, INV-11.
+
+    The two halves stay APART rather than being flattened into one pair of
+    lists. Flattening cost information as well as bytes: the three CLUSTER_PATHS
+    literals that live under ``orchestrator/tests`` appeared in both halves, so
+    the merged lists carried three duplicate entries each, and any later attempt
+    to separate them again by set membership against CLUSTER_PATHS would drop a
+    ``merge_lane/**`` file once PRD task zeta1 makes that glob expand -- a
+    silent completeness hole in the instrument whose whole job is completeness.
+
+    Key order is fixed here, not incidental: ``render_baseline`` emits this block
+    with ``json.dumps(..., indent=2)``, so insertion order IS the committed
+    bytes.
+    """
+    return {
+        'requested': list(cluster.requested),
+        'resolved': list(cluster.resolved),
+        'test_tree': coverage.to_dict(),
+        'unreadable': list(cluster.unreadable) + list(test_unreadable),
+        'complete': cluster.complete and not test_unreadable,
+    }
 
 
 #: Per-file measures summed into a cluster total by ``derive_totals``.
