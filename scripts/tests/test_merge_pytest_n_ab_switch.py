@@ -201,3 +201,51 @@ def test_flip_reports_outcome_applied_and_commits(tmp_path):
     ).stdout.split()
     assert touched == ["dark-factory-orchestrator.yaml"]
     assert f'{KEY}: "8"' in config.read_text()
+
+
+# ---------------------------------------------------------------------------
+# The converged path: a crash-resume onto a config that already carries the
+# value, against an orchestrator whose live config already matches it
+# ---------------------------------------------------------------------------
+
+def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tmp_path):
+    """Re-running the switch for a value the file and the running config
+    BOTH already carry is success, not failure.
+
+    The reload genuinely happens and genuinely applies other hot leaves, but
+    verify_env is equal on both sides so it never appears under `applied` --
+    `unchanged` is a bare int count, so absence is the only converged signal
+    on the wire. Nothing to commit is likewise already success (step 2's
+    `already-at-<value>` sentinel); step 4 must reach the same verdict.
+    """
+    config = _make_repo(tmp_path, "8", marker=True)
+    repo = config.parent
+    before_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    before_bytes = config.read_bytes()
+
+    proc = _run(tmp_path, config, "8", _envelope(
+        reloaded=True,
+        error=None,
+        config_path=str(config),
+        applied={"max_turns.architect": {"old": 40, "new": 60}},
+    ))
+
+    assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
+    assert "applied.verify_env does not carry" not in proc.stderr
+    verdict = _verdict(proc)
+    assert verdict["outcome"] == "already_converged"
+    assert verdict["switched_to"] == "8"
+    assert verdict["commit"] == "already-at-8"
+
+    after_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert after_head == before_head, "a converged re-run must commit nothing"
+    assert config.read_bytes() == before_bytes, (
+        "the idempotent rewrite must restore the prior A/B marker byte for "
+        "byte, not stack a fresh one"
+    )
