@@ -162,6 +162,7 @@ from fused_memory.services.completion_claim_gate import (
     verify_claims,
 )
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.read_telemetry import summarize_search_results
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
@@ -4048,13 +4049,43 @@ def create_mcp_server(
                 diagnostics = getattr(results, 'failure_diagnostics', [])
                 if diagnostics:
                     response['failed_store_diagnostics'] = diagnostics
+            # The shape's SINGLE home is
+            # fused_memory/services/read_telemetry.py::summarize_search_results
+            # — three producers, one contract (INV-5).  Summarise
+            # `grouped_results`, not `results`: grouping runs at THIS boundary,
+            # so the grouped list is literally what the agent was shown, and
+            # leaf eta's (task 3213) question is "was the agent SHOWN the thing
+            # it then re-wrote?".  The raw list would over-report top-level
+            # visibility and omit the folded child ids the agent did see.
+            #
+            # The FULL query is journalled for search rows only — the 200-char
+            # convention at every other _log_read caller is deliberately left
+            # alone.  A retrieval metric computed from half a query measures
+            # the wrong thing.
+            try:
+                search_summary: dict[str, Any] = summarize_search_results(grouped_results)
+            except Exception:
+                # A telemetry fault must never turn a working search into an
+                # error — same degradation posture as the grouping guard above.
+                logger.warning(
+                    'search: result telemetry FAILED for project=%s; journalling count only',
+                    project_id,
+                    exc_info=True,
+                    extra={'project_id': project_id},
+                )
+                search_summary = {'count': len(results)}
+            # Read off `results` (the SearchResults object) exactly as the
+            # response block above does — this fact does not survive a list
+            # transform, and the widening must not drop what was already recorded.
+            if getattr(results, 'degraded', False):
+                search_summary['failed_stores'] = getattr(results, 'failed_stores', [])
             await _log_read(
                 operation='search',
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query[:200], 'limit': limit},
-                result_summary={'count': len(results)},
+                params={'query': query, 'limit': limit},
+                result_summary=search_summary,
             )
             return response
         except Exception as e:
@@ -4063,7 +4094,7 @@ def create_mcp_server(
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query[:200], 'limit': limit},
+                params={'query': query, 'limit': limit},
                 success=False,
                 error=str(e),
             )
