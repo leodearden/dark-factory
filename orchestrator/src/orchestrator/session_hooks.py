@@ -116,11 +116,22 @@ def resolve_hook_identity(
     no title to parse. *cwd* comes from the hook's stdin JSON, falling back
     to ``os.getcwd()`` when absent.
 
-    Callers on the fork path (a forked-inheritor's env slug rejected -- see
-    ``_HookSlugResolution.rejected_env_slug``) must pass an *env* already
-    stripped of the SPAWNER-describing identity keys via
-    ``_non_spawner_identity_env`` rather than the raw hook env -- see that
-    function's docstring for why.
+    SCOPE of the fork-path strip, stated once (task 4663): the strip is
+    RECORD-BODY-scoped. ``run_session_start`` -- the one caller whose
+    resolved identity is PERSISTED as a record's role/project/task_id/
+    escalation_id/title -- must pass an *env* already stripped of the
+    SPAWNER-describing identity keys via ``_non_spawner_identity_env``
+    whenever the inherited env slug was rejected (see
+    ``_HookSlugResolution.rejected_env_slug``), so a forked row describes
+    itself rather than its spawner.
+
+    The other two fork-path callers deliberately keep the RAW env, each for
+    a reason of its own, both commented at their call sites: the slug
+    derivation in ``_resolve_hook_slug`` (the slug is an opaque key whose
+    segments nothing parses back, and raw-env derivation is what keeps all
+    three hook events resolving the SAME one) and the OSC retitle in
+    ``_run_status_refresh_and_retitle`` (the tab it paints belongs to the
+    terminal the nested ``claude`` runs INSIDE -- its spawner's).
     """
     cwd = str(hook_input.get('cwd') or os.getcwd())
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
@@ -145,6 +156,13 @@ Named separately from the handful of ``CLAUDE_SPAWN_*`` keys
 ``CLAUDE_SPAWN_WM_TITLE``) because those are consulted directly by name at
 their own call sites, not funneled through identity resolution -- this set
 exists purely to drive ``_non_spawner_identity_env``.
+
+``CLAUDE_SPAWN_PROMPT`` is the one member no assertion can pin: it is
+forwarded to ``parse_spawn_identity`` but documented there as taking no part
+in the resolution, so stripping it is inert today and listed only so the
+funnel stays complete if that ever changes. Every OTHER member is
+load-bearing and mutation-detectable -- see
+``test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title``.
 """
 
 
@@ -572,6 +590,25 @@ def _resolve_hook_slug(
             return _HookSlugResolution(candidate, None, may_bind, snapshot)
         rejected = candidate
 
+    # RAW env, deliberately, on the fork branch too (task 4663): the
+    # role/project/task segments below stay SPAWNER-derived even though the
+    # record BODY `run_session_start` writes at this slug does not, so on
+    # that one path slug and body legitimately disagree. Two reasons to
+    # leave it. First, the slug is an opaque KEY, not a description: every
+    # consumer either keys on it or prints it verbatim (measured over
+    # cockpit's registry_reader/session_table/spawn_tree, workflow.py,
+    # scripts/legibility, spawn-claude.sh -- none splits a slug back into an
+    # identity), so a spawner-flavoured segment misleads nothing but a human
+    # reading the sessions dir, whose authoritative answer is the body.
+    # Second, this exact shape is a landed task-4193 contract, pinned by
+    # test_hook_session_slug_forks_when_binding_mismatches -- re-deriving it
+    # is a deliberate contract change, not a consistency tidy-up.
+    # CONSTRAINT on any such change: SessionStart, Notification and Stop each
+    # re-derive this slug independently, so whatever identity it is built
+    # from must be identical across all three or one forked session splits
+    # across two records. The forked session's OWN identity is carried by its
+    # record body instead -- see `resolve_hook_identity` for that strip's
+    # scope.
     identity = resolve_hook_identity(hook_input, env)
     session_id = _hook_session_id(hook_input) or 'unknown'
     # session_id (str) deliberately fills the launcher_pid slot as the
@@ -1587,6 +1624,15 @@ def _run_status_refresh_and_retitle(
     merely slow -- trading a rare stale status for a routine wrong one.
     """
     probes = _EventProbes(env)
+    # RAW env, deliberately, on the fork path too (task 4663): this identity
+    # feeds ONLY the OSC retitle returned at the bottom, never the record
+    # body, and the tab that escape paints is the terminal the nested
+    # ``claude`` is running INSIDE -- its SPAWNER's. Stripping the spawn
+    # title here would have a forked session rename its spawner's tab,
+    # flapping the text between the two sessions' titles as each one's hooks
+    # fire; the forked session's own identity lands on its own RECORD
+    # instead (``run_session_start``). See `resolve_hook_identity` for the
+    # scope of that strip.
     identity = resolve_hook_identity(hook_input, env)
     resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
     slug, may_bind = resolution.slug, resolution.may_bind
