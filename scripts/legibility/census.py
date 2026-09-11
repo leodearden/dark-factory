@@ -856,7 +856,55 @@ class DryRunFiling:
     payload_count: int
 
 
-def render_report(
+SECTION_HEADER = "header"
+SECTION_FORCE_MARKER = "force-marker"
+SECTION_SATURATION = "saturation"
+SECTION_VERIFICATION = "verification"
+SECTION_MATRIX = "matrix"
+SECTION_SYNTHESIS = "synthesis"
+SECTION_FILED_TASKS = "filed-tasks"
+SECTION_COST = "cost"
+"""Stable machine keys for the blocks :func:`census_report_sections` emits.
+
+Never rendered -- they exist so a caller can ask WHICH blocks a report
+carries and in what order without matching on the English inside them."""
+
+
+@dataclass(frozen=True)
+class ReportSection:
+    """One block of the census report, under a STABLE machine key.
+
+    The key is never rendered. It exists so a caller can ask WHICH blocks a
+    report carries and in what order without matching on the English inside
+    them. Prose is the part of this function expected to be reworded, and a
+    check that keys on prose constrains wording rather than behaviour; keying
+    on the structure keeps the NO-SILENT-CAPS disclosure guarantees
+    falsifiable instead -- a section that stops being emitted, or is emitted
+    on the wrong run, or lands below the thing it qualifies, fails, and a copy
+    edit does not.
+
+    ``lines`` is the section's own slice of the report, including its own
+    leading blank line, so :func:`join_report_sections` is a plain
+    concatenation. A single element may itself be a multi-line blob (an
+    embedded ``matrix_md`` / ``synthesis_md``).
+
+    Convention, not invention: esc-3208-4, memories
+    53e61951-0704-4436-94bd-bf12ae66c23b and
+    538183c6-6a83-44b6-8a2f-290b75a545d6, shipped in
+    ``fused-memory/scripts/memory_eval_retrieval_probe.py`` and
+    ``memory_eval_staleness_sweep.py``, which each define the dataclass
+    locally as this does.
+    """
+
+    key: str
+    lines: tuple[str, ...]
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def census_report_sections(
     *,
     date: str,
     project_id: str,
@@ -868,31 +916,39 @@ def render_report(
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
-) -> str:
-    """Assemble the dated census report as markdown, purely from the
-    pieces passed in -- no clock, no model call, no I/O. *date* and every
-    piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
-    so the same inputs always render byte-identical output.
+) -> tuple[ReportSection, ...]:
+    """The dated census report, decomposed -- see :func:`render_report` for
+    the markdown an operator reads.
 
-    NO SILENT CAPS: when the operator bounded this run, the report says
-    so in as many words. The batch-cap coverage lines in ``## Saturation``
-    are rendered ONLY when ``mining_result.max_batches`` is not None, so a
-    FLAGLESS run's output is byte-identical to what it was before the
-    operator cost-control flags existed (locked by
-    ``test_render_report_flagless_output_is_byte_identical_golden``). The
-    same gating applies to every other cost-control rendering here.
+    THE single source of both: :func:`render_report` joins what this returns,
+    so a section present here is present there by construction and the two
+    cannot drift into disagreeing about what the run disclosed.
+
+    NO SILENT CAPS: when the operator bounded this run, the report says so in
+    as many words. The batch-cap coverage lines in ``## Saturation`` are
+    emitted ONLY when ``mining_result.max_batches`` is not None, so a FLAGLESS
+    run's output is byte-identical to what it was before the operator
+    cost-control flags existed (locked by
+    ``test_render_report_flagless_output_is_byte_identical_golden``). The same
+    gating applies to every other cost-control rendering here.
     """
-    lines = [f"# confusion census {date}", "", f"Project: {project_id}"]
+    sections: list[ReportSection] = []
+
+    def emit(key: str, lines: list[str]) -> None:
+        sections.append(ReportSection(key=key, lines=tuple(lines)))
+
+    emit(SECTION_HEADER, [f"# confusion census {date}", "", f"Project: {project_id}"])
 
     if force:
-        lines.append("")
-        lines.append("_--force: operator-initiated run._")
+        emit(SECTION_FORCE_MARKER, ["", "_--force: operator-initiated run._"])
 
-    lines.append("")
-    lines.append("## Saturation")
-    lines.append("")
-    lines.append(f"- batches: {len(mining_result.batch_stats)}")
-    lines.append(f"- stop reason: {mining_result.stop_reason}")
+    saturation = [
+        "",
+        "## Saturation",
+        "",
+        f"- batches: {len(mining_result.batch_stats)}",
+        f"- stop reason: {mining_result.stop_reason}",
+    ]
     if mining_result.max_batches is not None:
         # Deliberately states only counts this function was actually handed:
         # the total number of ENUMERATED sessions is not knowable here
@@ -932,12 +988,12 @@ def render_report(
                     f" {drawn - coded} digest(s) FAILED TO CODE and contributed no "
                     "signal (see the per-batch tallies below)."
                 )
-            lines.append(coverage_line)
+            saturation.append(coverage_line)
             # PARTIAL is not the same as "the rest comes later" -- say which
             # one this is. run_census always calls advance_census_state, and
             # _census_window_dates anchors the NEXT window at last_census_at,
             # so the capped-away sessions fall outside every future window.
-            lines.append(
+            saturation.append(
                 "- NOT PICKED UP LATER: this run still advances last_census_at, so the "
                 "next census window starts here -- the capped-away sessions fall outside "
                 "it and are never re-enumerated. Sweeping them means rolling "
@@ -945,24 +1001,23 @@ def render_report(
                 "next run; a plain re-run will not reach them."
             )
         else:
-            lines.append(
+            saturation.append(
                 f"- operator batch cap: {mining_result.max_batches} batch(es) "
                 f"(not reached -- mining stopped by: {mining_result.stop_reason})"
             )
     for stats in mining_result.batch_stats:
-        lines.append(
+        saturation.append(
             f"  - batch {stats.index}: dup_rate={stats.dup_rate:.2f} "
             f"(total={stats.total}, succeeded={stats.succeeded}, failed={stats.failed}, "
             f"saturated={stats.saturated})"
         )
+    emit(SECTION_SATURATION, saturation)
 
     if verify_coverage is not None:
         deferred = verify_coverage.novel - verify_coverage.verified
-        lines.append("")
-        lines.append("## Verification")
-        lines.append("")
+        verification = ["", "## Verification", ""]
         if deferred > 0:
-            lines.append(
+            verification.append(
                 f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
                 f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
                 "as pending candidates -- merged into the codebook by this run but NOT "
@@ -972,7 +1027,7 @@ def render_report(
             # conditional, not automatic. This window's sightings are not
             # re-mined (last_census_at re-anchors), so a deferred cluster is
             # re-adjudicated only when the same confusion shows up again.
-            lines.append(
+            verification.append(
                 "- a deferred candidate is re-adjudicated only if the same confusion "
                 "RECURS in a later window: this run advances last_census_at, so these "
                 "sightings are never re-mined. A one-off deferred by the cap stays "
@@ -981,43 +1036,87 @@ def render_report(
         else:
             # A cap that was SET BUT NOT REACHED must not emit the deferral
             # clause -- nothing was deferred and nothing went unverified.
-            lines.append(
+            verification.append(
                 f"- verified all {verify_coverage.novel} novel cluster(s); operator "
                 f"verify cap: {verify_coverage.cap} (not reached)."
             )
+        emit(SECTION_VERIFICATION, verification)
 
-    lines.append("")
-    lines.append("## Origin x Manifestation Matrix")
-    lines.append("")
-    lines.append(matrix_md)
+    emit(SECTION_MATRIX, ["", "## Origin x Manifestation Matrix", "", matrix_md])
 
-    lines.append("## Synthesis")
-    lines.append("")
-    lines.append(synthesis_md)
+    # NO leading blank line, deliberately: `matrix_md` is embedded verbatim and
+    # carries its own trailing newline, so `## Synthesis` follows it
+    # immediately. The golden pins `matrix\n## Synthesis`; normalising this
+    # during a refactor is the one plausible way to break byte-identity while
+    # every structural assertion still passes.
+    emit(SECTION_SYNTHESIS, ["## Synthesis", "", synthesis_md])
 
-    lines.append("")
-    lines.append("## Filed Tasks")
-    lines.append("")
+    filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
         # Checked FIRST: under --dry-run-filing, filed_task_ids is empty by
         # construction, and the plain "_none filed._" placeholder would read
         # as a normal run that simply had nothing to file.
-        lines.append(
+        filed_tasks.append(
             f"_dry-run: {dry_run.payload_count} payload(s) written to {dry_run.path} "
             "-- NOTHING filed; review before filing._"
         )
     elif filed_task_ids:
-        lines.extend(f"- {task_id}" for task_id in filed_task_ids)
+        filed_tasks.extend(f"- {task_id}" for task_id in filed_task_ids)
     else:
-        lines.append("_none filed._")
+        filed_tasks.append("_none filed._")
+    emit(SECTION_FILED_TASKS, filed_tasks)
 
-    lines.append("")
-    lines.append("## Cost")
-    lines.append("")
-    lines.append(cost_note)
-    lines.append("")
+    # The trailing "" is the report's final newline, which the join would
+    # otherwise not supply.
+    emit(SECTION_COST, ["", "## Cost", "", cost_note, ""])
 
-    return "\n".join(lines)
+    return tuple(sections)
+
+
+def join_report_sections(sections: tuple[ReportSection, ...]) -> str:
+    """Render *sections* to the markdown an operator reads.
+
+    Each section carries its own leading blank line, so this is a plain
+    concatenation -- there is no separator policy here that could disagree
+    with what a section believes its own shape is."""
+    return "\n".join(line for section in sections for line in section.lines)
+
+
+def render_report(
+    *,
+    date: str,
+    project_id: str,
+    force: bool,
+    matrix_md: str,
+    mining_result: MiningResult,
+    synthesis_md: str,
+    filed_task_ids: list[str],
+    cost_note: str,
+    verify_coverage: VerifyCoverage | None = None,
+    dry_run: DryRunFiling | None = None,
+) -> str:
+    """Assemble the dated census report as markdown, purely from the
+    pieces passed in -- no clock, no model call, no I/O. *date* and every
+    piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
+    so the same inputs always render byte-identical output.
+
+    A pure join of :func:`census_report_sections`, which is the single source
+    of what the report contains and in what order -- including every
+    NO-SILENT-CAPS gating rule. Read that function for the structure; this one
+    exists so callers who only want the text do not have to.
+    """
+    return join_report_sections(census_report_sections(
+        date=date,
+        project_id=project_id,
+        force=force,
+        matrix_md=matrix_md,
+        mining_result=mining_result,
+        synthesis_md=synthesis_md,
+        filed_task_ids=filed_task_ids,
+        cost_note=cost_note,
+        verify_coverage=verify_coverage,
+        dry_run=dry_run,
+    ))
 
 
 # ---------------------------------------------------------------------------
