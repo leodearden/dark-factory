@@ -39,6 +39,7 @@ plus a real ``select_graph`` call — do not add either.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -116,6 +117,25 @@ def _graph_returning(*read_results):
     return graph
 
 
+def _graph_always_returning(read_result):
+    """A graph mock whose EVERY ``ro_query`` returns *read_result*, unboundedly.
+
+    The supply must be unbounded, not merely large, for any test that expects
+    the BUDGET to end the poll loop.  The barrier is bounded by wall clock and
+    nothing else, so under ``interval=0`` it issues as many reads as the machine
+    can fit in ``timeout_s`` — MEASURED here, ~760 mocked reads inside a 0.01 s
+    budget.  A finite list standing in for "never settles" is therefore a race
+    between machine speed and list length: out-poll it and ``AsyncMock`` reports
+    the exhaustion as ``StopAsyncIteration``, a mock artifact masquerading as the
+    failure under test.  ``repeat`` makes "never" actually never, so the deadline
+    is the only thing that can end the loop, on any host at any load.
+    """
+    graph = MagicMock()
+    graph.ro_query = AsyncMock(side_effect=itertools.repeat(read_result))
+    graph.query = AsyncMock()
+    return graph
+
+
 def _backend_on(make_backend, mock_config, graph):
     backend = make_backend(mock_config)
     backend._driver._get_graph = MagicMock(return_value=graph)
@@ -186,10 +206,9 @@ class TestAwaitIndexCatalogSettled:
         indices, leaving stale ones behind while the operator believes the
         rebuild was clean.
         """
-        never_settles = [
-            _result([STALE_ENTITY_ROW, REBUILDING_ENTITY_ROW]) for _ in range(200)
-        ]
-        graph = _graph_returning(*never_settles)
+        graph = _graph_always_returning(
+            _result([STALE_ENTITY_ROW, REBUILDING_ENTITY_ROW])
+        )
         backend = _backend_on(make_backend, mock_config, graph)
 
         with pytest.raises(IndexCatalogUnsettledError) as excinfo:
