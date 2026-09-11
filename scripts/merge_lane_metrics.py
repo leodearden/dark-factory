@@ -878,6 +878,12 @@ def build_report(root: Path) -> dict[str, object]:
     shared totals line would conflict on every one of ten rebases -- while
     deriving preserves the anti-rename-gaming property in full (see
     ``derive_totals``) and keeps one number in one place.
+
+    The ``enumeration`` block obeys that same constraint, which it did not when
+    the argument above was first written: the cluster half is a fixed manifest
+    that moves only when ``CLUSTER_PATHS`` does, and the test tree's size is
+    reported rather than stored, so nothing here is a shared line ten branches
+    would each rewrite (see ``_stored_enumeration``).
     """
     # Up front, before any measurement: a wrong-version engine must fail
     # immediately with a named cause rather than after a 250-second run whose
@@ -1054,7 +1060,11 @@ BASELINE_README = (
     'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
     'RISES above these numbers. Equality is fine, lowering is the point. NEVER '
     'regenerate this file merely to make a test pass -- that silently widens '
-    'the ratchet for every downstream task. A task that legitimately LOWERS a '
+    'the ratchet for every downstream task. The enumeration block below is the '
+    'CLUSTER half only: the instrument also sweeps every .py under '
+    'orchestrator/tests for the measures in the tests section, and that sweep '
+    'is sized by --report rather than ratcheted here, so an unrelated test file '
+    'arriving never touches these bytes. A task that legitimately LOWERS a '
     'measure regenerates the baseline in the SAME commit: '
     'python scripts/merge_lane_metrics.py --write-baseline '
     'orchestrator/tests/merge_lane_ratchet_baseline.json'
@@ -1064,58 +1074,51 @@ BASELINE_README = (
 _PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
 
 
-def _lane_scoped_enumeration(enumeration: dict) -> dict:
-    """Narrow ``enumeration.requested`` to the lane-relevant paths, for STORAGE.
+def _stored_enumeration(enumeration: dict) -> dict:
+    """Strip the live-only test-tree counts; the baseline stores the cluster half.
 
-    WHY THIS EXISTS (esc-5021-7). ``_sweep_test_tree`` appends EVERY ``*.py``
-    under ``orchestrator/tests`` to ``requested`` -- 583 paths, of which only
-    the lane-importing ones are ever measured. Freezing that full manifest in
-    the committed baseline made this gate a hair trigger: any task ANYWHERE in
-    the repo that adds, removes or renames a single test file reddened
-    ``test_baseline_matches_a_fresh_measurement`` even though no lane measure
-    moved, and the failure it printed ("Regenerate it in this commit if you
-    lowered a measure") invited a blind regeneration of a baseline that task had
-    never inspected -- exactly the silent widening ``BASELINE_README`` and that
-    test exist to prevent. Observed live: an unrelated file arriving via rebase
-    (test_roles_error_remedy_hint.py, task 4964) produced a ONE-LINE baseline
-    diff and a red gate.
+    WHY THE TEST TREE IS NOT STORED AT ALL, in paths OR in counts (esc-5021-7).
+    ``_sweep_test_tree`` walks every ``*.py`` under ``orchestrator/tests`` -- 568
+    paths, of which only the lane-importing ones are ever measured. Freezing that
+    manifest in the committed baseline made this gate a hair trigger: any task
+    ANYWHERE in the repo that added, removed or renamed a single test file
+    reddened ``test_baseline_matches_a_fresh_measurement`` even though no lane
+    measure moved, and the failure it printed ("Regenerate it in this commit if
+    you lowered a measure") invited a blind regeneration of a baseline that task
+    had never inspected -- exactly the silent widening ``BASELINE_README`` and
+    that test exist to prevent. Observed live: an unrelated file arriving via
+    rebase (``test_roles_error_remedy_hint.py``, task 4964) produced a ONE-LINE
+    baseline diff and a red gate.
 
     It also cut against this task's decompose-time baseline-format constraint,
     which rejected even a single shared ``totals`` line because ten parallel
-    gamma branches "would conflict on every rebase". A frozen 583-entry list is
-    strictly MORE rebase-sensitive than the line that constraint rejected, and
-    it is sensitive to churn outside the lane entirely.
+    gamma branches "would conflict on every rebase". A frozen 568-entry list is
+    strictly MORE rebase-sensitive than the line that constraint rejected, and it
+    is sensitive to churn outside the lane entirely.
 
-    WHAT IS KEPT: every ``CLUSTER_PATHS`` entry (including the glob LITERALS,
-    which are the SPOT record of PRD Appendix A and do not churn), plus anything
-    that actually resolved or was skipped. So the stored list still moves on
-    REAL lane churn -- a new test that imports a lane module lands in
-    ``resolved`` and is kept, and it was already going to move the ``tests``
-    section anyway -- while a non-lane test file is invisible here.
+    STORING THE COUNTS INSTEAD WOULD BE WORSE, NOT BETTER, which is why this
+    function drops them rather than reducing them. The denominator moves on any
+    ``.py`` arriving anywhere under ``orchestrator/tests``, so it is the same
+    hair trigger with a shorter diff. The numerator is exactly
+    ``len(report['tests'])``, already in the file line-locally, so storing it is
+    a second copy of one number (SPOT) -- and it is a single SHARED line that
+    every gamma branch deleting a lane-importing test would rewrite, which is the
+    guaranteed one-line conflict the ``totals`` constraint rejected. Neither is
+    ratcheted by anything: ``check_against_baseline`` reads completeness from the
+    CURRENT report, never from the stored block.
 
-    INV-11 IS UNAFFECTED, and deliberately so: ``unreadable`` entries are
-    retained rather than filtered, ``complete`` is untouched, and
-    ``check_against_baseline`` reads completeness from the CURRENT report, never
-    from the stored list. The full 583-path denominator remains in ``--report``
-    and ``--json`` output, which is where the sweep's coverage is legible; the
-    live sweep's breadth is floored by
-    ``test_the_live_sweep_denominator_covers_the_whole_test_tree`` so a
-    COLLAPSED sweep still fails loudly rather than quietly shrinking this list.
+    INV-11 IS UNAFFECTED, and deliberately so: ``unreadable`` keeps every skipped
+    path from BOTH halves verbatim and ``complete`` is untouched, so a skipped
+    test-tree file is still named in the committed file and still makes
+    ``check_against_baseline`` refuse to compare. The sweep's breadth is reported
+    by ``--report`` and ``--json``, and a COLLAPSED sweep still fails loudly via
+    ``test_the_live_sweep_denominator_covers_the_whole_test_tree`` rather than
+    quietly shrinking anything.
 
     Idempotent, which ``render_baseline``'s round-trip contract requires:
-    the kept set is a function of ``resolved``/``unreadable``/``CLUSTER_PATHS``,
-    all of which survive filtering, so re-filtering a filtered block is a no-op.
+    dropping an absent key is a no-op.
     """
-    requested = enumeration.get('requested')
-    if not isinstance(requested, list):
-        return enumeration
-    keep = set(CLUSTER_PATHS)
-    keep.update(enumeration.get('resolved', ()) or ())
-    keep.update(enumeration.get('unreadable', ()) or ())
-    return {
-        **enumeration,
-        'requested': [entry for entry in requested if entry in keep],
-    }
+    return {key: value for key, value in enumeration.items() if key != 'test_tree'}
 
 
 def _render_section(name: str, mapping: dict) -> str:
@@ -1146,12 +1149,12 @@ def render_baseline(report: dict) -> str:
             entries.append(_render_section(key, value))
         else:
             # Top-level scalars and the small params/enumeration blocks are
-            # ordinary pretty-printed JSON, shifted one level in. `enumeration`
-            # is narrowed to the lane-relevant paths first -- see
-            # _lane_scoped_enumeration for why storing the full 583-path sweep
-            # made this a hair trigger on unrelated test files (esc-5021-7).
+            # ordinary pretty-printed JSON, shifted one level in. The
+            # `enumeration` block sheds its live-only test-tree counts first --
+            # see _stored_enumeration for why neither the test tree's paths nor
+            # its numbers belong in a committed baseline (esc-5021-7).
             if key == 'enumeration' and isinstance(value, dict):
-                value = _lane_scoped_enumeration(value)
+                value = _stored_enumeration(value)
             block = json.dumps(value, indent=2).replace('\n', '\n  ')
             entries.append(f'  {json.dumps(key)}: {block}')
     return '{\n' + ',\n'.join(entries) + '\n}\n'
