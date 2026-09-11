@@ -101,6 +101,7 @@ class TestModuleLevelAll:
             'AllAccountsCappedException',
             'build_failure_message',
             'classify_agent_failure',
+            'claude_binary_spec',
             'count_transcript_turns',
             'detect_ended_awaiting_background',
             'detect_resumable_progress',
@@ -114,6 +115,7 @@ class TestModuleLevelAll:
             'note_unreadable_transcript',
             'read_transcript_records',
             'require_non_blank_prompt',
+            'resolve_claude_binary',
             'resumable_progress_for_session',
             'transcript_exists',
         }
