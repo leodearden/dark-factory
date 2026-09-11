@@ -2194,5 +2194,27 @@ def test_log_bounds_systemd_cat_with_a_five_second_timeout(monkeypatch):
     )
 
 
+def test_log_falls_through_to_stderr_on_timeout(monkeypatch, capsys):
+    """A systemd-cat call that exceeds its bound must still emit on stderr.
+
+    This is the direct sibling of the ``timeout=5`` pin above: the bound only
+    helps if the ``TimeoutExpired`` it produces is then CAUGHT and the message
+    still reaches the journal by the ``StandardError=journal`` route. Without
+    this half, a wedged systemd-cat would stop hanging the tick only to kill it
+    instead — the tick would die at the logging call rather than continue.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(argv, *args, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    wdog.log("hello")  # must not raise
+
+    captured = capsys.readouterr()
+    assert "hello" in captured.err, f"expected the message on stderr, got: {captured!r}"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
