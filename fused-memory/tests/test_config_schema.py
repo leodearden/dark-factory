@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings
 from fused_memory.config.schema import (
     CuratorConfig,
     EmbedderConfig,
+    EntityMintConfig,
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
@@ -29,7 +30,11 @@ from fused_memory.config.schema import (
     TaskStatusConfig,
     YamlSettingsSource,
 )
-from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
+from fused_memory.server.near_duplicate_guard import (
+    _TOPIC_CLUSTER_DEFAULT_HINT,
+    build_topic_cluster_block,
+    find_matching_topic_cluster,
+)
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
 
 # Imported from the LEAF, not from memory_metadata: this test module asserts
@@ -963,6 +968,119 @@ class TestMem0UpdateConfig:
     def test_two_configs_do_not_share_the_submodel(self):
         a, b = FusedMemoryConfig(), FusedMemoryConfig()
         assert a.mem0_update is not b.mem0_update
+
+
+class TestEntityMintConfig:
+    """Authorization + storm knobs for the ensure_entity_node MCP tool (task 4932).
+
+    Shape copied from the ``TestMem0UpdateConfig`` trio above — the same
+    kill-switch + self-reported-agent-prefix-allowlist + storm-knob posture,
+    for the same reason: minting a Graphiti Entity node from MCP is a
+    write-time-identity primitive, so it ships behind a narrow allowlist and a
+    kill switch rather than open on the tool surface.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig or Mem0UpdateConfig: recon Stage 1 and the curator are
+    this gate's first sanctioned CALLERS, not its owners, and the gate is about
+    the graph's identity surface rather than about mem0 in-place updates.
+    """
+
+    # --- fail-safe defaults ---
+
+    def test_default_enabled_is_true(self):
+        """A named kill switch, defaulting ON — the tool ships usable.
+
+        Mirrors ``Mem0UpdateConfig.enabled = True`` exactly: the narrow prefix
+        allowlist is the real bar, and this tool is strictly more careful than
+        merge_entities / delete_entity(force=True) / rename_entity, all already
+        on the MCP surface with no locking at all.
+        """
+        assert EntityMintConfig().enabled is True
+
+    def test_default_allowlist_is_recon_stage_and_curator(self):
+        """Same two prefixes as the mem0_update bars, for the same reasons:
+        recon-stage- admits every reconciliation stage agent, curator- admits
+        the interactive consolidation sitting."""
+        assert EntityMintConfig().allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+
+    def test_default_lock_timeout_is_5s(self):
+        assert EntityMintConfig().lock_timeout_seconds == 5.0
+
+    def test_default_storm_threshold_is_10(self):
+        assert EntityMintConfig().storm_threshold == 10
+
+    def test_default_storm_window_is_3600(self):
+        assert EntityMintConfig().storm_window_seconds == 3600.0
+
+    def test_separate_instances_do_not_share_lists(self):
+        """A shared default_factory list would let one config's widening leak
+        into every other instance."""
+        a, b = EntityMintConfig(), EntityMintConfig()
+        a.allowed_agent_prefixes.append('x-')
+        assert b.allowed_agent_prefixes == ['recon-stage-', 'curator-']
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = EntityMintConfig(
+            enabled=False,
+            allowed_agent_prefixes=['recon-stage-', 'auditor-'],
+            lock_timeout_seconds=0.25,
+            storm_threshold=3,
+            storm_window_seconds=600.0,
+        )
+        assert cfg.enabled is False
+        assert cfg.allowed_agent_prefixes == ['recon-stage-', 'auditor-']
+        assert cfg.lock_timeout_seconds == 0.25
+        assert cfg.storm_threshold == 3
+        assert cfg.storm_window_seconds == 600.0
+
+    # --- validation bounds: all three numeric leaves reject <= 0 ---
+
+    @pytest.mark.parametrize('field', [
+        'lock_timeout_seconds', 'storm_threshold', 'storm_window_seconds',
+    ])
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_numeric_leaves_reject_non_positive(self, field, bad):
+        with pytest.raises(ValidationError):
+            EntityMintConfig(**{field: bad})
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the narrow allowlist.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which would silently assert
+        on the shipped YAML rather than the schema default (the 65b011ed8c
+        tripwire casualties)."""
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.entity_mint, EntityMintConfig)
+        assert cfg.entity_mint.enabled is True
+        assert cfg.entity_mint.allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+        assert cfg.entity_mint.lock_timeout_seconds == 5.0
+        assert cfg.entity_mint.storm_threshold == 10
+        assert cfg.entity_mint.storm_window_seconds == 3600.0
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1), which would cost every leaf
+        here its green-tier hot-reload."""
+        annotation = FusedMemoryConfig.model_fields['entity_mint'].annotation
+        assert annotation is EntityMintConfig, (
+            f'expected a bare EntityMintConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.entity_mint is not b.entity_mint
 
 
 class TestReconciliationConfigStormKnobs:
@@ -1911,10 +2029,6 @@ class TestProceduralTopicGuardClustersDefault:
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert topic_id not in {c.topic_id for c in clusters}
 
-    def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
-        cluster = _seeded_cluster('pytest-xdist-serial-override')
-        assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
-
     def test_every_seeded_cluster_is_well_formed(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         for cluster in clusters:
@@ -1961,6 +2075,150 @@ class TestProceduralTopicGuardClustersDefault:
                             f'occurrence would score two distinct hits and defeat '
                             f'min_phrase_hits'
                         )
+
+
+class TestPytestXdistSerialOverrideCluster:
+    """Topic-guard cluster for the pytest-xdist -n0 serial-override workaround
+    (the topic that originally motivated this guard, task 2845; canonical
+    memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51).
+
+    Unlike its four siblings, this cluster's hint used to carry a SINGLE
+    dead-end instruction -- amend the canonical memory in place -- that is
+    structurally unreachable for the audience that ever sees it:
+    ``update_memory``'s content-amend arm is authz-gated to ``recon-stage-``
+    / ``curator-`` ``agent_id`` prefixes
+    (``Mem0UpdateConfig.content_amend_allowed_agent_prefixes``), and every
+    orchestrator-dispatched task/merge agent is neither. Task 4738 (fix A)
+    replaces that hint with three ratified outcomes the blocked writer can
+    actually act on. The structural fix -- stopping a per-cluster hint from
+    shadowing the guard's escape hatches at all -- is the sibling fix-B task
+    and is deliberately not this class's concern.
+    """
+
+    TOPIC_ID = 'pytest-xdist-serial-override'
+
+    @classmethod
+    def _cluster(cls):
+        return _seeded_cluster(cls.TOPIC_ID)
+
+    def test_rendered_hint_names_all_three_outcomes(self):
+        """The rendered hint -- not the bare cluster field -- must name all three.
+
+        Asserted through ``build_topic_cluster_block`` (not ``cluster.hint``
+        alone), because ``build_topic_cluster_block`` resolves ``cluster.hint
+        or _TOPIC_CLUSTER_DEFAULT_HINT`` -- asserting on the module default here
+        would pass vacuously, since this cluster always sets its own hint.
+        The explicit ``!= _TOPIC_CLUSTER_DEFAULT_HINT`` assertion guards
+        against exactly that vacuous-pass mode, which is how the previous
+        dead-end hint survived four rounds of triage undetected.
+
+        Reviewer (test-quality, task 4738 amendment): renamed from
+        ``..._returned_to_a_non_curator_...`` -- ``build_topic_cluster_block``
+        never reads ``agent_id`` to select the hint, only echoes it into the
+        block, so this was never actually an agent-conditional test; the name
+        no longer claims a discrimination it can't make. ``matched_phrases``
+        is now derived from ``find_matching_topic_cluster`` on the realistic
+        excerpt below (the ``TestNpxPyrightEaccesAgentSandboxCluster``
+        convention), rather than hand-supplied, so the content string is
+        load-bearing rather than decorative.
+
+        Each outcome is pinned by the literal the writer must ACT on, not by
+        surrounding prose (the ``TestNpxPyrightEaccesAgentSandboxCluster``
+        convention): ``allow_near_duplicate`` for the override, ``skip`` +
+        ``curate-fused-memories`` for the sanctioned no-write outcome (the
+        skill name is what makes "skip" a real answer rather than an implied
+        failure -- it names who DOES own consolidation), and
+        ``escalate_blocker`` -- the actual tool name, not just the bare word
+        "escalate" -- for the unsure/contradicts outcome.
+        """
+        content = (
+            'Hit the pytest-xdist -n0 serial-override workaround again: '
+            'fused-memory/pyproject.toml hardcodes --dist loadgroup in addopts.'
+        )
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
+        hint = block['hint']
+        assert block['topic_id'] == self.TOPIC_ID
+        assert block['error_type'] == 'ProceduralKnowledgeKnownTopicClusterWriteRejected'
+        assert hint != _TOPIC_CLUSTER_DEFAULT_HINT
+        # Outcome 1: genuinely distinct -> override, open to every agent today.
+        assert 'allow_near_duplicate' in hint
+        # Outcome 2: genuine duplicate -> skip is sanctioned, and consolidation
+        # is attributed to the interactive curation skill, not to this agent.
+        assert 'skip' in hint.lower()
+        assert 'curate-fused-memories' in hint
+        # Outcome 3: unsure / contradicts -> escalate, naming the actual tool.
+        assert 'escalate_blocker' in hint
+
+    def test_rendered_hint_does_not_route_to_a_refused_amend(self):
+        """Pins that the IMPERATIVE is gone, and that the authz reason survives.
+
+        Reviewer (test-quality, task 4738 amendment): this used to also
+        assert ``'update/consolidate canonical memory' not in hint`` -- the
+        exact wording of the phrase that had just been deleted. That pins one
+        2026-08 rephrasing, not the contract: it would stay green even if a
+        future hint reintroduced the same dead-end imperative in different
+        words ('amend the canonical entry in place'). Dropped in favour of
+        the tool-name pin below plus a positive, behavioural pin: the hint
+        must still STATE why the amend arm is refused, so a future edit that
+        quietly reroutes this audience back toward an amend -- without
+        removing that explanation -- is caught too.
+
+        ``update_memory``'s content-amend arm is authz-gated to
+        ``recon-stage-`` / ``curator-`` agent_id prefixes
+        (``Mem0UpdateConfig.content_amend_allowed_agent_prefixes``, esc-3524-1
+        ruling (b) 2026-08-11 + the 2026-08-12 all-deployments schema-default
+        ruling), so routing this audience to call it directly reproduces the
+        exact defect this task fixes.
+
+        Also renamed from ``..._a_non_curator_...``, for the same reason as
+        the sibling test above: ``agent_id`` is inert for hint rendering.
+        """
+        content = 'pytest-xdist -n0 --dist loadgroup workaround again'
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
+        hint = block['hint']
+        assert 'update_memory' not in hint
+        assert 'authz-gated' in hint
+        assert 'recon-stage-' in hint
+
+    def test_cluster_phrases_and_threshold_are_unchanged(self):
+        """Characterization: step-2's hint-only edit must not touch the matcher.
+
+        Green from the start -- exists so a hint rewrite cannot silently
+        widen or narrow what this cluster matches on.
+        """
+        cluster = self._cluster()
+        assert cluster.phrases == [
+            'pytest-xdist',
+            '-n0',
+            '--dist loadgroup',
+            'max-worker-restart',
+            '-p no:xdist',
+        ]
+        assert cluster.min_phrase_hits == 2
+        assert cluster.sufficient_phrases == []
+
+    def test_canonical_memory_id_survives_as_a_read_pointer(self):
+        """The canonical memory id stays in the hint, as a READ pointer only.
+
+        Retained (not deleted) so a blocked writer can search
+        8bb3eb15-1133-4e7b-ac1f-5bac10329b51 to decide which of the three
+        outcomes applies -- distinct, duplicate, or contradicts. It must
+        never again be re-attached to an amend instruction this audience
+        cannot execute; that regression is what
+        ``test_rendered_hint_does_not_route_to_a_refused_amend`` pins.
+        Supersedes the former
+        ``test_pytest_xdist_cluster_hint_points_at_canonical_memory`` in
+        ``TestProceduralTopicGuardClustersDefault``, folded in here so this
+        cluster's hint contract is pinned in exactly one place.
+        """
+        cluster = self._cluster()
+        assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
 
 
 class TestReportTaskAlreadyDoneMainReachabilityCluster:

@@ -95,7 +95,7 @@ Three tiers (within-tier ordering unreliable at 50 rounds/task):
 - **Widespread cap starvation**: REAP-139B FP8 run ($181 Sonnet-equiv) + Opus df_18 ($43) + Sonnet df_12 ($25) burned through all 6 automation accounts. All subsequent tasks across all configs hit cap-cycling — 20 "iterations" at $0/0L in seconds.
 - **Reify Claude baselines (Sonnet + Opus) completely tainted** — 0 cost, 0 lines, 2 min. Every iteration was a cap bounce, not real work.
 - **NVFP4 pod was idle for 2+ hours** at $5.49/h because reify's accounts file excluded A and G. Terminated, relaunched with all accounts. 3 remaining tasks completed.
-- **Dedicated eval account injection deployed** (d33db0cfaf): `run_vllm_eval.py` generates temp accounts YAML (shared pool + max-a) via `USAGE_ACCOUNTS_FILE` env var. Orchestrators see 6 accounts; eval runners see 7. Account A protected from orchestrator automation.
+- **Dedicated eval account injection deployed** (d33db0cfaf): `run_vllm_eval.py` generates temp accounts YAML (shared pool + max-a) via `USAGE_ACCOUNTS_FILE` env var. Orchestrators see 6 accounts; eval runners see 7. Account A protected from orchestrator automation. **SUPERSEDED 2026-09-02 — see "Eval account injection retired" below.** This records what was true during this session, not current behaviour.
 - **plan.json concurrency bug found**: M25-FP8 df_task_13 blocked after successful implementer ($7.47, 31 turns) due to plan.json ownership mismatch — 5 concurrent tasks on same pod clobber each other's plan state.
 
 ### Results matrix (all final-run configs)
@@ -129,7 +129,7 @@ The eval pipeline uses Claude API for judge + reviewer calls even on vLLM config
 |-----|--------|--------|
 | Cap bounce counts as iteration | Known | Each cap-hit + retry burns one iteration; 20 iterations = ~3 cycles through 7 accounts in seconds |
 | plan.json concurrency bug | **NEW** | 5 concurrent tasks on same pod: plan.json overwritten by sibling task after implementer succeeds |
-| Reify accounts file missing A/G | FIXED | Reify config excluded A/G; now both configs use ${USAGE_ACCOUNTS_FILE} override |
+| Reify accounts file missing A/G | FIXED | Reify config excluded A/G; now both configs use ${USAGE_ACCOUNTS_FILE} override. The override survives; what it points at changed — see "Eval account injection retired" |
 | dark-factory config.yaml missing usage_cap | FIXED | No failover at all for df_task evals; added usage_cap section |
 | Cost tracking on cap-interrupted sessions | Known | CLI reports $0 when capped mid-session; real work done but cost not accumulated |
 
@@ -137,8 +137,45 @@ The eval pipeline uses Claude API for judge + reviewer calls even on vLLM config
 
 | Commit | Description |
 |--------|-------------|
-| `d33db0cfaf` | Dedicated eval account injection via USAGE_ACCOUNTS_FILE |
+| `d33db0cfaf` | Dedicated eval account injection via USAGE_ACCOUNTS_FILE (**retired 2026-09-02**, task 4945 — the override remains, the injection does not) |
 | (reify) `39db84fb7` | Reify config: USAGE_ACCOUNTS_FILE override support |
+
+### Eval account injection retired (2026-09-02, tasks 4741/4945)
+
+The "shared pool + max-a" injection recorded above is **no longer how eval
+runs are rostered**. Both eval launchers — `scripts/run_vllm_eval.py` and
+`scripts/rerun_cap_tainted.sh` — now point `USAGE_ACCOUNTS_FILE` at
+`config/usage-accounts.yaml` directly, and neither synthesises a roster of its
+own. Evals draw on the same seven-account shared fleet pool as every other
+invocation, so "orchestrators see 6, eval runners see 7" no longer holds.
+
+**Why.** The 2026-08-30 ruling found the premise false. Account A is Leo's
+INTERACTIVE account and his own sessions exhaust its weekly cap most weeks, so
+it was never the uncapped private reserve the injection assumed. The seventh
+account it bought an eval run was frequently already capped, at the cost of
+spending the one account interactive work depends on.
+
+**What replaces it: cap tolerance, not a reserve.** `run_architect_eval`
+routes every invocation through `invoke_with_cap_retry` with 48h of patience,
+resuming the capped session via `--resume` on whichever account frees up
+first, so banked spend survives a failover instead of being discarded. A
+fully-capped pool now also announces itself — `UsageGate.before_invoke` emits
+a throttled `all_capped_park` WARNING carrying elapsed time, account count and
+the soonest expected reopen — so a parked campaign is distinguishable from a
+hung one, which the cap-starvation forensics above had no way to tell apart.
+
+**The `USAGE_ACCOUNTS_FILE` override itself remains**, and is still the seam
+for "which roster does this run use": `shared.config_models.UsageCapConfig`
+reads it and so does reify's orchestrator config, which is why the "Reify
+accounts file missing A/G" fix above is still in force. The launchers set it
+explicitly rather than leaving it unset because the orchestrator config's
+default is a hardcoded absolute path into the main checkout, which would
+silently roster the wrong tree for a worktree-launched run. What was retired
+is the roster it pointed at, not the pointing.
+
+Guarded by `tests/scripts/test_eval_accounts_shared_pool.py`, which sweeps
+both launchers and the shared roster together, so re-adding account A to any
+of the three fails loudly rather than quietly.
 
 ### Next-session priorities
 

@@ -1307,7 +1307,7 @@ def test_a_symlinked_plan_resolves_to_the_meta_root_and_stays_a_link(sweep_root)
 
     ``os.replace`` onto the link path would replace it with a regular file and
     re-fork the lane and meta-root copies — the esc-5205-9 stale-plan
-    divergence ``plan_tools._atomic_write_plan`` documents at line 715. The
+    divergence ``TaskArtifacts._write_json`` documents. The
     link must therefore still be a link after resolution, and forever after.
     """
     target = _plan_target(sweep_root, '9002-2026')
@@ -1446,8 +1446,9 @@ def test_unreproducible_formatting_is_refused(raw):
     """A hand-edited or unusually-formatted file fail-safes for free.
 
     Rewriting it would put changes in the diff that the corrupted strings did
-    not cause — the exact reason plan_tools._atomic_write_plan was NOT reused
-    here (it stamps _schema_version and re-indents).
+    not cause — the exact reason TaskArtifacts.write_plan, the single
+    plan.json writer, is NOT reused here (it stamps _schema_version and
+    re-indents).
     """
     assert sweep.round_trips(raw, json.loads(raw)) is False
 

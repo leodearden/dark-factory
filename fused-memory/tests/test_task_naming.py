@@ -15,6 +15,11 @@ import pytest
 from fused_memory.utils import task_naming
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 
+# A Unicode decimal digit that ``str.isdigit()`` accepts but ``str.isascii()``
+# does not — spelled by ESCAPE so the fixture survives transport and a reader
+# sees the codepoint rather than a glyph that renders like an ASCII '3'.
+ARABIC_INDIC_THREE = '\u0663'  # ARABIC-INDIC DIGIT THREE
+
 
 class TestCanonicalizeTaskNodeNameMatches:
     """Bare 'task N' / 'tasks N' node names (any case, extra whitespace) canonicalize
@@ -60,6 +65,18 @@ class TestCanonicalizeTaskNodeNameNonMatches:
             'taskforce 9',
             'Task 42 orchestrator',
             'reify task 12',
+            # A Unicode digit is not a task number. task_naming owns no pattern
+            # of its own, so these assert the canonical_labels narrowing
+            # propagates through this adapter. Measured RED before that fix:
+            # 'Task \u0663' canonicalized to itself and 'Task 12\u0663' to
+            # 'Task 12\u0663', either of which the normalization hook would have
+            # written back onto a real graph node.
+            'Task ' + ARABIC_INDIC_THREE,
+            # The mixed run is the sharper case: it must yield None, never the
+            # TRUNCATED prefix 'Task 12', which names a REAL node the hook would
+            # happily rename. See TestUnicodeDigitsAreNotTaskNumbers in
+            # tests/test_canonical_labels.py for the full rationale.
+            'Task 12' + ARABIC_INDIC_THREE,
         ],
     )
     def test_returns_none(self, name):

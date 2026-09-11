@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -1404,6 +1405,233 @@ class TestZeroOutputBreakerCurate:
             )
         # Breaker should NOT be open after 1 ZOT since reset.
         assert 'zero-output-breaker' not in r_next.justification
+
+
+class TestZeroOutputBreakerBatchReset:
+    """RED (task 4143): a successful MULTI-ITEM batch LLM call must reset the
+    consecutive-ZOT breaker too, not just the single-item curate() path.
+
+    On main, _call_llm_batch has no success-path reset, so in a
+    batch-dominant deployment size-1 bisect ZOTs accumulate across an
+    unbounded number of healthy batch round-trips until they trip the
+    breaker on a demonstrably healthy service.
+    """
+
+    def _zot_result(self) -> AgentResult:
+        return AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+            proc_tree='<pgid tree>', account_name='max-g',
+        )
+
+    def _healthy_batch_result(self, n: int) -> AgentResult:
+        return AgentResult(
+            success=True, output='', cost_usd=0.03,
+            structured_output={'decisions': [
+                {'candidate_index': i, 'action': 'create', 'justification': 'ok'}
+                for i in range(n)
+            ]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_resets_zot_counter(self):
+        """(1) A successful _call_llm_batch call resets the counter directly."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Seed one recorded ZOT directly.
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_zero_output_timeouts == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_batch_between_zots_does_not_open_breaker(self):
+        """(2) Production symptom, end to end: ZOT, healthy batch, ZOT must NOT open
+        the breaker — the healthy batch has to clear what the first ZOT left behind."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot = self._zot_result()
+        healthy = self._healthy_batch_result(2)
+        mock_llm = AsyncMock(side_effect=[zot, healthy, zot])
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            # ZOT via curate() (counter → 1).
+            await curator.curate(
+                CandidateTask(title='Alpha'), project_id='p', project_root='/x',
+            )
+            # Healthy batch call — must reset counter to 0.
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='Batch1'), CandidateTask(title='Batch2')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+            # ZOT via curate() again (counter → 1, still under threshold=2).
+            await curator.curate(
+                CandidateTask(title='Bravo'), project_id='p', project_root='/x',
+            )
+
+        assert curator._zero_output_breaker_open_until is None
+        assert curator._consecutive_zero_output_timeouts == 1
+        # All three LLM-bound calls actually reached the LLM — nothing was
+        # short-circuited by a wrongly-opened breaker.
+        assert mock_llm.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_healthy_batch_through_curate_batch_prepared_resets_counter(self):
+        """(3) Same reset, proven through the real production entry point
+        (curate_batch_prepared → _call_llm_batch_with_fallback → _call_llm_batch)
+        rather than the private method directly."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        c1 = CandidateTask(title='Prepared candidate Gamma', description='gamma task details')
+        c2 = CandidateTask(title='Prepared candidate Delta', description='delta task details')
+        prepared = [
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+            PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+        ]
+
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_zero_output_timeouts == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_batch_does_not_reset_counter(self):
+        """(4) Placement guard — GREEN before and after the fix. A failed batch
+        must NOT reset the counter, pinning the reset behind the success check
+        (if it were placed above the `if not agent_result.success` guard, the
+        breaker would become unreachable from the batch path)."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        zot = self._zot_result()
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=zot)), \
+             pytest.raises(CuratorFailureError):
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert curator._consecutive_zero_output_timeouts == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_closes_already_open_breaker(self):
+        """(5) Deliberate semantic widening, pinned per this task's plan design
+        decision 3: a successful `_call_llm_batch` call closes an ALREADY-OPEN
+        breaker/cooldown too, not just the consecutive counter.
+
+        During a real bisect, `_call_llm_batch_with_fallback`'s two halves run
+        concurrently under asyncio.gather. A left half that bisected down to
+        size-1 curate() calls can open the breaker (two ZOTs, threshold=2)
+        while a sibling right-half batch call is still in flight; when that
+        sibling batch succeeds, this reset now cancels the cooldown the left
+        half just opened. Pre-task-4143 the batch path had no reset at all,
+        so it could never close an open breaker either — this is new
+        behaviour introduced by the fix, not a narrowing of pre-existing
+        behaviour. It is accepted rather than restricted to counter-only
+        because a completed LLM round-trip is still proof the backend isn't
+        wedged (see the plan's design-decision rationale)."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Simulate a sibling bisect half having already tripped the breaker.
+        now = time.monotonic()
+        curator._record_zero_output_timeout(now)
+        curator._record_zero_output_timeout(now)
+        assert curator._consecutive_zero_output_timeouts == 2
+        assert curator._zero_output_breaker_open_until is not None
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='E'), CandidateTask(title='F')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        assert curator._consecutive_zero_output_timeouts == 0
+        assert curator._zero_output_breaker_open_until is None
 
 
 class TestCurateHappyPath:
@@ -4923,6 +5151,444 @@ class TestCuratorPremiseRefutedDrop:
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
         assert decision.action == "create"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-4201 RED: TestPremiseGuardRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestPremiseGuardRunsOffEventLoop:
+    """Tests that _maybe_premise_refuted_drop's blocking filesystem/YAML work
+    (per-candidate live-source re-verification, and the lazy registry load)
+    runs OFF the event-loop thread, so it cannot stall the fused-memory event
+    loop or any other coroutine sharing it — e.g. a concurrent project's
+    curate() call, since TaskInterceptor._get_curator memoises a single
+    TaskCurator while TaskInterceptor._curator_lock is keyed per-project.
+    """
+
+    async def test_premise_verification_runs_off_event_loop(self, tmp_path):
+        """RED: per-candidate live-source re-verification must be offloaded.
+
+        Asserts thread IDENTITY rather than a wall-clock timing threshold:
+        identity is exact and cannot flake under CI contention, whereas a
+        timing threshold would need a numeric bound with no achievability
+        basis (same rationale as test_recon_claim_verification_wiring.py's
+        test_probe_construction_runs_off_event_loop, and the wall-clock-proxy
+        anti-pattern documented at
+        orchestrator/tests/test_liveness_boundary_gate.py:345-358).
+
+        Patches verify_premise_refuted — the symbol that actually performs
+        the blocking read_text — rather than premise_refuted_entry, so this
+        pins behaviour (the work runs off-loop) rather than call shape; it
+        holds whether the implementation wraps the composite call or
+        decomposes it into match-then-verify.
+        """
+        import threading
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        verify_threads: list[int] = []
+
+        def recording_verify(entry, source_root):
+            verify_threads.append(threading.get_ident())
+            return True
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            side_effect=recording_verify,
+        ):
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert verify_threads and all(tid != loop_thread_id for tid in verify_threads)
+        assert decision is not None
+        assert decision.action == "refuse"
+        assert decision.justification.startswith("recon-premise-refuted:")
+
+    async def test_verification_failure_fails_open(self, tmp_path, caplog):
+        """RED: an exception from the offloaded verification must fail OPEN.
+
+        _maybe_premise_refuted_drop's own docstring promises "Never raises",
+        and both its callers — curate() and curate_batch_prepared() — invoke
+        it unguarded, so an escaping exception would take down the whole
+        task submission. That contract held for free while the callees were
+        the guard module's own never-raising functions; offloading
+        verify_premise_refuted via asyncio.to_thread (this task) is a NEW
+        raise path (thread-pool failure, or anything the real/patched callee
+        raises) that does not route through the guard module's internal
+        except. Failing open (returning None) is the direction every other
+        failure mode this method already enumerates takes, and it means "let
+        the candidate through to the architect" — never "silently file a
+        dead-premise task". Mirrors task 4091's
+        TestClaimVerificationGuardFailsOpen, which needed a review amendment
+        to close this exact gap on the sibling claim-verification guard.
+        """
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            side_effect=RuntimeError("boom"),
+        ), caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        fail_open_records = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "recon-premise" in r.getMessage()
+        ]
+        # Exactly one — not "the word 'premise' appears somewhere in the log",
+        # which would stay green even if a retry loop double-logged or if
+        # this WARNING were deleted and some unrelated premise-related
+        # warning (e.g. the guard module's own "assertion fails open", or
+        # the pre-existing "guard disabled for this call" cwd warning) fired
+        # instead. "recon-premise" + "failing open" together are the exact
+        # text this method's own except block emits and nothing else in the
+        # module does (verified by grep).
+        assert len(fail_open_records) == 1
+
+    async def test_registry_load_runs_off_event_loop(self, tmp_path):
+        """RED: the one-shot lazy registry load must also be offloaded.
+
+        This site is NOT the one task 4201 was filed against, but
+        measurement is what promotes it: load_premise_registry on the
+        shipped 11 KB config/recon_code_fix_premise_registry.yaml measures
+        9,917 us, of which only 21 us is read_text and 8,152 us is
+        pure-Python yaml.safe_load — ~8x the worst per-candidate
+        verification read, and by far the largest single event-loop stall
+        in this method. It runs on the first task submission each
+        fused-memory process sees, while the per-project curator write lock
+        is held. INV-8 (loop-thread-occupancy-bounded,
+        docs/legibility/design-invariants.md) names filesystem work
+        explicitly and gives asyncio.to_thread as the house pattern.
+
+        Delegates to the REAL load_premise_registry (captured before
+        patching) rather than stubbing a return value: a stub returning []
+        would make the thread-identity assertion vacuous by short-circuiting
+        at ``if not entries: return None`` before ever reaching the match/
+        verify path, and would not exercise a genuine refusal.
+        """
+        import threading
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        load_threads: list[int] = []
+
+        def recording_load(path):
+            load_threads.append(threading.get_ident())
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=recording_load,
+        ):
+            decision1 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert load_threads and all(tid != loop_thread_id for tid in load_threads)
+        assert len(load_threads) == 1  # lazy load, at most once per instance
+        assert decision1 is not None and decision1.action == "refuse"
+        assert decision2 is not None and decision2.action == "refuse"
+
+    async def test_concurrent_first_calls_both_see_loaded_registry(self, tmp_path):
+        """RED: concurrent first calls must not observe a half-loaded registry.
+
+        self._premise_registry_load_attempted is set BEFORE the registry
+        assignment. That ordering was safe only while the load was
+        synchronous — there was no await point between the two. Offloading
+        the load (previous step) inserted one, so a second caller can now
+        see load_attempted=True while self._premise_registry is still None,
+        fall into ``if not entries: return None``, and SILENTLY FAIL OPEN:
+        the guard is skipped and the dead-premise task it exists to refuse
+        gets filed.
+
+        This is reachable, not theoretical:
+        task_interceptor.py::TaskInterceptor._get_curator memoises a SINGLE
+        TaskCurator on self._curator with no project key, while
+        task_interceptor.py::TaskInterceptor._curator_lock is keyed
+        PER-PROJECT — so two projects can be inside curate() concurrently on
+        the same TaskCurator instance.
+
+        Uses a slow load_premise_registry wrapper (sleeps inside the worker
+        thread, off the event loop) to guarantee the second concurrent call
+        enters while the first load is still in flight.
+        """
+        import time
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        load_call_count = 0
+
+        def slow_load(path):
+            nonlocal load_call_count
+            load_call_count += 1
+            time.sleep(0.05)  # yields the loop; runs on the to_thread worker
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=slow_load,
+        ):
+            d1, d2 = await asyncio.gather(
+                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
+                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
+            )
+
+        assert d1 is not None and d1.action == "refuse"
+        assert d2 is not None and d2.action == "refuse"
+        assert load_call_count == 1
+
+    async def test_registry_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a registry load that RAISES must fail OPEN, and must not latch
+        into a permanent failure.
+
+        VERIFIED EMPIRICALLY (not assumed): load_premise_registry only catches
+        FileNotFoundError/OSError on read_text and yaml.YAMLError on parse, so
+        a registry that is not valid UTF-8 raises UnicodeDecodeError — a
+        ValueError, NOT an OSError — despite that function's own docstring
+        claiming "The function never raises". The prior step (offloading the
+        lazy load via asyncio.to_thread, with
+        _premise_registry_load_attempted set only AFTER a successful
+        assignment) left this raise path unwrapped, so on the current branch:
+        (a) the exception escapes _maybe_premise_refuted_drop — whose own
+        docstring promises "Never raises" and whose callers curate() /
+        curate_batch_prepared() invoke it unguarded — and (b) the attempted
+        flag is never set, so EVERY subsequent call re-enters the load and
+        re-raises again: a one-shot failure becomes a permanent one for the
+        life of the process.
+
+        Writes the registry as genuinely non-UTF-8 bytes so the failure is
+        reached through the real load_premise_registry rather than fabricated
+        with a bare side_effect=RuntimeError — this is reachable in
+        production with no thread-pool weirdness and no mocking of the raise
+        itself. The patch wraps the real callable (captured before patching)
+        only to count invocations.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry_path = tmp_path / "premise_registry.yaml"
+        registry_path.write_bytes(b"- name: \xff\xfe bad\n")
+
+        config = _make_config_with_premise_registry(str(registry_path))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        load_calls = 0
+
+        def counting_load(path):
+            nonlocal load_calls
+            load_calls += 1
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=counting_load,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "recon-premise" + "failing open" is the exact text this method's
+        # registry-load except block emits (see the sibling assertion in
+        # test_verification_failure_fails_open) — narrower than "premise"
+        # appears somewhere, which would stay green even if this WARNING
+        # were deleted and some other premise-related warning fired instead.
+        assert any(
+            "failing open" in r.getMessage() and "recon-premise" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    async def test_registry_load_cancellation_does_not_disable_guard(
+        self, tmp_path,
+    ):
+        """GUARD (expected GREEN already): a cancelled load must NOT latch the
+        guard permanently off.
+
+        This locks a property that already holds on the current branch (the
+        attempted flag sits after the assignment, inside the lock, so a
+        CancelledError from the first caller leaves it clear and a later call
+        retries) against the obvious "just settle the flag in a finally"
+        fix for the sibling RED test above. asyncio.CancelledError is a
+        BaseException in Python 3.13, so a `finally` would also latch the
+        flag on cancellation — permanently disabling the premise guard for
+        this TaskCurator instance because one unrelated caller was
+        cancelled mid-load, which is the same transient-becomes-permanent
+        defect class the sibling test exists to close, just with a rarer
+        trigger. The follow-up impl step must keep this test GREEN.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        call_count = 0
+
+        def first_call_cancelled(path):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise asyncio.CancelledError()
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=first_call_cancelled,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await curator._maybe_premise_refuted_drop(
+                    candidate, candidate.payload_hash(),
+                )
+
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is not None
+        assert decision.action == "refuse"
+        assert decision.justification.startswith("recon-premise-refuted:")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

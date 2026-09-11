@@ -117,6 +117,11 @@ def _wire_gate_harness(mock_orch_config, repo: Path, *, task_id: str) -> Harness
     # MagicMock.__iter__'s empty default.
     h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value=f'esc-{task_id}-1')
+    # Explicit for the same reason (task 4499): the filer's auto-dismiss guard
+    # reads a TERMINAL record on this citation, so "nothing was previously
+    # adjudicated" must be stated, not inherited from MagicMock's truthy
+    # auto-child — which would silently suppress every filing below.
+    h._escalation_queue.find_terminal_by_citation = MagicMock(return_value=None)
     return h
 
 

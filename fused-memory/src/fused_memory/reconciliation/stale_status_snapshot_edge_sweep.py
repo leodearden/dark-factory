@@ -156,7 +156,8 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   residual pointed the WRONG way (an unlisted preposition over-selects)
   and one fail-safe residual (a genuine subject-position enumeration
   sharing a clause with a listed preposition is missed) — see
-  ``_ENUM_PREP_WORDS``.
+  ``_ENUM_PREP_WORDS``. The fail-safe one is MEASURED, not open: zero
+  cost on the live corpus (task 3949).
 - task 3037: the blocked family drops any aggregate list whose introducer
   follows a task reference in the same clause ('Task 5 is waiting on
   blocked tasks: 142, 148'), so a genuine aggregate of that shape is not
@@ -243,7 +244,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import NamedTuple
 
@@ -587,8 +588,64 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 # speculation: every candidate tightening (requiring a plural/capitalized head
 # before the preposition, or stopping the backward scan at a comma when no
 # preposition follows it) trades back toward the unrecoverable over-selection
-# direction, so it needs measurement against the real edge corpus first.
+# direction, so it needed measurement against the real edge corpus first.
 # (amendment, reviewer_comprehensive correctness-recall finding, task 3079)
+#
+# THAT MEASUREMENT IS NOW DONE (task 3949), against every populated FalkorDB
+# graph the store reports — discovered rather than hardcoded, because a
+# hardcoded project list is a coverage claim nothing checks. THE FIGURES LIVE
+# IN THE ARTIFACT, DELIBERATELY NOT HERE:
+#
+#     plans/plural-enum-guard-recall-report.md    (per-graph table, totals)
+#     plans/plural-enum-guard-recall-report.json  (same, machine-readable)
+#
+# An earlier draft of this block hand-copied that table inline, and every row
+# of it went stale within days as the corpus grew — the per-graph edge counts,
+# the graph count and the near-miss total all moved on the next re-run. Cite
+# the artifact and re-run the script; do not paste the numbers back in here.
+#
+# What the measurement FOUND is the durable part, and is what belongs here:
+# the recall cost of this guard on the real corpus is ZERO edges. Only two live
+# facts reach the guard at all, and both are genuine prepositional complements
+# it is right to reject — 'Task 3949 mentions that blockers for downstream,
+# still-unmerged tasks 1020 and 1030 are pending' (the BLOCKERS are pending).
+# Neither triages as an adverbial preamble, which is the only rejection class
+# that costs recall. Note the observer effect, and discount accordingly: both
+# edges were written at 07:24 on the FIRST measurement day by task 3949's own
+# session, so what the corpus actually offers is still zero organic matches.
+#
+# What the plural path loses here it loses at the REGEX, not at the guard. The
+# artifact's 'tasks <n>' column is a LEXICAL SUPERSET that already includes the
+# two full matches above; the remainder carry 'tasks <digits>' but no status
+# marker, no copula, or broken copula-marker adjacency ('Tasks 1752 and 1753
+# are related to ...', 'Both tasks 1920 and 1921 edit ...').
+#
+# Both candidates were re-validated against the full precision
+# parametrization, as the finding required before shipping either:
+#   (a) plural/capitalized head before the preposition — re-opens none of the
+#       47 pinned precision+suppression shapes, but does NOT recover
+#       'As of <date>, tasks ...', the finding's OWN motivating shape,
+#       because 'of' there follows the capitalized sentence-initial 'As'.
+#   (b) restart the backward scan after a preposition-free comma — recovers
+#       all three preamble shapes, but RE-OPENS the pinned over-selection
+#       'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are
+#       pending.', where the comma is intra-clause. It fails the required
+#       re-validation outright — and now on LIVE data too: it re-opens one of
+#       the two real corpus rejections above, which is the same shape.
+#
+# VERDICT: NOT TIGHTENED. Zero measured recall loss to buy back, against
+# nonzero unrecoverable over-selection risk, on a module whose stated
+# invariant is that under-selection self-heals and over-selection never does.
+#
+# Re-checkable as the corpus grows — the verdict is only as good as its
+# re-runnability, and a rejection census is a point-in-time fact:
+#     cd fused-memory && \
+#       uv run python scripts/measure_plural_enum_guard_recall.py
+# Artifacts: plans/plural-enum-guard-recall-report.{json,md}. The candidate
+# re-validation is mechanical — it parametrizes over the shared pinned corpora
+# in tests/reconciliation/plural_enum_shapes.py, which this suite parametrizes
+# off too, so a shape appended there re-validates both candidates — in
+# tests/test_measure_plural_enum_guard_recall.py.
 #
 # Kept as a single flat tuple rather than inlined into the pattern so the
 # vocabulary has ONE source of truth: the regression test parametrizes
@@ -1452,6 +1509,67 @@ class _ExtractionResult(NamedTuple):
     rejected_spans: tuple[tuple[int, int], ...]
 
 
+def _plural_enum_ids(
+    fact: str,
+    pattern: re.Pattern[str] = PLURAL_ENUM_SNAPSHOT_RE,
+    *,
+    guard: Callable[[str], bool] = _enumeration_is_prepositional_complement,
+) -> tuple[set[int], list[tuple[int, int]]]:
+    """The plural-enumeration arm, in ONE place. (task 3079; task 3949; task 3037)
+
+    Returns ``(ids, rejected_spans)``: the ids the plural path yields, and the
+    spans of every enumeration *guard* rejected. Both outputs are needed by
+    the production extractor — a rejected span is, by construction, a region
+    established to be a preposition's complement, so the drop it implies is
+    applied to every other anchored path too (see ``_extract_ids``).
+
+    Ids come from the match's ``'ids'`` group only, via ``_BARE_DIGIT_RE``,
+    preserving invariant (d): a bare ``\\d+`` contributes an id only from
+    inside an already-detected, marker-anchored span.
+
+    WHY THIS IS A FUNCTION AND NOT AN INLINE LOOP. ``guard`` is injectable
+    solely so task 3949's recall probe
+    (``fused-memory/scripts/measure_plural_enum_guard_recall.py``) can run the
+    IDENTICAL arm under a candidate guard instead of re-implementing it. A
+    hand-copied arm in the probe would keep measuring the old spelling after
+    this one gained a step, and would report a reassuring zero while doing it
+    — the same staleness argument that makes the probe import
+    ``PLURAL_ENUM_SNAPSHOT_RE`` rather than re-spell it. Any future drift now
+    surfaces as a signature change rather than as a silently stale copy.
+
+    The default is the shipped guard, so production callers pass nothing and
+    the injection point costs them nothing. It is a REPORTING seam, not an
+    extension point: no production caller may pass a different guard.
+
+    *pattern* defaults to ``PLURAL_ENUM_SNAPSHOT_RE`` — i.e. the UNION
+    family's plural arm, since that constant is bound from
+    ``_UNION_PATTERNS`` — so the probe's one-positional-argument call keeps
+    measuring exactly the arm it always measured. ``_extract_ids`` passes its
+    own family's ``patterns.plural_enum`` explicitly instead, because the
+    BLOCKED family narrows this pattern and must not silently fall back to
+    the union's. (task 3037 made the patterns per-family; this parameter is
+    how the task-3949 seam survives that.)
+
+    Pure: no I/O, no side effects.
+    """
+    ids: set[int] = set()
+    rejected_spans: list[tuple[int, int]] = []
+    for enum in pattern.finditer(fact):
+        # Subjecthood guard, second half: reject an enumeration that is a
+        # PREPOSITION'S COMPLEMENT rather than the copula's subject
+        # ('Reviews of the tasks A and B are pending' — the REVIEWS are
+        # pending). Lives here rather than as an in-pattern lookbehind
+        # because Python lookbehind is fixed-width, and a fixed offset is
+        # defeated by a single intervening determiner — while the words that
+        # may sit in that gap are an open class no bound can cover. See
+        # _ENUM_PREP_WORDS.
+        if guard(fact[: enum.start()]):
+            rejected_spans.append(enum.span())
+            continue
+        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+    return ids, rejected_spans
+
+
 def _extract_ids(
     fact: str,
     patterns: _SnapshotPatterns,
@@ -1481,22 +1599,22 @@ def _extract_ids(
 
     Pure: no I/O, no side effects.
     """
-    ids: set[int] = set()
-    rejected_spans: list[tuple[int, int]] = [*inherited_rejected_spans]
-
-    for enum in patterns.plural_enum.finditer(fact):
-        # Subjecthood guard, second half: reject an enumeration that is a
-        # PREPOSITION'S COMPLEMENT rather than the copula's subject
-        # ('Reviews of the tasks A and B are pending' — the REVIEWS are
-        # pending). Lives here rather than as an in-pattern lookbehind
-        # because Python lookbehind is fixed-width, and a fixed offset is
-        # defeated by a single intervening determiner — while the words that
-        # may sit in that gap are an open class no bound can cover. See
-        # _ENUM_PREP_WORDS.
-        if _enumeration_is_prepositional_complement(fact[: enum.start()]):
-            rejected_spans.append(enum.span())
-            continue
-        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+    # The plural arm lives in _plural_enum_ids so task 3949's recall probe can
+    # measure THIS code rather than a copy of it (see that function). THIS
+    # family's plural pattern is passed explicitly — the blocked family
+    # narrows it, and must not fall back to the union default.
+    #
+    # This family's OWN rejections are concatenated AFTER the inherited ones,
+    # which reproduces exactly the order the in-place loop built before the arm
+    # was extracted (inherited seeded first, own appended in match order). The
+    # loop only ever APPENDED to rejected_spans and never read it, so hoisting
+    # it out is order- and value-preserving; the spans are consumed as an
+    # unordered membership test below in any case.
+    ids, own_rejected_spans = _plural_enum_ids(fact, patterns.plural_enum)
+    rejected_spans: list[tuple[int, int]] = [
+        *inherited_rejected_spans,
+        *own_rejected_spans,
+    ]
 
     # Suppressing only the PLURAL match left the rejected enumeration's tail
     # extractable by the other anchored paths, because an enumeration may

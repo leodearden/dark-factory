@@ -27,12 +27,33 @@ from dashboard.data.active_tasks import (
 
 def test_minutes_since_handles_z_suffix_and_naive_iso():
     one_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace('+00:00', 'Z')
-    assert 59 <= _minutes_since(one_hour_ago) <= 61
+    minutes = _minutes_since(one_hour_ago)
+    assert minutes is not None  # a parseable start time is never the unknown-start None
+    assert 59 <= minutes <= 61
 
 
-def test_minutes_since_returns_zero_on_missing_or_bad():
-    assert _minutes_since(None) == 0
-    assert _minutes_since('not-a-date') == 0
+def test_minutes_since_returns_none_on_missing_and_on_bad(caplog):
+    """A MISSING start time and a present-but-unparseable one are both None.
+
+    ``None``/``''`` is the per-task artifact-read-failure signal on
+    ``TaskRuntimeEntry.started`` (see ``shared/src/shared/task_runtime_state.py``
+    — "never a fabricated 0"), so the helper must propagate the unknown rather
+    than render it as '0m running'. A present-but-unparseable timestamp is a
+    different failure (upstream data damage, no known producer), but renders
+    identically misleadingly as '0m running' if faked to 0, so it is also
+    surfaced as None rather than fabricated (task 4365; task 4055 scoped its
+    fix to the missing/empty case only and left this branch for follow-up).
+    The unparseable case must also be LOUD (loud-over-silent-degradation): a
+    WARNING naming the offending value, not just a silently-swapped return —
+    mirroring ``test_queue.py::test_unparseable_timestamp_logs_a_warning``.
+    """
+    assert _minutes_since(None) is None
+    assert _minutes_since('') is None
+
+    with caplog.at_level(logging.WARNING):
+        assert _minutes_since('not-a-date') is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('not-a-date' in m for m in warnings), warnings
 
 
 def test_minutes_since_uses_provided_now():
@@ -57,6 +78,7 @@ def test_minutes_since_no_now_resolves_via_clock():
 
     lower = int((before - ts).total_seconds() // 60)
     upper = int((after - ts).total_seconds() // 60)
+    assert result is not None  # a parseable start time is never the unknown-start None
     assert lower <= result <= upper
 
 
@@ -349,6 +371,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
         'lane': None, 'phase': None, 'lane_state': None, 'runtime_offline': False,
+        'runtime_status': 'ok',
         # Claim projection (task 3543): carried on every row. A 'pending' task
         # is never stranded — the shared predicate gates on 'in-progress'.
         'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
@@ -416,6 +439,39 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
 
 
 @pytest.mark.asyncio
+async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """An ONLINE entry whose ``started`` is present-but-unparseable renders as
+    ``None`` on the row, not a fabricated ``0`` — the row-level counterpart to
+    ``test_minutes_since_returns_none_on_missing_and_on_bad`` (task 4365),
+    mirroring ``test_task_runtime_boundary.py``'s
+    ``test_b6_online_per_task_read_failure_yields_none_started`` shape for the
+    unparseable-rather-than-missing case. ``runtime_offline`` stays False: this
+    is a damaged field on an otherwise-online snapshot, not an outage.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='damagedlane',
+        tasks=[{'id': 9, 'title': 'damaged task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {
+        'damagedlane': [_runtime_entry(9, started='not-a-date')],
+    })
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    row = active[0]
+    assert row['started'] is None
+    assert row['runtime_offline'] is False
+
+
+@pytest.mark.asyncio
 async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     tmp_path, monkeypatch, dummy_client,
 ):
@@ -443,6 +499,10 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key}=None when runtime offline, got {row[key]!r}'
     assert row['runtime_offline'] is True
+    # offline=True with NO reason is out-of-contract for a dashboard-synthesized
+    # snapshot. Report it as an honest 'unknown' — never guess 'unreachable',
+    # which is precisely the fabricated diagnosis task 3517 exists to prevent.
+    assert row['runtime_status'] == 'unknown'
 
 
 @pytest.mark.asyncio
@@ -471,14 +531,18 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key}=None when no escalation URL, got {row[key]!r}'
     assert row['runtime_offline'] is True
+    # ...but the CAUSE is separable now: nothing was ever probed here, so this
+    # is the expected/permanent case, not an orchestrator fault.
+    assert row['runtime_status'] == 'not_configured'
 
 
 @pytest.mark.asyncio
 async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     tmp_path, monkeypatch, dummy_client,
 ):
-    """A per-task artifact read failure (loops/attempts/phase=None, error set)
-    is honest but distinct from project-offline: runtime_offline stays False.
+    """A per-task artifact read failure (loops/attempts/started/phase=None,
+    error set) is honest but distinct from project-offline: runtime_offline
+    stays False.
     """
     root, shaped = _make_project(
         tmp_path, project_dir='flaky',
@@ -503,9 +567,118 @@ async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     assert row['loops'] is None
     assert row['attempts'] is None
     assert row['phase'] is None
+    assert row['started'] is None, (
+        "a per-task read failure must not fabricate '0m running'"
+    )
     assert row['runtime_offline'] is False, (
         'a per-task read failure is an honest error, not an offline project'
     )
+    assert row['runtime_status'] == 'ok', (
+        'the PROBE succeeded — the failure is per-task, not a probe fault domain'
+    )
+
+
+# ---------------------------------------------------------------------------
+# runtime_status probe discriminator (task 3517)
+# ---------------------------------------------------------------------------
+
+
+async def _one_task_row_with_snapshot(
+    tmp_path, monkeypatch, dummy_client, snapshot: TaskRuntimeSnapshot | None,
+) -> dict:
+    """Collect a single-task project whose runtime map holds *snapshot*.
+
+    ``None`` means the label is absent from the map entirely (no escalation
+    URL configured for it) — the never-probed case.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='probe',
+        tasks=[{'id': 3, 'title': 'probed task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    async def _fake_fetch_task_runtime(client, escalation_urls):
+        return {} if snapshot is None else {'probe': snapshot}
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
+    )
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=DashboardConfig(project_root=root),
+    )
+    assert len(active) == 1
+    return active[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ['deadline_exceeded', 'unreachable'])
+async def test_collect_active_tasks_row_carries_probe_reason(
+    tmp_path, monkeypatch, dummy_client, reason,
+):
+    """The probe's fault-domain discriminator reaches the task row intact.
+
+    Without this an operator sees identical blank cells whether the
+    orchestrator is down or the dashboard was too starved to ask — the
+    2026-07-30 misdiagnosis.
+    """
+    row = await _one_task_row_with_snapshot(
+        tmp_path, monkeypatch, dummy_client,
+        TaskRuntimeSnapshot(offline=True, offline_reason=reason),
+    )
+    assert row['runtime_status'] == reason
+    # Back-compat: runtime_offline keeps its exact prior meaning, and degraded
+    # rows still carry honest Nones rather than fabricated zeros.
+    assert row['runtime_offline'] is True
+    for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
+        assert row[key] is None, f'expected {key}=None when probe failed, got {row[key]!r}'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_online_snapshot_with_entry_is_ok(
+    tmp_path, monkeypatch, dummy_client,
+):
+    row = await _one_task_row_with_snapshot(
+        tmp_path, monkeypatch, dummy_client,
+        TaskRuntimeSnapshot(tasks=[_runtime_entry(3, loops=4)]),
+    )
+    assert row['runtime_status'] == 'ok'
+    assert row['runtime_offline'] is False
+    assert row['loops'] == 4
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_terminal_rows_carry_runtime_status(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Terminal (done) rows get the discriminator too — the row shape must not
+    diverge between the active loop and the terminal bucket."""
+    root, shaped = _make_done_project(
+        tmp_path, project_dir='term',
+        active_tasks=[{'id': 1, 'title': 'active', 'status': 'in-progress', 'dependencies': []}],
+        done_tasks=[{'id': 60, 'title': 'finished', 'status': 'done', 'dependencies': [],
+                     'updated_at': '2026-05-29T12:00:00+00:00'}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    async def _fake_fetch_task_runtime(client, escalation_urls):
+        return {'term': TaskRuntimeSnapshot(offline=True, offline_reason='unreachable')}
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
+    )
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=DashboardConfig(project_root=root),
+        max_done_per_project=1,
+    )
+    done_row = next(r for r in active if r['id'] == 'term/T-60')
+    assert done_row['runtime_status'] == 'unreachable'
+    assert all('runtime_status' in r for r in active)
 
 
 @pytest.mark.asyncio

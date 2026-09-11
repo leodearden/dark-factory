@@ -20,6 +20,7 @@ from fused_memory.reconciliation.prompts import (
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
+    render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
@@ -69,6 +70,8 @@ Interpreting the status:
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
+
+{render_finding_provenance_section(can_file_tasks=True)}
 
 {render_execution_class_section()}
 
@@ -456,12 +459,17 @@ project_root=<project_root>)` as the canonical confirmation step — unlike \
 `set_task_status`, which returns per-task \
 `{{"taskId": ..., "oldStatus": ..., "newStatus": ...}}` records inline, `update_task` \
 does not reliably echo back the post-write `memory_hints` field (the Taskmaster \
-backend may filter, normalise, or coalesce hint entries). Always pass `append=True` \
-when attaching `memory_hints`. Under `append=True` the backend performs an additive \
-union merge: list-valued and dict-valued metadata keys (including `memory_hints` \
-itself and its `entities`/`queries` sub-fields) are merged with pre-existing entries \
-rather than replaced — newly-attached entries are combined with any hints already on \
-the row, and sibling keys (`files`, `spawned_from`, audit fields) are preserved \
+backend may filter, normalise, or coalesce hint entries). When attaching \
+`memory_hints`, always request the ADDITIVE merge — pass `append=True` ALONE, or the \
+equivalent explicit `metadata_mode='additive'`. Do NOT combine `append=True` with \
+`metadata_mode='merge'`: that pair is a contradiction ('merge' is a shallow \
+last-write-wins overwrite, `append=True` means additive) and the backend now REJECTS \
+it with a `TASKMASTER_TOOL_ERROR` rather than silently honouring 'merge' and \
+overwriting the task's whole `memory_hints` key. Under the additive merge the backend \
+unions list-valued and dict-valued metadata keys (including `memory_hints` \
+itself and its `entities`/`queries` sub-fields) with pre-existing entries \
+rather than replacing them — newly-attached entries are combined with any hints already \
+on the row, and sibling keys (`files`, `spawned_from`, audit fields) are preserved \
 automatically by the backend (no pre-write baseline fetch is required). Only increment \
 `tasks_hints_updated` if the returned task's `memory_hints` field is a SUPERSET of \
 the newly-attached entries — it MUST contain every newly-attached entity and query; it \
@@ -469,7 +477,7 @@ MAY also contain pre-existing entries that were preserved through the union merg
 the returned hints are missing any newly-attached entry, skip the \
 `tasks_hints_updated` increment and flag the discrepancy in your structured report.
 
-The `append=True` additive union above is ONLY for the ATTACH case (adding new hints \
+The additive union above is ONLY for the ATTACH case (adding new hints \
 to a task). For the distinct RESHAPE case — converting a task's LEGACY list-format \
 `memory_hints` (`[{{entity, query}}, ...]`) to the canonical `{{entities, queries}}` \
 dict shape — you must NOT use `append=False`: a bare `append=False` whole-blob metadata \

@@ -3,25 +3,30 @@
 # via usage_cap.accounts_file in their respective configs.
 #
 # Order matters: accounts are tried in list order during failover.
-# Account A is reserved for interactive + eval sessions (not here).
-# Eval runners inject A dynamically via USAGE_ACCOUNTS_FILE override.
+# Account A is reserved for INTERACTIVE use only (not here) — Leo's own
+# sessions exhaust its weekly cap most weeks, so it cannot double as a
+# reserve. Evals have NO dedicated account: they share this same pool
+# and must be robust to cap/429 events (ruling 2026-08-30, task 4741).
 
 accounts:
-  - name: max-g
-    oauth_token_env: CLAUDE_OAUTH_TOKEN_G
-  - name: max-f
-    oauth_token_env: CLAUDE_OAUTH_TOKEN_F
-  - name: max-e
-    oauth_token_env: CLAUDE_OAUTH_TOKEN_E
-  - name: max-c
-    oauth_token_env: CLAUDE_OAUTH_TOKEN_C
   - name: max-b
     oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+  - name: max-c
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_C
   - name: max-d
     oauth_token_env: CLAUDE_OAUTH_TOKEN_D
+  - name: max-e
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_E
+  - name: max-f
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_F
+  - name: max-g
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_G
+  - name: max-h
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_H
 # max-b previously believed permanently dead (HTTP 403 since 2026-04-20);
 # re-tested 2026-04-26 with a haiku probe and found alive (real tokens consumed).
-# max-a remains reserved for interactive + eval sessions; eval runners inject A
-# dynamically via USAGE_ACCOUNTS_FILE override.
+# max-a remains reserved for interactive use only — NOT an eval account,
+# and not part of the shared pool above. Evals draw on the pool above
+# like the rest of the fleet (ruling 2026-08-30, task 4741).
 #  - name: max-a
 #    oauth_token_env: CLAUDE_OAUTH_TOKEN_A

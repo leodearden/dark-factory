@@ -144,6 +144,169 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 
 ### Changed
 
+#### `related_tasks` blessed into Tier-A, and every Tier-B canonical key is now machine-checked (task 4303)
+
+`related_tasks` was the **largest single `unknown_key` contributor in the
+corpus** — and, unusually, the *canonical* Tier-B spelling that
+`docs/task-authoring.md` §8 tells authors to migrate **toward**. So an author
+who followed the documentation exactly still minted a census line, and the
+drift signal could not distinguish "used a deprecated alias" from "used the
+canonical spelling". It was the sole violation of an invariant the Tier-B
+table already depended on: measured on the base tree, `prd_path`,
+`prd_task_label`, `invariants` and `source_finding_id` — every other key in
+the table's Canonical column — were already blessed.
+
+**The reader trace came back NEGATIVE, and the key is blessed anyway. This is
+the fact most likely to be misread later, so it is stated plainly.** There is
+no code reader, no code writer, and `git log -S` across `orchestrator/src`,
+`fused-memory/src`, `escalation/src`, `shared/src`, `dashboard`, `scripts`,
+`hooks`, `skills` and `.claude` shows the key has **never existed in code** in
+this repo's history. Unlike `related_memory_ids`, no live prompt instructs it
+either — the empirical writer is an LLM prose convention. The blessing rests on
+the **`esc-3796-1` corpus-dominance precedent**, under which the
+finding-provenance family is Tier-A with no reader and no writer because *the
+corpus is the usage*; `source_finding_id` was blessed at 120 tasks, this key at
+469. A future reader who greps for a writer, finds none, and prunes the entry
+as dead would be wrong.
+
+**Retirement was measured, not assumed, to be impossible today.** 326 of the
+469 carriers (69.5%) hold `done_provenance` and are unwritable under the
+presence-only write-authority floor until task 3777 lands. Sweeping only the
+writable ~30% is exactly the "fifth of the benefit" vocabulary fork §8 already
+rules out for task 4302 — so retiring would have converted this task into a
+block on 3777 while leaving live authoring guidance inverted for four spellings
+in the meantime. Typing was ruled out on the same grounds that decided
+`execution_class`: the corpus values are heterogeneous (432 list, 37 bare str),
+so a `list[str]` field would raise on every metadata write to those 37 under
+`direction='write', enforce=True`, permanently.
+
+**A new structural guard closes the class of bug, not just this instance.**
+`tests/scripts/test_task_authoring_tier_b_canonical_keys.py` pins the general
+invariant *every key in the Tier-B Canonical column is Tier-A blessed*, so a
+future table row whose canonical is unblessed fails the suite instead of
+silently recreating this defect. It is a new file rather than an extension of
+`test_task_authoring_blessed_keys_drift.py`, whose docstring explicitly forbids
+extending that guard to the surrounding prose. Non-vacuity was measured by
+hand, since its own RED was scaffolding-shaped: removing `'related_tasks'` from
+the frozenset makes it fail naming the key.
+
+**Two coverage holes in that guard were then closed, both falsified by hand.**
+(1) The row filter keeps any row with a backtick *anywhere* in it, but names are
+read out of the first cell only — so a row whose Canonical cell was written as
+bare prose passed the filter, contributed zero names and was **silently
+unpinned**. Measured on the live document: rewriting the real ``| `invariants` |
+`inv` |`` row as `| the invariants key | `inv` |` left the guard reporting
+**11 passed**; with the new per-row assertion the same edit fails **3 tests**
+naming the offending row. That is the identical silent-narrowing shape as the
+`` ` + ` ``-joined cell the file already guards against — one loses a key, this
+lost a whole row. (2) The parser suite exercised only `direction='read'` with a
+list value, so the **bless-not-type** ruling — which rests entirely on 37 corpus
+carriers holding a bare `str` — was defended by prose alone. A parametrized
+write leg now pins both shapes under `direction='write', enforce=True`, asserting
+neither raises *and* neither is coerced. Falsified by adding
+`related_tasks: list[str]` to `TaskMetadata`: exactly one case failed,
+`[bare_str_value]`, with `Input should be a valid list [input_value='task-1']`,
+while `[list_value]` stayed green. Neither mutation was committed.
+
+**Deliberately deferred:** the marker-span extraction (`begin`/`end` counting,
+inversion check, slice) is now duplicated between this guard and
+`tests/scripts/test_task_authoring_blessed_keys_drift.py`. Extracting it to a
+shared helper is only worth doing if *both* callers migrate, and the task-3780
+guard is outside this task's lock set, so it is filed as follow-up rather than
+half-done here.
+
+The frozenset header comment's `related_task*` **wildcard** is narrowed to the
+three literal aliases. It went false the moment the key was blessed, and was
+independently hazardous: the glob sweeps in `related_task_ids`, a different key
+— memory metadata, not task metadata — with a live reader in
+`fused-memory/scripts/audit_duplicate_memories.py`.
+
+**This does NOT empty the census, and should not be read as if it had.**
+Measured before and after against the live store (4748 dict-metadata tasks,
+2026-08-31): **1516 tasks → 1215** carrying at least one unknown key, **3130 →
+2661** warning lines, **1028 → 1027** distinct spellings. The blessing removes
+469 warning *lines* but clears only **301 tasks entirely**, because most
+carriers also hold other unknown keys. `related_tasks` is now absent from the
+census; the new #1 contributor is `merge_first_enqueued_at` at 209. The
+remaining tail is deliberately left warning as a drift signal.
+
+**`delivered_checks` (313 in a raw census) was investigated and is a
+non-finding** — a measurement artifact, not a leak, and no code changed. It is
+a registered submodel (`shared/src/shared/capability_manifest.py`) whose
+registration is an **import-order side effect**, so a standalone script that
+never imported `shared.capability_manifest` counts it as unknown. The live
+write path does reach the registration, so no real write emits the warning.
+Recorded in §8 with the operational corollary: import the submodel
+registrations before running a task-metadata census, or you will measure
+phantom leaks.
+
+**Operator note:**
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` now **refuses**
+`related_tasks` as a Tier-A blessed key (`--force` overrides) — verified by
+hand. That closes the retirement path in code, not merely in prose.
+
+The historical task-4372 entry below, which reads "The largest single
+contributor is `related_tasks` at 445 tasks — which is the *canonical* Tier-B
+spelling, not drift", is left as written: it was true when written and is the
+record of how this task was found. This entry supersedes it.
+
+#### `execution_class` blessed into Tier-A, and the Tier-A listing is now machine-checked (task 3780)
+
+**Two changes, and the second matters more than the first.**
+
+**`execution_class` is now a Tier-A blessed metadata key.** It had eight
+production read sites across seven modules — `execution_class_guard`,
+`operational_routing_guard` (which coerces `operational`/`decision` to
+`task_kind='deterministic'` + `always_escalates`, a real dispatch consequence),
+`routing_intent_guard`, `operational_suggestion_guard`,
+`operational_ask_registry`, the `task_interceptor` gate-marker set and the task
+curator's decision-cache key — while still emitting `code=unknown_key` on every
+read. Measured 2026-08-18: **336 of 4204 dict-metadata tasks carry it**
+(`code_tdd` 196, `operational` 126, `decision` 12, `implementation` 2), so that
+is 336 census lines removed.
+
+Blessed rather than promoted to a typed `Literal`, despite `EXECUTION_CLASSES`
+looking like a closed vocabulary. Its validity rule is conditional on
+recon-stage caller identity, which no pydantic field validator can see; and the
+vocabulary is not closed in the data — tasks 3623/3624 carry `'implementation'`,
+and both are `done` carrying `done_provenance`, so a `Literal` would raise on
+every metadata write to them and they stay unrepairable until task 3777 lands.
+That acceptance is now pinned by a test, so the constraint cannot be silently
+re-tightened into a stranding bug. `docs/task-authoring.md` §8 "Promoting a
+convention" records the generalised rule.
+
+**`docs/task-authoring.md` §8's Tier-A listing is now pinned to the frozenset**
+by `tests/scripts/test_task_authoring_blessed_keys_drift.py`, anchored on a
+`tier-a-blessed-keys-mirror` marker pair. This is the structural half. The
+listing is what a task author reads before deciding whether a key they are about
+to write will manufacture census noise, and nothing kept it in step with the
+code. The failure is measured, not hypothetical: task 4372 blessed two keys the
+day before, then mirrored them into the doc by hand in a *separate* follow-up
+commit whose own message names the hazard — "hand-maintained prose with no sync
+test, so it drifts silently if not mirrored by hand". Under-listing is the
+dangerous direction: an author sees a blessed key absent, concludes it is
+unblessed, and either `x_`-renames a machine-written key — forking the
+vocabulary against every sibling task and blinding its live reader — or files a
+redundant blessing task. The same file's frozenset header comment had meanwhile
+gone stale across two blessings, claiming 39 keys against 42; that count is now
+dropped rather than re-derived, since a hand-maintained denominator needs a hand
+re-count on every future blessing.
+
+**This does NOT empty the census, and should not be read as if it had.**
+Re-measured after the change: **1622 tasks still carry at least one unknown
+key** (down from 1688 — the blessing removes 336 warning *lines* but clears only
+66 tasks entirely, because most carry other unknown keys too), spread across
+**975 distinct spellings**, 725 of which appear on exactly one task. The largest
+single contributor is `related_tasks` at 445 tasks — which is the *canonical*
+Tier-B spelling, not drift. Blessing one key does not move that number much, and
+the remaining tail is deliberately left warning as a drift signal.
+
+Also splits out the corpus `x_` sweep that this task originally carried, as task
+4302: 23 of its 29 target tasks carry `done_provenance` and are unwritable until
+task 3777 lands, and sweeping only the 6 writable ones would fork the vocabulary
+for a fifth of the benefit. §8's Known-gaps table is re-pointed and re-measured
+accordingly; the `execution_class` row there is now closed.
+
 #### `migrate_task_metadata_to_x_namespace.py`: a snapshot per run, and a recovery pointer on every post-write exit (task 4125)
 
 **Behaviour change, operator-visible.** Two changes to the pre-write snapshot
@@ -478,6 +641,36 @@ table in `docs/task-authoring.md` §8, owned by
 `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS`: `execution_class` is read by two live guards
 but is neither blessed nor typed (272 tasks), and the `x_` sweep has not been
 run corpus-wide.
+
+#### Plan-decision cross-pairing: a re-runnable scanner, and where it's documented (task 3967)
+
+A `design_decisions` entry whose `decision` and `rationale` are each well-formed
+prose but wrongly **paired** — a different damage class from the envelope
+leakage above, and invisible to that detector by construction, not by
+oversight (`shared.toolcall_markup.detect` cannot see a mis-pairing) — though
+the two classes do co-occur on individual plans, which is why the scanner
+reports an `envelope_leak` column rather than deferring to a second sweep.
+The full account — the shape, why repair is impossible, why no deterministic
+write-time predicate can contain it, and the containment measurement — lives
+in [`docs/plan-decision-cross-pairing.md`](docs/plan-decision-cross-pairing.md).
+Treat every prevalence figure there as a dated, strict lower bound, not a
+number to trust — the corpus keeps growing — and re-run the scanner instead of
+citing it.
+
+**Added `scripts/scan_plan_decision_pairing.py`**, a read-only, re-runnable CLI
+(`--root`, `--json`, `--fail-on-hit`, `--require-scanned`; no `--apply`, ever).
+The invocation safe for an unattended gate (CI job, timer):
+
+```bash
+python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1
+```
+
+`--require-scanned` must accompany `--fail-on-hit`: alone, `--fail-on-hit` keys
+only on hits, so a `--root` that is mistyped, not yet created, or unlistable
+yields zero hits over zero scanned files and exits 0 — indistinguishable from a
+clean corpus. `--require-scanned N` states the coverage floor instead and exits
+**3** when fewer than `N` plan files were actually read, which outranks
+`--fail-on-hit`'s exit 1.
 
 ### Changed (BREAKING)
 

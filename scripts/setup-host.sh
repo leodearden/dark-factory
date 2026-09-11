@@ -62,6 +62,35 @@ _parity_verdict() {
   fi
 }
 
+# Does FalkorDB answer? ONE probe, two callers — the section-2 wait loop and the
+# section-12 health check ask exactly the same question, and a copy at each site
+# is how the two drift apart.
+#
+# The verdict is read from the captured REPLY, not from a pipeline's exit
+# status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
+# a different question and gets this wrong two ways. `grep -q` exits on its
+# first match and closes the read end, so a producer still writing dies of
+# SIGPIPE and `pipefail` hands the caller that 141; and the same conflation
+# misreads any producer that emits PONG and then exits non-zero for reasons of
+# its own (an exec whose status covers the whole run, not the one line asked
+# about). Either way a live FalkorDB is reported as down. (Measured: with 256KiB
+# of trailing output the pipe form reports no PONG 30/30; this form reports it.)
+#
+# `|| true` is load-bearing: without it the assignment is a simple command and
+# `set -e` kills the bootstrap the moment docker is unavailable, where the old
+# pipeline merely took the else branch. It also must not be `|| out=""` — that
+# throws away a reply the producer did write, preserving the bug. A producer
+# that wrote nothing still yields no match, which is the not-answering verdict
+# both callers already gave.
+#
+# `local` confines the reply to the call, so neither caller can ever read a
+# verdict the other left behind in the shared shell scope.
+falkordb_pings() {
+  local out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  [[ "$out" == *PONG* ]]
+}
+
 # ---------------------------------------------------------------------------
 # 1. Prerequisites
 # ---------------------------------------------------------------------------
@@ -129,7 +158,9 @@ docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
 
 # Wait for healthy
 for i in $(seq 1 30); do
-  if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+  # that pipeline can report a live server as never healthy.
+  if falkordb_pings; then
     ok "FalkorDB healthy"
     break
   fi
@@ -165,21 +196,130 @@ UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
 
 UV_PATH="$(command -v uv)"
-sed \
-  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  -e "s|__UV_PATH__|$UV_PATH|g" \
-  "$REPO_ROOT/scripts/fused-memory.service.template" \
-  > "$UNIT_DIR/fused-memory.service"
 
-systemctl --user daemon-reload
-systemctl --user enable fused-memory
+# THE RENDER. No longer `sed ... > "$UNIT_DIR/fused-memory.service"`, and the
+# difference is not stylistic (task 4796; same fix as section 8, task 4793).
+#
+# scripts/fused-memory.service.template declares
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`, which renders to a
+# SINGLE root. Further project roots are host-LOCAL settings, appended to the
+# INSTALLED unit and deliberately not committed — the template's own comment
+# says so. A truncating redirect destroyed them on every re-run.
+#
+# AND ON THIS UNIT THAT IS WORSE THAN THE DASHBOARD CASE. Here the variable is
+# not a view setting: fused_memory/models/scope.py reads it as
+# KNOWN_PROJECT_ROOTS_ENV, and reconciliation/harness.py raises
+# UnknownProjectError for a project outside the resulting set. Collapsing it
+# de-registers every OTHER project from RECONCILIATION — and invisibly, because
+# the post-install parity gate (section 12) checks only host-invariant safety
+# directives and is structurally incapable of seeing this variable's value.
+#
+# THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
+# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# defect one level up: bash truncates the destination before python ever opens
+# it, so the installed value would be gone before it could be read and the tool
+# would preserve nothing while reporting success. --output is read FIRST as the
+# installed copy, then replaced atomically.
+#
+# AND THERE IS DELIBERATELY NO sed FALLBACK. Rendering "the old way" when the
+# renderer is missing would reinstate the exact clobber it replaced, on the one
+# path where nobody is left watching for it. A missing renderer therefore leaves
+# the unit ALONE and says so, which is the recoverable direction: stale but
+# intact is fixable on the next run; de-registered from reconciliation is not
+# noticed until projects start failing with UnknownProjectError.
+#
+# KEEP IN STEP WITH SECTION 8's `_dash_render_script=` BLOCK. The two are
+# deliberately parallel: same hoisted `_<x>_render_script=` anchor, same
+# `_<x>_rendered=0` flag, same missing-renderer / rendered / refused three-way,
+# same "daemon-reload always, enable on the unit EXISTING, the destructive step
+# on the flag" gate split. They are not factored into one helper because every
+# message differs (this unit governs reconciliation; that one governs a view)
+# and a helper would have to signal WHICH failure occurred back to the call site
+# through an exit code, reproducing the three-way at both ends. The cost of that
+# choice is drift, so: a change to the control flow or the failure modes here
+# belongs in BOTH sites. The one INTENTIONAL divergence is documented at the
+# `restart` gate below — section 8 has no equivalent because the dashboard is
+# started by hand and never restarted by this script.
+_fm_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
 
-# Only start if .env exists (needs secrets)
-if [ -f "$REPO_ROOT/fused-memory/.env" ]; then
-  systemctl --user restart fused-memory
-  ok "fused-memory unit installed and started"
+# Set to 1 only by the branch that actually rendered. `fail` here is a printf,
+# not an exit, so without this flag every degraded path still reached the
+# `restart` below and the green "installed and started" line under it — bouncing
+# the server that backs the orchestrators, the dashboard and this session's own
+# MCP tooling on the strength of an install that did not happen.
+_fm_rendered=0
+
+if [ ! -f "$_fm_render_script" ]; then
+  fail "fused-memory unit renderer missing: $_fm_render_script"
+  fail "  NOT rendering it the old way — a plain template render would strip"
+  fail "  this host's local DASHBOARD_KNOWN_PROJECT_ROOTS entries, which is what"
+  fail "  registers other projects with RECONCILIATION, and the post-install"
+  fail "  parity check cannot see that variable's value."
+  fail "  $UNIT_DIR/fused-memory.service is left AS-IS. The sections below still run."
+elif python3 "$_fm_render_script" \
+       --unit      fused-memory \
+       --template  "$REPO_ROOT/scripts/fused-memory.service.template" \
+       --repo-root "$REPO_ROOT" \
+       --uv-path   "$UV_PATH" \
+       --output    "$UNIT_DIR/fused-memory.service"; then
+  _fm_rendered=1
 else
-  warn "fused-memory unit installed but NOT started (fused-memory/.env missing)"
+  # The renderer RAN and refused. Without this branch the `elif` chain falls
+  # through with status 0 and says nothing about the unit that did not get
+  # written — reports-green-because-it-never-ran, one construct over. Leaving
+  # `_fm_rendered` at 0 is the other half: it keeps the systemctl calls and the
+  # section's closing line from claiming an install that did not happen.
+  fail "fused-memory unit render FAILED — see the [fused_memory_unit_render]"
+  fail "  report above for which step refused and why."
+  fail "  $UNIT_DIR/fused-memory.service was left UNTOUCHED: this host's local"
+  fail "  Environment= values (DASHBOARD_KNOWN_PROJECT_ROOTS) survived, and the"
+  fail "  unit is at worst STALE — which the parity check reports on the next"
+  fail "  run. Re-run this script once the cause is fixed."
+fi
+
+# UNCONDITIONAL, exactly as before this task and exactly as in section 8. It is
+# a no-op when nothing changed, and skipping it on a degraded path would leave
+# systemd reading a stale generation of whatever unit IS on disk.
+systemctl --user daemon-reload
+
+# GUARDED on the unit EXISTING, not on `_fm_rendered` — the same split section 8
+# makes, for the same reasons. (1) A failed render on a host that already HAS the
+# unit must still leave it enabled: stale but supervised is the recoverable
+# direction this whole construct chooses, and `enable` is idempotent and cheap.
+# Before this gate existed the pre-4796 code enabled unconditionally, so gating
+# `enable` on `_fm_rendered` would have been a silent REGRESSION on exactly the
+# render-refused path (renderer missing, or apply_preserved refusing a value that
+# cannot round-trip through one Environment= line). (2) The combination the guard
+# genuinely exists for is a BARE host plus a failed render — there
+# `systemctl --user enable` on a unit that does not exist exits non-zero, and
+# under this file's `set -e` that aborts the entire installer before every later
+# section. Both FAIL branches above promise "the sections below still run"; this
+# is what makes that promise true rather than true-only-when-a-unit-was-there.
+if [ -f "$UNIT_DIR/fused-memory.service" ]; then
+  systemctl --user enable fused-memory
+else
+  fail "fused-memory NOT enabled: no unit file in $UNIT_DIR."
+  fail "  The render above did not happen and this host had no previous copy,"
+  fail "  so there is nothing to enable. The sections below still run."
+fi
+
+# THE RESTART, and ONLY the restart, stays gated on `_fm_rendered`. This is the
+# one deliberate divergence from section 8 (which has no restart at all — the
+# dashboard is started by hand). `enable` is idempotent bookkeeping; `restart`
+# bounces the server backing the orchestrators, the dashboard and this session's
+# own MCP tooling. On a path where nothing was written that outage buys exactly
+# nothing: the on-disk unit is unchanged, so the running process already matches
+# it. The closing `ok` is inside the gate for the same reason it is in section 8
+# — a green "installed and started" would assert precisely what the FAIL lines
+# above it had just denied.
+if [ "$_fm_rendered" = "1" ]; then
+  # Only start if .env exists (needs secrets)
+  if [ -f "$REPO_ROOT/fused-memory/.env" ]; then
+    systemctl --user restart fused-memory
+    ok "fused-memory unit installed and started (host-local Environment= values preserved — see the [fused_memory_unit_render] lines above)"
+  else
+    warn "fused-memory unit installed but NOT started (fused-memory/.env missing)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -655,7 +795,13 @@ fi
 
 # Add jcodemunch MCP to user-level Claude config (idempotent)
 if command -v claude &>/dev/null; then
-  if claude mcp list --scope user 2>/dev/null | grep -q jcodemunch; then
+  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+  # that pipeline can report an installed server as absent.
+  # Here the cost is re-running `claude mcp add` on a server already registered.
+  # The capture stays INSIDE the `command -v claude` guard: hoisting it would
+  # run `claude mcp list` on hosts with no claude installed.
+  _jcodemunch_mcp_out="$(claude mcp list --scope user 2>/dev/null)" || true
+  if [[ "$_jcodemunch_mcp_out" == *jcodemunch* ]]; then
     ok "jcodemunch MCP already in user config"
   else
     claude mcp add --scope user jcodemunch -- uvx --python 3.12 jcodemunch-mcp
@@ -852,20 +998,111 @@ else
   esac
 fi
 
-sed \
-  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  -e "s|__UV_PATH__|$UV_PATH|g" \
-  "$REPO_ROOT/scripts/dashboard.service.template" \
-  > "$UNIT_DIR/dark-factory-dashboard.service"
+# THE RENDER. No longer `sed ... > "$UNIT_DIR/<unit>"`, and the difference is
+# not stylistic (task 4793).
+#
+# scripts/dashboard.service.template declares
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`, which renders to a
+# SINGLE root. Further aggregation roots are host-LOCAL settings, added to the
+# installed unit and deliberately not committed — the committed unit's own
+# comment says so, and nine of them were measured on this host on 2026-08-01. A
+# truncating redirect destroyed eight of those nine on every re-run, and did it
+# INVISIBLY: that variable is on the parity checker's DIVERGENCE_ALLOWLIST
+# (compared by NAME, value blessed), so the post-install check in section 12
+# reported parity afterwards — and the gate above tells the operator to run this
+# script, so following the advice was what caused the loss.
+#
+# THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
+# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# defect one level up: bash truncates the destination before python ever opens
+# it, so the installed value would be gone before it could be read and the tool
+# would preserve nothing while reporting success. --output is read FIRST as the
+# installed copy, then replaced atomically.
+#
+# AND THERE IS DELIBERATELY NO sed FALLBACK. Rendering "the old way" when the
+# renderer is missing would reinstate the exact clobber it replaced, on the one
+# path where nobody is left watching for it — the post-install gate cannot see
+# this variable's value. A missing renderer therefore leaves the unit ALONE and
+# says so, which is the recoverable direction: stale but intact.
+#
+# KEEP IN STEP WITH SECTION 4's `_fm_render_script=` BLOCK (task 4796), which is
+# the same construct for fused-memory.service: same anchor shape, same
+# `_<x>_rendered=0` flag, same three-way, same "daemon-reload always, enable on
+# the unit EXISTING, the rest on the flag" gate split. Deliberately two copies
+# rather than one helper — every message differs and a helper would have to
+# signal WHICH failure occurred back through an exit code — so a change to the
+# control flow or the failure modes here belongs in BOTH sites. Section 4's
+# extra `restart` gate has no counterpart here on purpose: the dashboard is
+# started by hand, never restarted by this script.
+_dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
+
+# Set to 1 only by the branch that actually rendered. The section's closing line
+# and the enable below are worded off it rather than printed unconditionally:
+# `fail` here is a printf, not an exit, so without this every degraded path
+# still reached a green "Dashboard units installed" — a line asserting exactly
+# what the FAIL lines above it had just denied.
+_dash_rendered=0
+
+if [ ! -f "$_dash_render_script" ]; then
+  fail "Dashboard unit renderer missing: $_dash_render_script"
+  fail "  NOT rendering it the old way — a plain template render would strip"
+  fail "  this host's local DASHBOARD_KNOWN_PROJECT_ROOTS entries, and the"
+  fail "  post-install parity check cannot see that variable's value."
+  fail "  $UNIT_DIR/dark-factory-dashboard.service is left AS-IS. The watchdog"
+  fail "  units below still install."
+elif python3 "$_dash_render_script" \
+       --template  "$REPO_ROOT/scripts/dashboard.service.template" \
+       --repo-root "$REPO_ROOT" \
+       --uv-path   "$UV_PATH" \
+       --output    "$UNIT_DIR/dark-factory-dashboard.service"; then
+  _dash_rendered=1
+  ok "Dashboard service unit rendered (host-local Environment= values preserved — see the [dashboard_unit_render] lines above)"
+else
+  # The renderer RAN and refused. Without this branch the `elif` chain simply
+  # falls through with status 0 and says nothing about the unit that did not get
+  # written — the same reports-green-because-it-never-ran failure the parity
+  # gate above exists to remove, one construct over. Leaving `_dash_rendered` at
+  # 0 is the other half: it is what keeps the section's closing line from
+  # claiming the install happened.
+  fail "Dashboard service unit render FAILED — see the [dashboard_unit_render]"
+  fail "  report above for which step refused and why."
+  fail "  $UNIT_DIR/dark-factory-dashboard.service was left UNTOUCHED: this"
+  fail "  host's local Environment= values (DASHBOARD_KNOWN_PROJECT_ROOTS)"
+  fail "  survived, and the unit is at worst STALE — which the pre-install"
+  fail "  parity gate reports on the next run. Re-run this script once the"
+  fail "  cause is fixed. The watchdog units below still install: one"
+  fail "  un-renderable service unit must not take its supervision with it."
+fi
 
 # Watchdog service + timer (no templating needed — no repo-specific paths)
 cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.timer" "$UNIT_DIR/"
 
 systemctl --user daemon-reload
-systemctl --user enable dark-factory-dashboard
+# GUARDED on the unit existing, not on `_dash_rendered`: a failed render on a
+# host that already HAS the unit must still leave it enabled (stale but
+# supervised is the recoverable direction this whole construct chooses). The
+# combination the guard exists for is a BARE host plus a failed render — there
+# `systemctl --user enable` on a unit that does not exist is a non-zero exit,
+# and under this file's `set -e` that aborts the entire installer before the
+# watchdog TIMER is enabled and before every later section. The two branches
+# above promise "the watchdog units below still install"; this is what makes
+# that promise true rather than true-only-when-a-unit-was-already-there.
+if [ -f "$UNIT_DIR/dark-factory-dashboard.service" ]; then
+  systemctl --user enable dark-factory-dashboard
+else
+  fail "dark-factory-dashboard NOT enabled: no unit file in $UNIT_DIR."
+  fail "  The render above did not happen and this host had no previous copy,"
+  fail "  so there is nothing to enable. The watchdog timer below still is."
+fi
 systemctl --user enable dark-factory-dashboard-watchdog.timer
-ok "Dashboard units installed (start manually when ready: systemctl --user start dark-factory-dashboard)"
+if [ "$_dash_rendered" = "1" ]; then
+  ok "Dashboard units installed (start manually when ready: systemctl --user start dark-factory-dashboard)"
+else
+  warn "Dashboard watchdog units installed; the dashboard SERVICE unit was NOT"
+  warn "  rendered — see the FAIL lines above. Whatever copy this host already"
+  warn "  had is untouched and still enabled; a bare host has none."
+fi
 
 # ---------------------------------------------------------------------------
 # 9. Claude Code skill symlinks
@@ -960,7 +1197,10 @@ echo ""
 info "Health checks"
 
 # FalkorDB
-if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+# The same probe the section-2 wait loop runs, so it is the same function and
+# not a second copy of it — see falkordb_pings for why the verdict is read from
+# the reply rather than from `| grep -q`.
+if falkordb_pings; then
   ok "FalkorDB: PONG"
 else
   fail "FalkorDB: not responding"

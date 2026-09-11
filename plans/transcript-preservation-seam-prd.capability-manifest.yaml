@@ -32,7 +32,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: jsonl\.gz
+      pattern: gzip\.open
       paths:
       - fused-memory/scripts/memory_eval_transcript_corpus.py
       - scripts/gc_agent_transcripts.py

@@ -39,7 +39,11 @@ while letting a future caller silently lose the observability.
 Generalized from the reference implementation in
 tests/scripts/test_check_orchestrator_unit_parity.py (task 3424) and migrated
 onto this module by task 3909, so all four parity suites now share one slicer,
-one preamble and one stub.
+one preamble and one stub. The stub directory's own PATH literal is owned here
+too, by `stub_bin_dir`: a caller that drops stubs of its own alongside the
+harness's `systemctl` imports that accessor instead of re-deriving
+``tmp_path / "stub-bin"`` and depending on this module's private choice by
+string equality.
 """
 
 from __future__ import annotations
@@ -72,8 +76,10 @@ SYSTEMCTL_LOG = "systemctl-calls.log"
 
 # setup-host.sh defines `_parity_verdict` once, below the log shims and above
 # every parity call site, so a sliced block that calls it needs it in scope.
-_VERDICT_HELPER_START = "_parity_verdict() {"
-_VERDICT_HELPER_END = "\n}\n"
+# Named, not spelled out as start/end markers: `slice_shell_function` already
+# derives both endpoints of a shell definition from the name, and a second
+# hand-written pair here would be the same slice expressed twice.
+_VERDICT_HELPER = "_parity_verdict"
 
 
 def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
@@ -89,21 +95,43 @@ def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
     "reports green because it never ran" class this whole gate family exists to
     catch, reproduced one level up in its own harness.
 
-    Slicing also fails LOUDLY (slice_section asserts, naming the marker) if the
-    helper is ever renamed, rather than leaving the suite testing a helper the
-    installer no longer has.
+    Slicing also fails LOUDLY (`slice_section`, under `slice_shell_function`,
+    asserts naming the marker) if the helper is ever renamed, rather than
+    leaving the suite testing a helper the installer no longer has.
     """
     return (
         "set -euo pipefail\n"
         f'REPO_ROOT="{repo_root}"\n'
         f'UNIT_DIR="{unit_dir}"\n'
         'mkdir -p "$UNIT_DIR"\n'
-    ) + _SHIMS + slice_section(_VERDICT_HELPER_START, _VERDICT_HELPER_END)
+    ) + _SHIMS + slice_shell_function(_VERDICT_HELPER)
 
 
 def setup_host_text() -> str:
     """The full text of scripts/setup-host.sh."""
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
+
+
+def stub_bin_dir(tmp_path: pathlib.Path) -> pathlib.Path:
+    """The (created) directory `run_section` prepends to PATH for *tmp_path*.
+
+    THE PATH LITERAL LIVES HERE, ONCE. Callers that need to drop their own
+    stubs alongside the harness's `systemctl` previously re-derived
+    ``tmp_path / "stub-bin"`` and depended on this module's private choice by
+    string equality — a rename here would silently drop their stubs off PATH.
+    Going through this accessor makes that coupling an import instead.
+    """
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir(exist_ok=True)
+    return stub_bin
+
+
+def write_stub(stub_bin: pathlib.Path, name: str, body: str) -> pathlib.Path:
+    """Drop an executable bash stub *name* carrying *body* into *stub_bin*."""
+    path = stub_bin / name
+    path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
 def _find_in_code(text: str, marker: str, *, start: int = 0) -> int:
@@ -204,6 +232,26 @@ def slice_section(
     return text[start:end]
 
 
+def slice_shell_function(name: str) -> str:
+    """Return setup-host.sh's ``name() {`` ... column-0 ``}`` definition, verbatim.
+
+    A slice that CALLS a helper defined elsewhere in the file dies with exit
+    127 under the preamble, which knows only the four logging shims. Prepending
+    the REAL definition is what keeps such a section runnable WITHOUT giving up
+    what these tests are for: defining a copy of the helper in `_preamble`
+    instead would make every assertion downstream a claim about the harness's
+    own bash, green no matter what the shipped helper does — the same
+    "verdict manufactured by the mechanism" failure a behavioural test exists
+    to catch.
+
+    Both endpoints are derived, as in `slice_section`: the header line, and the
+    first column-0 ``}`` at or after it. A helper whose body ever grew a
+    column-0 ``}`` of its own would slice short and fail LOUDLY under `bash`,
+    not silently.
+    """
+    return slice_section(f"{name}() {{", "\n}\n")
+
+
 def run_section(
     tmp_path: pathlib.Path,
     section_text: str,
@@ -220,16 +268,12 @@ def run_section(
     ``tmp_path / SYSTEMCTL_LOG`` before exiting 0 — see the module docstring
     for why that is unconditional.
     """
-    stub_bin = tmp_path / "stub-bin"
-    stub_bin.mkdir(exist_ok=True)
-    systemctl = stub_bin / "systemctl"
-    systemctl.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\n"
-        "exit 0\n",
-        encoding="utf-8",
+    stub_bin = stub_bin_dir(tmp_path)
+    write_stub(
+        stub_bin,
+        "systemctl",
+        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\nexit 0\n",
     )
-    systemctl.chmod(0o755)
 
     script = tmp_path / "section.sh"
     script.write_text(

@@ -32,6 +32,7 @@ from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_recorder import record_merge_flake_suppression
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
     AdvanceOutcome,
@@ -92,16 +93,20 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     MergeLivenessAssessment,
     MergeLivenessConfigError,
     PersistentWorktreeConfigError,
+    SerialLaneAssessment,
     _acquire_warm_verify_worktree,
     _alarm_verify_host_unreachable,
     _clear_verify_host_unreachable,
     _safety_valve_due,
     _verify_host_unreachable_sentinel,
     acquire_chain_build_lane,
+    alarm_serial_lane_breach,
     check_merge_liveness_margin,
+    check_serial_lane_tripwire,
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
     newest_content_mtime,
+    per_host_inflight_bound,
     release_chain_build_lane,
 )
 from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
@@ -2457,6 +2462,49 @@ def _merge_boundary_module_configs(
     return effective_merge_module_configs(config, module_configs)
 
 
+def _record_flake_observation(
+    result: VerifyResult,
+    req: MergeRequest,
+    *,
+    merge_sha: str,
+    event_store: EventStore | None,
+    escalation_queue: Any,
+) -> None:
+    """Record whatever flake observation *result* carries (PRD task ε, §5.8).
+
+    Binds this call site's context once — project root, project id, merge SHA,
+    task id and both stores — so the two recording points below cannot drift
+    apart in what they attribute an observation to.
+
+    THE topology rule ε encodes: the DISCRIMINATOR runs where the WORKTREE is
+    (local host or remote runner — only there can the failing tests be re-run);
+    the RECORDER runs HERE, on the dispatcher, because ``_run_post_merge_verify``
+    is the only scope where a local OR remote ``VerifyResult`` sits alongside an
+    ``EventStore``, an escalation queue, ``project_root``, ``merge_sha`` and
+    ``task_id`` at once.
+
+    That co-location is what makes the three side-effects — the durable
+    ``flake_occurrence`` row, the ``merge_flake_suppressed`` fact and the INV-4
+    storm-streak bump — unconditional BY CONSTRUCTION rather than dependent on
+    which host happened to run the verify.  Before ε they fired inline inside the
+    producer, so a REMOTE verify landed none of the three: no ledger call existed
+    at all, the remote host has no event store, and its streak counter died with
+    its process.
+
+    Never raises (the recorder owns that guarantee), so a lost measurement can
+    never fail a verify or stall the merge queue.
+    """
+    record_merge_flake_suppression(
+        result,
+        project_root=req.config.project_root,
+        project_id=req.config.fused_memory.project_id,
+        merge_sha=merge_sha,
+        task_id=req.task_id,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -2817,10 +2865,12 @@ async def _run_post_merge_verify(
                 run_unscoped=_run_unscoped_typechecks,
                 task_id=req.task_id,
                 archive_root=req.config.project_root / 'data' / 'verify-logs',
-                # PRD task α: thread the fact-emission + storm-escalation stores
-                # into the merge-flake suppression gate (LocalRunner.run_merge_verify).
+                # INV-1 (task 2883): thread the dispatching store so run_scoped's
+                # merge gate emits trivial_pass_escalated.  The merge-flake gate's
+                # own side-effects are NOT threaded here — task ε moved them to the
+                # dispatcher (_run_post_merge_verify), driven off the
+                # FlakeSuppression the returned VerifyResult carries.
                 event_store=event_store,
-                escalation_queue=escalation_queue,
             )],
             event_store=event_store,
             task_id=req.task_id,
@@ -2862,6 +2912,25 @@ async def _run_post_merge_verify(
         ):
             await stack.enter_async_context(git_ops.merge_verify_lease())
 
+        # Task ε: attempts whose VERDICT is superseded by a retry below, but whose
+        # OBSERVATION is not.  §5.5 records the observation, not the remedy — and the
+        # compound case is real: `apply_merge_flake_suppression` runs on the SCOPED
+        # leg, so an attempt can suppress a scoped red (a genuine `passes_in_isolation`
+        # observation) and STILL come back failing because the unscoped gate then broke
+        # or the run hit ENOSPC.  That result is retried, `verify` is rebound, and
+        # recording only the settled verdict would silently drop the observation —
+        # exactly the load-correlated shape this PRD exists to measure, and one that
+        # WAS emitted inline (at the moment of observation) before ε moved recording to
+        # the dispatcher.  §8.3's `(test_id, observed_at, call_site)` dedup keeps a
+        # replay idempotent, and each attempt stamps its own `observed_at`, so every
+        # attempt contributes exactly one row per test.
+        superseded_observations: list[VerifyResult] = []
+
+        def _remember_superseded(v: VerifyResult) -> None:
+            """Stash *v* iff it carries an observation, just BEFORE `verify` is rebound."""
+            if getattr(v, 'flake_suppression', None) is not None:
+                superseded_observations.append(v)
+
         verify = await pool.dispatch(
             merge_sha, spec, depth=depth, speculative=speculative,
             chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -2884,6 +2953,7 @@ async def _run_post_merge_verify(
                     'stale merge worktree(s), retrying verify once',
                     req.task_id, len(pruned),
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
                     chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -2993,11 +3063,37 @@ async def _run_post_merge_verify(
                     '(category=%s); retrying verify (attempt=%d, budget=%d, narrowed=%s)',
                     req.task_id, verify.category, retries[req.task_id], budget, narrowed,
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=retries[req.task_id], depth=depth,
                     speculative=speculative, chain_items=chain_items,
                     chain_build_ms=chain_build_ms,
                 )
+
+    # Task ε: record EVERY attempt's flake observation, oldest first.
+    #
+    # Placed after BOTH retry loops (ENOSPC and infra-transient) have finished
+    # rebinding `verify`, so the recording order matches the observation order and
+    # a single pass covers both loops.  A superseded attempt's VERDICT is dead, but
+    # its OBSERVATION is not (§5.5 — record the observation, not the remedy): an
+    # attempt whose SCOPED red was suppressed can still come back failing on the
+    # unscoped gate or on ENOSPC and be retried, and that suppression is a real
+    # masked red that the inline pre-ε emit would have reported at the moment it
+    # happened.  `superseded_observations` is empty on every path where no retry
+    # carried an observation, which is the overwhelmingly common case.
+    for superseded in superseded_observations:
+        _record_flake_observation(
+            superseded, req,
+            merge_sha=merge_sha,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+        )
+    _record_flake_observation(
+        verify, req,
+        merge_sha=merge_sha,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
@@ -3059,7 +3155,6 @@ async def _run_post_merge_verify(
             task_id=req.task_id,
             archive_root=req.config.project_root / 'data' / 'verify-logs',
             event_store=event_store,
-            escalation_queue=escalation_queue,
         )
         try:
             # task 2873: defense-in-depth lane-lock for the REMOTE-path
@@ -3085,6 +3180,18 @@ async def _run_post_merge_verify(
                         git_ops.merge_verify_lease(lane_dir=merge_wt)
                     )
                 local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
+            # Task ε: the cross-check ran its OWN merge gate on the local trust
+            # anchor, so it can carry its own observation.  Its LocalRunner had
+            # both stores wired before ε and therefore emitted + bumped inline;
+            # recording it here is what keeps this detective-control path from
+            # regressing.  Inside the `try`, after the await, so a raised verify
+            # (handled below) records nothing — there is no verdict to record.
+            _record_flake_observation(
+                local_verify, req,
+                merge_sha=merge_sha,
+                event_store=event_store,
+                escalation_queue=escalation_queue,
+            )
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
@@ -8976,7 +9083,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # automatically safe the moment a remote runner is turned on. The BLIND
     # SPOT above (toolchains writing outside merge_wt) applies verbatim to
     # the cross-check leg of the REMOTE arm too.
-    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
+    #
+    # INVARIANT (task 4659 incident, 2026-08-29): this budget MUST EXCEED the
+    # longest PER-COMMAND verify timeout the target can authorise, because a
+    # command that is still within its own sanctioned runtime is by definition
+    # healthy and must never be killed here. pytest writes its junit XML only
+    # at command COMPLETION, so a single verify command legitimately produces
+    # ZERO writes under merge_wt for its entire duration — the no-progress
+    # signal cannot distinguish that from a hang, and must not try to.
+    # dark-factory authorises up to `verify_command_timeout_secs: 3600` on the
+    # global fallback path (the path a zero-.py / cross-cutting diff routes
+    # to), above every per-module budget (max: scripts/ at 2400s). The old
+    # 1800.0 sat BELOW that 3600s ceiling, so this watchdog could fire on a
+    # verify with 30 minutes of authorised runtime still to go.
+    # It did: under host oversubscription (load 76-137 on 32 cores) three
+    # consecutive head-of-line verifies — tasks 4659, 4810, 4055 — were each
+    # killed at 1800s and re-queued, main took ZERO landings for 3+ hours, and
+    # the queue grew 1 -> 19 while the scheduler kept dispatching the task
+    # pytest runs that caused the contention. A livelock, not a hang.
+    # 5400s clears the 3600s ceiling with 1800s of headroom. Raise this again
+    # if any per-command budget is ever raised past 5400s; the ordering is the
+    # contract, not the number.
+    # Cost of the raise, accepted deliberately: a genuinely hung verify now
+    # holds the (single) verifier host 90min x MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+    # = 4.5h before resolving `blocked`, up from 1.5h. That is strictly better
+    # than the livelock above, which had no terminating condition at all.
+    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 5400.0
     # Throttle for the newest_content_mtime() worktree-subtree walk that
     # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
     # the walk cost is bounded independently of the 10s abort-poll cadence.
@@ -16073,6 +16205,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ItemLifecycleState.VERIFYING, live_obj=entry,
         )
         self._inflight.append(entry)
+
+        # ── PRD C4 / task 2930 η: serial-lane tripwire (DETECTION ONLY) ──
+        # Runs AFTER the append (never before) so no existing transition or
+        # append semantics shift and the just-appended entry IS counted.
+        #
+        # `_frozen_inflight_entries()`, not a raw `self._inflight` scan:
+        # `_finalize_inflight` pops the head via `_inflight_popleft` BEFORE
+        # awaiting the long verify, so an entry can still be verifying while
+        # absent from `_inflight`.  Counting `_inflight` alone would MISS
+        # exactly the overlap C4 exists to catch.  Reusing the helper also
+        # avoids restating the frozen-window definition (INV-5).
+        #
+        # `self._host_allocator.host_names` is a PROPERTY ACCESS, NOT A CALL.
+        # `HostAllocator.host_names` is decorated `@property`; writing
+        # `host_names()` raises `TypeError: 'list' object is not callable`,
+        # which the fail-open arm below would SWALLOW SILENTLY — the tripwire
+        # would be permanently dead in production while unit tests that leave
+        # `_host_allocator = None` still passed.  This expression is lifted
+        # VERBATIM from this file's own `snapshot()` occupancy block, `is not
+        # None` guard included.  test_merge_serial_lane_tripwire.py's
+        # `test_real_host_allocator_does_not_break_the_hook` is the regression
+        # guard that keeps it honest.
+        #
+        # `except Exception` fail-open: merge_queue.py is the #1-reliability
+        # file and a tripwire bug must never wedge dispatch.  Two corollaries
+        # worth stating out loud: (i) enforcement can NEVER be added here by
+        # making the alarm raise — this arm would swallow it silently; and
+        # (ii) any future edit inside the `try` must be covered by a test that
+        # exercises it with a real allocator, or it can rot invisibly.
+        #
+        # No hard block: the append already happened above; this block has no
+        # `return`, no `raise`, and no veto.
+        try:
+            _local = sum(
+                1 for _e in self._frozen_inflight_entries()
+                if getattr(_e.lease, 'is_local', False)
+            )
+            _hosts = (
+                len(self._host_allocator.host_names)
+                if self._host_allocator is not None else 1
+            )
+            alarm_serial_lane_breach(
+                check_serial_lane_tripwire(
+                    _local,
+                    merge_ahead_bound=self._speculation_depth,
+                    num_hosts=_hosts,
+                ),
+                event_store=self._event_store,
+                task_id=entry.item.request.task_id,
+                branch=entry.item.request.branch.bare_id,
+                request_id=entry.item.request.request_id,
+                host=getattr(entry.lease, 'name', None),
+            )
+        except Exception:
+            logger.warning('serial-lane tripwire check failed', exc_info=True)
 
     def _inflight_popleft(self) -> InflightEntry:
         """Pop and return the head of ``self._inflight`` (verifier-owned single-writer choke point).

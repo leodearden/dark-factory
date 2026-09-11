@@ -303,17 +303,23 @@ def write_failure_reason(reply: Any) -> str | None:
     migration exists to stop colliding with — arrives here as a perfectly
     ordinary return value, and without this predicate is printed as a success.
 
-    DELIBERATELY MIRRORS, RATHER THAN IMPORTS, two existing implementations of
-    the same contract:
+    DELIBERATELY MIRRORS, RATHER THAN IMPORTS, the one canonical
+    implementation of this contract —
+    ``fused_memory.middleware.task_interceptor::interceptor_write_succeeded``,
+    which is not importable here: ``fused_memory`` fails to import from this
+    script's runtime context (measured: ``ModuleNotFoundError:
+    graphiti_core``).
 
-    * ``fused_memory.middleware.task_interceptor.interceptor_write_succeeded``,
-      the canonical one. Not importable here — ``fused_memory`` fails to import
-      from this script's runtime context (measured:
-      ``ModuleNotFoundError: graphiti_core``).
-    * ``scripts/repair_wiped_metadata_files.py:classify_reply``. Not imported
-      because that module imports :class:`FusedMemoryClient` FROM this one
-      (:1066); importing it back would make this base module depend on its
-      subclass's module.
+    THIS IS THE SINGLE IMPLEMENTATION FOR BOTH SCRIPTS.
+    ``scripts/repair_wiped_metadata_files.py::classify_reply`` was a
+    transcribed twin until task 4608 and now DELEGATES here, wrapping the
+    ``str | None`` returned below in its own ``ReplyVerdict``. It runs in that
+    direction and not the reverse because that module imports
+    :class:`FusedMemoryClient` FROM this one — importing ``classify_reply``
+    back would make this base module depend on its subclass's module. Its
+    import of this function is FUNCTION-SCOPED, so this module's module-scope
+    ``httpx`` stays off that script's dry-run path; do not "tidy" it by asking
+    it to hoist the import.
 
     THE CHECK ORDER IS LOAD-BEARING: not-a-dict first (nothing else can call
     ``.get`` on it), then emptiness — a ``{}`` has neither an ``error`` nor a

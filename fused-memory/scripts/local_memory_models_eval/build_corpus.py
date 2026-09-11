@@ -116,10 +116,17 @@ Status                Exit  Meaning and remedy
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
 complete at all — the store was unreachable, the requested corpus is
-unsatisfiable, or stdout could not be written (a downstream reader closed the
-pipe, as in ``--verify | head``; a full disk on ``> report.txt``). It is
-deliberately outside the table above so a caller can tell "the corpus is wrong"
-from "the check never ran".
+unsatisfiable, stdout could not be written (a downstream reader closed the
+pipe, as in ``--verify | head``; a full disk on ``> report.txt``), the manifest
+could not be written to ``--out`` (a full disk or an unwritable directory on
+the artifact path — distinct from the stdout case, which is a reader going away
+rather than the artifact failing to land), or a store defect blocked the check
+under ``--verify`` (a duplicated episode uuid or an unparseable ``created_at``
+on a live row). That last one is 1 and not 5 on purpose: the
+artifact is fine, so no verdict about it was reached at all, and the row named
+in the ``error: ...`` line is what needs fixing. Exit 1 is deliberately outside
+the table above so a caller can tell "the corpus is wrong" from "the check
+never ran".
 
 A stdout failure can strike AFTER the manifest was written, on the trailing
 ``manifest: ...`` line. The exit code cannot express that, so the ``error: ...``
@@ -541,19 +548,22 @@ class SelectionResult:
     cell_counts: dict[tuple[str, str], int]
 
 
-def _group_by_cell(
-    population: list[EpisodeRecord],
-) -> dict[tuple[str, str], list[EpisodeRecord]]:
-    """Group *population* by stratum key, rejecting duplicate uuids.
+def _require_unique_uuids(population: list[EpisodeRecord]) -> None:
+    """Raise unless every record in *population* carries a distinct uuid.
 
-    A duplicate uuid would break the disposition accounting (one id could be
-    both selected and not-selected), so it is a loud error rather than a
-    silently deduplicated row.
+    The single home for the uniqueness rule. A duplicate uuid would break the
+    disposition accounting (one id could be both selected and not-selected),
+    so it is a loud error rather than a silently deduplicated row.
+
+    Its own function, rather than a loop inside :func:`_group_by_cell`, so the
+    rule can be applied WITHOUT the grouping. :func:`verify_manifest` needs
+    exactly this rule and nothing else, twice, and borrowing the grouper for it
+    would derive a ``stratum_key`` for every record — an ISO-8601 parse plus a
+    regex substitution each — purely to throw the grouping away. That is the
+    same redundancy :func:`_permutation_from_cells` was split out to avoid, one
+    call frame further out; see :func:`_reject_duplicate_uuids` for the caller.
     """
-    if not population:
-        raise CorpusBuildError('cannot select from an empty population')
     seen: set[str] = set()
-    cells: dict[tuple[str, str], list[EpisodeRecord]] = {}
     for record in population:
         if record.uuid in seen:
             raise CorpusBuildError(
@@ -561,6 +571,22 @@ def _group_by_cell(
                 f'disposition accounting requires unique ids'
             )
         seen.add(record.uuid)
+
+
+def _group_by_cell(
+    population: list[EpisodeRecord],
+) -> dict[tuple[str, str], list[EpisodeRecord]]:
+    """Group *population* by stratum key, rejecting duplicate uuids.
+
+    The uniqueness rule is :func:`_require_unique_uuids`, called rather than
+    re-spelled here — one home for it, and no second spelling to drift. It runs
+    first because a grouping is the first thing a duplicate would corrupt.
+    """
+    if not population:
+        raise CorpusBuildError('cannot select from an empty population')
+    _require_unique_uuids(population)
+    cells: dict[tuple[str, str], list[EpisodeRecord]] = {}
+    for record in population:
         cells.setdefault(stratum_key(record), []).append(record)
     return cells
 
@@ -1243,6 +1269,52 @@ def _window_population(
     return windowed
 
 
+def _reject_duplicate_uuids(population: list[EpisodeRecord]) -> None:
+    """Raise if *population* holds the same episode uuid twice.
+
+    The second half of the same wrong-culprit pattern as
+    :func:`_window_population`, and placed beside it so a reader tracing
+    attribution finds both together. It is its own function, called from
+    OUTSIDE :func:`verify_manifest`'s manifest-attributable ``try``, because
+    the failures that clause used to cover have two different culprits:
+    :func:`select` is handed two MANIFEST values (``n`` and ``seed``) over a
+    STORE-supplied population. No manifest value can put the same node in
+    FalkorDB twice, so reporting a duplicated node as ``bad_manifest`` sends
+    the reader off to re-derive a corpus that is perfectly correct while the
+    duplicated node that actually needs deleting stays put.
+
+    The rule itself is :func:`_require_unique_uuids`, called rather than
+    re-spelled here: one home for it, and no second spelling to drift. All this
+    function adds is the attribution suffix, worded exactly as
+    :func:`_window_population` words its own, so an operator meets the same
+    sentence from either half of the pattern.
+
+    Deliberately the uniqueness rule ALONE, and not the whole of
+    :func:`_group_by_cell`, whose other two failures each belong elsewhere:
+
+    *An empty population* is, in the verify path, produced by the manifest's
+    OWN recorded window bound. It is the degenerate limit of "the window no
+    longer holds enough episodes to satisfy the recorded ``n``", which
+    :func:`allocate` already reports — correctly — as ``bad_manifest``.
+    Pre-empting it here would make the exit code discontinuous at the point a
+    shrinking window happens to reach zero. Nothing is needed to carve it out:
+    a uuid scan over an empty list is simply a no-op.
+
+    *An unplaceable* ``stratum_key`` is a store condition too, but it is one
+    :meth:`EpisodeReader.fetch_population` already rejects per row on the way
+    in, so it cannot reach here from a live graph. Borrowing the grouper to
+    cover it would buy an unreachable case at the price of a second
+    ``stratum_key`` derivation over the whole frame — see
+    :func:`_require_unique_uuids`.
+    """
+    try:
+        _require_unique_uuids(population)
+    except CorpusBuildError as exc:
+        raise CorpusBuildError(
+            f'{exc} — this is a store condition, not a defect in the manifest'
+        ) from exc
+
+
 def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> VerifyReport:
     """Re-derive *manifest*'s sample from its OWN recorded criteria and compare.
 
@@ -1291,7 +1363,8 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     exits 1, "no verdict was reached". Collapsing the second into
     ``bad_manifest`` would be worse than unhelpful — it names a culprit that is
     innocent, and the reader would re-derive a perfectly good corpus while the
-    real problem stayed in the store. See :func:`_window_population`.
+    real problem stayed in the store. See :func:`_window_population` for a
+    corrupted row, and :func:`_reject_duplicate_uuids` for a duplicated one.
     """
     try:
         criteria, episodes = _read_criteria(manifest)
@@ -1299,6 +1372,18 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
         return VerifyReport(status='bad_manifest', detail=str(exc))
 
     recorded_ids = [entry['uuid'] for entry in episodes]
+    # Guarded at the point `present` is BUILT, because `present` is what a
+    # duplicate corrupts: a dict comprehension silently keeps whichever row came
+    # LAST, and the hash comparison below would then hash a row the sampling
+    # frame may never have contained — a spurious hash_drift, or a real one
+    # masked, decided by nothing but the order FalkorDB returned rows in.
+    # Scoped to the manifest-named ids because those are the only uuids
+    # `present` is ever consulted for; a duplicate elsewhere cannot reach a
+    # verdict through here, and rejecting it would deny the reader an answer
+    # this function can still give. This does NOT subsume the frame check
+    # further down, which covers duplicates the manifest does not name.
+    named = set(recorded_ids)
+    _reject_duplicate_uuids([record for record in population if record.uuid in named])
     present = {record.uuid: record for record in population}
     missing = [uuid for uuid in recorded_ids if uuid not in present]
     if missing:
@@ -1333,8 +1418,20 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     # corrupted store row, and blaming the artifact for it points the reader at
     # the wrong culprit. See _window_population.
     windowed = _window_population(population, cutoff)
+    # Same reason as the comment above, for the same clause: a duplicated node
+    # is a store condition no manifest value can produce. Run over `windowed`
+    # rather than `population` — that is the frame `select` actually operates
+    # on, so this is the minimum that makes the attribution below true, and a
+    # duplicate outside the recorded window still leaves the reader a verdict.
+    # The manifest-named ids were already checked, unwindowed, above; this
+    # covers the rest of the frame, which `select` reads and that check did not.
+    _reject_duplicate_uuids(windowed)
 
     try:
+        # What still reports bad_manifest here is `allocate`'s verdict on the
+        # RECORDED n against the sampling frame — a manifest value the frame
+        # cannot satisfy. The population-integrity failures `_group_by_cell`
+        # owns were pre-run above and cannot arrive here.
         rederived = [
             record.uuid
             for record in select(windowed, criteria['n'], seed=criteria['seed']).selected

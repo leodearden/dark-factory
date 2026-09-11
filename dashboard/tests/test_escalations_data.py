@@ -1286,6 +1286,49 @@ class TestFetchPinsRecovery:
         assert name == 'get_pending_escalations'
         assert args.get('compact') is True
 
+    async def test_per_call_budget_reaches_the_request_timeout_too(self):
+        """The probe's budget is threaded into `mcp_tool_call`, not only
+        into the surrounding `asyncio.wait_for`.
+
+        The two layers are complementary, not redundant — `mcp_tool_call`'s
+        docstring (dashboard/data/memory.py) is explicit: the per-request
+        value is handed to `client.post`, so it bounds connect/read/write
+        **and pool acquisition**.  That last one is why threading it matters.
+        With only the outer `wait_for`, a probe working to a 2.0s budget still
+        leaves the inner call on httpx's 10s default while it waits for a free
+        connection slot, so a saturated pool blows the poll cycle's budget by
+        5x before the outer timeout can even be observed by the transport.
+
+        The sibling this probe is modelled on, `task_runtime._probe_one`
+        (dashboard/data/task_runtime.py:53-58), passes BOTH; this is the seam
+        where the two must read identically.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _ExplodingHandler()  # every call is intercepted below
+        transport = httpx.MockTransport(handler)
+        stub = AsyncMock(return_value=[])
+        async with httpx.AsyncClient(transport=transport) as client:
+            with patch('dashboard.data.escalations.mcp_tool_call', stub):
+                await fetch_pins_recovery(
+                    client, _pins_urls(8100), per_call_timeout=2.0,
+                )
+
+        assert stub.await_count == 1, stub.await_args_list
+        call = stub.await_args
+        assert call is not None, 'mcp_tool_call was never awaited'
+        # Assert on the kwarg SPECIFICALLY.  Pinning the whole call signature
+        # would churn on any unrelated argument change without adding signal.
+        assert call.kwargs.get('timeout') == 2.0, (
+            'the per-call budget must reach mcp_tool_call so it bounds pool '
+            f'acquisition too; got kwargs={call.kwargs!r}'
+        )
+        # ...and the existing request shape is carried through unchanged.
+        assert call.args[2] == 'get_pending_escalations'
+        assert call.args[3] == {'compact': True}
+
     async def test_record_without_the_key_is_omitted_not_defaulted(self):
         """An older escalation server omits `pins_recovery` → omit the id.
 
@@ -1429,7 +1472,11 @@ class TestFetchPinsRecovery:
 
         from dashboard.data.escalations import fetch_pins_recovery
 
-        async def _mcp(_client, base_url, _tool, _args):
+        async def _mcp(_client, base_url, _tool, _args, **_kwargs):
+            # **_kwargs absorbs the per-request `timeout=` the probe threads
+            # through; this test is about exception isolation, not the call
+            # shape (which test_per_call_budget_reaches_the_request_timeout_too
+            # pins).
             if '8102' in base_url:
                 raise RuntimeError('session state went sideways')
             return [_rec('esc-a', pins_recovery=['3543'])]

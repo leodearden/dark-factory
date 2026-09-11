@@ -447,7 +447,7 @@ stability_concerns:
       update_task(status=...) bypass, closed 2026-05-08 by server-side rejection plus four
       defence-in-depth fixes. Reviewers should treat any new code path that mutates task
       status outside of Scheduler.mark_done / set_task_status with extreme suspicion.
-    what_to_check: "Any new caller of update_task that might include status; any path that mutates tasks.json or task records directly; any error swallow around SetTaskStatusRejected"
+    what_to_check: "Any new caller of update_task that might include status; any path that mutates tasks.db or task records directly; any error swallow around SetTaskStatusRejected"
 
   - area: "SQLite durability under reader contention"
     history: >

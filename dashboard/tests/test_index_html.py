@@ -10,10 +10,18 @@ from __future__ import annotations
 
 import html.parser
 import re
+from pathlib import Path
 
 import pytest
+from _cache_buster_helpers import (
+    ReduxBaseState,
+    cache_buster_violation,
+    redux_cache_buster_versions,
+    resolve_redux_base_state,
+    sole_cache_buster_version,
+)
 
-_INDEX_URL = '/static/redux/index.html'
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Matches well-formed SRI hashes: sha256/384/512 followed by a base64 payload.
 _SRI_HASH_RE = re.compile(r'^sha(256|384|512)-[A-Za-z0-9+/=]{20,}$')
@@ -52,22 +60,12 @@ def _find_script_position(
     return None
 
 
-@pytest.fixture(scope='module')
-def index_html_body():
-    """Fetch /static/redux/index.html once for the whole test module."""
-    from starlette.testclient import TestClient
-
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        return c.get(_INDEX_URL).text
-
-
 def test_static_index_html_serves_200(client):
     """GET /static/redux/index.html via the StaticFiles mount returns 200."""
-    resp = client.get(_INDEX_URL)
+    resp = client.get('/static/redux/index.html')
     assert resp.status_code == 200, (
-        f'expected 200 for {_INDEX_URL}, got {resp.status_code}'
+        f'expected 200 for /static/redux/index.html, '
+        f'got {resp.status_code}'
     )
 
 
@@ -876,63 +874,38 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 45,
-    and graph_layout.js / prd_grouping.js / task_status_counts.js /
-    runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
-    must all be among the versioned assets.
+    """All /static/redux/*?v= cache-busters must share ONE version, and the
+    eight assets destructured at module top level must be among them.
 
     This is the sole home of the UNIFORMITY check ("all versions are the
-    same"); every other module asserts only its own `min(versions) >= N`
-    floor, which needs no uniformity precondition to be sound (the OLDEST
+    same").  Every other module asserts only its own absolute floor over the
+    same tags, which needs no uniformity precondition to be sound (the OLDEST
     asset is the one that would still serve stale code).
 
-    The floor tracks the newest bump — currently 45, for task 3489's
-    null-sample fix in the four padded chart primitives (LineChart /
-    StackedAreaChart / BarChart / HistBar). Raising it matters more than a
-    routine bump for the usual reason: an already-open browser holds a cached
-    copy of the BROKEN file, so without a new ?v= the fix never reaches it.
+    THERE IS NO LONGER A FLOOR HERE.  This test used to also assert
+    `v >= 45`, a hardcoded number that had to be hand-raised on every asset
+    task.  It was not being maintained — index.html shipped v=49 while the
+    constant still read 45, four releases stale — and, more damningly, a
+    constant cannot catch the failure that actually bites: a branch whose
+    version is high enough to clear the floor but not newer than what main
+    already released.  That case now has its own assertion in
+    `test_redux_cache_buster_is_newer_than_merge_base` below, which is
+    base-relative and therefore cannot go stale.
 
-    3489 is the sharpest case in this chain, because it can BLANK the page
-    rather than only mis-draw it: charts.jsx's module-top-level
-    `window.DF_SPARK_PATH` destructure now reaches for five NEW names
-    (plottableMax, axisY, axisPaths, barFractions, stackedAreaPaths), so a
-    browser holding a cached spark_path.js at ANY previously released version
-    next to a fresh charts.jsx binds five undefined builders and blanks every
-    tab that renders a chart. A fully cached older pair is the milder failure:
-    it keeps drawing missing samples as measured zeros at the chart floor,
-    zero-height bars and 1px HistBar stubs.
-
-    3489 PLANNED 43, THEN 44, AND LANDED AT 45 — worth recording because the
-    reason generalises. Main kept bumping while 3489 sat in flight (43 wired
-    in memory_evals_fmt.js; 44 followed), and each of those releases already
-    serves the OLD four-export spark_path.js — isPlottable, sparkScale,
-    sparkPaths, stepPaths, with none of 3489's five padded builders. Landing
-    3489 at a number main already released would leave the URL unchanged while
-    its content changed, which is precisely the pairing this guard exists to
-    make impossible. A version number is only a cache key if it is strictly
-    newer than every version already released: when a branch that bumps sits
-    in flight long enough for main to bump too, re-check the number before
-    merging rather than trusting the one the plan named.
+    Anti-revert cover is unchanged: seven sibling modules still pin their own
+    absolute floors over these tags — test_charts_axis_labels.py (44),
+    test_tab_memory_evals.py (43), test_esc_flow_diagram.py (33),
+    test_tab_escalation_analytics.py (30), test_tab_scheduler.py (19),
+    test_tab_escalations.py (10), test_scheduler_page.py (10) — and none of
+    them was touched by the retirement.  Their docstrings say that "whether
+    the newest bump landed is asserted in test_index_html.py"; that
+    cross-reference is true for the first time now that a stale constant has
+    been replaced by a real freshness check.
     """
-    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    versions = redux_cache_buster_versions(index_html_body)
     assert len(versions) == 1, (
         f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
         'bump all of them uniformly to the same value.'
-    )
-    v = int(next(iter(versions)))
-    assert v >= 45, (
-        f'index.html cache-buster version is {v}, expected >= 45 (proves the '
-        "uniform bump for task 3489's null-sample fix in LineChart / "
-        'StackedAreaChart / BarChart / HistBar actually reaches already-open '
-        'browsers. This one can BLANK the page rather than merely mis-draw it: '
-        "charts.jsx's top-level window.DF_SPARK_PATH destructure now reaches "
-        'for five new builder names, so a cached spark_path.js at any '
-        'previously released version (42, 43, 44 — all of which ship the OLD '
-        'four-export module) next to a fresh charts.jsx binds five undefined '
-        'builders and every tab that renders a chart goes blank; a fully '
-        'cached older pair instead keeps drawing missing samples as measured '
-        'zeros at the chart floor. 44 is NOT sufficient here precisely because '
-        'main already released it.).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -979,3 +952,69 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'a tag added without a cache-buster misses already-open browsers. Bump '
         'all /static/redux/* ?v= uniformly.'
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: the cache-buster is strictly newer than what main released
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def redux_base_state() -> ReduxBaseState | None:
+    """What `merge-base(main, HEAD)` says about the redux assets, or `None`.
+
+    Module-scoped so the three git calls run once for the file, matching the
+    `index_html_body` fixture's scope.
+    """
+    return resolve_redux_base_state(REPO_ROOT)
+
+
+def test_redux_cache_buster_is_newer_than_merge_base(
+    index_html_body: str,
+    redux_base_state: ReduxBaseState | None,
+) -> None:
+    """The cache-buster must be newer than the version main already released.
+
+    THE RULE, evaluated against `merge-base(main, HEAD)`:
+
+      * MONOTONIC, always — the version may not move backwards.
+      * FRESH, when a file under /static/redux/ that EXISTED at the merge base
+        now holds different bytes — the version must be strictly greater.
+      * EXEMPT otherwise.  A branch that touches no redux asset owes no bump,
+        which is what keeps this guard from taxing every unrelated task in the
+        repo.  An ADDED asset is exempt too: its URL was never in any cache.
+
+    WHY IT EXISTS.  Task/3490 planned a 43 -> 44 bump, sat in flight while
+    main released 44 itself, and its rebase then dropped the now-redundant
+    bump patch — so it merged carrying main's number while still shipping
+    modified JSX.  Every /static/redux/ URL was unchanged while its content
+    changed, which is precisely the pairing a cache-buster exists to prevent,
+    and the hardcoded floor that used to live next door was green throughout:
+    the branch's version cleared it easily.  A version number is only a cache
+    key if it is strictly newer than every version already released, and that
+    is a property of the BASE, not of any constant a human remembers to raise.
+
+    Measured against the merge base rather than main's tip on purpose.  The
+    two coincide at the moment this actually gates a merge, because the merge
+    lane rebases first; before that, comparing against a moving tip would turn
+    an in-flight branch red the instant an unrelated merge landed, with no
+    change of its own to explain it.  This way a branch's result stays a
+    function of the branch.
+
+    The rule itself lives in `_cache_buster_helpers.cache_buster_violation`,
+    where its truth table is pinned against literals and its git resolver
+    against throwaway repos — including a replay of the 3490 shape — because
+    on a healthy branch this assertion is vacuously satisfied and could
+    otherwise rot unnoticed.  See test_cache_buster_freshness.py.
+    """
+    if redux_base_state is None:
+        pytest.skip(
+            'no main or origin/main ref resolves from '
+            f'{REPO_ROOT}, so there is no merge base to compare the '
+            'cache-buster against (an sdist install or a shallow clone). '
+            'Skipping rather than failing: this tree is unmeasurable, not broken.'
+        )
+
+    head_version = sole_cache_buster_version(index_html_body)
+    violation = cache_buster_violation(head_version, redux_base_state)
+    assert violation is None, violation

@@ -237,10 +237,43 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
             else:
                 check_openai_responses_api()
-                llm_client = OpenAIClient(config=llm_config)
+                # max_tokens= is NOT redundant with GraphitiLLMConfig(max_tokens=...)
+                # above, and must not be "simplified" away — the same mechanism
+                # as the generic arm's, one class up the hierarchy:
+                # BaseOpenAIClient.__init__ (openai_base_client.py:51-67), which
+                # OpenAIClient derives from, declares its own
+                # `max_tokens: int = DEFAULT_MAX_TOKENS` (16384 on the 0.28.2
+                # wheel) and unconditionally re-assigns
+                # `self.max_tokens = max_tokens` immediately after
+                # super().__init__(config, cache) had correctly set it from the
+                # config object (client.py:80). _generate_response then sends
+                # `max_tokens or self.max_tokens` (:176,187), so this
+                # constructor kwarg is the ONLY lever that reaches the wire.
+                #
+                # This is a DELIBERATE behaviour change (task 3864): until it
+                # landed, the default arm asked for upstream's 16384 output
+                # tokens regardless of configuration, and now asks for the
+                # configured value (4096 with the shipped config). It restores
+                # agreement rather than inventing a new policy — the anthropic
+                # arm below (which honours a passed config, measured) and mem0
+                # (fused-memory/src/fused_memory/backends/mem0_client.py::Mem0Backend._build_config_dict)
+                # have always read the same cfg.llm.max_tokens knob. And if the
+                # configured value ever proves too small the failure is LOUD,
+                # never silent ('Output length exceeded max tokens <N>' from
+                # openai_base_client.py:191-192, or a truncated body failing
+                # json.loads), retried by graphiti and then dead-lettered
+                # visibly; whereas before, an operator hitting truncation had no
+                # working lever on this arm at all.
+                llm_client = OpenAIClient(config=llm_config, max_tokens=cfg.llm.max_tokens)
+            # max_tokens is named here deliberately (task 3864): it is now
+            # authoritative on BOTH sub-arms, and the default arm's effective
+            # value changed from upstream's 16384 to the configured one without
+            # any other signal to the operator. Log cfg.llm.max_tokens rather
+            # than llm_client.max_tokens — the two are equal, and the config
+            # value is the one an operator can act on.
             logger.info(
                 f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
-                f'({type(llm_client).__name__})'
+                f'({type(llm_client).__name__}, max_tokens={cfg.llm.max_tokens})'
             )
             return llm_client
     elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
@@ -256,7 +289,14 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                     max_tokens=cfg.llm.max_tokens,
                 )
                 llm_client = AnthropicClient(config=llm_config)
-                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+                # Same addition as the openai arm above, so the observability is
+                # uniform across arms rather than present only where the value
+                # changed. This arm has always honoured the knob (AnthropicClient
+                # .__init__ overrides config.max_tokens only when config is None).
+                logger.info(
+                    f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                    f'(max_tokens={cfg.llm.max_tokens})'
+                )
                 return llm_client
             except ImportError:
                 logger.warning('Anthropic client not available for Graphiti')

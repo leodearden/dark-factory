@@ -20,6 +20,16 @@ Covers:
 - Step-16: end-to-end fidelity — genuinely-absent task's flag survives run() when
   get_task RAISES the not-found TaskmasterError (real backend behavior)
   (TestMemoryConsolidatorRunWiring.test_genuine_absence_flag_survives_run)
+
+Payload builder/section PARITY is NOT covered here — it lives in
+tests/reconciliation/test_stage1_payload_section_parity.py (task 4708), which
+derives the payload-builder set by AST introspection and checks it against the
+declared ``MemoryConsolidator.REQUIRED_SECTIONS`` registry. The per-builder
+classes below are deliberately KEPT: they pin end-to-end RENDERING through real
+fixtures and the real detector monkeypatch, which a structural guard cannot.
+Parity is structural and belongs in the guard; rendering is behavioural and
+belongs here. A NEW inference-bearing section needs a REQUIRED_SECTIONS edit,
+not another class here — see the pointer comments below.
 """
 
 from __future__ import annotations
@@ -43,15 +53,18 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.models.scope import ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
-
-def _scope(project_id: str, project_root: str) -> ProjectScope:
-    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
-    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
+# make_consolidator/make_scope used to be defined here as _make_consolidator/
+# _scope. They moved to a shared non-test module (task 4708) once the
+# payload-section parity guard needed the same factory: importing it from THIS
+# module pulled a ~2700-line test file and its whole import graph in to get one
+# callable, and bound the guard to a private name this file was free to rename.
+# Add a new shared consolidator fixture there, not here.
+from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 
 
 def _rescope(stages, scope: ProjectScope) -> list:
@@ -66,35 +79,6 @@ def _rescope(stages, scope: ProjectScope) -> list:
     return stages
 
 
-def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
-    """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418.
-
-    NOTE: callers must pass a non-empty absolute ``project_root``. Passing
-    ``project_root=''`` (the pre-task-2146 "unset root" sentinel) raises
-    ``InputValidationError`` from ``ProjectScope.__post_init__`` at this call
-    site — a required ``scope`` can no longer carry a falsy root. The former
-    empty-root tests were removed accordingly (task 2146).
-    """
-    config = ReconciliationConfig()
-    memory_mock = AsyncMock()
-    memory_mock.get_episodes = AsyncMock(return_value=[])
-    memory_mock.mem0 = AsyncMock()
-    memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
-    memory_mock.get_status = AsyncMock(return_value={})
-
-    stage = MemoryConsolidator(
-        StageId.memory_consolidator,
-        memory_mock,
-        AsyncMock(),  # taskmaster
-        AsyncMock(),  # journal
-        config,
-        scope=_scope('test_project', project_root),
-    )
-    stage.episode_limit = 5
-    stage.memory_limit = 10
-    return stage
-
-
 # ---------------------------------------------------------------------------
 # project_root in legacy (time-windowed) assemble_payload
 # ---------------------------------------------------------------------------
@@ -106,7 +90,7 @@ class TestStage1PayloadThreadsProjectRootLegacy:
     @pytest.mark.asyncio
     async def test_assemble_payload_includes_project_root(self):
         """Legacy assemble_payload emits 'Use project_root=...' when project_root is set."""
-        stage = _make_consolidator(project_root='/home/leo/src/test_proj')
+        stage = make_consolidator(project_root='/home/leo/src/test_proj')
         watermark = Watermark(project_id='test_project')
 
         result = await stage.assemble_payload(
@@ -135,7 +119,7 @@ class TestStage1PayloadThreadsProjectRootAssembled:
     @pytest.mark.asyncio
     async def test_format_assembled_payload_includes_project_root(self):
         """Assembled-payload branch emits 'Use project_root=...' when project_root is set."""
-        stage = _make_consolidator(project_root='/home/leo/src/test_proj')
+        stage = make_consolidator(project_root='/home/leo/src/test_proj')
 
         # Set assembled_payload to trigger the ContextAssembler branch
         stage.assembled_payload = AssembledPayload(
@@ -167,6 +151,13 @@ class TestStage1PayloadThreadsProjectRootAssembled:
 # coverage above (TestStage1PayloadThreadsProjectRootLegacy /
 # ...Assembled) — no need to duplicate those here (reviewer finding, amendment
 # pass round 1).
+#
+# POINTER (task 4708): this is a per-builder RENDERING pin, kept on purpose. Do
+# NOT clone it for a new section — add the section to
+# MemoryConsolidator.REQUIRED_SECTIONS, which covers every payload builder at
+# once and is enforced by tests/reconciliation/test_stage1_payload_section_parity.py.
+# (The project_root directive itself is deliberately NOT in that registry: it
+# carries no absence-inference in any prompt, so this class remains its coverage.)
 # ---------------------------------------------------------------------------
 
 
@@ -187,7 +178,7 @@ class TestStage1RemediationPayloadIncludesProjectRootDirective:
 
     @pytest.mark.asyncio
     async def test_remediation_payload_includes_directive(self):
-        stage = _make_consolidator(project_root=self._EXPECTED_ROOT)
+        stage = make_consolidator(project_root=self._EXPECTED_ROOT)
         stage.remediation_findings = []
         watermark = Watermark(project_id='test_project')
 
@@ -273,7 +264,7 @@ class TestMemoryConsolidatorDeterministicCycleSummaryWrite:
     async def _run_stage(
         self, ledger_store, run_id: str, *, remediation: bool = False,
     ) -> StageReport:
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.memory.recon_ledger = ledger_store
         if remediation:
             stage.remediation_findings = [{'description': 'fix this'}]
@@ -351,7 +342,7 @@ class TestMemoryConsolidatorDeterministicCycleSummaryWrite:
         Nonce' section or a 'summary_nonce'/'retry_nonce' line — Python owns
         the per-cycle summary write now, so there is nothing for the LLM to
         prepend a dedup-defeating nonce to."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         watermark = Watermark(project_id='test_project')
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -691,7 +682,7 @@ class TestReconEscalationDedup:
 
         await harness._maybe_remediate(
             'test_project', 'parent-run-id', parent_run,
-            TierConfig(), scope=_scope('test_project', '/tmp/x'),
+            TierConfig(), scope=make_scope('test_project', '/tmp/x'),
         )
 
         files = list(queue_dir.glob('esc-*.json'))
@@ -914,7 +905,7 @@ class TestReconEscalationDedup:
 
         # Use real stage instances (to pass isinstance checks in _run_remediation_pass)
         # with their run() methods patched to return quickly.
-        stages = harness._make_stages(_scope('test_project', '/tmp/x'))
+        stages = harness._make_stages(make_scope('test_project', '/tmp/x'))
         stages[0].run = AM(return_value=StageReport(
             stage=StageId.memory_consolidator, started_at=now, completed_at=now,
         ))
@@ -939,7 +930,7 @@ class TestReconEscalationDedup:
                     'description': 'trigger finding', 'actionable': True,
                 }],
                 tier=TierConfig(),
-                scope=_scope('test_project', '/tmp/x'),
+                scope=make_scope('test_project', '/tmp/x'),
                 filtered_task_tree=MagicMock(),  # pre-supply to skip _fetch_filtered_task_tree
             )
 
@@ -987,9 +978,9 @@ class TestMemoryConsolidatorRunWiring:
         RED before step-12: filter_false_absence_flags is not called, so the
         absence flag remains in items_flagged.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # get_task returns a present record — task is real, not absent
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_task.return_value = {'id': '3438', 'title': 'real task 3438'}  # type: ignore[union-attr]
 
         absence_flag = {
@@ -1051,7 +1042,7 @@ class TestMemoryConsolidatorRunWiring:
         RED before step-12: detect_census_inconsistency is not called, so the stat
         is not set.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(max_task_id=1515, total_count=1515)
 
         # Event with task_id exceeding the census max
@@ -1120,10 +1111,10 @@ class TestMemoryConsolidatorRunWiring:
 
         This test remains GREEN after step-12 as long as the early-return is preserved.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.remediation_findings = [{'description': 'fix this'}]  # remediation mode
         # get_task must NOT be called at all for remediation runs
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_task.side_effect = AssertionError(  # type: ignore[union-attr]
             'get_task must NOT be called during a remediation run'
         )
@@ -1182,9 +1173,9 @@ class TestMemoryConsolidatorRunWiring:
         drops every raise as inconclusive, so the flag is removed from items_flagged
         even though the task is genuinely absent.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # Simulate real sqlite backend: RAISES not-found on absence
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_task.side_effect = TaskmasterError(  # type: ignore[union-attr]
             'TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 3438'
         )
@@ -1236,9 +1227,9 @@ class TestMemoryConsolidatorRunWiring:
         RED before step-6: run() does not set this stat at all (task-2312 step-5).
         """
         # project_id='test_project' is already set via the scope passed into
-        # _make_consolidator (task 2146) — project_id is now a read-only
+        # make_consolidator (task 2146) — project_id is now a read-only
         # property, so the old post-construction assignment is deleted.
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         plain_flag = {
             'task_id': '100',
@@ -1284,9 +1275,9 @@ class TestMemoryConsolidatorRunWiring:
         RED before step-6: run() does not set this stat at all (task-2312 step-5).
         """
         # project_id='test_project' is already set via the scope passed into
-        # _make_consolidator (task 2146) — project_id is now a read-only
+        # make_consolidator (task 2146) — project_id is now a read-only
         # property, so the old post-construction assignment is deleted.
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         completion_flag = {
             'task_id': '77',
@@ -1347,7 +1338,7 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
     @pytest.mark.asyncio
     async def test_task_count_verification_stat_set_when_inconsistent(self):
         """When task_count_verification has consistent=False, report.stats is set and WARNING logged."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         verification_record = {
             'available': True,
@@ -1394,7 +1385,7 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
         """run() logs a WARNING when task_count_verification.consistent is False."""
         import logging
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.task_count_verification = {
             'available': True,
             'consistent': False,
@@ -1435,7 +1426,7 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
     @pytest.mark.asyncio
     async def test_task_count_verification_absent_when_none(self):
         """When stage.task_count_verification is None, the key must be absent from report.stats."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # Explicitly leave task_count_verification at the default (None)
 
         base_report = StageReport(
@@ -1482,7 +1473,7 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
     @pytest.mark.asyncio
     async def test_graphiti_queue_health_stat_set_when_unhealthy(self):
         """When graphiti_queue_health.healthy=False, report.stats is set."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         health_record = {
             'dead_count': 2,
@@ -1528,7 +1519,7 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
         """run() logs a WARNING when graphiti_queue_health.healthy=False."""
         import logging
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.graphiti_queue_health = {
             'dead_count': 2, 'pending_count': 0, 'retry_count': 0,
             'oldest_pending_age_seconds': None, 'healthy': False,
@@ -1565,7 +1556,7 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
     @pytest.mark.asyncio
     async def test_graphiti_queue_health_absent_when_none(self):
         """When stage.graphiti_queue_health is None, the key must be absent from report.stats."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # Explicitly leave graphiti_queue_health at the default (None)
 
         base_report = StageReport(
@@ -1644,7 +1635,7 @@ class TestMemoryConsolidatorIndexHealthWiring:
     @pytest.mark.asyncio
     async def test_index_health_stat_set_when_unhealthy(self):
         """An unhealthy record is carried into report.stats verbatim."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         health_record = {
             'healthy': False,
             'missing': [['Entity', 'NODE', 'name', 'RANGE']],
@@ -1667,7 +1658,7 @@ class TestMemoryConsolidatorIndexHealthWiring:
         """run() logs a WARNING naming the project_id, run_id and missing count."""
         import logging
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.index_health = {
             'healthy': False,
             'missing': [['Entity', 'NODE', 'name', 'RANGE']],
@@ -1714,7 +1705,7 @@ class TestMemoryConsolidatorIndexHealthWiring:
         """A HEALTHY record must be observable too — ζ's activation check reads it."""
         import logging
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         health_record = {
             'healthy': True,
             'missing': [],
@@ -1756,7 +1747,7 @@ class TestMemoryConsolidatorIndexHealthWiring:
     @pytest.mark.asyncio
     async def test_index_health_key_absent_when_none(self):
         """None must leave the key ABSENT — never a null a consumer reads as 'fine'."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # Explicitly leave index_health at the default (None)
 
         report = await self._run(stage, 'run-3709-ih-none')
@@ -1786,7 +1777,7 @@ class TestMemoryConsolidatorStatusCorrectionReconciliationWiring:
     @pytest.mark.asyncio
     async def test_status_correction_reconciliation_stat_set_when_present(self):
         """When stage.status_correction_reconciliation is set, report.stats carries it."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         reconciliation_record = {
             'superseded': True, 'diverged': True, 'memory_id': 'x',
@@ -1826,7 +1817,7 @@ class TestMemoryConsolidatorStatusCorrectionReconciliationWiring:
     @pytest.mark.asyncio
     async def test_status_correction_reconciliation_absent_when_none(self):
         """When stage.status_correction_reconciliation is None, the key is absent."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # Explicitly leave status_correction_reconciliation at the default (None)
 
         base_report = StageReport(
@@ -1873,7 +1864,7 @@ class TestStage1PayloadTaskCountCensus:
     _CENSUS_HEADER = '### Task Count Census'
 
     def _make_stage_with_census(self) -> MemoryConsolidator:
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.task_count_verification = {
             'available': True,
             'consistent': False,
@@ -1936,7 +1927,7 @@ class TestStage1PayloadTaskCountCensus:
     @pytest.mark.asyncio
     async def test_census_section_absent_when_verification_is_none(self):
         """Census section must be absent when task_count_verification is None."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # task_count_verification defaults to None — don't set it
         watermark = Watermark(project_id='test_project')
 
@@ -1982,7 +1973,7 @@ class TestStaleCountSnapshotCorrectionWiring:
         RED: filter_stale_count_snapshot_corrections is not yet wired into
         run() and the stat is unset.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         incident_flag = {
             'task_id': None,
@@ -2072,7 +2063,7 @@ class TestConsolidatorFetchDegradedSources:
         """Case A: get_episodes raises → WARNING emitted AND 'episodes' in _fetch_degraded_sources."""
         import logging
 
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.memory.get_episodes = AsyncMock(side_effect=RuntimeError('graphiti down'))
         watermark = Watermark(project_id='test_project')
 
@@ -2109,7 +2100,7 @@ class TestConsolidatorFetchDegradedSources:
         so the RED driver is solely the missing _fetch_degraded_sources tracking
         (AttributeError or missing 'mem0' entry), not a missing warning.
         """
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.memory.mem0.get_all = AsyncMock(side_effect=RuntimeError('mem0 down'))
         watermark = Watermark(project_id='test_project')
 
@@ -2132,7 +2123,7 @@ class TestConsolidatorFetchDegradedSources:
         """Case C: get_status raises → WARNING emitted AND 'status' in _fetch_degraded_sources."""
         import logging
 
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.memory.get_status = AsyncMock(side_effect=RuntimeError('status backend down'))
         watermark = Watermark(project_id='test_project')
 
@@ -2164,7 +2155,7 @@ class TestConsolidatorFetchDegradedSources:
     @pytest.mark.asyncio
     async def test_clean_fetch_leaves_degraded_sources_empty(self):
         """When no fetch fails, _fetch_degraded_sources is empty (genuine empty corpus)."""
-        stage = _make_consolidator()
+        stage = make_consolidator()
         watermark = Watermark(project_id='test_project')
 
         await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
@@ -2188,7 +2179,7 @@ class TestConsolidatorFetchDegradedSources:
         """
         import logging
 
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.assembled_payload = AssembledPayload(events=[], context_items={})
         stage.memory.get_status = AsyncMock(side_effect=RuntimeError('status backend down'))
         watermark = Watermark(project_id='test_project')
@@ -2226,7 +2217,7 @@ class TestConsolidatorFetchDegradedSources:
         reset to a fresh instance [] at the top of _format_assembled_payload so reused instances
         never leak stale state from a prior run.
         """
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.assembled_payload = AssembledPayload(events=[], context_items={})
         watermark = Watermark(project_id='test_project')
 
@@ -2268,7 +2259,7 @@ class TestConsolidatorRunFetchDegradedStat:
     @pytest.mark.asyncio
     async def test_run_surfaces_degraded_episodes_in_stats(self):
         """When episodes fetch fails, report.stats['stage1_fetch_degraded'] == ['episodes']."""
-        stage = _make_consolidator(project_root='/tmp/test_run_degraded')
+        stage = make_consolidator(project_root='/tmp/test_run_degraded')
         stage.memory.get_episodes = AsyncMock(side_effect=RuntimeError('graphiti down'))
 
         # Use real assemble_payload (no BaseStage.run mock) — let MemoryConsolidator.run
@@ -2313,7 +2304,7 @@ class TestConsolidatorRunFetchDegradedStat:
     @pytest.mark.asyncio
     async def test_run_surfaces_empty_degraded_on_clean_fetch(self):
         """When no fetch fails, report.stats['stage1_fetch_degraded'] == []."""
-        stage = _make_consolidator(project_root='/tmp/test_run_clean')
+        stage = make_consolidator(project_root='/tmp/test_run_clean')
 
         watermark = Watermark(project_id='test_project')
         # Clean fetch — no exceptions
@@ -2349,7 +2340,7 @@ class TestConsolidatorRunFetchDegradedStat:
         and report.stats['stage1_fetch_degraded'] is [] rather than ['status'].
         Mirrors test_run_surfaces_degraded_episodes_in_stats but for the assembled-payload path.
         """
-        stage = _make_consolidator(project_root='/tmp/test_run_degraded_assembled')
+        stage = make_consolidator(project_root='/tmp/test_run_degraded_assembled')
         stage.assembled_payload = AssembledPayload(events=[], context_items={})
         stage.memory.get_status = AsyncMock(side_effect=RuntimeError('status backend down'))
 
@@ -2452,7 +2443,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree([live_task, other_task])
         watermark = Watermark(project_id='test_project')
 
@@ -2485,7 +2476,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(
             [{'id': 100, 'title': 'Other', 'status': 'blocked'}]
         )
@@ -2506,7 +2497,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 
     @pytest.mark.asyncio
     async def test_legacy_path_omits_section_when_no_filtered_task_tree(self, monkeypatch):
-        """Section absent when filtered_task_tree is None (the _make_consolidator default)."""
+        """Section absent when filtered_task_tree is None (the make_consolidator default)."""
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
@@ -2522,7 +2513,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         assert stage.filtered_task_tree is None
         watermark = Watermark(project_id='test_project')
 
@@ -2562,7 +2553,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(
             [{'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}]
         )
@@ -2591,6 +2582,14 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 # missing-builder-call shape, different section) and of
 # TestStage1PayloadLiveWorkflowSignalsSection above (same section, different
 # builder).
+#
+# POINTER (task 4708): 2552 and 3839 were the second and third hand-fixes of one
+# drift mechanism; the registry now closes it. This class is kept as a RENDERING
+# pin — do NOT clone it for a new section. Add the section to
+# MemoryConsolidator.REQUIRED_SECTIONS instead: all three payload builders render
+# it through one aggregator, and
+# tests/reconciliation/test_stage1_payload_section_parity.py fails loudly if any
+# builder skips it.
 # ---------------------------------------------------------------------------
 
 
@@ -2599,8 +2598,10 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
     section emitted by ``_build_live_workflow_section`` when the harness has
     set a ``filtered_task_tree`` with a live active task.
 
-    RED until step-2 wires ``_build_live_workflow_section()`` into
-    ``_assemble_remediation_payload`` (memory_consolidator.py:971).
+    Landed by task 3839, which wired the section into
+    ``memory_consolidator.py::MemoryConsolidator._assemble_remediation_payload``;
+    since task 4708 that builder reaches the section through
+    ``_render_required_sections`` rather than calling the renderer directly.
     """
 
     def _make_tree(self, tasks: list[dict]) -> FilteredTaskTree:
@@ -2648,7 +2649,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         stage.remediation_findings = []
         stage.filtered_task_tree = self._make_tree([live_task, other_task])
         watermark = Watermark(project_id='test_project')
@@ -2682,7 +2683,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         stage.remediation_findings = []
         stage.filtered_task_tree = self._make_tree(
             [{'id': 100, 'title': 'Other', 'status': 'blocked'}]
@@ -2700,7 +2701,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
     async def test_remediation_payload_omits_section_when_no_filtered_task_tree(
         self, monkeypatch
     ):
-        """Section absent when filtered_task_tree is None (the _make_consolidator default)."""
+        """Section absent when filtered_task_tree is None (the make_consolidator default)."""
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
@@ -2716,7 +2717,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         stage.remediation_findings = []
         assert stage.filtered_task_tree is None
         watermark = Watermark(project_id='test_project')
@@ -2748,7 +2749,7 @@ class TestDegenerateTaskNodeSweepWiring:
     async def test_run_sweeps_terminal_task_ids_and_surfaces_stats(self):
         """run() awaits the sweep with done+cancelled ids (incl. cancelled 142 & 144)
         and surfaces its scanned/deleted stats under the degenerate_task_nodes_* keys."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(
             done_tasks=[{'id': 148}],
             cancelled_tasks=[{'id': 142}, {'id': 144}],
@@ -2823,7 +2824,7 @@ class TestDegenerateTaskNodeSweepGuards:
     @pytest.mark.asyncio
     async def test_remediation_pass_never_sweeps(self):
         """remediation_findings set -> run() returns before reaching the sweep block."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.remediation_findings = [{'description': 'some finding'}]
         stage.filtered_task_tree = FilteredTaskTree(done_tasks=[{'id': 148}])
 
@@ -2858,7 +2859,7 @@ class TestDegenerateTaskNodeSweepGuards:
     @pytest.mark.asyncio
     async def test_none_filtered_task_tree_never_sweeps(self):
         """filtered_task_tree left at its None default -> sweep not awaited, no stats set."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         assert stage.filtered_task_tree is None
 
         base_report = StageReport(
@@ -2897,7 +2898,7 @@ class TestDegenerateTaskNodeSweepGuards:
         RED: the sweep call has no try/except yet, so the RuntimeError propagates
         out of stage.run() instead of being swallowed.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(done_tasks=[{'id': 148}])
 
         incident_flag = {
@@ -2971,7 +2972,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         stale edge (via the real sweep_stale_status_snapshot_edges orchestration,
         exercised end-to-end through the wired backend calls) and surface both
         stats keys."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         stale_edge = {
             'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
@@ -2982,7 +2983,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         stage.memory.graphiti.get_all_valid_edges = AsyncMock(
             return_value={'entity-a': [stale_edge, healthy_edge]},
         )
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_statuses = AsyncMock(
             return_value={'142': 'done', '999': 'pending'},
         )
@@ -3043,7 +3044,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         same run so the new deterministic step's OWN effect is observable in
         Stage-1 stats, not merely inside the sweep's return value.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         unblocked_edge = {
             'uuid': 'edge-2848',
@@ -3056,7 +3057,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         stage.memory.graphiti.get_all_valid_edges = AsyncMock(
             return_value={'entity-a': [unblocked_edge, still_blocked_edge]},
         )
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_statuses = AsyncMock(
             return_value={'2848': 'pending', '3001': 'blocked'},
         )
@@ -3123,7 +3124,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         RED: the sweep call has no try/except yet, so the RuntimeError propagates
         out of stage.run() instead of being swallowed.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         incident_flag = {
             'task_id': None,
@@ -3203,7 +3204,7 @@ class TestStalePriorityOverrideEdgeSweepWiring:
         the live override map) + one healthy edge (boost for task 999, present
         in the live map). run() must invalidate only the stale edge and
         surface both stats keys."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         stale_edge = {
             'uuid': 'edge-po-stale',
@@ -3261,7 +3262,7 @@ class TestStalePriorityOverrideEdgeSweepWiring:
         RED: the sweep call has no try/except yet (nor is the sweep imported
         into memory_consolidator), so the patch target does not exist.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
 
         # The task 2613 stale-status-snapshot sweep runs immediately before the
         # 2781 sweep and is NOT patched here, so it exercises the real
@@ -3371,9 +3372,9 @@ class TestAlreadyTrackedSystemicPatternWiring:
     @pytest.mark.asyncio
     async def test_already_tracked_finding_dropped_and_benign_survives(self):
         """The e61b38f9/1938 false finding is dropped; benign finding survives."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.known_projects = {'dark_factory': '/df'}
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [self._make_matching_done_task()],
         })
@@ -3437,9 +3438,9 @@ class TestAlreadyTrackedSystemicPatternWiring:
         must degrade to a pass-through rather than erroring or dropping
         anything.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.known_projects = {}  # no cross-project routing map
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [self._make_matching_done_task()],
         })
@@ -3524,9 +3525,9 @@ class TestDedupFlagsCrossProjectWiring:
     @pytest.mark.asyncio
     async def test_run_passes_taskmaster_and_known_projects_to_dedup_flags(self):
         """run() forwards self.taskmaster and self.known_projects."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.known_projects = {'dark_factory': '/df'}
-        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
         stage.taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
         dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
 
@@ -3549,7 +3550,7 @@ class TestDedupFlagsCrossProjectWiring:
         """Degradation guard: a stage with the default known_projects={} still
         completes and keeps the flag, so the wiring cannot regress into a hard
         dependency on cross-project routing."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.known_projects = {}
         assert stage.taskmaster is not None
         stage.taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
@@ -3703,8 +3704,8 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
         point, and leaving it real would exercise the ledger reclaim path
         instead of the carve-out under test.
         """
-        stage = _make_consolidator(project_root=self.PROJECT_ROOT)
-        assert stage.memory is not None  # AsyncMock() from _make_consolidator
+        stage = make_consolidator(project_root=self.PROJECT_ROOT)
+        assert stage.memory is not None  # AsyncMock() from make_consolidator
         assert stage.taskmaster is not None
         stage.memory.recon_ledger = ledger_store
         stage.known_projects = {self.FOREIGN_PROJECT: self.FOREIGN_ROOT}
@@ -3823,7 +3824,7 @@ class TestMemoryConsolidatorCitationVerificationWiring:
 
         from fused_memory.reconciliation.cli_stage_runner import StageResult
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         # Remediation mode: run() early-returns right after super().run(),
         # before the full-path filter chain.
         stage.remediation_findings = [{'description': 'remediation'}]
@@ -3834,7 +3835,7 @@ class TestMemoryConsolidatorCitationVerificationWiring:
                 return {'id': 'good-id', 'content': 'x', 'metadata': {}}
             return None
 
-        assert stage.memory is not None  # AsyncMock() from _make_consolidator
+        assert stage.memory is not None  # AsyncMock() from make_consolidator
         stage.memory.get_memory_by_id = AsyncMock(side_effect=_get)  # type: ignore[union-attr]
 
         finding = {
@@ -3900,7 +3901,7 @@ class TestMemoryConsolidatorCitationVerificationWiring:
 
         from fused_memory.reconciliation.cli_stage_runner import StageResult
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.remediation_findings = [{'description': 'remediation'}]
 
         assert stage.memory is not None
@@ -4028,7 +4029,7 @@ class TestMemoryConsolidatorGateBacklogWiring:
         """(a) blocked gate aged 49h → one pending L1 gate-backlog + stalled=1, escalated=1."""
         from escalation.queue import EscalationQueue
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         queue = EscalationQueue(tmp_path / 'gate_esc')
         stage._escalation_queue = queue
         stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
@@ -4061,7 +4062,7 @@ class TestMemoryConsolidatorGateBacklogWiring:
         """
         from escalation.queue import EscalationQueue
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         queue = EscalationQueue(tmp_path / 'gate_esc')
         stage._escalation_queue = queue
         stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
@@ -4098,7 +4099,7 @@ class TestMemoryConsolidatorGateBacklogWiring:
         """(b) control: gate aged 1h (< 48h) → no gate-backlog L1; both stats 0."""
         from escalation.queue import EscalationQueue
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         queue = EscalationQueue(tmp_path / 'gate_esc')
         stage._escalation_queue = queue
         stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=1)])
@@ -4116,7 +4117,7 @@ class TestMemoryConsolidatorGateBacklogWiring:
         """(c1) filtered_task_tree is None → block no-ops: no escalation, no raise, no stat."""
         from escalation.queue import EscalationQueue
 
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         queue = EscalationQueue(tmp_path / 'gate_esc')
         stage._escalation_queue = queue
         stage.filtered_task_tree = None
@@ -4131,7 +4132,7 @@ class TestMemoryConsolidatorGateBacklogWiring:
     @pytest.mark.asyncio
     async def test_none_queue_noops(self, monkeypatch):
         """(c2) _escalation_queue is None → block no-ops: no raise, no stat."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage._escalation_queue = None
         stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
 
@@ -4194,7 +4195,7 @@ class TestCuratorGateResolutionSweepWiring:
     @pytest.mark.asyncio
     async def test_run_sweeps_gate_ids_and_appends_flag_alongside_llm_flags(self):
         """The sweep's flag joins the LLM's flags and the stats are surfaced."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[
             _open_gate_task('5561'),
             {'id': '4242', 'status': 'pending', 'metadata': {'operational_mode': 'llm'}},
@@ -4271,7 +4272,7 @@ class TestCuratorGateResolutionSweepWiring:
         makes explicit suppression apply — appending below dedup_flags would
         re-emit it unmarked every cycle forever.
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5561')])
 
         dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
@@ -4316,7 +4317,7 @@ class TestCuratorGateResolutionSweepWiring:
     @pytest.mark.asyncio
     async def test_filter_chain_fires_when_llm_flagged_nothing(self):
         """An LLM cycle with zero flags still runs the chain once the sweep appends one."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5563')])
 
         dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
@@ -4363,7 +4364,7 @@ class TestCuratorGateResolutionSweepWiring:
         _format_report, so the failure would exist only in the process log
         (reviewer finding "observability", amendment pass).
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[
             _open_gate_task('5561'), _open_gate_task('5563'),
         ])
@@ -4411,7 +4412,7 @@ class TestCuratorGateResolutionSweepWiring:
         drift on MemoryService would break production with both files green
         (reviewer finding "test-coverage", amendment pass).
         """
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[
             _open_gate_task('5561', title='Gate: adopt the widget policy'),
             {'id': '4242', 'status': 'pending', 'metadata': {'operational_mode': 'llm'}},
@@ -4529,7 +4530,7 @@ class TestCuratorGateResolutionSweepGuards:
     @pytest.mark.asyncio
     async def test_sweep_failure_is_swallowed_and_leaves_flags_untouched(self):
         """(a) a raising sweep must not abort the stage or corrupt items_flagged."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5561')])
 
         llm_flag = {
@@ -4557,7 +4558,7 @@ class TestCuratorGateResolutionSweepGuards:
     @pytest.mark.asyncio
     async def test_remediation_pass_has_both_stat_keys_at_zero(self):
         """(b) the keys are set above the early-return, so they are never absent."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.remediation_findings = [{'description': 'some finding'}]
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5561')])
         sweep_mock = AsyncMock(return_value={
@@ -4581,7 +4582,7 @@ class TestCuratorGateResolutionSweepGuards:
     @pytest.mark.asyncio
     async def test_remediation_pass_never_sweeps(self):
         """(c) a remediation pass re-emits a curated list — it must not sweep."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.remediation_findings = [{'description': 'some finding'}]
         stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5561')])
         sweep_mock = AsyncMock(return_value={
@@ -4595,7 +4596,7 @@ class TestCuratorGateResolutionSweepGuards:
     @pytest.mark.asyncio
     async def test_none_filtered_task_tree_noops_with_stats_at_zero(self):
         """(d) no task tree -> no sweep, no raise, and both keys still present at 0."""
-        stage = _make_consolidator(project_root='/tmp/reify')
+        stage = make_consolidator(project_root='/tmp/reify')
         stage.filtered_task_tree = None
         sweep_mock = AsyncMock(return_value={
             'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0,
@@ -4698,7 +4699,7 @@ class TestStage1PhantomCitationRecurrenceRegression:
             AsyncMock(),  # taskmaster
             AsyncMock(),  # journal
             config,
-            scope=_scope('test_project', '/tmp/test'),
+            scope=make_scope('test_project', '/tmp/test'),
             recon_report_state=state,
         )
         stage.episode_limit = 5
@@ -4783,3 +4784,192 @@ class TestStage1PhantomCitationRecurrenceRegression:
         assert durable[0]['citation_failures'] == [
             {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
         ]
+
+
+# ---------------------------------------------------------------------------
+# filter_style_only_authorship_flags wiring (task 3138)
+# ---------------------------------------------------------------------------
+
+
+class TestStyleOnlyAuthorshipFlagWiring:
+    """MemoryConsolidator.run() must apply filter_style_only_authorship_flags to
+    items_flagged (task 3138), dropping an injection/fabrication flag whose
+    cited entry is provably house-authored, and surfacing
+    report.stats['style_only_authorship_flags_dropped'].
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign —
+    it never checked the stored agent_id.
+
+    RED until step-10 wires filter_style_only_authorship_flags into run() and
+    sets the stat.
+    """
+
+    _HOUSE_MEMORY_ID = '11111111-2222-3333-4444-555555555555'
+    _FOREIGN_MEMORY_ID = '99999999-8888-7777-6666-555555555555'
+
+    def _make_authorship_flag(self, memory_id: str) -> dict:
+        return {
+            'task_id': None,
+            'category': 'memory_quality',
+            'flag_type': 'possible_injection',
+            'description': (
+                f'Entry {memory_id} is written in a terse imperative voice unlike '
+                'the rest of the corpus — possibly injected or fabricated content.'
+            ),
+            'suggested_action': 'Review the entry and delete it if unattributable.',
+            'cited_memories': [
+                {'memory_id': memory_id, 'store': 'mem0', 'metadata_fingerprint': {}},
+            ],
+        }
+
+    @staticmethod
+    def _record(memory_id: str, agent_id: str) -> dict:
+        """A get_memory_by_id record — ``metadata`` is the raw Qdrant payload,
+        which still carries the top-level agent_id mem0 promotes out of
+        metadata on the search/get paths."""
+        return {
+            'id': memory_id,
+            'content': 'Always cite the memory id when flagging a consolidation gap.',
+            'metadata': {'project_id': 'test_project', 'agent_id': agent_id},
+        }
+
+    @pytest.mark.asyncio
+    async def test_house_authored_flag_dropped_and_foreign_survives_annotated(self):
+        """esc-5564-1 end-to-end: the self-flagged finding is dropped, the
+        genuinely-foreign one survives carrying its provenance annotation, and
+        the filter runs BEFORE dedup_flags."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        records = {
+            self._HOUSE_MEMORY_ID: self._record(
+                self._HOUSE_MEMORY_ID, 'recon-stage-memory_consolidator',
+            ),
+            self._FOREIGN_MEMORY_ID: self._record(
+                self._FOREIGN_MEMORY_ID, 'attacker-xyz',
+            ),
+        }
+        stage.memory.get_memory_by_id = AsyncMock(
+            side_effect=lambda _project_id, memory_id: records[memory_id],
+        )
+
+        house_flag = self._make_authorship_flag(self._HOUSE_MEMORY_ID)
+        foreign_flag = self._make_authorship_flag(self._FOREIGN_MEMORY_ID)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[house_flag, foreign_flag],
+            stats={},
+        )
+        # dedup_flags passes everything through unchanged, and records what it
+        # was handed so the ordering assertion below can inspect it.
+        seen_by_dedup: list[list[dict]] = []
+
+        async def _dedup(**kw):
+            seen_by_dedup.append(list(kw['flags']))
+            return kw['flags']
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=_dedup),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3138-step9',
+            )
+
+        # StageReport is a pydantic model and copies the flag dicts at
+        # construction, so the pipeline never touches the locals above — match
+        # survivors by cited memory_id rather than by object identity.
+        survivors_by_memory_id = {
+            f['cited_memories'][0]['memory_id']: f for f in report.items_flagged
+        }
+        assert self._HOUSE_MEMORY_ID not in survivors_by_memory_id, (
+            'A possible_injection flag whose cited entry was authored by '
+            "'recon-stage-memory_consolidator' must be DROPPED — Stage 1 "
+            f'flagging its own output on style alone; got {report.items_flagged!r}. '
+            'RED: filter_style_only_authorship_flags is not yet wired into run().'
+        )
+        assert self._FOREIGN_MEMORY_ID in survivors_by_memory_id, (
+            'The genuinely-foreign-authored flag must SURVIVE; got '
+            f'{report.items_flagged!r}'
+        )
+        survivor = survivors_by_memory_id[self._FOREIGN_MEMORY_ID]
+        assert survivor['authorship_provenance'] == {
+            'checked': [
+                {
+                    'memory_id': self._FOREIGN_MEMORY_ID,
+                    'agent_id': 'attacker-xyz',
+                    'classification': 'foreign',
+                },
+            ],
+            'decision': 'kept_foreign_author',
+        }, (
+            'The surviving flag must carry the agent_id the gate actually checked '
+            f'as a field (INV-2); got {survivor.get("authorship_provenance")!r}'
+        )
+        assert report.stats.get('style_only_authorship_flags_dropped') == 1, (
+            "run() must set report.stats['style_only_authorship_flags_dropped'] = 1 "
+            f'when one house-authored flag is dropped; got stats={report.stats!r}. '
+            'RED: stat not yet surfaced.'
+        )
+
+        # Ordering: the filter must run BEFORE dedup_flags, so a dropped flag is
+        # picked up by the marker-reclaim tail and its Stage-2 marker
+        # acknowledged. If it ran after, dedup_flags would still see the flag.
+        assert seen_by_dedup, 'dedup_flags was never called'
+        dedup_input_memory_ids = {
+            f['cited_memories'][0]['memory_id'] for f in seen_by_dedup[0]
+        }
+        assert self._HOUSE_MEMORY_ID not in dedup_input_memory_ids, (
+            'filter_style_only_authorship_flags must run BEFORE dedup_flags — '
+            'landing it after would drop the flag outside the _pre_filter_flags '
+            'snapshot window and strand its Stage-2 disposition marker; got '
+            f'dedup_flags input={seen_by_dedup[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_when_nothing_is_dropped(self):
+        """The stat is always surfaced, so a 0 is legibly 'ran, dropped nothing'
+        rather than 'never ran'."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.memory.get_memory_by_id = AsyncMock(
+            return_value=self._record(self._FOREIGN_MEMORY_ID, 'attacker-xyz'),
+        )
+        foreign_flag = self._make_authorship_flag(self._FOREIGN_MEMORY_ID)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[foreign_flag],
+            stats={},
+        )
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3138-step9b',
+            )
+
+        assert len(report.items_flagged) == 1, (
+            f'the foreign-authored flag must survive; got {report.items_flagged!r}'
+        )
+        assert report.stats.get('style_only_authorship_flags_dropped') == 0, (
+            f'expected the stat present and 0; got stats={report.stats!r}'
+        )

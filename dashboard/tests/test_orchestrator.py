@@ -540,6 +540,310 @@ class TestDiscoverOrchestrators:
         assert result[0]["project_root"] == str(real_dir)
 
 
+class TestDiscoverOrchestratorsBudget:
+    """discover_orchestrators must be bounded as a WHOLE, not merely per request.
+
+    ``fetch_tasks``' own *timeout* is a per-HTTP-request budget: it bounds
+    connect/read/write and pool acquisition, and nothing else. The incident
+    that motivated these tests hung inside httpcore's connection lock, where
+    no outbound socket is ever opened and that timeout never fires — so this
+    endpoint wedged for 19.8 h with the per-request budget fully in place.
+    Only an enclosing ``asyncio.wait_for`` cancels that wait.
+
+    Every hang stub below is therefore ``await asyncio.Event().wait()`` on an
+    event nothing ever sets. That is deliberate and load-bearing: a stub that
+    slept for a fixed duration would pass against the PRE-FIX code as soon as
+    the sleep was shorter than the budget, proving nothing. An Event that is
+    never set has no duration at all, so the ONLY thing that can end the await
+    is the wait_for cancellation.
+
+    That same property would hang the pytest process forever against unfixed
+    code, so each call under test is additionally wrapped in a TEST-SIDE
+    ``asyncio.wait_for(..., timeout=2.0)``. The inner budget is monkeypatched
+    down to 0.05 s, so the guard is 40x the budget: it can only trip on a real
+    regression, never on scheduling jitter.
+    """
+
+    async def test_a_hanging_fetch_tasks_does_not_hang_discover_orchestrators(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """One root whose fetch never returns degrades to the offline marker."""
+        import asyncio
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data import orchestrator
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        calls: list[str] = []
+
+        async def _hang(client, config, project_root):
+            calls.append(str(project_root))
+            await asyncio.Event().wait()  # nothing ever sets it
+
+        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
+        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', 0.05)
+
+        proj = tmp_path / 'proj_a'
+        (proj / '.taskmaster').mkdir(parents=True)
+        config = DashboardConfig(project_root=tmp_path)
+        mock_procs = [{
+            'pid': 1234, 'prd': str(proj / 'prd.md'), 'config_path': None,
+            'running': True, 'started': 'Mar18',
+        }]
+
+        with patch(
+            'dashboard.data.orchestrator.find_running_orchestrators',
+            return_value=mock_procs,
+        ):
+            result = await asyncio.wait_for(
+                discover_orchestrators(client=dummy_client, config=config),
+                timeout=2.0,
+            )
+
+        assert len(calls) == 1, 'the hang stub must actually have been reached'
+        assert len(result) == 1
+        entry = result[0]
+        # Exactly the shape the module's EXISTING offline path already writes,
+        # so no shaper, wire contract or React change is needed.
+        assert entry['tasks'] == []
+        assert entry['offline'] is True
+        assert entry['summary']['total'] == 0
+        assert 'error' in entry
+        # A starved root must not read as a healthy project with zero tasks:
+        # the real cause has to reach the operator on the wire.
+        assert 'budget' in entry['error']
+
+    async def test_a_root_that_never_got_its_turn_is_marked_offline_not_silently_empty(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """The whole-loop deadline degrades the unreached root, not the loop."""
+        import asyncio
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data import orchestrator
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        calls: list[str] = []
+
+        async def _hang(client, config, project_root):
+            calls.append(str(project_root))
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
+        # The first root consumes the ENTIRE loop budget, so the second never
+        # gets its turn.
+        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', 0.05)
+        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_TOTAL_BUDGET', 0.05)
+
+        proj_a = tmp_path / 'proj_a'
+        (proj_a / '.taskmaster').mkdir(parents=True)
+        proj_b = tmp_path / 'proj_b'
+        (proj_b / '.taskmaster').mkdir(parents=True)
+        config = DashboardConfig(project_root=tmp_path)
+        mock_procs = [
+            {'pid': 1234, 'prd': str(proj_a / 'prd.md'), 'config_path': None,
+             'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': str(proj_b / 'prd.md'), 'config_path': None,
+             'running': True, 'started': 'Mar18'},
+        ]
+
+        with patch(
+            'dashboard.data.orchestrator.find_running_orchestrators',
+            return_value=mock_procs,
+        ):
+            result = await asyncio.wait_for(
+                discover_orchestrators(client=dummy_client, config=config),
+                timeout=2.0,
+            )
+
+        # The loop is not abandoned: BOTH roots still come back.
+        assert len(result) == 2
+        for entry in result:
+            assert entry['offline'] is True, (
+                'a root the budget never let us measure must not render as a '
+                'healthy project with zero tasks — that is the invisible '
+                'failure this whole task exists to close'
+            )
+            assert entry['error']
+        # The second root was skipped outright, not attempted and abandoned.
+        assert len(calls) == 1
+
+    async def test_the_loop_deadline_truncates_a_root_share_not_the_per_root_budget(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """When the loop deadline binds, IT is the bound — and the message says so.
+
+        The two tests above set the per-root and total budgets EQUAL, so
+        ``min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET)`` could be replaced by
+        the per-root constant alone and both would still pass — reintroducing
+        the ``roots x per-root budget`` worst case the whole-loop deadline
+        exists to prevent. Here the per-root budget is 10x the loop budget, so
+        only the ``min`` can keep the walk bounded, and only the ``min`` can
+        report the share the root ACTUALLY got.
+        """
+        import asyncio
+        import re
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data import orchestrator
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        calls: list[str] = []
+
+        async def _hang(client, config, project_root):
+            calls.append(str(project_root))
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
+        # Deliberately FAR above the loop budget: a walk bounded by the
+        # per-root constant alone would spend 1.0 s on the first root.
+        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', 1.0)
+        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_TOTAL_BUDGET', 0.1)
+
+        proj_a = tmp_path / 'proj_a'
+        (proj_a / '.taskmaster').mkdir(parents=True)
+        proj_b = tmp_path / 'proj_b'
+        (proj_b / '.taskmaster').mkdir(parents=True)
+        config = DashboardConfig(project_root=tmp_path)
+        mock_procs = [
+            {'pid': 1234, 'prd': str(proj_a / 'prd.md'), 'config_path': None,
+             'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': str(proj_b / 'prd.md'), 'config_path': None,
+             'running': True, 'started': 'Mar18'},
+        ]
+
+        loop = asyncio.get_running_loop()
+        with patch(
+            'dashboard.data.orchestrator.find_running_orchestrators',
+            return_value=mock_procs,
+        ):
+            started = loop.time()
+            result = await asyncio.wait_for(
+                discover_orchestrators(client=dummy_client, config=config),
+                timeout=2.0,
+            )
+            elapsed = loop.time() - started
+
+        assert len(result) == 2
+        assert len(calls) == 1
+        # The whole walk costs the LOOP budget, not roots x per-root budget.
+        assert elapsed < 0.5, (
+            f'the walk took {elapsed:.3f}s against a 0.1s loop budget with a '
+            '1.0s per-root budget — the per-root bound alone is being applied, '
+            'so N roots cost N x 1.0s and the deadline buys nothing'
+        )
+
+        # The operator message must name the share this root actually got, not
+        # the per-root constant it never received.
+        error = result[0]['error']
+        assert '1.0s share' not in error, (
+            f'the message reports the {orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET}s '
+            f'per-root constant as the share, but the loop budget truncated it: {error!r}'
+        )
+        match = re.search(r'exceeded its ([0-9.]+)s share', error)
+        assert match, f'no share reported in {error!r}'
+        assert float(match.group(1)) <= 0.1 + 1e-9, (
+            f'reported share {match.group(1)}s exceeds the 0.1s loop budget '
+            f'that was the binding constraint: {error!r}'
+        )
+
+    async def test_two_pids_sharing_one_root_pay_the_budget_once(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """Two processes on one root cost ONE budget, not one each.
+
+        The saving comes from the ``groups`` merge (roots are unique dict
+        keys), which is upstream of ``project_cache`` — so within one call the
+        cache can never be hit twice. This pins the OBSERVABLE property rather
+        than either mechanism: a refactor that walked processes instead of
+        roots would make a two-PID host pay 2x the budget on every poll, and
+        that is what must not regress.
+
+        The deterministic ``len(calls) == 1`` assertion is what actually pins
+        that property; the timing assertion below is a secondary backstop.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data import orchestrator
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        calls: list[str] = []
+
+        async def _hang(client, config, project_root):
+            calls.append(str(project_root))
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
+        budget = 0.5
+        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', budget)
+
+        proj = tmp_path / 'proj_shared'
+        (proj / '.taskmaster').mkdir(parents=True)
+        config = DashboardConfig(project_root=tmp_path)
+        # Two PIDs, two DIFFERENT prd paths, one resolved project root.
+        mock_procs = [
+            {'pid': 1234, 'prd': str(proj / 'docs' / 'a.md'), 'config_path': None,
+             'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': str(proj / 'docs' / 'b.md'), 'config_path': None,
+             'running': True, 'started': 'Mar18'},
+        ]
+
+        loop = asyncio.get_running_loop()
+        with patch(
+            'dashboard.data.orchestrator.find_running_orchestrators',
+            return_value=mock_procs,
+        ):
+            # Pre-warm the default executor so its FIRST-USE thread spin-up (a
+            # one-off cost of tens of ms) is not charged to the budget: the
+            # first act of dashboard/src/dashboard/data/orchestrator.py::
+            # discover_orchestrators is
+            # `await asyncio.to_thread(find_running_orchestrators)`, and that
+            # spin-up is not the budget under test. `_resolve_project_root`'s
+            # filesystem walks run inside the timed region too and CANNOT be
+            # pre-warmed away from the test side — they are absorbed by the
+            # widened 1.5x margin instead. Both remedies are needed here;
+            # neither alone suffices.
+            await asyncio.to_thread(lambda: None)
+            started = loop.time()
+            result = await asyncio.wait_for(
+                discover_orchestrators(client=dummy_client, config=config),
+                timeout=2.0,
+            )
+            elapsed = loop.time() - started
+
+        assert len(calls) == 1, (
+            f'the shared root was fetched {len(calls)} times — one PID per '
+            'fetch means an N-orchestrator host pays N x the budget for one '
+            'project on every poll'
+        )
+        assert len(result) == 1
+        assert sorted(result[0]['pids']) == [1234, 5678]
+        assert result[0]['offline'] is True
+        assert result[0]['error']
+        # Secondary backstop to `len(calls) == 1` above. The budget is
+        # deliberately large for a test whose subject is a timeout: it is
+        # scaled so the ABSOLUTE jitter margin exceeds host scheduling noise,
+        # not because the operation needs 0.5 s. One root fetched once costs
+        # ~1x budget; the per-process regression costs 2 PIDs x budget = ~2x;
+        # 1.5x sits midway, giving 0.25 s of slack on both sides instead of
+        # the 50 ms that flaked at ~4% per run. Do NOT shrink it back.
+        assert elapsed < 1.5 * budget, (
+            f'one root took {elapsed:.3f}s against a {1.5 * budget}s '
+            f'threshold (1.5 x the {budget}s per-root budget). The '
+            'len(calls) == 1 assertion above already passed, so the root was '
+            'fetched EXACTLY ONCE and this is not per-process payment: a '
+            'single fetch overran one budget of wall time. Look at the '
+            'per-root wait_for wiring and the min(remaining, '
+            '_ORCHESTRATORS_PER_ROOT_BUDGET) deadline arithmetic in '
+            'discover_orchestrators — or, failing that, at host jitter.'
+        )
+
+
 class TestResolveProjectRoot:
     """Tests for _resolve_project_root — finds project root from PRD path."""
 

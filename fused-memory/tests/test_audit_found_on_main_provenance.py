@@ -512,6 +512,99 @@ class TestClassifyMisattributed:
         assert verdict != 'misattributed'
 
 
+class TestCitationGatePositiveArmStampChoice:
+    """Task 4924: why the CITING sha, not the branch tip, is the right `commit`.
+
+    On the landed-sha ladder's citation-gate positive arm the shared runbook
+    (`skills/_shared/deriving-landed-sha.md`) used to prescribe stamping the
+    branch tip (`git rev-parse task/<TASK_ID>`). These two cases record the
+    measured basis for replacing it with the citing sha: this auditor
+    DISCRIMINATES the two, flagging the tip stamp `misattributed` (which gates
+    `check_found_on_main_spurious_rate.py`) while the citing sha short-circuits
+    the guard by construction.
+    """
+
+    def test_branch_tip_stamp_on_a_sibling_covered_branch_is_misattributed(self):
+        """The tip of a branch that never advanced is main's own old base commit.
+
+        Its subject is some *other* task's landing, so a tip stamp cites 4700
+        rather than the audited task 4924 and earns `misattributed`.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True, commit_message='Merge task/4700 into main',
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'misattributed'
+        assert reasons
+        assert any('4700' in r for r in reasons)
+
+    def test_citing_sha_stamp_is_ok_because_it_cites_the_audited_task_by_construction(self):
+        """The sha the gate actually discovered cites the audited task, so it is safe.
+
+        The `(#N)` hash-paren form is used deliberately rather than bare `(N)`:
+        task 4705 narrowed this script's CITATION_PATTERN so bare `(N)` no
+        longer cites (see TestExtractCitedTaskIdsBareParenRegressions above),
+        while `orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN` still
+        accepts it — the two are documented as allowed to diverge. `(#N)` is
+        the form BOTH accept, so this pins their agreement, not the divergence.
+        Do not "tidy" it to the bare-paren form.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True,
+            commit_message='impl(4701): sweep provenance (#4924)',
+        )
+        assert '4924' in extract_cited_task_ids(audit.commit_message)
+        verdict, _reasons = classify(audit)
+        # The concrete verdict, not the class-file's usual `!= 'misattributed'`:
+        # that weaker convention exists for the pre-step-12 interim verdicts (see
+        # the TestClassifyMisattributed banner) and does not apply here. The claim
+        # being made is "the citing-sha stamp audits CLEAN", so a regression that
+        # started returning `unverifiable` — or `deliverable_absent`, which
+        # `check_found_on_main_spurious_rate.py::_SPURIOUS_VERDICTS` gates on
+        # exactly like `misattributed` — must fail here rather than pass.
+        assert verdict == 'ok'
+
+    def test_sibling_covered_citing_sha_still_audits_deliverable_absent(self):
+        """The residual exposure the fix does NOT close, pinned so it stays visible.
+
+        On a SIBLING-covered landing the citing commit is the sibling's, and its
+        diff need not touch this task's declared files. Misattribution is gone
+        (the subject cites 4924 by construction), but `deliverable_absent` is
+        reachable — and `check_found_on_main_spurious_rate.py::_SPURIOUS_VERDICTS`
+        counts it as spurious just like `misattributed`, so the fix trades one
+        spurious verdict for a narrower one rather than eliminating both.
+
+        This is why `skills/_shared/deriving-landed-sha.md`'s citation gate tells
+        the agent to prefer, among subject-citing rows, one whose diff touches the
+        task's declared files, and to say so in the `note` when none does.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True,
+            commit_message='impl(4701): sweep provenance (#4924)',
+            declared_files=['skills/_shared/deriving-landed-sha.md'],
+            commit_files=['skills/merge-queue/SKILL.md'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'deliverable_absent'
+        assert any('deriving-landed-sha.md' in r for r in reasons)
+
+    def test_citing_sha_whose_diff_touches_a_declared_file_audits_ok(self):
+        """The row the runbook tells the agent to PREFER audits clean.
+
+        Same sibling-covered shape as above, except the selected citing row's
+        diff does touch a declared file — which is the whole content of the
+        gate's "prefer a row whose diff touches the declared files" advice.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True,
+            commit_message='impl(4701): sweep provenance (#4924)',
+            declared_files=['skills/_shared/deriving-landed-sha.md'],
+            commit_files=['skills/_shared/deriving-landed-sha.md', 'skills/unblock/SKILL.md'],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'ok'
+
+
 # ===========================================================================
 # Step-9/10: classify — reverted (post-hoc-revert blind spot)
 # ===========================================================================

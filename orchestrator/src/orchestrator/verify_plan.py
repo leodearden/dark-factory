@@ -23,6 +23,7 @@ from orchestrator.verify_cmd import (
     VerifyCmd,
     describe_dropped_clauses,
     has_unpreserved_chain_clauses,
+    keyword_truncation_end,
     parse_config_command,
     promote_cwd_to_project,
     render,
@@ -427,7 +428,12 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    retained = head[: idx + len(keyword)]
+    # Task 3931 / esc-3805-1: token-aware, in LOCKSTEP with
+    # verify._scope_to_keyword's identical line — the shared
+    # `keyword_truncation_end` helper is what makes that lockstep structural
+    # rather than a convention. The old byte-offset slice cut mid-token at the
+    # `@` of a pinned npx package spec, destroying the pin before the re-parse.
+    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     prefix_parsed = parse_config_command(retained)
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
         return unscoped
@@ -468,6 +474,15 @@ def deselecting_expression_for_command(
     of "which commands are refused" and "where the ini file is looked for" is
     load-bearing: were the two arms to answer differently, the arm with the
     weaker guards would over-fire on a config its command never applies.
+
+    That sharing is also how both arms acquired CLASS-level marker detection
+    (task 4561) without either one being edited: the probe's module-wide tier
+    is ``orchestrator/pytest_markers.py::guaranteed_marker_names``, which now
+    proves a class-level ``pytestmark`` or class decorator too — but only where
+    its all-items-accounted-for guard can show every collected item lives
+    inside a marked class. Widening that ONE tier gave both arms the capability
+    in one place; adding a second call site to "wire up" the other arm would
+    have created exactly the divergence this shared probe exists to prevent.
 
     *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
     while the command's own targets may be cwd-relative — only the CONFIG path

@@ -36,6 +36,7 @@ from orchestrator.verify_cmd import (
     VerifyCmd,
     _has_unspliceable_pytest_invocation,
     _is_serial_forced,
+    _segment_invokes_tool,
     _split_at_unbalanced_close,
     _unspliceable_pytest_spans,
     apply_pytest_numprocesses,
@@ -2984,3 +2985,151 @@ class TestSplitAndChainSegmentsLiveConfigDrift:
             "the live chain no longer carries a 'tests/scripts/' clause the "
             'segmenter can run independently (esc-3062-2)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Versioned npx package spec (task 3931 / esc-3805-1)
+# ---------------------------------------------------------------------------
+
+# The pinned spelling this task introduces into dark-factory-orchestrator.yaml's
+# type_check_command. Kept as a LOCAL literal rather than derived from the
+# corpus so these guards state the parse/render contract independently of
+# whichever version the fleet chain happens to pin today.
+_PINNED = 'npx pyright@1.1.408'
+
+
+class TestVersionedNpxPyrightSpec:
+    """``npx pyright@<version>`` must parse, render and classify as pyright.
+
+    Task 3931 / esc-3805-1. Pinning the npx package version in the YAML is
+    load-bearing only if the pin SURVIVES this module's parse/render pipeline.
+    It does not today, and the failure is silent.
+
+    MEASURED on this branch, before the step-4 change:
+
+        parse_config_command('npx pyright@1.1.408')
+            -> tool=ToolKind.NPX, wrappers=(), targets=('pyright@1.1.408',)
+
+    Two consequences, both wrong:
+
+      * the command is no longer recognised as a pyright invocation at all, so
+        every pyright-keyed code path (``_segment_invokes_tool`` and through it
+        ``split_chain_tail``) stops matching it;
+      * ``scope_to`` treats the version token as a TARGET and REPLACES it —
+        ``render(scope_to(parse_config_command(_PINNED), ['a/b.py']))``
+        measured as ``'npx a/b.py'``, i.e. the pyright invocation is deleted
+        outright and the gate silently runs bare ``npx`` against a file.
+
+    ``render`` round-tripping the pinned string is therefore NOT on its own
+    evidence of correctness — it round-trips today only because ToolKind.NPX
+    carries the whole spec through ``targets`` verbatim. The guard is the
+    CONJUNCTION of the round-trip with the tool classification, which is how
+    each test below is written.
+
+    The change these pin is strictly ADDITIVE: the bare ``npx pyright``
+    spelling must keep parsing, rendering and scoping exactly as today (the
+    last test), so the ~65 existing bare-spelling assertions in this repo stay
+    green.
+    """
+
+    def test_versioned_spec_parses_as_pyright_behind_npx(self):
+        cmd = parse_config_command(_PINNED)
+        assert cmd.tool is ToolKind.PYRIGHT, (
+            f'{_PINNED!r} parsed as {cmd.tool!r}, not ToolKind.PYRIGHT (task '
+            '3931) — _parse_single_segment matches the npx package token by '
+            "EXACT equality (rest[1:2] == ['pyright']), so any @version "
+            'suffix falls through to the ToolKind.NPX branch and the command '
+            'stops being recognised as pyright'
+        )
+        assert cmd.wrappers == ('npx',)
+        assert cmd.tool_version == '1.1.408', (
+            f'{_PINNED!r} parsed without carrying its package version (task '
+            '3931) — the version must be recoverable on the VerifyCmd or '
+            'render() cannot reproduce it from _TOOL_HEAD'
+        )
+        assert cmd.targets == ()
+        assert cmd.raw is None
+
+    def test_versioned_spec_round_trips_as_a_pyright_command(self):
+        """Byte-identical render, FROM a pyright-classified VerifyCmd."""
+        for raw in (_PINNED, f'{_PINNED} some/file.py'):
+            cmd = parse_config_command(raw)
+            assert cmd.tool is ToolKind.PYRIGHT, (
+                f'{raw!r} must classify as pyright for this round-trip to mean '
+                'anything — ToolKind.NPX round-trips it vacuously by carrying '
+                'the whole spec in targets (task 3931)'
+            )
+            assert render(cmd) == raw, (
+                f'render(parse_config_command({raw!r})) == {render(cmd)!r} '
+                '(task 3931) — render rebuilds the head from '
+                "_TOOL_HEAD[ToolKind.PYRIGHT] = 'pyright', so the @version is "
+                'unrecoverable unless render consults the parsed version'
+            )
+
+    def test_scope_to_keeps_the_version_and_replaces_only_targets(self):
+        cmd = parse_config_command(_PINNED)
+        scoped = render(scope_to(cmd, ['a/b.py']))
+        assert scoped == f'{_PINNED} a/b.py', (
+            f'scope_to on the pinned spec rendered {scoped!r} (task 3931). '
+            "MEASURED before the fix: 'npx a/b.py' — classified as "
+            'ToolKind.NPX, the version token sits in targets and scope_to '
+            'REPLACES it, deleting the pyright invocation entirely and '
+            'running bare npx against the touched file'
+        )
+
+    def test_pinned_and_unpinned_chains_get_the_same_tail_verdict(self):
+        """The pin must not flip ``split_chain_tail``'s accept/reject decision.
+
+        The fleet TYPE chain is a cwd-sequenced same-tool fan-out, which the
+        gate REJECTS (``_verify_config_corpus``'s
+        ``test_real_config_corpus_keeps_its_exact_disposition``, root-type-check
+        -> preserves=False). Pinning the version must not turn that into an
+        ACCEPT: a rejected chain falls through to the caller's
+        truncate-at-keyword path, an accepted one preserves a tail, and
+        silently swapping between them would change what the gate actually
+        runs.
+        """
+        pinned_chain = ROOT_TYPE_CHECK_COMMAND.replace('npx pyright', _PINNED)
+        assert pinned_chain != ROOT_TYPE_CHECK_COMMAND, (
+            'the pinned-chain fixture rewrote nothing (task 3931) — this '
+            'parity guard would compare a string against itself'
+        )
+
+        assert _segment_invokes_tool(_PINNED, 'pyright') is True, (
+            f'_segment_invokes_tool({_PINNED!r}, "pyright") is False (task '
+            '3931) — the npx-head check compares the package token by exact '
+            'equality, so a pinned clause reads as "does not invoke pyright" '
+            "and split_chain_tail's later-segment scan stops seeing it"
+        )
+        assert _segment_invokes_tool(f'{_PINNED} src/', 'pyright') is True
+
+        unpinned_prefix, unpinned_tail = split_chain_tail(ROOT_TYPE_CHECK_COMMAND, 'pyright')
+        pinned_prefix, pinned_tail = split_chain_tail(pinned_chain, 'pyright')
+        assert bool(pinned_tail) is bool(unpinned_tail) is False
+        assert pinned_prefix == pinned_chain
+        assert unpinned_prefix == ROOT_TYPE_CHECK_COMMAND
+
+    def test_bare_spelling_is_unchanged(self):
+        """Regression floor: the unpinned spelling parses/renders exactly as today.
+
+        Deliberately asserts ONLY properties that already hold before step-4,
+        so it is GREEN today and can only go red if that change stopped being
+        additive.
+        """
+        cmd = parse_config_command('npx pyright')
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert cmd.wrappers == ('npx',)
+        assert render(cmd) == 'npx pyright'
+        assert render(scope_to(cmd, ['a/b.py'])) == 'npx pyright a/b.py'
+        assert _segment_invokes_tool('npx pyright', 'pyright') is True
+
+    def test_bare_spelling_carries_no_version(self):
+        """The new field defaults to None, so VerifyCmd equality/replace() is preserved.
+
+        Separated from the regression floor above precisely because it is NOT
+        a property that holds today: ``tool_version`` does not exist yet, so
+        this is RED for the missing-field reason while the floor stays green.
+        """
+        assert parse_config_command('npx pyright').tool_version is None
+        assert parse_config_command('pyright src/').tool_version is None
+        assert VerifyCmd(tool=ToolKind.PYRIGHT).tool_version is None
