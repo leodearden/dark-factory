@@ -1200,7 +1200,8 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     live codebook) and routes the recurrence sighting to the standing
     record instead. The prior verdict standing is the CORRECT result; what
     was wrong was skipping the cluster in silence. Callers are therefore
-    required to SURFACE a ``None`` -- see ``run_census``'s reject loop and
+    required to SURFACE a ``None`` -- see BOTH of ``run_census``'s
+    adjudication loops (verified and rejected) and
     ``_find_adjudicated_candidate``, which names which verdict is
     standing."""
     for candidate in cb.get("candidates") or []:
@@ -1775,6 +1776,52 @@ def run_census(
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
+            # A verify verdict this run PAID FOR that resolves to no pending
+            # candidate. Post-4144 this is a normal outcome, not an anomaly
+            # (see _find_pending_candidate_id); skipping it is still correct,
+            # announcing it is what was missing. The silence costs MORE here
+            # than on the reject side below: a confusion pattern this run
+            # CONFIRMED enters no codebook entry, and every later census codes
+            # against entries -- so it goes invisible, not merely uncounted.
+            #
+            # THE INVERSION: `promoted` and `rejected` swap roles between the
+            # two loops. A standing PROMOTION contradicts a fresh REJECT; a
+            # standing REJECT contradicts a fresh VERIFY. These two ladders
+            # read as near-duplicates and are not -- this is the one place the
+            # loops must NOT be unified, because a shared ladder would
+            # silently mislabel every drop in whichever loop lost the
+            # argument. Pinned by
+            # test_dropped_verdict_contradiction_marker_inverts_between_the_loops.
+            unresolved_verdicts += 1
+            standing = _find_adjudicated_candidate(updated_codebook, cluster.get("title"))
+            if standing is None:
+                logger.warning(
+                    "census: verified cluster %r resolved to no pending candidate AND "
+                    "no same-title candidate exists at all -- this verdict is DROPPED "
+                    "with no standing record to explain it; the merge and this run's "
+                    "cluster list disagree about the title.",
+                    cluster.get("title"),
+                )
+            elif standing.get("disposition") == "rejected":
+                logger.warning(
+                    "census: verified cluster %r resolved to no pending candidate -- "
+                    "this verdict is DROPPED and CONTRADICTS a standing REJECTION: this "
+                    "run CONFIRMED a pattern a prior verdict called unfounded "
+                    "(id=%s, disposition=%s, first_seen=%s), so it enters NO codebook "
+                    "entry and is invisible to every later census. Nothing reconciles "
+                    "the two; only a hand re-open will change it.",
+                    cluster.get("title"), standing.get("id"),
+                    standing.get("disposition"), standing.get("first_seen"),
+                )
+            else:
+                logger.warning(
+                    "census: verified cluster %r resolved to no pending candidate -- "
+                    "this verdict is DROPPED and AGREES with the standing one, which "
+                    "already promoted the title to a live entry (id=%s, disposition=%s, "
+                    "first_seen=%s). Nothing to do; only the verify call was spent.",
+                    cluster.get("title"), standing.get("id"),
+                    standing.get("disposition"), standing.get("first_seen"),
+                )
             continue
         severity = cluster.get("severity")
         if severity not in _VALID_ENTRY_SEVERITIES:
