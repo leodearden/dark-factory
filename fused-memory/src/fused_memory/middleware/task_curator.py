@@ -629,6 +629,16 @@ class TaskCurator:
         self._consecutive_zero_output_timeouts: int = 0
         # monotonic() time until which the breaker is open (None = closed).
         self._zero_output_breaker_open_until: float | None = None
+        # Class-agnostic degraded streak (task 4448). DISTINCT from the ZOT
+        # counter above in both what it counts and why: that one counts only
+        # zero-output timeouts, to stop paying 180s per hung call; this one
+        # counts degraded DECISIONS of every cause, to make a sustained outage
+        # visible. They must not be merged — the ZOT counter's semantics carry
+        # task 3995C's breaker contract and task 4143's batch-reset fix.
+        self._consecutive_degraded: int = 0
+        # One-shot latch: a streak escalates once, not once per curation after
+        # the threshold. Cleared with the counter on the next LLM success.
+        self._degraded_alarm_fired: bool = False
 
     # ------------------------------------------------------------------
     # Zero-output-timeout circuit breaker (task 1743)
@@ -1394,6 +1404,68 @@ class TaskCurator:
         )
         return decision
 
+    # ------------------------------------------------------------------
+    # Class-agnostic degraded-streak alarm (task 4448)
+    # ------------------------------------------------------------------
+
+    def _reset_degraded_streak(self) -> None:
+        """Clear the streak and re-arm the alarm. Called on LLM success only."""
+        self._consecutive_degraded = 0
+        self._degraded_alarm_fired = False
+
+    async def _degraded_create(
+        self,
+        *,
+        justification: str,
+        pool_sizes: dict[str, int],
+        start: float,
+        candidate: CandidateTask,
+        project_id: str,
+        project_root: str,
+    ) -> CuratorDecision:
+        """Build a degraded ``action='create'`` decision and count it.
+
+        The single exit every degraded path in :meth:`curate` takes, which is
+        what lets the streak be counted without enumerating the reasons a
+        curation can degrade. A path that built its own
+        :class:`CuratorDecision` would be invisible here and, like the silent
+        exception arm that motivated task 4448, would look like nothing was
+        wrong; tests/test_curator_arm_instrumentation_guard.py holds that
+        structurally.
+
+        Degrading is not itself a failure — it is the designed fail-open
+        behaviour — so this neither raises nor changes the decision. It only
+        notices when degrading has stopped being occasional.
+        """
+        decision = CuratorDecision(
+            action='create',
+            justification=justification,
+            pool_sizes=pool_sizes,
+            latency_ms=int((time.monotonic() - start) * 1000),
+        )
+
+        self._consecutive_degraded += 1
+        threshold = self._config.curator.degraded_streak_threshold
+        if self._consecutive_degraded >= threshold and not self._degraded_alarm_fired:
+            self._degraded_alarm_fired = True
+            logger.error(
+                'task_curator: %d consecutive degraded curations for project %s '
+                '(threshold %d) — every candidate in that run was filed without '
+                'dedupe. Last: %s',
+                self._consecutive_degraded, project_id, threshold, justification,
+            )
+            if self._escalator is not None:
+                await self._escalator.report_consecutive_degraded(
+                    project_root=project_root,
+                    project_id=project_id,
+                    streak=self._consecutive_degraded,
+                    threshold=threshold,
+                    last_justification=justification,
+                    candidate_title=candidate.title,
+                )
+
+        return decision
+
     async def curate(
         self,
         candidate: CandidateTask,
@@ -1471,11 +1543,13 @@ class TaskCurator:
                 candidate.title,
                 self._consecutive_zero_output_timeouts,
             )
-            return CuratorDecision(
-                action='create',
+            return await self._degraded_create(
                 justification='zero-output-breaker-open',
                 pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
 
         try:
@@ -1488,11 +1562,13 @@ class TaskCurator:
                 exc,
                 exc_info=True,
             )
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification=f'corpus-failed: {exc}',
                 pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
             self._store_cache(payload_hash, decision)
             return decision
@@ -1509,6 +1585,8 @@ class TaskCurator:
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
             self._reset_zero_output_breaker()
+            # A real decision: the streak is broken and the alarm re-arms.
+            self._reset_degraded_streak()
         except AllAccountsCappedException as exc:
             logger.warning(
                 'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
@@ -1523,11 +1601,13 @@ class TaskCurator:
                     timed_out=False,
                     duration_ms=int(exc.elapsed_secs * 1000),
                 )
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification='all-accounts-capped',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
         except CuratorFailureError as exc:
             if self._escalator is not None:
@@ -1558,11 +1638,13 @@ class TaskCurator:
                 # from when the failure was observed, not from before the
                 # (potentially 180s) hung LLM call started.
                 self._record_zero_output_timeout(time.monotonic())
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification='llm-error-escalated',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
         except Exception as exc:
             # An exception class nobody anticipated. It degrades exactly like
@@ -1589,11 +1671,13 @@ class TaskCurator:
                     subtype=f'unexpected-exception:{type(exc).__name__}',
                     pool_sizes=pool_sizes,
                 )
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification=f'llm-failed: {type(exc).__name__}: {exc}',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
 
         self._store_cache(payload_hash, decision)

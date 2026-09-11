@@ -2158,6 +2158,19 @@ class CuratorConfig(BaseModel):
     # before allowing a half-open probe.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
 
+    # Class-agnostic degraded-streak alarm (task 4448). Counts CONSECUTIVE
+    # degraded curate() decisions of ANY cause — capped accounts, a reported
+    # LLM failure, an unexpected exception class, a corpus failure, an open
+    # breaker — and escalates once when the run reaches this length. Distinct
+    # from zero_output_breaker_threshold above, which counts only ZOT failures
+    # and exists to stop burning 180s per hung call; this one exists to make a
+    # sustained outage visible regardless of what is causing it.
+    # N=5 is chosen against the 2026-08-13 to 08-18 outage, where the curator
+    # degraded to action='create' for five days: 08-15 alone saw 38 consecutive
+    # degradations, so N=5 would have escalated within minutes of that day
+    # rather than on day five.
+    degraded_streak_threshold: int = Field(default=5, ge=1)
+
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
     # candidates are dropped before any LLM call. None disables the guard.
