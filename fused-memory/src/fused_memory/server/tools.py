@@ -1325,6 +1325,10 @@ def create_mcp_server(
                 error=error,
             )
         except Exception as e:
+            # Feed the SAME counter WriteJournal increments internally (INV-5).
+            # This outer handler fires rarely — log_write_op swallows its own
+            # failure first — but when it does the row is just as lost.
+            write_journal.record_journal_drop(operation)
             logger.warning(f'Failed to log read op: {e}')
 
     # ------------------------------------------------------------------
@@ -7267,6 +7271,20 @@ def create_mcp_server(
             and (halt := _halt_payload(project_id)) is not None
         ):
             result['reconciliation_halt'] = halt
+
+        # task 3212 (item 5): surface rows the write journal LOST. Deliberately
+        # not fault-only, unlike `degraded` / `failed_stores`: a zero is a
+        # meaningful assertion that nothing was lost, and an absent key would be
+        # indistinguishable from an unwired journal both to an operator and to
+        # leaf eta (task 3213), whose metric reads a dropped search row as
+        # "never asked" — a wrong answer rather than a missing one.
+        #
+        # Top-level rather than under `queue` for the same reason as
+        # `reconciliation_halt` above: `queue` is the durable-write-queue
+        # subsystem, and the write journal is not it. Conflating the two is the
+        # exact mis-triage task 2920 fixed.
+        if write_journal is not None and isinstance(result, dict) and 'error' not in result:
+            result['journal_drops'] = write_journal.journal_drop_stats()
 
         return result
 
