@@ -171,28 +171,21 @@ filterwarnings = [
     "error::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
-# Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
 # is 300 rather than the former 60: the cap is WALL-CLOCK, so a healthy test
 # starved of CPU on a loaded 32-core host trips it and — under thread mode
 # plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself.
 # 300 is INTERIM and judgement-picked, not measured).
 # Slow tests opt out with @pytest.mark.timeout(N) — but N is NOT free, and
-# that line used to imply it was. A marker OVERRIDES the budget rather than
-# raising a floor under it: pytest_timeout's _get_item_settings consults
-# config._env_timeout (CLI --timeout, then PYTEST_TIMEOUT, then this setting)
-# ONLY when the marker yielded None, so the marker wins unconditionally in
-# BOTH directions. Verify passes --timeout=300 (orchestrator.yaml
-# test_command, and every pytest segment of the fleet chain), so any N below
-# that silently TIGHTENS the run that gates your merge from 300 down to N.
-# That inversion cost tasks 4176, 4384 and 4405, via one marker at 120s.
-# So a new marker must be either:
-#   * N <= 60 — a DELIBERATE tight bound, for a test asserting something
-#     happens FAST (test_verify_clock_stop.py's 15s watchdog marks); or
-#   * @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/
-#     _orch_helpers.py, whose comment block is the single home of this
-#     rationale — a genuine loosening locally and a no-op under verify.
-# Enforced by tests/test_timeout_marker_inversion_guard.py.
+# that line used to imply it was. A marker OVERRIDES the budget in BOTH
+# directions rather than raising a floor under it, so any N below the
+# --timeout=300 verify passes silently TIGHTENS the run that gates your merge.
+# That inversion cost tasks 4176, 4384 and 4405. Write either N <= 60 (a
+# DELIBERATE tight bound, for a test asserting something happens FAST) or
+# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py
+# — whose comment block on that constant is the SINGLE home of this rationale,
+# including why the marker beats this setting. Enforced by
+# tests/test_timeout_marker_inversion_guard.py.
 # timeout_method: signal mode was paired with serial execution; once xdist
 # was enabled here (matching fused-memory/pyproject.toml) the worker
 # subprocesses run pytest in a thread, so signal-based interruption is no

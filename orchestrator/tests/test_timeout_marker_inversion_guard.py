@@ -1,57 +1,37 @@
 """Guard: no ``@pytest.mark.timeout(N)`` may INVERT into a tighter clamp under verify.
 
-THE PRECEDENCE RULE, read verbatim from ``pytest_timeout.py::_get_item_settings``
-in the installed package rather than inferred::
+THE RULE, in one line: a marker at ``PYPROJECT_DEFAULT_TIMEOUT < N <
+VERIFY_CLI_PER_TEST_TIMEOUT`` reads as a LOOSENING against the ini default its
+author is looking at and silently TIGHTENS the verify run that gates their
+merge, because a pytest-timeout marker is a two-way override and never a floor.
 
-    if marker is not None:
-        timeout = _validate_timeout(settings.timeout, "marker")
-    if timeout is None:
-        timeout = item.config._env_timeout
-
-The marker wins UNCONDITIONALLY.  ``config._env_timeout`` -- fed by CLI
-``--timeout``, then ``PYTEST_TIMEOUT``, then the ini ``timeout`` -- is consulted
-ONLY when the marker yielded None.  So ``@pytest.mark.timeout(N)`` is a TWO-WAY
-override and never a floor, which is the whole defect: the pyproject comment
-that sanctions it ("Slow tests opt out with ``@pytest.mark.timeout(N)``") is
-written from the perspective of a bare local ``pytest``, where the ini default
-is 60 and any larger N does loosen.
-
-THREE REGIMES fall out of the two budgets that bracket every test here -- the
-ini default (:data:`_orch_helpers.PYPROJECT_DEFAULT_TIMEOUT`, 60) and the
-budget verify actually passes
-(:data:`_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`, 300):
-
-* ``N <= 60`` -- tightens under BOTH, so unambiguously a DELIBERATE tight
-  bound; its author chose tighter than even a bare local run would give them.
-  test_verify_clock_stop.py's 13 marks at 15s are the worked example: those
-  tests assert a watchdog fires FAST, and raising them would blunt the
-  assertion AND turn each hang test into a 300s stall.  NOT policed here;
-* ``60 < N < 300`` -- INVERTS.  Written to loosen against the default in front
-  of the author, it silently TIGHTENS the run that gates their merge.  The sign
-  of the marker's effect flips with context.  This band, and only this band, is
-  what this module rejects;
-* ``N >= 300`` -- loosens under both.  Safe, which is what keeps the sanctioned
-  ceilings (WHOLE_TREE_SCAN_TEST_TIMEOUT, HEAVY_BARRIER_TEST_TIMEOUT,
-  PYTEST_TIMEOUT) and this module's own ``pytestmark`` out of the guard's way.
-
-The band is OPEN AT BOTH ENDS for those reasons: a mark exactly at the ini
-default expresses no opinion against it, and one exactly at the CLI budget is
-the recommended remediation.
-
-WHY A BREACH IS EXPENSIVE, and why this is worth a guard at all.
-``timeout_method = "thread"`` means pytest-timeout answers a breach by
-``os._exit()``ing the xdist worker rather than failing the offending test, and
-``--max-worker-restart=0`` (task 1907) then declines to replace it -- degrading
-the run to a TRUNCATED whole-suite session whose surviving failure names some
-innocent test that merely shared the dead worker.  ONE marker at 120s in
-test_aiosqlite_leak_isolation.py was blamed for failures in tasks 4176, 4384
-and 4405 that way.  Same mechanism spelled out at
-:data:`_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT`.
+The derivation -- the ``pytest_timeout._get_item_settings`` precedence it
+follows from, the three regimes the two budgets carve out, and why a breach
+costs a whole truncated session rather than one red test -- has ONE home: the
+``VERIFY_CLI_PER_TEST_TIMEOUT`` comment block in _orch_helpers.py.  Read it
+there.  This module points at it rather than restating it, so a pytest-timeout
+upgrade that moves that precedence invalidates one copy and not five.  The sole
+deliberate exception is :func:`test_no_new_inverting_timeout_marker`'s failure
+message, where the reader is looking at a traceback and not at the source.
 
 A RATCHET, NOT A SWEEP.  61 pre-existing in-band sites are grandfathered in
 :data:`_GRANDFATHERED`; see its comment for why they were not migrated here and
 :func:`test_grandfather_allowlist_has_no_stale_entries` for what forces that
 list to shrink.
+
+SCOPE IS ``orchestrator/tests`` ONLY, and the sibling packages are KNOWINGLY
+UNGUARDED -- do not read this module as tree-wide coverage.  The defect is a
+property of the ``(ini timeout, verify --timeout)`` PAIR, not of this package,
+and all eight segments of dark-factory-orchestrator.yaml's fleet chain pass
+``--timeout=300``.  MEASURED by running this module's own extractor over the
+siblings: fused-memory has 15 in-band sites of 41, under the same
+``timeout = 60`` / ``timeout_method = "thread"`` / ``-n auto`` settings that
+make a breach here cost a worker; shared has 1 of 21; escalation, dashboard,
+sampler and tests/scripts have none.  Covering them means lifting the extractor
+and :func:`_inverts` into a shared home -- orchestrator.pytest_markers already
+owns the marker grammar this module imports -- and instantiating the guard per
+package.  Filed as follow-up work rather than silently implied here:
+agent-followup ticket tkt_0RTGWEF0FDSZ9QFZZYDFZVYSF5.
 
 WHAT THIS DOES NOT DUPLICATE.  test_whole_tree_scan_timeout_guard.py polices a
 per-FILE family invariant using MODULE-LEVEL marks only; test_marker_
@@ -66,11 +46,14 @@ Task 5147.
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import textwrap
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
 
+import _orch_helpers
 import pytest
 import yaml
 from _orch_helpers import (
@@ -125,12 +108,18 @@ _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
 #: ``float(WHOLE_TREE_SCAN_TEST_TIMEOUT)``, which does not generalise to three
 #: names at two distinct values.
 #:
-#: These are cross-module MIRRORS, so state the failure mode plainly: a mirror
-#: that goes stale can only ever produce a false OFFENDER, never a false pass.
-#: Every value here sits OUTSIDE the inversion band (300 at its open upper
-#: edge, 960 well clear), so the only way a wrong number changes an answer is
-#: by dragging a name INTO the band -- which fails loudly at commit time and
-#: names the site.  Silence is not among the outcomes.
+#: These are cross-module MIRRORS, and a stale one is NOT self-announcing.  A
+#: mirror that reads too HIGH fails SILENTLY, which is the dangerous
+#: direction: retune ``MERGE_RESULT_TIMEOUT`` to 30 and every
+#: ``timeout(HEAVY_BARRIER_TEST_TIMEOUT)`` site really pins 225s -- squarely
+#: inside the band -- while this map still answers 300 and the ratchet stays
+#: green.  Matching on the TRAILING name only widens that hole: a new
+#: file-local ``PYTEST_TIMEOUT = 120`` would be waved through at 960.
+#:
+#: So every entry carries the same EXECUTABLE link the YAML pin above
+#: demonstrates -- :class:`TestSanctionedNameMirrors` re-reads each name's REAL
+#: definition out of the tree and fails if the two disagree.  This map is a
+#: cache of those definitions, never a claim about them.
 _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
     'WHOLE_TREE_SCAN_TEST_TIMEOUT': 300.0,
     'HEAVY_BARRIER_TEST_TIMEOUT': 300.0,
@@ -218,6 +207,21 @@ def _resolve_seconds(arg: ast.expr | None) -> float | None:
     return _SANCTIONED_TIMEOUT_NAMES.get(name)
 
 
+def _parse(source: str) -> ast.Module | None:
+    """*source* as a tree, or None when it does not parse.
+
+    FAIL-SOFT by design: :func:`_tree_scan` reads every ``*.py`` under this
+    directory, deliberately-malformed fixtures included, and a parse failure
+    must not turn a TIMEOUT-COVERAGE guard red for a reason unrelated to
+    timeout coverage -- the very class of misattributed failure this module
+    exists to prevent.
+    """
+    try:
+        return ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+
 def _timeout_sites_in(elements: list[ast.expr], qualname: str, kind: str) -> list[_Site]:
     """Every ``timeout`` mark among *elements*, as sites keyed *qualname*/*kind*.
 
@@ -288,11 +292,16 @@ def _timeout_marker_sites(source: str) -> tuple[_Site, ...]:
     fixtures included, and a parse failure must not turn a timeout-coverage
     guard red for a reason unrelated to timeout coverage.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return ()
+    tree = _parse(source)
+    return () if tree is None else _timeout_marker_sites_in(tree)
 
+
+def _timeout_marker_sites_in(tree: ast.Module) -> tuple[_Site, ...]:
+    """:func:`_timeout_marker_sites` over an already-parsed *tree*.
+
+    Split out so :func:`_tree_scan` can ``ast.parse`` each file ONCE and feed
+    both this and :func:`_sanctioned_bindings_in`; parsing dominates the sweep.
+    """
     sites: list[_Site] = []
 
     def walk(body: list[ast.stmt], prefix: str) -> None:
@@ -323,22 +332,130 @@ def _inverts(seconds: float | None) -> bool:
     """True iff a marker at *seconds* TIGHTENS verify while reading as a loosening.
 
     The band is ``(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)``,
-    open at both ends.  Named against the constants rather than their numbers,
-    which live -- with the full rationale -- in _orch_helpers.py; the three
-    regimes those two edges carve out are:
-
-    * at or below the ini default -- tightens under BOTH budgets, so a
-      deliberate tight bound.  NOT an offence;
-    * strictly between them -- INVERTS.  Written to loosen against the default
-      the author was reading, it silently becomes a tightening under verify's
-      CLI budget.  The sign of the marker's effect flips with context, which is
-      the defect;
-    * at or above the CLI budget -- loosens under both.  Safe.
+    open at both ends -- a mark AT the ini default expresses no opinion against
+    it, and one AT the CLI budget is the recommended remediation.  Named
+    against the constants rather than their numbers, and why those two edges
+    and not the task text's literal ``N < 300``: the
+    ``VERIFY_CLI_PER_TEST_TIMEOUT`` comment block in _orch_helpers.py.
 
     None is not a number and cannot invert: unresolvable means "no opinion",
     never "too small".
     """
     return seconds is not None and PYPROJECT_DEFAULT_TIMEOUT < seconds < VERIFY_CLI_PER_TEST_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# The REAL definitions behind _SANCTIONED_TIMEOUT_NAMES.
+#
+# The map is a mirror; these read the originals, so the mirror can be checked
+# rather than trusted.  See _SANCTIONED_TIMEOUT_NAMES' comment for the two
+# silent failures this closes.
+# ---------------------------------------------------------------------------
+
+#: Numbers a sanctioned constant's definition may be written in terms of.  All
+#: four real definitions are literal arithmetic over _orch_helpers' own numeric
+#: globals (``5 * PYPROJECT_DEFAULT_TIMEOUT``, ``5 * MERGE_RESULT_TIMEOUT +
+#: 75``), and the two defined in test modules import those names from there --
+#: so one namespace resolves every case without importing a test module, whose
+#: module-scope side effects (test_warm_lane_bash_suite.py:242 asserts at
+#: import time) make importing it for a constant a bad trade.
+#:
+#: STATED LIMIT: a definition written over a FILE-LOCAL name that shadows an
+#: _orch_helpers global of the same spelling would resolve against the wrong
+#: one.  No such shadow exists (all four definitions were read and resolved),
+#: and the check is a floor, not a proof -- so this is recorded rather than
+#: engineered around.
+_MIRROR_NAMESPACE: Mapping[str, float] = {
+    name: float(value)
+    for name, value in vars(_orch_helpers).items()
+    if isinstance(value, int | float) and not isinstance(value, bool)
+}
+
+
+class _Binding(NamedTuple):
+    """One assignment of a :data:`_SANCTIONED_TIMEOUT_NAMES` name found in the tree.
+
+    ``seconds`` is None when the right-hand side is outside
+    :func:`_binding_value`'s grammar -- "no longer statically verifiable",
+    which :class:`TestSanctionedNameMirrors` reports rather than passes over.
+    ``expression`` is the unparsed source, so a failure can show what it read.
+    """
+
+    module: str
+    name: str
+    lineno: int
+    expression: str
+    seconds: float | None
+
+
+def _binding_value(node: ast.expr, namespace: Mapping[str, float]) -> float | None:
+    """*node*'s value, if it is literal arithmetic over *namespace*'s numbers.
+
+    Deliberately tiny: numeric literals, names from *namespace*, and ``+ - *``
+    over them is the entire grammar the four real definitions use.  ``bool`` is
+    excluded from the literal case for the same reason :func:`_resolve_seconds`
+    excludes it.  Anything else -- a call, an attribute, a name this namespace
+    does not carry -- yields None.
+
+    OPPOSITE POLARITY TO :func:`_resolve_seconds`, deliberately.  There, None
+    means "no opinion" and is waved through; here it means the mirror can no
+    longer be checked against its original, which is a finding, not a pass.
+    """
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, int | float) and not isinstance(node.value, bool):
+            return float(node.value)
+        return None
+    if isinstance(node, ast.Name):
+        return namespace.get(node.id)
+    if isinstance(node, ast.BinOp):
+        left = _binding_value(node.left, namespace)
+        right = _binding_value(node.right, namespace)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+    return None
+
+
+def _sanctioned_bindings_in(tree: ast.Module, module: str) -> list[_Binding]:
+    """Every assignment in *tree* that binds a :data:`_SANCTIONED_TIMEOUT_NAMES` name.
+
+    ``ast.walk`` rather than module-level only, so the rule stays one sentence:
+    ANY binding of a sanctioned ceiling name under this tree must carry the
+    mirrored value.  A class-body binding really can reach a method decorator
+    (decorators are evaluated in the class namespace), and a function-local one
+    cannot -- but flagging that one anyway errs toward a LOUD false offender,
+    and a local shadowing a tree-wide ceiling name at a different value is
+    confusing enough to be worth the noise either way.
+    """
+    bindings: list[_Binding] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            value: ast.expr | None = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target.id]
+            value = node.value
+        else:
+            continue
+        if value is None:
+            continue
+        bindings.extend(
+            _Binding(
+                module=module,
+                name=target,
+                lineno=node.lineno,
+                expression=ast.unparse(value),
+                seconds=_binding_value(value, _MIRROR_NAMESPACE),
+            )
+            for target in targets
+            if target in _SANCTIONED_TIMEOUT_NAMES
+        )
+    return bindings
 
 
 class TestVerifyCliBudgetConstant:
@@ -351,10 +468,6 @@ class TestVerifyCliBudgetConstant:
     class is that shape one anchor over -- it reads the REAL
     orchestrator/orchestrator.yaml at runtime instead of citing a line number.
     """
-
-    def test_verify_cli_budget_is_three_hundred(self) -> None:
-        """The constant names the verify CLI per-test budget, currently 300s."""
-        assert VERIFY_CLI_PER_TEST_TIMEOUT == 300
 
     def test_the_inversion_band_is_non_empty(self) -> None:
         """The band ``(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)`` must be real.
@@ -409,6 +522,84 @@ class TestVerifyCliBudgetConstant:
             'genuinely-inverting marker through or manufactures false '
             'offenders.'
         )
+
+
+class TestSanctionedNameMirrors:
+    """Every :data:`_SANCTIONED_TIMEOUT_NAMES` value must match its REAL definition.
+
+    THE EXECUTABLE LINK the mirror map would otherwise lack -- the same shape
+    :class:`TestVerifyCliBudgetConstant` applies to the YAML, one anchor over.
+    Without it the map is an unchecked claim about four constants defined
+    elsewhere, and a wrong entry that reads too HIGH is silent: it resolves a
+    marker to a safe number while the real constant sits inside the band, so
+    the ratchet stays green over a live inversion.
+
+    THE MEASURED CASE this closes:
+    ``HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75``
+    (test_merge_queue_concurrent_verify.py) is not a literal -- retune
+    ``MERGE_RESULT_TIMEOUT`` from 45 to 30 and every site marked with it really
+    pins 225s.  And because :func:`_resolve_seconds` matches on the TRAILING
+    name only, a NEW file-local ``PYTEST_TIMEOUT = 120`` anywhere under this
+    directory would resolve at 960.  Both are caught here, at their source.
+    """
+
+    def test_every_mirror_matches_its_real_definition(self) -> None:
+        """No binding of a sanctioned name may disagree with the mirrored value.
+
+        Checked over EVERY binding in the tree, not just the one the map was
+        written from, because the trailing-name match makes a second definition
+        at a different value indistinguishable from the first.
+        """
+        wrong = [
+            binding
+            for binding in _tree_scan().bindings
+            if binding.seconds != _SANCTIONED_TIMEOUT_NAMES[binding.name]
+        ]
+
+        assert not wrong, (
+            f'{len(wrong)} binding(s) of a sanctioned timeout name disagree '
+            'with _SANCTIONED_TIMEOUT_NAMES in '
+            'test_timeout_marker_inversion_guard.py.\n\n'
+            'That map is how a `@pytest.mark.timeout(NAME)` site is resolved, '
+            'and it matches on the TRAILING name only. An entry reading HIGHER '
+            'than the real constant fails SILENTLY: the site is waved through '
+            'as safe while it really pins a value inside the inversion band '
+            f'({PYPROJECT_DEFAULT_TIMEOUT} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}). '
+            'Update the map to the real value -- and if the real value has '
+            'moved INTO the band, fix the constant instead, not the mirror.\n\n'
+            'A `seconds` of None means the definition left the literal '
+            'arithmetic _binding_value understands, so the mirror can no '
+            'longer be checked at all; give the constant a statically '
+            'resolvable definition or drop it from the map.\n\n'
+            + '\n'.join(
+                f'  {b.module}:{b.lineno} {b.name} = {b.expression} -> '
+                f'{b.seconds} (mirror says '
+                f'{_SANCTIONED_TIMEOUT_NAMES[b.name]})'
+                for b in sorted(wrong, key=lambda b: (b.module, b.lineno))
+            )
+        )
+
+    def test_every_mirrored_name_is_really_defined(self) -> None:
+        """The map may not outlive the constants it mirrors.
+
+        Same hygiene as
+        :func:`test_grandfather_allowlist_has_no_stale_entries`: an entry for a
+        deleted constant is dead weight that silently re-sanctions the name if
+        someone later reintroduces it at an arbitrary value.  It is also the
+        anti-vacuity floor for the twin above, which passes trivially over an
+        empty binding list.
+        """
+        defined = {binding.name for binding in _tree_scan().bindings}
+        undefined = sorted(set(_SANCTIONED_TIMEOUT_NAMES) - defined)
+
+        assert not undefined, (
+            f'_SANCTIONED_TIMEOUT_NAMES mirrors {undefined}, which no longer '
+            f'name a constant defined anywhere under {_TESTS_DIR}. Drop the '
+            'entr(y/ies) -- a mirror for a deleted constant sanctions the bare '
+            'NAME, so reintroducing it at any value at all would be resolved '
+            'to the stale number instead of read as new.'
+        )
+
 
 
 # ---------------------------------------------------------------------------
@@ -643,23 +834,13 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
     """``_inverts`` is True only strictly inside ``(60, 300)``.
 
     THE WHOLE DESIGN LIVES IN THESE EDGES, so every one is pinned rather than
-    left to a spot check.
-
-    CLOSED AT THE BOTTOM -- ``N <= PYPROJECT_DEFAULT_TIMEOUT`` is NOT an
-    offence, even though the task text says "N < 300".  A marker at or under
-    the ini default tightens under BOTH budgets, which makes it unambiguously a
-    deliberate tight bound rather than an accident: its author chose tighter
-    than even a bare local ``pytest`` would give them.  The worked example is
-    test_verify_clock_stop.py, which carries 13 marks at 15s because those
-    tests assert a watchdog fires FAST -- raising them to 300 would blunt the
-    assertion AND turn each hang test into a 300s stall.  Reading "N < 300"
-    literally would sweep those in and be actively wrong.
-
-    OPEN AT THE TOP -- ``N >= VERIFY_CLI_PER_TEST_TIMEOUT`` loosens under both
-    budgets and is safe, which is what keeps the sanctioned ceilings
-    (WHOLE_TREE_SCAN_TEST_TIMEOUT and HEAVY_BARRIER_TEST_TIMEOUT at 300,
-    PYTEST_TIMEOUT at 960) out of the guard's way -- including this module's
-    own ``pytestmark``.
+    left to a spot check.  Why the band is CLOSED at the bottom (a mark at or
+    under the ini default tightens under both budgets, so it is a deliberate
+    tight bound rather than an accident) and OPEN at the top (a mark at or over
+    the CLI budget loosens under both): the ``VERIFY_CLI_PER_TEST_TIMEOUT``
+    comment block in _orch_helpers.py.  The per-row comments record which REAL
+    population each edge was chosen to admit or exclude, which is the part that
+    belongs here.
 
     None -> False is the fail-soft polarity from :func:`_resolve_seconds`:
     "no opinion", never "too small".
@@ -684,56 +865,6 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The named regression instance.
-# ---------------------------------------------------------------------------
-
-#: The module whose in-band marker is the CONFIRMED, MEASURED instance of this
-#: defect -- the one that motivated the task.  Named as a constant so the pin
-#: below reads as a regression test for a specific historical failure rather
-#: than as an arbitrary sample of the tree.
-_NAMED_REGRESSION_MODULE = 'test_aiosqlite_leak_isolation.py'
-
-
-def test_the_aiosqlite_leak_isolation_regression_is_fixed() -> None:
-    """No marker in test_aiosqlite_leak_isolation.py may sit in the inversion band.
-
-    THE MEASURED INSTANCE, recorded here so the number is never re-guessed.
-
-    ``test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile``
-    carried ``@pytest.mark.timeout(120)``.  It spawns TWO full pytest
-    subprocesses -- a treatment arm and a control arm -- and measures 15.27s
-    unloaded (``8 passed in 17.72s`` for the module).  This suite's own
-    measured load inflation for that class of work is ~4.8x: 30.75s at loadavg
-    120-176 for a 6.46s unloaded scan, recorded against
-    WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py.  15.27 x 4.8 is ~73s,
-    already 61% of the old 120s budget -- and the loadavg 250-423 step at which
-    xdist worker DEATHS were actually observed sits one further inflation step
-    beyond that.  So 120 was genuinely too tight; VERIFY_CLI_PER_TEST_TIMEOUT
-    leaves ~19.6x headroom over the measurement.
-
-    WHY IT COST WHOLE RUNS rather than one test: ``timeout_method = "thread"``
-    answers a breach by ``os._exit()``ing the xdist worker, and
-    ``--max-worker-restart=0`` declines to replace it, truncating the session
-    and blaming whatever innocent test shared the dead worker.  That is how
-    this one marker was blamed for failures in tasks 4176, 4384 and 4405.
-
-    Asserted over the WHOLE module rather than the one qualname: the point is
-    that this file stays clean, not that one line stays fixed.
-    """
-    source = (_TESTS_DIR / _NAMED_REGRESSION_MODULE).read_text(encoding='utf-8')
-
-    offenders = [site for site in _timeout_marker_sites(source) if _inverts(site.seconds)]
-
-    assert not offenders, (
-        f'{_NAMED_REGRESSION_MODULE} has regressed to an inverting timeout '
-        f'marker: {[(s.qualname, s.seconds) for s in offenders]}. This module '
-        'spawns two full pytest subprocesses per test; at 15.27s unloaded and '
-        "this suite's measured ~4.8x load inflation it reaches ~73s, which a "
-        'marker inside the band clamps below. Use VERIFY_CLI_PER_TEST_TIMEOUT.'
-    )
-
-
-# ---------------------------------------------------------------------------
 # The tree-wide RATCHET.
 # ---------------------------------------------------------------------------
 
@@ -749,7 +880,7 @@ def test_the_aiosqlite_leak_isolation_regression_is_fixed() -> None:
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_MARKER_SITES = 100
 
-#: The pre-existing in-band sites, MEASURED at authorship time: 61 across 19
+#: The pre-existing in-band sites, MEASURED at authorship time: 61 across 18
 #: modules, at 90/120/150/180s.  Entries may only ever be REMOVED, never added
 #: -- a new marker in the band is what this module exists to reject, and
 #: `test_no_new_inverting_timeout_marker`'s failure message says so outright.
@@ -763,7 +894,13 @@ _MIN_EXPECTED_MARKER_SITES = 100
 #: being blamed; the migration is ordinary follow-up work, filed as
 #: agent-followup ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY.
 #:
-#: Keyed on ``(module, qualname)`` rather than a line number so an entry
+#: Keyed on ``(module, qualname)`` -- *module* being the path RELATIVE to this
+#: directory (``test_cli.py``, and ``fixtures/x.py`` for anything nested), NOT
+#: the basename.  The sweep rglob()s subdirectories, so a basename key would
+#: silently hand a future ``tests/<subdir>/test_cli.py`` the top-level
+#: test_cli.py's exemption -- exactly the collapse that per-SITE keying exists
+#: to avoid.  Every entry below is top-level, so the two spellings agree today.
+#: Keyed on a name rather than a line number so an entry
 #: survives ordinary edits above it, and per-SITE rather than a per-file COUNT
 #: because a count nets to zero when one marker is added and another removed in
 #: the same file -- a hole in a guard whose entire purpose is catching
@@ -855,41 +992,90 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
 )
 
 
-def _all_timeout_sites() -> tuple[list[tuple[str, _Site]], int, list[str]]:
-    """Every timeout marker site under this directory, with sweep-health counters.
+class _TreeScan(NamedTuple):
+    """One pass over every ``*.py`` under :data:`_TESTS_DIR`, with sweep-health counters.
 
-    Returns ``(sites, files_examined, unreadable)`` where each site is paired
-    with its module filename -- the first half of the ``(module, qualname)``
-    key the allowlist is written in.
+    All fields are IMMUTABLE because the scan is memoised and shared: a caller
+    that mutated a list here would corrupt every later caller's view of the
+    tree.
 
-    Fail-soft on the READ for the same reason :func:`_timeout_marker_sites`
-    fails soft on the PARSE: a non-UTF-8 source, a deliberately-malformed
-    encoding fixture or a broken symlink under this directory would otherwise
-    raise straight out of a TIMEOUT-COVERAGE check and turn it red for a reason
-    unrelated to timeout coverage.  Skipped files are NOT counted as examined
-    (they were not) and are surfaced to the caller, so a sweep that silently
-    stops reading anything cannot hide here.
+    ``sites`` pairs each timeout marker site with its module -- the path
+    relative to :data:`_TESTS_DIR`, which is the first half of the
+    ``(module, qualname)`` key :data:`_GRANDFATHERED` is written in.
+    ``bindings`` is every assignment of a :data:`_SANCTIONED_TIMEOUT_NAMES`
+    name, for :class:`TestSanctionedNameMirrors`.  Files skipped as
+    ``unreadable`` are NOT counted as ``examined`` (they were not).
+    """
+
+    sites: tuple[tuple[str, _Site], ...]
+    bindings: tuple[_Binding, ...]
+    examined: int
+    unreadable: tuple[str, ...]
+
+
+@functools.cache
+def _tree_scan() -> _TreeScan:
+    """Read, parse and extract from every ``*.py`` under this directory -- ONCE.
+
+    MEMOISED because FOUR tests need it and one pass is not cheap: MEASURED
+    15.03s over 569 files on this loaded machine (6.06s measured unloaded).
+    Uncached that is four passes where one does, and the surplus lands as
+    contention on the very ``-n auto`` verify run this module exists to
+    de-flake -- the same cost that motivated WHOLE_TREE_SCAN_TEST_TIMEOUT.
+    Under xdist the tests may land on different workers, so the win is partial;
+    it is never negative.
+
+    Parsing dominates, which is why each file is parsed once here and the tree
+    handed to BOTH extractors, rather than each extractor re-reading the file.
+
+    Fail-soft on the READ for the same reason :func:`_parse` fails soft on the
+    PARSE: a non-UTF-8 source, a deliberately-malformed encoding fixture or a
+    broken symlink under this directory would otherwise raise straight out of a
+    TIMEOUT-COVERAGE check. Skipped files are surfaced to the caller, so a
+    sweep that silently stops reading anything cannot hide here.
     """
     sites: list[tuple[str, _Site]] = []
+    bindings: list[_Binding] = []
     unreadable: list[str] = []
     examined = 0
 
     for py_file in sorted(_TESTS_DIR.rglob('*.py')):
+        module = py_file.relative_to(_TESTS_DIR).as_posix()
         try:
             source = py_file.read_text(encoding='utf-8')
         except (UnicodeDecodeError, OSError):
-            unreadable.append(py_file.name)
+            unreadable.append(module)
             continue
         examined += 1
-        sites.extend((py_file.name, site) for site in _timeout_marker_sites(source))
+        tree = _parse(source)
+        if tree is None:
+            continue
+        sites.extend((module, site) for site in _timeout_marker_sites_in(tree))
+        bindings.extend(_sanctioned_bindings_in(tree, module))
 
-    return sites, examined, unreadable
+    return _TreeScan(tuple(sites), tuple(bindings), examined, tuple(unreadable))
 
 
-def _in_band_sites() -> tuple[list[tuple[str, _Site]], int, list[str]]:
-    """:func:`_all_timeout_sites`, narrowed to the sites that actually invert."""
-    sites, examined, unreadable = _all_timeout_sites()
-    return [pair for pair in sites if _inverts(pair[1].seconds)], examined, unreadable
+def _in_band_sites() -> tuple[tuple[str, _Site], ...]:
+    """:func:`_tree_scan`'s sites, narrowed to the ones that actually invert."""
+    return tuple(pair for pair in _tree_scan().sites if _inverts(pair[1].seconds))
+
+
+def _sweep_is_healthy(scan: _TreeScan) -> str:
+    """'' when *scan* cleared :data:`_MIN_EXPECTED_TEST_FILES`, else why not.
+
+    SPOT for the anti-vacuity floor both ratchet tests need: a broken sweep
+    reports zero offenders AND reads every allowlist entry as stale, and the
+    two failures want the same measurement stated the same way.
+    """
+    if scan.examined >= _MIN_EXPECTED_TEST_FILES:
+        return ''
+    return (
+        f'only {scan.examined} .py files examined under {_TESTS_DIR} (expected '
+        f'at least {_MIN_EXPECTED_TEST_FILES}; {len(scan.unreadable)} skipped '
+        f'as unreadable: {sorted(scan.unreadable)}) -- the sweep itself is '
+        'broken'
+    )
 
 
 def test_no_new_inverting_timeout_marker() -> None:
@@ -921,17 +1107,16 @@ def test_no_new_inverting_timeout_marker() -> None:
     leaving a hole in a guard whose entire purpose is catching accidental
     additions.  Verbosity is cheap; a hole in the ratchet is not.
     """
-    offenders, examined, unreadable = _in_band_sites()
-
-    assert examined >= _MIN_EXPECTED_TEST_FILES, (
-        f'only {examined} .py files examined under {_TESTS_DIR} (expected at '
-        f'least {_MIN_EXPECTED_TEST_FILES}; {len(unreadable)} skipped as '
-        f'unreadable: {sorted(unreadable)}) -- the sweep itself is broken, so '
-        'this guard would pass vacuously rather than because the tree is clean.'
+    broken = _sweep_is_healthy(_tree_scan())
+    assert not broken, (
+        f'{broken}, so this guard would pass vacuously rather than because '
+        'the tree is clean.'
     )
 
     new_offenders = [
-        (module, site) for module, site in offenders if (module, site.qualname) not in _GRANDFATHERED
+        (module, site)
+        for module, site in _in_band_sites()
+        if (module, site.qualname) not in _GRANDFATHERED
     ]
     if new_offenders:
         offender_list = '\n  '.join(
@@ -977,16 +1162,10 @@ def test_grandfather_allowlist_has_no_stale_entries() -> None:
     later re-adds under the same name.  Same shape, and same reason, as
     test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
     """
-    offenders, examined, unreadable = _in_band_sites()
+    broken = _sweep_is_healthy(_tree_scan())
+    assert not broken, f'{broken}, so EVERY allowlist entry would read as stale.'
 
-    assert examined >= _MIN_EXPECTED_TEST_FILES, (
-        f'only {examined} .py files examined under {_TESTS_DIR} (expected at '
-        f'least {_MIN_EXPECTED_TEST_FILES}; {len(unreadable)} skipped as '
-        f'unreadable: {sorted(unreadable)}) -- the sweep is broken, so EVERY '
-        'allowlist entry would read as stale.'
-    )
-
-    live = {(module, site.qualname) for module, site in offenders}
+    live = {(module, site.qualname) for module, site in _in_band_sites()}
     stale = sorted(_GRANDFATHERED - live)
 
     assert not stale, (
@@ -1006,11 +1185,12 @@ def test_the_marker_census_is_not_vacuous() -> None:
     examine 563 files, find zero sites, report zero offenders and pass. This is
     the floor that catches that. 148 sites measured at authorship time.
     """
-    sites, examined, _ = _all_timeout_sites()
+    scan = _tree_scan()
 
-    assert len(sites) >= _MIN_EXPECTED_MARKER_SITES, (
-        f'only {len(sites)} timeout marker site(s) found across {examined} '
-        f'files (expected at least {_MIN_EXPECTED_MARKER_SITES}) -- '
+    assert len(scan.sites) >= _MIN_EXPECTED_MARKER_SITES, (
+        f'only {len(scan.sites)} timeout marker site(s) found across '
+        f'{scan.examined} files (expected at least '
+        f'{_MIN_EXPECTED_MARKER_SITES}) -- '
         '_timeout_marker_sites has probably stopped matching, so the ratchet '
         'would pass vacuously. Check it against the inline fixtures above.'
     )
