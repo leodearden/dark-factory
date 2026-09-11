@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,7 +44,7 @@ class TestCostStoreInit:
 
 @pytest.mark.asyncio
 class TestSaveInvocation:
-    """step-9: save_invocation() persists a row with all 15 fields."""
+    """step-9: save_invocation() persists a row with all 17 fields."""
 
     async def test_save_invocation_full_row(self, tmp_path: Path):
         async with CostStore(tmp_path / 'costs.db') as store:
@@ -63,12 +64,15 @@ class TestSaveInvocation:
                 capped=False,
                 started_at='2024-01-01T00:00:00',
                 completed_at='2024-01-01T00:00:01',
+                model_id='claude-opus-5',
+                capped_reason=None,
             )
             # Verify via raw SQL
             async with _conn(store).execute(
                 'SELECT run_id, task_id, project_id, account_name, model, role, '
                 'cost_usd, input_tokens, output_tokens, cache_read_tokens, '
-                'cache_create_tokens, duration_ms, capped, started_at, completed_at '
+                'cache_create_tokens, duration_ms, capped, started_at, completed_at, '
+                'model_id, capped_reason '
                 'FROM invocations'
             ) as cur:
                 row = await cur.fetchone()
@@ -88,6 +92,8 @@ class TestSaveInvocation:
         assert row[12] == 0  # capped=False stored as 0
         assert row[13] == '2024-01-01T00:00:00'
         assert row[14] == '2024-01-01T00:00:01'
+        assert row[15] == 'claude-opus-5'  # exact CLI-served version (task 4826)
+        assert row[16] is None  # not a cap kill
 
     async def test_save_invocation_nullable_fields(self, tmp_path: Path):
         """task_id and token counts can be None."""
@@ -1250,3 +1256,324 @@ class TestApiErrorEventTypeConstant:
             async with _conn(store).execute('SELECT event_type FROM account_events') as cur:
                 rows = await cur.fetchall()
         assert [r[0] for r in rows] == [API_ERROR_EVENT_TYPE]
+
+
+# ---------------------------------------------------------------------------
+# Schema + additive migration for model_id / capped_reason (task 4826)
+# ---------------------------------------------------------------------------
+
+# The pre-4826 DDL for `invocations`, verbatim. Every already-deployed runs.db
+# is on this 16-column shape, and _SCHEMA is applied with CREATE TABLE IF NOT
+# EXISTS, so editing the DDL string alone would never reach them.
+_LEGACY_INVOCATIONS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS invocations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id              TEXT NOT NULL,
+    task_id             TEXT,
+    project_id          TEXT NOT NULL,
+    account_name        TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    role                TEXT NOT NULL,
+    cost_usd            REAL NOT NULL DEFAULT 0.0,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_create_tokens INTEGER,
+    duration_ms         INTEGER NOT NULL DEFAULT 0,
+    capped              INTEGER NOT NULL DEFAULT 0,
+    started_at          TEXT NOT NULL,
+    completed_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inv_run ON invocations(run_id);
+"""
+
+_NEW_INVOCATION_COLUMNS = ('model_id', 'capped_reason')
+_NEW_INVOCATION_COLUMNS_SET = set(_NEW_INVOCATION_COLUMNS)
+
+
+def _legacy_cost_db(path: Path) -> None:
+    """Create a pre-4826 cost DB carrying one legacy invocations row.
+
+    Deliberately built with plain ``sqlite3`` rather than through ``CostStore``:
+    the fixture must not be creatable by the code under test, or "migration
+    leaves existing rows readable" degrades into a tautology.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_LEGACY_INVOCATIONS_SCHEMA)
+    conn.execute(
+        'INSERT INTO invocations (run_id, task_id, project_id, account_name, model, '
+        ' role, cost_usd, input_tokens, output_tokens, cache_read_tokens, '
+        ' cache_create_tokens, duration_ms, capped, started_at, completed_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (
+            'legacy-run',
+            'legacy-task',
+            'dark_factory',
+            'max-d',
+            'opus',
+            'agent',
+            1.25,
+            900,
+            300,
+            120,
+            60,
+            4321,
+            0,
+            '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:05+00:00',
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _invocation_columns(path: Path) -> list[str]:
+    """Column names in ``PRAGMA table_info(invocations)`` order."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return [r[1] for r in conn.execute('PRAGMA table_info(invocations)')]
+    finally:
+        conn.close()
+
+
+def _invocation_column_specs(path: Path) -> dict[str, tuple[int, str | None]]:
+    """``{column: (notnull, dflt_value)}`` from ``PRAGMA table_info(invocations)``.
+
+    Asserts against the table the writer actually inserts into rather than
+    against the DDL text, so the assertion survives any reformatting of
+    ``_SCHEMA``.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        return {r[1]: (r[3], r[4]) for r in conn.execute('PRAGMA table_info(invocations)')}
+    finally:
+        conn.close()
+
+
+class TestInvocationsSchemaColumns:
+    """The fresh-DB shape of the two task-4826 columns."""
+
+    async def test_fresh_db_is_already_at_the_new_shape(self, tmp_path: Path):
+        db = tmp_path / 'fresh.db'
+        async with CostStore(db):
+            pass
+
+        assert set(_invocation_columns(db)) >= _NEW_INVOCATION_COLUMNS_SET
+
+    async def test_new_columns_are_declared_last(self, tmp_path: Path):
+        """On a FRESH DB the two new columns are the LAST two, in order.
+
+        ``ALTER TABLE ... ADD COLUMN`` can only append, so a migrated runs.db
+        necessarily carries them at the end.  Declaring them anywhere else in
+        ``_SCHEMA`` would give a freshly-created DB a different physical column
+        ORDER — and ``orchestrator/tests/test_harness_module_tagger_cost.py``'s
+        ``SELECT * FROM invocations`` is a positional consumer that would then
+        disagree between a fresh and a migrated store.
+        """
+        db = tmp_path / 'fresh.db'
+        async with CostStore(db):
+            pass
+
+        columns = _invocation_columns(db)
+        assert columns[-2:] == list(_NEW_INVOCATION_COLUMNS), columns
+        assert columns[-3] == 'completed_at', columns
+
+    async def test_new_columns_are_nullable_with_no_default(self, tmp_path: Path):
+        """Both are plain nullable TEXT — no ``NOT NULL DEFAULT``.
+
+        Nullability keeps ``ADD COLUMN`` O(1) with no table rewrite against a
+        live multi-ten-thousand-row table, and NULL is the honest encoding for
+        "this row predates task 4826" — distinguishable from a
+        recorded-but-empty value in a way ``''`` would not be.
+        """
+        db = tmp_path / 'fresh.db'
+        async with CostStore(db):
+            pass
+
+        specs = _invocation_column_specs(db)
+        for col in _NEW_INVOCATION_COLUMNS:
+            assert col in specs, f'{col} missing from the created invocations table'
+            notnull, default = specs[col]
+            assert notnull == 0, f'{col} must stay nullable'
+            assert default is None, f'{col} must carry no default, got {default!r}'
+
+
+class TestInvocationsMigration:
+    """``CostStore.open()`` brings a pre-4826 invocations table up to shape.
+
+    Mandatory, not cosmetic: ``_SCHEMA`` is applied with
+    ``CREATE TABLE IF NOT EXISTS``, so a live runs.db never gains the new
+    columns from the DDL edit alone and the widened INSERT would fail on the
+    first invocation after deploy — on exactly the machines holding the history
+    this task exists to make legible.
+    """
+
+    async def test_adds_the_columns_to_a_legacy_db(self, tmp_path: Path):
+        db = tmp_path / 'legacy.db'
+        _legacy_cost_db(db)
+        assert not (_NEW_INVOCATION_COLUMNS_SET & set(_invocation_columns(db)))
+
+        async with CostStore(db):
+            pass
+
+        assert set(_invocation_columns(db)) >= _NEW_INVOCATION_COLUMNS_SET
+
+    async def test_legacy_row_survives_and_reads_null(self, tmp_path: Path):
+        db = tmp_path / 'legacy.db'
+        _legacy_cost_db(db)
+
+        async with CostStore(db) as store, _conn(store).execute(
+            'SELECT run_id, task_id, project_id, account_name, model, role, '
+            'cost_usd, input_tokens, output_tokens, cache_read_tokens, '
+            'cache_create_tokens, duration_ms, capped, started_at, completed_at, '
+            'model_id, capped_reason FROM invocations'
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row is not None
+        assert row[:15] == (
+            'legacy-run',
+            'legacy-task',
+            'dark_factory',
+            'max-d',
+            'opus',
+            'agent',
+            1.25,
+            900,
+            300,
+            120,
+            60,
+            4321,
+            0,
+            '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:05+00:00',
+        )
+        assert row[15] is None  # model_id genuinely unknown for a historical row
+        assert row[16] is None  # capped_reason likewise
+
+    async def test_is_idempotent_across_reopen(self, tmp_path: Path):
+        db = tmp_path / 'legacy.db'
+        _legacy_cost_db(db)
+
+        async with CostStore(db):
+            pass
+        async with CostStore(db):  # must not raise
+            pass
+
+        columns = _invocation_columns(db)
+        assert columns.count('model_id') == 1, columns
+        assert columns.count('capped_reason') == 1, columns
+
+    async def test_is_a_noop_on_a_fresh_db(self, tmp_path: Path):
+        db = tmp_path / 'fresh.db'
+        async with CostStore(db):
+            pass
+        before = _invocation_columns(db)
+
+        async with CostStore(db):
+            pass
+
+        assert _invocation_columns(db) == before
+
+    async def test_widened_insert_succeeds_after_migration(self, tmp_path: Path):
+        db = tmp_path / 'legacy.db'
+        _legacy_cost_db(db)
+
+        async with CostStore(db) as store:
+            await store.save_invocation(
+                run_id='post-migration',
+                task_id='4826',
+                project_id='dark_factory',
+                account_name='max-d',
+                model='opus',
+                role='implementer',
+                cost_usd=2.5,
+                input_tokens=1,
+                output_tokens=2,
+                cache_read_tokens=3,
+                cache_create_tokens=4,
+                duration_ms=5,
+                capped=True,
+                started_at='2026-09-11T00:00:00+00:00',
+                completed_at='2026-09-11T00:00:01+00:00',
+                model_id='claude-opus-5',
+                capped_reason='budget',
+            )
+            async with _conn(store).execute(
+                'SELECT model, model_id, capped, capped_reason FROM invocations '
+                'WHERE run_id = ?',
+                ('post-migration',),
+            ) as cur:
+                row = await cur.fetchone()
+
+        assert row == ('opus', 'claude-opus-5', 1, 'budget')
+
+
+class TestSaveInvocationModelIdAndCappedReason:
+    """``save_invocation`` round-trips the two task-4826 fields."""
+
+    async def test_records_both_fields(self, tmp_path: Path):
+        """`model` keeps the routing alias; `model_id` carries the exact version.
+
+        The two differing in the SAME row is the crux of the task: existing
+        ``GROUP BY model`` consumers keep seeing the lineage alias, while
+        attribution gains the version the CLI actually served.
+        """
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_invocation(
+                run_id='run-abc',
+                task_id='4826',
+                project_id='dark_factory',
+                account_name='max-d',
+                model='opus',
+                role='agent',
+                cost_usd=0.5,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=10,
+                capped=True,
+                started_at='2026-09-11T00:00:00+00:00',
+                completed_at='2026-09-11T00:00:01+00:00',
+                model_id='claude-opus-5',
+                capped_reason='turns',
+            )
+            async with _conn(store).execute(
+                'SELECT model, model_id, capped, capped_reason FROM invocations'
+            ) as cur:
+                row = await cur.fetchone()
+
+        assert row is not None
+        assert row[0] == 'opus'
+        assert row[1] == 'claude-opus-5'
+        assert row[0] != row[1]
+        assert row[2] == 1
+        assert row[3] == 'turns'
+
+    async def test_both_default_to_none(self, tmp_path: Path):
+        """Callers that have not been widened yet still insert, writing NULL."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_invocation(
+                run_id='run-xyz',
+                task_id=None,
+                project_id='p',
+                account_name='a',
+                model='m',
+                role='r',
+                cost_usd=0.0,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=0,
+                capped=False,
+                started_at='2026-09-11T00:00:00+00:00',
+                completed_at='2026-09-11T00:00:00+00:00',
+            )
+            async with _conn(store).execute(
+                'SELECT model_id, capped_reason FROM invocations'
+            ) as cur:
+                row = await cur.fetchone()
+
+        assert row == (None, None)
