@@ -1420,3 +1420,125 @@ def test_prune_write_ops_defaults_match_write_journal_config():
             f'RED: prune_write_ops({parameter}=...) and '
             f'WriteJournalConfig.{field} must not diverge'
         )
+
+
+# ------------------------------------------------------------------
+# Journal-drop counting (task 3212 item 5, INV-4)
+#
+# WHY THE COUNTER LIVES IN WriteJournal AND NOT IN tools.py::_log_read.
+# `log_write_op` swallows its own failure internally, so the outer
+# `except` in `_log_read` almost never fires. A counter placed only there
+# would read ~zero while rows were being lost — which is precisely how a
+# silent journalling loss would corrupt leaf eta's metric (task 3213): a
+# dropped search row is a search the metric scores as "never asked".
+# ------------------------------------------------------------------
+
+
+class _Unserializable:
+    """A params value json.dumps cannot encode — log_write_op passes no
+    ``default=`` handler, so this is one of the two real failure modes."""
+
+
+@pytest.mark.asyncio
+async def test_journal_drop_stats_starts_at_zero(journal):
+    """(a) A healthy journal asserts "nothing lost" rather than staying silent."""
+    assert journal.journal_drop_stats() == {'dropped_total': 0, 'by_operation': {}}, (
+        'RED: a fresh journal must report zero drops through a public accessor'
+    )
+
+
+@pytest.mark.asyncio
+async def test_closed_db_write_counts_a_drop(journal):
+    """(b) A closed DB still does not raise — and the lost row is COUNTED."""
+    await journal.close()
+    journal._db = None
+
+    await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
+
+    stats = journal.journal_drop_stats()
+    assert stats['dropped_total'] == 1, (
+        f'RED: a swallowed journal failure must increment the drop counter, got {stats}'
+    )
+    assert stats['by_operation']['search'] == 1, (
+        'RED: the breakdown must name the operation whose row was lost — a lost '
+        'search row is what silently starves leaf eta'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unserializable_params_counts_a_drop(journal):
+    """(b) The second real failure mode: params json.dumps cannot encode."""
+    await journal.log_write_op(
+        write_op_id=str(uuid.uuid4()),
+        operation='add_memory',
+        params={'bad': _Unserializable()},
+    )
+
+    stats = journal.journal_drop_stats()
+    assert stats['dropped_total'] == 1, (
+        f'RED: an unserializable params value loses the row silently today, got {stats}'
+    )
+    assert stats['by_operation'] == {'add_memory': 1}
+
+
+@pytest.mark.asyncio
+async def test_journal_drops_are_cumulative(journal):
+    """(c) A fallback firing 100 times must read as 100, not as one log line."""
+    await journal.close()
+    journal._db = None
+
+    for _ in range(100):
+        await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
+
+    stats = journal.journal_drop_stats()
+    assert stats['dropped_total'] == 100, (
+        f'RED: drops must accumulate, got {stats["dropped_total"]}'
+    )
+    assert stats['by_operation'] == {'search': 100}
+
+
+@pytest.mark.asyncio
+async def test_backend_op_drops_share_the_same_counter(journal):
+    """(d) Layer-2 losses feed ONE counter, not a second divergent one."""
+    await journal.close()
+    journal._db = None
+
+    await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
+    await journal.log_backend_op(backend='mem0', operation='add')
+
+    stats = journal.journal_drop_stats()
+    assert stats['dropped_total'] == 2, (
+        f'RED: log_backend_op failures must be counted too, got {stats}'
+    )
+    assert stats['by_operation'] == {'search': 1, 'add': 1}
+
+
+@pytest.mark.asyncio
+async def test_successful_write_does_not_count_a_drop(journal):
+    """(e) The counter reports losses, not traffic."""
+    await journal.log_write_op(
+        write_op_id=str(uuid.uuid4()),
+        operation='search',
+        kind='read',
+        params={'query': 'q'},
+    )
+
+    assert journal.journal_drop_stats()['dropped_total'] == 0, (
+        'RED: a successful journal write must leave the drop counter untouched'
+    )
+
+
+@pytest.mark.asyncio
+async def test_journal_drop_stats_returns_a_defensive_copy(journal):
+    """A caller must not be able to mutate the journal's internal counter."""
+    await journal.close()
+    journal._db = None
+    await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
+
+    snapshot = journal.journal_drop_stats()
+    snapshot['by_operation']['search'] = 999
+    snapshot['dropped_total'] = 999
+
+    assert journal.journal_drop_stats() == {
+        'dropped_total': 1, 'by_operation': {'search': 1},
+    }, 'RED: journal_drop_stats must hand back a copy, never live internal state'
