@@ -91,11 +91,12 @@ class TestBuildHttpLimits:
         background reaper (see
         ``dashboard/src/dashboard/app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS`` for
         the verified mechanism), so it neither races nor pre-empts any
-        server-side close, regardless of its value. This test pins the
-        shipped number itself — omitting the kwarg would silently fall back
-        to httpx's stock 5.0 instead — plus the one band that carries a true,
-        independent rationale: a pooled connection must survive one ~3s poll
-        cycle or pooling is defeated and every poll pays a fresh handshake.
+        server-side close, regardless of its value. Two things are therefore
+        worth pinning and nothing else is: the shipped number, so a re-tune
+        has to be deliberate and visible; and the one band that carries a
+        true, independent rationale — a pooled connection must survive one
+        ~3s poll cycle or pooling is defeated and every poll pays a fresh
+        handshake.
         """
         from dashboard.app import _HTTP_KEEPALIVE_EXPIRY_SECONDS, _build_http_limits
 
@@ -105,8 +106,9 @@ class TestBuildHttpLimits:
         assert expiry == _HTTP_KEEPALIVE_EXPIRY_SECONDS, (
             f'keepalive_expiry={expiry} must equal the shipped '
             f'_HTTP_KEEPALIVE_EXPIRY_SECONDS={_HTTP_KEEPALIVE_EXPIRY_SECONDS} — '
-            f'omitting the kwarg would silently fall back to httpx stock 5.0 '
-            f'instead'
+            f'either a re-tune moved the value without moving this pin, or '
+            f'the keepalive_expiry= kwarg was dropped from _build_http_limits '
+            f"(which leaves httpx's stock 5.0)"
         )
         assert expiry > _DASHBOARD_POLL_INTERVAL, (
             f'keepalive_expiry={expiry} is at-or-below the ~{_DASHBOARD_POLL_INTERVAL}s '
@@ -134,36 +136,39 @@ class TestBuildHttpLimits:
     ):
         """Pin both sides of the floor-vs-derived boundary.
 
-        ``max(_HTTP_MIN_CONNECTIONS, _HTTP_CONNS_PER_ENDPOINT *
-        _HTTP_ASSUMED_CONCURRENT_VIEWERS * endpoints)`` = ``max(100, 12 *
-        endpoints)``. The derived term only overtakes the floor at
-        ``endpoints >= 9`` (12*8=96 < 100; 12*9=108 > 100). Below that a small
-        install gets EXACTLY httpx's stock number — the derived term is inert
-        there — and no existing test located this boundary:
+        Where the crossover sits, and why it matters, is documented once
+        beside the sizing constants that
+        ``dashboard/src/dashboard/app.py::_build_http_limits`` combines — not
+        restated here. What was missing is a test that locates the boundary:
         ``test_max_connections_scales_with_endpoint_count`` only compares 2
         vs 48 endpoints, and ``test_small_install_is_never_tighter_than_httpx_stock``
         only asserts ``>= 100``. A future re-tune of ``_HTTP_CONNS_PER_ENDPOINT``,
         ``_HTTP_ASSUMED_CONCURRENT_VIEWERS`` or ``_HTTP_MIN_CONNECTIONS`` should
         fail here with a legible reason rather than silently moving the crossover.
         """
-        from dashboard.app import _build_http_limits
+        from dashboard.app import (
+            _HTTP_ASSUMED_CONCURRENT_VIEWERS,
+            _HTTP_CONNS_PER_ENDPOINT,
+            _build_http_limits,
+        )
+
+        # Reported, not asserted: a re-tune's failure message must carry the
+        # number the constants now produce, not the one they produced when
+        # this test was written.
+        per_endpoint = _HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS
 
         at_floor = _build_http_limits(_config(tmp_path, escalation=5, fused=3))
         assert at_floor.max_connections == _HTTPX_STOCK_MAX_CONNECTIONS, (
-            f'8 endpoints: the derived term (12*8=96) must be discarded by the '
-            f'floor, so max_connections must equal the httpx stock '
-            f'{_HTTPX_STOCK_MAX_CONNECTIONS} exactly — got {at_floor.max_connections}'
+            f'8 endpoints: the derived term ({per_endpoint * 8}) must be '
+            f'discarded by the floor, so max_connections must equal the httpx '
+            f'stock {_HTTPX_STOCK_MAX_CONNECTIONS} exactly — got '
+            f'{at_floor.max_connections}'
         )
 
         past_crossover = _build_http_limits(_config(tmp_path, escalation=5, fused=4))
         assert past_crossover.max_connections == 108, (
-            f'9 endpoints: the derived term (12*9=108) must bind and exceed the '
-            f'httpx stock {_HTTPX_STOCK_MAX_CONNECTIONS} floor — got '
-            f'{past_crossover.max_connections}'
-        )
-        assert past_crossover.max_connections > _HTTPX_STOCK_MAX_CONNECTIONS, (
-            f'past the crossover the derived term must strictly exceed the '
-            f'httpx stock floor of {_HTTPX_STOCK_MAX_CONNECTIONS} — got '
+            f'9 endpoints: the derived term ({per_endpoint * 9}) must bind and '
+            f'exceed the httpx stock {_HTTPX_STOCK_MAX_CONNECTIONS} floor — got '
             f'{past_crossover.max_connections}'
         )
 

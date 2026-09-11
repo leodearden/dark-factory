@@ -495,14 +495,15 @@ _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 #     the derived product (_HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS
 #     * endpoints, i.e. 12 * endpoints) only overtakes this floor at
 #     endpoints >= 9 (12*8=96 < 100; 12*9=108 > 100). Below that threshold
-#     _build_http_limits returns EXACTLY this floor, unchanged — this change
-#     must never make the pool TIGHTER than what already shipped. Sizing below
-#     stock would convert ordinary queueing into httpx.PoolTimeout — which,
-#     now that the per-call budget also bounds pool acquisition, would render
-#     as an "offline" pill on a perfectly healthy orchestrator. (When that
-#     does happen it is diagnosable: mcp_fanout.describe_exc names the
-#     exception type, so 'PoolTimeout' in the log distinguishes local
-#     saturation from a dead endpoint.)
+#     _build_http_limits returns EXACTLY this stock number and the derived
+#     term is inert — a small install gets a floor, not a fleet-scaled bound.
+#     That is deliberate: this change must never make the pool TIGHTER than
+#     what already shipped. Sizing below stock would convert ordinary queueing
+#     into httpx.PoolTimeout — which, now that the per-call budget also bounds
+#     pool acquisition, would render as an "offline" pill on a perfectly
+#     healthy orchestrator. (When that does happen it is diagnosable:
+#     mcp_fanout.describe_exc names the exception type, so 'PoolTimeout' in
+#     the log distinguishes local saturation from a dead endpoint.)
 #
 #   * IDLE RETENTION (max_keepalive_connections) is held FLAT at httpx's stock
 #     20, NOT scaled as a fraction of the total. A `max_connections // 2` rule
@@ -520,17 +521,8 @@ _HTTP_MAX_KEEPALIVE_CONNECTIONS = 20
 def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
     """Derive the shared client's connection-pool bound from *config*.
 
-    ``max_connections = max(_HTTP_MIN_CONNECTIONS, _HTTP_CONNS_PER_ENDPOINT *
-    _HTTP_ASSUMED_CONCURRENT_VIEWERS * endpoints)`` = ``max(100, 12 *
-    endpoints)``. ``_HTTP_MIN_CONNECTIONS = 100`` is deliberately httpx's own
-    stock ``DEFAULT_LIMITS.max_connections``, so this helper can never ship a
-    pool TIGHTER than what already shipped.
-
-    That floor has a consequence worth stating plainly rather than leaving a
-    reader to derive it: the derived term only overtakes the floor at
-    **endpoints >= 9** (12*8=96 < 100; 12*9=108 > 100). Below that threshold
-    this returns EXACTLY httpx's stock number — for a small install this is a
-    floor, not a fleet-scaled bound, and the derived term is inert.
+    The sizing constants, and the floor-vs-derived crossover they imply, are
+    documented once where they are defined, directly above.
 
     Pure by design: ``httpx.AsyncClient`` exposes no public accessor for its
     limits, so a helper is the only way to test the sizing without asserting
