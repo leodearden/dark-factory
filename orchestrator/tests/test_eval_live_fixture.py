@@ -227,3 +227,106 @@ class TestBuildLiveFixtureKeySurface:
     def test_null_description_becomes_an_empty_string(self, tmp_path):
         fixture = self._build(tmp_path, task=live_task(description=None))
         assert fixture['task_definition']['description'] == ''
+
+
+class TestBuildLiveFixtureRefuses:
+    """The guard block: every bad input is a ValueError naming what was wrong.
+
+    Refusing at BUILD time is the point. `runner.py`'s own plan check fires at
+    :529, AFTER `create_eval_worktree` has already run at :495 — so a plan-less
+    implementer fixture leaks an eval worktree before it fails, and a bad
+    base_sha dies as a late HEAD-mismatch RuntimeError with a worktree already
+    on disk. Refusing here keeps a data-plumbing bug from becoming a leaked
+    worktree and a scored candidate decline (INV-11, no-silent-fail-soft).
+    """
+
+    def _build(self, tmp_path, **overrides):
+        kwargs = {
+            'base_sha': BASE_SHA,
+            'project_root': tmp_path,
+            'plan': live_plan(),
+            'verify_commands': default_verify_commands('df'),
+            'shape': ShadowShape.IMPLEMENTER,
+            'cell_id': '01JCELL',
+        }
+        task = overrides.pop('task', None)
+        kwargs.update(overrides)
+        return build_live_fixture(task if task is not None else live_task(), **kwargs)
+
+    @pytest.mark.parametrize(
+        'shape', [ShadowShape.IMPLEMENTER, ShadowShape.ARCHITECT_CONSEQUENCE]
+    )
+    @pytest.mark.parametrize('plan', [None, {}], ids=['none', 'empty'])
+    def test_plan_requiring_shape_without_a_plan(self, tmp_path, shape, plan):
+        # {} is falsy, which is exactly what runner.py:529 also rejects.
+        with pytest.raises(ValueError, match=str(shape.value)):
+            self._build(tmp_path, shape=shape, plan=plan)
+
+    @pytest.mark.parametrize('shape', [ShadowShape.ARCHITECT, ShadowShape.END_TO_END])
+    def test_plan_forbidden_shape_given_a_plan(self, tmp_path, shape):
+        # The same invariant in the other direction, so shape→plan is a total
+        # function. Neither runner reads `plan`, so a stray plan here would be
+        # silently ignored — leaving the consequence measurement comparing
+        # legs that were not configured as intended, with nothing in the
+        # record to show it.
+        with pytest.raises(ValueError, match=str(shape.value)):
+            self._build(tmp_path, shape=shape, plan=live_plan())
+
+    @pytest.mark.parametrize('shape', [ShadowShape.ARCHITECT, ShadowShape.END_TO_END])
+    def test_plan_forbidden_shape_with_no_plan_is_accepted(self, tmp_path, shape):
+        assert self._build(tmp_path, shape=shape, plan=None)['plan'] is None
+
+    @pytest.mark.parametrize(
+        'shape', ['Implementer', 'consequence', '', 'plan', 'end_to_end']
+    )
+    def test_unrecognised_shape_names_the_four_valid_values(self, tmp_path, shape):
+        with pytest.raises(ValueError) as excinfo:
+            self._build(tmp_path, shape=shape)
+        message = str(excinfo.value)
+        assert repr(shape) in message
+        for valid in ShadowShape:
+            assert valid.value in message
+
+    @pytest.mark.parametrize(
+        'base_sha',
+        ['', 'abc123def456', 'main', 'z' * 40, 'A' * 40, None],
+        ids=['empty', 'short', 'refname', 'non-hex', 'uppercase', 'none'],
+    )
+    def test_base_sha_must_be_a_40_hex_sha(self, tmp_path, base_sha):
+        with pytest.raises(ValueError, match='base_sha'):
+            self._build(tmp_path, base_sha=base_sha)
+
+    @pytest.mark.parametrize('cell_id', ['', '   ', '\t\n'], ids=['empty', 'sp', 'ws'])
+    def test_cell_id_must_be_non_empty(self, tmp_path, cell_id):
+        with pytest.raises(ValueError, match='cell_id'):
+            self._build(tmp_path, cell_id=cell_id)
+
+    @pytest.mark.parametrize('task_id', ['', '   ', None], ids=['empty', 'ws', 'none'])
+    def test_task_id_must_be_non_empty(self, tmp_path, task_id):
+        # The id is load-bearing: it is half the fixture id, so an empty one
+        # silently produces 'shadow__<cell>' and two tasks collide.
+        task = live_task(id=task_id)
+        with pytest.raises(ValueError, match='id'):
+            self._build(tmp_path, task=task)
+
+    def test_missing_id_key_entirely_is_refused(self, tmp_path):
+        task = live_task()
+        del task['id']
+        with pytest.raises(ValueError, match='id'):
+            self._build(tmp_path, task=task)
+
+    @pytest.mark.parametrize(
+        'overrides',
+        [
+            {'plan': None},
+            {'shape': 'nonsense'},
+            {'base_sha': 'main'},
+            {'cell_id': ''},
+        ],
+        ids=['no-plan', 'bad-shape', 'bad-sha', 'no-cell-id'],
+    )
+    def test_the_raise_is_the_only_exit(self, tmp_path, overrides):
+        # No half-built fixture is ever returned alongside a logged complaint.
+        with pytest.raises(ValueError):
+            result = self._build(tmp_path, **overrides)
+            pytest.fail(f'expected ValueError, got a fixture: {result!r}')
