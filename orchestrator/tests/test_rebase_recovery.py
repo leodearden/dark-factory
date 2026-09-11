@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -53,16 +54,26 @@ _FEATURE = 'line1\nFEATURE\nline3\n'
 _MAIN = 'line1\nMAIN\nline3\n'
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    """Run one git command inside *repo*, under both isolation layers."""
+def _run_argv(repo: Path, argv) -> subprocess.CompletedProcess:
+    """Run an arbitrary command vector inside *repo*, under both isolation layers.
+
+    Takes the whole vector rather than trailing arguments so a caller can pass
+    ``rebase_recovery.RECOVERY_GIT`` itself, instead of re-spelling the prefix
+    the production code already defines.
+    """
     assert_isolated_git_repo(repo)
     return subprocess.run(
-        ['git', *args],
+        list(argv),
         cwd=str(repo),
         capture_output=True,
         text=True,
         env=git_env_with_ceiling(repo),
     )
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run one plain git command inside *repo*."""
+    return _run_argv(repo, ['git', *args])
 
 
 def _git_ok(repo: Path, *args: str) -> str:
@@ -580,3 +591,70 @@ class TestSweepStaleLocks:
         assert plain.exists()
         assert deep.exists()
         assert [s.path.name for s in swept.removed] == ['MERGE_RR.lock']
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: the dangling-ref recovery this task exists for
+# ---------------------------------------------------------------------------
+
+def _make_dangling(repo: Path, conflict_id: str) -> None:
+    """Delete the rr-cache directory MERGE_RR points at, leaving the ref dangling."""
+    shutil.rmtree(repo / '.git' / 'rr-cache' / conflict_id)
+
+
+class TestPreflightEndToEnd:
+    """The full guarded-recovery path against a real wedged repository.
+
+    What is deliberately NOT asserted: that an UNGUARDED ``git rebase --abort``
+    segfaults here.  It does on git 2.43.0 — measured rc 139 — but that is an
+    upstream ``rerere_clear()`` bug this task puts out of scope, and pinning it
+    would turn the day the host's git is patched into a red suite, with the fix
+    reading as the regression.  The guarded post-condition asserted instead is
+    version-independent and still fails loudly if the preflight regresses.
+    """
+
+    def test_dangling_ref_is_detected_quarantined_and_the_abort_recovers(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        pre_rebase_tip = _git_ok(repo, 'rev-parse', 'feature').strip()
+
+        result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert [r.conflict_id for r in result.dangling] == [conflict_id]
+        assert result.verdict == 'repaired'
+
+        assert result.merge_rr_backup is not None
+        assert not (repo / '.git' / 'MERGE_RR').exists()
+        assert conflict_id.encode() in result.merge_rr_backup.read_bytes()
+
+        abort = _run_argv(repo, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        assert _git_ok(repo, 'rev-parse', 'HEAD').strip() == pre_rebase_tip
+        assert _git_ok(repo, 'rev-parse', '--abbrev-ref', 'HEAD').strip() == 'feature'
+        assert result.merge_rr_backup.exists(), 'evidence must outlive the abort'
+
+    def test_healthy_mid_rebase_worktree_is_left_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        """The negative control that stops the case above passing vacuously.
+
+        Same fixture, rr-cache INTACT.  If the preflight reported dangling refs
+        here it would quarantine healthy state on every wedged rebase in the
+        fleet, and the assertion above would hold no matter what the classifier
+        did.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        original = (repo / '.git' / 'MERGE_RR').read_bytes()
+
+        result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert result.dangling == ()
+        assert result.merge_rr_backup is None
+        assert result.verdict == 'clean'
+        assert (repo / '.git' / 'MERGE_RR').read_bytes() == original
+        assert list((repo / '.git').glob('MERGE_RR.quarantined-*')) == []
