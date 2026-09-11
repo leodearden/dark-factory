@@ -74,6 +74,19 @@ tasks:
       paths:
       - shared/src/shared/cost_store.py
       expect: present
+  - name: cost-credits-and-cost-basis-columns
+    binding: capability→producer (α) — Leo chose BOTH cost columns (2026-09-11). A
+      subscription-metered arm and a token-metered arm cannot share one cost number,
+      so the row carries cost_credits alongside cost_usd plus cost_basis ('metered'
+      | 'subscription') as a typed discriminator — never inferred from the candidate
+      name (heuristic 12; INV-1).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: cost_basis
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
   - name: eval-metrics-additive-shadow-fields
     binding: capability→producer (α) — EvalMetrics is a plain dataclass, all fields
       defaulted, read-back whitelists via __dataclass_fields__; no schema, no full-set
@@ -182,16 +195,29 @@ tasks:
       paths:
       - orchestrator/tests/test_eval_candidate_bundles.py
       expect: present
-  - name: zai-base-url-resolved-by-probe-not-by-guess
-    binding: 'OPEN — Leo''s ruling at decompose. Z.ai has two non-interchangeable
-      endpoint families (Coding Plan: /api/coding/paas/v4; general: /api/paas/v4,
-      Anthropic-format /api/anthropic) and which the host key answers on is unknown;
-      a wrong constant 4xxs per cell. γ authors both and a startup probe that fails
-      loudly'
-    verdict: OPEN
+  - name: zai-coding-plan-endpoint
+    binding: 'SETTLED 2026-09-11 (Leo: use a GLM Coding Plan for GLM access). A Coding
+      Plan key works ONLY via https://api.z.ai/api/coding/paas/v4 (OpenAI protocol)
+      or https://api.z.ai/api/anthropic (Anthropic protocol); the general /api/paas/v4
+      returns an ERROR with a subscription key. The startup probe is retained, now
+      asserting the coding endpoint answers rather than discovering which family does.'
+    verdict: PASS
     delivered_check:
       kind: grep
       pattern: coding/paas/v4
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+  - name: glm-price-is-tagged-imputed-not-metered
+    binding: numeric premise — under a Coding Plan GLM is CREDIT-metered, not token-metered,
+      so the glm-5.3 / glm-5.3-flash entries in CANDIDATE_ENDPOINT_PRICES are an IMPUTED
+      list price and must be marked as such. An untagged entry would present a price
+      Leo does not pay as a measured cost; this lineage already retired hardware_time_seconds
+      GPU-imputation for exactly that reason (eval-revival decision 1).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: imputed
       paths:
       - orchestrator/src/orchestrator/evals/configs.py
       expect: present
@@ -334,6 +360,34 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/shadow_eval.py
       expect: present
+  - name: cost-ratio-guard-does-not-compare-unlike-bases
+    binding: FAIL-shaped as originally specified, resolved in ε1 — cost_ratio_ceiling
+      compares cell cost to production cost. A subscription-metered arm has cost_usd
+      near zero, so the ratio can never trip and the storm escape is SILENTLY DISARMED
+      for exactly the cheapest-looking arm (INV-4 storm-escape-required). ε1 computes
+      the ratio only within a matching cost_basis and skips with a named reason otherwise,
+      rather than returning a meaningless 0.
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: cost_basis
+      paths:
+      - orchestrator/src/orchestrator/shadow_eval.py
+      expect: present
+  - name: credit-exhaustion-is-a-named-terminal
+    binding: 'capability→producer (ε1); INV-11 — a Coding Plan carries a hard weekly
+      / 5-hour credit ceiling, so exhaustion is a real terminal condition: the cell
+      settles cap_excluded with reason credits_exhausted, never a generic failure
+      or a silent stall. Leo confirmed 2026-09-11 that the plan is eval-exclusive
+      at present, so NO contention model is built — but the ceiling still exists,
+      and ''at present'' is an assumption a later reader must be able to find.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: credits_exhausted
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
   - name: coordinator-holds-no-merge-client
     binding: rejection-mechanism, structural limb (ii) of boundary row 13 — with the
       shadow branch deleted (correction S5) a cell has no ref to enqueue; this pins
@@ -448,6 +502,19 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/evals/
       expect: present
+  - name: dual-cost-columns-credits-and-imputed-usd
+    binding: 'capability→producer (θ1) — Leo chose BOTH columns (2026-09-11): credits
+      as the real figure for a subscription arm, imputed $ as a tagged secondary so
+      one comparable statistic survives across arms. Every imputed cell is tagged
+      at the point of display; an untagged imputed number is the failure mode this
+      choice exists to avoid.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: imputed
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
   - name: n-min-floor-is-provisional-with-a-stated-basis
     binding: numeric bound — 12 pairs is a legibility floor, NOT a power calculation
       (PRD open question 2; kept unchanged by Leo at decompose). Not an accuracy bound
@@ -552,6 +619,62 @@ tasks:
       kind: manual
       reason: a reported statistic, asserted by θ2's golden
   task_id: 5392
+- label: ω
+  title: ZCode harness arm — probe drivability, then measure GLM on its own harness
+  note: Added 2026-09-11 at Leo's direction. GLM-5.3 shares a base model with GLM-5.2;
+    its gains come from post-training RL on executable agentic environments, and ZCode
+    is marketed as the Official Harness for GLM-5.3 — so measuring GLM only under
+    the Claude Code harness measures its ability to imitate a Claude-Code-shaped agent,
+    the same confound class this PRD exists to remove. Probe-gated because ZCode is
+    documented as a desktop ADE and may have no headless mode at all.
+  capabilities:
+  - name: backend-dispatch-seam-exists
+    binding: capability→producer (wired) — agents/invoke.py already dispatches backend
+      == 'claude' | 'codex' | 'gemini' | 'pi' to _invoke_claude_with_sandbox / _invoke_codex
+      / _invoke_gemini / _invoke_pi. A zcode backend is a fifth arm of an existing
+      seam, not a new mechanism.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the seam is verified on main; whether ω extends it depends on the stage-1
+        probe
+  - name: harness-control-precedent-exists
+    binding: 'capability→producer (wired) — pi-sonnet-control exists precisely to
+      isolate harness effect from model effect, pinned by TestPiSonnetControl::test_pi_control_isolates_harness_from_claude_sonnet_incumbent.
+      ω is that pattern inverted, and the Claude-harness control for the SAME model
+      is mandatory: a ZCode arm without it measures nothing.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pairing discipline is an experimental-design property asserted by ω
+        own fixtures
+  - name: zcode-is-headlessly-drivable
+    binding: OPEN — the stage-1 gate, and genuinely in doubt. ZCode is documented
+      as a desktop Agentic Development Environment. The eval runner needs a non-interactive
+      invocation, MCP server configuration (the implementer leg calls mark_step_done),
+      an argument targeting the cell's detached eval worktree rather than a GUI-selected
+      project, and a per-invocation turn/cost bound. If the first two are absent the
+      arm is UNBUILDABLE and ω lands that finding plus an escalation rather than half-building
+      a backend.
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: ZCode
+      paths:
+      - plans/
+      expect: present
+  - name: zcode-backend-and-candidate
+    binding: 'OPEN, CONDITIONAL on the stage-1 probe — _invoke_zcode in agents/invoke.py
+      plus an EvalConfig for glm-5.3 with backend=''zcode'' against the Coding Plan
+      endpoint. Deliberately NOT a mechanical check: on a probe failure this correctly
+      never lands, and a grep gate that could never be satisfied would strand any
+      future dependent.'
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: conditional on the stage-1 probe outcome; a mechanical gate could never
+        be satisfied on the probe-fail branch
+  task_id: 5399
 - label: κ1
   title: Operator gate — rule the first shadow campaign's sample rate and enable shadow_eval
     on dark_factory and reify

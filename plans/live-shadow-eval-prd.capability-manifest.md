@@ -39,6 +39,43 @@ Two further out-of-batch facts, recorded but not blocking: task **4758** is `def
 (coalesced into **4844**, which is the pending successor), and task **3637** — the
 consumer of the `architect-consequence` report — is `blocked` on **3636**, not pending.
 
+## Amendments — 2026-09-11, after the first filing
+
+Leo made two decisions after the batch was filed. Both are carried into the PRD (decisions 15
+and 16) and into the affected leaves' `details`.
+
+**GLM access is a Coding Plan** (`https://docs.z.ai/devpack/overview`). This settles the
+endpoint γ was going to probe for — a Coding Plan key works only via
+`https://api.z.ai/api/coding/paas/v4` or `https://api.z.ai/api/anthropic`, and the general
+`/api/paas/v4` errors — and introduces a measurement problem it did not have: the plan bills
+**credits** against a weekly / rolling-5h allowance, not tokens. Leo chose **both cost
+columns**. Consequences bound below: α gains `cost_credits` + `cost_basis` and the
+`credits_exhausted` reason; ε1's `cost_ratio_ceiling` must compare only within a matching
+basis, or the storm escape is permanently un-trippable for the subscription arm — present,
+green, and disarmed (INV-4); θ1/θ2 render both columns and tag every imputed figure. γ's price
+entries are explicitly imputed, which is the `hardware_time_seconds` lesson
+(`eval-framework-revival-prd.md` decision 1) applied rather than re-learned.
+
+**GLM should be measured on ZCode** — new leaf **ω** (task 5399). Recorded below.
+
+---
+
+## ω — ZCode harness arm (probe-gated)
+
+| Capability | Evidence | Verdict |
+|---|---|---|
+| a backend dispatch seam exists | `agents/invoke.py` already dispatches `backend == 'claude' \| 'codex' \| 'gemini' \| 'pi'` to `_invoke_claude_with_sandbox` / `_invoke_codex` / `_invoke_gemini` / `_invoke_pi`. A `zcode` backend is a fifth arm of an existing seam, not a new mechanism | PASS |
+| a harness-control precedent exists | `EvalConfig('pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max')` exists precisely to isolate harness effect from model effect, pinned by `TestPiSonnetControl::test_pi_control_isolates_harness_from_claude_sonnet_incumbent`. ω is that pattern inverted; the Claude-harness control for the **same** model is mandatory, because an arm without its control measures nothing | PASS |
+| **ZCode is headlessly drivable** | **the stage-1 gate, and genuinely in doubt.** ZCode is documented as a *desktop* Agentic Development Environment. The runner needs a non-interactive invocation, MCP config (the implementer leg calls `mark_step_done`), a target-working-directory argument for the cell's detached eval worktree, and a per-invocation bound. Not verifiable from the repo or the docs read at decompose | OPEN (ω's stage-1 work product; on failure it lands the finding + an escalation rather than half-building a backend) |
+| the backend and candidate themselves | conditional on stage 1. Deliberately **not** bound to a mechanical check: on a probe failure it correctly never lands, and a grep gate that could never be satisfied would strand any future dependent | OPEN |
+
+**Why the arm is worth a leaf.** GLM-5.3 shares a base model with GLM-5.2; the entire gain is
+post-training RL on executable agentic environments, and ZCode is marketed as the Official
+Harness for GLM-5.3. A GLM verdict taken only under the Claude Code harness measures imitation
+rather than capability — the same confound that made the v1 fable verdict uninterpretable, which
+is the founding motivation of this PRD. Measuring it from only one side would repeat the error
+the instrument exists to remove.
+
 ---
 
 ## α — cell store, config, events and the production-metric accessors

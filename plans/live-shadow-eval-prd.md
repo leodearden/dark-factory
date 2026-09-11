@@ -300,11 +300,15 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     ($1.40/$4.40), `glm-5.3-flash` ($0.15/$0.50 **list** — the 50% promo expired
     2026-09-09 24:00 UTC+8 and aggregators still quote it) and `MiniMax-M3`
     ($0.30/$1.20 native, base `https://api.minimax.io/v1`). The March-dated
-    `codex-gpt54*` / `gemini-*` entries are retired. **The Z.ai base URL is the one part not
-    settled**: Z.ai runs two non-interchangeable endpoint families (Coding Plan
-    `/api/coding/paas/v4` vs general `/api/paas/v4`; Anthropic wire format `/api/anthropic`)
-    and which the host's key answers on is unknown, so γ authors both constants plus a startup
-    probe that fails loudly rather than 4xx-ing per cell. **[S7]** γ also adds the literal slate
+    `codex-gpt54*` / `gemini-*` entries are retired. **Access is a GLM Coding Plan** (Leo, 2026-09-11,
+    `https://docs.z.ai/devpack/overview`), which settles the endpoint: a Coding Plan key works
+    **only** via `https://api.z.ai/api/coding/paas/v4` (OpenAI protocol) or
+    `https://api.z.ai/api/anthropic` (Anthropic protocol) — the general `/api/paas/v4` returns an
+    **error** with a subscription key. γ keeps a startup probe, now asserting that endpoint
+    answers rather than discovering which family does. A Coding Plan covers GLM-5.3 and
+    GLM-5.3-Flash, so both slate entries run on one subscription. It is **credit-metered, not
+    token-metered**, so the GLM entries in `CANDIDATE_ENDPOINT_PRICES` are an **imputed** list
+    price and must be tagged as such — see decision 16. **[S7]** γ also adds the literal slate
     pin, because the existing bundle tests assert against the constants they protect and would
     stay green on any value. The `eval-ofat` candidate-selector gap is **not** fixed: the
     coordinator is the screen.
@@ -321,14 +325,44 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     against what the variant does for a capable model. The production consumer beyond this
     PRD is a routing flip on a favourable report, filed by ruling as in decision 13; the
     knob ships default `whole-plan` and changes nothing until then.
+15. **(Leo) The agent harness is an eval axis, and GLM must be measured on its own.** GLM-5.3
+    shares a base model with GLM-5.2; Z.ai attributes the whole gain to roughly a further month
+    of post-training RL on executable agentic environments with stronger verifiers, and **ZCode
+    — Z.ai's own agentic development environment — is marketed as the Official Harness for
+    GLM-5.3**. Measuring GLM only under the Claude Code harness therefore measures its ability to
+    imitate a Claude-Code-shaped agent, not its capability: the same confound class this PRD
+    exists to remove, arriving from the other direction. `EvalConfig.backend` already dispatches
+    `claude | codex | gemini | pi` in `agents/invoke.py`, so a `zcode` backend is a fifth arm of
+    an existing seam. **The arm is probe-gated** (leaf ω): ZCode is documented as a *desktop*
+    ADE, so whether it can be driven headlessly with MCP at all is genuinely in doubt, and an
+    unbuildable arm is a real answer to land rather than a backend to half-build. **The
+    Claude-harness control for the same model is mandatory** — the existing `pi-sonnet-control`
+    candidate is exactly this pattern, and an arm without its control measures nothing.
+16. **A subscription-metered arm gets two cost columns, and the modelled one is tagged (Leo).**
+    A GLM Coding Plan bills **credits** against a weekly and rolling-5h allowance, not tokens, so
+    a GLM cell meters no dollars. Writing `0` would make the cheapest-looking arm appear free and
+    corrupt C5's headline statistic; writing a list price into the same field would present a
+    price Leo does not pay as a measured cost — the mistake this lineage already corrected once
+    when `eval-framework-revival-prd.md` decision 1 retired the `hardware_time_seconds`
+    GPU-imputation machinery. So the row carries `cost_credits` **and** `cost_usd`, plus a
+    `cost_basis` discriminator (`metered` | `subscription`) that is a typed field, never inferred
+    from a candidate name (heuristic 12). The report prints both, tagging every imputed figure at
+    the point of display. **The Coding Plan is eval-exclusive at present** (Leo, 2026-09-11), so
+    no quota-contention model is built — but the ceiling is real, so exhaustion settles a cell
+    `cap_excluded` with reason `credits_exhausted`, and the `cost_ratio_ceiling` storm escape
+    compares only within a matching `cost_basis`: across bases it would be permanently
+    un-trippable for the subscription arm, a guard present and green and disarmed (INV-4).
 
 ## Pre-conditions for activating
 
 - Tasks **4757** and **3096** landed (isolation). Phase 1 leaves may proceed; Phase 2's
   dispatching leaf and everything after it depend on both.
-- Provider keys present in the orchestrator's environment for any endpoint bundle to be
-  sampled (`ZAI_API_KEY`, `MINIMAX_API_KEY`, …); a missing key is a per-candidate
-  `shadow_cell_skipped reason=no_credentials`, never a run that 401s.
+- Provider credentials present in the orchestrator's environment for any endpoint bundle to be
+  sampled — a **GLM Coding Plan** key for the GLM arms (paired with the coding endpoint, not the
+  general one), `MINIMAX_API_KEY`, a Codex CLI ≥ 0.153.0 for `gpt-6-astra`, … A missing
+  credential is a per-candidate `shadow_cell_skipped reason=no_credentials`, never a run that
+  401s; a Coding Plan whose allowance is spent settles the cell `cap_excluded` with reason
+  `credits_exhausted`.
 - Nothing else is novel: every substrate item in §Premise exists on main.
 
 ## Cross-PRD relationship
@@ -367,7 +401,10 @@ shadow_cells(
   reference_kind TEXT,                 -- landed|none  (NULL until settled)
   reference_sha TEXT,                  -- merge_sha when landed
   result_path TEXT,                    -- EvalResult JSON once saved
-  cost_usd REAL NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,    -- imputed for a subscription-metered arm
+  cost_credits REAL NOT NULL DEFAULT 0, -- the REAL figure for a Coding Plan arm
+  cost_basis TEXT NOT NULL,            -- 'metered' | 'subscription'. A typed discriminator,
+                                       -- never inferred from the candidate name (heuristic 12)
   run_id TEXT,                         -- the orchestrator run that opened it; startup
                                        -- reconciliation reads this to find orphans
   opened_at TEXT NOT NULL, running_at TEXT, settled_at TEXT,
@@ -395,7 +432,7 @@ class ShadowCoordinator:
     def should_open(self, task: dict, shape: str, candidate: EvalConfig) -> OpenDecision:
         """Pure. Returns OpenDecision(open: bool, reason: str). Reasons are a closed
         vocabulary: sampled_out | no_credentials | isolation_unavailable | budget_exhausted |
-        concurrency_full | host_saturated | shape_disabled | already_open."""
+        credits_exhausted | concurrency_full | host_saturated | shape_disabled | already_open."""
 
     async def on_phase(self, task_id: str, phase: str, entering: bool) -> list[str]:
         """Harness-side hook: called for every phase_enter/phase_exit. Opens cells whose
@@ -467,10 +504,14 @@ site. A cell settles exactly once.
 ### C5 — report (`orchestrator eval-shadow report`)
 
 Per `(shape, candidate)`: `pairs`, `unpaired`, `cap_excluded`, `expired`, `failed`; the
-shape's primary outcome as paired mean difference with a 95% bootstrap CI; `$ per usable
-outcome` for candidate and incumbent; `terminal_kind` split; and `n_min` (contract: a
-line whose `pairs < n_min` is printed with an `UNDERPOWERED` tag, not hidden). Machine
-form: `--json` emits the same rows.
+shape's primary outcome as paired mean difference with a 95% bootstrap CI; **both cost
+columns** — `credits per usable outcome` and `$ per usable outcome`, for candidate and incumbent
+— with **every imputed figure tagged at the point of display** (decision 16; a row whose
+`cost_basis` is `subscription` has a modelled dollar figure, and if the display cannot carry the
+tag it omits the dollar figure rather than printing it bare); `terminal_kind` split; and `n_min`
+(contract: a line whose `pairs < n_min` is printed with an `UNDERPOWERED` tag, not hidden).
+Machine form: `--json` emits the same rows, `cost_basis` included so a machine consumer can also
+tell a measured cost from a modelled one.
 
 ### C6 — config (`ShadowEvalConfig`, green-tier hot-reloadable, under `shadow_eval:`)
 
@@ -579,6 +620,24 @@ for the reason vocabulary). Per-leaf capability→evidence bindings:
   Modules: `orchestrator/evals`, `orchestrator/agents`. Prereqs: α, ν. Depends
   (out-of-batch): **4757**, **3096**.
 
+- **ω — ZCode harness arm** *(leaf, probe-gated, task **5399**)*. **Stage 1 is a gate:** probe
+  whether ZCode can be driven by the eval runner at all — a headless/non-interactive invocation,
+  MCP server config (the implementer leg calls `mark_step_done`), an argument targeting the
+  cell's detached eval worktree, and a per-invocation turn/cost bound. ZCode is documented as a
+  *desktop* ADE, so the first two are genuinely in doubt. **If either is absent, stop**: land the
+  finding as a committed note under `plans/` and escalate for a ruling on an alternative harness
+  (the Coding Plan also supports OpenCode and Cline, both CLI-shaped). An unbuildable arm is a
+  real answer; what must not happen is a reader unable to tell "measured impossible" from "not
+  done" (INV-11). **Stage 2, conditional:** `_invoke_zcode` as a fifth arm of
+  `agents/invoke.py`'s existing backend dispatch, plus a `glm-5.3` candidate with
+  `backend='zcode'` against the Coding Plan endpoint — **with the same model on the Claude
+  harness as its mandatory paired control** (the `pi-sonnet-control` pattern inverted). **Signal:**
+  whichever branch fires, executed — the committed probe finding plus escalation, or a cell for
+  the ZCode candidate running through `run_eval` against a real fixture alongside its
+  Claude-harness control over the same fixture. Modules: `orchestrator/agents`,
+  `orchestrator/evals`, `plans/`. Prereqs: γ (slate constants + Coding Plan endpoint), δ (same
+  file: `agents/invoke.py`).
+
 **Phase 2 — vertical slice (the integration gate)**
 
 - **ε1 — coordinator core** *(leaf, task **5387**)*. `orchestrator/shadow_eval.py`:
@@ -654,7 +713,8 @@ and resolving the escalation re-runs the check and re-escalates.
   `reload_config`, reading the returned `applied` / `restart_required` dispositions rather than
   the top-level `reloaded` flag. **Signal:** the escalation is filed and resolved with
   `shadow_eval.*` confirmed `applied` on both running orchestrators. No production config change
-  beyond enabling the measurement. Prereqs: θ2, and 4757/3096 landed (δ's probe is what tells
+  beyond enabling the measurement. Prereqs: θ2, ω (the slate Leo rules on must
+  include, or knowingly exclude, the ZCode arm), and 4757/3096 landed (δ's probe is what tells
   the truth about that, not the task statuses).
 - **κ2 — the η-gate ruling** *(deterministic pure gate with a `delayed` milestone of 14 days
   anchored on κ1 reaching `done`; task **5394**)*. The gate criterion is `pairs ≥ n_min` for the
@@ -694,10 +754,12 @@ Resolved at decompose on 2026-09-11 are struck through with their resolution; th
 
 1. ~~**Exact provider model strings and list prices for γ.**~~ **RESOLVED** (Leo, after a live
    market check on 2026-09-10) — see decision 12 for the settled slate. γ is authored with
-   authoritative constants, not placeholders. **Still open, narrowed:** which Z.ai endpoint
-   family the host's `ZAI_API_KEY` answers on (Coding Plan `/api/coding/paas/v4` vs general
-   `/api/paas/v4`). Leo's ruling: γ authors both plus a startup probe that fails loudly, so this
-   never degrades into a silent per-cell 4xx.
+   authoritative constants, not placeholders. **Endpoint also RESOLVED** (Leo, 2026-09-11): access is a
+   **GLM Coding Plan**, so the constant is `https://api.z.ai/api/coding/paas/v4` (OpenAI protocol)
+   or `https://api.z.ai/api/anthropic` (Anthropic protocol) — the general `/api/paas/v4` errors
+   with a subscription key. γ keeps the startup probe as a cheap fail-loud assertion. The
+   consequence — credit metering rather than token metering — is decision 16, not an open
+   question.
 2. **`n_min` calibration.** 12 pairs is a screen floor chosen for legibility, not a power
    calculation — **confirmed unchanged by Leo at decompose**. **Suggested resolution:** θ2
    prints the observed pair variance so κ2's ruling can state the power it had; recalibrate in a
