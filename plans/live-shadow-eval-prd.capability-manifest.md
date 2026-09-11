@@ -14,8 +14,15 @@ Code cited as `path::symbol` throughout — never `file:line` (CLAUDE.md).
 ## Substrate corrections made at decompose
 
 Eight PRD §Premise / §Boundary claims were re-measured and did not hold as written. Each
-is resolved below and carried into the owning leaf's brief. The PRD itself is NOT edited
-(its §Premise is a dated snapshot); this manifest is the correction's home.
+is resolved below and carried into the owning leaf's brief.
+
+**The PRD was subsequently corrected in place** (2026-09-11, at Leo's direction — a design
+document that stores measured-false premises misleads every later reader). `live-shadow-eval-prd.md`
+now states only what is true, tagging the corrected claims **[S1]**–**[S8]** and pointing here.
+This table is the *provenance* record — what was originally claimed, what was measured, and
+which leaf absorbed the resolution — and is the only place the superseded claims are written
+down (INV-9 `one-fact-one-home`: the PRD is the home of the design, this is the home of the
+correction event).
 
 | # | PRD claim | Measured | Resolution |
 |---|---|---|---|

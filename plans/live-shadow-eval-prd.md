@@ -10,8 +10,16 @@ mechanism runs in every orchestrator process, so reify is covered by the same co
 dispatch path and the merge-lane landing event), and **two cross-PRD consumers** (the fable
 η gate and the adaptive-routing flip).
 
-> **Code anchors** verified against main `32d0f6d1a7` (`2026-09-10`). Main moves fast —
-> cite-by-symbol; re-locate at implementation time.
+> **Code anchors** verified against main `32d0f6d1a7` (`2026-09-10`), re-measured against
+> main at decompose on `2026-09-11`. Main moves fast — cite-by-symbol; re-locate at
+> implementation time.
+
+> **Corrections.** Eight premises written here on 2026-09-10 were measured false or unbuilt
+> during the decompose gate walk and are **fixed in place** throughout this document, tagged
+> **[S1]**–**[S8]** where they bite. What was originally claimed, what was measured, and which
+> leaf absorbed each resolution is recorded once — in
+> `plans/live-shadow-eval-prd.capability-manifest.md` §"Substrate corrections made at
+> decompose". This document states only what is true (INV-9 `one-fact-one-home`).
 
 ## Goal
 
@@ -35,8 +43,8 @@ transcripts or logs.
 
 **Named consumers (G1):**
 
-1. **esc-3637-1 / task 3637** (fable-trial-v2 η, the admission re-ruling gate, pending
-   since 2026-08-30). Leo ruled 2026-09-10 that *this PRD is the redesigned eval set* the
+1. **esc-3637-1 / task 3637** (fable-trial-v2 η, the admission re-ruling gate, open since
+   2026-08-30; the task itself is `blocked` on task 3636). Leo ruled 2026-09-10 that *this PRD is the redesigned eval set* the
    v2 decision record deferred to. The gate's ruling consumes this PRD's report over the
    `architect-consequence` shape for `architect-fable-max` vs `architect-opus-max`.
 2. **`plans/adaptive-model-routing-prd.md`** — any production routing change stays a
@@ -48,12 +56,12 @@ transcripts or logs.
 
 ## Background — why the frozen corpus cannot answer the question
 
-Measured 2026-09-09 against main:
+Measured 2026-09-09 against main (fixture counts re-counted 2026-09-11):
 
 | Corpus | Fixtures | With frozen plan | Base age | Commits behind HEAD |
 |---|---|---|---|---|
 | `evals/tasks/` | 22 | **6** (five are April fixtures) | Apr–Jul 2026 | 7k–65k |
-| `evals/tasks_hard_v2/` | 39 | 3 | Apr–Jul 2026 | 6k–65k |
+| `evals/tasks_hard_v2/` | 42 | 3 | Apr–Jul 2026 | 6k–65k |
 
 - The **implementer** screen needs a frozen plan; five of the six plan-bearing fixtures are
   the April tasks (`df_task_12/13/18`, `reify_task_12/27`) — a codebase 59k–65k commits
@@ -61,12 +69,14 @@ Measured 2026-09-09 against main:
 - **Historical replay is incoherent by construction.** The eval worktree shares the live
   object DB, refs, task DB and escalation queue, so an honest architect sees the task
   already landed and correctly declines — 47 of 53 cells in fable-trial-v2 tranche 1
-  (`plans/fable-architect-trial-v2-decision-2026-08-30.md` §8). Tasks 4758/4844 try to
-  patch the replay frame; a live eval makes the frame moot.
+  (`plans/fable-architect-trial-v2-decision-2026-08-30.md` §8). Task 4844 (which absorbed
+  4758 and 4765) tries to patch the replay frame; a live eval makes the frame moot.
 - The non-Claude candidate bundles (`evals/configs.py::claude_endpoint_candidates`,
   `codex_pi_candidates`) have **never produced a result**: `eval-ofat` hardcodes
-  `ofat_candidates()` and excludes them, the slate is pinned to July-12 model ids, and no
-  provider key is present on the host.
+  `ofat_candidates()` and excludes them, and the slate is stale — the retired
+  `codex-gpt54*` / `gemini-*` entries in `EVAL_CONFIGS` date to **2026-03-19**
+  (`d3b14de8107`), and the endpoint bundles still name `MiniMax-M2.5`, `glm-5.2`,
+  `deepseek-v4`, `kimi-latest`.
 - **The v1 fable verdict tied on plan quality** (0.919 vs 0.909, six near-ceiling
   fixtures); the judge scores a plan against the incumbent's landed diff, so a better plan
   that takes a different route is penalised. Leo's live hypothesis — *Opus can plan; Fable
@@ -75,30 +85,103 @@ Measured 2026-09-09 against main:
 
 ## Premise (G6)
 
-- `run_eval`, `run_architect_eval`, `run_end_to_end` (`evals/runner.py`) accept a fixture
-  path and are driven end-to-end by the July revival; their fixture contract is the
-  `load_task` dict (`id`, `project_root`, `pre_task_commit`, `task_definition`,
-  `verify_commands`, `plan`, `reference.post_task_commit`, timeouts). **Verified.**
-- Production persists the accepted plan durably at `.task-meta/<task>/plan.json`
-  (`artifacts.py::TaskArtifacts.write_plan`, written by `mcp/plan_tools.py`). **Verified.**
-- The task record carries `metadata.branch_base_sha` (the dispatch base). **Verified.**
-- `EventType.phase_enter` / `phase_exit` carry `(task_id, phase)`;
-  `EventType.merge_finalized` carries `branch`, `state`, `merge_sha`, `snapshot_tip`,
-  `superseded_by`; `EventStore.latest_merge_finalized(branch=)` and
+Re-measured against main at decompose, 2026-09-11. Corrected claims carry their **[S*]** tag;
+see the Corrections note in the header for where the provenance lives.
+
+- `run_eval`, `run_architect_eval`, `run_end_to_end` (`evals/runner.py`) accept a fixture path
+  and are driven end-to-end by the July revival. **Verified.** Their fixture contract is the
+  `load_task` dict, and it is **wider** than the keys first listed here: beyond `id`,
+  `project_root`, `pre_task_commit`, `task_definition`, `verify_commands`, `plan`,
+  `reference.post_task_commit` and `timeout_minutes`, consumers also read `setup_commands`,
+  `modules`, `name`, `max_execute_iterations`, `max_review_cycles`,
+  `judge_after_each_iteration`, `max_architect_turns` and `adversarial`. `run_eval` raises
+  `ValueError` on a falsy `plan`.
+- Production persists the accepted plan durably as `plan.json` under the task's meta root
+  (`artifacts.py::TaskArtifacts.write_plan`, writer call site `mcp/plan_tools.py::_create_plan`).
+  **[S8]** That root comes from `TaskArtifacts.meta_root_for(worktree_base, worktree_name)`, so
+  the real path is `<worktree_base>/.task-meta/<worktree_name>/plan.json` — keyed by **worktree
+  name**, not by task id.
+- The task record carries `metadata.branch_base_sha` (the dispatch base), written by
+  `workflow.py::TaskWorkflow._setup_worktree_and_artifacts` immediately after worktree creation
+  — and written **soft-failing**, so a cell must treat its absence as a skip with a reason
+  rather than guess HEAD. **Verified.**
+- `EventType.phase_enter` / `phase_exit` carry `(task_id, phase)` and are emitted from exactly
+  one site, `workflow.py::TaskWorkflow._enter_phase`. `EventType.merge_finalized` carries
+  `branch`, `state`, `merge_sha`, `snapshot_tip`, `superseded_by` (plus `request_id`,
+  `generation`, `reason`, `landed_via_chain`) at its emit site — the `_on_finalized` closure in
+  `merge_queue.py::enqueue_merge_request`. `EventStore.latest_merge_finalized(branch=)` and
   `fetch_events_by_type` exist. **Verified.**
-- `EvalMetrics` already carries `terminal_kind` (task 4760), `cap_tainted`,
-  `role_under_test`, `cost_source`; `EvalResult` is persisted by `save_result` as
-  `<task>__<config>__<run_id>.json`. **Verified.**
-- The dispatch load gate is `scheduler.py::_phase_psi_gate` over `shared.psi::saturated`.
-  **Verified.**
-- The EXECUTE phase already re-invokes the implementer while `artifacts.get_pending_steps()`
-  is non-empty, bounded by `config.max_execute_iterations` (`workflow.py::_execute_iterations`);
-  the brief is assembled by `briefing.py::build_implementer_prompt` from the plan's
-  `pending`/`done` steps and today ends "execute the next pending steps … stop at a logical
-  boundary"; `judge_after_each_iteration` exists; `EvalConfig` is a plain dataclass that
-  `build_eval_orch_config` maps onto per-role config. A one-step variant is therefore a brief
-  branch plus bound scaling, not a workflow change. **Verified.** No prior design or task for
-  step-wise execution exists in plans, docs, briefs, tasks or memory (searched 2026-09-10).
+  **[S4]** But `merge_finalized` has **no consumer inside the orchestrator process outside the
+  merge worker**: `TaskWorkflow` takes its merge outcome from the awaited `MergeRequest.result`
+  future, not from the event. The settle hook is therefore a further `add_done_callback` on that
+  future, where two independent callbacks already coexist. Relatedly,
+  `_await_cancellable`'s `on_soft_cancel` is the **only** pre-existing callback seam on the
+  harness — `EventStore` has no subscribe API — so the phase hook is the first observer.
+- `evals/snapshots.py::create_eval_worktree` places a worktree at
+  `<project_root.parent>/<project_root.name>-eval-worktrees/<id>/run-<8hex>/` — a **sibling** of
+  `project_root`, outside `.worktrees/`. **Verified.**
+  **[S5]** It uses `git worktree add --detach`, so it creates **no ref at all**. A cell has no
+  branch and nothing it could enqueue. The four worktree reapers
+  (`git_ops.py::prune_stale_merge_worktrees`, `::reap_interactive_worktrees`,
+  `harness.py::_reap_orphan_worktrees`, `::_run_interactive_worktree_reaper_pass`) all filter on
+  the worktree's parent being `worktree_base` (`GitConfig.worktree_dir`, default `.worktrees`),
+  so the eval root is already structurally invisible to them and **no exclusion needs adding**.
+- `EvalMetrics` already carries `terminal_kind` (task 4760), `cap_tainted`, `role_under_test`,
+  `cost_source`; `EvalResult` is persisted by `save_result` as
+  `<task>__<config>__<run_id>.json`. Both are plain dataclasses with every field defaulted, and
+  every read-back site whitelists via `__dataclass_fields__`, so additive fields
+  (`shadow_cell_id`, `reference_kind`) are safe. **Verified.**
+- **[S1]** Production's paired metrics are **not readable today**, and the two sources have
+  different owners. `task_results` belongs to `orchestrator/run_store.py::RunStore`, whose only
+  accessor is `get_task_cost` (an aggregate cost float — there is no outcome accessor). The
+  *invocation ledger* is **`shared/src/shared/cost_store.py::CostStore`**'s `invocations` table
+  — a separate class in a separate package that merely shares the `runs.db` **file** with
+  `RunStore`/`EventStore` — and it exposes only window aggregates; per-task filtering is done
+  today by callers hand-writing SQL (`harness.py::Harness._auto_eval_budget_used_24h`). Leaf α
+  builds both accessors, and retires that hand-written site.
+- The dispatch load gate is `scheduler.py::_phase_psi_gate` over `shared.psi`. **Verified** —
+  noting `saturated(cfg)` is a **method on the frozen `PsiSample` dataclass**, not a module-level
+  function, and returns `False` whenever `read_ok` is `False` (a deliberate fail-open).
+- A usage-cap hit is the **boolean return** of
+  `shared/src/shared/usage_gate.py::UsageGate.detect_cap_hit` — not an exception, and not a field
+  on a result. `SessionBudgetExhausted` is a different mechanism (local session budget) and must
+  not be conflated with it. `evals/runner.py::_build_eval_usage_gate` returns `None` fail-open.
+  **Verified.** (`orchestrator/usage_gate.py` is a re-export shim; cite the `shared` path.)
+- The EXECUTE phase already re-invokes the implementer while `artifacts.get_pending_steps()` is
+  non-empty, bounded by `config.max_execute_iterations` (`workflow.py::_execute_iterations`,
+  whose cap check subtracts `metrics.progress_resume_total` — a scaled bound must too); the brief
+  is assembled by `briefing.py::build_implementer_prompt` from the plan's `pending`/`done` steps
+  and today ends "Execute the next pending steps in TDD order … Stop at a logical boundary";
+  `judge_after_each_iteration` exists; `EvalConfig` is a plain dataclass that
+  `build_eval_orch_config` maps onto per-role config; `get_config_by_name` is a linear scan
+  returning `None` on a miss. A one-step variant is therefore a brief branch plus bound scaling,
+  not a workflow change. **Verified.** No prior design or task for step-wise execution exists in
+  plans, docs, briefs, tasks or memory (searched 2026-09-10).
+  **[S3]** But the iteration log's `steps_completed` is a **list**, computed as a set difference
+  of before/after `done` step ids — zero, one or many per iteration. "Exactly one step per
+  invocation" is what leaf ν *delivers*, never a property to assert of today's mechanism.
+- **[S6]** **Sandboxing does not reach eval invocations.** `evals/runner.py`, `evals/compare.py`
+  and `evals/judge.py` all call `agents/invoke.py::invoke_agent` **without** `sandbox_modules`,
+  and the entire wrap path inside `_invoke_claude_with_sandbox` is gated on that argument being
+  non-`None`; `EVAL_PROFILE` carries no sandbox key. Landlock wrapping for shadow implementer
+  legs is plumbing leaf δ must build, not a capability to inherit.
+- **[S2]** **A new config block is not green-tier by imitation.**
+  `OrchestratorConfig.auto_eval_redo_budget_usd` — the budget pattern this PRD copies — is **not**
+  in `config.py::RELOADABLE_FIELDS`; it is restart-tier. Hot reload requires an explicit
+  `_submodel_leaf_paths('shadow_eval', ShadowEvalConfig)` registration, which leaf α does. (A new
+  field on an *already-registered* submodel needs no further edit.)
+- **[S7]** **The candidate-slate tests pin wiring, not values.**
+  `test_eval_candidate_bundles.py` and `test_eval_codex_pi_bundles.py` assert against the
+  constants themselves (`MINIMAX_MODEL`, `GLM_MODEL`, `CODEX_RUST_MODEL`, `PI_CONTROL_MODEL`) and
+  check prices only for being positive, so changing a model id's *value* leaves both suites
+  green. A placeholder constant would **not** be rejected. Leaf γ adds the literal pin that makes
+  the slate's values enforceable.
+- `EventType` has no registry and no full-set-pinning test, so adding a member is free — and
+  unbacked by any collision check. A new closed vocabulary must carry its own uniqueness
+  assertion. **Verified.**
+- `orchestrator/cli.py::main` is a **click** group whose every existing `eval*` command is a flat
+  sibling; there is no nested sub-group anywhere, and nothing pins the command set. An
+  `eval-shadow` group is a new pattern that breaks nothing. **Verified.**
 - The harness's `_maybe_auto_eval` sibling-task redo hook has fired **0 times ever**
   (`plans/author-declared-complexity-prd.md` §Out of scope) and files real tasks; it is
   **not** reused (decision 3).
@@ -114,8 +197,9 @@ harness already emits, decides — deterministically, per sampled task and candi
 **cells** to open, runs each cell through the existing eval runners against a **live
 fixture** built from the production task, and **settles** each cell when production's own
 outcome for that task becomes known. Cells are rows in a `shadow_cells` table; results are
-`EvalResult` JSONs; branches are `shadow/<task>/<cell_id>`; nothing about a cell is a task,
-an escalation, a merge request or a memory write.
+`EvalResult` JSONs; the cell's throwaway worktree is **detached and carries no ref at all**,
+so a cell has no branch; nothing about a cell is a task, an escalation, a merge request or a
+memory write.
 
 ### The four shapes
 
@@ -149,8 +233,10 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
    daily USD cap, `max_concurrent`, the host `saturated()` gate and the candidate's
    own key presence. Every negative decision is a `shadow_cell_skipped` event with a
    reason (INV-11).
-2. **Open.** Write the `shadow_cells` row, build the live fixture, create the
-   `shadow/<task>/<cell_id>` worktree at `branch_base_sha` (`snapshots.py::create_eval_worktree`).
+2. **Open.** Write the `shadow_cells` row, build the live fixture, create the detached eval
+   worktree at `branch_base_sha` via `snapshots.py::create_eval_worktree`, passing
+   `task_id=f"shadow_{task}_{cell_id}"` — already the fixture `id` of contract C3, so the
+   helper is reused byte-unchanged and the cell's path is recorded in `worktree_path`.
 3. **Run.** Dispatch through the existing runner for the shape, under the shadow
    invocation profile: `EVAL_PROFILE` + `strict_mcp_config=True` + null-routed memory +
    the landlock sandbox for implementer legs. A usage-cap hit ends the cell as
@@ -180,8 +266,10 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
    (verify gates, review outcome, plan structure, `terminal_kind`) and tagged
    `reference_kind=none`; it is never scored as a pass or a fail by default.
 5. **Pairing is within task.** Every report statistic is a paired difference
-   (candidate cell minus production's own metrics for the same task, read from
-   `task_results` / the invocation ledger), with a bootstrap CI over pairs. Unpaired
+   (candidate cell minus production's own metrics for the same task, read through the two
+   accessors leaf α builds — `RunStore.get_task_outcome` over `task_results` for the outcome
+   and `CostStore.task_invocation_cost` over the `invocations` ledger for cost **[S1]**, never
+   from logs and never from SQL hand-written elsewhere), with a bootstrap CI over pairs. Unpaired
    cells (production unreferenced *and* the shape needs a reference) are counted, not
    averaged in.
 6. **Cap policy.** A shadow cell that hits a usage cap is `cap_excluded`, not retried and
@@ -205,10 +293,21 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     the `EvalResult` JSON carries the row id and the report renders from rows. No cell
     fact is copied into task metadata, escalations or memory.
 12. **Candidate slate refresh is folded in (Leo).** One leaf updates the endpoint and
-    Codex model ids and prices in `evals/configs.py` with strings Leo supplies (Codex
-    Sol/Astra, GLM-5.3 and GLM-5.3-flash, the current MiniMax, and whatever else he
-    names). The `eval-ofat` candidate-selector gap is **not** fixed: the coordinator is
-    the screen.
+    Codex model ids and prices in `evals/configs.py`. **Settled at decompose** (Leo, after a
+    live market check on 2026-09-10) — these are authoritative constants, not placeholders:
+    Codex arms `gpt-6-astra` ($10/$50 per 1M in/out; needs Codex CLI ≥ 0.153.0),
+    `gpt-5.6-sol` ($4/$20) and `gpt-5.6-terra` ($2/$12); endpoint arms `glm-5.3`
+    ($1.40/$4.40), `glm-5.3-flash` ($0.15/$0.50 **list** — the 50% promo expired
+    2026-09-09 24:00 UTC+8 and aggregators still quote it) and `MiniMax-M3`
+    ($0.30/$1.20 native, base `https://api.minimax.io/v1`). The March-dated
+    `codex-gpt54*` / `gemini-*` entries are retired. **The Z.ai base URL is the one part not
+    settled**: Z.ai runs two non-interchangeable endpoint families (Coding Plan
+    `/api/coding/paas/v4` vs general `/api/paas/v4`; Anthropic wire format `/api/anthropic`)
+    and which the host's key answers on is unknown, so γ authors both constants plus a startup
+    probe that fails loudly rather than 4xx-ing per cell. **[S7]** γ also adds the literal slate
+    pin, because the existing bundle tests assert against the constants they protect and would
+    stay green on any value. The `eval-ofat` candidate-selector gap is **not** fixed: the
+    coordinator is the screen.
 13. **No production config change** is applied by anything in this PRD (as every eval
     PRD in this lineage).
 14. **(Leo) The one-step implementer harness variant is an eval axis, with a control.**
@@ -242,7 +341,7 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
 | `adaptive-model-routing-prd.md` | **produces** | a favourable report as the evidence a flip task cites | that PRD's flip task, filed by Leo's ruling — never by this PRD |
 | `load-throttle-harmonisation-prd.md` | **consumes** | `shared.psi::saturated()` / `tripping_metric()` for the open decision | that PRD; this PRD adds no arm |
 | `usage-gate-model-scoped-caps-prd.md` | **consumes** | `UsageGate` via `_build_eval_usage_gate`; `cap_hit` | that PRD; the `cap_excluded` disposition is this PRD's |
-| `os-sandbox-worktree-containment-prd.md` | **consumes** | landlock wrapping for implementer legs in `shadow/` worktrees | that PRD; this PRD passes the worktree path, nothing more |
+| `os-sandbox-worktree-containment-prd.md` | **consumes** | landlock wrapping for implementer legs in the cell's eval worktree | that PRD owns the wrapper (`agents/sandbox_dispatch.py::wrap_command` → `agents/landlock.py::build_landlock_command`). **[S6]** No eval call site passes `sandbox_modules` today, so the wrap never engages for evals — **δ owns that plumbing**; it is not inherited |
 | the harness `_maybe_auto_eval` hook | **none** | not reused (decision 3) | — |
 
 ## Contract (H)
@@ -252,6 +351,8 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
 ```
 shadow_cells(
   cell_id TEXT PRIMARY KEY,            -- ulid
+  parent_cell_id TEXT,                 -- consequence leg 1 -> leg 2. A real edge, never a
+                                       -- cell_id string prefix (heuristic 12; INV-1)
   project_id TEXT NOT NULL,
   task_id TEXT NOT NULL,               -- the production task
   shape TEXT NOT NULL,                 -- implementer|architect|architect-consequence|end-to-end
@@ -259,6 +360,7 @@ shadow_cells(
   incumbent TEXT NOT NULL,             -- the pinned incumbent config name for the role
   stratum TEXT NOT NULL,               -- "<repo>×<kind>×<path>"
   base_sha TEXT NOT NULL,              -- task.metadata.branch_base_sha at open
+  worktree_path TEXT,                  -- the DETACHED eval worktree. A cell has no branch [S5]
   plan_source TEXT,                    -- 'production' (implementer) | 'candidate' (consequence leg 2) | NULL
   state TEXT NOT NULL,                 -- sampled|opened|running|awaiting_reference|settled|cap_excluded|expired|failed
   reason TEXT,                         -- populated on cap_excluded|expired|failed
@@ -266,6 +368,8 @@ shadow_cells(
   reference_sha TEXT,                  -- merge_sha when landed
   result_path TEXT,                    -- EvalResult JSON once saved
   cost_usd REAL NOT NULL DEFAULT 0,
+  run_id TEXT,                         -- the orchestrator run that opened it; startup
+                                       -- reconciliation reads this to find orphans
   opened_at TEXT NOT NULL, running_at TEXT, settled_at TEXT,
   settle_deadline TEXT NOT NULL,       -- opened_at + shadow_eval.settle_deadline
   owner TEXT NOT NULL DEFAULT 'shadow_coordinator'
@@ -274,7 +378,12 @@ shadow_cells(
 
 Invariants: a `(task_id, shape, candidate)` triple opens at most once per trial index;
 `state` transitions are monotone along the lifecycle above; every non-`settled` terminal
-state carries a non-empty `reason`; `settle_deadline` is never NULL (INV-7).
+state carries a non-empty `reason`; `settle_deadline` is never NULL and `owner` is never NULL
+(INV-7); and **no row stays non-terminal across a restart** — the coordinator reconciles any
+`opened`/`running` row whose `run_id` is no longer live to `failed`
+(`reason=orphaned_by_restart`) at startup, because the fleet redeploys on an ~8h clock and
+soft-cancels every in-flight task, so an abandoned claim is the common case, not an edge
+(INV-6 `status-matches-liveness`).
 
 ### C2 — `ShadowCoordinator` (new module `orchestrator/shadow_eval.py`)
 
@@ -296,7 +405,15 @@ class ShadowCoordinator:
         """Settles awaiting cells for payload['branch']. Returns cell_ids settled."""
 
     async def expire(self, now: datetime) -> list[str]:
-        """Settles every awaiting cell past settle_deadline as expired."""
+        """Settles every awaiting cell past settle_deadline as expired. The sweep is
+        explicitly bounded and NAMES what it deferred: awaiting cells accumulate for up to
+        settle_deadline_hours (168h), so the fan-out is not bounded upstream (INV-8), and a
+        silent truncation would be indistinguishable from 'nothing left' (INV-11)."""
+
+    async def reconcile_on_start(self) -> list[str]:
+        """Writes `failed` (reason=orphaned_by_restart) for every non-terminal row whose
+        run_id is no longer live. Without it, a restart strands rows in `opened`/`running`
+        with no exit owner at all (INV-6, INV-7)."""
 
     def storm_state(self) -> StormState:
         """paused: bool, reason: str | None — read by the harness before each on_phase."""
@@ -317,11 +434,21 @@ def build_live_fixture(task: dict, *, base_sha: str, project_root: Path,
 ```
 
 Returns a dict accepted unchanged by `runner.load_task`'s consumers: `id =
-f"shadow_{task_id}_{cell_id}"`, `pre_task_commit = base_sha`, `task_definition` from the
-task record's title/description/details, `plan` as given (production's for `implementer`,
-the candidate's for consequence leg 2, `None` for architect legs), **no `reference`** at
-build time. Invariant: `build_live_fixture` reads nothing from the live repo beyond the
-task record and `plan.json`; the base is the caller's, never "HEAD now".
+f"shadow_{task_id}_{cell_id}"` (also the `task_id` handed to `create_eval_worktree`),
+`pre_task_commit = base_sha`, `task_definition` from the task record's
+title/description/details, `plan` as given (production's for `implementer`, the candidate's
+for consequence leg 2, `None` for architect legs), **no `reference`** at build time — plus
+the wider optional key surface named in §Premise (`setup_commands`, `modules`, `name`,
+`max_execute_iterations`, `max_review_cycles`, `judge_after_each_iteration`,
+`max_architect_turns`, `adversarial`), each emitted or deliberately omitted rather than
+silently dropped.
+
+Invariants: `build_live_fixture` reads nothing from the live repo beyond its arguments — the
+plan dict is passed **in** by the caller, read from
+`<worktree_base>/.task-meta/<worktree_name>/plan.json` **[S8]**, and the base is the caller's,
+never "HEAD now". A shape that requires a plan, called with none, **raises**: it must never
+emit a plan-less fixture that would later score as a candidate decline, which would silently
+convert a data-plumbing bug into a capability measurement (INV-11 `no-silent-fail-soft`).
 
 ### C4 — settle and scoring rules
 
@@ -330,8 +457,12 @@ task record and `plan.json`; the base is the caller's, never "HEAD now".
 | `implementer`, `end-to-end`, consequence leg 2 | verify gates at `base_sha`; judge vs `reference_sha` diff; composite as `compute_composite` | verify gates + review outcome only; `composite_score` left `None`, never 0.0 |
 | `architect` | `terminal_kind`; `plan_quality` judged vs reference diff | `terminal_kind`; `score_plan_structure` only; `plan_quality=None` |
 
-Production's paired metrics for the same task are read from `task_results` and the
-invocation ledger (`runs.db`), never from logs. A cell settles exactly once.
+**[S1]** Production's paired metrics for the same task are read through leaf α's two
+accessors — `RunStore.get_task_outcome` over `task_results` for the outcome, and
+`CostStore.task_invocation_cost` over `shared.cost_store`'s `invocations` ledger for cost.
+Those are different owners in different packages that merely share the `runs.db` file, and
+neither accessor exists on main today. Never from logs, never from SQL written at the call
+site. A cell settles exactly once.
 
 ### C5 — report (`orchestrator eval-shadow report`)
 
@@ -346,7 +477,10 @@ form: `--json` emits the same rows.
 `enabled` (default **false**), `sample_rate` (0..1, per candidate override map),
 `shapes` (enabled set), `candidates` (list of `EvalConfig` names, optionally
 `<name>@<variant>`), `end_to_end_candidates`,
-`max_concurrent` (1), `daily_budget_usd` (50.0, the `auto_eval_redo_budget_usd` pattern),
+`max_concurrent` (1), `daily_budget_usd` (50.0 — the `auto_eval_redo_budget_usd` budget
+semantics, but **[S2]** *not* its reload tier: that field is restart-only, so `shadow_eval`
+is made green-tier by an explicit `_submodel_leaf_paths('shadow_eval', ShadowEvalConfig)`
+entry in `config.py::RELOADABLE_FIELDS`),
 `settle_deadline_hours` (168), `failure_streak_pause` (5), `cost_ratio_ceiling` (3.0),
 `n_min` (12, provisional — see Open questions), `seed`.
 
@@ -354,7 +488,7 @@ form: `--json` emits the same rows.
 
 | # | Scenario | Preconditions | Postconditions |
 |---|---|---|---|
-| 1 | Implementer cell opens on PLAN exit | `enabled`, candidate sampled in, plan.json present, isolation landed | one `shadow_cells` row `opened`; `shadow/<task>/<cell>` worktree at `branch_base_sha`; fixture `plan` byte-equal to plan.json |
+| 1 | Implementer cell opens on PLAN exit | `enabled`, candidate sampled in, plan.json present, isolation landed | one `shadow_cells` row `opened`, its `worktree_path` set to a **detached** eval worktree at `branch_base_sha`; fixture `plan` byte-equal to plan.json |
 | 2 | Sampled-out task opens nothing | hash outside `sample_rate` | no row; one `shadow_cell_skipped(reason=sampled_out)` event |
 | 3 | Isolation not landed | 4757 or 3096 absent (probe: invocation kwargs lack `strict_mcp_config=True`) | no cell; `skipped(reason=isolation_unavailable)`; coordinator `storm_state.paused=False` |
 | 4 | Production lands | cell `awaiting_reference`; `merge_finalized(state=done, merge_sha=X)` | cell `settled`, `reference_kind=landed`, `reference_sha=X`; result JSON path set; one `shadow_cell_settled` |
@@ -362,129 +496,183 @@ form: `--json` emits the same rows.
 | 6 | Deadline passes | cell awaiting; `now > settle_deadline` | `expire()` → state `expired`, reason `settle_deadline`; never re-opened |
 | 7 | Cap hit mid-cell | `UsageGate` reports `cap_hit` for the cell's invocation | state `cap_excluded`; no retry invocation recorded; production task unaffected |
 | 8 | Host saturated | `saturated()` true at trigger | `skipped(reason=host_saturated)`; production dispatch proceeds |
-| 9 | Consequence leg 2 | leg-1 architect cell produced a plan with `plan_steps>0` | a second cell, `plan_source=candidate`, incumbent implementer config, same `base_sha`; leg 1 and leg 2 rows linked by `cell_id` prefix |
+| 9 | Consequence leg 2 | leg-1 architect cell produced a plan with `plan_steps>0` | a second cell, `plan_source=candidate`, incumbent implementer config, same `base_sha`; leg 1 and leg 2 rows linked by the `parent_cell_id` **column** — never a `cell_id` string prefix (heuristic 12; INV-1) |
 | 10 | Consequence leg 1 declines | leg-1 `terminal_kind` is a decline | **no** leg 2; leg 1 settles with the decline recorded; report counts it in the `terminal_kind` split |
 | 11 | Storm escape | five consecutive `failed`/`expired` cells | `storm_state.paused=True`; exactly one escalation filed; subsequent triggers `skipped(reason=paused)` |
 | 12 | Report renders from rows only | rows present, result JSON deleted for one cell | report prints the row with `result_missing`, exit non-zero; no log-scrape |
-| 13 | Shadow branch never reaches the lane | `shadow/<task>/<cell>` exists in `<root>-eval-worktrees/` (`snapshots.py::create_eval_worktree`), outside `.worktrees/` | no `merge_request` is ever filed for it (the coordinator holds no merge client); the worktree reapers' enumeration is asserted to exclude the eval-worktree root or ε2 adds the exclusion; the assertion is executed, not read from prose |
+| 13 | A cell can never reach the merge lane **[S5]** | a cell has run; its worktree is under `<root>-eval-worktrees/`, a sibling of `project_root` | two limbs, both **executed**, not read from prose: (i) **no ref exists** — `create_eval_worktree` is `git worktree add --detach`, so there is nothing to enqueue and no `merge_request` is ever filed; (ii) the coordinator module imports no merge client. No reaper exclusion is added: all four reapers already filter on `wt.parent == worktree_base` (`.worktrees`), which the eval root is not under |
 | 14 | Runner failure is contained | the shape runner raises | cell `failed` with exception class in `reason`; the production slot's `TaskReport` is unchanged |
-| 15 | One-step variant is honoured | candidate `X@one-step`, a plan with N pending steps | the cell's config carries `implementer_brief_variant=one-step`; every implementer invocation's brief names exactly one step; on a clean run `iterations == N` and each iteration's `iteration_log` entry lists exactly one `steps_completed`; the iteration cap equals `N + prerequisites + slack` |
+| 15 | One-step variant is honoured | candidate `X@one-step`, a plan with N pending steps | the cell's config carries `implementer_brief_variant=one-step`; every implementer invocation's brief names exactly one step; on a clean run `iterations == N`, and each iteration-log entry's `steps_completed` **list has length exactly 1** — the field is a list computed as a set difference, so this is the property ν *establishes*, not one today's mechanism has **[S3]**; the iteration cap equals `N + prerequisites + slack`, computed against the same `- progress_resume_total` adjustment the existing cap check uses |
 
 ## Decomposition plan
 
-Leaf sizing follows the overlay bands (300–1,500 LOC, ≤10–12 files). Greek labels; real ids
-at decompose. **G7** notes are inline. Every leaf cites `docs/code-quality.md` heuristics
-in its brief where they bind (small function scopes and stateless interactions for the
-coordinator; SPOT for the reason vocabulary).
+**Filed 2026-09-11 as tasks 5382–5395**, all `pending`, 21 dependency edges. Leaf sizing
+follows the overlay bands (300–1,500 LOC, ≤10–12 files). Greek labels below carry their real
+ids. **G7** notes are inline. Every leaf cites `docs/code-quality.md` heuristics in its brief
+where they bind (small function scopes and stateless interactions for the coordinator; SPOT
+for the reason vocabulary). Per-leaf capability→evidence bindings:
+`plans/live-shadow-eval-prd.capability-manifest.md` and its YAML sidecar.
 
 **Phase 1 — foundation**
 
-- **α — cell store, config and events** *(leaf)*. `shadow_cells` table and
-  `ShadowCell` dataclass in `run_store.py`; `ShadowEvalConfig` in `config.py` (green
-  tier, registered with reload); `EventType.shadow_cell_opened/skipped/settled` with the
-  closed reason vocabulary as an enum (INV-1: the vocabulary is a schema, not prose).
-  **Signal:** `orchestrator check-config` accepts a `shadow_eval:` block; a hermetic test
-  inserts a row through `RunStore` and reads it back; `reload_config` reports
-  `shadow_eval.*` under `applied`. Modules: `orchestrator`. Prereqs: none.
-- **β — live fixture builder** *(leaf)*. `evals/live_fixture.py::build_live_fixture`
-  reusing `task_sampler`'s verify-command derivation and stratum classifiers. **Signal:**
-  for a synthetic task record + plan.json, the emitted dict round-trips through
-  `runner.load_task` and `build_eval_orch_config` without error; the builder is proven
-  to read only its arguments (a test passes a temp dir with no git repo). Modules:
-  `orchestrator/evals`. Prereqs: none.
-- **γ — candidate slate refresh** *(leaf, independent)*. Update `evals/configs.py`
-  model ids, base URLs where changed, `CANDIDATE_ENDPOINT_PRICES`, `CODEX_RUST_MODEL`
-  (and a second Codex candidate if Leo names two), the reviewer-trial cross-family
-  variant, and retire the April `codex-gpt54*` / `gemini-*` entries from `EVAL_CONFIGS`.
-  Leo supplies the exact provider strings and prices at filing (open question 1).
-  **Signal:** `test_eval_candidate_bundles.py` and `test_eval_codex_pi_bundles.py`
-  green against the new constants; `get_config_by_name` resolves every new name;
-  `claude_endpoint_price_table()` has an entry for every non-incumbent model.
-  Modules: `orchestrator/evals`, `orchestrator/tests`. Prereqs: none.
-- **ν — one-step implementer brief variant** *(leaf)*. `implementer_brief_variant`
-  per-role config knob (green tier; default `whole-plan`), the `one-step` branch in
-  `briefing.py::build_implementer_prompt`, bound scaling in `_execute_iterations` and the
-  per-invocation implementer `max_turns`/`budget_usd` under the variant,
-  `EvalConfig.harness_variant` plus the `<name>@<variant>` resolver in
-  `get_config_by_name`, and `build_eval_orch_config` mapping the field onto the knob.
-  **Signal:** boundary row 15 executed against a real `TaskWorkflow` in eval mode on a
-  synthetic 3-step plan; with the knob at its default the rendered brief and every bound
-  are byte-identical to today's (the parity tripwire). G7: `contracts-machine-checked` —
-  the variant is a validated enum, not prose in the brief. Modules: `orchestrator`,
-  `orchestrator/agents`, `orchestrator/evals`. Prereqs: none.
-- **δ — shadow invocation profile** *(leaf)*. `build_shadow_orch_config` =
-  `build_eval_orch_config` + `strict_mcp_config=True` + null memory endpoint + shadow
-  branch naming; plus the **deterministic isolation probe** the coordinator consults
-  (row 3): a check that the invocation kwargs a shadow cell would send carry strict MCP
-  and that the eval-lane escalation containment from 3096 is active. **Signal:** a test
-  builds the profile and asserts the kwargs; with 4757/3096 absent the probe returns
-  `isolation_unavailable`. G7: `guards-exercise-behaviour` — the probe inspects the
-  built invocation, not a docstring. Modules: `orchestrator/evals`. Prereqs: α.
-  Depends (out-of-batch): **4757**, **3096**.
+- **α — cell store, config, events and the production-metric accessors** *(leaf, task
+  **5382**)*. `shadow_cells` table and `ShadowCell` dataclass in `run_store.py` (extend the
+  `_SCHEMA` constant — `CREATE TABLE IF NOT EXISTS` is idempotent, so a new *table* needs no
+  `_migrate_*` helper), including the `parent_cell_id` and `worktree_path` columns and `run_id`;
+  `ShadowEvalConfig` in `config.py` registered green-tier via
+  `_submodel_leaf_paths('shadow_eval', ShadowEvalConfig)` **[S2]**;
+  `EventType.shadow_cell_opened/skipped/settled` with the closed reason vocabulary as an enum
+  (INV-1: the vocabulary is a schema, not prose); the additive `EvalMetrics.shadow_cell_id` /
+  `reference_kind` fields; and **[S1]** the two accessors production's paired metrics are read
+  through — `RunStore.get_task_outcome` over `task_results` and
+  `CostStore.task_invocation_cost` over `shared.cost_store`'s `invocations`, the latter also
+  retiring the hand-written SQL in `harness.py::Harness._auto_eval_budget_used_24h` (SPOT).
+  **Signal:** `orchestrator check-config` accepts a `shadow_eval:` block with no unknown-key
+  finding (it walks raw YAML through `config.py::census_config_keys`, and `OrchestratorConfig`
+  is `extra='ignore'`, so an unregistered block exits 1 — the signal is real, not tautological);
+  a hermetic test inserts a row through `RunStore` and reads it back including `parent_cell_id`
+  and `worktree_path`; `reload_config` reports `shadow_eval.*` under `applied`; both accessors
+  return production's recorded outcome and invocation cost for a seeded task. Modules:
+  `orchestrator`, `shared`. Prereqs: none.
+- **β — live fixture builder** *(leaf, task **5383**)*.
+  `evals/live_fixture.py::build_live_fixture` reusing `task_sampler`'s
+  `default_verify_commands` and stratum classifiers. **Signal:** for a synthetic task record +
+  plan dict, the emitted fixture round-trips through `runner.load_task`'s consumers and
+  `build_eval_orch_config` without error; the builder is proven argument-pure by a test running
+  it against a temp dir with no git repo; and a plan-requiring shape called with `plan=None`
+  **raises** rather than emitting a plan-less fixture (INV-11). Modules: `orchestrator/evals`.
+  Prereqs: none.
+- **γ — candidate slate refresh** *(leaf, independent, task **5384**)*. Update
+  `evals/configs.py` model ids, base URLs, `CANDIDATE_ENDPOINT_PRICES` and `CODEX_RUST_MODEL`
+  to the slate settled in decision 12, retire the 2026-03-19 `codex-gpt54*` / `gemini-*`
+  entries from `EVAL_CONFIGS`, and author both Z.ai endpoint constants plus a startup probe
+  that fails loudly. **[S7] Signal:** a **new literal slate pin** asserts each candidate's exact
+  model string and its `input_per_1m`/`output_per_1m` and goes RED on a stale or placeholder id
+  — the existing bundle tests assert against the constants they protect and cannot do this;
+  `get_config_by_name` resolves every new name; `claude_endpoint_price_table()` has a priced
+  entry for every non-incumbent model. G7: `guards-exercise-behaviour` — the pin is the
+  mechanism, not prose about it. Modules: `orchestrator/evals`, `orchestrator/tests`.
+  Prereqs: none.
+- **ν — one-step implementer brief variant** *(leaf, task **5385**)*.
+  `implementer_brief_variant` per-role config knob (green tier; default `whole-plan`), the
+  `one-step` branch in `briefing.py::build_implementer_prompt`, bound scaling in
+  `_execute_iterations` (subtracting `progress_resume_total`, as the existing cap check does)
+  and the per-invocation implementer `max_turns`/`budget_usd` under the variant,
+  `EvalConfig.harness_variant` plus the `<name>@<variant>` resolver in `get_config_by_name`
+  (which must split the suffix *before* the linear scan and **refuse** an unknown variant rather
+  than fall through to `None` — INV-11), and `build_eval_orch_config` mapping the field onto the
+  knob. **Signal:** boundary row 15 executed against a real `TaskWorkflow` in eval mode on a
+  synthetic 3-step plan; with the knob at its default the rendered brief and every bound are
+  byte-identical to today's (the parity tripwire). G7: `contracts-machine-checked` — the variant
+  is a validated enum, not prose in the brief. Modules: `orchestrator`, `orchestrator/agents`,
+  `orchestrator/evals`. Prereqs: α, γ (both edit files ν also edits — real edges, not advisory).
+- **δ — shadow invocation profile** *(leaf, task **5386**)*. `build_shadow_orch_config` =
+  `build_eval_orch_config` + `strict_mcp_config=True` + null memory endpoint; **[S6]** the
+  `sandbox_modules` plumbing that makes landlock actually engage for implementer legs (no eval
+  call site passes it today); plus the **deterministic isolation probe** the coordinator consults
+  (row 3): a check that the invocation kwargs a shadow cell would send carry strict MCP and that
+  3096's eval-lane escalation containment is active. The probe must inspect the built invocation,
+  never a task status — 4757 and 3096 are both still pending (INV-3). **Signal:** a test builds
+  the profile and asserts the kwargs carry strict MCP, the null memory endpoint and
+  `sandbox_modules`; with 4757/3096 absent the probe returns `isolation_unavailable`. G7:
+  `guards-exercise-behaviour` — the probe inspects the built invocation, not a docstring.
+  Modules: `orchestrator/evals`, `orchestrator/agents`. Prereqs: α, ν. Depends
+  (out-of-batch): **4757**, **3096**.
 
 **Phase 2 — vertical slice (the integration gate)**
 
-- **ε1 — coordinator core** *(leaf)*. `orchestrator/shadow_eval.py`: `should_open`
-  (pure), the cell state machine, `expire`, storm state, settle rules (C4) as pure
-  functions over `EvalMetrics` and a reference. Hermetic tests cover rows 2, 5, 6, 10,
-  11 with an injected clock and a fake runner. G7: `holds-owned-and-bounded` — every
-  awaiting cell has `owner` and `settle_deadline`; `no-silent-fail-soft` — every
-  non-open is a reason. **Signal:** the state-machine tests; a property test that
-  `should_open` is deterministic in its inputs. Modules: `orchestrator`. Prereqs: α.
-- **ε2 — harness wiring + implementer shape, end to end** *(integration gate)*. Hook
-  `on_phase` into the phase-event emission path in `workflow.py`/`harness.py` (the only
-  existing hook is `on_soft_cancel`; this adds a coordinator observer), `on_merge_finalized`
-  into the merge-lane landing path, the `shadow/` worktree creation via
-  `snapshots.py::create_eval_worktree`, the `implementer` shape through `run_eval`, the
-  PSI gate and `max_concurrent` checks, `cap_excluded` on `cap_hit`, and the row-13
-  binding: verify (or add) the worktree reapers' exclusion of the eval-worktree root —
-  G6 branch 4: a "never reaches the lane" claim must name the mechanism that refuses. **Signal: boundary
-  rows 1, 3, 4, 7, 8, 13, 14 executed against a real `TaskWorkflow` in eval mode** (the
-  revival's `build_workflow` factory), with the production slot's `TaskReport` asserted
-  unchanged. G7: `status-matches-liveness` — a cell whose runner dies writes `failed`
-  through the coordinator before the slot returns; `loop-thread-occupancy-bounded` —
-  the runner is awaited as a separate task, never inline in the slot. Modules:
-  `orchestrator`, `orchestrator/evals`. Prereqs: β, δ, ε1, ν (row 15 runs as a shadow
-  cell here).
-- **θ1 — minimal report** *(leaf)*. `eval-shadow report` over the `implementer` shape:
-  pairs, paired mean difference with bootstrap CI, `$ per usable`, counts, `UNDERPOWERED`
-  tag, `--json`. Row 12. **Signal:** against a seeded `shadow_cells` fixture the report
-  prints the contracted columns and exits non-zero on a missing result JSON. Modules:
-  `orchestrator/evals`, `orchestrator/cli`. Prereqs: α (rows), ε1 (settle rules).
+- **ε1 — coordinator core** *(leaf, task **5387**)*. `orchestrator/shadow_eval.py`:
+  `should_open` (pure), the cell state machine, `expire` (bounded, naming what it deferred),
+  **`reconcile_on_start`**, storm state, settle rules (C4) as pure functions over `EvalMetrics`
+  and a reference. Hermetic tests cover rows 2, 5, 6, 10, 11 with an injected clock and a fake
+  runner. G7: `holds-owned-and-bounded` — every awaiting cell has `owner` and `settle_deadline`;
+  `status-matches-liveness` — no row stays non-terminal across a restart;
+  `no-silent-fail-soft` — every non-open is a reason; `loop-thread-occupancy-bounded` — the
+  expiry sweep is capped. **Signal:** the state-machine tests; a property test that `should_open`
+  is deterministic in its inputs; and a restart-orphan test showing an `opened`/`running` row
+  from a dead run reconciles to `failed` with `reason=orphaned_by_restart`. Modules:
+  `orchestrator`. Prereqs: α.
+- **ε2 — harness wiring + implementer shape, end to end** *(integration gate, task **5388**)*.
+  Hook `on_phase` into `workflow.py::TaskWorkflow._enter_phase`, the sole emitter of both phase
+  events (the only pre-existing seam is `_await_cancellable`'s `on_soft_cancel`; this adds the
+  first observer). **[S4]** Hook `on_merge_finalized` as a further
+  `req.result.add_done_callback` in `merge_queue.py::enqueue_merge_request`, where two already
+  coexist — the event itself has no in-process consumer outside the merge worker. Create the
+  detached eval worktree via `snapshots.py::create_eval_worktree`, run the `implementer` shape
+  through `run_eval`, apply the PSI gate and `max_concurrent` checks, and set `cap_excluded` on
+  a `detect_cap_hit` boolean. **[S5]** Row 13 is re-bound: no reaper exclusion is added
+  (structurally unnecessary), and the "never reaches the lane" claim is proved by the absence of
+  any ref plus the coordinator's lack of a merge client — G6 branch 4, executed rather than
+  asserted. **Signal: boundary rows 1, 3, 4, 7, 8, 13, 14, 15 executed against a real
+  `TaskWorkflow` in eval mode** (the revival's `build_workflow` factory), with the production
+  slot's `TaskReport` asserted unchanged. G7: `status-matches-liveness` — a cell whose runner
+  dies writes `failed` through the coordinator before the slot returns;
+  `loop-thread-occupancy-bounded` — the runner is awaited as a separate task, never inline in
+  the slot. Modules: `orchestrator`, `orchestrator/evals`. Prereqs: β, δ, ε1, ν (row 15 runs as
+  a shadow cell here).
+- **θ1 — minimal report** *(leaf, task **5389**)*. `eval-shadow report` over the `implementer`
+  shape: pairs, paired mean difference with bootstrap CI, `$ per usable`, counts,
+  `UNDERPOWERED` tag, `--json`. Row 12. The CLI is **click** and every existing `eval*` command
+  is a flat sibling, so `eval-shadow` is a new sub-group; nothing pins the command set.
+  **Signal:** against a seeded `shadow_cells` fixture the report prints the contracted columns
+  and exits non-zero on a missing result JSON. Modules: `orchestrator/evals`,
+  `orchestrator/cli`. Prereqs: α (rows), ε1 (settle rules).
 
 **Phase 3 — the remaining shapes**
 
-- **ζ — architect and architect-consequence shapes** *(leaf)*. Trigger on
-  `phase_enter(PLAN)`; leg 1 through `run_architect_eval` with `terminal_kind`; leg 2
-  opened only on `plan_steps>0`, through `run_eval` with `plan_source=candidate` and the
-  incumbent implementer; rows 9 and 10. **Signal:** rows 9–10 executed end to end; the
-  report shows the consequence shape with leg-2 outcomes paired against production's
-  implementer metrics for the same task. Modules: `orchestrator`, `orchestrator/evals`.
-  Prereqs: ε2, θ1.
-- **η — end-to-end shape** *(leaf)*. Through `run_end_to_end`, gated on
-  `end_to_end_candidates`. **Signal:** a cell for a listed candidate runs both roles live
-  and settles with `$/done` paired; an unlisted candidate is `skipped(reason=shape_disabled)`.
-  Prereqs: ζ.
-- **θ2 — full report and the η-gate view** *(leaf)*. All shapes; `terminal_kind`
-  split; per-stratum breakdown; the `architect-consequence` view for
-  `architect-fable-max` vs `architect-opus-max` that esc-3637-1 consumes. **Signal:** the
-  report over a seeded multi-shape store matches a committed golden output; `--json`
-  validates against a committed schema. Prereqs: ζ, η.
+- **ζ — architect and architect-consequence shapes** *(leaf, task **5390**)*. Trigger on
+  `phase_enter(PLAN)`; leg 1 through `run_architect_eval` with `terminal_kind`; leg 2 opened
+  only on `plan_steps>0`, through `run_eval` with `plan_source=candidate` and the incumbent
+  implementer, **linked to leg 1 by the `parent_cell_id` column**; rows 9 and 10. **Signal:**
+  rows 9–10 executed end to end; the report shows the consequence shape with leg-2 outcomes
+  paired against production's implementer metrics for the same task. G7:
+  `contracts-machine-checked` — the leg link is a column, not a string convention. Modules:
+  `orchestrator`, `orchestrator/evals`. Prereqs: ε2, θ1.
+- **η — end-to-end shape** *(leaf, task **5391**)*. Through `run_end_to_end`, which already
+  takes the two role configs separately, gated on `end_to_end_candidates`. **Signal:** a cell
+  for a listed candidate runs both roles live and settles with `$/done` paired; an unlisted
+  candidate is `skipped(reason=shape_disabled)`. Prereqs: ζ.
+- **θ2 — full report and the η-gate view** *(leaf, task **5392**)*. All shapes;
+  `terminal_kind` split; per-stratum breakdown; observed pair variance and iterations-per-step;
+  the `architect-consequence` view for `architect-fable-max` vs `architect-opus-max` that
+  esc-3637-1 consumes. **Signal:** the report over a seeded multi-shape store matches a
+  committed golden output rendered from that store (INV-10 tier 1: it executes the renderer);
+  `--json` validates against a committed schema. Prereqs: ζ, η.
 
-**Phase 4 — operator gate and companion corrections**
+**Phase 4 — operator gates and companion corrections**
 
-- **κ — first live campaign gate** *(deterministic milestone gate; born-at-L2 for
-  Leo)*. Enable `shadow_eval` on df and reify with `candidates=[architect-fable-max,
-  <one endpoint bundle>]`, `shapes=[architect-consequence, implementer]`, at the ruled
-  `sample_rate`; the gate's predicate is `pairs ≥ n_min` for the fable consequence shape
-  in the `--json` report. **Signal:** the escalation filed with the report attached;
-  Leo rules esc-3637-1 on it. No config flip. Prereqs: θ2, and 4757/3096 landed.
-- **λ — companion corrections** *(leaf, docs)*. Amend `eval-framework-revival-prd.md`
-  decision 1 and status; append a pointer note to `fable-architect-trial-v2-prd.md`
-  naming this PRD as the redesign; add an `OPERATIONS.md` §"Shadow eval" (config keys,
-  the report, the storm escape, how to read `UNDERPOWERED`); mark `tasks_hard_v2` as
-  retired-for-capability in `evals/README` or the pool's own header. **Signal:** the
-  three documents carry the dated pointers; no restated contract (INV-9). Prereqs: ε2.
+The PRD originally carried a single κ. It is **split**: one task would hold an open L2 for the
+whole campaign — a hold whose exit owner cannot yet act (INV-7) — and a deterministic
+`before_done.kind='predicate'` cannot express "escalate when the data arrives", because
+predicate mode is check-then-**done**-or-escalate, so a passing check closes the task silently
+and resolving the escalation re-runs the check and re-escalates.
+
+- **κ1 — campaign activation gate** *(deterministic pure gate; born-at-L2 for Leo; task
+  **5393**)*. Leo rules the `sample_rate`, the candidate slate and the enabled shapes, then sets
+  `shadow_eval` in both `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` and
+  `/home/leo/src/reify/dark-factory-orchestrator.yaml` and hot-applies each with
+  `reload_config`, reading the returned `applied` / `restart_required` dispositions rather than
+  the top-level `reloaded` flag. **Signal:** the escalation is filed and resolved with
+  `shadow_eval.*` confirmed `applied` on both running orchestrators. No production config change
+  beyond enabling the measurement. Prereqs: θ2, and 4757/3096 landed (δ's probe is what tells
+  the truth about that, not the task statuses).
+- **κ2 — the η-gate ruling** *(deterministic pure gate with a `delayed` milestone of 14 days
+  anchored on κ1 reaching `done`; task **5394**)*. The gate criterion is `pairs ≥ n_min` for the
+  fable consequence shape — and that threshold has **one home**, the report's own `UNDERPOWERED`
+  tag (C5); κ2 points at it rather than re-implementing the comparison (INV-9). Read the observed
+  pair variance θ2 prints alongside it and state in the ruling what power the campaign actually
+  had; if the view is still UNDERPOWERED at 14 days, extending the campaign is a legitimate
+  ruling. **Signal:** the escalation filed with the report attached; Leo rules esc-3637-1 on it.
+  No config flip. Prereqs: κ1.
+- **λ — companion corrections** *(leaf, docs, `complexity='simple'`; task **5395**)*. Amend
+  `eval-framework-revival-prd.md` decision 1 and status; append a dated pointer note under
+  `fable-architect-trial-v2-prd.md`'s TERMINATED status blockquote, following that file's
+  existing convention; add an `OPERATIONS.md` §"Shadow eval" — as **`## 7a.`**, following the
+  existing `6a.` precedent, so no heading below it is renumbered; and add the
+  retired-for-capability marker as a row in
+  `orchestrator/src/orchestrator/evals/tasks_hard_v2/README.md`'s existing table (`evals/tasks/`
+  has no README, and a one-line marker does not justify creating one). **Signal:** the four
+  documents carry the dated pointers; no restated contract (INV-9). Prereqs: ε2.
 
 ## Out of scope
 
@@ -493,27 +681,36 @@ coordinator; SPOT for the reason vocabulary).
 - **Fixing `eval-ofat`'s candidate selector** (decision 12) and any further offline
   campaign; the offline runners are kept as the instrument this PRD drives, not as a
   screen.
-- **The replay-frame tasks 4758 / 4844.** They concern the offline instrument; this PRD
-  neither depends on nor closes them (Leo may re-disposition them once κ runs).
+- **The replay-frame work, task 4844** (4758 is `deferred`, coalesced into 4844 along with
+  4765; 4844 is the live successor). It concerns the offline instrument; this PRD neither
+  depends on nor closes it (Leo may re-disposition it once κ1/κ2 run).
 - **vLLM / self-hosted serving**, the LME programme, the memory-eval programme.
 - **Dashboard panels** for shadow cells — a follow-up once θ2's `--json` exists.
 - **A shadow reviewer or judge shape.** The judge OFAT axis stays offline.
 
-## Open questions (surfaced but not decided in this session)
+## Open questions
 
-1. **Exact provider model strings and list prices for γ.** Leo names them at filing
-   (Codex Sol / Astra ids, `glm-5.3`, `glm-5.3-flash`, current MiniMax; anything else).
-   Until then γ is authored with placeholders that the slate tests reject, so it cannot
-   be marked done on stale ids.
-2. **`n_min` calibration.** 12 pairs is a screen floor chosen for legibility, not a
-   power calculation. **Suggested resolution:** θ2 prints the observed pair variance so
-   κ's ruling can state the power it had; recalibrate in a follow-up.
-3. **Where the coordinator reads production's paired metrics.** `task_results` vs the
-   invocation ledger vs `merge_finalized` payload for cost. **Suggested resolution:**
-   the invocation ledger for cost, `task_results` for outcome; decide in ε1.
+Resolved at decompose on 2026-09-11 are struck through with their resolution; the rest stand.
+
+1. ~~**Exact provider model strings and list prices for γ.**~~ **RESOLVED** (Leo, after a live
+   market check on 2026-09-10) — see decision 12 for the settled slate. γ is authored with
+   authoritative constants, not placeholders. **Still open, narrowed:** which Z.ai endpoint
+   family the host's `ZAI_API_KEY` answers on (Coding Plan `/api/coding/paas/v4` vs general
+   `/api/paas/v4`). Leo's ruling: γ authors both plus a startup probe that fails loudly, so this
+   never degrades into a silent per-cell 4xx.
+2. **`n_min` calibration.** 12 pairs is a screen floor chosen for legibility, not a power
+   calculation — **confirmed unchanged by Leo at decompose**. **Suggested resolution:** θ2
+   prints the observed pair variance so κ2's ruling can state the power it had; recalibrate in a
+   follow-up.
+3. ~~**Where the coordinator reads production's paired metrics.**~~ **RESOLVED** — and the
+   substrate was mis-stated when the question was written **[S1]**. The invocation ledger is
+   `shared/src/shared/cost_store.py::CostStore`'s `invocations` table, not part of
+   `run_store.py`, and neither store has a per-task outcome accessor today. Leaf α builds
+   `RunStore.get_task_outcome` (outcome) and `CostStore.task_invocation_cost` (cost); ε1 and θ1
+   read only through those.
 4. **Settle-deadline default.** 168 h assumes production lands within a week; long
    `merge-deferred` holds may exceed it. **Suggested resolution:** keep 168 h, count
-   `expired` in the report, revisit after κ.
+   `expired` in the report, revisit after κ2.
 5. **Cross-project report aggregation.** Each orchestrator writes its own runs.db;
    `eval-shadow report --project-root` per project vs a merged view. Decide in θ1.
 6. **Consequence leg 2 reviewer.** Whether leg 2 runs the reviewer (adds cost, gives
@@ -522,4 +719,4 @@ coordinator; SPOT for the reason vocabulary).
 7. **One-step bound values.** The per-invocation `max_turns`/`budget_usd` under
    `one-step` and the iteration `slack`. **Suggested resolution:** turns and budget at
    one third of the whole-plan role defaults, slack of 3; ν records the chosen values
-   with their basis and θ2 reports iterations-per-step so κ can recalibrate.
+   with their basis and θ2 reports iterations-per-step so κ2 can recalibrate.
