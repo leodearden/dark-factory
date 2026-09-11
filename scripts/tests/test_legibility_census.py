@@ -2013,6 +2013,127 @@ def test_run_census_dropped_reject_with_no_standing_candidate_says_so_plainly(
     assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
 
 
+def _verify_fn_rejecting_unknown_titles(*titles):
+    """A verifier whose rejects name titles the merge never saw -- the
+    shortest route to N dropped verdicts in one run, independent of any
+    codebook seeding."""
+    def fake_verify_fn(clusters, *, model):
+        return {
+            "verified": [],
+            "rejected": [{"title": t, "sightings": []} for t in titles],
+            "fixed": [],
+        }
+
+    return fake_verify_fn
+
+
+def _run_summary_records(caplog):
+    """The run-summary WARNING(s) sizing the run, as distinct from the
+    per-cluster warnings (which say "resolved to no pending candidate")."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "unresolved verdict(s)" in r.getMessage()
+    ]
+
+
+def test_run_census_dropped_rejects_emit_exactly_one_run_summary(tmp_path, caplog):
+    """Dropped reject verdicts are COUNTED, not just individually logged -- an
+    operator needs to know how much of the run went nowhere without tallying
+    per-cluster lines by hand.
+
+    Exactly one summary record, asserted as an exact count rather than a
+    presence, so a second summary mechanism added later fails here rather than
+    quietly doubling the line."""
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _minimal_v2_codebook(),
+        verify_fn=_verify_fn_rejecting_unknown_titles("Ghost title one", "Ghost title two"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    summaries = _run_summary_records(caplog)
+    assert len(summaries) == 1, (
+        f"exactly one run-summary WARNING, not one per mechanism; got: {summaries}"
+    )
+    assert "2 unresolved verdict(s)" in summaries[0]
+    # The per-cluster warnings are still there -- the summary sizes the run,
+    # they say WHICH titles. Neither replaces the other.
+    per_cluster = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "resolved to no pending candidate" in r.getMessage()
+    ]
+    assert len(per_cluster) == 2
+    assert outcome.status == "done"
+
+
+def test_run_census_clean_reject_run_emits_no_run_summary(tmp_path, caplog):
+    """Silence on a clean run is what keeps the line worth reading: a line
+    trained to be ignored is a line that will be ignored on the run that
+    matters. Here the mined title is genuinely new, so the merge assigns it a
+    pending candidate and the reject verdict lands."""
+    kwargs = _rejected_run_kwargs(tmp_path, _minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert _run_summary_records(caplog) == []
+    # Proves the run really did adjudicate rather than drop silently.
+    persisted = codebook.load(kwargs["codebook_path"])
+    rejected_candidate = next(c for c in persisted["candidates"] if c["title"] == _REJECTED_TITLE)
+    assert rejected_candidate["disposition"] == "rejected"
+    assert outcome.status == "done"
+
+
+def test_run_census_carries_unresolved_verdicts_as_an_outcome_field(tmp_path, caplog):
+    """The count is a FIELD on `CensusOutcome`, not something to be parsed out
+    of log prose -- assertable structurally, exactly like
+    `unverified_clusters`. Asserted on both a dropping and a clean run so the
+    field cannot be a constant."""
+    dropping = _rejected_run_kwargs(
+        tmp_path / "dropping", _minimal_v2_codebook(),
+        verify_fn=_verify_fn_rejecting_unknown_titles("Ghost title one", "Ghost title two"),
+    )
+    clean = _rejected_run_kwargs(tmp_path / "clean", _minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        dropping_outcome = mod.run_census(**dropping)
+        clean_outcome = mod.run_census(**clean)
+
+    assert dropping_outcome.unresolved_verdicts == 2
+    assert clean_outcome.unresolved_verdicts == 0
+
+
+def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
+    tmp_path, monkeypatch, capsys,
+):
+    """The CLI clause appears exactly when it carries information, so a normal
+    run's summary line stays BYTE-unchanged -- same gating reasoning as
+    render_report's coverage-shortfall clause."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    def _run_main(unresolved):
+        monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(
+            outcome=mod.CensusOutcome(
+                status="done", report_path="plans/confusion-census-2026-01-02.md",
+                filed_task_ids=["1234"], stop_reason="exhausted",
+                unresolved_verdicts=unresolved,
+            ),
+        ))
+        assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+        return capsys.readouterr().out
+
+    noisy = _run_main(3)
+    assert "unresolved_verdicts=3" in noisy
+
+    quiet = _run_main(0)
+    assert "unresolved_verdicts" not in quiet
+    # Byte-identical to the line minus the clause -- not merely "the substring
+    # is absent", which a reworded line would also satisfy.
+    assert quiet == noisy.replace(" unresolved_verdicts=3", "")
+
+
 # ---------------------------------------------------------------------------
 # task 3291: run_census() must never persist a FABRICATED done-count baseline.
 #
