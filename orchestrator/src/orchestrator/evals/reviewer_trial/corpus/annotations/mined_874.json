@@ -32,5 +32,42 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Fix AsyncMock setup in merge_queue verification tests",
+      "description": "orchestrator/tests/test_merge_queue.py emits RuntimeWarning 'coroutine AsyncMockMixin._execute_mock_call was never awaited' at merge_queue.py:280 and 987 for several tests (test_verify_failure_returns_blocked, test_speculative_discard_on_failure, test_speculative_events_emitted, test_verifier_remerge_exception_releases_slot, test_speculative_chain_invalidation_propagates, test_speculative_remerge_preserves_duration_ms, test_verify_failure).\n\nRoot cause: test sets `mock_verify = AsyncMock()` then `mock_verify.return_value.passed = False`. Accessing `.return_value` on an AsyncMock creates an AsyncMock child and configures it, so when the mock is awaited, an unnecessary coroutine is created and discarded. The suggested fix is `AsyncMock(return_value=SimpleNamespace(passed=False, summary='tests failed'))` or `AsyncMock(return_value=MagicMock(passed=False))`.\n\nAlso test_steward.py:1009 test_timeout_counts_dict_initialized_empty is decorated with @pytest.mark.asyncio but is a sync function \u2014 fix by removing the asyncio mark from that specific test.\n\nThese are test-hygiene issues, not production bugs, but the warnings clutter CI output and mask genuine resource leaks.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "874",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-22T10:10:12.942Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "orchestrator/pyproject.toml",
+      "orchestrator/tests/test_merge_queue.py",
+      "orchestrator/tests/test_steward.py"
+    ],
+    "base_sha": "8db73ccc128d3f01a3a3443eaec706f507bfc4e4",
+    "branch_sha": "3f103ac58cd3570f2624cf10ef11bc74afd0ed8e",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "725c30b0e5fa38882e4984ca4402959395b6df03",
+      "merge_base_sha": "5c5f25f14349d1c5a17922eb64e7a0a55dddf51e",
+      "diff_reproduces_from": "git diff 8db73ccc12 725c30b0e5",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

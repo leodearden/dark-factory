@@ -40,5 +40,42 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Fix stage1.py (memory_consolidator): add metadata.stage='memory_consolidator' to cycle summary writes",
+      "description": "Stage 1 cycle summary for run 0a05e493-5dc2-482d-b384-fe92100b7b6f was written without metadata.stage='memory_consolidator'. Triple-filter check {kind: cycle_summary, run_id: 0a05e493, stage: memory_consolidator} returns 0. This causes false 'Stage 1 summary missing' signals in Stage 3's triple-filter verification path. Stage 2 already has the correct metadata.stage field (fixed in run 9af436fe); Stage 1 needs the same treatment.",
+      "test_strategy": "",
+      "details": "Fix: In stage1.py (memory_consolidator), update the per-cycle summary add_memory call to include metadata={'kind': 'cycle_summary', 'run_id': run_id, 'stage': 'memory_consolidator'}. After the fix, add a post-write self-check using count_memories_by_metadata with the triple filter {kind: cycle_summary, run_id: run_id, stage: memory_consolidator} to verify the stage key persisted. This mirrors the Stage 2 pattern fixed in task 9af436fe. Flagged by Stage 1 analytical finding b87b9d49 in know_live run 511e0a0a.",
+      "authored": false,
+      "id": "1653",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-06-05T00:26:42.910Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py",
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py",
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py"
+    ],
+    "base_sha": "9351e6e3487c57ad9ccc3dcba0c6b105c7314aca",
+    "branch_sha": "f264d24b4e927f9bd0c16fde674bd2278418c81b",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "2f4212e9380085b6704b59eeb479bdfa7279f899",
+      "merge_base_sha": "9351e6e3487c57ad9ccc3dcba0c6b105c7314aca",
+      "diff_reproduces_from": "git diff 9351e6e348 2f4212e938",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

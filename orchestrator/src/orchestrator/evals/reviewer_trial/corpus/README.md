@@ -40,11 +40,38 @@ Each entry: `{diff_id, language, source, description, project?, split?}`.
 - `split` — `"train" | "selection" | "test"`, assigned by
   `mining.assign_split()` (see "Split" below). Every diff has one.
 
-**`annotations/<diff_id>.json`** — `{diff_id, ground_truth: [...], provenance?}`.
+**`annotations/<diff_id>.json`** — `{diff_id, ground_truth: [...], provenance?, context?}`.
 Each `ground_truth` entry is a `GroundTruthIssue`:
 `{id, location, category, severity, description, mutation_type}`
 (`severity` is `"blocking" | "suggestion"`). `provenance` is present only for
-mined diffs (see "Mining provenance" below).
+mined diffs (see "Mining provenance" below). `context` (`corpus.FixtureContext`)
+carries the inputs the context-complete reviewer briefing (ruling D2, task
+5369) needs beyond the diff, so the trial can score that briefing offline:
+
+- `task` — `{id?, title, description, details, test_strategy, authored,
+  record_source?}`: the record the implementer received. Mined fixtures read
+  it from `.taskmaster/tasks/tasks.db` (`record_source` says when, and whether
+  the row moved after the merge); the 15 hand-authored fixtures carry a
+  plausible record reconstructed from the diff, flagged `authored: true`, that
+  states the intent without naming the planted defect.
+- `plan` — the architect's `plan.json` (`analysis`, `design_decisions`,
+  `steps`) when a copy survives, else `null` with `plan_reason` listing the
+  locations searched. As of the 2026-09-11 enrichment one mined fixture's plan
+  (1157) survives, in a never-reclaimed worktree; the other 37 have none
+  (task-meta dirs are reclaimed with the worktree, runs.db events carry only
+  token counts).
+- `base_sha` / `branch_sha` — the commit the stored diff applies to and the
+  reviewed tip. For mined fixtures these are the merge commit's two parents,
+  and `verification` records that `git diff base_sha merge_sha` reproduces the
+  stored diff byte-for-byte and `git merge-tree` of the parents equals the
+  merge commit's tree. Hand-authored fixtures have `branch_sha: null`; their
+  `base_sha` is the commit the diff was cut from when `git apply --check` or
+  a byte-level content match recovers one (`verification.applies_cleanly`
+  says which), else `null` with `base_sha_reason`.
+- `changed_files` — the paths the diff touches.
+
+The loader is tolerant: a fixture without `context` loads with
+`CorpusDiff.context is None`, and `save()` omits the key for it.
 
 ## Split (train / selection / test, 2:1:7)
 
