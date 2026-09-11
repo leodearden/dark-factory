@@ -510,11 +510,14 @@ def log(msg: str) -> None:
         # The fallback is itself best-effort: writing to stderr raises on a
         # broken pipe or a full/failing journal socket, and that OSError
         # would otherwise escape log() and abort a caller's tick (see the
-        # never-raises contract in the docstring). Both journal routes are
-        # gone at this point, so there is nothing left to report WITH —
-        # dropping the message is the only remaining option, and it is
-        # strictly better than dropping the rest of the tick with it.
-        with contextlib.suppress(OSError):
+        # never-raises contract in the docstring). Stderr can also be CLOSED
+        # rather than broken, and `print` to a closed stream raises
+        # ValueError, not an OSError — the same best-effort situation, so it
+        # is suppressed too. Both journal routes are gone at this point, so
+        # there is nothing left to report WITH — dropping the message is the
+        # only remaining option, and it is strictly better than dropping the
+        # rest of the tick with it.
+        with contextlib.suppress(OSError, ValueError):
             print(
                 f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]",
                 file=sys.stderr,
