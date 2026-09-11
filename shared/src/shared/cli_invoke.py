@@ -3033,7 +3033,28 @@ def build_claude_argv(
     already created during this call are unlinked before the exception
     propagates — callers never need to clean up after a raised call.
     """
-    cmd = ['claude', '--print', '--output-format', 'json']
+    # argv[0] is RESOLVED here rather than left for the kernel to look up
+    # against whatever PATH the spawning process inherited. This one site
+    # covers BOTH spawn paths — the sandbox and non-sandbox invocations here,
+    # and the orchestrator's, which reaches this same helper via
+    # orchestrator/src/orchestrator/agents/invoke.py::_invoke_claude_cli.
+    #
+    # Fail-open: an unresolvable spec falls back to itself, so a caller that
+    # only assembles an argv (several test suites, the startup probe) keeps
+    # working on a host with no CLI installed. The WARNING is the diagnostic
+    # that was missing on 2026-08-13→08-18, when a bare `claude` failed to
+    # resolve off an unpinned systemd PATH and the curator degraded silently
+    # for 80+ hours.
+    _spec = claude_binary_spec()
+    _resolved = resolve_claude_binary()
+    if _resolved is None:
+        logger.warning(
+            'claude binary %r does not resolve on PATH — spawning it will fail. '
+            'Set %s to an absolute path, or pin Environment=PATH= in the unit. '
+            'PATH=%s',
+            _spec, _CLAUDE_BINARY_ENV_VAR, os.environ.get('PATH'),
+        )
+    cmd = [_resolved or _spec, '--print', '--output-format', 'json']
 
     cmd.extend(['--model', model])
     cmd.extend(['--max-budget-usd', str(max_budget_usd)])
