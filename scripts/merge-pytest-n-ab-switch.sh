@@ -17,7 +17,8 @@
 # Modelled on scripts/merge-deep-set-cap.sh (same commit --only + single-shot
 # MCP tools/call reload). Exit 0 only when the reload's `applied` disposition
 # carries verify_env with the new value; the last stdout line is a JSON verdict
-# for a kind='predicate' before_done note.
+# for a kind='predicate' before_done note — {switched_to, commit, outcome},
+# where `outcome` names how the value came to be live ('applied').
 set -euo pipefail
 die() { echo "merge-pytest-n-ab-switch: $*" >&2; exit 1; }
 
@@ -99,10 +100,14 @@ RESP="$(curl -sS -X POST "http://127.0.0.1:${PORT}/mcp" \
     || die "reload_config request to 127.0.0.1:${PORT} failed (committed as ${SHA}; the value lands at the next restart)"
 
 # 4. Assert the applied disposition carries verify_env with the new value.
-printf '%s' "$RESP" | python3 - "$KEY" "$VALUE" "$SHA" <<'PY'
+#    The response travels as an ARGUMENT, never on stdin: `python3 -` reads its
+#    program from stdin, and the heredoc below IS that stdin, so a
+#    `printf '%s' "$RESP" | python3 - <<'PY'` pipe is swallowed whole by the
+#    heredoc and json.load(sys.stdin) then sees EOF on every single run.
+python3 - "$KEY" "$VALUE" "$SHA" "$RESP" <<'PY'
 import json, sys
-key, value, sha = sys.argv[1:4]
-env = json.load(sys.stdin)
+key, value, sha, resp = sys.argv[1:5]
+env = json.loads(resp)
 res = env.get('result', {})
 tool = res.get('structuredContent')
 if not isinstance(tool, dict):
@@ -116,5 +121,5 @@ if str(new.get(key)) != value:
     print(f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
           f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}', file=sys.stderr)
     sys.exit(1)
-print(json.dumps({'switched_to': value, 'commit': sha, 'reload_applied': True}))
+print(json.dumps({'switched_to': value, 'commit': sha, 'outcome': 'applied'}))
 PY
