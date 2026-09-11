@@ -1,0 +1,648 @@
+prd: plans/live-shadow-eval-prd.md
+schema_version: 1
+tasks:
+- label: α
+  title: Shadow-eval cell store, config block, event vocabulary and production-metric
+    accessors
+  note: 'Widened at decompose beyond the PRD''s α: adds parent_cell_id (replacing
+    the rejected cell_id-prefix link, heuristic 12), worktree_path (replacing the
+    deleted shadow branch, correction S5), explicit RELOADABLE_FIELDS registration
+    (S2 — auto_eval_redo_budget_usd is restart-tier, not green), and the two production-metric
+    accessors the PRD assumed already existed (S1).'
+  capabilities:
+  - name: shadow-cells-table-in-run-store
+    binding: capability→producer (α) — run_store.py::RunStore builds from the _SCHEMA
+      constant via executescript; CREATE TABLE IF NOT EXISTS needs no _migrate_* helper
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CREATE TABLE IF NOT EXISTS shadow_cells
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: parent-cell-id-is-a-column-not-a-string-prefix
+    binding: anti-meaningful-string — the PRD linked consequence legs 'by cell_id
+      prefix'; heuristic 12 + INV-1 require a real column
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: parent_cell_id
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: shadow-eval-config-is-green-tier
+    binding: capability→producer (α) — config.py::RELOADABLE_FIELDS unions _submodel_leaf_paths(name,
+      Cls) per whole submodel; auto_eval_redo_budget_usd is NOT in that set (correction
+      S2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _submodel_leaf_paths\(\s*'shadow_eval'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: closed-reason-vocabulary-as-an-enum
+    binding: capability→producer (α) — event_store.py::EventType is a StrEnum with
+      no registry and no full-set pinning test, so the vocabulary must carry its own
+      collision discipline (INV-1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shadow_cell_skipped
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: per-task-production-outcome-accessor
+    binding: OPEN — task_results' only accessor today is RunStore.get_task_cost (cost
+      only); α builds RunStore.get_task_outcome (correction S1)
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: def get_task_outcome
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: per-task-invocation-cost-accessor
+    binding: OPEN — the invocation ledger is shared/cost_store.py::CostStore (table
+      invocations), which exposes only window aggregates; α builds CostStore.task_invocation_cost
+      and retires the hand-written SQL in harness.py::_auto_eval_budget_used_24h (S1,
+      heuristic 11 SPOT)
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: def task_invocation_cost
+      paths:
+      - shared/src/shared/cost_store.py
+      expect: present
+  - name: eval-metrics-additive-shadow-fields
+    binding: capability→producer (α) — EvalMetrics is a plain dataclass, all fields
+      defaulted, read-back whitelists via __dataclass_fields__; no schema, no full-set
+      test
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shadow_cell_id
+      paths:
+      - orchestrator/src/orchestrator/evals/metrics.py
+      expect: present
+  task_id: 5382
+- label: β
+  title: Live fixture builder — a production task rendered as an eval fixture
+  capabilities:
+  - name: build-live-fixture-exists
+    binding: capability→producer (β) — runner.py::load_task's consumers read a plain
+      dict by key with .get defaults
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def build_live_fixture
+      paths:
+      - orchestrator/src/orchestrator/evals/live_fixture.py
+      expect: present
+  - name: verify-commands-and-strata-reused-not-reimplemented
+    binding: capability→producer (wired) — task_sampler.py::default_verify_commands
+      / ::classify_kind / ::classify_path / ::repo_of_project all exist on main (heuristic
+      11 SPOT)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: default_verify_commands|classify_kind
+      paths:
+      - orchestrator/src/orchestrator/evals/live_fixture.py
+      expect: present
+  - name: missing-plan-is-refused-not-silently-plan-less
+    binding: OPEN — INV-11; a shape needing a plan with no plan.json must raise, never
+      emit a fixture that would score as a decline. run_eval already raises ValueError
+      on a falsy plan, so the refusal is consistent with the runner
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: a raise-on-missing-plan is a test property of β's own fixtures, not
+        a grep
+  task_id: 5383
+- label: γ
+  title: Candidate slate refresh — 2026-09 provider model ids, prices and a Z.ai endpoint
+    probe
+  note: 'Correction S7: the existing bundle tests assert against the constants they
+    are meant to protect, so a stale or placeholder model id stays green. γ therefore
+    ADDS the literal slate pin; the PRD''s ''tests green against the new constants''
+    clause was vacuous.'
+  capabilities:
+  - name: codex-arms-astra-sol-terra
+    binding: 'authoritative constants supplied by Leo at decompose after a live market
+      check (2026-09-10): gpt-6-astra $10/$50, gpt-5.6-sol $4/$20, gpt-5.6-terra $2/$12'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: gpt-6-astra
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+  - name: glm-5-3-and-flash
+    binding: glm-5.3 $1.40/$4.40; glm-5.3-flash $0.15/$0.50 LIST — the 50% promo ($0.075/$0.25)
+      expired 2026-09-09 24:00 UTC+8 and aggregator pages still quote it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: glm-5\.3-flash
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+  - name: minimax-m3-native-id
+    binding: MiniMax-M3 (exact native casing), base https://api.minimax.io/v1, $0.30/$1.20
+      native; replaces MINIMAX_MODEL='MiniMax-M2.5'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MiniMax-M3
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+  - name: march-dated-entries-retired
+    binding: rejection-mechanism (expect absent) — EVAL_CONFIGS' gemini-3.1-pro-preview
+      / gemini-3-flash-preview / gpt-5.4 / gpt-5.4-mini entries were added 2026-03-19
+      (d3b14de8107), older than the PRD's 'April' claim
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: gemini-3\.1-pro-preview|gemini-3-flash-preview|'gpt-5\.4-mini'
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: absent
+  - name: the-slate-tests-actually-reject-a-stale-id
+    binding: 'rejection-mechanism, MEASURED ABSENT then produced by γ — test_eval_candidate_bundles.py
+      / test_eval_codex_pi_bundles.py assert against MINIMAX_MODEL/GLM_MODEL/CODEX_RUST_MODEL
+      themselves and check prices only for >0 (INV-10: the guard reads the thing it
+      protects). γ adds the literal pin, following the 2861/3627 candidate-set pin
+      precedent'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MiniMax-M3|gpt-6-astra
+      paths:
+      - orchestrator/tests/test_eval_candidate_bundles.py
+      expect: present
+  - name: zai-base-url-resolved-by-probe-not-by-guess
+    binding: 'OPEN — Leo''s ruling at decompose. Z.ai has two non-interchangeable
+      endpoint families (Coding Plan: /api/coding/paas/v4; general: /api/paas/v4,
+      Anthropic-format /api/anthropic) and which the host key answers on is unknown;
+      a wrong constant 4xxs per cell. γ authors both and a startup probe that fails
+      loudly'
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: coding/paas/v4
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+  task_id: 5384
+- label: ν
+  title: One-step implementer brief variant — per-role knob, bound scaling and the
+    parity tripwire
+  note: 'Correction S3: steps_completed is a LIST computed as a set difference in
+    _execute_iterations (0..n per iteration), so ''exactly one'' is not a property
+    of today''s mechanism — it is what ν delivers, asserted by execution against a
+    real TaskWorkflow.'
+  capabilities:
+  - name: implementer-brief-variant-knob
+    binding: capability→producer (ν) — BriefingAssembler.__init__ stores the whole
+      OrchestratorConfig as self.config; there is no narrower per-role sub-config
+      to thread
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: implementer_brief_variant
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: one-step-branch-in-the-implementer-brief
+    binding: capability→producer (ν) — build_implementer_prompt partitions plan['steps']/['prerequisites']
+      into done/pending and today ends 'Execute the next pending steps in TDD order
+      … Stop at a logical boundary.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: one-step
+      paths:
+      - orchestrator/src/orchestrator/agents/briefing.py
+      expect: present
+  - name: eval-config-carries-the-variant
+    binding: capability→producer (ν) — EvalConfig is a plain dataclass; get_config_by_name
+      is a linear scan returning None on a miss, so the <name>@<variant> resolver
+      must split before the scan and REFUSE an unknown variant rather than fall through
+      to None (INV-11)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: harness_variant
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+  - name: iteration-cap-scales-with-the-plan
+    binding: capability→producer (ν) — _execute_iterations caps on (metrics.execute_iterations
+      - metrics.progress_resume_total) >= config.max_execute_iterations, so the scaled
+      bound must subtract progress_resume_total too
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the bound is an arithmetic property asserted by ν's executed 3-step-plan
+        fixture, not a grep
+  - name: default-path-is-byte-identical
+    binding: parity tripwire — with the knob at whole-plan the rendered brief and
+      every bound are unchanged; the repo's standing parity discipline for candidate/config
+      edits
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: parity is a rendered-output equality assertion in ν's own tests
+  task_id: 5385
+- label: δ
+  title: Shadow invocation profile, sandbox plumbing and the deterministic isolation
+    probe
+  note: 'Correction S6: landlock does NOT reach eval invocations today — evals/runner.py,
+    compare.py and judge.py call invoke_agent without sandbox_modules and the whole
+    wrap path is gated on it being non-None. δ owns the plumbing; it is not pre-existing.'
+  capabilities:
+  - name: shadow-invocation-profile
+    binding: capability→producer (δ) — build_eval_orch_config returns apply_eval_profile(base).model_copy(update=...);
+      EVAL_PROFILE already null-routes fused_memory.url to FM_NULL_SENTINEL_URL
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def build_shadow_orch_config
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
+  - name: isolation-probe-inspects-the-built-invocation
+    binding: capability→producer (δ); INV-10 tier 1 — the probe asserts over the kwargs
+      a shadow cell would send, never a docstring and never a task status (4757/3096
+      are both still pending)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: isolation_unavailable
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
+  - name: landlock-reaches-shadow-implementer-legs
+    binding: producer-absent, MEASURED — then produced by δ. agents/sandbox_dispatch.py::wrap_command
+      and agents/landlock.py::build_landlock_command exist and take a worktree path;
+      no eval call site passes sandbox_modules (correction S6)
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: sandbox_modules
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
+  task_id: 5386
+- label: ε1
+  title: Shadow coordinator core — sampling, cell state machine, settle rules and
+    storm escape
+  note: 'Widened at decompose: adds startup reconciliation of non-terminal rows orphaned
+    by a process restart (INV-6/INV-7 — the fleet redeploys on an ~8h clock and soft-cancels
+    every in-flight task, so this is the common case), and an explicit bound on the
+    expiry sweep''s fan-out (INV-8/INV-11 — awaiting cells accumulate for up to 168h).'
+  capabilities:
+  - name: coordinator-module
+    binding: capability→producer (ε1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ShadowCoordinator
+      paths:
+      - orchestrator/src/orchestrator/shadow_eval.py
+      expect: present
+  - name: host-load-gate-is-consulted-correctly
+    binding: capability→producer (wired) — shared/psi.py::PsiSample.saturated(cfg)
+      is a METHOD on the frozen dataclass, not a module function, and returns False
+      whenever read_ok is False (fail-open); scheduler.py::Scheduler._phase_psi_gate
+      is the production precedent
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: correct fail-open handling is a behavioural property of ε1's injected-sample
+        tests
+  - name: restart-orphan-reconciliation
+    binding: FAIL as specified, resolved in ε1 — expire() as written settles only
+      awaiting_reference rows past deadline; a row left opened/running by a restart
+      had no exit owner (INV-6 status-matches-liveness, INV-7 holds-owned-and-bounded)
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: orphaned_by_restart
+      paths:
+      - orchestrator/src/orchestrator/shadow_eval.py
+      expect: present
+  - name: coordinator-holds-no-merge-client
+    binding: rejection-mechanism, structural limb (ii) of boundary row 13 — with the
+      shadow branch deleted (correction S5) a cell has no ref to enqueue; this pins
+      that the coordinator cannot acquire one either
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: merge_request|merge_queue|MergeRequest
+      paths:
+      - orchestrator/src/orchestrator/shadow_eval.py
+      expect: absent
+  task_id: 5387
+- label: ε2
+  title: Harness wiring and the implementer shape end to end — the B+H integration
+    gate
+  note: 'Correction S4: merge_finalized has no consumer inside the orchestrator process
+    outside the merge worker; the hook is a further req.result.add_done_callback in
+    merge_queue.py::enqueue_merge_request, where two already coexist. Correction S5:
+    create_eval_worktree is --detach, so no ref is created and boundary row 13''s
+    rejection claim is structural, not an added reaper exclusion.'
+  capabilities:
+  - name: phase-hook-wired-into-the-sole-emitter
+    binding: capability→producer (wired) — workflow.py::TaskWorkflow._enter_phase
+      is the ONLY emitter of phase_enter/phase_exit, and _await_cancellable's on_soft_cancel
+      is confirmed the only pre-existing callback seam on the harness
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shadow_coordinator
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: merge-landing-hook-wired
+    binding: capability→producer (wired) — merge_queue.py::enqueue_merge_request already
+      registers two independent req.result.add_done_callback callbacks (the retention
+      _on_finalized emitter and a chain-counter cleanup)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shadow_coordinator
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: landing-payload-carries-the-settle-inputs
+    binding: 'capability→producer (wired) — read at the EMIT site: data={request_id,
+      branch, state, snapshot_tip, merge_sha, superseded_by, generation, reason, landed_via_chain};
+      EventStore.latest_merge_finalized and ::fetch_events_by_type both exist'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: payload-key presence is exercised by ε2's boundary row 4 against a real
+        TaskWorkflow
+  - name: cap-hit-is-a-boolean-return-not-an-exception
+    binding: capability→producer (wired) — shared/usage_gate.py::UsageGate.detect_cap_hit
+      returns bool; SessionBudgetExhausted is a DIFFERENT mechanism (local session
+      budget) and must not be conflated; _build_eval_usage_gate returns None fail-open
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: boundary row 7 executes a cap hit; conflation is a review-time judgement
+  - name: a-shadow-cell-can-never-reach-the-merge-lane
+    binding: rejection-mechanism, limb (i), EXECUTED not read — create_eval_worktree
+      runs 'git worktree add --detach' so no ref exists; the four reapers (git_ops.py::prune_stale_merge_worktrees
+      / ::reap_interactive_worktrees, harness.py::_reap_orphan_worktrees / ::_run_interactive_worktree_reaper_pass)
+      all filter wt.parent == worktree_base (.worktrees) while the eval root is a
+      SIBLING of project_root, so no exclusion needs adding
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: boundary row 13 asserts no ref and no merge request against a real run;
+        limb (ii) is ε1's expect-absent grep
+  - name: production-slot-report-unchanged
+    binding: capability→producer (ε2) — harness.py::TaskReport, built by Harness._run_slot;
+      INV-8 requires the cell runner be awaited as a separate task, never inline in
+      the slot
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by boundary row 14 against the real slot object
+  task_id: 5388
+- label: θ1
+  title: eval-shadow report — the implementer-shape paired view and its JSON form
+  capabilities:
+  - name: eval-shadow-cli-group
+    binding: capability→producer (θ1) — cli.py::main is a click group whose eval commands
+      (::eval_cmd, ::eval_ofat_cmd, eval-matrix, eval-confirm, …) are all FLAT siblings;
+      a sub-group is a new pattern here, and no test pins the command set
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: eval-shadow
+      paths:
+      - orchestrator/src/orchestrator/cli.py
+      expect: present
+  - name: report-renders-from-rows-only
+    binding: capability→producer (wired via α) — INV-2 structured-facts-at-failure;
+      no transcript or log scrape anywhere in the path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shadow_cells
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
+  - name: missing-result-json-is-distinguishable-from-success
+    binding: capability→producer (θ1); INV-11 — boundary row 12 prints result_missing
+      and exits non-zero rather than logging and returning a clean table
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: result_missing
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
+  - name: n-min-floor-is-provisional-with-a-stated-basis
+    binding: numeric bound — 12 pairs is a legibility floor, NOT a power calculation
+      (PRD open question 2; kept unchanged by Leo at decompose). Not an accuracy bound
+      over a method with an analytical error floor, so the floor check does not apply;
+      θ2 prints observed pair variance so κ2's ruling can state the power it had
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: UNDERPOWERED
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
+  task_id: 5389
+- label: ζ
+  title: Architect and architect-consequence shapes — the Fable-plans-better instrument
+  capabilities:
+  - name: architect-and-implementer-runners-exist
+    binding: capability→producer (wired) — runner.py::run_architect_eval reads reference.post_task_commit
+      for the judge's ground truth; runner.py::run_eval raises ValueError on a falsy
+      plan, which is exactly leg 2's contract
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: run_architect_eval
+      paths:
+      - orchestrator/src/orchestrator/shadow_eval.py
+      expect: present
+  - name: leg1-leg2-linked-by-a-column
+    binding: 'FAIL as specified, resolved — the PRD linked legs ''by cell_id prefix''
+      (routing on a string prefix: heuristic 12 structured-data-not-meaningful-strings,
+      INV-1). α carries parent_cell_id and ζ sets/reads it; no prefix parsing anywhere'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: parent_cell_id
+      paths:
+      - orchestrator/src/orchestrator/shadow_eval.py
+      expect: present
+  - name: a-declining-leg1-opens-no-leg2
+    binding: capability→producer (ζ) — EvalMetrics.terminal_kind (task 4760) is populated;
+      boundary row 10 requires the decline be counted in the report's terminal_kind
+      split, not dropped
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: boundary row 10 executes leg-1 decline end to end
+  task_id: 5390
+- label: η
+  title: End-to-end shadow shape — the live confirm stage for a survivor candidate
+  capabilities:
+  - name: end-to-end-runner-takes-both-role-configs
+    binding: capability→producer (wired) — runner.py::run_end_to_end(task_path, arch_config,
+      impl_config, ...) already separates the two roles, which is exactly the shape
+      η needs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: run_end_to_end
+      paths:
+      - orchestrator/src/orchestrator/shadow_eval.py
+      expect: present
+  - name: an-unlisted-candidate-is-refused-audibly
+    binding: capability→producer (wired via α) — skipped(reason=shape_disabled) from
+      the closed reason enum (INV-11)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shape_disabled
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  task_id: 5391
+- label: θ2
+  title: Full shadow report, per-stratum breakdown and the esc-3637-1 consequence
+    view
+  capabilities:
+  - name: fable-candidate-pair-exists
+    binding: capability→producer (wired) — configs.py::ARCHITECT_EVAL_CONFIGS carries
+      architect-fable-max and architect-opus-max (claude-fable-5), the exact pair
+      esc-3637-1 consumes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: architect-fable-max
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+  - name: golden-executes-the-renderer
+    binding: INV-10 tier 1 — the golden renders from a SEEDED shadow_cells store,
+      so it exercises the renderer rather than matching prose; the --json schema is
+      the contract's one home (INV-1, INV-9)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the golden is θ2's own committed fixture; its execution is the test,
+        not a grep
+  - name: pair-variance-reported-for-the-n-min-recalibration
+    binding: capability→producer (θ2) — PRD open question 2's suggested resolution;
+      κ2's ruling cites it
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reported statistic, asserted by θ2's golden
+  task_id: 5392
+- label: κ1
+  title: Operator gate — rule the first shadow campaign's sample rate and enable shadow_eval
+    on dark_factory and reify
+  note: 'The PRD''s single κ is split at decompose. One task would hold an open L2
+    for the whole campaign — a hold whose exit owner cannot yet act (INV-7). A deterministic
+    before_done.kind=''predicate'' cannot express ''escalate when the data arrives''
+    either: predicate mode is check-then-DONE-or-escalate, so a passing check closes
+    the task and a resolved escalation re-runs the check and re-escalates.'
+  capabilities:
+  - name: pure-human-gate-is-expressible
+    binding: 'capability→producer (wired) — docs/task-authoring.md §5: task_kind=''deterministic''
+      + always_escalates=True + no before_done is the sanctioned pure gate, born-at-L2,
+      blocked until resume'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a born-at-L2 human gate; nothing mechanical to check
+  - name: both-project-configs-exist-at-the-canonical-path
+    binding: capability→producer (wired) — /home/leo/src/dark-factory/dark-factory-orchestrator.yaml
+      (project_id dark_factory) and /home/leo/src/reify/dark-factory-orchestrator.yaml
+      (project_id reify)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an operator edit plus reload_config on two live units
+  task_id: 5393
+- label: κ2
+  title: Operator gate — rule esc-3637-1 on the first architect-consequence shadow
+    report
+  capabilities:
+  - name: the-gate-predicate-has-one-home
+    binding: INV-9 one-fact-one-home — pairs >= n_min is rendered by the report itself
+      as the UNDERPOWERED tag (contract C5, producers θ1/θ2); κ2 points at it rather
+      than re-implementing the threshold
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Leo's ruling on esc-3637-1; the escalation body names the exact report
+        command
+  - name: the-hold-is-bounded
+    binding: INV-7 holds-owned-and-bounded — a delayed milestone anchored on κ1 going
+      done gives the campaign its window, and the open L2 is the supervised queue
+      with age surfacing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: milestone + L2 queue are the bound; nothing to grep
+  task_id: 5394
+- label: λ
+  title: Companion corrections — retire the frozen corpus as capability evidence and
+    document shadow eval
+  capabilities:
+  - name: eval-revival-decision-1-exists-to-amend
+    binding: 'capability→producer (wired) — plans/eval-framework-revival-prd.md §Resolved
+      design decisions #1 ''(Leo) Keep an offline fixed eval — a fixed target multiple
+      candidates compare against…'''
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: live-shadow-eval-prd
+      paths:
+      - plans/eval-framework-revival-prd.md
+      expect: present
+  - name: operations-section-slots-in-without-renumbering-eight-headings
+    binding: capability→producer (λ) — OPERATIONS.md has 16 top-level headings numbered
+      1.–14. plus 6a. and See also; an a-suffix (7a.) follows the existing 6a. precedent
+      and changes one line rather than eight
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: Shadow eval
+      paths:
+      - OPERATIONS.md
+      expect: present
+  - name: the-retirement-marker-has-a-real-home
+    binding: capability→producer (λ) — evals/tasks/ (22 fixtures) has NO README; evals/tasks_hard_v2/
+      (42 fixtures) has README.md with an existing | Path | What is it | table that
+      already says it is not the standing corpus. The marker is a row there, not a
+      new file
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: retired
+      paths:
+      - orchestrator/src/orchestrator/evals/tasks_hard_v2/README.md
+      expect: present
+  - name: no-contract-is-restated
+    binding: INV-9 one-fact-one-home / INV-5 — λ writes dated pointers only; the PRD
+      stays the home for every shadow-eval contract
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a restatement is a review-time judgement, not a grep
+  task_id: 5395
