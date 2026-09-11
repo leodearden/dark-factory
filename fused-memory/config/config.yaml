@@ -165,6 +165,50 @@ taskmaster:
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "all"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# write_journal — RED-TIER / restart-only. The prune runs once at startup
+# (server/main.py), so nothing re-reads these values afterwards; a changed leaf
+# is correctly reported restart_required by mcp__escalation__reload_config.
+#
+# MEASURED STARTING STATE (2026-09-11, before this section existed): write_ops
+# held 35,428,715 rows / 16 GB spanning 157 days, never pruned. The mix is
+# lopsided, which is why the horizons are:
+#
+#   reads   35,170,444 (99.27%) — get_task 20.9M, get_tasks 7.5M,
+#                                 get_statuses 5.1M, get_external_statuses 1.2M
+#                                 = 34,669,782 task reads (97.9% of the whole
+#                                 table, ~220,800/day) with NO consumer
+#   search     481,447 (1.36%, ~3,066/day) — leaf eta's (task 3213) sole data
+#                                 source and leaf theta's (3214) retro corpus
+#   writes     258,271 (0.73%)  — the causation-joined durable audit trail
+#
+# So search rows outlive task-read rows: the long horizon is nearly free
+# (365 d of search is ~1.1M rows) while the volume problem is entirely the four
+# task-read operations. An inverted pair is REJECTED at config load.
+#
+# RECORDED COST of task 3212 item (1): journalling per-result ids/scores/sizes
+# grows a search row from a measured ~90 B of JSON to roughly ~1.3 KB, i.e.
+# ~1.4 GB across the 365-day search horizon. Stated here so the cost is a
+# decision rather than a later discovery.
+#
+# THIS BOUNDS GROWTH; IT DOES NOT SHRINK THE FILE. `PRAGMA auto_vacuum` is NONE
+# on this database, so deleted pages go to SQLite's freelist for reuse — `ls -lh`
+# still reports ~16 GB after a fully successful prune, and those freed pages are
+# what absorbs the per-result detail above. Reclaiming disk needs an offline
+# VACUUM (a full-file rewrite needing ~16 GB of scratch), never run at startup.
+#
+# A first run against a large backlog legitimately needs many restarts to drain;
+# each partial sweep logs a WARNING naming which horizon is still behind.
+# ─────────────────────────────────────────────────────────────────────────────
+write_journal:
+  read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
+  search_retention_days: ${WRITE_JOURNAL_SEARCH_RETENTION_DAYS:365}
+  write_retention_days: ${WRITE_JOURNAL_WRITE_RETENTION_DAYS:730}
+  prune_batch_size: ${WRITE_JOURNAL_PRUNE_BATCH_SIZE:5000}
+  prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
+  prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
+
+
 # task_metadata.enforce — RED-TIER / restart-only (task 2162, W3-β). warn-mode
 # (false) logs a task_metadata.schema_warning line per SchemaWarning and lets
 # the write proceed; true rejects a schema-violating add_task/update_task with
