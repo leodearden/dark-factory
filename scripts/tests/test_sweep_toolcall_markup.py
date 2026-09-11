@@ -2489,7 +2489,16 @@ def test_apply_repairs_the_dead_lane_and_refuses_the_live_one(meta_plans_root):
 
 
 def test_a_second_apply_run_over_the_same_tree_exits_clean(meta_plans_root):
-    """(e) The acceptance invariant delta already uses: second run reports 0."""
+    """(e) The acceptance invariant delta already uses: second run reports 0.
+
+    EXIT_CLEAN here does NOT mean the tree is clean — ``7002`` is still corrupt
+    on disk and always will be, because a live lane's plan is plan-tools' to
+    repair (PRD D4), not this sweep's. That is the exact ambiguity the
+    reviewer flagged: a green exit over a tree carrying known corruption, with
+    nothing in the report to say so. ``skipped_with_markup`` is that missing
+    signal, asserted here rather than only on the dry-run row, because this is
+    the invocation an operator's cron actually leaves green.
+    """
     sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True)
 
     summary, diffs = sweep.run_sweep(
@@ -2499,6 +2508,9 @@ def test_a_second_apply_run_over_the_same_tree_exits_clean(meta_plans_root):
     assert summary.pending == 0
     assert diffs == []
     assert summary.exit_code() == sweep.EXIT_CLEAN
+    assert summary.skipped_with_markup == 1, (
+        'green exit, and the report still says corruption was seen'
+    )
 
 
 def test_never_touch_still_fires_for_a_meta_plans_shaped_target(meta_plans_root):
