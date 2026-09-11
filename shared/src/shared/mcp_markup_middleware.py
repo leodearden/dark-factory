@@ -1632,10 +1632,55 @@ _OVERRIDE_PARAMETER = inspect.Parameter(
 )
 
 
+def _consume_override(tool: str, metadata: Any) -> None:
+    """End the override map's lifecycle: drop the flag, REPORT what is left.
+
+    The flag is write-time-only control and never payload, so a decorated tool
+    body never sees it and nothing here forwards it. That leaves one question:
+    what about anything the caller sent BESIDES the flag?
+
+    Before the parameter was declared, that residue was the caller's own bug
+    AND its own diagnostic — ``_apply_override``'s drop branch left it in
+    place and pydantic bounced the call with ``Unexpected keyword argument``.
+    Declaring ``metadata`` removes the bounce, which is the point; silently
+    eating the residue with it would not be. So the response goes and the
+    REPORT stays.
+
+    KEYS ONLY, never values — the same names-only convention
+    :meth:`MarkupGuardMiddleware._emit_fact` and :meth:`~MarkupGuardMiddleware._forward`
+    already hold to. A record that copies the caller's payload is a second
+    copy of data this boundary has no business retaining.
+
+    The strip itself is :func:`~shared.toolcall_markup.strip_markup_override`,
+    the shared helper the tripwire and the middleware already use — "what is
+    the flag" is answered in one place (INV-5).
+
+    Total for any input. The declared type makes ``dict | None`` the only
+    shape pydantic lets through, so a non-dict here means something upstream
+    changed; it is reported by TYPE rather than by content, and never raised.
+    """
+    if metadata is None:
+        return
+    residue = strip_markup_override(metadata)
+    if isinstance(residue, dict):
+        if not residue:
+            # Only the flag: the expected shape, and the silent one.
+            return
+        leftover = sorted(residue)
+    else:
+        leftover = [type(residue).__name__]
+    logger.warning(
+        'markup override: %s was sent metadata it does not own and will not '
+        'persist — leftover keys %r (names only; values are not logged)',
+        tool, leftover,
+    )
+
+
 def _swallowing_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
     """*fn* plus a swallowed ``metadata`` keyword. The sync half of the pair."""
     @functools.wraps(fn)
     def wrapper(*args: Any, metadata: Any = None, **kwargs: Any) -> Any:
+        _consume_override(getattr(fn, '__name__', repr(fn)), metadata)
         return fn(*args, **kwargs)
 
     return wrapper
@@ -1649,6 +1694,7 @@ def _async_swallowing_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
     """
     @functools.wraps(fn)
     async def wrapper(*args: Any, metadata: Any = None, **kwargs: Any) -> Any:
+        _consume_override(getattr(fn, '__name__', repr(fn)), metadata)
         return await fn(*args, **kwargs)
 
     return wrapper
@@ -1674,7 +1720,9 @@ def accepts_markup_override(fn: Callable[..., Any]) -> Callable[..., Any]:
     to end, and it would leave twenty places for a future tool to be born
     without it. The argument is swallowed HERE too, so no tool body can
     persist it: "the flag is never written" is structural rather than a promise
-    repeated at every registration site.
+    repeated at every registration site. :func:`_consume_override` is that one
+    consumption point, and the one place a caller's non-flag residue can still
+    be reported now that pydantic no longer bounces it.
 
     SUBSTRATE, MEASURED IN THIS WORKTREE (fastmcp 3.2.2, CPython 3.13.9) — the
     PRD's section 6 table has been wrong about this library before, so this is
