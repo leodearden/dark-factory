@@ -303,6 +303,7 @@ __all__ = [
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'detect_resumable_progress',
+    'detect_transcript_model_id',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -315,6 +316,7 @@ __all__ = [
     'require_non_blank_prompt',
     'resumable_progress_for_session',
     'transcript_exists',
+    'transcript_model_id_for_session',
 ]
 
 
@@ -1027,6 +1029,60 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
+# The CLI writes this in place of a model name on records it synthesised
+# itself rather than received from a model.  Measured, not hypothetical: a
+# 2026-09-11 scan of 14 days of transcripts found 8 occurrences alongside the
+# real ids (`claude-sonnet-5` x78, `claude-opus-5` x45), and an earlier scan
+# found a stub transcript in which it was the ONLY model value present.
+_SYNTHETIC_MODEL_SENTINEL = '<synthetic>'
+
+
+def detect_transcript_model_id(records: list[dict]) -> str | None:
+    """Return the exact model id the CLI actually served, from *records*.
+
+    Reads ``model`` off each ``type == 'assistant'`` record, tolerating both
+    transcript nestings exactly as :func:`_content_blocks` does for content:
+    the real CLI shape nests it under ``record['message']['model']``, a flat
+    ``record['model']`` is also accepted, and anything else — a non-dict
+    record, a missing key, a non-string or empty value — is skipped rather
+    than raised.
+
+    Returns the LAST surviving id, or None when no record carries one.  Last
+    over first because a run that fails over or is downgraded mid-flight ends
+    on the model that actually produced its final output, which is the one a
+    cost or capability analysis needs to attribute the run to.
+
+    :data:`_SYNTHETIC_MODEL_SENTINEL` is discarded and treated as absent:
+    recording it would poison the very column this exists to make trustworthy.
+
+    Why the transcript and NOT the CLI stdout result envelope: the envelope is
+    an unverified source here.  :func:`_parse_claude_output` reads no ``model``
+    or ``modelUsage`` key and neither string appears anywhere in this repo, so
+    an envelope-based implementation would rest on an assumption about CLI
+    output shape with no real fixture to test it against.  The transcript is
+    measured (see :data:`_SYNTHETIC_MODEL_SENTINEL`) and is already
+    load-bearing for ``transcript_turns`` and ``ended_awaiting_background`` on
+    this exact code path.
+
+    Pure and total — operates on already-parsed records, so it is unit-testable
+    with no filesystem and costs no I/O at the seam that has already read them.
+    """
+    found: str | None = None
+    for record in records:
+        if not isinstance(record, dict) or record.get('type') != 'assistant':
+            continue
+        message = record.get('message')
+        model = message.get('model') if isinstance(message, dict) else None
+        if not isinstance(model, str) or not model:
+            model = record.get('model')
+        if not isinstance(model, str) or not model:
+            continue
+        if model == _SYNTHETIC_MODEL_SENTINEL:
+            continue
+        found = model
+    return found
+
+
 def detect_resumable_progress(records: list[dict] | None) -> bool:
     """Return True when the transcript *records* hold work worth CONTINUING.
 
@@ -1186,6 +1242,30 @@ def ended_awaiting_background_for_session(
     if records is None:
         return False
     return detect_ended_awaiting_background(records)
+
+
+def transcript_model_id_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> str | None:
+    """Return the exact model id served for *session_id*, read from its transcript.
+
+    Mirrors ``ended_awaiting_background_for_session``' shape: delegate to
+    ``read_transcript_records``; if it returns None (transcript not located or
+    a catastrophic read error) return None; otherwise apply the pure
+    :func:`detect_transcript_model_id` detector.  Never raises — an
+    unattributable run records NULL, which reads correctly as "not recorded",
+    rather than failing the invocation over telemetry.
+
+    This wrapper is for the paths that have NOT already read the transcript
+    (the timeout path).  The normal-exit path derives the same value from its
+    existing single read via the pure detector instead — see the task-2761
+    comment in ``_run_subprocess``.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return detect_transcript_model_id(records)
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
