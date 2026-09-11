@@ -98,14 +98,22 @@ citations, because the corpus spells them as BARE id lists
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from fused_memory.reconciliation.task_filter import TERMINAL_OUTCOME_RE
 
 __all__ = [
+    'ERROR_TYPE',
     'GATE_CITATION_MARKER',
     'GATE_CITATION_RE',
     'find_gate_citation_ids',
+    'stale_gate_citation_error',
 ]
+
+# The rejection this guard returns. Shared with render_gate_citation_section()
+# below so the prompt names exactly the error the write boundary produces —
+# renaming this constant cannot silently orphan the prompt.
+ERROR_TYPE = 'ReconStaleGateCitationRejected'
 
 # Marker vocabulary: the phrasings that assert THIS task's pending external
 # gates. Deliberately narrow and corpus-derived — each exclusion below was
@@ -187,3 +195,92 @@ def find_gate_citation_ids(text: str) -> set[int]:
             continue
         cited.update(int(t) for t in re.findall(r'\d{2,5}', m.group(1)))
     return cited
+
+
+def _normalise_dependency_ids(value: Any) -> set[int] | None:
+    """Coerce a live ``dependencies`` payload to a set of task ids.
+
+    Returns ``None`` when the payload cannot be interpreted at all, which the
+    caller reads as "fail open". An EMPTY list is interpretable and returns an
+    empty set — a task with no dependencies genuinely has no pending external
+    gates, so citing one is precisely the violation.
+
+    Both int and str shapes arrive here in practice, so accepting both is
+    load-bearing rather than defensive: ``sqlite_task_backend._row_to_task``
+    types ``dependencies`` as ``list[int]`` on READ, while
+    ``TaskBackend.update_task(..., dependencies: list[str] | None)`` takes
+    ``list[str]`` on WRITE, and the interceptor prefers the write kwarg when the
+    same call rewrites the array. Non-coercible entries are skipped rather than
+    raising, which is what admits the cross-project ``'reify:6508'`` spelling
+    alongside ordinary ids.
+    """
+    if not isinstance(value, (list, tuple)):
+        return None
+    ids: set[int] = set()
+    for entry in value:
+        try:
+            ids.add(int(entry))
+        except (TypeError, ValueError):
+            continue
+    if value and not ids:
+        return None
+    return ids
+
+
+def stale_gate_citation_error(
+    details: Any,
+    agent_id: str | None,
+    *,
+    live_dependencies: Any,
+) -> dict[str, Any] | None:
+    """Reject a recon-stage ``details`` write that cites a pending external gate
+    absent from the task's live ``dependencies`` array.
+
+    Returns a structured error dict (``{'error', 'error_type', 'hint'}``, the
+    same flat shape as ``premise_lint_guard.premise_lint_error``) on a
+    violation, else ``None``. See the module docstring for the incident, the
+    corpus measurement, and the fail-open rationale.
+
+    Args:
+        details: The ``details`` text being written. Anything that is not a
+            non-empty string is a no-op.
+        agent_id: The resolved caller identity. Enforcement fires only for a
+            string starting with ``'recon-stage-'`` — the scoping lives inside
+            the function (as in ``premise_lint_error``) so the predicate is
+            safe to unit-test and safe to call from any boundary.
+        live_dependencies: The dependency array the write LEAVES BEHIND — the
+            incoming kwarg when the same call rewrites it, else the live row's.
+    """
+    if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
+        return None
+    if not isinstance(details, str) or not details:
+        return None
+    live = _normalise_dependency_ids(live_dependencies)
+    if live is None:
+        return None
+
+    stale = sorted(find_gate_citation_ids(details) - live)
+    if not stale:
+        return None
+
+    stale_text = ', '.join(str(i) for i in stale)
+    live_text = ', '.join(str(i) for i in sorted(live)) or '(none)'
+    return {
+        'error': (
+            f'Task details cite {stale_text} as a pending external gate, but '
+            f"those ids are absent from the task's live `dependencies` array "
+            f'({live_text}). A gate list copied forward from earlier relay '
+            f'prose keeps a superseded dependency presenting as a live '
+            f'blocker — the task-3708 incident this guard closes.'
+        ),
+        'error_type': ERROR_TYPE,
+        'hint': (
+            f'Re-derive the gate list from the live `dependencies` array read '
+            f'this cycle ({live_text}), drop {stale_text}, and retry — the '
+            f'array above is current, so no second read is needed. If an id is '
+            f'being mentioned historically rather than as a live gate, phrase '
+            f'it outside a gate assertion (e.g. "3660 was coalesced into '
+            f'4856") or as a completed outcome (e.g. "external deps '
+            f'3658/3659 have landed").'
+        ),
+    }
