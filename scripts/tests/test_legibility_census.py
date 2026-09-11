@@ -1088,51 +1088,49 @@ def _sample_mining_result():
     )
 
 
-def test_render_report_contains_dated_header_and_all_sections():
-    report = mod.render_report(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=False,
-        matrix_md="| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n",
-        mining_result=_sample_mining_result(),
+def test_render_report_carries_each_piece_in_its_own_section():
+    matrix_md = "| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n"
+    sections = _sections(
+        matrix_md=matrix_md,
         synthesis_md="Fable synthesis prose goes here.",
         filed_task_ids=["1234", "1235"],
         cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
     )
 
-    assert "# confusion census 2026-07-14" in report
-    assert "dark_factory" in report
-    # matrix embedded verbatim
-    assert "| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n" in report
-    # saturation-stats section: batch count, per-batch dup rates, stop_reason
-    assert "saturated" in report
-    assert "2" in report  # batch count
-    assert "0.5" in report
-    assert "0.9" in report
-    # filed task ids
-    assert "1234" in report
-    assert "1235" in report
-    # cost note
-    assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in report
-    # synthesis prose
-    assert "Fable synthesis prose goes here." in report
-    # no force marker on a non-forced run
-    assert "--force" not in report
+    # The key set doubles as the force-marker absence check this test used to
+    # spell `"--force" not in report`.
+    assert [section.key for section in sections] == [
+        mod.SECTION_HEADER,
+        mod.SECTION_SATURATION,
+        mod.SECTION_MATRIX,
+        mod.SECTION_SYNTHESIS,
+        mod.SECTION_FILED_TASKS,
+        mod.SECTION_COST,
+    ]
 
-
-def test_render_report_force_marker_present_when_forced():
-    report = mod.render_report(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=True,
-        matrix_md="matrix",
-        mining_result=_sample_mining_result(),
-        synthesis_md="prose",
-        filed_task_ids=[],
-        cost_note="cost",
+    # Each piece in its OWN section -- strictly stronger than `in report`,
+    # which passed if a piece landed anywhere in the blob, including under the
+    # wrong heading.
+    header = _section_text(sections, mod.SECTION_HEADER)
+    assert "# confusion census 2026-07-14" in header
+    assert "Project: dark_factory" in header
+    assert matrix_md in _section_text(sections, mod.SECTION_MATRIX), "embedded verbatim"
+    assert "Fable synthesis prose goes here." in _section_text(sections, mod.SECTION_SYNTHESIS)
+    filed = _section_text(sections, mod.SECTION_FILED_TASKS)
+    assert "- 1234" in filed
+    assert "- 1235" in filed
+    assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in _section_text(
+        sections, mod.SECTION_COST
     )
-    assert "--force" in report
-    assert "operator-initiated" in report.lower()
+
+    # The saturation tallies as whole lines, not bare digits: the old
+    # `"2" in report` / `"0.5" in report` checks passed against a rendering
+    # that had dropped the batch index or transposed the fields.
+    saturation = _section(sections, mod.SECTION_SATURATION).lines
+    assert "- batches: 2" in saturation
+    assert "- stop reason: saturated" in saturation
+    assert any("batch 0:" in line and "dup_rate=0.50" in line for line in saturation)
+    assert any("batch 1:" in line and "dup_rate=0.90" in line for line in saturation)
 
 
 def test_render_report_is_deterministic_no_clock():
@@ -1226,23 +1224,69 @@ def _storm_capped_mining_result():
     )
 
 
-def _coverage_line(report):
-    """Isolate the single "- coverage:" line inside "## Saturation" from the
-    rest of the section. The per-batch bullets rendered below it already
-    contain digit-bearing substrings like "total=10 ... succeeded=4", so
-    asserting against the whole section (the same trap
-    test_render_report_capped_run_names_cap_and_partial_coverage's own
-    precision comment below calls out for the bare cap digit) would pass
-    even against unfixed code and prove nothing. Assert only against what
-    this returns."""
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    coverage_lines = [
-        line for line in saturation_section.splitlines() if line.strip().startswith("- coverage:")
+def _section(sections, key):
+    """The section keyed *key*, or a legible AssertionError naming the key and
+    the keys actually present.
+
+    Replaces `report.split("## Saturation", 1)[1]`, whose IndexError on an
+    absent section is the illegible failure the convention memory explicitly
+    calls out: it names neither what was looked for nor what was there. THE
+    single lookup -- `_section_text` and `_saturation_lines` both go through
+    it, so there is one failure message to get right."""
+    matches = [section for section in sections if section.key == key]
+    assert len(matches) == 1, (
+        f"expected exactly one {key!r} section; keys present: "
+        f"{[section.key for section in sections]}"
+    )
+    return matches[0]
+
+
+def _section_text(sections, key):
+    """The rendered text of the section keyed *key*."""
+    return _section(sections, key).text
+
+
+def _section_keys(**overrides):
+    return [section.key for section in _sections(**overrides)]
+
+
+def _saturation_lines(sections, prefix):
+    """Every `SECTION_SATURATION` line whose stable leading field is *prefix*.
+
+    The section is found by KEY and the line by its leading field, never by a
+    prose substring. Isolating the line also matters for precision: the
+    per-batch bullets below the coverage line already carry digit-bearing
+    substrings like "total=10 ... succeeded=4", so asserting against the whole
+    section would pass even against unfixed code."""
+    return [
+        line for line in _section(sections, mod.SECTION_SATURATION).lines
+        if line.strip().startswith(prefix)
     ]
+
+
+def _coverage_line_among(lines):
+    """The single "- coverage:" line among *lines*, found by its stable leading
+    field."""
+    coverage_lines = [line for line in lines if line.strip().startswith("- coverage:")]
     assert len(coverage_lines) == 1, (
         f"expected exactly one '- coverage:' line, found {coverage_lines!r}"
     )
     return coverage_lines[0]
+
+
+def _coverage_line(sections):
+    """The coverage line the CAPPED branch renders into `SECTION_SATURATION`."""
+    return _coverage_line_among(_saturation_lines(sections, "- coverage:"))
+
+
+def _persisted_coverage_line(report):
+    """The coverage line of a PERSISTED report artifact -- for the `run_census`
+    end-to-end tests, which hold the written text and not the render kwargs.
+
+    Scans for the line by its stable leading field rather than splitting on
+    "## Saturation", so an absent line fails naming what was looked for instead
+    of raising IndexError out of a string split."""
+    return _coverage_line_among(report.splitlines())
 
 
 def _render_kwargs(**overrides) -> dict[str, Any]:
@@ -1273,23 +1317,27 @@ def _render(**overrides):
     return mod.render_report(**_render_kwargs(**overrides))
 
 
+def _sections(**overrides):
+    return mod.census_report_sections(**_render_kwargs(**overrides))
+
+
 def test_render_report_capped_run_names_cap_and_partial_coverage():
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "20" in saturation_section, "sessions actually mined (2 batches x 10) must be stated"
-    # Assert the substantive substring, not a bare "2": the section always
-    # carries "- batches: 2" and digit-bearing per-batch bullets, so a bare
-    # digit check passes even if the cap VALUE stopped being rendered --
-    # exactly the regression this line claims to guard.
-    assert "operator batch cap = 2" in saturation_section
-    assert "cap" in lowered, "the operator cap must be named, never applied silently"
-    # A capped report must be unreadable as full coverage.
-    assert "partial" in lowered
-    assert "not mined" in lowered
+    coverage_line = _coverage_line(sections)
+    # Assert the substantive NUMBERS with enough anchor to order them, not bare
+    # digits: the section always carries "- batches: 2" and digit-bearing
+    # per-batch bullets, so a bare digit check passes even if the cap VALUE
+    # stopped being rendered -- exactly the regression this line guards.
+    assert "coded 20 of 20 session digest(s) drawn" in coverage_line, (
+        "sessions actually mined (2 batches x 10) must be stated"
+    )
+    assert "operator batch cap = 2 batch(es)" in coverage_line
+    # The partial-coverage disclosure is its own line, and a capped run is the
+    # only run that carries it (see ..._no_cap_renders_no_coverage_line).
+    assert len(_saturation_lines(sections, "- NOT PICKED UP LATER:")) == 1
 
 
 def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
@@ -1300,9 +1348,7 @@ def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
     # bounded run is never read as fuller coverage than it actually was --
     # so it must lead with what was CODED (succeeded), not merely what was
     # DRAWN (total).
-    report = _render(mining_result=_storm_capped_mining_result())
-
-    coverage_line = _coverage_line(report)
+    coverage_line = _coverage_line(_sections(mining_result=_storm_capped_mining_result()))
     # One ordered-substring assertion, not separate bare-digit checks: two
     # independent "14 in line" / "20 in line" checks would both still pass
     # against a transposed rendering ("coded 20 of 14 ... drawn") -- exactly
@@ -1322,13 +1368,13 @@ def test_render_report_capped_coverage_names_the_uncoded_digests_when_coding_fel
     # merely inferable by subtracting the per-batch bullets rendered below
     # it -- an operator deciding whether to roll last_census_at back reads
     # THIS line, and it is the one line whose job is the coverage claim.
-    report = _render(mining_result=_storm_capped_mining_result())
-
-    coverage_line = _coverage_line(report)
-    lowered = coverage_line.lower()
-    assert "6" in coverage_line, "the 6 digests that failed to code must be named"
-    assert "failed to code" in lowered
-    assert "no signal" in lowered, "the shortfall must say these digests contributed nothing"
+    coverage_line = _coverage_line(_sections(mining_result=_storm_capped_mining_result()))
+    # The shortfall COUNT attached to the claim it qualifies, not a bare "6":
+    # the line legitimately carries 14 and 20, each of which a bare digit check
+    # would also match.
+    assert "6 digest(s) FAILED TO CODE" in coverage_line, (
+        "the 6 digests that failed to code must be named on this line"
+    )
 
 
 def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_digest_coded():
@@ -1336,18 +1382,18 @@ def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_dig
     # line trained to be ignored is a line that will be ignored on the run
     # that matters. This is the branch guard for the shortfall clause: it
     # must render ONLY when coding actually fell short of what was drawn.
-    report = _render(
+    coverage_line = _coverage_line(_sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
-    )
-
-    coverage_line = _coverage_line(report)
-    lowered = coverage_line.lower()
-    assert "failed to code" not in lowered
-    assert "no signal" not in lowered
+    ))
+    # The precondition asserted rather than assumed: coded == drawn is what
+    # makes the clause inapplicable.
+    assert "coded 20 of 20 session digest(s) drawn" in coverage_line
     # Not a bare "0" check (a healthy run's line legitimately contains "20",
-    # which itself contains "0") -- assert the shortfall-clause SHAPE is
+    # which itself contains "0") -- assert the shortfall-clause MARKER is
     # absent, not merely that some unrelated digit is.
-    assert "0 digest" not in coverage_line, "a healthy run must not render a 0-failure clause"
+    assert "FAILED TO CODE" not in coverage_line, (
+        "a healthy run must not render a 0-failure clause"
+    )
 
 
 def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
@@ -1356,152 +1402,169 @@ def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
     # anchors the NEXT window there, so the capped-away sessions fall outside
     # every future window -- the same dead-recovery-path hazard the dry-run
     # WARNING is written to avoid.
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "last_census_at" in lowered, "the re-anchoring mechanism must be named"
-    assert "next census window starts here" in lowered
-    assert "never re-enumerated" in lowered, (
-        "the report must say the capped-away sessions are not swept later"
+    disclosure = _saturation_lines(sections, "- NOT PICKED UP LATER:")
+    assert len(disclosure) == 1, "the disclosure is one line of its own"
+    # The two IDENTIFIERS an operator needs to act: the field that re-anchors
+    # the window, and the file holding it. Asserted because they are machine
+    # names a reader can look up, not because of the prose around them.
+    assert "last_census_at" in disclosure[0], "the re-anchoring mechanism must be named"
+    assert "docs/legibility/census-state.json" in disclosure[0], (
+        "the one real recovery lever is named, so a plain re-run is not read as it"
     )
-    # ...and must not leave a re-run reading as the recovery path.
-    assert "census-state.json" in lowered, "the one real recovery lever is named"
 
 
 def test_render_report_cap_not_reached_makes_no_re_anchor_claim():
     # The re-anchor disclosure belongs to the CAPPED branch only: a cap that
     # was set but never reached mined exactly what an uncapped run would.
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "last_census_at" not in lowered
-    assert "never re-enumerated" not in lowered
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- coverage:") == []
 
 
 def test_render_report_cap_set_but_not_reached_is_reported_distinctly():
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "99" in saturation_section, "the cap is still named for the operator's record"
-    assert "cap" in lowered
-    assert "not reached" in lowered
+    # DISTINCTLY: a different line shape from the capped branch's
+    # "- coverage:", carrying the cap value and why it did not bind.
+    not_reached = _saturation_lines(sections, "- operator batch cap:")
+    assert len(not_reached) == 1
+    assert "99 batch(es)" in not_reached[0], "the cap is still named for the operator's record"
+    assert "not reached -- mining stopped by: saturated" in not_reached[0]
     # No partial-coverage claim: the run stopped on its own terms.
-    assert "partial" not in lowered
-    assert "not mined" not in lowered
+    assert _saturation_lines(sections, "- coverage:") == []
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
 
 
 def test_render_report_no_cap_renders_no_coverage_line():
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="exhausted", max_batches=None),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "cap" not in lowered, "an uncapped run must render no cap text at all"
-    assert "coverage" not in lowered
-    assert "partial" not in lowered
+    # None of the three cap line shapes, and -- stronger than any absence
+    # check -- the whole section locked to the header plus the two tallies
+    # plus the per-batch bullets, so no cap text can appear anywhere in it.
+    assert _saturation_lines(sections, "- coverage:") == []
+    assert _saturation_lines(sections, "- operator batch cap:") == []
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _section(sections, mod.SECTION_SATURATION).lines == (
+        "",
+        "## Saturation",
+        "",
+        "- batches: 2",
+        "- stop reason: exhausted",
+        "  - batch 0: dup_rate=0.10 (total=10, succeeded=10, failed=0, saturated=False)",
+        "  - batch 1: dup_rate=0.10 (total=10, succeeded=10, failed=0, saturated=False)",
+    )
+
+
+def _verification_bullets(sections):
+    """The `SECTION_VERIFICATION` bullets, i.e. the section minus its heading
+    and the blank lines framing it."""
+    return [
+        line for line in _section(sections, mod.SECTION_VERIFICATION).lines
+        if line.startswith("- ")
+    ]
 
 
 def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
-    report = _render(
-        verify_coverage=mod.VerifyCoverage(novel=812, verified=150, cap=150),
+    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=812, verified=150, cap=150))
+
+    bullets = _verification_bullets(sections)
+    # TWO bullets: the deferral counts, and the conditional-pickup caveat that
+    # "a later census" is not automatic. Counting them is the structural form
+    # of "the caveat is disclosed" -- the caveat's prose is free to be
+    # reworded, its presence is not.
+    assert len(bullets) == 2, f"expected the counts line and the caveat line; got {bullets!r}"
+    # One ordered assertion, not three independent bare-digit checks: separate
+    # "150 in section" / "812 in section" checks would both still pass against
+    # a transposed rendering.
+    assert "verified 150 of 812 novel clusters" in bullets[0]
+    assert "operator verify cap: 150" in bullets[0]
+    assert "662 deferred" in bullets[0], (
+        "the deferred remainder must be STATED, not left to the reader's arithmetic"
     )
-
-    assert "## Verification" in report
-    section = report.split("## Verification", 1)[1].split("##", 1)[0]
-    assert "150" in section
-    assert "812" in section
-    assert "662" in section, "the deferred remainder must be stated, not left to arithmetic"
-    lowered = section.lower()
-    assert "verified 150 of 812" in lowered
-    # Deferred means "not yet adjudicated", never "dropped": the deferred
-    # clusters still merged into the codebook as pending candidates.
-    assert "pending candidate" in lowered
-    assert "deferred" in lowered
-    assert "dropped" not in lowered
-    # "a later census picks it up" is CONDITIONAL: this window's sightings are
-    # never re-mined, so a deferred cluster is re-adjudicated only on a
-    # recurrence. Say so, exactly as the batch-cap and dry-run paths do.
-    assert "recurs" in lowered, "the later-census pickup must be stated as conditional"
-    assert "not re-mined" in lowered or "never re-mined" in lowered
-
-    # Placement: between Saturation and the matrix.
-    assert report.index("## Saturation") < report.index("## Verification")
-    assert report.index("## Verification") < report.index("## Origin x Manifestation Matrix")
+    # Placement is asserted structurally by
+    # test_census_report_sections_verification_is_gated_and_positioned.
 
 
 def test_render_report_verify_cap_set_but_not_reached_claims_no_deferral():
     # Mirror of the batch cap's "not reached" branch. With novel == verified
     # nothing was deferred and nothing went unverified, so the deferral clause
     # would be a false statement about this run.
-    report = _render(verify_coverage=mod.VerifyCoverage(novel=3, verified=3, cap=5))
+    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=3, verified=3, cap=5))
 
-    assert "## Verification" in report
-    section = report.split("## Verification", 1)[1].split("##", 1)[0]
-    lowered = section.lower()
-    assert "verified all 3 novel cluster" in lowered
-    assert "5" in section, "the cap is still named for the operator's record"
-    assert "not reached" in lowered
-    # Nothing was deferred -- the deferral wording must be absent entirely.
-    assert "deferred" not in lowered
-    assert "0 deferred" not in lowered
-    assert "pending candidate" not in lowered
+    bullets = _verification_bullets(sections)
+    # ONE bullet, not two: nothing was deferred, so the deferral counts line
+    # and its conditional-pickup caveat are both absent. Asserted as a count
+    # rather than as the absence of the word "deferred", which a reworded
+    # deferral clause would slip past.
+    assert len(bullets) == 1, f"a not-reached cap defers nothing; got {bullets!r}"
+    assert "verified all 3 novel cluster(s)" in bullets[0]
+    assert "operator verify cap: 5 (not reached)" in bullets[0], (
+        "the cap is still named for the operator's record"
+    )
 
 
 def test_render_report_without_verify_coverage_renders_no_verification_section():
-    assert "## Verification" not in _render()
-    assert "## Verification" not in _render(verify_coverage=None)
+    assert mod.SECTION_VERIFICATION not in _section_keys()
+    assert mod.SECTION_VERIFICATION not in _section_keys(verify_coverage=None)
 
 
 _PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
 
 
 def test_render_report_dry_run_filing_section_names_count_and_path():
-    report = _render(
+    sections = _sections(
         filed_task_ids=[],
         dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     )
 
-    section = report.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "dry-run: 12 payload" in section
-    assert _PAYLOADS_PATH in section
-    assert "_none filed._" not in section
+    # The two VALUES a reviewer needs, on one line, ordered: the count and the
+    # file it was written to.
+    assert f"12 payload(s) written to {_PAYLOADS_PATH}" in _section_text(
+        sections, mod.SECTION_FILED_TASKS
+    )
 
 
 def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
     # An empty filed list plus a dry run must never read as "a normal run
-    # that happened to file nothing" -- the dry-run wording wins.
-    report = _render(
-        filed_task_ids=[],
-        dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
+    # that happened to file nothing" -- so the two renderings must DIFFER.
+    # Asserted as a difference against the plain rendering rather than as the
+    # absence of a hand-picked phrase, which a reworded placeholder would slip
+    # past.
+    dry_run_text = _section_text(
+        _sections(
+            filed_task_ids=[],
+            dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
+        ),
+        mod.SECTION_FILED_TASKS,
     )
+    plain_text = _section_text(_sections(filed_task_ids=[]), mod.SECTION_FILED_TASKS)
 
-    section = report.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "_none filed._" not in section
-    assert "dry-run" in section.lower()
-    assert "nothing filed" in section.lower()
+    assert dry_run_text != plain_text
+    assert f"3 payload(s) written to {_PAYLOADS_PATH}" in dry_run_text
 
 
 def test_render_report_without_dry_run_filed_tasks_section_unchanged():
-    filed = _render(filed_task_ids=["1234", "1235"])
-    filed_section = filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "- 1234" in filed_section
-    assert "- 1235" in filed_section
-    assert "dry-run" not in filed_section.lower()
+    # Whole-section locks rather than substring probes: every line the section
+    # renders is pinned, so a dry-run clause cannot leak into either branch
+    # and no `"dry-run" not in ...` probe has to anticipate its wording.
+    assert _section(
+        _sections(filed_task_ids=["1234", "1235"]), mod.SECTION_FILED_TASKS
+    ).lines == ("", "## Filed Tasks", "", "- 1234", "- 1235")
 
-    none_filed = _render(filed_task_ids=[])
-    none_section = none_filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "_none filed._" in none_section
-    assert "dry-run" not in none_section.lower()
+    assert _section(
+        _sections(filed_task_ids=[]), mod.SECTION_FILED_TASKS
+    ).lines == ("", "## Filed Tasks", "", "_none filed._")
 
 
 # ---------------------------------------------------------------------------
@@ -1520,24 +1583,6 @@ def test_render_report_without_dry_run_filed_tasks_section_unchanged():
 # stops being emitted, is emitted on the wrong run, or lands below the thing
 # it qualifies, fails, and a copy edit does not.
 # ---------------------------------------------------------------------------
-
-def _section_text(sections, key):
-    """The text of the section keyed *key*, or a legible AssertionError.
-
-    Replaces `report.split("## Saturation", 1)[1]`, whose IndexError on an
-    absent section is the illegible failure the convention memory explicitly
-    calls out: it names neither what was looked for nor what was there."""
-    matches = [section for section in sections if section.key == key]
-    assert len(matches) == 1, (
-        f"expected exactly one {key!r} section; keys present: "
-        f"{[section.key for section in sections]}"
-    )
-    return matches[0].text
-
-
-def _section_keys(**overrides):
-    return [section.key for section in mod.census_report_sections(**_render_kwargs(**overrides))]
-
 
 # Every flag combination render_report gates a section on, so no branch can
 # render outside the structure.
@@ -2618,7 +2663,7 @@ def test_run_census_storm_batch_capped_reports_coded_of_drawn_end_to_end(tmp_pat
     # (now-empty) source is ever polled again -- "capped", not "exhausted".
     assert outcome.stop_reason == "capped"
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    coverage_line = _coverage_line(report_text)
+    coverage_line = _persisted_coverage_line(report_text)
     assert "coded 1 of 3 session digest(s) drawn" in coverage_line, (
         "only dup-1 coded successfully; bad-1 and bad-2 failed to parse -- "
         "this count must come from a real coder.code_digests run, not a "
@@ -3286,7 +3331,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     # (none configured to fail to parse), so coded == drawn == 3 here -- no
     # shortfall clause is expected from THIS combination; step-5's extension
     # of the storm test already locks that clause separately.
-    coverage_line = _coverage_line(report_text)
+    coverage_line = _persisted_coverage_line(report_text)
     assert "coded 3 of 3" in coverage_line
     assert "operator batch cap = 1" in coverage_line
     assert "failed to code" not in coverage_line.lower()
