@@ -2111,19 +2111,50 @@ def test_log_swallows_only_os_and_subprocess_errors(monkeypatch):
         wdog.log("hello")
 
 
-def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
-    """The stderr fallback is best-effort too: it must not raise even when
-    stderr itself is a broken pipe or a full/failing journal socket.
+class _BrokenStderr:
+    """A stderr that is BROKEN: a dead pipe, or a full/failing journal socket.
+
+    Both surface as an OSError out of ``write``.
+    """
+
+    def write(self, _s: str) -> int:
+        raise BrokenPipeError("stderr is gone too")
+
+    def flush(self) -> None:
+        raise BrokenPipeError("stderr is gone too")
+
+
+def _closed_stderr():
+    """A stderr that is CLOSED — a real stream, not a double.
+
+    ``print`` to one raises ``ValueError: I/O operation on closed file``, which
+    is not an OSError. Handing back the genuine article rather than a fake that
+    re-states that message keeps the pin honest: a double can drift from what
+    CPython actually does, and then the test passes while log() would not.
+    """
+    with open(os.devnull, "w") as stream:
+        pass
+    return stream
+
+
+@pytest.mark.parametrize(
+    "make_stderr", [_BrokenStderr, _closed_stderr], ids=["broken", "closed"]
+)
+def test_log_never_raises_when_the_stderr_fallback_is_unusable(monkeypatch, make_stderr):
+    """The stderr fallback is best-effort too: an unusable stderr must not
+    raise out of log(). Stderr is unusable in more than one way, and they do
+    not share an exception type — broken raises OSError, closed raises
+    ValueError — so the fallback guard has to cover the class, not a list.
 
     dashboard-watchdog has no per-unit loop (unlike orchestrator-watchdog,
     whose main() calls log() from inside a per-unit ``except Exception``).
-    The real damage here is that an escaping OSError aborts tick() MID-BRANCH:
-    every log() call site in tick() — the startup-grace streak reset, the
-    healthy-again streak reset, and the ceiling re-trip log that precedes the
-    ceiling_open write — is ordered BEFORE the save_state() it narrates, so a
-    streak reset or the ``ceiling_open`` write would be silently skipped. A
-    skipped streak reset arms a restart of a *healthy* dashboard on the very
-    next missed probe — and this all lands on a 30s timer, twice as tight as
+    The damage here is that an escape aborts tick() MID-BRANCH: every log()
+    call site in tick() — the startup-grace streak reset, the healthy-again
+    streak reset, and the ceiling re-trip log that precedes the ceiling_open
+    write — is ordered BEFORE the save_state() it narrates, so a streak reset
+    or the ``ceiling_open`` write would be silently skipped. A skipped streak
+    reset arms a restart of a *healthy* dashboard on the very next missed
+    probe — and this all lands on a 30s timer, twice as tight as
     orchestrator-watchdog's 60s.
     """
     wdog = _load_watchdog()
@@ -2131,48 +2162,8 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
     def fake_run(argv, *args, **kwargs):
         raise FileNotFoundError("systemd-cat not found")
 
-    class _BrokenStderr:
-        def write(self, _s: str) -> int:
-            raise BrokenPipeError("stderr is gone too")
-
-        def flush(self) -> None:
-            raise BrokenPipeError("stderr is gone too")
-
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog.sys, "stderr", _BrokenStderr())
-
-    wdog.log("hello")  # must not raise — both journal routes are gone
-
-
-def test_log_never_raises_when_the_stderr_fallback_is_closed(monkeypatch):
-    """A CLOSED stderr must not escape log() either — not just a broken one.
-
-    ``contextlib.suppress(OSError)`` covers the broken-stream case above (a
-    broken pipe or a full/failing journal socket: BrokenPipeError IS an
-    OSError). It does NOT cover a CLOSED stream: ``print`` to one raises
-    ``ValueError: I/O operation on closed file``, which is not an OSError and
-    so escapes the guard entirely. Same best-effort situation, same already-
-    gone journal routes, opposite outcome.
-
-    The consequence is the one the never-raises contract above spells out: an
-    escape aborts tick() mid-branch and skips the save_state() that follows —
-    the startup-grace streak reset, the healthy-again streak reset, or the
-    ceiling re-trip log preceding the ceiling_open write — on a 30s timer.
-    """
-    wdog = _load_watchdog()
-
-    def fake_run(argv, *args, **kwargs):
-        raise FileNotFoundError("systemd-cat not found")
-
-    class _ClosedStderr:
-        def write(self, _s: str) -> int:
-            raise ValueError("I/O operation on closed file")
-
-        def flush(self) -> None:
-            raise ValueError("I/O operation on closed file")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog.sys, "stderr", _ClosedStderr())
+    monkeypatch.setattr(wdog.sys, "stderr", make_stderr())
 
     wdog.log("hello")  # must not raise — both journal routes are gone
 
