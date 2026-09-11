@@ -39,6 +39,8 @@ from pathlib import Path
 
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
+from orchestrator import rebase_recovery
+
 # ---------------------------------------------------------------------------
 # Real-git fixture scaffolding
 # ---------------------------------------------------------------------------
@@ -124,3 +126,90 @@ def build_mid_rebase_repo(root: Path, name: str = 'repo') -> tuple[Path, str]:
         'fixture expected a backing rr-cache entry'
     )
     return repo, conflict_id
+
+
+# ---------------------------------------------------------------------------
+# The MERGE_RR grammar
+# ---------------------------------------------------------------------------
+
+class TestParseMergeRr:
+    """MERGE_RR's real on-disk grammar, measured rather than assumed.
+
+    Records are NUL-TERMINATED ``<id>\\t<path>\\0``, not newline-separated, and
+    the id is ``<40-hex>[.<variant>]`` — git appends a ``.N`` suffix when one
+    conflict has several rerere variants.  Both details are load-bearing: a
+    parser that splits on newlines finds nothing in a real file, and one that
+    normalizes the id away reports a dangling ref as intact.
+
+    The byte literals below are taken verbatim from live files in this repo's
+    ``.git/worktrees/*/MERGE_RR`` (read-only observation).
+    """
+
+    def test_empty_file_yields_no_records(self) -> None:
+        parsed = rebase_recovery.parse_merge_rr(b'')
+        assert parsed.records == ()
+        assert parsed.unparsable == ()
+
+    def test_single_nul_terminated_record(self) -> None:
+        data = b'd233fdd99096e62540dc6cb96cae57c25398fa57\tshared/src/shared/mcp_markup_middleware.py\x00'
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert parsed.unparsable == ()
+        assert len(parsed.records) == 1
+        assert parsed.records[0].conflict_id == 'd233fdd99096e62540dc6cb96cae57c25398fa57'
+        assert parsed.records[0].path == 'shared/src/shared/mcp_markup_middleware.py'
+
+    def test_variant_suffix_is_retained_verbatim(self) -> None:
+        """The ``.1`` is part of the rr-cache directory NAME, never a decoration.
+
+        Live state of worktree 29171: MERGE_RR cites ``...648.1`` while
+        ``rr-cache/...648.1`` is ABSENT and the bare ``rr-cache/...648`` is
+        PRESENT.  A parser that strips the suffix here hands the classifier a
+        token that resolves, turning a genuinely dangling ref into a false
+        "intact" — the exact false negative that lets the crash through.
+        """
+        data = (
+            b'd932b0e1e48d84453c25373f569e77581b8cc648.1\t'
+            b'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py\x00'
+        )
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert parsed.unparsable == ()
+        assert parsed.records[0].conflict_id == (
+            'd932b0e1e48d84453c25373f569e77581b8cc648.1'
+        )
+
+    def test_multiple_records_including_a_path_with_a_space(self) -> None:
+        data = (
+            b'a' * 40 + b'\tsrc/one.py\x00'
+            + b'b' * 40 + b'\tdocs/a file with spaces.md\x00'
+            + b'c' * 40 + b'.12\tsrc/three.py\x00'
+        )
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert parsed.unparsable == ()
+        assert [r.conflict_id for r in parsed.records] == [
+            'a' * 40, 'b' * 40, 'c' * 40 + '.12',
+        ]
+        assert parsed.records[1].path == 'docs/a file with spaces.md'
+
+    def test_corrupt_records_surface_as_unparsable_without_raising(self) -> None:
+        """``read_rr()`` calls ``die("corrupt MERGE_RR")`` on these shapes.
+
+        A malformed record is a second way recovery fails hard, so it is
+        reported rather than raised: this helper decorates a RECOVERY path and
+        must never itself become the reason recovery fails.
+        """
+        data = (
+            b'deadbeef\tsrc/short-id.py\x00'          # id too short
+            + b'e' * 40 + b'src/no-tab.py\x00'        # missing the tab
+            + b'f' * 40 + b'\tsrc/good.py\x00'        # still parsed
+        )
+        parsed = rebase_recovery.parse_merge_rr(data)
+        assert [r.conflict_id for r in parsed.records] == ['f' * 40]
+        assert parsed.unparsable == (
+            b'deadbeef\tsrc/short-id.py',
+            b'e' * 40 + b'src/no-tab.py',
+        )
+
+    def test_trailing_bytes_without_a_nul_are_not_dropped(self) -> None:
+        """A truncated final record is evidence of damage, not something to skip."""
+        parsed = rebase_recovery.parse_merge_rr(b'a' * 40 + b'\tsrc/one.py')
+        assert [r.conflict_id for r in parsed.records] == ['a' * 40]
