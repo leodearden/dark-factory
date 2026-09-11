@@ -2188,9 +2188,12 @@ def test_the_self_name_specimen_is_invisible_to_the_blanket_predicate():
 def test_repair_document_repairs_a_self_name_closer_in_a_dict_field():
     """The gate widening, asserted where the sweep actually writes.
 
-    Today ``_repair_dict``'s per-field gate asks the param-free ``detect``, so
-    both fields are skipped, the document round-trips UNCHANGED and the sweep
-    reports nothing at all — the corruption is not even counted as residue.
+    ``_repair_dict``'s per-field gate asks the parameter-aware ``detect_for``
+    (task **4696**), so both self-name closers are SEEN and both fields are
+    repaired here, on the path that rewrites the file. Each outcome is
+    ``ACTION_REPAIRED`` with empty ``recovered_names`` — the PRD boundary row
+    B4 last-parameter shape, where the mis-closed field was the final argument
+    so there was nothing to drop and nothing to recover.
     """
     document = _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW)
     original = json.loads(json.dumps(document))
