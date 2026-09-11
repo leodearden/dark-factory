@@ -15,6 +15,7 @@ that suppresses spam from a stuck curator.
 from __future__ import annotations
 
 import fcntl
+import logging
 from typing import IO, Any, Literal, overload
 
 import pytest
@@ -445,6 +446,99 @@ class TestZeroOutputTimeoutEscalation:
 # ----------------------------------------------------------------------
 # Burst log keyed by (project_id, subtype) — independent counters
 # ----------------------------------------------------------------------
+
+
+class TestConsecutiveDegradedEscalation:
+    """The class-agnostic backstop: N consecutive degraded curations, whatever
+    the cause, is itself the alarm.
+
+    Per-exception-class instrumentation always has a hole — the next outage
+    arrives as an exception class nobody has written a handler for yet. This
+    path is reached by streak, not by type, so the hole cannot hide an outage
+    for longer than ``threshold`` curations.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queues_one_escalation_with_streak_evidence(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                streak=5,
+                threshold=5,
+                last_justification='llm-failed: FileNotFoundError: claude',
+                candidate_title='T',
+            )
+
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1
+            body = files[0].read_text()
+            assert 'curator_consecutive_degraded' in body
+            assert '"level": 1' in body
+            assert '"severity": "blocking"' in body
+            assert 'streak=5' in body
+            assert 'threshold=5' in body
+            assert 'llm-failed: FileNotFoundError: claude' in body
+            assert 'T' in body
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_bypasses_burst_suppression(self, tmp_path):
+        """Five successive alarms produce five escalations and leave the burst
+        window untouched.
+
+        Suppression is exactly what would defeat this alarm: a curator degrading
+        steadily for days trips the threshold repeatedly, and each trip must be
+        visible. Not touching ``_failure_log`` also keeps this path from
+        consuming the ordinary window's budget.
+        """
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for streak in range(5, 10):
+                await escalator.report_consecutive_degraded(
+                    project_root=str(tmp_path),
+                    project_id='proj-x',
+                    streak=streak,
+                    threshold=5,
+                    last_justification='llm-failed: RuntimeError: boom',
+                    candidate_title='T',
+                )
+
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 5
+            assert escalator._failure_log == {}
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_logs_and_does_not_raise(self, tmp_path, caplog):
+        """Unlike report_failure, this alarm must never raise.
+
+        report_failure raises with no orchestrator so an interactive MCP caller
+        sees the outage. This is a monitoring alarm reached from inside
+        curate()'s degraded path — raising here would convert a curator that is
+        merely degrading into a curator that fails add_task outright, breaking
+        the fail-open contract the alarm exists to observe.
+        """
+        escalator = CuratorEscalator()
+        with caplog.at_level(logging.ERROR):
+            await escalator.report_consecutive_degraded(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                streak=5,
+                threshold=5,
+                last_justification='llm-failed: RuntimeError: boom',
+                candidate_title='T',
+            )
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a dropped alarm must still be loud in the log'
+        assert any('proj-x' in r.getMessage() for r in errors)
 
 
 class TestBurstLogCompositeKey:
