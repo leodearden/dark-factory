@@ -198,7 +198,11 @@ def build_live_fixture(
     return {
         'id': f'shadow_{task_id}_{cell_id}',
         'name': str(task.get('title') or ''),
-        'project_root': project_root,
+        # str, not Path: the fixture must be JSON-serialisable to round-trip
+        # at all, and load_task reads this key as `raw_root.startswith(...)`,
+        # where a Path (or a null) is an AttributeError. Accepted as either
+        # and normalised once, here, so no caller has to know that.
+        'project_root': str(project_root),
         'pre_task_commit': base_sha,
         'task_definition': {
             'title': str(task.get('title') or ''),
