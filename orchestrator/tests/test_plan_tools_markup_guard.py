@@ -69,7 +69,6 @@ from shared.toolcall_markup import (
     ENVELOPE_LITERALS,
     MARKUP_OVERRIDE_KEY,
     detect,
-    detect_for,
     repair,
 )
 
@@ -779,6 +778,15 @@ class TestUnrepairableResidueIsPreserved:
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
         event, which already carries the widened value.
+
+        The expectation is SPELLED, not computed by calling ``detect_for``
+        here. An expectation derived from the predicate under test moves with
+        it, so it can only ever catch a disagreement between
+        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
+        closer sits at offset 459 and the blanket ``detect``'s answer at 471,
+        so the widened value is the HEAD of the leak and the blanket one
+        trails it by twelve characters.
         """
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
@@ -793,7 +801,7 @@ class TestUnrepairableResidueIsPreserved:
         assert record['level'] == 2
         assert record['tool'] == 'add_design_decision'
         assert record['field'] == 'decision'
-        assert record['matched_pattern'] == detect_for(UNREPAIRABLE_DECISION, 'decision')
+        assert record['matched_pattern'] == _close('decision')
         assert record['raw_value'] == UNREPAIRABLE_DECISION
 
     @pytest.mark.asyncio
@@ -957,6 +965,15 @@ class TestUnrepairableResidueIsPreserved:
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
         event, which already carries the widened value.
+
+        The expectation is SPELLED, not computed by calling ``detect_for``
+        here. An expectation derived from the predicate under test moves with
+        it, so it can only ever catch a disagreement between
+        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
+        closer sits at offset 459 and the blanket ``detect``'s answer at 471,
+        so the widened value is the HEAD of the leak and the blanket one
+        trails it by twelve characters.
         """
         queue = _FakeQueue(submit_error=OSError('queue is unwritable'))
         rig = build_residue_rig(monkeypatch, artifacts, queue)
@@ -967,9 +984,7 @@ class TestUnrepairableResidueIsPreserved:
         )
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
-        assert payload['matched_pattern'] == detect_for(
-            UNREPAIRABLE_DECISION, 'decision'
-        )
+        assert payload['matched_pattern'] == _close('decision')
         assert payload['escalation_id'] is None, (
             'the caller is better told nothing than pointed at a record that '
             'was never written'
