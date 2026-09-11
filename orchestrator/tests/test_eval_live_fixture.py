@@ -18,7 +18,11 @@ Step map:
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -330,3 +334,103 @@ class TestBuildLiveFixtureRefuses:
         with pytest.raises(ValueError):
             result = self._build(tmp_path, **overrides)
             pytest.fail(f'expected ValueError, got a fixture: {result!r}')
+
+
+class TestBuildLiveFixtureIsArgumentPure:
+    """C3's purity invariant: reads only its arguments, and shares none of them.
+
+    Two halves. (1) The builder never reaches the live repo — so a cell's
+    inputs are reproducible from its `shadow_cells` row rather than bound to
+    whenever the builder happened to run. (2) It neither mutates its arguments
+    nor hands back aliases of them — the plan dict the coordinator passes in is
+    production's freshly-read `.task-meta/<worktree>/plan.json`, and `run_eval`
+    hands the fixture's plan to a real workflow that flips step status in place.
+    """
+
+    def _forbid_subprocesses(self, monkeypatch):
+        def _fail(*args, **kwargs):
+            raise AssertionError('live repo read')
+
+        for attr in ('run', 'Popen', 'check_output', 'check_call', 'call'):
+            monkeypatch.setattr(subprocess, attr, _fail)
+        for attr in ('create_subprocess_exec', 'create_subprocess_shell'):
+            monkeypatch.setattr(asyncio, attr, _fail)
+
+    def test_builds_with_no_git_repo_and_a_nonexistent_project_root(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)          # a temp dir containing no git repo
+        self._forbid_subprocesses(monkeypatch)
+        absent = tmp_path / 'no-such-checkout'
+        assert not absent.exists()
+
+        fixture = build_live_fixture(
+            live_task(),
+            base_sha=BASE_SHA,
+            project_root=absent,
+            plan=live_plan(),
+            verify_commands=default_verify_commands('df'),
+            shape=ShadowShape.IMPLEMENTER,
+            cell_id='01JCELL',
+        )
+
+        # The base is the caller's, never "HEAD now" — there is no HEAD here.
+        assert fixture['pre_task_commit'] == BASE_SHA
+        assert Path(fixture['project_root']) == absent
+
+    def test_does_not_mutate_its_arguments(self, tmp_path):
+        task, plan = live_task(), live_plan()
+        verify_commands = default_verify_commands('df')
+        before = copy.deepcopy((task, plan, verify_commands))
+
+        build_live_fixture(
+            task,
+            base_sha=BASE_SHA,
+            project_root=tmp_path,
+            plan=plan,
+            verify_commands=verify_commands,
+            shape=ShadowShape.IMPLEMENTER,
+            cell_id='01JCELL',
+        )
+
+        assert (task, plan, verify_commands) == before
+
+    def test_the_returned_fixture_shares_nothing_with_the_caller(self, tmp_path):
+        task, plan = live_task(), live_plan()
+        verify_commands = default_verify_commands('df')
+        fixture = build_live_fixture(
+            task,
+            base_sha=BASE_SHA,
+            project_root=tmp_path,
+            plan=plan,
+            verify_commands=verify_commands,
+            shape=ShadowShape.IMPLEMENTER,
+            cell_id='01JCELL',
+        )
+        before = copy.deepcopy((task, plan, verify_commands))
+
+        # Exactly what run_eval's workflow does to the plan it is handed.
+        fixture['plan']['steps'].append({'id': 'step-3', 'status': 'pending'})
+        fixture['plan']['steps'][0]['status'] = 'done'
+        fixture['verify_commands']['test'] = 'echo pwned'
+        fixture['modules'].append('orchestrator/agents')
+
+        assert (task, plan, verify_commands) == before
+        assert plan['steps'][0]['status'] == 'pending'
+        assert task['metadata']['modules'] == ['orchestrator/evals']
+
+    def test_fixture_plan_still_equals_the_caller_plan(self, tmp_path):
+        # C3 says "plan as given": equal by value is all it requires, and a
+        # copy satisfies it.
+        plan = live_plan()
+        fixture = build_live_fixture(
+            live_task(),
+            base_sha=BASE_SHA,
+            project_root=tmp_path,
+            plan=plan,
+            verify_commands=default_verify_commands('df'),
+            shape=ShadowShape.IMPLEMENTER,
+            cell_id='01JCELL',
+        )
+        assert fixture['plan'] == plan
+        assert fixture['plan'] is not plan
