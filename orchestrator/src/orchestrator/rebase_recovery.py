@@ -31,6 +31,7 @@ capability the remaining half never had.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -209,3 +210,119 @@ def _free_backup_path(merge_rr_path: Path) -> Path:
     while (candidate := Path(f'{base}-{counter}')).exists():
         counter += 1
     return candidate
+
+
+#: Age past which an UNHELD ``*.lock`` is treated as abandoned.  Conservative
+#: by a wide margin: no legitimate git operation holds MERGE_RR.lock longer
+#: than a single rerere write, while the incident's lock was 22.6 hours old.
+DEFAULT_LOCK_STALE_AFTER_SECONDS = 3600.0
+
+
+@dataclass(frozen=True)
+class LockFinding:
+    """One ``*.lock`` and the two facts the removal decision turns on."""
+
+    path: Path
+    age_seconds: float
+    holder_pids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class LockSweep:
+    """Which locks were cleared and which were deliberately left alone.
+
+    Retained locks are returned rather than dropped: a lock this refused to
+    touch is the reason a subsequent abort may still fail, so the caller can
+    say so instead of leaving the operator to rediscover it.
+    """
+
+    removed: tuple[LockFinding, ...]
+    retained: tuple[LockFinding, ...]
+
+
+def lock_holder_pids(path: Path) -> tuple[int, ...]:
+    """Pids holding *path* open, found by scanning ``/proc/<pid>/fd``.
+
+    Deliberately NOT ``git_ops.lane_lock_holder_pids``, which reads
+    ``/proc/locks``.  That file lists kernel FLOCK/POSIX locks, whereas git's
+    ``*.lock`` files are plain ``O_CREAT|O_EXCL`` sentinels held open by file
+    descriptor with no kernel lock at all — so it would report "no holder" for
+    every live git lock, and this sweep would delete them.  The two probes
+    answer different questions and neither substitutes for the other.
+
+    Per-entry ``OSError`` is tolerated throughout: processes exit mid-scan and
+    other users' fd directories are not ours to read.  Either way the answer
+    for that pid is "cannot confirm it holds this", which is what skipping it
+    records.
+    """
+    target = str(path.resolve())
+    holders: list[int] = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fds = list((entry / 'fd').iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                resolved = os.readlink(fd)
+            except OSError:
+                continue
+            if resolved == target:
+                holders.append(int(entry.name))
+                break
+    return tuple(holders)
+
+
+def sweep_stale_locks(
+    *,
+    git_dir: Path,
+    now: datetime | None = None,
+    stale_after_seconds: float = DEFAULT_LOCK_STALE_AFTER_SECONDS,
+) -> LockSweep:
+    """Remove abandoned ``*.lock`` files directly under *git_dir*.
+
+    A lock is removed ONLY when nothing holds it open AND its mtime is older
+    than *stale_after_seconds*.  The conjunction is the whole contract: age
+    alone would delete a lock a live process still depends on, and a holder
+    check alone would clear a lock the instant its writer blinked.
+
+    The mtime of the operation the lock BLOCKS is never consulted — not as a
+    tiebreak, not as a hint.  Incident 3517's lock was older than the
+    rebase-merge directory it blocked, so "newer than the operation" clears a
+    lock that must be kept and "older than the operation" keeps one that must
+    be cleared; the relative comparison is wrong in both directions.
+
+    Size is likewise not a liveness signal: git's lock files are empty for as
+    long as they are held, so a 0-byte lock is exactly as likely to be live as
+    it is to be abandoned.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    removed: list[LockFinding] = []
+    retained: list[LockFinding] = []
+
+    for lock in sorted(git_dir.glob('*.lock')):
+        try:
+            age = moment.timestamp() - lock.stat().st_mtime
+        except OSError:
+            continue
+        finding = LockFinding(
+            path=lock, age_seconds=age, holder_pids=lock_holder_pids(lock),
+        )
+        if finding.holder_pids or age <= stale_after_seconds:
+            retained.append(finding)
+            continue
+        try:
+            lock.unlink()
+        except OSError:
+            retained.append(finding)
+            continue
+        removed.append(finding)
+        logger.warning(
+            'Removed stale git lock %s — age %.0fs (threshold %.0fs), '
+            'no holder process found in /proc.',
+            finding.path, finding.age_seconds, stale_after_seconds,
+        )
+
+    return LockSweep(removed=tuple(removed), retained=tuple(retained))
