@@ -2,7 +2,10 @@
 
 import asyncio
 import contextlib
+import fcntl
 import logging
+import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
@@ -1339,6 +1342,76 @@ class TestRunScopedVerificationSkipsUntouched:
         assert test_calls == 3, (
             f'default should retry per config; got {test_calls} invocations'
         )
+
+
+class TestAdmissionSlotBypassesExecutorForUngatedRoles:
+    """Task 5424 regression guard.
+
+    ``_admission_slot`` used to route EVERY role's ``cm.__enter__()`` through
+    ``loop.run_in_executor(_admission_executor(), ...)`` — even for roles
+    (e.g. ``'merge'``) that ``shared.verify_admission.acquire_task_slot``
+    never gates (its own role check yields ``held=False`` synchronously, no
+    I/O). Once the shared executor's fixed worker pool was fully pinned by
+    queued task-role acquisitions, a merge verify's admission check queued
+    FIFO behind them despite never needing a slot at all — contradicting
+    ``_admission_slot``'s own docstring (C-merge-priority) and 90+ minutes of
+    observed head-of-line merge starvation.
+
+    This test saturates a (patched, small) ``_admission_executor`` with real
+    task-role acquisitions permanently blocked against a held flock slot,
+    then asserts a merge-role ``_admission_slot`` call still enters within a
+    bounded wall-clock budget. Pre-fix, this call queues behind the
+    saturating workers and only proceeds once they are cleaned up at the end
+    of the test — comfortably exceeding the budget.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_merge_role_enters_immediately_when_executor_saturated(self, tmp_path, monkeypatch):
+        slots_dir = tmp_path / 'slots'
+        slots_dir.mkdir()
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+
+        # A tiny pool so two blocked task-role acquisitions fully saturate it
+        # (a fresh pool, decoupled from any singleton other tests created).
+        monkeypatch.setattr(verify, '_ADMISSION_EXECUTOR_MAX_WORKERS', 2)
+        monkeypatch.setattr(verify, '_admission_executor_singleton', None)
+
+        # Hold the sole slot externally so every task-role acquisition below
+        # blocks forever in T1's flock poll loop until this fd is closed.
+        holder_fd = os.open(str(slots_dir / 'slot-1'), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        async def _saturate():
+            async with verify._admission_slot('task', config):
+                pass  # pragma: no cover - never reached while the slot is held
+
+        saturating_tasks = [asyncio.create_task(_saturate()) for _ in range(2)]
+        try:
+            # Let both worker threads actually enter the blocking flock poll
+            # loop (0.1s poll interval), so the pool is genuinely saturated.
+            await asyncio.sleep(0.3)
+
+            start = time.monotonic()
+            async with verify._admission_slot('merge', config):
+                pass
+            elapsed = time.monotonic() - start
+
+            assert elapsed < 1.0, (
+                f'merge-role _admission_slot took {elapsed:.2f}s with the '
+                'admission executor fully saturated by task-role '
+                'acquisitions; a role acquire_task_slot never gates must '
+                'never queue behind the shared executor'
+            )
+        finally:
+            os.close(holder_fd)
+            await asyncio.wait_for(asyncio.gather(*saturating_tasks), timeout=5.0)
+            executor = verify._admission_executor_singleton
+            if executor is not None:
+                executor.shutdown(wait=True)
 
 
 class TestMergeFanoutCap:

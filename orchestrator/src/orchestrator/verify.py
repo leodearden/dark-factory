@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 from shared.proc_group import terminate_process_group
 from shared.psi import read_psi_sample
-from shared.verify_admission import acquire_task_slot, nice_prefix
+from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
@@ -5246,34 +5246,42 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
 
     Gates only the test leg of a verify (callers decide that; this CM itself
-    is role-agnostic and always attempts acquisition uniformly — T1's
-    ``acquire_task_slot`` internally no-ops for ``role`` values other than
-    ``'task'``/``'background'`` and always yields ``held=False`` immediately
-    for them, so ``merge`` can never be starved by ``task`` — C-merge-priority
-    is owned entirely by T1, not re-implemented here).
+    is role-agnostic and delegates the actual gating decision to T1's
+    ``shared.verify_admission.is_gated_role`` — the single place that decides
+    which roles ``acquire_task_slot`` attempts acquisition for
+    (``'task'``/``'background'``). A role it never gates (``merge``,
+    ``offline``, or unknown) must yield at once: no mkdir, no executor
+    round-trip, so ``merge`` can never be starved by ``task`` — C-merge-priority
+    is owned entirely by T1, not re-implemented here, and this CM's own
+    executor hop can't reintroduce the starvation T1's no-op was meant to
+    prevent (a full ``_admission_executor`` must never delay a role T1
+    guarantees is instant).
 
     T1 never creates ``slots_dir`` itself (fails open when absent) and never
     even inspects it for roles it can't acquire for (its own role check
-    short-circuits first), so this CM only mkdirs it for roles that actually
-    attempt acquisition (``task``/``background``) — leaving ``merge`` (and any
-    other role) with no filesystem side effect. The mkdir and the blocking,
-    potentially-unbounded ``acquire_task_slot(...).__enter__`` (a synchronous
-    flock poll-loop) both run on the dedicated ``_admission_executor`` so the
-    wait never blocks the event loop nor contends with unrelated
-    ``asyncio.to_thread`` work — a loop-blocking acquire would otherwise stall
-    the holder's own subprocess-exit callback from ever firing on this same
-    loop, deadlocking cross-verify contention.
+    short-circuits first), so this CM only mkdirs it for gated roles — leaving
+    ``merge`` (and any other ungated role) with no filesystem side effect. For
+    a gated role, the mkdir and the blocking, potentially-unbounded
+    ``acquire_task_slot(...).__enter__`` (a synchronous flock poll-loop) both
+    run on the dedicated ``_admission_executor`` so the wait never blocks the
+    event loop nor contends with unrelated ``asyncio.to_thread`` work — a
+    loop-blocking acquire would otherwise stall the holder's own
+    subprocess-exit callback from ever firing on this same loop, deadlocking
+    cross-verify contention. For an ungated role, ``acquire_task_slot(...)
+    .__enter__()`` is a synchronous no-op (no I/O, no blocking) and is called
+    directly on the event loop thread — routing it through the executor would
+    only expose it to that same pool's queueing delay for no benefit.
 
-    The acquire await is shielded from cancellation (``asyncio.shield``): if
-    the awaiting coroutine is cancelled mid-wait (e.g. orchestrator shutdown,
-    or a sibling verify's failure cancelling this one via ``asyncio.gather``),
-    the worker thread's poll loop keeps running in the background regardless
-    — it cannot be interrupted mid-``time.sleep`` — so a bare cancellation
-    would otherwise leave a slot acquired-but-never-released if the thread
-    goes on to succeed after we stopped waiting. A done-callback releases it
-    in that case instead. Release on the normal path (``os.close`` under the
-    hood) is synchronous and instant, so it runs directly in ``finally``
-    without needing an executor thread.
+    The gated-role acquire await is shielded from cancellation
+    (``asyncio.shield``): if the awaiting coroutine is cancelled mid-wait
+    (e.g. orchestrator shutdown, or a sibling verify's failure cancelling this
+    one via ``asyncio.gather``), the worker thread's poll loop keeps running
+    in the background regardless — it cannot be interrupted mid-``time.sleep``
+    — so a bare cancellation would otherwise leave a slot acquired-but-never-
+    released if the thread goes on to succeed after we stopped waiting. A
+    done-callback releases it in that case instead. Release on the normal
+    path (``os.close`` under the hood) is synchronous and instant, so it runs
+    directly in ``finally`` without needing an executor thread.
 
     Fails open (runs ungated) on any ``OSError`` — most commonly a
     ``slots_dir`` that cannot be created (C-fail-open, mirroring T1's own
@@ -5281,26 +5289,29 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     """
     slots_dir = Path(config.verify_admission_slots_dir)
     n = config.verify_admission_task_slots
-    loop = asyncio.get_running_loop()
-    executor = _admission_executor()
     cm = None
     try:
-        if role in {'task', 'background'}:
+        if is_gated_role(role):
+            loop = asyncio.get_running_loop()
+            executor = _admission_executor()
             await loop.run_in_executor(
                 executor, lambda: slots_dir.mkdir(parents=True, exist_ok=True),
             )
-        cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
-        enter_future = loop.run_in_executor(executor, cm.__enter__)
-        try:
-            await asyncio.shield(enter_future)
-        except asyncio.CancelledError:
-            def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
-                if cm is None or fut.cancelled() or fut.exception() is not None:
-                    return
-                with contextlib.suppress(OSError):
-                    cm.__exit__(None, None, None)
-            enter_future.add_done_callback(_release_if_acquired)
-            raise
+            cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
+            enter_future = loop.run_in_executor(executor, cm.__enter__)
+            try:
+                await asyncio.shield(enter_future)
+            except asyncio.CancelledError:
+                def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
+                    if cm is None or fut.cancelled() or fut.exception() is not None:
+                        return
+                    with contextlib.suppress(OSError):
+                        cm.__exit__(None, None, None)
+                enter_future.add_done_callback(_release_if_acquired)
+                raise
+        else:
+            cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
+            cm.__enter__()
     except OSError:
         cm = None
     try:
