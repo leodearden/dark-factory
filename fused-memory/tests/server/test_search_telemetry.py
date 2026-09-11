@@ -482,3 +482,114 @@ class TestTelemetryFaultCannotBreakSearch:
         assert summary.get('count') == 2, (
             f'The fallback must still record the count, got {summary!r}. RED: row lost entirely.'
         )
+
+
+# ── Item (5): journal drops are visible to a reader ─────────────────
+
+
+def _make_status_service():
+    """Mock service whose get_status returns the standard legacy shape.
+
+    Same shape as tests/test_halt_visibility.py's ``_make_status_mock_service``
+    so the "legacy payload stays byte-identical" claim is comparable across
+    both enrichment sites.
+    """
+    svc = AsyncMock()
+    svc.get_status = AsyncMock(return_value={
+        'graphiti': {'connected': True},
+        'mem0': {'connected': True},
+        'projects': {},
+        'queue': {
+            'counts': {'completed': 8648, 'dead': 3},
+            'oldest_pending_age_seconds': None,
+        },
+    })
+    return svc
+
+
+class TestGetStatusSurfacesJournalDrops:
+    """A dropped journal row is a search leaf eta scores as "never asked".
+
+    That makes a silent drop a WRONG answer rather than a missing one, so the
+    count has to be readable where an operator already looks.
+    """
+
+    @pytest.mark.asyncio
+    async def test_zero_drops_are_reported_not_omitted(self, write_journal):
+        server = create_mcp_server(_make_status_service(), None, write_journal)
+
+        result = await server._tool_manager.call_tool('get_status', {})
+
+        assert result.get('journal_drops') == {'dropped_total': 0, 'by_operation': {}}, (
+            'RED: "nothing was lost" must be ASSERTED, not inferred from an absent '
+            f'key — an absent key is indistinguishable from an unwired journal. '
+            f'got {result.get("journal_drops")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_reports_the_exact_drop_count(self, write_journal):
+        server = create_mcp_server(_make_status_service(), None, write_journal)
+        await write_journal.close()
+        write_journal._db = None
+        for _ in range(7):
+            await write_journal.log_write_op(
+                write_op_id='x', operation='search', kind='read',
+            )
+
+        result = await server._tool_manager.call_tool('get_status', {})
+
+        assert result['journal_drops'] == {
+            'dropped_total': 7, 'by_operation': {'search': 7},
+        }, (
+            'RED: a fallback firing 7 times must read as 7, not be absorbed; got '
+            f'{result.get("journal_drops")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_when_no_journal_wired(self):
+        """No journal → no key, so the legacy payload stays byte-identical."""
+        server = create_mcp_server(_make_status_service())
+
+        result = await server._tool_manager.call_tool('get_status', {})
+
+        assert 'journal_drops' not in result, (
+            'An unwired deployment has no drop count to report, and inventing a '
+            'zero would claim knowledge the server does not have'
+        )
+
+    @pytest.mark.asyncio
+    async def test_error_shaped_status_is_not_enriched(self, write_journal):
+        """Never graft stats onto an error payload — the same rule the
+        dead_letters and reconciliation_halt enrichments already follow."""
+        svc = _make_status_service()
+        svc.get_status = AsyncMock(return_value={
+            'error': 'Graphiti unreachable', 'error_type': 'ConnectionError',
+        })
+        server = create_mcp_server(svc, None, write_journal)
+
+        result = await server._tool_manager.call_tool('get_status', {})
+
+        assert result['error_type'] == 'ConnectionError'
+        assert 'journal_drops' not in result, (
+            'RED: grafting stats onto an error-shaped payload produces a mixed '
+            'error/stats result whose consumers must then handle both'
+        )
+
+    @pytest.mark.asyncio
+    async def test_log_read_fallback_feeds_the_same_counter(self, write_journal):
+        """(e) `_log_read`'s OWN except path must not grow a second counter."""
+        _, server = _make_server(write_journal)
+        # Bypass the journal's internal swallow so the OUTER handler in
+        # _log_read is the one that sees the failure — the rare path that
+        # would otherwise lose a row with nothing counting it.
+        write_journal.log_write_op = AsyncMock(side_effect=RuntimeError('journal down'))
+
+        await server._tool_manager.call_tool(
+            'search', {'query': _LONG_QUERY, 'project_id': _PROJECT_ID}
+        )
+
+        stats = write_journal.journal_drop_stats()
+        assert stats['dropped_total'] == 1, (
+            f'RED: _log_read\'s fallback must feed the SAME counter, got {stats!r}'
+        )
+        assert stats['by_operation'] == {'search': 1}
