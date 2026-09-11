@@ -1565,12 +1565,33 @@ class TaskCurator:
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
         except Exception as exc:
+            # An exception class nobody anticipated. It degrades exactly like
+            # the named arms above, and it reports exactly like them too: a
+            # silent arm here returns action='create', which downstream cannot
+            # tell from a healthy create (the 2026-08-13 to 08-18 outage ran
+            # five days on a FileNotFoundError landing right here).
             logger.warning(
-                'task_curator: LLM call failed, falling through to create: %s', exc,
+                'task_curator: LLM call failed with unexpected %s, '
+                'falling through to create: %s',
+                type(exc).__name__,
+                exc,
+                exc_info=True,
             )
+            if self._escalator is not None:
+                # No defensive try/except: the escalator's no-orchestrator
+                # re-raise must propagate here for the same reason it already
+                # does from the CuratorFailureError arm.
+                await self._escalator.report_failure(
+                    project_root=project_root,
+                    project_id=project_id,
+                    justification=f'unexpected-exception: {type(exc).__name__}: {exc}',
+                    candidate_title=candidate.title,
+                    subtype=f'unexpected-exception:{type(exc).__name__}',
+                    pool_sizes=pool_sizes,
+                )
             decision = CuratorDecision(
                 action='create',
-                justification=f'llm-failed: {exc}',
+                justification=f'llm-failed: {type(exc).__name__}: {exc}',
                 pool_sizes=pool_sizes,
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
