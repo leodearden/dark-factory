@@ -1263,9 +1263,20 @@ class ReconReportState:
         pointer): the most recent assertion about a claim is the one a reader
         should follow.
 
-        The stamp is applied only after the new finding is successfully
-        allocated and appended, so a ``duplicate_finding`` return never
-        stamps anything.
+        A ``supersedes`` that does not resolve to a finding THIS RUN owns
+        (unknown id, or an id belonging to another run —
+        :meth:`_resolve_finding` is run-scoped) fails the WHOLE call with
+        ``finding_unknown``, rather than filing the finding with the
+        supersession silently dropped.  A silently-unstamped supersession is
+        the original defect reinstated: the new claim goes live beside the
+        claim it refutes with no relation recorded, which is precisely the
+        state this argument exists to prevent.
+
+        Validate-early / stamp-late: the target is resolved before any
+        truncation, dedup or allocation work, so the reject path mutates
+        nothing and needs no index cleanup; the stamp is written only after
+        the new finding is allocated and appended (it needs the new
+        finding_id), so a ``duplicate_finding`` return never stamps anything.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1281,6 +1292,25 @@ class ReconReportState:
                 entry.stage,
             )
             return _ERR_ALREADY_COMPLETED.copy()
+
+        # task-4653 validate-early: resolve the supersession target BEFORE any
+        # truncation, dedup or allocation work, so an unresolvable target fails
+        # the whole call with nothing mutated — no finding row, no dedup index
+        # entry, nothing to clean up on the reject path.  The stamp itself is
+        # written late (after the new finding is appended), since the forward
+        # pointer needs the new finding_id.
+        supersedes_target: _Finding | None = None
+        if supersedes is not None:
+            resolved_target = self._resolve_finding(run_id, supersedes)
+            if resolved_target is None:
+                logger.warning(
+                    'recon_report: add_finding supersedes=%r does not resolve in run_id=%r; '
+                    'rejected',
+                    supersedes,
+                    run_id,
+                )
+                return _ERR_FINDING_UNKNOWN.copy()
+            _target_entry, supersedes_target = resolved_target
 
         # Fix 2 (task-2410): gracefully cap pathologically long text fields
         # BEFORE dedup hashing, so the stored text, the assembled-report
@@ -1390,20 +1420,17 @@ class ReconReportState:
         # run-scoped and cross-stage, so a later stage can retire an earlier
         # stage's claim; _persist_run below upserts EVERY entry of the run, so
         # the stamp on the earlier stage's row is durably written.
-        if supersedes is not None:
-            resolved_target = self._resolve_finding(run_id, supersedes)
-            if resolved_target is not None:
-                _target_entry, target = resolved_target
-                if target.superseded_by is not None:
-                    logger.info(
-                        'recon_report: finding_id=%r was already superseded by %r; '
-                        'moving the pointer forward to %r (run_id=%r)',
-                        supersedes,
-                        target.superseded_by,
-                        finding_id,
-                        run_id,
-                    )
-                target.superseded_by = finding_id
+        if supersedes_target is not None:
+            if supersedes_target.superseded_by is not None:
+                logger.info(
+                    'recon_report: finding_id=%r was already superseded by %r; '
+                    'moving the pointer forward to %r (run_id=%r)',
+                    supersedes,
+                    supersedes_target.superseded_by,
+                    finding_id,
+                    run_id,
+                )
+            supersedes_target.superseded_by = finding_id
 
         result: dict[str, Any] = {'finding_id': finding_id}
         if warnings:
