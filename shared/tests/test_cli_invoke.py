@@ -35,11 +35,13 @@ from shared.cli_invoke import (
     build_failure_message,
     classify_agent_failure,
     count_transcript_turns,
+    detect_transcript_model_id,
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
+    transcript_model_id_for_session,
 )
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
@@ -5400,3 +5402,158 @@ class TestMaterializeStdin:
         assert any(
             'read-only fd' in r.message for r in caplog.records
         ), f'narrowing was skipped silently; records={[r.message for r in caplog.records]}'
+
+
+# ── Exact model id from the transcript (task 4826) ──────────────────────────
+
+class TestDetectTranscriptModelId:
+    """``detect_transcript_model_id(records)`` — the pure model-id detector.
+
+    Answers "which model actually served this run?" from already-parsed
+    transcript records, so it is unit-testable with no filesystem and can be
+    called from the normal-exit seam that has already read them.
+    """
+
+    def test_reads_the_nested_message_model(self):
+        """The real CLI shape nests it under ``record['message']['model']``."""
+        records = [
+            {'type': 'user', 'message': {'role': 'user'}},
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_reads_the_flat_model(self):
+        """A flat ``record['model']`` is accepted too, mirroring _content_blocks."""
+        records = [{'type': 'assistant', 'model': 'claude-sonnet-5'}]
+        assert detect_transcript_model_id(records) == 'claude-sonnet-5'
+
+    def test_nested_wins_over_flat(self):
+        records = [
+            {
+                'type': 'assistant',
+                'model': 'claude-sonnet-5',
+                'message': {'model': 'claude-opus-5'},
+            },
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_returns_the_last_of_several_differing_ids(self):
+        """A run that fails over or is downgraded mid-flight ends on the model
+        that actually produced the final output — that is the one to attribute."""
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'user', 'message': {'role': 'user'}},
+            {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-sonnet-5'
+
+    def test_skips_the_synthetic_sentinel(self):
+        """``<synthetic>`` is not a model — the nearest real id is returned.
+
+        Measured: a 2026-09-11 scan of 14 days of transcripts found 8
+        occurrences of ``"model":"<synthetic>"`` alongside the real ids.
+        Recording it would poison the very column this exists to make
+        trustworthy.
+        """
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_synthetic_only_returns_none(self):
+        """The observed stub-transcript shape: no real id was ever served."""
+        records = [
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+        ]
+        assert detect_transcript_model_id(records) is None
+
+    def test_empty_records_return_none(self):
+        assert detect_transcript_model_id([]) is None
+
+    def test_no_assistant_records_return_none(self):
+        records = [
+            {'type': 'user', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'system', 'model': 'claude-opus-5'},
+        ]
+        assert detect_transcript_model_id(records) is None
+
+    def test_non_dict_record_is_skipped_not_raised(self):
+        records = [
+            'not a dict',
+            None,
+            42,
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_non_string_and_empty_values_are_skipped(self):
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'model': ''}},
+            {'type': 'assistant', 'message': {'model': 123}},
+            {'type': 'assistant', 'message': {'model': None}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_assistant_record_without_a_model_is_skipped(self):
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'role': 'assistant'}},
+            {'type': 'assistant'},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+
+class TestTranscriptModelIdForSession:
+    """``transcript_model_id_for_session(config_dir, session_id)`` — the wrapper.
+
+    Mirrors ``ended_awaiting_background_for_session``: delegate to
+    ``read_transcript_records``, fail safe to None, never raise.
+    """
+
+    def _write_transcript(self, base: Path, session_id: str, lines: list[str]) -> Path:
+        slug_dir = base / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        transcript = slug_dir / f'{session_id}.jsonl'
+        transcript.write_text('\n'.join(lines) + '\n')
+        return transcript
+
+    def test_finds_the_id_on_disk(self, tmp_path):
+        sid = 'sess-model-001'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [
+                json.dumps({'type': 'system', 'content': 'init'}),
+                json.dumps({'type': 'assistant', 'message': {'model': 'claude-opus-5'}}),
+            ],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) == 'claude-opus-5'
+
+    def test_absent_transcript_returns_none(self, tmp_path):
+        (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
+        assert transcript_model_id_for_session(tmp_path, 'sess-absent') is None
+
+    def test_truncated_trailing_line_is_tolerated(self, tmp_path):
+        """A SIGKILL-truncated final line must not lose the id already recorded."""
+        sid = 'sess-model-002'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [
+                json.dumps({'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}}),
+                '{"type": "assistant", "message": {"model": "claude-op',  # truncated
+            ],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) == 'claude-sonnet-5'
+
+    def test_transcript_with_no_model_returns_none(self, tmp_path):
+        sid = 'sess-model-003'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [json.dumps({'type': 'user', 'content': 'hi'})],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) is None
