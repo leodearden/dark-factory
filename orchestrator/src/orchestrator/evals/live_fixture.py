@@ -74,11 +74,20 @@ import copy
 from enum import StrEnum
 from pathlib import Path
 
+from orchestrator.evals.task_sampler import (
+    Cell,
+    CompletedTaskCandidate,
+    cell_of,
+    default_verify_commands,
+    repo_of_project,
+)
 from orchestrator.landing_evidence import is_valid_sha_40
 
 __all__ = [
     'ShadowShape',
     'build_live_fixture',
+    'live_stratum',
+    'live_verify_commands',
 ]
 
 
@@ -219,3 +228,68 @@ def build_live_fixture(
         # asks; it is simply not the same object.
         'plan': copy.deepcopy(plan),
     }
+
+
+# ---------------------------------------------------------------------------
+# The two derivations a caller needs to OPEN a cell, alongside the builder
+# ---------------------------------------------------------------------------
+#
+# C3 takes ``verify_commands`` as an INPUT and says nothing about the stratum,
+# so the reuse this leaf owes ``task_sampler`` has nowhere to live inside the
+# builder itself. Without these two, every caller would re-derive
+# ``repo_of_project`` + ``default_verify_commands`` and re-adapt a task record
+# onto the classifiers — the duplication SPOT forbids.
+
+
+def live_verify_commands(project: str) -> dict[str, str]:
+    """Return the ``{test,lint,typecheck}`` gates a cell on *project* runs.
+
+    The single definition of "the gates a live shadow cell runs", so a cell and
+    the ``evals/tasks/`` corpus it is compared against can never disagree about
+    them. Deliberately thin: the command strings live in ``task_sampler`` and
+    are never restated here, and ``repo_of_project``'s ``ValueError`` on an
+    unrecognised project propagates unchanged rather than defaulting — a
+    silent fallback would run (say) a Rust task's cell under pytest and score
+    the resulting red gate as a candidate failure.
+    """
+    return default_verify_commands(repo_of_project(project))
+
+
+def _candidate_from_live_task(task: dict, project: str) -> CompletedTaskCandidate:
+    """Adapt a LIVE task record onto the classifiers' existing input type.
+
+    Populates only the four fields the classifiers read — ``project``,
+    ``title``, ``description``, ``complexity`` — plus ``task_id``, which
+    ``repo_of`` names in its error. ``project_root`` and the landed-commit
+    fields are left at their defaults on purpose: a stratum derivation has no
+    business holding a checkout path, and a live cell has no landed provenance
+    at build time.
+    """
+    metadata = task.get('metadata') or {}
+    return CompletedTaskCandidate(
+        task_id=str(task.get('id') or ''),
+        project=project,
+        project_root='',
+        title=str(task.get('title') or ''),
+        description=str(task.get('description') or ''),
+        complexity=metadata.get('complexity'),
+    )
+
+
+def live_stratum(task: dict, *, project: str) -> Cell:
+    """Return the ``(repo, kind, path)`` stratification cell for a LIVE *task*.
+
+    The sampler's own three axes applied to a live record, so a shadow cell
+    and a corpus fixture land in the same cell for the same reasons —
+    including ``classify_path``'s reuse of production's
+    ``has_simple_task_blocker`` veto, which comes along for free.
+
+    Returns the structured triple rather than the ``<repo>×<kind>×<path>``
+    text: rendering it as a delimited string and splitting it back would be an
+    ad-hoc parser at every consumer. The single text rendering belongs with
+    the ``shadow_cells.stratum`` column that stores it.
+
+    Raises ``ValueError`` on an unrecognised *project* (propagated from
+    ``repo_of``) — repo is a hard axis, not a defaultable one.
+    """
+    return cell_of(_candidate_from_live_task(task, project))
