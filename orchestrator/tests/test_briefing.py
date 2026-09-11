@@ -17,8 +17,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from shared.capability_manifest import DeliveredCheckMeta
 
-from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.briefing import BriefingAssembler, _format_delivered_checks
 from orchestrator.config import GitConfig, OrchestratorConfig
 
 
@@ -147,6 +148,102 @@ class TestFormatTaskIncludeFiles:
         out = briefing._format_task(anti_anchor_task)
         assert '**Files:** orchestrator, shared' in out
 
+
+class TestFormatDeliveredChecks:
+    """Unit tests for the module-level ``_format_delivered_checks`` renderer.
+
+    Covers the happy path: the two descriptor kinds
+    (``shared.capability_manifest.DeliveredCheckMeta``), bullet ordering, the
+    empty-input contract the caller relies on to omit the section entirely,
+    and the anti-gaming reading directive.
+
+    Directive assertions use positive-directive form per
+    ``feedback_test_assert_negative_directives.md`` and the convention
+    ``TestBuildPlanTighteningPrompt`` already records: the directive prose
+    necessarily contains the words it warns about ("comment", "docstring",
+    "pattern"), so a bare ``not in`` would self-conflict.
+    """
+
+    GREP_CHECK = {
+        'name': 'cap-one',
+        'kind': 'grep',
+        'pattern': 'FooBar',
+        'expect': 'present',
+        'paths': ['orchestrator'],
+    }
+    SCRIPT_CHECK = {
+        'name': 'cap-two',
+        'kind': 'script',
+        'script': 'scripts/check.py',
+        'args': ['--strict'],
+        'timeout_secs': 30,
+    }
+
+    def test_grep_entry_renders_its_descriptor(self):
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert 'cap-one' in out
+        assert 'grep' in out
+        assert 'FooBar' in out
+        assert 'present' in out
+        assert 'orchestrator' in out
+
+    def test_script_entry_renders_its_descriptor(self):
+        out = _format_delivered_checks([self.SCRIPT_CHECK])
+        assert 'cap-two' in out
+        assert 'script' in out
+        assert 'scripts/check.py' in out
+        assert '--strict' in out
+        assert '30' in out
+
+    def test_two_entries_render_two_bullets_in_order(self):
+        out = _format_delivered_checks([self.GREP_CHECK, self.SCRIPT_CHECK])
+        bullets = [ln for ln in out.splitlines() if ln.startswith('- name:')]
+        assert len(bullets) == 2
+        assert out.index('cap-one') < out.index('cap-two')
+
+    def test_none_renders_nothing(self):
+        """The caller uses falsiness to omit the whole section."""
+        assert _format_delivered_checks(None) == ''
+
+    def test_empty_list_renders_nothing(self):
+        assert _format_delivered_checks([]) == ''
+
+    def test_block_labels_itself_as_the_capability_gate_against_main(self):
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert '## Declared Capability Gate' in out
+        assert 'delivered_checks' in out
+        assert 'main' in out
+
+    def test_block_carries_the_anti_gaming_directive(self):
+        """Positive-directive assertions — the prose names what to DO."""
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert 'Deliver the BEHAVIOUR' in out
+        assert 'is a defect, not a pass' in out
+
+    def test_block_tells_the_agent_to_escalate_an_unsatisfiable_descriptor(self):
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert 'escalate_blocker' in out
+        assert 'design_concern' in out
+
+    def test_block_points_at_the_descriptor_contract_rather_than_restating_it(self):
+        """INV-9: point at §3.3, do not restate the descriptor shape."""
+        out = _format_delivered_checks([self.GREP_CHECK])
+        assert 'docs/task-authoring.md' in out
+
+    def test_render_mentions_every_live_descriptor_field(self):
+        """INV-5 drift pin against the live schema.
+
+        A field added to ``_CheckFieldsBase`` would otherwise vanish silently
+        from every briefing. The grep and script field sets are mutually
+        exclusive by ``kind``, so the union of the two renders is what must
+        cover ``DeliveredCheckMeta.model_fields``.
+        """
+        union = (
+            _format_delivered_checks([self.GREP_CHECK])
+            + _format_delivered_checks([self.SCRIPT_CHECK])
+        )
+        missing = [f for f in DeliveredCheckMeta.model_fields if f not in union]
+        assert not missing, f'renderer omits live DeliveredCheckMeta fields: {missing}'
 
 @pytest.mark.asyncio
 class TestBuildPlanTighteningPrompt:

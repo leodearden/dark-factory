@@ -52,6 +52,70 @@ def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str
         )
     return '\n'.join(lines)
 
+def _format_delivered_checks(checks: list[dict] | None) -> str:
+    """Render a task's ``metadata.delivered_checks`` as an agent-readable block.
+
+    Returns '' for a falsy input so ``BriefingAssembler._format_task`` can omit
+    the whole section on the common path (most tasks declare no capability).
+
+    One bullet per descriptor, field-labelled so the rendered text names every
+    field of :class:`shared.capability_manifest.DeliveredCheckMeta` — a field
+    added to that model must not vanish silently from the prompt, which
+    ``test_briefing.py::TestFormatDeliveredChecks`` pins against the live
+    schema.
+
+    The block carries its OWN reading directive rather than relying on the six
+    consuming prompt bodies to explain it — the same co-location precedent
+    ``BriefingAssembler._format_prior_proposal`` follows with its
+    verify-before-reuse line. The directive is load-bearing: ``docs/task-authoring.md``
+    §3.3 records that a symbol-name grep "is satisfiable by prose — a comment, a
+    docstring, or a variable named after the thing", so handing an agent the
+    literal pattern is a teach-to-the-test hazard unless the same text tells it
+    that matching the pattern without delivering the behaviour is a defect.
+    """
+    if not checks:
+        return ''
+
+    bullets = '\n'.join(_delivered_check_bullet(check) for check in checks)
+
+    return f"""\
+## Declared Capability Gate (metadata.delivered_checks)
+
+This task's own mark-done is gated on the capability checks below
+(`orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks`).
+
+{bullets}
+
+After this task lands, a `grep` check is re-run with `git grep -E` against the
+COMMITTED `main` tree and a `script` check against the working checkout. A FAILED
+check blocks mark-done; on the dependency path it also fires an escalation routed
+straight at a human.
+
+Deliver the BEHAVIOUR each capability names. Satisfying a pattern with a comment, a
+docstring, or a variable named after the thing is a defect, not a pass. If a
+descriptor cannot be satisfied by the work this task should do, escalate it
+(`escalate_blocker(category='design_concern')`) rather than writing the string to
+make the check match. The descriptor contract lives in `docs/task-authoring.md` §3.3
+— read it there rather than inferring it from these bullets.
+"""
+
+
+def _delivered_check_bullet(check: dict) -> str:
+    """Render one delivered-check descriptor as a single field-labelled bullet."""
+    kind = check.get('kind')
+    fields = [f'kind: `{kind}`']
+    if kind == 'grep':
+        fields.append(f'pattern: `{check.get("pattern")}`')
+        fields.append(f'expect: `{check.get("expect")}`')
+        paths = check.get('paths') or []
+        fields.append(f'paths: {", ".join(str(p) for p in paths) if paths else "whole tree"}')
+    elif kind == 'script':
+        fields.append(f'script: `{check.get("script")}`')
+        args = check.get('args') or []
+        fields.append(f'args: {", ".join(str(a) for a in args) if args else "none"}')
+        fields.append(f'timeout_secs: {check.get("timeout_secs")}')
+    return f'- name: `{check.get("name")}` — ' + ', '.join(fields)
+
 
 FOREIGN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
 """Metadata keys, in precedence order, that name a memory result's owning project.
