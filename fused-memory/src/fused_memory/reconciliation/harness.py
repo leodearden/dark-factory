@@ -434,6 +434,32 @@ def _finding_has_citation_failures(finding: dict) -> bool:
     return bool(finding.get('citation_failures'))
 
 
+def _finding_is_live_actionable(finding: dict) -> bool:
+    """Return True iff *finding* is actionable and not superseded.
+
+    Task 4653: ``add_finding(..., supersedes=...)`` lets a later finding of a
+    run mark an earlier one historical, stamping the target's
+    ``superseded_by``.  A superseded claim has already been refuted by the
+    run that filed it, so acting on it is acting on a known-false instruction.
+
+    ``get_assembled_report`` already projects such a finding with
+    ``actionable`` forced False, which would make the ``superseded_by`` check
+    here look redundant — it is not.  Both partition sites also accept a
+    DICT-shaped ``s3_report`` straight from persisted JSON, which never passed
+    through that projection, so on that path ``actionable`` is whatever was
+    stored.  Checking the pointer explicitly is what closes it.
+
+    Applied at the actionable/non-actionable partition in
+    ``_maybe_remediate`` and ``_run_remediation_pass``, so the complement
+    feeds the existing ``_log_non_actionable_finding`` branch unchanged.
+    Deliberately UPSTREAM of ``_maybe_remediate``'s task-4781 three-way
+    split: a superseded finding is neither a phantom-cited drop nor a
+    never-cited placeholder, so counting it as either would corrupt the
+    drop-cause attribution that split exists to get right.
+    """
+    return bool(finding.get('actionable', False)) and not finding.get('superseded_by')
+
+
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
 _sleep = asyncio.sleep
@@ -4820,6 +4846,11 @@ class ReconciliationHarness:
 
         Called from both _maybe_remediate (parent pass) and _run_remediation_pass (after
         the second-pass actionable partition) so both sites stay in sync as fields evolve.
+
+        Task 4653: both partitions now route two different kinds of finding here —
+        one that was never actionable, and one a later finding of the same run
+        RETIRED (``_finding_is_live_actionable``).  ``superseded_by`` is logged so
+        the two are distinguishable in the journal; it is None for the first kind.
         """
         logger.info(
             'reconciliation.non_actionable_integrity_finding',
@@ -4830,6 +4861,7 @@ class ReconciliationHarness:
                 'affected_ids': _derive_affected_ids(finding),
                 'description': finding.get('description', ''),
                 'severity': finding.get('severity', ''),
+                'superseded_by': finding.get('superseded_by'),
             },
         )
 
@@ -5020,8 +5052,8 @@ class ReconciliationHarness:
                 return
 
             # Partition into actionable vs escalation
-            actionable = [f for f in all_findings if f.get('actionable', False)]
-            non_actionable = [f for f in all_findings if not f.get('actionable', False)]
+            actionable = [f for f in all_findings if _finding_is_live_actionable(f)]
+            non_actionable = [f for f in all_findings if not _finding_is_live_actionable(f)]
 
             # Task 1512 / plans/afk-A7-recon-closure.md:
             # Non-actionable findings are NOT escalated.  Per the Stage-3 contract
@@ -5685,8 +5717,10 @@ class ReconciliationHarness:
                     all_remaining = s3_report.get('items_flagged', [])
                 else:
                     all_remaining = s3_report.items_flagged
-                actionable_remaining = [f for f in all_remaining if f.get('actionable', False)]
-                non_actionable_remaining = [f for f in all_remaining if not f.get('actionable', False)]
+                actionable_remaining = [f for f in all_remaining if _finding_is_live_actionable(f)]
+                non_actionable_remaining = [
+                    f for f in all_remaining if not _finding_is_live_actionable(f)
+                ]
                 # Non-actionable findings are logged but never escalated — same
                 # contract as the parent pass in _maybe_remediate.
                 for finding in non_actionable_remaining:
