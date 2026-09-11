@@ -34,6 +34,7 @@ is impossible at the git level even if the pre-flight is refactored away).
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
@@ -338,3 +339,98 @@ class TestScanMergeRr:
         scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
 
         assert scan.suspect is True
+
+
+# ---------------------------------------------------------------------------
+# Quarantine
+# ---------------------------------------------------------------------------
+
+class TestQuarantineMergeRr:
+    """MERGE_RR is MOVED aside, never unlinked.
+
+    The file is the only record of which conflict ids a wedged worktree was
+    carrying, and a SUCCESSFUL abort DELETES it (measured).  So the quarantine
+    is not crash-avoidance — the ``RECOVERY_GIT`` prefix already covers that —
+    it is what stops the repair from destroying its own evidence.
+    """
+
+    def test_dangling_scan_moves_the_file_preserving_its_bytes(
+        self, tmp_path: Path,
+    ) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        original = (git_dir / 'MERGE_RR').read_bytes()
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+        backup = rebase_recovery.quarantine_merge_rr(scan)
+
+        assert backup is not None
+        assert not (git_dir / 'MERGE_RR').exists()
+        assert backup.read_bytes() == original
+        assert backup.parent == git_dir
+
+    def test_a_second_quarantine_does_not_clobber_the_first(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two wedged runs leave two backups; the earlier evidence survives."""
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX, 'src/first.py'))
+        first = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
+
+        _plant_merge_rr(git_dir, _record(_HEX, 'src/second.py'))
+        second = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
+
+        assert first is not None and second is not None
+        assert first != second
+        assert b'src/first.py' in first.read_bytes()
+        assert b'src/second.py' in second.read_bytes()
+
+    def test_intact_scan_leaves_the_file_exactly_where_it_was(
+        self, tmp_path: Path,
+    ) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX))
+        (git_dir / 'rr-cache' / _HEX).mkdir(parents=True)
+        original = (git_dir / 'MERGE_RR').read_bytes()
+
+        scan = rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir)
+        backup = rebase_recovery.quarantine_merge_rr(scan)
+
+        assert backup is None
+        assert (git_dir / 'MERGE_RR').read_bytes() == original
+        assert list(git_dir.glob('MERGE_RR.*')) == []
+
+    def test_unparsable_record_also_quarantines(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, b'deadbeef\tsrc/short.py')
+
+        backup = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
+
+        assert backup is not None
+        assert not (git_dir / 'MERGE_RR').exists()
+
+    def test_warning_names_every_dangling_conflict_id(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Assert on the IDS, not on sentence wording — the ids are the payload."""
+        git_dir = tmp_path / 'gitdir'
+        other = 'a' * 40
+        _plant_merge_rr(
+            git_dir, _record(f'{_HEX}.1', 'src/one.py'), _record(other, 'src/two.py'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            backup = rebase_recovery.quarantine_merge_rr(
+                rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+            )
+
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert f'{_HEX}.1' in logged
+        assert other in logged
+        assert backup is not None and str(backup) in logged
