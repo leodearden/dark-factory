@@ -14721,9 +14721,9 @@ entries:
     manifested_phase: implement
     note: 'Verified finding: Edit''s multi-match error (''set replace_all to true'') prompted agent to invoke nonexistent bare tool replace_all({}) instead of re-issuing Edit with replace_all:true parameter; wasted turn before fallback to manual disambiguation. Corroborated sighting from session 7dae04c6-f0a5-400d-b199-8932d65a8790.'
 - id: entry-cand-20260831-16
-  title: Verify-summary glob miss cascades into a generic JSONDecodeError instead of a clear not-found
+  title: 'RETRACTED: the verify-artifact discovery failure was cwd drift, not an artifact-naming defect. Superseded by entry-cand-20260729-4.'
   severity: medium
-  status: open
+  status: retired
   origin_phase: unknown
   manifested_phase: verify
   sightings:
@@ -14745,6 +14745,13 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: 'Periodic-census verifier session confirmed this candidate is still observable in current tree. Session shows 8 tool_error signals from chained Bash attempts to discover verify-summary artifacts under .task/verify/ using glob patterns that assume specific naming (.task/verify/*scripts.summary.json). Glob misses trigger empty stdin → opaque json.decoder.JSONDecodeError rather than clear ''file not found'' signal. Evidence: turns 21, 24, 34, 38, 41, 45, 53, 59 all fail on artifact discovery.'
+  - date: '2026-09-11'
+    project: dark_factory
+    session: task-5198-verify-summary-glob-refutation
+    origin_phase: unknown
+    manifested_phase: verify
+    note: 'CORRECTION (task 5198, esc-5120-2, Leo ruled option (b) 2026-09-08). This entry''s title and cause are withdrawn and it is retired. It ANNOTATES rather than retracts its three prior sightings (sessions 273579c5-e299-40c6-ab02-e4c0ab24213b @2026-08-31, 8a483603-92b1-460b-8af1-65c02d70a598 @2026-09-05, d83f509f-a7e5-4eeb-9e2b-74e80289204b @2026-09-05): each was a true observation of a real symptom, and only the cause they were filed under was refuted. Two of the three were the legibility census quoting its own error string back to itself — one session "directly instantiating this candidate", one periodic-census verifier session "confirming this candidate is still observable" — which is what made this entry self-ingesting and growing. The refutation came from reading the raw session transcript and is not re-derived here: the file existed under exactly the globbed name, and the failure was cwd drift that self-corrected 19 seconds later. Task 5120 was cancelled. A recurrence of the refuted framing is now dropped before any LLM call by the fused-memory/config/cancelled_premise_blocklist.yaml entry verify_summary_glob_jsondecodeerror_refuted, consulted by fused_memory/middleware/task_curator.py::_maybe_blocklist_drop. This amendment landed through the sole writer scripts/legibility/codebook.py::apply_coding_record; the codebook is never hand-edited.'
+  cause: 'Refuted by the raw session transcript, not re-derived: the summary file existed under exactly the name and location the agent globbed for. The real failure was cwd drift — the agent had cd''d into .task/verify and then used a worktree-relative glob, so it resolved against the wrong directory — and the agent self-corrected 19 seconds later. There is no artifact-naming defect and no error-cascade defect here. The phenomenon is owned by entry-cand-20260729-4 ("Bash cwd persists across turns"), which is where a recurrence belongs. Leo ruled option (b) on esc-5120-2, 2026-09-08; task 5120 was cancelled.'
 - id: entry-cand-20260907-20
   title: add_design_decision rejects payload for leaked MCP tool-call envelope markup
   severity: medium
