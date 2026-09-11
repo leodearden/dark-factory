@@ -15,9 +15,11 @@ wired for the live transport (a ``verdict-tools`` MCP server, no
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.usage_gate import UsageGate
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
@@ -579,7 +581,7 @@ class TestRunnerIsolation:
         """With a gate the reviewer draws on the account pool via
         invoke_with_cap_retry (failover on cap hits) instead of the CLI's
         default login; the isolation kwarg rides along."""
-        gate = object()
+        gate = cast(UsageGate, object())
         captured: dict = {}
 
         async def _cap_retry(usage_gate, label, *, invoke_fn, backend, **kwargs):
