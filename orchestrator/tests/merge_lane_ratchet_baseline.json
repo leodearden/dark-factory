@@ -1472,7 +1472,7 @@
     "orchestrator/tests/test_merge_verify_mock_autouse.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_verify_survivor_barrier.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_worker_retired.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 18},
+    "orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_multihost_verify_integration.py": {"patch_targets": ["LocalRunner", "_classify_main_health_red", "_resolve_dispatch_time_merge_base", "_run_post_merge_verify", "_spawn_main_health_probe", "run_scoped_verification"], "private_reads": 58},
     "orchestrator/tests/test_offline_lane.py": {"patch_targets": [], "private_reads": 123},
     "orchestrator/tests/test_offline_lane_infra_integration.py": {"patch_targets": [], "private_reads": 15},
