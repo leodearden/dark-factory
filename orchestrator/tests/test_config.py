@@ -3798,12 +3798,17 @@ class TestRecoveryEmissionConfig:
     this class only pins the operator-facing surface.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_section_is_registered_on_orchestrator_config(self):
         """OrchestratorConfig exposes recovery_emission with the shipped defaults.
 
         Registration is load-bearing, not cosmetic: ``model_config`` sets
         ``extra='ignore'``, so an UNREGISTERED yaml block is silently dropped
         and the operator edits a stanza that does nothing.
+
+        ``code_default_config`` because the assertions below are about the
+        SHIPPED defaults, not the live project yaml — which an operator may
+        retune at any time (and did: ``streak_escalation_enabled: false``).
         """
         from orchestrator.config import OrchestratorConfig
 
