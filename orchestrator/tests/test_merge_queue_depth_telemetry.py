@@ -30,10 +30,12 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
     InflightEntry,
     MergedOk,
@@ -347,21 +349,12 @@ class TestRunInflightVerifyDepthWiring:
     ) -> None:
         item, lease = _item_and_lease(tmp_path, 't-wire', speculative=True)
         es = _CapturingEventStore()
-        worker = SpeculativeMergeWorker(
+        worker = MergeLane(
             git_ops=_make_git_ops_mock(), queue=asyncio.Queue(), event_store=es,
+            verifier=FakeVerifier(),
         )
 
-        captured: dict = {}
-
-        async def _fake_run_post_merge_verify(*_args, **kwargs):
-            captured.update(kwargs)
-            return None  # pass
-
-        with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
-            _fake_run_post_merge_verify,
-        ):
-            await worker._run_inflight_verify(item, lease, depth=2)
+        await worker._run_inflight_verify(item, lease, depth=2)
 
         (event,) = es.events_of(EventType.merge_verify)
         assert event['data']['depth'] == 2
@@ -387,21 +380,13 @@ class TestRunInflightVerifyChainItemsWiring:
     async def _verify_event(self, tmp_path: Path, **verify_kwargs) -> dict:
         item, lease = _item_and_lease(tmp_path, 't-ci-wire')
         es = _CapturingEventStore()
-        worker = SpeculativeMergeWorker(
+        worker = MergeLane(
             git_ops=_make_git_ops_mock(), queue=asyncio.Queue(), event_store=es,
+            verifier=FakeVerifier(),
         )
 
-        captured: dict = {}
+        await worker._run_inflight_verify(item, lease, **verify_kwargs)
 
-        async def _fake_run_post_merge_verify(*_args, **kwargs):
-            captured.update(kwargs)
-            return None  # pass
-
-        with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
-            _fake_run_post_merge_verify,
-        ):
-            await worker._run_inflight_verify(item, lease, **verify_kwargs)
         (event,) = es.events_of(EventType.merge_verify)
         return event['data']
 
