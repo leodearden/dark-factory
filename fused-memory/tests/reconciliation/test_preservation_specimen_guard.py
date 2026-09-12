@@ -23,6 +23,9 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -331,6 +334,34 @@ LIVE_GRAPHITI_ENTITY = {
 }
 
 PROJECT = 'dark_factory'
+
+GUARD_LOGGER = 'fused_memory.reconciliation.preservation_specimen_guard'
+
+
+@contextlib.contextmanager
+def caplog_at_warning():
+    """Yield a growing list of the guard's WARNING+ messages.
+
+    A local handler rather than pytest's ``caplog`` fixture: these tests run
+    under xdist and assert on one named logger, so attaching to that logger
+    directly keeps the capture independent of global log-level state.
+    """
+    records: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage() % record.args if record.args else record.getMessage())
+
+    handler = _Collect(level=logging.WARNING)
+    log = logging.getLogger(GUARD_LOGGER)
+    log.addHandler(handler)
+    previous = log.level
+    log.setLevel(logging.WARNING)
+    try:
+        yield records
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(previous)
 
 
 def _stranded_flag(task_id='3105', flag_type='task_stranded_no_claimant', **extra):
@@ -791,3 +822,147 @@ class TestBoundedScopeAndReadEconomy:
         )
 
         assert result.kept_flags == [a, c, d]
+
+
+class TestDegradedCorroborationReads:
+    """INV-11: fail OPEN on the drop, but never silently.
+
+    The two failure directions are asymmetric. Suppressing on a backend blip
+    would hide every stranded finding fleet-wide — the hidden-finding cost the
+    under-suppression bias forbids — whereas KEEPING the flag costs at most one
+    more cycle of a false positive the rotation has absorbed since August.
+
+    But a bare fail-open makes "corroboration unreadable" byte-identical to "no
+    citation exists", and then the destructive recommendation flows on
+    unremarked. ``unresolved_task_ids`` is what stops that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mem0_timeout_keeps_the_flag_and_discloses_it(self):
+        """(a) TimeoutError is the real failure ``scroll_by_metadata`` propagates."""
+        memory_service = _make_memory_service(mem0_error=TimeoutError('qdrant read timed out'))
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert result.unresolved_task_ids == ('3105',)
+
+    @pytest.mark.asyncio
+    async def test_graphiti_failure_keeps_the_flag_and_discloses_it(self):
+        """(b) The fallback channel degrades the same way."""
+        memory_service = _make_memory_service(entity_error=RuntimeError('falkordb down'))
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.unresolved_task_ids == ('3105',)
+
+    @pytest.mark.asyncio
+    async def test_failed_channel_logs_a_warning_naming_the_task(self):
+        """Loud over silent: the degradation is in the log stream, not only a field."""
+        memory_service = _make_memory_service(mem0_error=TimeoutError('boom'))
+        with caplog_at_warning() as records:
+            await filter_preservation_specimen_flags(
+                memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+            )
+        blob = '\n'.join(records)
+        assert '3105' in blob
+        assert PROJECT in blob
+
+    @pytest.mark.asyncio
+    async def test_graphiti_still_answers_when_mem0_is_broken(self):
+        """(c) One broken channel must not cost the OTHER channel's verdict.
+
+        A citation found on the surviving channel suppresses AND leaves the task
+        out of ``unresolved_task_ids`` — the corroboration WAS resolved, just not
+        by the cheap path.
+        """
+        memory_service = _make_memory_service(
+            mem0_error=TimeoutError('qdrant read timed out'),
+            entities={'Task 3105': LIVE_GRAPHITI_ENTITY},
+        )
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+        assert result.citations_by_task['3105'] == 'a8fd36a8-46db-4ca8-a21c-554c38a918ee'
+        assert result.unresolved_task_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_both_channels_broken_is_unresolved_once(self):
+        """A task is disclosed once, not once per failed channel."""
+        memory_service = _make_memory_service(
+            mem0_error=TimeoutError('down'), entity_error=RuntimeError('also down'),
+        )
+        flags = [_stranded_flag(), _stranded_flag(flag_type='stranded_merge_phase_liveness')]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.kept_flags == flags
+        assert result.unresolved_task_ids == ('3105',)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc', [asyncio.CancelledError(), KeyboardInterrupt(), SystemExit()],
+    )
+    async def test_lifecycle_exceptions_propagate(self, exc):
+        """(d) Shutdown is not a backend blip — never absorbed as best-effort."""
+        memory_service = _make_memory_service(mem0_error=exc)
+
+        with pytest.raises(type(exc)):
+            await filter_preservation_specimen_flags(
+                memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc', [asyncio.CancelledError(), KeyboardInterrupt(), SystemExit()],
+    )
+    async def test_lifecycle_exceptions_propagate_from_graphiti_too(self, exc):
+        """(d) Both channels, so neither can quietly swallow a shutdown."""
+        memory_service = _make_memory_service(entity_error=exc)
+
+        with pytest.raises(type(exc)):
+            await filter_preservation_specimen_flags(
+                memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+            )
+
+    @pytest.mark.asyncio
+    async def test_one_tasks_failure_does_not_abort_the_batch(self):
+        """(e) A failure costs one task's verdict, not the cycle's.
+
+        Without this, a single flaky lookup would leave every later flag
+        unfiltered — and the corroborated specimen's destructive recommendation
+        would sail through on a cycle that merely had bad luck earlier.
+        """
+        def _scroll(project_id, filters):
+            if filters['task_id'] == '4102':
+                raise TimeoutError('only this one')
+            return {'3105': [LIVE_MEM0_ROW]}.get(filters['task_id'], [])
+
+        memory_service = MagicMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+        memory_service.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+
+        broken = _stranded_flag(task_id='4102')
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[broken, _stranded_flag(task_id='3105')],
+        )
+
+        assert result.kept_flags == [broken]
+        assert result.suppressed_by_task == {'3105': 1}
+        assert result.unresolved_task_ids == ('4102',)
