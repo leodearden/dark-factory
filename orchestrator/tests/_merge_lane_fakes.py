@@ -97,10 +97,12 @@ class FakeVerifier:
 
     ``run_scoped`` follows ``scripts[task_id]``, or ``default`` for a task
     without a script, and records every task id it was asked about in
-    ``verified``. The gates a merge passes through after a green scoped
-    verify all report clean, the disk guard reports *disk_reason* (``None``,
-    the default, being "proceed"), and dry-run investigations are recorded
-    in ``investigations`` rather than run.
+    ``verified`` -- setting ``entered`` as it starts, which is how a test
+    waits for a scripted hang to be genuinely under way before it probes the
+    lane. The gates a merge passes through after a green scoped verify all
+    report clean, the disk guard reports *disk_reason* (``None``, the
+    default, being "proceed"), and dry-run investigations are recorded in
+    ``investigations`` rather than run.
     """
 
     def __init__(
@@ -115,6 +117,7 @@ class FakeVerifier:
         self.disk_reason = disk_reason
         self.verified: list[str | None] = []
         self.investigations: list[dict[str, Any]] = []
+        self.entered = asyncio.Event()
 
     async def run_scoped(
         self,
@@ -126,6 +129,7 @@ class FakeVerifier:
     ) -> VerifyResult:
         task_id = options.get('task_id')
         self.verified.append(task_id)
+        self.entered.set()
         script = self.scripts.get(task_id, self.default)
         if script.release is not None:
             await script.release.wait()
@@ -178,24 +182,54 @@ class FakeClock:
     """``ClockPort`` that moves only when told to.
 
     ``now`` and ``monotonic`` read ``time``; ``sleep`` advances it by the
-    requested seconds and yields once so other tasks run; every requested
-    sleep is kept in ``sleeps``. ``newest_content_mtime`` reports
-    ``content_mtime``.
+    requested seconds and yields once so other tasks run, keeping every
+    requested sleep in ``sleeps``.
+
+    ``tick`` additionally advances ``time`` on every ``monotonic()`` read.
+    That is how a test drives a lane loop which measures elapsed time off
+    this clock but waits on something else -- the in-flight verify
+    abort-poll waits on ``asyncio.wait(timeout=VERIFY_ABANDON_POLL_SECS)``
+    and only READS ``monotonic()``, so with the default ``tick`` of 0 its
+    no-progress budget can never elapse. ``monotonic`` is the lane's
+    duration reference (never a stamp), so a tick is invisible to
+    ``now()``'s callers beyond the value they read.
+
+    ``newest_content_mtime`` reports ``content_mtime`` -- ``None`` or a
+    frozen value being a merge worktree nothing is writing to -- and
+    advances it by ``content_tick`` per probe, so a ``content_tick`` above
+    zero is a verify that keeps writing. Every probed root is kept in
+    ``content_probes``, the way ``sleeps`` keeps every requested sleep.
     """
 
-    def __init__(self, *, time: float = 1_000_000.0, content_mtime: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        time: float = 1_000_000.0,
+        tick: float = 0.0,
+        content_mtime: float | None = None,
+        content_tick: float = 0.0,
+    ) -> None:
         self.time = time
+        self.tick = tick
         self.content_mtime = content_mtime
+        self.content_tick = content_tick
         self.sleeps: list[float] = []
+        self.content_probes: list[Path] = []
 
     def now(self) -> float:
         return self.time
 
     def monotonic(self) -> float:
-        return self.time
+        reading = self.time
+        self.time += self.tick
+        return reading
 
     def newest_content_mtime(self, root: Path) -> float | None:
-        return self.content_mtime
+        self.content_probes.append(root)
+        reading = self.content_mtime
+        if reading is not None:
+            self.content_mtime = reading + self.content_tick
+        return reading
 
     async def sleep(self, secs: float) -> None:
         self.sleeps.append(secs)
