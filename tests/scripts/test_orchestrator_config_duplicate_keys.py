@@ -97,12 +97,30 @@ class _NoDuplicateKeysLoader(yaml.SafeLoader):
     """
 
 
+_MERGE_TAG = 'tag:yaml.org,2002:merge'
+
+
 def _construct_mapping_rejecting_duplicates(
     loader: yaml.SafeLoader, node: yaml.nodes.MappingNode
 ) -> dict[Any, Any]:
-    """Walk the key nodes for a repeat, then delegate the actual construction."""
+    """Walk the key nodes for a repeat, then delegate the actual construction.
+
+    MERGE KEYS (``<<: *anchor``) ARE SKIPPED rather than inspected, and that is
+    a correctness requirement rather than a convenience. ``<<`` is not a key at
+    all — ``SafeConstructor.flatten_mapping`` folds the anchored mapping in
+    later — and SafeLoader registers no constructor for its tag, so putting one
+    through ``construct_object`` raises a ConstructorError ABOUT TAGS. That
+    error is not a ``_DuplicateKeyError``, so under the propagation rule in
+    ``duplicate_keys`` it would escape and turn the sweep red, naming the wrong
+    defect, on a config the PRODUCTION loader parses perfectly well. Repeating
+    ``<<`` within one mapping is legal YAML that PyYAML supports — both anchors
+    are merged — so skipping is the semantically correct answer too, not a
+    blind spot traded for a green run.
+    """
     seen: dict[Any, yaml.nodes.Node] = {}
     for key_node, _value_node in node.value:
+        if key_node.tag == _MERGE_TAG:
+            continue
         key = loader.construct_object(key_node, deep=True)
         if not isinstance(key, Hashable):
             # Not ours to report: the delegate below raises the proper
@@ -208,6 +226,38 @@ def test_a_clean_multi_level_document_yields_no_findings(tmp_path: Path) -> None
     assert duplicate_keys(path) == []
 
 
+def test_a_merge_key_is_not_a_repeated_key_and_is_not_reported(tmp_path: Path) -> None:
+    """``<<: *anchor`` must stay silent, including when one mapping carries two.
+
+    The loaded value is asserted FIRST because it is the premise the guard hangs
+    on: this document is one the production loader accepts, so any noise here —
+    a finding, or the tag-constructor error a naive key walk raises on ``<<`` —
+    would be a red sweep about the wrong defect on a healthy config.
+    """
+    text = (
+        'role_defaults: &role_defaults\n'
+        '  model: opus\n'
+        'effort_defaults: &effort_defaults\n'
+        '  effort: high\n'
+        'roles:\n'
+        '  implementer:\n'
+        '    <<: *role_defaults\n'
+        '    max_turns: 200\n'
+        '  architect:\n'
+        '    <<: *role_defaults\n'
+        '    <<: *effort_defaults\n'
+    )
+    path = _yaml_file(tmp_path, text)
+
+    architect = yaml.safe_load(text)['roles']['architect']
+    assert architect == {'model': 'opus', 'effort': 'high'}, (
+        'the premise: PyYAML merges BOTH anchors, so a mapping carrying two `<<` '
+        f'keys is legal YAML the fleet reads fine; got {architect!r}'
+    )
+
+    assert duplicate_keys(path) == []
+
+
 def test_a_second_verify_env_block_is_silently_last_wins_and_is_reported(tmp_path: Path) -> None:
     """Task 4635's exact shape, with the silent-degradation mechanism pinned alongside.
 
@@ -236,6 +286,27 @@ def test_a_second_verify_env_block_is_silently_last_wins_and_is_reported(tmp_pat
     finding = findings[0]
     assert finding.key == 'verify_env'
     assert (finding.first_line, finding.duplicate_line) == (1, 4)
+
+
+def test_a_config_that_does_not_parse_at_all_propagates_rather_than_reporting_green(
+    tmp_path: Path,
+) -> None:
+    """The other half of ``duplicate_keys``'s contract, as an executable claim.
+
+    A duplicate key is REPORTED as a finding; anything else that leaves a config
+    unparseable is RAISED. Pinning both halves is what keeps the two classes
+    distinguishable by test rather than by prose — and the merge-key case above
+    is correct precisely because it belongs to NEITHER of them.
+    """
+    path = _yaml_file(tmp_path, 'roles: [implementer, architect\nverify_env:\n  A: "1"\n')
+
+    with pytest.raises(yaml.YAMLError) as caught:
+        duplicate_keys(path)
+
+    assert not isinstance(caught.value, _DuplicateKeyError), (
+        'an unparseable config must surface as itself rather than be dressed up '
+        f'as a duplicate-key finding; got {caught.value!r}'
+    )
 
 
 _MUTANT_MARKER_KEY = 'DF_DUPLICATE_KEY_GUARD_MARKER'
