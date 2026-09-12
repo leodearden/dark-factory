@@ -318,8 +318,9 @@ HARNESS NOTES
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import pytest
 from shared.task_metadata import RetryLedger
@@ -328,6 +329,7 @@ from orchestrator import merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import (
     CapPermit,
@@ -526,9 +528,31 @@ def _ephemeral_merge_wt(git_ops: GitOps, tag: str) -> Path:
     return git_ops.worktree_base / f'_merge-{tag}'
 
 
-def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+def _make_worker(
+    git_ops: GitOps, *, verifier: VerifyPort = merge_queue.PRODUCTION_VERIFIER,
+) -> SpeculativeMergeWorker:
+    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring).
+
+    *verifier* is the lane's injected ``VerifyPort``.  It defaults to the
+    production one, so a caller that states no verdict of its own is
+    byte-identical to before the parameter existed.
+    """
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue(), verifier=verifier)
+
+
+def _verifier_with_scoped(scoped) -> ProductionVerifier:
+    """The production ``VerifyPort`` with ONLY its SCOPED leg supplied here.
+
+    ``ProductionVerifier`` holds one zero-argument RESOLVER per leg, so
+    replacing ``scoped`` states a scene's verdict through the port the worker
+    already takes — rather than rebinding
+    ``orchestrator.merge_queue.run_scoped_verification`` out from under
+    conftest's autouse stub — and leaves the other six legs (unscoped
+    typechecks, the disk guard, post-merge pyright and equivalence, cold
+    shadow, dry-run) genuinely production.
+    """
+    production = cast(ProductionVerifier, merge_queue.PRODUCTION_VERIFIER)
+    return dataclasses.replace(production, scoped=lambda: scoped)
 
 
 # ── event capture ────────────────────────────────────────────────────────────
@@ -906,27 +930,27 @@ def _capture_verify_timeouts(monkeypatch) -> list[float]:
     bottom of the stack, at the subprocess launcher, and lets everything above
     it run for real.
 
-    TWO patches, and BOTH are required for the capture to be non-vacuous:
+    TWO things, and BOTH are required for the capture to be non-vacuous:
 
       * ``verify._run_cmd`` -> a recorder returning ``(0, '', False)`` (rc 0,
-        no output, not timed out).  The recorder is the reason no configured
-        command ever actually executes — the gate's config carries the SHIPPED
-        ``test_command``/``lint_command``/``type_check_command``, which would
-        otherwise launch the whole repo's suite.  Same shape as
+        no output, not timed out) — patched HERE.  The recorder is the reason
+        no configured command ever actually executes — the gate's config
+        carries the SHIPPED ``test_command``/``lint_command``/
+        ``type_check_command``, which would otherwise launch the whole repo's
+        suite.  Same shape as
         test_verify.py::TestRunVerificationColdFirstUse.
-      * ``merge_queue.run_scoped_verification`` -> the REAL
-        ``verify.run_scoped_verification``.  The conftest autouse
-        ``_mock_merge_queue_verification`` replaces this with a passed=True
-        stub for every test in the suite, and that stub sits ABOVE
-        ``run_verification`` — i.e. above ``_resolve_verify_timeout``.  Without
-        this restore the recorder is never called at all and the assertion
-        passes on an empty list.  (Hence the ``assert captured`` vacuity guard
-        every caller carries.)
+      * the scene's injected ``VerifyPort``, whose SCOPED leg is the REAL
+        ``verify.run_scoped_verification`` — wired by ``real_local=True``
+        (:func:`_scene_verifier`), not here.  The conftest autouse
+        ``_mock_merge_queue_verification`` replaces the module-level name with
+        a passed=True stub for every test in the suite, and that stub sits
+        ABOVE ``run_verification`` — i.e. above ``_resolve_verify_timeout``.
+        Without the injection the recorder is never called at all and the
+        assertion passes on an empty list.  (Hence the ``assert captured``
+        vacuity guard every caller carries.)
 
     Returns the live list, appended to as commands dispatch.
     """
-    from orchestrator import verify as _verify
-
     captured: list[float] = []
 
     async def _recording_run_cmd(
@@ -936,10 +960,6 @@ def _capture_verify_timeouts(monkeypatch) -> list[float]:
         return 0, '', False
 
     monkeypatch.setattr('orchestrator.verify._run_cmd', _recording_run_cmd)
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.run_scoped_verification',
-        _verify.run_scoped_verification,
-    )
     return captured
 
 
@@ -1135,18 +1155,38 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
     return drained
 
 
-def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
-    """Return the lane whose buffer currently holds *task_id*, or ``None``.
+def _queued_in_lane(worker: SpeculativeMergeWorker, lane: str) -> list[str]:
+    """Task ids still QUEUED in *lane*, in queue order, off ``snapshot()``.
 
-    MEMBERSHIP, not position — the composition rows that care about position
-    compare the whole ``[r.task_id for r in buffer]`` list instead, because
-    submission order inside a lane IS the next round's ``chain_snapshot`` and a
-    membership check cannot see a reorder.  This is for the weaker claim that
-    still needs saying: the item is on the queue at all, in the lane it was
-    submitted to, rather than having been silently promoted or dropped.
+    ``snapshot()`` enumerates the lane buffers in priority order and stamps
+    every entry with its lane, state and position (merge_queue.py::
+    SpeculativeMergeWorker.snapshot), so this IS the public reading of the
+    claim the composition rows make: what is still waiting, in which lane, and
+    in what order.  Order matters as much as membership — submission order
+    inside a lane is the next round's ``chain_snapshot``, and a membership-only
+    check cannot see a reorder.
+
+    It reads WIDER than the lane buffer alone, deliberately: ``snapshot()``
+    lists the buffered items first and then anything not yet drained off the
+    outer queue, both as ``queued``.  A red tip requeued by the round it failed
+    is therefore visible here, at the TAIL — which is the true state of the
+    pipeline, and a fact the buffer alone could not report at all.
+    """
+    return [
+        e['task_id'] for e in worker.snapshot()['entries']
+        if e['state'] == 'queued' and e['lane'] == lane
+    ]
+
+
+def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
+    """Return the lane that currently holds *task_id* queued, or ``None``.
+
+    MEMBERSHIP, not position — the weaker claim that still needs saying: the
+    item is on the queue at all, in the lane it was submitted to, rather than
+    having been silently promoted or dropped.
     """
     for lane in ('high', 'normal'):
-        if any(r.task_id == task_id for r in worker._lane_buffers[lane]):
+        if task_id in _queued_in_lane(worker, lane):
             return lane
     return None
 
@@ -2033,6 +2073,24 @@ class _StubRemoteAllocator:
         self._held = False
         return True
 
+    # -- the read side `snapshot()` goes through (verify_runner.py:3376) ------
+    # Minimal, but not optional: `SpeculativeMergeWorker.snapshot()` reads
+    # `host_names` for `occupancy.hosts_total` and `host_states()` for the
+    # `hosts` block, so a stub without them makes the worker's own public
+    # observation surface unreadable on a remote scene.
+
+    @property
+    def host_names(self) -> list[str]:
+        return [self._lease.name]
+
+    def host_states(self) -> list[dict]:
+        return [{
+            'name': self._lease.name,
+            'is_local': self._lease.is_local,
+            'slot_state': 'busy' if self._held else 'free',
+            'quarantined': False,
+        }]
+
 
 def _verify_rows(db_path: Path) -> list[dict]:
     """Return every ``merge_verify`` row's parsed ``data`` dict, in order.
@@ -2576,6 +2634,36 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
     return fake
 
 
+def _scene_verifier(verdict, real_local: bool, log: list[dict]) -> VerifyPort:
+    """The ``VerifyPort`` a scene's seam selection implies.
+
+    ``verdict=`` and ``real_local=`` are the two seams that decide the SCOPED
+    verdict, and both state it through the port rather than by rebinding
+    ``orchestrator.merge_queue.run_scoped_verification``: ``verdict=`` injects
+    the caller's content-keyed callable, recording every call on *log*
+    (which becomes ``scene.verdicts``); ``real_local=`` injects the REAL
+    ``verify.run_scoped_verification`` so the whole stack beneath it — down to
+    ``verify._resolve_verify_timeout``, which is the only reason that arm
+    exists — genuinely runs.
+
+    Every other seam leaves the production port in place, which is what keeps
+    conftest's autouse ``_mock_merge_queue_verification`` stub in charge of the
+    rounds that state no verdict of their own.
+    """
+    if verdict is not None:
+        async def _recording_verdict(worktree, *args, **kwargs):
+            result = await verdict(worktree, *args, **kwargs)
+            log.append({'worktree': Path(worktree), 'passed': result.passed})
+            return result
+
+        return _verifier_with_scoped(_recording_verdict)
+    if real_local:
+        from orchestrator import verify as _verify
+
+        return _verifier_with_scoped(_verify.run_scoped_verification)
+    return merge_queue.PRODUCTION_VERIFIER
+
+
 async def _make_gate_scene(
     repo: Path, tmp_path: Path, monkeypatch, *,
     chain_cap: int,
@@ -2611,18 +2699,19 @@ async def _make_gate_scene(
         is about TELEMETRY (``chain_items``, ``chain_build_ms``), because that
         is produced strictly below that call.
       * ``real_local=True`` — patch NOTHING on the verify path: a LOCAL lease,
-        the real ``_run_post_merge_verify``, its real ``LocalRunner``, and (via
-        :func:`_capture_verify_timeouts`, which the caller installs) the real
+        the real ``_run_post_merge_verify``, its real ``LocalRunner``, and —
+        through the INJECTED port (:func:`_scene_verifier`) — the real
         ``run_scoped_verification`` → ``run_verification``.  The ONLY seam that
         reaches ``verify._resolve_verify_timeout``, so the only one a BUDGET
-        claim can be made at.  The caller supplies the recorder; *script* is
-        ignored on this arm (the verdict is whatever the real stack produces —
-        a pass, since the recorder returns rc 0).
+        claim can be made at.  The caller supplies the recorder
+        (:func:`_capture_verify_timeouts`); *script* is ignored on this arm
+        (the verdict is whatever the real stack produces — a pass, since the
+        recorder returns rc 0).
 
     *verdict* is the CONTENT-KEYED alternative to the positional *script*, and
     it selects a fourth seam — the deepest one that still decides a verdict.
     It is a ``run_scoped_verification``-shaped callable (see
-    :func:`_verdict_from_tree`) installed over conftest's autouse stub, with
+    :func:`_verdict_from_tree`) injected as the port's SCOPED leg, with
     everything above it left real: a LOCAL lease (so the ordinary arm really
     warm-swaps into a ``_spec-`` lane and the verdict sees a real tree), the
     real ``_run_post_merge_verify``, and therefore the real rendering of a red
@@ -2651,16 +2740,13 @@ async def _make_gate_scene(
     Module-level monkeypatching is confined to (a) the four
     ``orchestrator.merge_queue`` names test_merge_queue_reachback_patch_guard.py
     sanctions — ``build_chain``, ``_run_post_merge_verify``,
-    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS`` — and (b) the
-    PUBLIC verify seams conftest's own autouse ``_mock_merge_queue_verification``
-    already occupies: ``orchestrator.merge_queue.run_scoped_verification`` (the
-    ``verdict=`` arm below, installed over that stub so it wins) and
-    ``orchestrator.verify._run_cmd`` plus the same ``run_scoped_verification``
-    name (:func:`_capture_verify_timeouts`, which RESTORES the real function so
-    the resolver is reachable at all).  (b) is not a reach-back: the guard
-    freezes the ``merge_queue.<private>`` surface, and both of these are public
-    names the shipped test harness itself patches.  Everything else — every
-    worker attribute, every ``GitOps`` method — is patched on the INSTANCE.
+    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS`` — and (b)
+    ``orchestrator.verify._run_cmd`` (:func:`_capture_verify_timeouts`), a
+    public name one layer BELOW the port that no ``VerifyPort`` leg covers.
+    The scoped verdict itself is NOT patched at all any more: both seams that
+    decide one go in through the worker's injected ``VerifyPort``
+    (:func:`_scene_verifier`).  Everything else — every worker attribute, every
+    ``GitOps`` method — is patched on the INSTANCE.
     """
     from orchestrator.event_store import EventStore
 
@@ -2673,9 +2759,16 @@ async def _make_gate_scene(
         await _create_branch_editing(repo, f'task/{tid}', filename, body)
     db_path = tmp_path / db_name
     store = EventStore(db_path, f'run-{db_name}')
-    worker = _make_worker(git_ops)
+    # The scoped verdict is stated through the INJECTED port, so the seam has
+    # to be settled before the worker exists; `verdict_log` is the ledger the
+    # `verdict=` arm records onto, handed to the scene below.
+    verdict_log: list[dict] = []
+    worker = _make_worker(
+        git_ops, verifier=_scene_verifier(verdict, real_local, verdict_log),
+    )
     worker._event_store = store
     scene = _GateScene(git_ops, config, worker, repo, store, db_path)
+    scene.verdicts = verdict_log
 
     if remote:
         from orchestrator.verify_runner import HostLease
@@ -2730,20 +2823,6 @@ async def _make_gate_scene(
         assert not script, (
             'script= and verdict= are mutually exclusive: a scene cannot state '
             'its verdicts both by position and by tree content'
-        )
-
-        async def _recording_verdict(worktree, *args, **kwargs):
-            result = await verdict(worktree, *args, **kwargs)
-            scene.verdicts.append({
-                'worktree': Path(worktree), 'passed': result.passed,
-            })
-            return result
-
-        # The same public name conftest's autouse `_mock_merge_queue_verification`
-        # patches, so this is a documented seam rather than a
-        # `merge_queue.<private>` reach-back.  Installed AFTER it, so it wins.
-        monkeypatch.setattr(
-            'orchestrator.merge_queue.run_scoped_verification', _recording_verdict,
         )
     elif real_local:
         # Hard-guarded for the same reason `verdict=` is: this arm patches
@@ -3840,15 +3919,21 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         # membership: a chain rebuild that reordered the buffer would leave the
         # next round chaining a different prefix while every membership
         # assertion above still passed.
-        assert [r.task_id for r in worker._lane_buffers['normal']] == list(
-            _gate_followers(_ROW8_FOLLOWERS)
-        ), (
+        #
+        # The head trails the followers TWICE, and that is the fixture rather
+        # than the code: each red round requeues its dispatching request onto
+        # the outer queue, and `_pair` re-dispatches the same object on round 2
+        # by design (its docstring says why) instead of consuming round 1's
+        # requeue, so the one request is queued twice over.
+        assert _queued_in_lane(worker, 'normal') == [
+            *_gate_followers(_ROW8_FOLLOWERS), '101', '101',
+        ], (
             f'the followers left their submission order: '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+            f'{_queued_in_lane(worker, "normal")!r}'
         )
-        assert list(worker._lane_buffers['high']) == [], (
+        assert _queued_in_lane(worker, 'high') == [], (
             f'nothing was ever enqueued high; got '
-            f'{[r.task_id for r in worker._lane_buffers["high"]]!r}'
+            f'{_queued_in_lane(worker, "high")!r}'
         )
 
     async def test_the_pair_leaves_the_shipped_thrash_ladder_byte_identical(
@@ -4628,10 +4713,11 @@ class TestBoundaryRowsComposed:
             f'{_finalized_rows(scene.db_path)!r}'
         )
 
-        # ── every item still queued, at its ORIGINAL lane index ─────────────
-        assert [r.task_id for r in worker._lane_buffers['normal']] == followers, (
+        # ── every item still queued: the followers at their ORIGINAL lane
+        #    index, then the red tip requeued behind them ────────────────────
+        assert _queued_in_lane(worker, 'normal') == [*followers, '101'], (
             f'the chain mutated the queue on a red tip: '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+            f'{_queued_in_lane(worker, "normal")!r}'
         )
         for tid in followers:
             assert _lane_of(worker, tid) == 'normal', (
@@ -4856,12 +4942,12 @@ class TestBoundaryRowsComposed:
             assert rc == 0, f'{sha[:8]} is no longer on main after the abort'
 
         # ── every unlanded link is back at its EXACT lane index, unresolved ─
-        assert [r.task_id for r in worker._lane_buffers['normal']] == [
+        assert _queued_in_lane(worker, 'normal') == [
             '103', '104', '105', '106',
         ], (
             f'submission order must survive the abort — it is the next round\'s '
             f'chain_snapshot; got '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+            f'{_queued_in_lane(worker, "normal")!r}'
         )
         for tid in ('103', '104', '105', '106'):
             req = scene.reqs[tid]
@@ -5227,10 +5313,10 @@ class TestRow4ConflictTruncatesSilently:
         )
 
         # ── every offered item is UNTOUCHED, in its original lane position ──
-        assert [r.task_id for r in worker._lane_buffers['normal']] == followers, (
+        assert _queued_in_lane(worker, 'normal') == followers, (
             f'submission order must survive a truncation — it is the next '
             f'round\'s chain_snapshot; got '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+            f'{_queued_in_lane(worker, "normal")!r}'
         )
         for tid in followers:
             req = scene.reqs[tid]
@@ -5555,11 +5641,11 @@ class TestDeepGateCapstone:
             f'the head and its first link landed before the bump; got '
             f'{r5["landed"]!r}'
         )
-        assert [r.task_id for r in worker._lane_buffers['normal']][:4] == [
+        assert _queued_in_lane(worker, 'normal')[:4] == [
             '110', '111', '112', '113',
         ], (
             f'every unlanded link returns to its EXACT lane index; got '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]][:4]!r}'
+            f'{_queued_in_lane(worker, "normal")[:4]!r}'
         )
         _conserved(r5)
 

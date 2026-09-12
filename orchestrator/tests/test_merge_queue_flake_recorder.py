@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from test_merge_boundary_effective_module_configs import (
     _ALPHA_TEST,
     _BETA_FAILING_ID,
@@ -48,7 +49,6 @@ from orchestrator.flake_ledger import (
     ledger_db_path,
     read_occurrences,
 )
-from orchestrator.merge_gates import PostMergePyrightResult
 from orchestrator.merge_queue import _run_post_merge_verify
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import VerifyRunner, result_from_json, result_to_json
@@ -117,6 +117,22 @@ def _still_failing(s: FlakeSuppression) -> VerifyResult:
     return replace(_failing_scoped_result(_BETA_FAILING_ID), flake_suppression=s)
 
 
+def _scripted_red() -> FakeVerifier:
+    """The injected ``VerifyPort``, scripted to the RED the production gate judges.
+
+    This is the boundary's INPUT, not its answer: the scripted result carries
+    ``flake_suppression=None``, so every observation these tests assert on is one
+    the real ``verify.apply_merge_flake_suppression`` produced inside the
+    boundary's own ``LocalRunner`` (verify_runner.py:864) off the isolated re-run.
+    Scripted inline rather than in ``_merge_lane_fakes`` — a
+    suppression-carrying result needs no new shared helper, and that module
+    belongs to another scope.
+    """
+    return FakeVerifier(
+        default=VerifyScript(result=_failing_scoped_result(_BETA_FAILING_ID)),
+    )
+
+
 def _remote_runner(*results: VerifyResult) -> MagicMock:
     """A fake REMOTE runner returning *results* in order (one per dispatch)."""
     r = MagicMock(spec=VerifyRunner)
@@ -136,15 +152,20 @@ async def _drive(
     cross_check: bool = False,
     rerun_passes: bool = True,
     max_enospc: int = 1,
+    verifier: FakeVerifier | None = None,
 ):
     """Drive the REAL ``_run_post_merge_verify``.
 
-    On the LOCAL path (*runner* None) the boundary builds its own ``LocalRunner``,
-    so ``run_scoped_verification`` is patched to the red and
-    ``verify.run_verification`` to the isolated re-run — the production gate then
-    produces the ``FlakeSuppression`` itself, rather than the test hand-feeding one.
-    On the REMOTE path the injected runner returns its own queued results directly,
-    which is exactly how a real remote's already-suppressed verdict arrives.
+    On the LOCAL path (*runner* None) the boundary builds its own ``LocalRunner``
+    over the INJECTED ``VerifyPort``, so *verifier*'s scoped leg answers the red
+    and ``verify.run_verification`` the isolated re-run — the production gate
+    then produces the ``FlakeSuppression`` itself, rather than the test
+    hand-feeding one.  On the REMOTE path the injected runner returns its own
+    queued results directly, which is exactly how a real remote's
+    already-suppressed verdict arrives.
+
+    Pass *verifier* to inspect the port afterwards; the default is
+    :func:`_scripted_red`.
 
     ``verify_cross_check_remote_green`` is OFF by default so the dispatched
     verdict's recording is measured on its own; the one case that needs the
@@ -165,21 +186,14 @@ async def _drive(
     req = _make_req(task_id, task_wt, config)
     req.module_configs = [mc_alpha]
 
-    with (
-        patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            new=AsyncMock(return_value=_failing_scoped_result(_BETA_FAILING_ID)),
-        ),
-        patch(
-            'orchestrator.merge_queue._run_unscoped_typechecks',
-            new=AsyncMock(return_value=PostMergePyrightResult()),
-        ),
-        patch.object(
-            verify, 'run_verification',
-            new=AsyncMock(
-                return_value=_passing_result() if rerun_passes
-                else _failing_scoped_result(_BETA_FAILING_ID),
-            ),
+    # `verify.run_verification` stays PATCHED: it is one layer BELOW the port —
+    # the isolated re-run `apply_merge_flake_suppression` makes to decide the
+    # verdict — so no `VerifyPort` leg covers it.
+    with patch.object(
+        verify, 'run_verification',
+        new=AsyncMock(
+            return_value=_passing_result() if rerun_passes
+            else _failing_scoped_result(_BETA_FAILING_ID),
         ),
     ):
         return await _run_post_merge_verify(
@@ -192,6 +206,7 @@ async def _drive(
             escalation_queue=escalation_queue,
             merge_sha=_MERGE_SHA,
             runner=runner,
+            verifier=_scripted_red() if verifier is None else verifier,
         )
 
 
@@ -255,14 +270,30 @@ class TestDispatcherRecordsTheFlakeObservation:
         Here the production gate inside the boundary's own ``LocalRunner``
         produces the observation — nothing is hand-fed — and the same three
         land, with ``runner`` reading ``'local'`` because that is where it ran.
+
+        The two guards around the drive are what keep "nothing is hand-fed"
+        CHECKED rather than asserted.  Before: the scripted port hands the
+        boundary a bare red carrying no observation at all.  After: the port
+        was actually consulted for this task — an injection that silently went
+        unused would leave ``verified`` empty and make every count below the
+        answer to a question nobody asked.
         """
         store, queue = _FakeEventStore(), _FakeEscalationQueue()
+        verifier = _scripted_red()
+        assert verifier.default.result.flake_suppression is None, (
+            'the injected port must hand the boundary a bare red; a '
+            'pre-suppressed result would make every assertion below vacuous'
+        )
 
         outcome = await _drive(
             tmp_path, task_id='b3-local', runner=None,
-            event_store=store, escalation_queue=queue,
+            event_store=store, escalation_queue=queue, verifier=verifier,
         )
 
+        assert verifier.verified == ['b3-local'], (
+            f'the LocalRunner must have gone through the injected port; '
+            f'verified={verifier.verified!r}'
+        )
         assert outcome is None
         assert len(_suppression_events(store)) == 1, store.emits
         rows = _rows(tmp_path)
