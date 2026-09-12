@@ -257,3 +257,56 @@ class TestCopyToSystemClipboard:
 
         assert runner.calls == []
         assert attempt == CopyAttempt(CopyOutcome.NO_HELPER, ())
+
+
+class TestCopyFeedback:
+    """The operator-visible wording, decided by a pure function.
+
+    No pilot, no event loop, no terminal: what the toast says and whether
+    the OSC 52 fallback still runs are both pinnable here. The incident's
+    primary complaint was that 'y' produced no signal in EITHER direction,
+    which is how a total no-op survived a whole task cycle.
+    """
+
+    def test_success_names_the_mechanism_and_skips_the_fallback(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.COPIED, _XCLIP))
+
+        assert feedback.severity == 'information'
+        assert feedback.write_osc52 is False
+        assert 'xclip' in feedback.message
+
+    def test_no_helper_warns_and_asks_for_the_osc52_fallback(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.NO_HELPER))
+
+        assert feedback.severity == 'warning'
+        assert feedback.write_osc52 is True
+        assert 'OSC 52' in feedback.message
+        assert 'terminal' in feedback.message
+
+    def test_helper_failure_names_both_the_helper_and_the_fallback(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.HELPER_FAILED, _WL_COPY))
+
+        assert feedback.severity == 'warning'
+        assert feedback.write_osc52 is True
+        assert 'wl-copy' in feedback.message
+        assert 'OSC 52' in feedback.message
+
+    def test_a_failure_with_no_command_still_reads_as_prose(self):
+        """The guarded-exception case (action_copy's except branch) carries no argv.
+
+        Fail-soft must not mean fail-ugly: the operator gets a generic label,
+        never an empty fragment or a literal 'None'/'()' in the toast.
+        """
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.HELPER_FAILED))
+
+        assert feedback.message
+        assert 'None' not in feedback.message
+        assert '()' not in feedback.message
