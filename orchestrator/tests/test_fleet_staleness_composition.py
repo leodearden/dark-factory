@@ -193,8 +193,10 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         assert coord._restart_precondition == harness._merge_pipeline_idle
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('on_active_override', [None, 37])
     async def test_fires_systemd_run_with_fleet_script_via_committed_config(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+        on_active_override: int | None,
     ) -> None:
         """End-to-end: note_merge arms the real (list-index-2) coordinator on a
         watched-path diff; once the merge pipeline is drained, the systemd-run
@@ -203,8 +205,14 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         dark-factory-orchestrator.yaml does not set orchestrator_restart_on_active_secs,
         so the asserted value (10) comes from config.py's pydantic default, not
         a value pinned in the committed YAML.
+
+        ``on_active_override`` perturbs that undeclared leaf on the parsed
+        ``committed`` object before the graft, reproducing task 4481's
+        adversarial-config sweep for this one field.
         """
         committed = _load_committed_orchestrator_config(monkeypatch)
+        if on_active_override is not None:
+            committed.orchestrator_restart_on_active_secs = on_active_override
         _graft_committed_restart_config(harness, committed)
         # Deterministic fire — no need to wait the committed 300s debounce.
         harness.config.orchestrator_restart_debounce_secs = 0.0
