@@ -51,7 +51,7 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
-from orchestrator.merge_lane.ports import VerifyPort
+from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
 from orchestrator.merge_lane.types import DiskGuardOutcome
 from orchestrator.merge_queue import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
@@ -14062,8 +14062,10 @@ def _production_verifier_with(**steps: Any) -> VerifyPort:
     plain callable, wrapped here in the zero-argument resolver shape
     :class:`ProductionVerifier` holds its steps in.
     """
+    production = PRODUCTION_VERIFIER
+    assert isinstance(production, ProductionVerifier)
     return dataclasses.replace(
-        PRODUCTION_VERIFIER,
+        production,
         **{step: (lambda fn=fn: fn) for step, fn in steps.items()},
     )
 
