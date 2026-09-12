@@ -51,18 +51,16 @@ from orchestrator.workflow import _ORPHAN_HALT_NO_QUEUE_TOKENS, TaskWorkflow, Wo
 class _FakeMergeWorker:
     """Minimal halt-owner state machine — same contract as MergeWorker.
 
-    Mirrors test_halt_owner._FakeMergeWorker and extends it to:
+    Mirrors test_halt_owner._FakeMergeWorker, ``_owner`` included so the two
+    doubles of one contract read the same, and extends it to:
     - accept an optional ``reason`` keyword on ``unhalt_wip``
     - record the most-recent reason as ``last_unhalt_reason`` for assertion
-    - hold the owner in a PUBLIC ``owner_esc_id``, so the two rows that plant a
-      FOREIGN owner (deliberately bypassing ``set_halt_owner``'s
-      owner-collision assertion) write a declared attribute of this double
-      rather than reaching into a private one
+    - offer :meth:`force_owner` for the two rows that need a FOREIGN owner
     """
 
     def __init__(self) -> None:
         self._halted = False
-        self.owner_esc_id: str | None = None
+        self._owner: str | None = None
         self.last_unhalt_reason: str | None = None
 
     @property
@@ -71,26 +69,41 @@ class _FakeMergeWorker:
 
     @property
     def halt_owner_esc_id(self) -> str | None:
-        return self.owner_esc_id
+        return self._owner
 
     def halt_for_wip(self, reason: str) -> None:
         self._halted = True
-        self.owner_esc_id = None
+        self._owner = None
 
     def set_halt_owner(self, esc_id: str) -> None:
-        assert self.owner_esc_id is None, (
-            f'halt owner already set to {self.owner_esc_id!r}, '
+        assert self._owner is None, (
+            f'halt owner already set to {self._owner!r}, '
             f'refusing to overwrite with {esc_id!r}'
         )
-        self.owner_esc_id = esc_id
+        self._owner = esc_id
+
+    def force_owner(self, esc_id: str) -> None:
+        """Plant *esc_id* as the owner, bypassing the collision assertion.
+
+        The foreign-owner rows need a halt ALREADY owned by someone else
+        before the code under test runs — the one state :meth:`set_halt_owner`
+        exists to refuse.  A named seam says that; a write to this double's
+        ``_owner`` said only "reached inside".
+
+        Deliberately a METHOD and not a writable public owner attribute: the
+        real ``_WipHaltMixin`` exposes ``halt_owner_esc_id`` read-only, and a
+        double carrying a public owner slot would model a surface production
+        does not have.
+        """
+        self._owner = esc_id
 
     def is_halt_owner(self, esc_id: str) -> bool:
-        return self.owner_esc_id is not None and self.owner_esc_id == esc_id
+        return self._owner is not None and self._owner == esc_id
 
     def unhalt_wip(self, reason: str | None = None) -> None:
         self.last_unhalt_reason = reason
         self._halted = False
-        self.owner_esc_id = None
+        self._owner = None
 
 
 @pytest.fixture
@@ -552,7 +565,7 @@ async def test_submit_failure_does_not_release_foreign_owned_halt(
 
     # Pre-engage the halt AND set a FOREIGN owner (bypass the assertion in set_halt_owner).
     fake_worker.halt_for_wip('wip_overlap')
-    fake_worker.owner_esc_id = 'esc-other-1'
+    fake_worker.force_owner('esc-other-1')
     assert fake_worker.is_wip_halted
     assert fake_worker.halt_owner_esc_id == 'esc-other-1'
 
@@ -896,7 +909,7 @@ async def test_trio_never_refiles_sibling_halt_category(
     tripping ``_FakeMergeWorker``'s owner-collision assertion.
     """
     fake_worker.halt_for_wip(handler_id)
-    fake_worker.owner_esc_id = 'esc-foreign-1'
+    fake_worker.force_owner('esc-foreign-1')
     _forbid_waiting_helper(workflow)
 
     outcome = await asyncio.wait_for(
