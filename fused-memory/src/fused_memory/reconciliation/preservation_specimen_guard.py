@@ -64,6 +64,7 @@ flag_types and unrelated recon prose, rather than asserting on this comment.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -363,10 +364,28 @@ def _graphiti_citation(entity: Any) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _Corroboration:
+    """One task's corroboration verdict.
+
+    - ``citation`` — the citing ref, or ``None`` when no channel produced one.
+    - ``degraded`` — at least one channel could not be READ this cycle.
+
+    The two are carried separately because ``citation is None`` alone cannot
+    tell "no citation exists" from "we could not look", and collapsing them is
+    exactly the silent fail-soft INV-11 forbids.  ``degraded`` matters only when
+    ``citation is None``: a verdict reached on a surviving channel is resolved,
+    however the other channel fared.
+    """
+
+    citation: str | None
+    degraded: bool
+
+
 async def _corroborate_preservation(
-    memory_service: Any, project_id: str, task_id: str,
-) -> str | None:
-    """Return the citation corroborating *task_id* as a preserved specimen, or ``None``.
+    memory_service: Any, project_id: str, task_id: str, *, log: logging.Logger,
+) -> _Corroboration:
+    """Corroborate *task_id* as a preserved specimen across both channels.
 
     Two channels, OR'd, cheapest-first.
 
@@ -375,7 +394,7 @@ async def _corroborate_preservation(
        so the ``actionable: False`` term is what makes a retrieved row a RECORDED
        not-actionable adjudication rather than any passing mention of the task.
     2. **Graphiti** — ``get_entity('Task <id>')``, consulted ONLY when channel 1
-       found nothing.
+       produced no citation.
 
     Neither channel is a semantic ``search``: its top-N cutoff silently drops
     low-similarity matches, and a silent miss here re-opens the destructive path.
@@ -383,27 +402,59 @@ async def _corroborate_preservation(
     The fallback is not redundant.  A Graphiti edge exists as soon as the
     preservation fact is recorded, whereas an ``investigation_outcome`` row only
     exists after some stage has ALREADY investigated a flag — so channel 2 is
-    what protects a newly documented specimen on its first cycle, which is
-    precisely the window tasks 5080 and 5104 were filed in.  Channel 1 runs
-    first because its metadata filter is the cheaper and more authoritative
-    signal, which makes the fallback free on the common path.
-    """
-    rows = await memory_service.get_memories_by_metadata(
-        project_id=project_id,
-        filters={
-            'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
-            'task_id': task_id,
-            'actionable': False,
-        },
-    )
-    citation = _first_citation(rows, _mem0_row_text, 'id')
-    if citation is not None:
-        return citation
+    what protects a newly documented specimen on its first cycle, precisely the
+    window tasks 5080 and 5104 were filed in.  Channel 1 runs first because its
+    metadata filter is the cheaper and more authoritative signal, which makes
+    the fallback free on the common path.
 
-    entity = await memory_service.get_entity(
-        GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id), project_id,
-    )
-    return _graphiti_citation(entity)
+    Each channel is guarded independently, so one being down never costs the
+    other its verdict.  A failed read logs WARNING naming the project, task and
+    channel, and marks the verdict ``degraded`` — it is NEVER counted as
+    evidence either way.  ``asyncio.CancelledError``/``KeyboardInterrupt``/
+    ``SystemExit`` propagate unchanged: a shutdown is not a backend blip.
+    """
+    degraded = False
+
+    try:
+        rows = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={
+                'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
+                'task_id': task_id,
+                'actionable': False,
+            },
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        # Includes a propagated Qdrant read-timeout, which arrives here as an
+        # exception precisely so it cannot be mistaken for an empty scroll.
+        log.warning(
+            'preservation_specimen_guard: mem0 corroboration read failed for task '
+            '%s in project %s — verdict unresolved, flag kept',
+            task_id, project_id, exc_info=True,
+        )
+        degraded = True
+    else:
+        citation = _first_citation(rows, _mem0_row_text, 'id')
+        if citation is not None:
+            return _Corroboration(citation=citation, degraded=False)
+
+    try:
+        entity = await memory_service.get_entity(
+            GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id), project_id,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.warning(
+            'preservation_specimen_guard: graphiti corroboration read failed for '
+            'task %s in project %s — verdict unresolved, flag kept',
+            task_id, project_id, exc_info=True,
+        )
+        return _Corroboration(citation=None, degraded=True)
+
+    return _Corroboration(citation=_graphiti_citation(entity), degraded=degraded)
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -435,7 +486,21 @@ async def filter_preservation_specimen_flags(
     calls.  The corroboration loop is sequential rather than an
     ``asyncio.gather``: the candidate population is tiny, and a serial loop
     keeps per-task error attribution exact (the reason
-    ``curator_gate_resolution_sweep`` gives for its own).
+    ``curator_gate_resolution_sweep`` gives for its own), which is what lets a
+    failure name the task it belongs to.
+
+    **Fail OPEN on the drop, but never silently.**  A read failure NEVER
+    suppresses: it keeps the flag and names the task in ``unresolved_task_ids``.
+    The asymmetry is deliberate.  Suppressing on a backend blip would hide every
+    stranded finding fleet-wide — the hidden-finding cost the under-suppression
+    bias forbids — whereas keeping the flag costs at most one more cycle of a
+    false positive the rotation has absorbed since August.  But a BARE fail-open
+    would make "corroboration unreadable" byte-identical to "no citation
+    exists", and the destructive recommendation would then flow on unremarked;
+    disclosing the unresolved tasks in the result (surfaced as a stat and
+    reported through the storm escape) is what keeps the degradation visible at
+    the point of consumption.  A per-task failure costs that task's verdict
+    only, never the batch.
 
     Returns a :class:`PreservationSuppressionResult`; the caller assigns
     ``kept_flags`` back to ``items_flagged``.  Suppression is NOT resolution —
@@ -456,17 +521,22 @@ async def filter_preservation_specimen_flags(
             unresolved_task_ids=(),
         )
 
-    verdicts: dict[str, str | None] = {}
+    verdicts: dict[str, _Corroboration] = {}
+    unresolved: list[str] = []
     for task_id in candidates:
-        verdicts[task_id] = await _corroborate_preservation(
-            memory_service, project_id, task_id,
+        verdict = await _corroborate_preservation(
+            memory_service, project_id, task_id, log=log,
         )
+        verdicts[task_id] = verdict
+        if verdict.citation is None and verdict.degraded:
+            unresolved.append(task_id)
 
     kept: list[dict[str, Any]] = []
     suppressed_by_task: dict[str, int] = {}
     citations_by_task: dict[str, str] = {}
     for flag, task_id in candidacy:
-        citation = verdicts.get(task_id) if task_id else None
+        verdict = verdicts.get(task_id) if task_id else None
+        citation = verdict.citation if verdict is not None else None
         if citation is None:
             kept.append(flag)
             continue
@@ -482,5 +552,5 @@ async def filter_preservation_specimen_flags(
         kept_flags=kept,
         suppressed_by_task=suppressed_by_task,
         citations_by_task=citations_by_task,
-        unresolved_task_ids=(),
+        unresolved_task_ids=tuple(unresolved),
     )

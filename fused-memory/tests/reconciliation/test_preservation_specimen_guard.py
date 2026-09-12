@@ -350,7 +350,8 @@ def caplog_at_warning():
 
     class _Collect(logging.Handler):
         def emit(self, record):
-            records.append(record.getMessage() % record.args if record.args else record.getMessage())
+            # getMessage() already interpolates record.args.
+            records.append(record.getMessage())
 
     handler = _Collect(level=logging.WARNING)
     log = logging.getLogger(GUARD_LOGGER)
