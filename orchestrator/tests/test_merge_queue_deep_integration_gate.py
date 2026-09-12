@@ -2956,15 +2956,15 @@ class TestRow11TimeoutMargin:
         )
         # The two knobs this test's whole claim is a routing statement about.
         config = scene.config
-        assert config.merge_verify_cold_command_timeout_secs == 7200.0, (
-            'the shipped merge-verify cold budget moved: expected 7200.0, got '
-            f'{config.merge_verify_cold_command_timeout_secs!r}'
-        )
-        assert config.verify_cold_command_timeout_secs == 5400.0, (
-            'the shipped GENERAL cold budget moved, so the exact-set assertion '
-            'below is no longer a negative control (it discriminates between '
-            'the two routes only while the two budgets DIFFER): got '
-            f'{config.verify_cold_command_timeout_secs!r}'
+        merge_budget = config.merge_verify_cold_command_timeout_secs
+        general_budget = config.verify_cold_command_timeout_secs
+        # Both are operator-tunable, so the premise is that they DIFFER, not
+        # that either holds a particular value: the exact-set assertion below
+        # discriminates between the two routes only while they do.
+        assert merge_budget != general_budget, (
+            'the merge-verify and general cold budgets have converged on '
+            f'{merge_budget!r}, so the exact-set assertion below is no longer '
+            'a negative control'
         )
 
         assert captured, (
@@ -2972,10 +2972,11 @@ class TestRow11TimeoutMargin:
             '(the autouse run_scoped_verification stub was probably still in '
             'place, short-circuiting above the resolver)'
         )
-        assert set(captured) == {7200.0}, (
+        assert set(captured) == {merge_budget}, (
             f'every command in a merge verify is handed the merge-verify cold '
-            f'budget, and NOTHING else — 5400.0, the general cold budget a '
-            f'dropped is_merge_verify would fall back to, must not appear; got '
+            f'budget ({merge_budget!r}), and NOTHING else — {general_budget!r}, '
+            f'the general cold budget a dropped is_merge_verify would fall back '
+            f'to, must not appear; got '
             f'{sorted(set(captured))!r} across {len(captured)} commands'
         )
 
