@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 from typing import Any
 
 import pytest
@@ -24,6 +25,7 @@ from shared.uuid_prefix import (
     find_prefix_tokens,
     strip_uuid_prefix_override,
     substitute,
+    substitute_all,
     uuid_prefix_override_requested,
 )
 
@@ -420,6 +422,344 @@ def test_forward_order_is_what_would_corrupt_the_second_span() -> None:
     first, second = find_prefix_tokens(arguments)
     after_first = substitute(arguments, first, FULL_F1C)
     assert after_first['content'][second.start : second.end] != second.token
+
+
+# --- substitute_all: the BATCH door, and the cost bound that justifies it ---
+#
+# The single-token door above stays the DEFINITION of a substitution; this
+# section pins the batch door against it. The reason the batch door exists is a
+# cost bound, not taste: applying N occurrences by folding `substitute` rebuilds
+# the containing string N times, which is O(occurrences x string length).
+
+#: Every token these rows plant, paired with the id it expands to. A table
+#: rather than a literal per row, so a row's expectation cannot disagree with
+#: what was actually asked for.
+FULL_OF = {
+    'bff81530': FULL_BFF,
+    '8bec9cd6': FULL_8BE,
+    'f1c4a651': FULL_F1C,
+    'b7b0f63b': FULL_B7B,
+}
+
+
+def replacements_for(arguments: dict[str, Any]) -> list[tuple[PrefixToken, str]]:
+    """Every token in *arguments*, in document order, paired with its full id."""
+    return [(token, FULL_OF[token.token]) for token in find_prefix_tokens(arguments)]
+
+
+def test_batch_matches_folding_substitute_in_reverse_document_order() -> None:
+    """EQUIVALENCE: the older door's semantics stay the definition.
+
+    Tokens across several paths, one of them cited twice, so the fold this
+    replaces is exercised over exactly the shape the guard produces.
+    """
+    arguments: dict[str, Any] = {
+        'content': 'f1c4a651 supersedes b7b0f63b, and bff81530 is the pair',
+        'metadata': {
+            'cluster_memory_ids': ['8bec9cd6', FULL_BFF],
+            'note': 'f1c4a651 again',
+        },
+    }
+    pairs = replacements_for(arguments)
+    assert len(pairs) == 5
+
+    folded: Any = arguments
+    for token, full_id in reversed(pairs):
+        folded = substitute(folded, token, full_id)
+
+    assert substitute_all(arguments, pairs) == folded
+
+
+def test_many_interleaved_occurrences_are_all_span_exact() -> None:
+    """SPAN-EXACTNESS: two adjacent occurrences, and one at each end of the string."""
+    arguments = {
+        'content': (
+            'bff81530 sees f1c4a651/b7b0f63b then 8bec9cd6 and bff81530 again f1c4a651'
+        )
+    }
+    result = substitute_all(arguments, replacements_for(arguments))
+    assert result['content'] == (
+        f'{FULL_BFF} sees {FULL_F1C}/{FULL_B7B} then {FULL_8BE} '
+        f'and {FULL_BFF} again {FULL_F1C}'
+    )
+
+
+def test_replacements_may_arrive_in_any_order() -> None:
+    """ORDER-INDEPENDENCE: the caller carries no ordering precondition.
+
+    The fold demanded reverse document order and corrupted the second span
+    without it (``test_forward_order_is_what_would_corrupt_the_second_span``).
+    Removing that precondition is what makes the batch door SAFER, not merely
+    faster, so it is pinned rather than left as a property of the sort inside.
+    """
+    arguments: dict[str, Any] = {
+        'content': 'bff81530 then f1c4a651 then b7b0f63b then bff81530',
+        'metadata': {'cluster_memory_ids': ['8bec9cd6']},
+    }
+    pairs = replacements_for(arguments)
+    expected = substitute_all(arguments, pairs)
+
+    shuffled = list(pairs)
+    random.Random(20260912).shuffle(shuffled)
+    assert shuffled != pairs
+
+    assert substitute_all(arguments, shuffled) == expected
+    assert substitute_all(arguments, list(reversed(pairs))) == expected
+
+
+def test_batch_does_not_mutate_its_input() -> None:
+    arguments: dict[str, Any] = {
+        'content': 'see bff81530 and bff81530 again',
+        'metadata': {'cluster_memory_ids': ['8bec9cd6', FULL_BFF]},
+    }
+    before = copy.deepcopy(arguments)
+    substitute_all(arguments, replacements_for(arguments))
+    assert arguments == before
+
+
+def test_batch_shares_untouched_substructures_by_identity() -> None:
+    """A PATH COPY per DISTINCT path, not a deep copy."""
+    untouched = {'deep': ['no identifiers here']}
+    arguments: dict[str, Any] = {
+        'content': 'see bff81530 and bff81530 again',
+        'other': untouched,
+        'metadata': {'cluster_memory_ids': ['8bec9cd6', FULL_BFF]},
+    }
+    result = substitute_all(arguments, replacements_for(arguments))
+    assert result['other'] is untouched
+    # The already-full uuid beside a replaced entry comes across by reference.
+    assert (
+        result['metadata']['cluster_memory_ids'][1]
+        is arguments['metadata']['cluster_memory_ids'][1]
+    )
+    assert result['metadata']['cluster_memory_ids'][0] == FULL_8BE
+
+
+@pytest.mark.parametrize('position', [0, 1, 2], ids=['first', 'middle', 'last'])
+def test_batch_refuses_a_non_prefix_replacement_anywhere_in_the_batch(position: int) -> None:
+    """MONOTONICITY is enforced for EVERY pair, not just the first.
+
+    Same wording as the single-token door's refusal, because it is the same
+    invariant enforced in the same place (heuristic 10) — a door that read
+    differently depending on the arity a caller used would be two invariants.
+    """
+    arguments = {'content': 'f1c4a651 and b7b0f63b and bff81530'}
+    pairs = replacements_for(arguments)
+    assert len(pairs) == 3
+    bad = 'c0ffee00-1c2d-4e3f-a5b6-7c8d9e0f1a2b'
+    offender = pairs[position][0]
+    pairs[position] = (offender, bad)
+
+    with pytest.raises(ValueError) as excinfo:
+        substitute_all(arguments, pairs)
+    message = str(excinfo.value)
+    assert offender.token in message
+    assert repr(bad) in message or bad in message
+
+
+def test_a_refused_batch_leaves_the_input_untouched() -> None:
+    """ALL-OR-NOTHING: validation completes before any rebuilding starts.
+
+    This is what lets the guard keep "nothing was written" structurally true
+    rather than intended: a batch that refuses one pair cannot have applied
+    the ones ahead of it.
+    """
+    arguments: dict[str, Any] = {
+        'content': 'f1c4a651 and b7b0f63b',
+        'metadata': {'cluster_memory_ids': ['8bec9cd6']},
+    }
+    before = copy.deepcopy(arguments)
+    pairs = replacements_for(arguments)
+    pairs[-1] = (pairs[-1][0], 'c0ffee00-1c2d-4e3f-a5b6-7c8d9e0f1a2b')
+
+    with pytest.raises(ValueError):
+        substitute_all(arguments, pairs)
+    assert arguments == before
+
+
+def test_an_empty_batch_returns_the_arguments_unchanged() -> None:
+    arguments: dict[str, Any] = {'content': 'see bff81530', 'metadata': {'k': ['8bec9cd6']}}
+    before = copy.deepcopy(arguments)
+    assert substitute_all(arguments, ()) == before
+    assert arguments == before
+
+
+def overlapping_pairs(kind: str) -> list[tuple[PrefixToken, str]]:
+    """Two pairs whose spans overlap inside ONE string, in two realistic shapes.
+
+    ``same-span-twice`` is the migration bug a batch door invites — a caller
+    that stopped deduplicating. ``straddling`` is a span built to start inside
+    the one before it, which no detector produces (``re.finditer`` yields
+    non-overlapping matches) and which a span-exact splice would silently
+    corrupt rather than refuse.
+    """
+    arguments = {'content': 'see bff81530 here'}
+    token = find_prefix_tokens(arguments)[0]
+    if kind == 'same-span-twice':
+        return [(token, FULL_BFF), (token, FULL_BFF)]
+    inner = PrefixToken(
+        path=token.path, token=token.token[2:], start=token.start + 2, end=token.end
+    )
+    return [(token, FULL_BFF), (inner, f'{inner.token}-1a2b')]
+
+
+@pytest.mark.parametrize('kind', ['same-span-twice', 'straddling'])
+def test_overlapping_spans_in_one_string_are_refused(kind: str) -> None:
+    arguments = {'content': 'see bff81530 here'}
+    with pytest.raises(ValueError) as excinfo:
+        substitute_all(arguments, overlapping_pairs(kind))
+    assert 'overlap' in str(excinfo.value).lower()
+    assert arguments == {'content': 'see bff81530 here'}
+
+
+# --- the cost pin: characters TOUCHED, deliberately not wall clock ----------
+
+
+class _Tally:
+    """One counter shared by a string and every string derived from it."""
+
+    def __init__(self) -> None:
+        self.touched = 0
+
+
+class CountingStr(str):
+    """``str`` subclass tallying every character its own operations copy.
+
+    The instrument, and why it is not a clock. The property under test is
+    "each containing string is rebuilt ONCE per call", which is a claim about
+    characters copied, not about seconds. A wall-clock budget cannot see it:
+    task 4149 measured a deliberately O(n**2) rewrite PASSING a 1.0s budget at
+    0.026s, because the quadratic term is C-level memcpy that retires far
+    faster than the surrounding Python. Counting slices and concatenations
+    observes the cost property itself, so the pin holds at a fixture size this
+    suite can afford and does not flake under xdist load.
+
+    The taint PROPAGATES: ``__getitem__`` and ``__add__`` both return a
+    ``CountingStr`` sharing the same :class:`_Tally`. Without that, a fold's
+    intermediate result would fall back to a plain ``str`` after the first
+    splice and every later rebuild would go uncounted — undercounting exactly
+    the shape being ruled out. ``str.join`` reads its arguments' buffers at C
+    level and returns a plain ``str``, which is why a grouped rebuild is
+    counted by its input slices rather than by its output.
+    """
+
+    _tally: _Tally
+
+    def __new__(cls, value: str, tally: _Tally | None = None) -> CountingStr:
+        self = super().__new__(cls, value)
+        self._tally = tally if tally is not None else _Tally()
+        return self
+
+    @property
+    def touched(self) -> int:
+        return self._tally.touched
+
+    def reset(self) -> None:
+        self._tally.touched = 0
+
+    def __getitem__(self, key: Any) -> CountingStr:
+        got = str.__getitem__(self, key)
+        self._tally.touched += len(got)
+        return CountingStr(got, self._tally)
+
+    def __add__(self, other: str) -> CountingStr:
+        got = str.__add__(self, other)
+        self._tally.touched += len(got)
+        return CountingStr(got, self._tally)
+
+
+#: Prose carrying no run the grammar accepts, so a cost row's occurrence count
+#: is exactly the number of tokens it planted.
+FILLER = 'the reconciler ran twice and both passes agreed. '
+
+#: The same ~20KB string driven at three occurrence counts. 16x between the
+#: ends is what makes "the ratio does not track occurrence count" measurable.
+COST_OCCURRENCES = (100, 400, 1600)
+
+
+def expand_and_count(occurrences: int, length: int = 20_000) -> tuple[int, int, str]:
+    """Expand *occurrences* citations of one id in ONE ~*length*-char string.
+
+    Returns the characters the substitution door touched, the string's length,
+    and the expanded string. The tally is reset after detection: the scan has
+    its own stated bound (``find_prefix_tokens``' INV-8 paragraph), and this
+    row bounds the door.
+    """
+    planted = 'bff81530 x ' * occurrences
+    pad = max(0, length - len(planted))
+    text = planted + (FILLER * (pad // len(FILLER) + 1))[:pad]
+    content = CountingStr(text)
+    arguments: dict[str, Any] = {'content': content}
+    pairs = [(token, FULL_BFF) for token in find_prefix_tokens(arguments)]
+    assert len(pairs) == occurrences
+
+    content.reset()
+    result = substitute_all(arguments, pairs)
+    return content.touched, len(text), result['content']
+
+
+def test_batch_substitution_touches_a_constant_multiple_of_the_string() -> None:
+    """One rebuild per containing string, pinned by characters touched.
+
+    MEASURED on this branch with this harness, ~20KB string, occurrences
+    100 / 400 / 1600:
+
+      - grouped (the shipped door): 0.96x / 0.84x / 0.36x of the string's
+        length. Flat, then FALLING — the gaps copied are the string minus the
+        tokens, so denser citations copy less.
+      - the reversed fold of ``substitute`` it replaces: 216.86x / 1068.45x /
+        7489.80x. The ratio RISING with occurrence count is the quadratic
+        signature, and it is already 108x over the budget below at the
+        smallest row. A separation of ~20,000x at 1600 occurrences, with no
+        clock and no large fixture.
+
+    The wall clock agrees and is why the work was done — one ``content``
+    string, 16 distinct tokens each repeated: the fold costs 0.69s at 6,400
+    occurrences (275KB), 3.00s at 12,800 (550KB) and 16.91s at 25,600
+    (1.1MB), 4x the time per 2x the input, against 0.00s / 0.01s / 0.02s
+    grouped. Those seconds are a full stall of a shared single-threaded
+    server, reachable from one ordinary large write.
+
+    The 2x budget is derived, not guessed: the door copies each string's gaps
+    exactly once, which is at most its length, and the headroom absorbs an
+    innocuous per-token read without admitting any per-occurrence rebuild.
+    """
+    ratios = []
+    for occurrences in COST_OCCURRENCES:
+        touched, length, expanded = expand_and_count(occurrences)
+
+        # Correctness alongside cost: the budget must not be satisfiable by
+        # doing less work than asked.
+        assert expanded.count(FULL_BFF) == occurrences
+        assert expanded.startswith(f'{FULL_BFF} x ')
+
+        assert touched <= 2 * length, (
+            f'substitute_all touched {touched} characters expanding {occurrences} '
+            f'occurrences in a {length}-char string (budget {2 * length} = 2x '
+            f'length) — a containing string is being rebuilt more than once'
+        )
+        ratios.append(touched / length)
+
+    assert ratios[-1] <= 2 * ratios[0], (
+        f'characters touched per string-length grew from {ratios[0]:.2f}x at '
+        f'{COST_OCCURRENCES[0]} occurrences to {ratios[-1]:.2f}x at '
+        f'{COST_OCCURRENCES[-1]} — growth tracking occurrence count is the '
+        f'per-occurrence-rebuild signature the batch door exists to remove'
+    )
+
+
+def test_the_expansion_preserves_every_character_between_the_citations() -> None:
+    """The 1600-occurrence row, checked as one byte-exact equality.
+
+    The cost test above spot-checks; this asserts the whole 20KB result, so a
+    grouped rebuild that dropped or duplicated a gap could not hide behind a
+    passing budget.
+    """
+    _, _, expanded = expand_and_count(COST_OCCURRENCES[-1])
+    planted = 'bff81530 x ' * COST_OCCURRENCES[-1]
+    pad = max(0, 20_000 - len(planted))
+    text = planted + (FILLER * (pad // len(FILLER) + 1))[:pad]
+    assert expanded == text.replace('bff81530', FULL_BFF)
 
 
 # --- the override trio (mirrors toolcall_markup.py's MARKUP_OVERRIDE_KEY) ---
