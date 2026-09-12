@@ -803,8 +803,47 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # the answer is scoping verify to the task's declared modules — which is what
 # tests/scripts/orchestrator.yaml now does for this very fallback path (task
 # 3350) — or sharding the suite (task 3353), not raising this number again.
-verify_command_timeout_secs: 3600
-verify_cold_command_timeout_secs: 5400
+# RAISED 3600 -> 7200 warm / 5400 -> 10800 cold (Leo, 2026-09-12), OVERRIDING the
+# paragraph immediately above, which says "not raising this number again". Recorded
+# as an override rather than by quietly deleting that sentence, because its
+# reasoning is still correct and is the thing that should eventually retire this
+# raise.
+#
+# WHY OVERRIDE IT NOW. That paragraph names the right answers — scope verify to the
+# task's declared modules, or shard the suite (task 3353) — but neither is
+# implemented, and the cost of waiting is being paid daily in FALSE reds, not in
+# slow runs: 5 worktrees lost to false verify timeouts in 6 days (esc-4211-6), each
+# burning ~1h of 8 workers on a task that was fully green, plus task 3202, which is
+# complete and review-clean and cannot pass verify at any priority. A ceiling a
+# green run cannot clear surfaces nothing but false infra_timeouts — this file
+# already says so, twelve lines up, about the 1800s era.
+#
+# WHAT THIS ACTUALLY LOOSENS: only the `orchestrator` module. Every other
+# discovered module config declares its own budget (600-2400s) and is unaffected;
+# `orchestrator` is the single documented exception that hard-falls-through to this
+# value (see MODULE_BUDGET_EXCLUSIONS). Its measured cost is 1765.95s median with an
+# 864.83..3310.50s spread (n=28, task 4902) — at that observed max the honest green
+# path is ~4190s, i.e. OVER the old ceiling, which is the defect in one line.
+# 7200 is the figure already ruled as task 3353 scope B.
+#
+# THE COLD VALUE MOVED BECAUSE IT HAD TO, not from measurement: warm <= cold is
+# asserted twice (test_fallback_verify_config.py, tasks 3350 and 3397) on the
+# ground that a cold run does strictly more work. Both values are scaled x2 so the
+# previously-ruled 1.5x cold/warm relationship is preserved exactly rather than
+# silently re-derived on the way past.
+#
+# THE COST, stated because it is real: a genuinely WEDGED run now holds a verify
+# slot for 2h warm / 3h cold instead of 1h / 1.5h, and verify_admission_task_slots
+# is 1, so that is the whole task-verify lane. Accepted against a false-red rate of
+# ~1 stranded green worktree per day.
+#
+# REVERT CONDITION, and it is the one the paragraph above already wrote: when task
+# 3353 lands (split or shard the orchestrator suite) or the module declares its own
+# budget, put these back to 3600/5400. This raise buys time for that work; it is not
+# a replacement for it. Do NOT read it as licence to raise again — the next raise
+# should be refused and 3353 done instead.
+verify_command_timeout_secs: 7200
+verify_cold_command_timeout_secs: 10800
 
 # Pre-turn-1 startup grace (Leo, 2026-09-07; esc-4444-3 cluster).
 # RAISED 120 -> 450, matching reify's already-ruled value.
