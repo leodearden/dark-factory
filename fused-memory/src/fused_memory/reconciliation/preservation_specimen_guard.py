@@ -65,6 +65,7 @@ flag_types and unrelated recon prose, rather than asserting on this comment.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -87,6 +88,7 @@ __all__ = [
     'STRANDED_ACTION_TARGET_FAMILY',
     'STRANDED_ACTION_VERB_FAMILY',
     'STRANDED_FLAG_TOKEN_FAMILY',
+    'GRAPHITI_TASK_ENTITY_TEMPLATE',
     'PreservationSuppressionResult',
     'cites_preservation',
     'filter_preservation_specimen_flags',
@@ -260,29 +262,128 @@ class PreservationSuppressionResult:
     unresolved_task_ids: tuple[str, ...]
 
 
-def _citable_preservation_row(rows: Any) -> str | None:
-    """Return the id of the first *rows* entry whose prose cites preservation.
+#: Canonical Graphiti entity label for a task.  ``get_entity`` resolves this
+#: shape by EXACT, case-sensitive match, so it lands on the task's own node
+#: instead of scattering across fuzzy neighbours.
+GRAPHITI_TASK_ENTITY_TEMPLATE: str = 'Task {task_id}'
 
-    ``None`` when no row does, when *rows* is not iterable-of-mappings, or when
-    the one row that matches carries no usable id.  That last case is deliberate
-    and mirrors ``curator_gate_resolution_sweep``'s refusal to flag a gate it
-    cannot cite: a suppression that cannot name its evidence is exactly the
-    anonymous drop ``citations_by_task`` exists to prevent.
+#: The Graphiti sub-collections consulted for a preservation citation, in
+#: preference order, as ``(collection key, text field)``.
+#:
+#: EDGES FIRST, deliberately.  An edge fact is the atomic, individually
+#: addressable statement (``get_edge(uuid)``) and is durable; a node summary is
+#: a derived digest that ``refresh_entity_summary`` regenerates.  Citing the
+#: edge is what lets a later reader check the evidence rather than take the
+#: suppression on trust.  The summary is still consulted, because it can carry
+#: the fact in a graph whose edges word it differently.
+_GRAPHITI_CITATION_SOURCES: tuple[tuple[str, str], ...] = (
+    ('edges', 'fact'),
+    ('nodes', 'summary'),
+)
 
+
+def _mem0_row_text(row: dict[str, Any]) -> str:
+    """The human-readable prose of one ``get_memories_by_metadata`` row.
+
+    That reader returns ``{'id', 'created_at', 'metadata'}`` where ``metadata``
+    is the FULL raw Qdrant payload, so the text is wherever
+    :func:`~fused_memory.services.memory_service._mem0_content` says it is —
+    ``data``, then ``memory``, then ``content``.  Pure, sync, no I/O.
+    """
+    payload = row.get('metadata')
+    return _mem0_content(payload) if isinstance(payload, dict) else ''
+
+
+def _first_citation(
+    rows: Any,
+    text_of: Callable[[dict[str, Any]], Any],
+    ref_key: str,
+) -> str | None:
+    """Return *ref_key* of the first row in *rows* whose text cites preservation.
+
+    The single definition of "a citable preservation record", shared by both
+    channels so they cannot drift on what counts (INV-5).  *text_of* extracts
+    the prose (payload fallback for Mem0, a plain field for Graphiti) and
+    *ref_key* names the field holding the citable id (``'id'`` / ``'uuid'``).
+
+    ``None`` when nothing matches, when *rows* is not a list/tuple of mappings,
+    or when the row that matches carries no usable ref.  That last case is
+    deliberate and mirrors ``curator_gate_resolution_sweep``'s refusal to flag a
+    gate it cannot cite: a suppression that cannot name its evidence is exactly
+    the anonymous drop ``citations_by_task`` exists to prevent.
+
+    Total over malformed input — every row here comes off a raw backend read.
     Pure, sync, no I/O.
     """
     if not isinstance(rows, (list, tuple)):
         return None
     for row in rows:
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or not cites_preservation(text_of(row)):
             continue
-        payload = row.get('metadata')
-        if not isinstance(payload, dict) or not cites_preservation(_mem0_content(payload)):
-            continue
-        row_id = row.get('id')
-        if isinstance(row_id, str) and row_id:
-            return row_id
+        ref = row.get(ref_key)
+        if isinstance(ref, str) and ref:
+            return ref
     return None
+
+
+def _graphiti_citation(entity: Any) -> str | None:
+    """Return the uuid of the first edge fact / node summary citing preservation.
+
+    Consults :data:`_GRAPHITI_CITATION_SOURCES` in order.  ``None`` for a
+    non-mapping result, a missing collection, or no match.  Pure, sync, no I/O.
+    """
+    if not isinstance(entity, dict):
+        return None
+    for collection, text_field in _GRAPHITI_CITATION_SOURCES:
+        citation = _first_citation(
+            entity.get(collection), lambda row, f=text_field: row.get(f), 'uuid',
+        )
+        if citation is not None:
+            return citation
+    return None
+
+
+async def _corroborate_preservation(
+    memory_service: Any, project_id: str, task_id: str,
+) -> str | None:
+    """Return the citation corroborating *task_id* as a preserved specimen, or ``None``.
+
+    Two channels, OR'd, cheapest-first.
+
+    1. **Mem0** — a deterministic ``get_memories_by_metadata`` scroll filtered on
+       ``{kind, task_id, actionable: False}``.  Qdrant ANDs equality conditions,
+       so the ``actionable: False`` term is what makes a retrieved row a RECORDED
+       not-actionable adjudication rather than any passing mention of the task.
+    2. **Graphiti** — ``get_entity('Task <id>')``, consulted ONLY when channel 1
+       found nothing.
+
+    Neither channel is a semantic ``search``: its top-N cutoff silently drops
+    low-similarity matches, and a silent miss here re-opens the destructive path.
+
+    The fallback is not redundant.  A Graphiti edge exists as soon as the
+    preservation fact is recorded, whereas an ``investigation_outcome`` row only
+    exists after some stage has ALREADY investigated a flag — so channel 2 is
+    what protects a newly documented specimen on its first cycle, which is
+    precisely the window tasks 5080 and 5104 were filed in.  Channel 1 runs
+    first because its metadata filter is the cheaper and more authoritative
+    signal, which makes the fallback free on the common path.
+    """
+    rows = await memory_service.get_memories_by_metadata(
+        project_id=project_id,
+        filters={
+            'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
+            'task_id': task_id,
+            'actionable': False,
+        },
+    )
+    citation = _first_citation(rows, _mem0_row_text, 'id')
+    if citation is not None:
+        return citation
+
+    entity = await memory_service.get_entity(
+        GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id), project_id,
+    )
+    return _graphiti_citation(entity)
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -297,13 +398,8 @@ async def filter_preservation_specimen_flags(
 ) -> PreservationSuppressionResult:
     """Drop stranded-class recon flags for tasks documented as preserved specimens.
 
-    Corroborates each candidate task against the Mem0 ``investigation_outcome``
-    channel: a deterministic ``get_memories_by_metadata`` scroll filtered on
-    ``{kind, task_id, actionable: False}``.  Qdrant ANDs equality conditions, so
-    the ``actionable: False`` term is what makes a retrieved row a RECORDED
-    not-actionable adjudication rather than any passing mention of the task.
-    Deliberately not a semantic ``search``: its top-N cutoff silently drops
-    low-similarity matches, and a silent miss here re-opens the destructive path.
+    Each flag's task is corroborated by :func:`_corroborate_preservation`; a
+    corroborated task's flag is dropped and the citation recorded.
 
     Returns a :class:`PreservationSuppressionResult`; the caller assigns
     ``kept_flags`` back to ``items_flagged``.  Suppression is NOT resolution —
@@ -320,15 +416,7 @@ async def filter_preservation_specimen_flags(
             kept.append(flag)
             continue
 
-        rows = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={
-                'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
-                'task_id': task_id,
-                'actionable': False,
-            },
-        )
-        citation = _citable_preservation_row(rows)
+        citation = await _corroborate_preservation(memory_service, project_id, task_id)
         if citation is None:
             kept.append(flag)
             continue
