@@ -51,6 +51,7 @@ from df_pytest_isolation import (  # noqa: E402
     CLOCK_PROVENANCE_SOURCE_KEY,
     PROTECTED_DEPLOY_CLOCK_RELPATHS,
     PYTEST_SESSION_TOKEN_ENV,
+    ClockVerdict,
     DeployClockRedeployWarning,
     clock_stamp_provenance,
     deploy_clock_change_report,
@@ -615,7 +616,7 @@ class TestDeployClockChangeReport:
 
         assert report is not None
         verdict, message = report
-        assert verdict == 'falsified'
+        assert verdict is ClockVerdict.FALSIFIED
         assert 'falsified a REAL deploy clock' in message, message
         assert _FLEET_SOURCE in message, 'the writer must be named for triage'
         assert 'this run' in message, message
@@ -637,7 +638,7 @@ class TestDeployClockChangeReport:
 
         assert report is not None
         verdict, message = report
-        assert verdict == 'external_redeploy'
+        assert verdict is ClockVerdict.EXTERNAL_REDEPLOY
         assert 'falsified a REAL deploy clock' not in message, (
             'the benign message must not carry the accusing string — the nested '
             'end-to-end test and the failure-path tests both key on it'
@@ -663,7 +664,7 @@ class TestDeployClockChangeReport:
 
         assert report is not None
         verdict, message = report
-        assert verdict == 'falsified'
+        assert verdict is ClockVerdict.FALSIFIED
         assert 'another pytest session' in message.lower(), message
 
     def test_a_legacy_provenance_free_stamp_still_fails(self, tmp_path: Path) -> None:
@@ -676,7 +677,7 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] == 'falsified'
+        assert report[0] is ClockVerdict.FALSIFIED
 
     def test_a_created_external_stamp_is_a_redeploy(self, tmp_path: Path) -> None:
         """CREATED-from-absent is the 3797 SHAPE but not necessarily its cause:
@@ -692,7 +693,7 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] == 'external_redeploy'
+        assert report[0] is ClockVerdict.EXTERNAL_REDEPLOY
 
     def test_a_created_provenance_free_stamp_fails(self, tmp_path: Path) -> None:
         before = deploy_clock_snapshot(tmp_path)
@@ -703,7 +704,7 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] == 'falsified'
+        assert report[0] is ClockVerdict.FALSIFIED
 
     def test_a_deleted_clock_always_fails(self, tmp_path: Path) -> None:
         """There is no body left to attribute, and nothing legitimate deletes a
@@ -719,7 +720,7 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] == 'falsified'
+        assert report[0] is ClockVerdict.FALSIFIED
 
     def test_a_restamp_with_identical_bytes_is_still_attributed(
         self, tmp_path: Path,
@@ -746,7 +747,7 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] == 'external_redeploy'
+        assert report[0] is ClockVerdict.EXTERNAL_REDEPLOY
 
     @pytest.mark.parametrize('token', [None, ''])
     def test_an_unstamped_session_token_fails_closed(
@@ -766,11 +767,14 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] == 'falsified'
+        assert report[0] is ClockVerdict.FALSIFIED
 
-    @pytest.mark.parametrize('token,expected', [('', 'external_redeploy'), (_THIS_SESSION, 'falsified')])
+    @pytest.mark.parametrize('token,expected', [
+        ('', ClockVerdict.EXTERNAL_REDEPLOY),
+        (_THIS_SESSION, ClockVerdict.FALSIFIED),
+    ])
     def test_a_root_names_the_absolute_file_in_both_verdicts(
-        self, tmp_path: Path, token: str, expected: str,
+        self, tmp_path: Path, token: str, expected: ClockVerdict,
     ) -> None:
         """A run guards MORE THAN ONE checkout, so a bare relpath cannot say
         which one moved — and that is as true of the benign verdict as of the
@@ -786,12 +790,15 @@ class TestDeployClockChangeReport:
 
         assert report is not None
         verdict, message = report
-        assert verdict == expected
+        assert verdict is expected
         assert str(tmp_path / _FLEET_RELPATH) in message, message
 
-    @pytest.mark.parametrize('token,expected', [('', 'external_redeploy'), (_THIS_SESSION, 'falsified')])
+    @pytest.mark.parametrize('token,expected', [
+        ('', ClockVerdict.EXTERNAL_REDEPLOY),
+        (_THIS_SESSION, ClockVerdict.FALSIFIED),
+    ])
     def test_the_fm_clock_is_attributed_identically(
-        self, tmp_path: Path, token: str, expected: str,
+        self, tmp_path: Path, token: str, expected: ClockVerdict,
     ) -> None:
         """The second protected clock, and the one the measured 2026-08-28
         instances actually pointed at — it must not be covered by inheritance
@@ -807,7 +814,7 @@ class TestDeployClockChangeReport:
 
         assert report is not None
         verdict, message = report
-        assert verdict == expected
+        assert verdict is expected
         assert str(tmp_path / _FM_RELPATH) in message, message
 
     def test_both_observed_bodies_are_printed_in_the_benign_verdict_too(
@@ -828,7 +835,7 @@ class TestDeployClockChangeReport:
 
         assert report is not None
         verdict, message = report
-        assert verdict == 'external_redeploy'
+        assert verdict is ClockVerdict.EXTERNAL_REDEPLOY
         assert '"ts": 111' in message, message
         assert '"ts": 222' in message, message
 
@@ -903,7 +910,7 @@ class TestAFalsificationIsNeverMaskedByABenignChange:
 
         assert report is not None
         verdict, message = report
-        assert verdict == 'falsified', (
+        assert verdict is ClockVerdict.FALSIFIED, (
             'a real redeploy on the fleet clock masked a self-stamped '
             f'falsification of the fm clock. report={report!r}'
         )
@@ -928,7 +935,7 @@ class TestAFalsificationIsNeverMaskedByABenignChange:
         report = self._report(tmp_path, before)
 
         assert report is not None
-        assert report[0] == 'falsified', report
+        assert report[0] is ClockVerdict.FALSIFIED, report
         assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
 
     def test_a_benign_fleet_stamp_does_not_mask_an_unattributable_fm_write(
@@ -947,7 +954,7 @@ class TestAFalsificationIsNeverMaskedByABenignChange:
         report = self._report(tmp_path, before)
 
         assert report is not None
-        assert report[0] == 'falsified', report
+        assert report[0] is ClockVerdict.FALSIFIED, report
         assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
 
     def test_a_benign_fleet_stamp_does_not_mask_a_deleted_fm_clock(
@@ -962,7 +969,7 @@ class TestAFalsificationIsNeverMaskedByABenignChange:
         report = self._report(tmp_path, before)
 
         assert report is not None
-        assert report[0] == 'falsified', report
+        assert report[0] is ClockVerdict.FALSIFIED, report
         assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
 
     def test_the_benign_verdict_survives_only_when_every_change_is_attributed(
@@ -980,7 +987,7 @@ class TestAFalsificationIsNeverMaskedByABenignChange:
 
         assert report is not None
         verdict, message = report
-        assert verdict == 'external_redeploy', report
+        assert verdict is ClockVerdict.EXTERNAL_REDEPLOY, report
         assert str(tmp_path / PROTECTED_DEPLOY_CLOCK_RELPATHS[0]) in message, message
 
     def test_a_falsified_fleet_clock_still_outranks_a_benign_fm_one(
@@ -994,7 +1001,7 @@ class TestAFalsificationIsNeverMaskedByABenignChange:
         report = self._report(tmp_path, before)
 
         assert report is not None
-        assert report[0] == 'falsified', report
+        assert report[0] is ClockVerdict.FALSIFIED, report
         assert str(tmp_path / _FLEET_RELPATH) in report[1], report[1]
 
     def test_the_public_wrapper_is_not_maskable_either(

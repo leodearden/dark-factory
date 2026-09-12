@@ -266,6 +266,7 @@ together by
 from __future__ import annotations
 
 import contextlib
+import enum
 import json
 import math
 import os
@@ -688,24 +689,43 @@ def _describe_clock_entry(entry: tuple[bytes, int] | None) -> str:
     return f'{text!r} st_mtime_ns={mtime_ns}'
 
 
+class ClockVerdict(enum.Enum):
+    """What a changed protected clock is attributed to.
+
+    A member, not a string, because both values are BRANCH KEYS — the fixture
+    and :func:`deploy_clock_violation_reason` each select their whole behaviour
+    by comparing one, and a mistyped literal would silently pick the other path
+    with nothing to catch it (docs/code-quality.md heuristic 12).  A mistyped
+    member raises instead.  ``_clock_change_kind`` deliberately stays a plain
+    string: its value is only ever concatenated into prose.
+
+    :func:`deploy_clock_change_report` is the sole producer and states what each
+    verdict means and which inputs reach it.
+    """
+
+    FALSIFIED = 'falsified'
+    EXTERNAL_REDEPLOY = 'external_redeploy'
+
+
 def deploy_clock_change_report(
     before: dict[str, tuple[bytes, int] | None],
     after: dict[str, tuple[bytes, int] | None],
     *,
     session_token: str | None,
     root: str | os.PathLike[str] | None = None,
-) -> tuple[str, str] | None:
+) -> tuple[ClockVerdict, str] | None:
     """Attribute the changed protected clocks, or ``None`` if none changed.
 
-    Returns ``(verdict, message)``, where *verdict* is:
+    Returns ``(verdict, message)``, where *verdict* is a
+    :class:`ClockVerdict`:
 
-    ``'falsified'``
+    :attr:`ClockVerdict.FALSIFIED`
         The change cannot be attributed to anything but this run, or cannot be
         attributed at all.  This is the DEFAULT — today's behaviour, unchanged —
         and it covers a provenance-free (pre-4823) body, an unparseable one, a
         DELETED file, a missing *session_token*, a stamp carrying THIS session's
         token, and a stamp carrying some other pytest session's token.
-    ``'external_redeploy'``
+    :attr:`ClockVerdict.EXTERNAL_REDEPLOY`
         A provenance-aware writer stamped the clock with an EMPTY session token,
         i.e. no pytest session was an ancestor of the write.  A REAL fleet or
         component redeploy straddled this run; the run is not at fault.
@@ -733,10 +753,11 @@ def deploy_clock_change_report(
     run must not become the arbiter of another run's bug on the strength of a
     token it cannot verify.
 
-    PRECEDENCE: ``'falsified'`` anywhere outranks ``'external_redeploy'``
-    anywhere, so EVERY protected relpath is inspected before a benign verdict is
-    returned.  Among changes of the SAME verdict the first in
-    :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS` order is reported.
+    PRECEDENCE: :attr:`~ClockVerdict.FALSIFIED` anywhere outranks
+    :attr:`~ClockVerdict.EXTERNAL_REDEPLOY` anywhere, so EVERY protected relpath
+    is inspected before a benign verdict is returned.  Among changes of the SAME
+    verdict the first in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS` order is
+    reported.
 
     That is not a tie-break detail, it is the whole contract: the benign reading
     is an exemption for the RUN's innocence, and one clock being provably
@@ -767,7 +788,7 @@ def deploy_clock_change_report(
     :func:`deploy_clock_guard_roots`), so a bare relpath leaves the reader unable
     to tell which one moved.
     """
-    benign: tuple[str, str] | None = None
+    benign: tuple[ClockVerdict, str] | None = None
     for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
         before_entry, after_entry = before.get(relpath), after.get(relpath)
         kind = _clock_change_kind(before_entry, after_entry)
@@ -787,7 +808,7 @@ def deploy_clock_change_report(
             # reported one stays first in protected order.
             if benign is None:
                 benign = (
-                    'external_redeploy',
+                    ClockVerdict.EXTERNAL_REDEPLOY,
                     _external_redeploy_message(
                         where, kind, observed,
                         provenance[CLOCK_PROVENANCE_SOURCE_KEY],
@@ -795,7 +816,7 @@ def deploy_clock_change_report(
                 )
             continue
         return (
-            'falsified',
+            ClockVerdict.FALSIFIED,
             _falsified_message(
                 relpath, where, kind, observed, provenance, session_token,
             ),
@@ -919,13 +940,13 @@ def deploy_clock_violation_reason(
 ) -> str | None:
     """Explain which protected deploy clock the run falsified, or ``None``.
 
-    The ``'falsified'``-only half of :func:`deploy_clock_change_report`, which is
-    the attributing entry point and the one the fixture calls — a change this
-    function passes over is not necessarily unchanged, it may have been
-    attributed to a REAL redeploy.  Kept at its original three-argument
-    signature, so the session token can only come from the ambient
-    :data:`PYTEST_SESSION_TOKEN_ENV`, which is exactly where every spawner picks
-    it up.
+    The :attr:`~ClockVerdict.FALSIFIED`-only half of
+    :func:`deploy_clock_change_report`, which is the attributing entry point and
+    the one the fixture calls — a change this function passes over is not
+    necessarily unchanged, it may have been attributed to a REAL redeploy.  Kept
+    at its original three-argument signature, so the session token can only come
+    from the ambient :data:`PYTEST_SESSION_TOKEN_ENV`, which is exactly where
+    every spawner picks it up.
 
     Reports the FIRST offending relpath in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`
     order, what happened to it, the before/after readings actually observed, and
@@ -944,7 +965,7 @@ def deploy_clock_violation_reason(
         session_token=os.environ.get(PYTEST_SESSION_TOKEN_ENV),
         root=root,
     )
-    if report is None or report[0] != 'falsified':
+    if report is None or report[0] is not ClockVerdict.FALSIFIED:
         return None
     return report[1]
 
@@ -1024,7 +1045,7 @@ def _df_deploy_clocks_unwritten():
             if report is None:
                 continue
             verdict, message = report
-            if verdict == 'external_redeploy':
+            if verdict is ClockVerdict.EXTERNAL_REDEPLOY:
                 warnings.warn(message, DeployClockRedeployWarning, stacklevel=1)
                 continue
             pytest.fail(message, pytrace=False)
