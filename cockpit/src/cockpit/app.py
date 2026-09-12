@@ -50,6 +50,7 @@ from textual.css.query import NoMatches
 from textual.widgets import DataTable
 
 from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
+from cockpit.clipboard import CopyAttempt, copy_to_system_clipboard
 from cockpit.panes.decision_queue import (
     DecisionQueue,
     QueueItem,
@@ -191,6 +192,7 @@ class CockpitApp(App):
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
         spawn_script: Path | str | None = None,
+        copy_runner: Callable[[str], CopyAttempt] | None = None,
         priorities: Priorities | None = None,
         **kwargs,
     ) -> None:
@@ -206,6 +208,7 @@ class CockpitApp(App):
         }
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
+        self._copy_runner = copy_runner if copy_runner is not None else copy_to_system_clipboard
         self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
         # Logged at DEBUG (not WARNING -- this is routine, not a fault) so a
         # deployment that sets $CLAUDE_FLEET_ROOT can confirm which
@@ -1035,9 +1038,16 @@ class CockpitApp(App):
         work in the running cockpit -- this is the in-app replacement.
         Mirrors action_drop/action_defer's highlighted-row lookup exactly
         (fail-soft: no highlighted row, or a key not present in the
-        last-built queue, no-ops). Delegates to Textual's own
-        App.copy_to_clipboard, which writes an OSC 52 escape sequence --
-        terminal-native, works over SSH, no xclip/wl-copy subprocess.
+        last-built queue, no-ops).
+
+        A LOCAL clipboard helper (wl-copy/xclip/xsel, via
+        cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard) is tried
+        first; OSC 52 is the fallback for when no local helper can reach a
+        clipboard, which is the over-SSH case. Task 2517 shipped the OSC 52
+        leg alone, and that is a measured total no-op on Konsole 23.08.5:
+        the operator pressed 'y', nothing reached the clipboard, and nothing
+        said so (task 5448).
+
         Strictly READ-ONLY: never calls set_manual_boost/
         update_decision_state, preserving the pure-consumer write-
         discipline invariant (see TestCopyAction).
@@ -1049,7 +1059,7 @@ class CockpitApp(App):
         item = self._queue_items_by_key.get(key)
         if item is None:
             return
-        self.copy_to_clipboard(format_copy_payload(item))
+        self._copy_runner(format_copy_payload(item))
 
     def action_new_session(self) -> None:
         """'n' -- push the spawn bar's project/role/prompt picker (PRD §9 C5b).
