@@ -1866,6 +1866,182 @@ class TestZeroOutputBreakerBatchReset:
         assert curator._zero_output_breaker_open_until is None
 
 
+class TestDegradedStreakBatchReset:
+    """RED (task 4448): a successful MULTI-ITEM batch LLM call must break the
+    degraded streak too, not just the single-item curate() path.
+
+    What the streak asserts is 'nothing has worked lately'. A completed batch
+    round-trip disproves that for the whole service, exactly as it disproves a
+    wedged backend for the consecutive-ZOT counter (task 4143, whose reset sits
+    immediately above this one in _call_llm_batch). Without it, size-1 bisect
+    and serial-fallback degradations accumulate across an unbounded number of
+    healthy BATCH calls in a batch-dominant deployment, until the alarm fires a
+    severity='blocking' L1 escalation whose text — 'every candidate in that run
+    was filed without dedupe' — is simply false.
+    """
+
+    def _zot_result(self) -> AgentResult:
+        return AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+            proc_tree='<pgid tree>', account_name='max-g',
+        )
+
+    def _healthy_batch_result(self, n: int) -> AgentResult:
+        return AgentResult(
+            success=True, output='', cost_usd=0.03,
+            structured_output={'decisions': [
+                {'candidate_index': i, 'action': 'create', 'justification': 'ok'}
+                for i in range(n)
+            ]},
+        )
+
+    @staticmethod
+    def _curator_with_escalator():
+        config = _make_config()
+        config.curator.degraded_streak_threshold = 5
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+        return curator, escalator
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_resets_degraded_streak(self):
+        """(1) A successful _call_llm_batch call clears counter AND latch."""
+        curator, _escalator = self._curator_with_escalator()
+
+        # Seed a streak that has already fired, so this pins both halves of
+        # the reset: a counter cleared but a latch left armed would silence
+        # the NEXT outage entirely.
+        curator._consecutive_degraded = 3
+        curator._degraded_alarm_fired = True
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_degraded == 0
+        assert curator._degraded_alarm_fired is False
+
+    @pytest.mark.asyncio
+    async def test_healthy_batches_between_degradations_do_not_fire_alarm(self):
+        """(2) The production symptom end to end: four size-1 degradations,
+        twenty healthy batch round-trips, one more degradation. A service doing
+        twenty successful batch curations is not down, so the alarm must stay
+        silent and the streak must read 1, not 5."""
+        curator, escalator = self._curator_with_escalator()
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+
+        # A DISTINCT title per curate() call: identical titles hash to the same
+        # payload and the idempotency cache serves call 2..N from call 1's
+        # decision, so no later arm is ever entered and the streak never grows.
+        async def degrade(i: int):
+            return await curator.curate(
+                CandidateTask(title=f'Deg{i}'), project_id='p', project_root='/x',
+            )
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch.object(curator, '_call_llm',
+                          side_effect=RuntimeError('llm down')), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            for i in range(4):
+                await degrade(i)
+            assert curator._consecutive_degraded == 4
+
+            for _ in range(20):
+                await curator._call_llm_batch(
+                    candidates=[CandidateTask(title='B1'), CandidateTask(title='B2')],
+                    pools=[[], []],
+                    pool_sizes_list=[empty_sizes, empty_sizes],
+                    start=0.0,
+                    project_id='p',
+                    project_root='/x',
+                )
+
+            await degrade(4)
+
+        escalator.report_consecutive_degraded.assert_not_awaited()
+        assert curator._consecutive_degraded == 1
+
+    @pytest.mark.asyncio
+    async def test_healthy_batch_through_curate_batch_prepared_resets_streak(self):
+        """(3) Same reset, proven through the real production entry point
+        (curate_batch_prepared → _call_llm_batch_with_fallback → _call_llm_batch)
+        rather than the private method directly."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        curator, _escalator = self._curator_with_escalator()
+        curator._consecutive_degraded = 3
+        curator._degraded_alarm_fired = True
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        c1 = CandidateTask(title='Prepared candidate Gamma', description='gamma task details')
+        c2 = CandidateTask(title='Prepared candidate Delta', description='delta task details')
+        prepared = [
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+            PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+        ]
+
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_degraded == 0
+        assert curator._degraded_alarm_fired is False
+
+    @pytest.mark.asyncio
+    async def test_failed_batch_does_not_reset_degraded_streak(self):
+        """(4) Placement guard — GREEN before and after the fix. A batch that
+        raises must leave the streak alone, pinning the reset INSIDE the success
+        branch: hoisted above the `if not agent_result.success: raise`, a wedged
+        backend's own failed batches would clear the streak they cause and the
+        alarm could never fire from the batch-dominant path at all."""
+        curator, _escalator = self._curator_with_escalator()
+        curator._consecutive_degraded = 3
+        curator._degraded_alarm_fired = True
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        zot = self._zot_result()
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=zot)), \
+             pytest.raises(CuratorFailureError):
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert curator._consecutive_degraded == 3
+        assert curator._degraded_alarm_fired is True
+
+
 class TestCurateHappyPath:
     @pytest.mark.asyncio
     async def test_create_flows_through_llm(self):
