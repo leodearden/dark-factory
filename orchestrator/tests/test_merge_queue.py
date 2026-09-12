@@ -10046,7 +10046,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         """
         branch = 'tip-carry-reverify'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
 
         branch_wt, ORIGINAL_TIP, base_main, req = await self._setup_overlap_branch(
             git_ops, branch, config,
@@ -10086,13 +10086,8 @@ class TestMergedBranchTipCarryThroughRebuild:
             captured_equiv_kw.update(kwargs)
             return []  # always clean so outcome proceeds to 'done'
 
-        passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=passing),
-            ),
             patch(
                 'orchestrator.merge_queue._reverify_rebased_tree',
                 AsyncMock(return_value=None),  # gate cleared (disjoint/green)
@@ -10140,7 +10135,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         """
         branch = 'tip-carry-drift'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
 
         branch_wt, ORIGINAL_TIP, base_main, req = await self._setup_overlap_branch(
             git_ops, branch, config,
@@ -10183,13 +10178,8 @@ class TestMergedBranchTipCarryThroughRebuild:
             cwd=git_ops.project_root,
         )
 
-        passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=passing),
-            ),
             patch(
                 'orchestrator.merge_queue._reverify_rebased_tree',
                 AsyncMock(return_value=None),  # gate cleared
@@ -10238,7 +10228,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         """
         branch = 'tip-carry-cas'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
 
         # Simple branch; no overlap needed (advance_main is mocked).
         branch_wt = (await git_ops.create_worktree(branch)).path
@@ -10288,13 +10278,8 @@ class TestMergedBranchTipCarryThroughRebuild:
                 return AdvanceOutcome('cas_failed')
             return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
 
-        passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=passing),
-            ),
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=base_sha)),
             # Eliminate term-1 so only term-2 (merged_branch_tip) can provide the tip.
@@ -10376,7 +10361,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         """
         branch = 'field-carry-reverify'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
 
         branch_wt, ORIGINAL_TIP, base_main, req = await self._setup_overlap_branch(
             git_ops, branch, config,
@@ -10417,13 +10402,8 @@ class TestMergedBranchTipCarryThroughRebuild:
             captured.append(rebuilt)
             return rebuilt
 
-        passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=passing),
-            ),
             patch(
                 'orchestrator.merge_queue._reverify_rebased_tree',
                 AsyncMock(return_value=None),  # gate cleared (disjoint or green re-verify)
@@ -10457,7 +10437,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         """
         branch = 'field-carry-cas'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
 
         branch_wt = (await git_ops.create_worktree(branch)).path
         (branch_wt / 'tip_carry_c2.py').write_text('tip_c2 = 1\n')
@@ -10516,13 +10496,8 @@ class TestMergedBranchTipCarryThroughRebuild:
                 return AdvanceOutcome('cas_failed')
             return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
 
-        passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=passing),
-            ),
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=new_main_sha)),
             # Eliminate term-1 so an unrelated merged_branch_tip regression
@@ -13257,7 +13232,7 @@ class TestSpeculationRaceRetry:
         branch = 'race-retry-ok'
         worktree = await _make_branch_with_file(git_ops, branch, 'race_ok.py', 'x = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         req = _make_request('race-retry', branch, worktree, config)
 
         real_merge_to_main = git_ops.merge_to_main
@@ -13281,10 +13256,9 @@ class TestSpeculationRaceRetry:
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
         actual_main = await git_ops.get_main_sha()
 
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            _mock_verify_pass(),
-        ), caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
             item = await worker._remerge(req, None)
 
         # merge_to_main must have been called exactly twice
@@ -13311,11 +13285,7 @@ class TestSpeculationRaceRetry:
         assert item.merge_result.success
 
         # _verify_and_advance must land the branch on main
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            _mock_verify_pass(),
-        ):
-            advanced = await drive_verify_and_advance(worker, item)
+        advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced is True
         outcome = req.result.result()
@@ -22552,12 +22522,11 @@ class TestSpeculationPermitLeakOnMergerError:
             return await original_merge(worktree, branch, **kwargs)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
         with (
             patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             req_n = _make_request('leak-wm-n', 'leak-wm-n', wt_n, config)
             req_n1 = _make_request('leak-wm-n1', 'leak-wm-n1', wt_n1, config)
@@ -22587,15 +22556,14 @@ class TestSpeculationPermitLeakOnMergerError:
         # No-deadlock: N+2 and N+3 must both resolve (merged + verified) after the permit
         # is released.  Against current code the merger blocks at the look-ahead acquire
         # after putting N+2 on the verifier queue, so N+3 hangs.
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            req_n2 = _make_request('leak-wm-n2', 'leak-wm-n2', wt_n2, config)
-            req_n3 = _make_request('leak-wm-n3', 'leak-wm-n3', wt_n3, config)
-            await queue.put(req_n2)
-            await queue.put(req_n3)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
-            outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
-            assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
-            assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
+        req_n2 = _make_request('leak-wm-n2', 'leak-wm-n2', wt_n2, config)
+        req_n3 = _make_request('leak-wm-n3', 'leak-wm-n3', wt_n3, config)
+        await queue.put(req_n2)
+        await queue.put(req_n3)
+        outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+        outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+        assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
+        assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
 
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
@@ -22627,12 +22595,11 @@ class TestSpeculationPermitLeakOnMergerError:
             return await original_merge(worktree, branch, **kwargs)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
         with (
             patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             req_n = _make_request('leak-ex-n', 'leak-ex-n', wt_n, config)
             req_n1 = _make_request('leak-ex-n1', 'leak-ex-n1', wt_n1, config)
@@ -22654,15 +22621,14 @@ class TestSpeculationPermitLeakOnMergerError:
             'merger will deadlock on next request'
         )
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            req_n2 = _make_request('leak-ex-n2', 'leak-ex-n2', wt_n2, config)
-            req_n3 = _make_request('leak-ex-n3', 'leak-ex-n3', wt_n3, config)
-            await queue.put(req_n2)
-            await queue.put(req_n3)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
-            outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
-            assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
-            assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
+        req_n2 = _make_request('leak-ex-n2', 'leak-ex-n2', wt_n2, config)
+        req_n3 = _make_request('leak-ex-n3', 'leak-ex-n3', wt_n3, config)
+        await queue.put(req_n2)
+        await queue.put(req_n3)
+        outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+        outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+        assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
+        assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
 
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
@@ -22692,7 +22658,7 @@ class TestSpeculationPermitLeakOnMergerError:
         wt_n3 = await _make_branch_with_file(git_ops, 'leak-ab-n3', 'leak_ab_n3.py', 'n3 = 4\n')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
         # Patch _request_abandoned to return True only for N+1 by task_id.
@@ -22706,15 +22672,14 @@ class TestSpeculationPermitLeakOnMergerError:
 
         worker._request_abandoned = _patched_abandoned  # type: ignore[method-assign]
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            req_n = _make_request('leak-ab-n', 'leak-ab-n', wt_n, config)
-            req_n1 = _make_request('leak-ab-n1', 'leak-ab-n1', wt_n1, config)
-            await queue.put(req_n)
-            await queue.put(req_n1)
+        req_n = _make_request('leak-ab-n', 'leak-ab-n', wt_n, config)
+        req_n1 = _make_request('leak-ab-n1', 'leak-ab-n1', wt_n1, config)
+        await queue.put(req_n)
+        await queue.put(req_n1)
 
-            # N completes normally; N+1 is abandoned (future never resolved — don't await).
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
-            assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
+        # N completes normally; N+1 is abandoned (future never resolved — don't await).
+        outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+        assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
 
         # Yield several event-loop ticks so the merger processes N+1's abandonment.
         for _ in range(10):
@@ -22730,15 +22695,14 @@ class TestSpeculationPermitLeakOnMergerError:
         # No-deadlock: N+2 and N+3 must both resolve.
         # Against current code: the merger blocks at the look-ahead acquire after
         # putting N+2 on the verifier queue, so N+3 hangs forever.
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            req_n2 = _make_request('leak-ab-n2', 'leak-ab-n2', wt_n2, config)
-            req_n3 = _make_request('leak-ab-n3', 'leak-ab-n3', wt_n3, config)
-            await queue.put(req_n2)
-            await queue.put(req_n3)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
-            outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
-            assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
-            assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
+        req_n2 = _make_request('leak-ab-n2', 'leak-ab-n2', wt_n2, config)
+        req_n3 = _make_request('leak-ab-n3', 'leak-ab-n3', wt_n3, config)
+        await queue.put(req_n2)
+        await queue.put(req_n3)
+        outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+        outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+        assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
+        assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
 
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
