@@ -32,6 +32,36 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/"
 # BASIS FOR 7200: ~1.6x headroom over the ~4400s loaded extrapolation from
 # task 4176's contended run.
 #
+# WARM-ONLY REMEDY, DELIBERATELY — do not read the value below as covering a
+# cold verify. Per verify._resolve_verify_timeout's cascade an unset module
+# cold knob does NOT inherit the warm budget: a COLD verify of this module
+# falls through to the repo-root verify_cold_command_timeout_secs (5400),
+# which is BELOW the 7200 declared here and only ~2% above the 5288s worst
+# observed green WARM run. A cold run also pays verify_cold_preprovision_
+# command (`uv sync --all-packages && npm ci ...`) and unwarmed caches on top,
+# so it is strictly COSTLIER than the warm path it already cannot reliably
+# fit. THE CONSEQUENCE, STATED RATHER THAN LEFT FOR A READER TO DISCOVER: the
+# false-infra_timeout mode esc-4211-6 documents REMAINS LIVE ON THE COLD LANE
+# after this change. Not fixed here by choice — a cold budget is a second
+# number needing its own basis, and task 3353's scope D (the measured
+# distribution that refines this whole block) is where the cold lane belongs.
+# The 5400s fall-through is pinned exactly as it stands by assertion (f) of
+# the guard named below, which is also the assertion to update if a cold
+# budget is ever declared here.
+#
+# COUNT THE RETRIES — the wall clock a genuine hang costs is a MULTIPLE of
+# 7200, not 7200. config.verify_timeout_retries defaults to 2
+# (orchestrator/src/orchestrator/defaults.yaml; dark-factory-orchestrator.yaml
+# does not override it) and verify.py's attempt loop re-runs a PURE TIMEOUT
+# failure — it breaks only on `attempt.passed or not
+# attempt.pure_timeout_failure or retries >= max_retries`. So on the TASK path
+# a real hang here now burns up to 3 x 7200s = ~6 hours before it surfaces,
+# against ~3 hours at the old 3600s ceiling. That is the price of removing the
+# false timeouts, written down because an operator would act on it; the
+# MERGE-verify and background-sweep paths pass max_retries=0, so on those the
+# bound is a single 7200s. Full statement of this mechanism lives ONCE, in
+# shared/orchestrator.yaml paragraph (4a).
+#
 # GATED BY tests/scripts/test_module_verify_budgets.py::
 # test_module_carries_its_own_measured_verify_budget[orchestrator].
 verify_command_timeout_secs: 7200
