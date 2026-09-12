@@ -60,11 +60,13 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, fails, passes
 
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import (
     CapPermit,
@@ -253,9 +255,86 @@ def _ephemeral_merge_wt(git_ops: GitOps, tag: str) -> Path:
     return git_ops.worktree_base / f'_merge-{tag}'
 
 
-def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+class _TipVerifier(FakeVerifier):
+    """The lane's verify port, scripted the way δ's scenes need it.
+
+    Injected through ``MergeLane(..., verifier=...)``, so the REAL
+    ``_run_post_merge_verify`` runs — disk guard, dispatcher, flake recorder
+    and the ``merge_verify`` event this module's transcript reads — while the
+    VERDICT comes from here.
+
+    *green* is the standing verdict.  *script* overrides it for as many
+    verifies as it holds, consumed IN ORDER — not keyed by task id, because a
+    deferred head is re-verified on a later round and legitimately gets a
+    different verdict each time.  *error* makes the verify blow up instead,
+    which is the third exit — the one that stays NON-adopting under δ
+    (merge_queue.py:18623); it propagates, because ``dispatch`` catches only
+    ``RunnerUnavailable`` (verify_runner.py:2172-2189).
+
+    *park* names task ids whose verify NEVER RETURNS — the shape a live head
+    has while the speculative slot verifies the chain tip, and the only way to
+    exercise a head that has already been WARM-SWAPPED but has no verdict.
+    *parked*, when given, is set the moment such a call is entered, so a test
+    can wait for the swap to have happened rather than sleeping for it.  The
+    park is ONE-SHOT per task id, deliberately: only the in-flight verify δ
+    tears down is unfinished — a later verify for the same task (the
+    post-rebase gate, say) really does return, and parking it too would hang
+    the CAS retry loop this module exists to exercise.
+    """
+
+    def __init__(
+        self, *,
+        green: bool = True,
+        script: list[bool] | None = None,
+        error: BaseException | None = None,
+        park: set[str] | None = None,
+        parked: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+        self.green = green
+        self.script = list(script or ())
+        self.error = error
+        self.park = set(park or ())
+        self.parked = parked
+        self._parked_once: set[str] = set()
+
+    async def run_scoped(self, worktree, config, module_configs, task_files=None, **options):
+        task_id = options.get('task_id')
+        self.verified.append(task_id)
+        self.calls.append({'task_id': task_id, 'worktree': worktree})
+        if task_id in self.park and task_id not in self._parked_once:
+            self._parked_once.add(task_id)
+            if self.parked is not None:
+                self.parked.set()
+            await asyncio.Event().wait()  # never completes: δ's teardown ends it
+        if self.error is not None:
+            raise self.error
+        green = self.script.pop(0) if self.script else self.green
+        return (passes() if green else fails(category='', summary='tip is red')).result
+
+
+def _make_worker(
+    git_ops: GitOps,
+    *,
+    verifier: FakeVerifier | None = None,
+    event_store: EventStore | None = None,
+    queue: asyncio.Queue | None = None,
+) -> SpeculativeMergeWorker:
+    """Build a bare MergeLane for unit tests (no harness wiring).
+
+    The verify port is a fake by DEFAULT, so no scene in this module can reach
+    a real verify even if it forgets to script one.  *queue* and *event_store*
+    are the test's own: holding them is what lets a scene enqueue through the
+    real ``enqueue_merge_request`` chokepoint and read the events the lane
+    published, without reaching into the worker for either.
+    """
+    return MergeLane(
+        git_ops,
+        asyncio.Queue() if queue is None else queue,
+        event_store=event_store,
+        verifier=_TipVerifier() if verifier is None else verifier,
+    )
 
 
 # ── public observation helpers (the lane's own snapshot()) ───────────────────
@@ -415,16 +494,6 @@ def _fake_pass_runner(name: str = 'fake-runner'):
     return fake
 
 
-def _fail_verify_result():
-    """A failing :class:`VerifyResult` — a RED tip verdict."""
-    from orchestrator.verify import VerifyResult
-
-    return VerifyResult(
-        passed=False, test_output='tip is red', lint_output='', type_output='',
-        summary='fail', category='',
-    )
-
-
 # ── dispatch-scene spies (cloned from test_merge_queue_deep_dispatch.py) ─────
 
 
@@ -440,51 +509,6 @@ async def _merge_commit_off_main(repo: Path, branch: str, label: str) -> str:
     sha = await _rev_parse(repo)
     await _run(['git', 'checkout', 'main'], cwd=repo)
     return sha
-
-
-def _spy_post_merge_verify(
-    monkeypatch, outcome=None, *, raises=None,
-    park: set[str] | None = None,
-    parked: asyncio.Event | None = None,
-) -> list[dict]:
-    """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
-
-    ``outcome=None`` is a PASS in this function's vocabulary; a
-    :class:`VerifyResult` is a FAIL.  *raises* makes the verify blow up
-    instead, which is the third exit — the one that stays NON-adopting under δ
-    (merge_queue.py:18623).
-
-    *park* names task ids whose verify NEVER RETURNS — the shape a live head
-    has while the speculative slot verifies the chain tip, and the only way to
-    exercise a head that has already been WARM-SWAPPED but has no verdict.
-    *parked*, when given, is set the moment such a call is entered, so a test
-    can wait for the swap to have happened rather than sleeping for it.
-
-    The park is ONE-SHOT per task id, deliberately: only the in-flight verify δ
-    tears down is unfinished.  A later call for the same task — the post-rebase
-    ``_reverify_rebased_tree`` gate, say — is a fresh verify that really does
-    return, and parking it too would hang the CAS retry loop this module exists
-    to exercise.
-    """
-    calls: list[dict] = []
-    parked_once: set[str] = set()
-
-    async def _recording(git_ops, req, merge_wt, **kwargs):
-        calls.append({'task_id': req.task_id, 'merge_wt': merge_wt, **kwargs})
-        if park is not None and req.task_id in park and req.task_id not in parked_once:
-            parked_once.add(req.task_id)
-            if parked is not None:
-                parked.set()
-            # Never completes on its own: δ's teardown is what ends it.
-            await asyncio.Event().wait()
-        if raises is not None:
-            raise raises
-        return outcome
-
-    monkeypatch.setattr(
-        'orchestrator.merge_queue._run_post_merge_verify', _recording,
-    )
-    return calls
 
 
 def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
@@ -978,11 +1002,13 @@ class TestTipPassAdoptionSignal:
         for tid, fn in (('102', 'b.txt'), ('103', 'c.txt')):
             await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
-        worker = _make_worker(git_ops)
+        store = _CapturingEventStore()
+        worker = _make_worker(
+            git_ops, event_store=store,
+            verifier=_TipVerifier(green=passed, error=raises),
+        )
         queued = [_make_req(tid, tid, config, git_repo) for tid in ('102', '103')]
         worker._lane_buffers['normal'].extend(queued)
-        store = _CapturingEventStore()
-        worker._event_store = store
         item = _make_item(
             _make_req('101', '101', config, git_repo), head,
             _ephemeral_merge_wt(git_ops, 'adopt'),
@@ -990,11 +1016,6 @@ class TestTipPassAdoptionSignal:
         chain = await worker._deep_chain_placement(item)
         assert chain is not None and len(chain.links) == 2
 
-        _spy_post_merge_verify(
-            monkeypatch,
-            outcome=None if passed else _fail_verify_result(),
-            raises=raises,
-        )
         releases = _spy_chain_lane_release(monkeypatch)
 
         res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
@@ -1113,11 +1134,10 @@ class TestTipPassAdoptionSignal:
         for tid, fn in (('102', 'b.txt'), ('103', 'c.txt')):
             await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
-        worker = _make_worker(git_ops)
+        worker = _make_worker(git_ops, event_store=_CapturingEventStore())
         worker._lane_buffers['normal'].extend(
             _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
         )
-        worker._event_store = _CapturingEventStore()
         item = _make_item(
             _make_req('101', '101', config, git_repo), head,
             _ephemeral_merge_wt(git_ops, 'halving'),
@@ -1125,7 +1145,6 @@ class TestTipPassAdoptionSignal:
         chain = await worker._deep_chain_placement(item)
         assert chain is not None and len(chain.links) == 2
         _install(worker)
-        _spy_post_merge_verify(monkeypatch, outcome=None)
 
         await worker._run_inflight_verify(item, _local_lease(), chain=chain)
 
@@ -1246,7 +1265,7 @@ def _events_for_task(db_path: Path, task_id: str) -> list[str]:
 
 async def _prefix_scene_upto_finalize(
     git_repo: Path, tmp_path: Path, monkeypatch, *,
-    db_name: str = 'delta-walk.db', advance_hook=None, verify_outcome=None,
+    db_name: str = 'delta-walk.db', advance_hook=None, tip_green: bool = True,
 ) -> dict:
     """Build a 4-item clean chain with a green tip, stopping just BEFORE
     ``_finalize_inflight``, and return everything the assertions read.
@@ -1257,9 +1276,8 @@ async def _prefix_scene_upto_finalize(
     to :func:`_spy_advance_main`, which is how a scenario makes main move (or
     a synthetic :class:`AdvanceOutcome` appear) partway down the walk.
 
-    *verify_outcome* is ``_run_post_merge_verify``'s return value in
-    :func:`_spy_post_merge_verify`'s vocabulary — ``None`` is a PASS (a GREEN
-    tip, the adopting arm), a :class:`VerifyResult` is a FAIL.
+    *tip_green* is the verdict the injected verify port renders for the tip:
+    True is the adopting arm, False the deferring one.
 
     ``advance_main`` is NOT stubbed — it is spied PASSTHROUGH, so main really
     moves and the recorded ``expected_main`` chain can be checked against real
@@ -1285,8 +1303,11 @@ async def _prefix_scene_upto_finalize(
 
     db_path = tmp_path / db_name
     store = EventStore(db_path, 'run-delta-walk')
-    worker = _make_worker(git_ops)
-    worker._event_store = store
+    queue: asyncio.Queue = asyncio.Queue()
+    worker = _make_worker(
+        git_ops, event_store=store, queue=queue,
+        verifier=_TipVerifier(green=tip_green),
+    )
 
     # Every request goes on through the REAL enqueue chokepoint: that is
     # what registers `_on_finalized`, and `merge_finalized` has no other
@@ -1297,7 +1318,7 @@ async def _prefix_scene_upto_finalize(
     reqs: dict[str, MergeRequest] = {}
     for tid in ('101', *_DELTA_LINKS, _DELTA_TRUNCATOR):
         reqs[tid] = _make_req(tid, tid, config, git_repo)
-        await enqueue_merge_request(worker._queue, reqs[tid], store)
+        await enqueue_merge_request(queue, reqs[tid], store)
     worker._drain_queue_into_lanes()
     popped = worker._pop_next_pickable()
     assert popped is reqs['101'], 'the head must be the first pickable'
@@ -1320,7 +1341,6 @@ async def _prefix_scene_upto_finalize(
     assert chain.truncated_at == _DELTA_TRUNCATOR
     assert chain.truncated_reason == 'conflict'
 
-    _spy_post_merge_verify(monkeypatch, outcome=verify_outcome)
     # Installed AFTER `_deep_chain_placement`, deliberately: the lane the chain
     # build acquired is held across the verify and returned on the way OUT of
     # `_run_inflight_verify` (its `finally`), so a spy armed here sees exactly
@@ -1812,7 +1832,7 @@ class TestStaleCasAbortLeavesTheRestAlone:
 
         s = await _prefix_scene_upto_finalize(
             git_repo, tmp_path, monkeypatch, db_name='delta-tipfail.db',
-            verify_outcome=_fail_verify_result(),
+            tip_green=False,
         )
         worker, git_ops, reqs = s['worker'], s['git_ops'], s['reqs']
         await worker._finalize_inflight(s['entry'])
@@ -2190,13 +2210,17 @@ async def _head_and_prefix_scene(
 
     db_path = tmp_path / db_name
     store = EventStore(db_path, 'run-delta-head')
-    worker = _make_worker(git_ops)
-    worker._event_store = store
+    queue: asyncio.Queue = asyncio.Queue()
+    # GREEN tip; the park (if any) belongs to the port, not to a module patch.
+    verifier = _TipVerifier(park=park_verify_for, parked=parked)
+    worker = _make_worker(
+        git_ops, event_store=store, queue=queue, verifier=verifier,
+    )
 
     reqs: dict[str, MergeRequest] = {}
     for tid in ('100', '101', *_DELTA_LINKS, _DELTA_TRUNCATOR):
         reqs[tid] = _make_req(tid, tid, config, git_repo)
-        await enqueue_merge_request(worker._queue, reqs[tid], store)
+        await enqueue_merge_request(queue, reqs[tid], store)
     worker._drain_queue_into_lanes()
     assert worker._pop_next_pickable() is reqs['100']
     assert worker._pop_next_pickable() is reqs['101']
@@ -2252,9 +2276,6 @@ async def _head_and_prefix_scene(
     assert [tid for tid, _ in chain.links] == list(_DELTA_LINKS)
     assert chain.truncated_at == _DELTA_TRUNCATOR
 
-    pmv = _spy_post_merge_verify(               # GREEN tip
-        monkeypatch, outcome=None, park=park_verify_for, parked=parked,
-    )
     _spy_chain_lane_release(monkeypatch)
     adv = _spy_advance_main(git_ops, monkeypatch)
 
@@ -2265,7 +2286,7 @@ async def _head_and_prefix_scene(
         'head_entry': head_entry, 'head_item': head_item,
         'head_task': head_task, 'spec_item': spec_item,
         'head_lease': head_lease, 'config': config, 'store': store,
-        'pmv': pmv,
+        'verifier': verifier,
     }
     if late_head_task_factory is not None:
         # The placeholder never ran (nothing has yielded to it that could let
@@ -2848,8 +2869,8 @@ async def _adopted_warm_head_scene(
     block) and exactly what δ's ``vr is None`` adoption then has to land from.
 
     Adds ``post_verify_wt``: the worktree the head's verify is REALLY sitting
-    in, read off the verify spy rather than asserted from the config, so the
-    scene cannot silently stop swapping.
+    in, read off the verify PORT the lane called rather than asserted from the
+    config, so the scene cannot silently stop swapping.
     """
     parked = asyncio.Event()
 
@@ -2874,9 +2895,9 @@ async def _adopted_warm_head_scene(
         parked=parked,
         late_head_task_factory=_real_head_verify,
     )
-    head_calls = [c for c in s['pmv'] if c['task_id'] == '100']
+    head_calls = [c for c in s['verifier'].calls if c['task_id'] == '100']
     assert len(head_calls) == 1, 'the head verify must have reached the park'
-    post_verify_wt = head_calls[0]['merge_wt']
+    post_verify_wt = head_calls[0]['worktree']
     assert post_verify_wt is not None
     assert post_verify_wt != s['head_item'].merge_wt, (
         'staging check: the warm swap must actually have swapped, or every '
@@ -3664,15 +3685,15 @@ class _DeltaScene:
         cannot produce a second merge commit.
     """
 
-    def __init__(self, git_ops, config, worker, repo, store, db_path) -> None:
+    def __init__(self, git_ops, config, worker, repo, store, db_path, queue) -> None:
         self.git_ops = git_ops
         self.config = config
         self.worker = worker
         self.repo = repo
         self.store = store
         self.db_path = db_path
+        self.queue = queue
         self.calls: list[dict] = []
-        self.posted: list[dict] = []
         self.built: list[dict] = []
         self.lane_releases: list[tuple] = []
         self.reqs: dict[str, MergeRequest] = {}
@@ -3691,9 +3712,7 @@ class _DeltaScene:
 
         for tid in task_ids:
             self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)
-            await enqueue_merge_request(
-                self.worker._queue, self.reqs[tid], self.store,
-            )
+            await enqueue_merge_request(self.queue, self.reqs[tid], self.store)
         self.worker._drain_queue_into_lanes()
 
     async def round_(
@@ -3765,9 +3784,12 @@ async def _make_delta_scene(
         await _create_branch_editing(repo, f'task/{tid}', f'f{tid}.txt', f'edit-{tid}\n')
     db_path = tmp_path / db_name
     store = EventStore(db_path, f'run-{db_name}')
-    worker = _make_worker(git_ops)
-    worker._event_store = store
-    scene = _DeltaScene(git_ops, config, worker, repo, store, db_path)
+    queue: asyncio.Queue = asyncio.Queue()
+    worker = _make_worker(
+        git_ops, event_store=store, queue=queue,
+        verifier=_TipVerifier(script=script),
+    )
+    scene = _DeltaScene(git_ops, config, worker, repo, store, db_path, queue)
     await scene.enqueue((*heads, *_DELTA_E2E_FOLLOWERS))
 
     # The round recorder, installed ONCE — re-wrapping per round would capture
@@ -3795,14 +3817,6 @@ async def _make_delta_scene(
 
     monkeypatch.setattr(merge_queue, 'build_chain', _recording_build)
 
-    verdicts = list(script)
-
-    async def _oracle(_git_ops, _req, merge_wt, **kwargs):
-        scene.posted.append({'merge_wt': merge_wt, **kwargs})
-        passed = verdicts.pop(0) if verdicts else True
-        return None if passed else _fail_verify_result()
-
-    monkeypatch.setattr('orchestrator.merge_queue._run_post_merge_verify', _oracle)
     return scene
 
 
@@ -3868,7 +3882,9 @@ class TestDeepLandingEndToEnd:
         # literal 1); `_run_inflight_verify` recomputes it from the chain it was
         # handed (:17588), which is what reaches η1's `merge_verify` row.
         assert rec['chain_items'] == 1
-        assert len(scene.posted) == 1, 'ONE verify paid for the whole prefix'
+        assert len(_event_rows(scene.db_path, 'merge_verify')) == 1, (
+            'ONE verify paid for the whole prefix'
+        )
 
         landed = ['101', *[tid for tid, _ in chain.links]]
         for tid in landed:
