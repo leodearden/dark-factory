@@ -65,11 +65,19 @@ flag_types and unrelated recon prose, rather than asserting on this comment.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
 )
+
+# The canonical ``data`` -> ``memory`` -> ``content`` raw-payload key fallback.
+# IMPORTED rather than re-spelled, exactly as ``server/grouped_read.py`` does:
+# a scroll payload and a search item do not put the text under the same key,
+# which is why guessing one is wrong, and a second copy of the order would be
+# one more place for the two to drift (INV-5).
+from fused_memory.services.memory_service import _mem0_content
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +87,9 @@ __all__ = [
     'STRANDED_ACTION_TARGET_FAMILY',
     'STRANDED_ACTION_VERB_FAMILY',
     'STRANDED_FLAG_TOKEN_FAMILY',
+    'PreservationSuppressionResult',
     'cites_preservation',
+    'filter_preservation_specimen_flags',
     'flag_asserts_stranded',
 ]
 
@@ -221,4 +231,119 @@ def flag_asserts_stranded(flag: Any) -> bool:
         _contains_any(flag.get(field), STRANDED_ACTION_VERB_FAMILY)
         and _contains_any(flag.get(field), STRANDED_ACTION_TARGET_FAMILY)
         for field in _STRANDED_ACTION_FIELDS
+    )
+
+
+@dataclass(frozen=True)
+class PreservationSuppressionResult:
+    """Outcome of :func:`filter_preservation_specimen_flags`.
+
+    - ``kept_flags`` — the flags that survived, input order preserved, to be
+      assigned back to ``report.items_flagged``.
+    - ``suppressed_by_task`` — ``{task_id: count}`` of flags dropped, attributed
+      per corroborated task.  Its ``values()`` sum is the per-cycle
+      ``preservation_specimen_suppressed`` stat, and it drives the storm escape.
+    - ``citations_by_task`` — ``{task_id: citation_ref}``, the Mem0 memory id or
+      Graphiti uuid each suppression actually relied on.  A suppression is never
+      anonymous: without this, "one flag suppressed" gives an operator no way to
+      check whether the citation is real, current, or over-broad.
+    - ``unresolved_task_ids`` — tasks whose corroboration could NOT be read this
+      cycle.  Their flags were KEPT (see the fail-open policy in
+      :func:`filter_preservation_specimen_flags`), and this field is what stops
+      that keep from being byte-identical to a clean "no citation exists"
+      (INV-11).
+    """
+
+    kept_flags: list[dict[str, Any]]
+    suppressed_by_task: dict[str, int]
+    citations_by_task: dict[str, str]
+    unresolved_task_ids: tuple[str, ...]
+
+
+def _citable_preservation_row(rows: Any) -> str | None:
+    """Return the id of the first *rows* entry whose prose cites preservation.
+
+    ``None`` when no row does, when *rows* is not iterable-of-mappings, or when
+    the one row that matches carries no usable id.  That last case is deliberate
+    and mirrors ``curator_gate_resolution_sweep``'s refusal to flag a gate it
+    cannot cite: a suppression that cannot name its evidence is exactly the
+    anonymous drop ``citations_by_task`` exists to prevent.
+
+    Pure, sync, no I/O.
+    """
+    if not isinstance(rows, (list, tuple)):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        payload = row.get('metadata')
+        if not isinstance(payload, dict) or not cites_preservation(_mem0_content(payload)):
+            continue
+        row_id = row.get('id')
+        if isinstance(row_id, str) and row_id:
+            return row_id
+    return None
+
+
+# ── Orchestrator ─────────────────────────────────────────────────────────────
+
+
+async def filter_preservation_specimen_flags(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]] | None,
+    *,
+    log: logging.Logger = logger,
+) -> PreservationSuppressionResult:
+    """Drop stranded-class recon flags for tasks documented as preserved specimens.
+
+    Corroborates each candidate task against the Mem0 ``investigation_outcome``
+    channel: a deterministic ``get_memories_by_metadata`` scroll filtered on
+    ``{kind, task_id, actionable: False}``.  Qdrant ANDs equality conditions, so
+    the ``actionable: False`` term is what makes a retrieved row a RECORDED
+    not-actionable adjudication rather than any passing mention of the task.
+    Deliberately not a semantic ``search``: its top-N cutoff silently drops
+    low-similarity matches, and a silent miss here re-opens the destructive path.
+
+    Returns a :class:`PreservationSuppressionResult`; the caller assigns
+    ``kept_flags`` back to ``items_flagged``.  Suppression is NOT resolution —
+    the caller excludes suppressed flags' signatures from marker acknowledgment
+    so recurrence history survives.
+    """
+    kept: list[dict[str, Any]] = []
+    suppressed_by_task: dict[str, int] = {}
+    citations_by_task: dict[str, str] = {}
+
+    for flag in flags or ():
+        task_id = str(flag.get('task_id') or '')
+        if not task_id:
+            kept.append(flag)
+            continue
+
+        rows = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={
+                'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
+                'task_id': task_id,
+                'actionable': False,
+            },
+        )
+        citation = _citable_preservation_row(rows)
+        if citation is None:
+            kept.append(flag)
+            continue
+
+        suppressed_by_task[task_id] = suppressed_by_task.get(task_id, 0) + 1
+        citations_by_task[task_id] = citation
+        log.info(
+            'preservation_specimen_guard: suppressed flag_type=%r for task %s in '
+            'project %s — corroborated as a preserved specimen by %s',
+            flag.get('flag_type'), task_id, project_id, citation,
+        )
+
+    return PreservationSuppressionResult(
+        kept_flags=kept,
+        suppressed_by_task=suppressed_by_task,
+        citations_by_task=citations_by_task,
+        unresolved_task_ids=(),
     )
