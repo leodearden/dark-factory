@@ -1047,6 +1047,12 @@ class _GatedVerifier(FakeVerifier):
     commit is on the verifier queue and main has NOT advanced to it, which is
     the state these scenes exist to observe.  Every later verify passes
     immediately.
+
+    Only the arguments this double actually READS are named; the rest of
+    ``VerifyPort.run_scoped``'s signature travels as ``*args``/``**options`` --
+    the shape ``orchestrator/merge_lane/ports.py::ProductionVerifier`` uses
+    too -- so a port-signature change lands in the port and its one fake, not
+    in every double that wraps them.
     """
 
     def __init__(
@@ -1059,15 +1065,13 @@ class _GatedVerifier(FakeVerifier):
         self.gate_entered = gate_entered
         self._first_blocked = False
 
-    async def run_scoped(self, worktree, config, module_configs, task_files=None, **options):
+    async def run_scoped(self, *args, **options):
         if not self._first_blocked:
             self._first_blocked = True
             if self.gate_entered is not None:
                 self.gate_entered.set()
             await self.gate_release.wait()
-        return await super().run_scoped(
-            worktree, config, module_configs, task_files, **options,
-        )
+        return await super().run_scoped(*args, **options)
 
 
 @pytest.mark.asyncio

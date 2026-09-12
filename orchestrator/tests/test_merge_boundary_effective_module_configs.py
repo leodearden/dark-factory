@@ -146,7 +146,7 @@ async def _drive_merge_boundary(
     """Drive the REAL ``_run_post_merge_verify`` — the single funnel every
     production merge verify flows through.
 
-The scoped verify and the post-scoped pyright gate both come from the
+    The scoped verify and the post-scoped pyright gate both come from the
     INJECTED verify port (``verifier=``), which is also what makes this
     independent of the autouse ``_mock_merge_queue_verification`` conftest stub:
       * ``run_scoped`` -> a failing VerifyResult naming *failing_node_id*;
@@ -203,17 +203,21 @@ class _BoundaryVerifier(FakeVerifier):
     resolved, so a test reads the LOCAL consumer's set here rather than off a
     ``LocalRunner`` constructor spy.  *result* is what the scoped verify
     renders — a red naming a specific node id, for the gate scenarios.
+
+    Only the arguments this double actually READS are named; the rest of
+    ``VerifyPort.run_scoped``'s signature travels as ``*args``/``**options`` --
+    the shape ``orchestrator/merge_lane/ports.py::ProductionVerifier`` uses
+    too -- so a port-signature change lands in the port and its one fake, not
+    in every double that wraps them.
     """
 
     def __init__(self, result: VerifyResult | None = None) -> None:
         super().__init__(None if result is None else VerifyScript(result=result))
         self.module_sets: list[list[ModuleConfig]] = []
 
-    async def run_scoped(self, worktree, config, module_configs, task_files=None, **options):
+    async def run_scoped(self, worktree, config, module_configs, *args, **options):
         self.module_sets.append(list(module_configs))
-        return await super().run_scoped(
-            worktree, config, module_configs, task_files, **options,
-        )
+        return await super().run_scoped(worktree, config, module_configs, *args, **options)
 
 
 def _suppression_events(store: _FakeEventStore) -> list[tuple]:
@@ -380,7 +384,16 @@ class TestMergeBoundarySuppressionControls:
     ):
         """(i) At the shipped default the merge verify never widened past the
         task's modules, so the gate has no business reasoning about beta — the
-        merge stays blocked, no fact, streak untouched.
+        merge stays blocked and no suppression fact is emitted.
+
+        ``_suppression_events`` is what carries the streak claim in all four
+        of these controls: the emit and the INV-4 streak bump sit under ONE
+        ``if suppressed:`` branch in
+        ``orchestrator/flake_recorder.py::record_merge_flake_suppression``, so
+        an absent fact means an untouched streak.  The escalation queue cannot
+        carry it — a storm escalation fires only at the streak THRESHOLD, so a
+        regression that bumped by exactly one would still leave ``submitted``
+        empty.
         """
         mc_alpha, _mc_beta, registry = self._two_module_registry()
         store, queue = _FakeEventStore(), _FakeEscalationQueue()
@@ -394,7 +407,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert queue.submitted == [], 'nothing was suppressed, so nothing bumped'
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
     # -- (ii) empty registry: safe degrade ------------------------------------
 
@@ -414,7 +427,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert queue.submitted == [], 'nothing was suppressed, so nothing bumped'
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
     # -- (iii) a red in NO registered module: still fail-closed ---------------
 
@@ -436,7 +449,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert queue.submitted == [], 'nothing was suppressed, so nothing bumped'
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
     # -- (iv) a GENUINE red in an untouched module: never suppressed ----------
 
@@ -462,7 +475,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert queue.submitted == [], 'nothing was suppressed, so nothing bumped'
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
 
 # ---------------------------------------------------------------------------

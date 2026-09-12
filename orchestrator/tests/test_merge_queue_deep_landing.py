@@ -280,6 +280,12 @@ class _TipVerifier(FakeVerifier):
     tears down is unfinished — a later verify for the same task (the
     post-rebase gate, say) really does return, and parking it too would hang
     the CAS retry loop this module exists to exercise.
+
+    Only the arguments this double actually READS are named; the rest of
+    ``VerifyPort.run_scoped``'s signature travels as ``*args``/``**options`` --
+    the shape ``orchestrator/merge_lane/ports.py::ProductionVerifier`` uses
+    too -- so a port-signature change lands in the port and its one fake, not
+    in every double that wraps them.
     """
 
     def __init__(
@@ -299,7 +305,7 @@ class _TipVerifier(FakeVerifier):
         self.parked = parked
         self._parked_once: set[str] = set()
 
-    async def run_scoped(self, worktree, config, module_configs, task_files=None, **options):
+    async def run_scoped(self, worktree, *args, **options):
         task_id = options.get('task_id')
         self.verified.append(task_id)
         self.calls.append({'task_id': task_id, 'worktree': worktree})
@@ -3820,6 +3826,27 @@ async def _make_delta_scene(
     return scene
 
 
+def _verify_event_for(scene: _DeltaScene, merge_sha: str) -> dict:
+    """The ``merge_verify`` row the lane published for *merge_sha*.
+
+    Selected by IDENTITY, not by round index.  `scene.calls` holds one entry
+    per ``_run_inflight_verify`` call and the event table one row per verify
+    DISPATCH, so the two are index-aligned only while every round dispatches
+    exactly one verify: a round that re-verifies (a CAS retry, the
+    ``_reverify_rebased_tree`` gate) shifts the rows, and a positional read
+    would then quietly attribute another round's merge_sha / depth /
+    chain_items to this one.  Matching on the sha makes "this round verified
+    the item's OWN merge commit" a property of the LOOKUP rather than an
+    assertion a caller has to remember to read.
+    """
+    rows = [r for r in _event_rows(scene.db_path, 'merge_verify') if r['merge_sha'] == merge_sha]
+    assert rows, (
+        f'no merge_verify event carries {merge_sha}: the round did not verify '
+        f"the item's own merge commit"
+    )
+    return rows[0]
+
+
 def _delta_round_transcript(scene: _DeltaScene, idx: int) -> dict:
     """Normalise ONE round into a repo-independent, comparable transcript.
 
@@ -3829,20 +3856,18 @@ def _delta_round_transcript(scene: _DeltaScene, idx: int) -> dict:
     did the round advance main, and did anything carry δ's landing stamp.
     """
     rec = scene.calls[idx]
+    item = rec['item']
     # The round's verify is read off the event the dispatcher emits, not off a
     # stub's recorded kwargs: `merge_verify` carries merge_sha / depth /
     # chain_items (verify_runner.py:2328-2349), so the transcript is a fact
     # about what the lane published rather than about what a double captured.
-    verify = _event_rows(scene.db_path, 'merge_verify')[idx]
-    item = rec['item']
+    verify = _verify_event_for(scene, item.merge_result.merge_commit)
     outcome = rec['req'].result.result() if rec['req'].result.done() else None
     return {
         'chain': rec['chain'],
         'chain_items': verify['chain_items'],
         'depth': verify['depth'],
         'probe_base': rec['probe_base'],
-        'verified_the_items_own_merge_commit':
-            verify['merge_sha'] == item.merge_result.merge_commit,
         'result_status': rec['result'].status,
         'result_has_worktree': rec['result'].merge_wt is not None,
         'advanced': rec['advanced'],
@@ -4024,7 +4049,6 @@ class TestDeepLandingEndToEnd:
             'chain_items': 1,
             'depth': 0,
             'probe_base': None,
-            'verified_the_items_own_merge_commit': True,
             'result_status': rec['result'].status,
             'result_has_worktree': True,
             'advanced': True,
