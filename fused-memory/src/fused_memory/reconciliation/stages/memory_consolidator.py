@@ -33,11 +33,13 @@ from fused_memory.reconciliation.flag_dedup import (
     dedup_flags,
     filter_accounted_cluster_growth_flags,
     filter_already_tracked_systemic_patterns,
+    filter_entity_standing_decisions,
     filter_false_absence_flags,
     filter_stale_bulk_get_statuses_flags,
     filter_stale_count_snapshot_corrections,
     filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
+    maybe_escalate_suppression_storm,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
@@ -303,6 +305,17 @@ class MemoryConsolidator(BaseStage):
         report.stats['curator_gate_resolution_flags_emitted'] = 0
         report.stats['curator_gate_resolution_errors'] = 0
 
+        # Always present (task 2896 γ): count of recon flags suppressed this cycle
+        # by an ACTIVE entity_standing_decision (Hook A).  Overwritten below to the
+        # actual sum on a full cycle with items_flagged; stays 0 when nothing was
+        # flagged and on a remediation pass, which returns just below.  Pre-inited
+        # HERE, above that early return, rather than beside the filter it belongs to
+        # (reviewer finding correctness, amendment pass): a key set below the return
+        # is simply ABSENT from a remediation report, which is the .get(..., 0)
+        # fallback the always-present convention exists to spare consumers — and
+        # Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt.
+        report.stats['entity_standing_decision_suppressed'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
@@ -542,6 +555,47 @@ class MemoryConsolidator(BaseStage):
             report.stats['accounted_cluster_growth_flags_dropped'] = (
                 _before_accounted_cluster_growth_filter - len(report.items_flagged)
             )
+            # ── Entity-standing-decision suppression (task 2896 γ, Hook A) ────────
+            # Drop flags already adjudicated by an ACTIVE entity_standing_decision
+            # ledger row BEFORE dedup_flags so a suppressed flag never writes a
+            # stage1_flag_marker.  Whole-batch fail-open (ledger unavailable or read
+            # error → no suppression this cycle; a read failure must never hide a
+            # finding).  Suppression is NOT resolution: the dropped flags' signatures
+            # are collected here and unioned into suppressed_signatures below so they
+            # are EXCLUDED from acknowledge_resolved_flags — preserving recurrence
+            # history for when the decision is later lifted.
+            _pre_esd_flags = list(report.items_flagged)
+            _esd_result = await filter_entity_standing_decisions(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                flags=report.items_flagged,
+            )
+            report.items_flagged = _esd_result.kept_flags
+            report.stats['entity_standing_decision_suppressed'] = sum(
+                _esd_result.suppressed_by_decision.values()
+            )
+            _esd_kept_signatures = {
+                sig for f in report.items_flagged
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None
+            }
+            esd_suppressed_signatures = {
+                sig for f in _pre_esd_flags
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None and sig not in _esd_kept_signatures
+            }
+            # Per-cycle "storm escape": one active decision suppressing more than the
+            # threshold in a single cycle is a signal it may be over-broad or the
+            # entity's situation changed — file one L1 recon escalation for that
+            # entity (best-effort; deduped per entity_uuid + category). Skipped when
+            # no escalation queue is wired (nothing would consume the escalation).
+            if self._escalation_queue is not None:
+                await maybe_escalate_suppression_storm(
+                    escalation_queue=self._escalation_queue,
+                    project_id=self.project_id,
+                    run_id=run_id,
+                    result=_esd_result,
+                )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
             # drops can be isolated below and excluded from acknowledgment.
@@ -610,6 +664,12 @@ class MemoryConsolidator(BaseStage):
                 if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
                 is not None and sig not in _post_dedup_signatures
             }
+            # Fold in the entity-standing-decision drops (task 2896 γ): they are a
+            # suppression, not a resolution, so — exactly like dedup_flags' own
+            # suppression drops above — their signatures are excluded from
+            # acknowledge_resolved_flags so the persisted stage1_flag_marker (and thus
+            # recurrence history) survives until the standing decision is lifted.
+            suppressed_signatures |= esd_suppressed_signatures
             # ── Deletion guard: drop absence-type flags that cannot be confirmed absent ──
             # filter_false_absence_flags is fail-closed: keeps an absence-asserting flag
             # ONLY when get_task POSITIVELY confirms the task does not exist.  Present or
