@@ -9,8 +9,6 @@ Covers:
                  no second done-write.
   step-7  (RED)  Scan robustness — empty outbox, multi-row error isolation,
                  status-unknown fail-safe ('skipped').
-  step-9  (RED)  Harness startup wiring — Harness._reconcile_landed_outbox
-                 None-guard + delegation.
 
 Crash is simulated via an injected fault point (PRD §9, NOT a real process
 kill): the PRODUCER half seeds the outbox through the REAL
@@ -31,10 +29,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import DeliveredChecksConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.git_ops import AdvanceOutcome
-from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow
 from orchestrator.merge_queue import (
     _journal_landed_then_advance,
@@ -343,91 +339,10 @@ class TestReconcileLandedOutboxRobustness:
 
 
 # ---------------------------------------------------------------------------
-# step-9 — Harness startup wiring
-# ---------------------------------------------------------------------------
-
-
-def _build_harness(mock_orch_config) -> Harness:
-    """Construct a Harness with heavy constructors patched out.
-
-    Mirrors test_harness_orphan_merge_reaper_wiring._build_harness /
-    test_harness_merge_store_wiring's bare-harness construction helper.
-    """
-    mock_orch_config.max_concurrent_tasks = 2
-    mock_orch_config.fused_memory.project_id = 'test'
-
-    with patch('orchestrator.harness.McpLifecycle'), \
-         patch('orchestrator.harness.Scheduler'), \
-         patch('orchestrator.harness.BriefingAssembler'):
-        return Harness(mock_orch_config)
-
-
-@pytest.mark.asyncio
-class TestHarnessReconcileLandedOutboxWiring:
-    """Harness._reconcile_landed_outbox: None-guard + delegation to the module fn."""
-
-    async def test_none_worker_is_noop(self, mock_orch_config) -> None:
-        """RED until step-10 adds Harness._reconcile_landed_outbox.
-
-        Mirrors _reap_orphaned_merge_worktrees's None-guard: no worker means
-        nothing to reconcile — must not touch git_ops/scheduler.
-        """
-        h = _build_harness(mock_orch_config)
-        h._merge_worker = None
-
-        with patch(
-            'orchestrator.harness.reconcile_landed_outbox', new=AsyncMock(),
-        ) as mock_reconcile:
-            await h._reconcile_landed_outbox()
-
-        mock_reconcile.assert_not_called()
-
-    async def test_delegates_with_worker_landed_outbox_git_ops_and_scheduler(
-        self, mock_orch_config,
-    ) -> None:
-        """RED until step-10 adds Harness._reconcile_landed_outbox.
-
-        When a merge worker with a bound LandedOutbox is present, the
-        harness delegates to the module-level reconcile_landed_outbox with
-        the worker's outbox plus the harness's own git_ops/scheduler,
-        (task 2677) the harness's shared ProvenanceConflictSink, and
-        (task 3057) the three params that ARM the RC-2 delivered-checks
-        guard from live config.
-        """
-        h = _build_harness(mock_orch_config)
-        h.config.delivered_checks = DeliveredChecksConfig(
-            enabled=True, check_timeout_secs=11.0,
-        )
-        worker = MagicMock()
-        worker._landed_outbox = MagicMock()
-        h._merge_worker = worker
-
-        empty_report = {
-            'pruned_not_landed': 0, 'marked_done': 0,
-            'already_done_pruned': 0, 'skipped': 0, 'stale_conflict': 0,
-            'delivered_checks_withheld': 0, 'errors': 0,
-        }
-        with patch(
-            'orchestrator.harness.reconcile_landed_outbox',
-            new=AsyncMock(return_value=empty_report),
-        ) as mock_reconcile:
-            await h._reconcile_landed_outbox()
-
-        mock_reconcile.assert_awaited_once_with(
-            worker._landed_outbox, h.git_ops, h.scheduler,
-            provenance_conflict_sink=h._provenance_conflict_sink,
-            project_root=str(h.config.project_root),
-            check_timeout_secs=11.0,
-            delivered_checks_enabled=True,
-        )
-
-
-# ---------------------------------------------------------------------------
 # task 2677 step-9 — RC-2 done_evidence_stale: 'stale_conflict' disposition
 #
-# NOT to be confused with this file's own pre-existing "step-9" label above
-# (Harness startup wiring) — that refers to task 2155/2156's step numbering.
-# This section is task 2677's step-9: the found_on_main provenance-integrity
+# This section is task 2677's step-9 (that numbering is task 2677's own, not
+# this file's): the found_on_main provenance-integrity
 # gate (task 2674) can refuse RC-2's ``scheduler.mark_done`` with a
 # ``StaleEvidenceRejection`` when the row's ``advanced_sha`` predates a later
 # ``reopen_at``. That must route to the shared ``ProvenanceConflictSink``
@@ -992,70 +907,93 @@ class TestWrappersForwardDeliveredChecksParamsToTheRow:
     ignored for seam 8, directly contradicting the single-sourced kill-switch
     contract these functions' docstrings assert.
 
-    ``reconcile_landed_row`` is patched rather than exercised so this pins the
-    CALL, not the downstream behaviour (which the class above already covers).
+    Observed through the real chain rather than a patched
+    ``reconcile_landed_row``: the wrappers are driven end to end and the
+    forwarded value is read off the PUBLIC report. That is a stronger pin than
+    a mock's recorded kwargs — it proves the value had an EFFECT at the row,
+    not merely that it was passed along. ``delivered_checks_enabled`` is the
+    discriminator that makes it observable: ``False`` leaves the guard inert
+    with zero I/O (``marked_done``, ``get_task`` never called, row consumed),
+    ``True`` arms it (``delivered_checks_withheld``, ``get_task`` consulted,
+    row retained). ``project_root``/``check_timeout_secs`` are proven by the
+    armed case reaching the guard at all — an unarmed row never does, which
+    ``test_unarmed_caller_never_reaches_the_guard`` above pins directly.
     """
 
-    _ARMED = {
-        'project_root': '/tmp/proj',
-        'check_timeout_secs': 7.5,
-        'delivered_checks_enabled': False,
-    }
+    @staticmethod
+    def _armed(tmp_path: Path, *, enabled: bool) -> dict:
+        """The three delivered-checks params, armed at a real directory.
+
+        *project_root* must exist for the armed case to reach a real check
+        evaluation rather than dying before it; it is deliberately NOT a git
+        repo, so the declared capability cannot be confirmed and the guard
+        withholds — the disposition this class reads.
+        """
+        return {
+            'project_root': str(tmp_path),
+            'check_timeout_secs': 7.5,
+            'delivered_checks_enabled': enabled,
+        }
 
     async def test_reconcile_landed_task_forwards_all_three(
         self, tmp_path: Path,
     ) -> None:
         outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path)
-        row_fn = AsyncMock(return_value='marked_done')
 
-        with patch('orchestrator.merge_queue.reconcile_landed_row', row_fn):
-            gated = await reconcile_landed_task(
-                'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                **self._ARMED,
-            )
+        gated = await reconcile_landed_task(
+            'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+            **self._armed(tmp_path, enabled=False),
+        )
 
+        # enabled=False reached the row: the guard stayed inert with zero
+        # I/O, so the done-write went through and the row was consumed.
         assert gated is True
-        assert row_fn.await_args is not None
-        kwargs = row_fn.await_args.kwargs
-        assert kwargs['project_root'] == '/tmp/proj'
-        assert kwargs['check_timeout_secs'] == 7.5
-        assert kwargs['delivered_checks_enabled'] is False
+        scheduler.get_task.assert_not_called()
+        scheduler.mark_done.assert_awaited_once_with('Z', kind='merged', sha='ADV')
+        assert outbox.lookup('Z') is None
 
+    @pytest.mark.parametrize('enabled,disposition,consults_task,row_retained', [
+        (False, 'marked_done', False, False),
+        (True, 'delivered_checks_withheld', True, True),
+    ])
     async def test_reconcile_landed_outbox_forwards_all_three(
-        self, tmp_path: Path,
+        self, tmp_path: Path, enabled: bool,
+        disposition: str, consults_task: bool, row_retained: bool,
     ) -> None:
+        """Both settings of the kill switch must reach the row and change the
+        report. A wrapper that dropped the param would report the same
+        disposition for both rows here."""
         outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path)
-        row_fn = AsyncMock(return_value='marked_done')
 
-        with patch('orchestrator.merge_queue.reconcile_landed_row', row_fn):
-            report = await reconcile_landed_outbox(
-                outbox, git_ops, scheduler, **self._ARMED,
-            )
+        report = await reconcile_landed_outbox(
+            outbox, git_ops, scheduler, **self._armed(tmp_path, enabled=enabled),
+        )
 
-        assert report['marked_done'] == 1
-        assert row_fn.await_args is not None
-        kwargs = row_fn.await_args.kwargs
-        assert kwargs['project_root'] == '/tmp/proj'
-        assert kwargs['check_timeout_secs'] == 7.5
-        assert kwargs['delivered_checks_enabled'] is False
+        assert report[disposition] == 1, report
+        assert scheduler.get_task.called is consults_task
+        assert (outbox.lookup('Z') is not None) is row_retained
 
     async def test_unarmed_defaults_stay_byte_identical(
         self, tmp_path: Path,
     ) -> None:
         """Every pre-3057 caller passes none of the three; the wrappers must
         still forward the unarmed defaults rather than omitting them, so the
-        row function's own ``None`` guard is the single arming decision."""
-        outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path)
-        row_fn = AsyncMock(return_value='marked_done')
+        row function's own ``None`` guard is the single arming decision.
 
-        with patch('orchestrator.merge_queue.reconcile_landed_row', row_fn):
-            await reconcile_landed_task(
-                'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-            )
-            await reconcile_landed_outbox(outbox, git_ops, scheduler)
+        Observed as the absence of any guard activity: an unarmed row never
+        reads the task's metadata, so a wrapper that substituted an ARMED
+        default for the omitted params would consult ``get_task`` here.
+        """
+        for wrapper in ('task', 'outbox'):
+            (tmp_path / wrapper).mkdir()
+            outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path / wrapper)
+            if wrapper == 'task':
+                await reconcile_landed_task(
+                    'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+                )
+            else:
+                await reconcile_landed_outbox(outbox, git_ops, scheduler)
 
-        assert row_fn.await_count == 2
-        for call in row_fn.await_args_list:
-            assert call.kwargs['project_root'] is None
-            assert call.kwargs['check_timeout_secs'] is None
-            assert call.kwargs['delivered_checks_enabled'] is True
+            scheduler.get_task.assert_not_called()
+            scheduler.mark_done.assert_awaited_once_with('Z', kind='merged', sha='ADV')
+            assert outbox.lookup('Z') is None
