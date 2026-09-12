@@ -41,9 +41,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
+from orchestrator.config import OrchestratorConfig
 
 REPO_ROOT = Path(__file__).parents[2]
+
+ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 
 
 @dataclass(frozen=True)
@@ -231,3 +235,89 @@ def test_a_second_verify_env_block_is_silently_last_wins_and_is_reported(tmp_pat
     finding = findings[0]
     assert finding.key == 'verify_env'
     assert (finding.first_line, finding.duplicate_line) == (1, 4)
+
+
+def test_every_verify_env_key_declared_in_the_root_config_survives_into_the_effective_config(
+    root_config: OrchestratorConfig,
+) -> None:
+    """Nothing else in this repo reads the EFFECTIVE verify_env, and that was the gap.
+
+    Task 4635's duplicate ``verify_env:`` block was invisible precisely because
+    no test ever compared what the yaml DECLARES against what the production
+    loader ends up serving. This is that comparison, through the real loader,
+    against this worktree's own config.
+
+    KEYS ONLY, NEVER VALUES, and the distinction is load-bearing rather than
+    cautious: ``scripts/merge-pytest-n-ab-switch.sh`` legitimately flips
+    ``PYTEST_XDIST_AUTO_NUM_WORKERS`` between arms and commits the result, and
+    ``config.py::YamlSettingsSource._expand_env_vars`` rewrites any ``${VAR}``
+    value between file and effective config — so a value pin would go red on a
+    sanctioned operator action. A whole entry VANISHING is exactly where the
+    duplicate-key defect bites, and keys are what catch it.
+
+    A SUPERSET, not an equality, for the same reason: ``config.py::load_config``
+    folds ``effective_verify_env`` back in for sccache, so the effective mapping
+    may legitimately carry keys the file never declared.
+    """
+    declared = _declared_verify_env(ROOT_CONFIG_PATH)
+
+    assert declared, (
+        f'{ROOT_CONFIG_PATH} declares an EMPTY verify_env, so this test would '
+        'pass while comparing nothing. Either the block was deleted, or it was '
+        'renamed and this guard is now reading the wrong key'
+    )
+    missing = sorted(set(declared) - set(root_config.verify_env))
+    assert not missing, (
+        f'{sorted(missing)!r} are declared in {ROOT_CONFIG_PATH.name} but absent '
+        'from the effective config the orchestrator serves. The usual cause is a '
+        'SECOND top-level `verify_env:` block: PyYAML keeps only the last one and '
+        'says nothing. Remedy: fold the blocks into a single mapping'
+    )
+
+
+def test_a_second_top_level_verify_env_block_silently_drops_the_earlier_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control: prove the test above is guarding a real failure.
+
+    A guard that has never been seen to fail is a guard nobody knows the
+    polarity of. This reproduces task 4635's defect against the PRODUCTION
+    loader — on a mutated COPY, never on the tracked file — and asserts that
+    the real loader really does drop the earlier block's keys without a word.
+
+    The mutant is built as a TEXT transform for the reason
+    ``scripts/merge-pytest-n-ab-switch.sh`` gives for its own line-based edit of
+    the same file: it is ~1400 lines of load-bearing comments that a parse-and-
+    dump round trip would destroy.
+
+    ``ORCH_CONFIG_PATH`` is re-pointed BEFORE the config is constructed, which
+    is the whole point — ``OrchestratorConfig.settings_customise_sources`` reads
+    that env var at construction time, so a config built earlier would still be
+    describing the tracked file.
+    """
+    declared = _declared_verify_env(ROOT_CONFIG_PATH)
+    assert declared, f'{ROOT_CONFIG_PATH} declares an empty verify_env; nothing to lose'
+
+    mutant = tmp_path / ROOT_CONFIG_PATH.name
+    mutant.write_text(_with_second_verify_env_block(ROOT_CONFIG_PATH.read_text()))
+
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(mutant))
+    effective = OrchestratorConfig(project_root=REPO_ROOT).verify_env
+
+    assert _MUTANT_MARKER_KEY in effective, (
+        f'the mutant copy at {mutant} was not the file the loader read — '
+        f'effective verify_env is {effective!r}. Without this check the '
+        'assertion below would pass vacuously against the pydantic defaults, '
+        'which is the reports-green-while-checking-something-else failure this '
+        'whole directory exists to prevent'
+    )
+    survivors = sorted(set(declared) & set(effective))
+    assert not survivors, (
+        f'expected the second `verify_env:` block to shadow the first entirely, '
+        f'but {survivors!r} survived — the reproduction no longer reproduces, so '
+        'the guard above may be passing for a reason other than the one claimed'
+    )
+    assert [f.key for f in duplicate_keys(mutant)] == ['verify_env'], (
+        'the detector must flag the very shape the production loader just '
+        'swallowed, or it would not have caught task 4635 either'
+    )
