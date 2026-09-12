@@ -340,6 +340,11 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
     `initialize` followed by a `tools/call` naming `reload_config`. A
     session-less single-shot POST never gets that far -- it is rejected with
     a 400 before any tool runs -- so exiting 0 here cannot be luck.
+
+    The sequence is asserted as "some tools/call AFTER the initialize", not
+    as a fixed list: `post_mcp_envelope` is deliberately ADAPTIVE, sending
+    the envelope session-less first and handshaking only on the 400, so the
+    real wire also carries a rejected tools/call ahead of the handshake.
     """
     config = _make_repo(tmp_path, "8", marker=True)
 
@@ -354,8 +359,9 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
     assert _verdict(proc)["outcome"] == "already_converged"
-    assert methods.index("initialize") < methods.index("tools/call"), methods
-    assert tools == ["reload_config"], f"methods={methods}"
+    assert "initialize" in methods, methods
+    assert "tools/call" in methods[methods.index("initialize"):], methods
+    assert set(tools) == {"reload_config"}, f"methods={methods}"
 
 
 # ---------------------------------------------------------------------------

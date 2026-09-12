@@ -31,6 +31,7 @@ CONFIG="${ARGS[1]:-/home/leo/src/dark-factory/dark-factory-orchestrator.yaml}"
 PORT="${ARGS[2]:-8102}"
 [[ "$VALUE" =~ ^[0-9]+$ ]] || die "value must be a positive integer, got '$VALUE'"
 [ -f "$CONFIG" ] || die "config not found: $CONFIG"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$(dirname "$CONFIG")" && git rev-parse --show-toplevel)" || die "config is not inside a git checkout"
 CONFIG_BASE="$(realpath --relative-to="$REPO" "$CONFIG")"
 KEY='PYTEST_XDIST_AUTO_NUM_WORKERS'
@@ -94,34 +95,31 @@ else
     SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 fi
 
-# 3. Hot-reload via the escalation MCP (single-shot tools/call; Accept must carry both media types).
-RESP="$(curl -sS -X POST "http://127.0.0.1:${PORT}/mcp" \
-    -H 'Accept: application/json, text/event-stream' \
-    -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reload_config","arguments":{}}}')" \
-    || die "reload_config request to 127.0.0.1:${PORT} failed (committed as ${SHA}; the value lands at the next restart)"
-
-# 4. Assert the value is live, in either of its two shapes. `applied` carrying
-#    verify_env with the new value is the flip. ABSENCE of verify_env from
-#    `applied` is the converged re-run — and absence is the ONLY converged
-#    signal on the wire, because `unchanged` is a bare int COUNT of equal leaves
+# 3. Hot-reload via the escalation MCP, and assert the value is live.
+#    The escalation MCP is STATEFUL, so reaching it takes a session handshake
+#    and an SSE decoder rather than one POST; `legibility.census_trigger`
+#    already owns that transport and is imported from the SCRIPT's own
+#    directory, never from $REPO (which is the CONFIG's checkout).
+#
+#    The value is live in either of two shapes. `applied` carrying verify_env
+#    with the new value is the flip. ABSENCE of verify_env from `applied` is
+#    the converged re-run — and absence is the ONLY converged signal on the
+#    wire, because `unchanged` is a bare int COUNT of equal leaves
 #    (config.py::ConfigDiff), naming no keys and carrying no values. Absence is
 #    weaker than convergence, though: a rolled-back reload and a reload of a
 #    DIFFERENT orchestrator both produce it, which is what the two corroborators
 #    below exclude.
-#    The response travels as an ARGUMENT, never on stdin: `python3 -` reads its
-#    program from stdin, and the heredoc below IS that stdin, so a
-#    `printf '%s' "$RESP" | python3 - <<'PY'` pipe is swallowed whole by the
-#    heredoc and json.load(sys.stdin) then sees EOF on every single run.
-python3 - "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$RESP" <<'PY'
+python3 - "$SCRIPT_DIR" "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$PORT" <<'PY'
 import json, os, sys
-key, value, sha, config_path, resp = sys.argv[1:6]
-env = json.loads(resp)
-res = env.get('result', {})
-tool = res.get('structuredContent')
-if not isinstance(tool, dict):
-    content = res.get('content') or []
-    tool = json.loads(content[0]['text']) if content and content[0].get('text') else {}
+script_dir, key, value, sha, config_path, port = sys.argv[1:7]
+sys.path.insert(0, script_dir)
+from legibility import census_trigger
+
+tool = census_trigger.post_mcp_tool_call(
+    f'http://127.0.0.1:{port}/mcp', 'reload_config', {})
+# reload_config's OWN error field: a config that failed to parse, reported by a
+# perfectly successful tools/call. `_raise_on_mcp_error` inspects the JSON-RPC
+# envelope and never sees this one.
 if tool.get('error'):
     print(f'reload_config error: {tool["error"]}', file=sys.stderr); sys.exit(1)
 entry = (tool.get('applied') or {}).get('verify_env')
