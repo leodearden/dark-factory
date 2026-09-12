@@ -62,7 +62,7 @@ from _fill_drive_harness import (  # noqa: F401,E402
     _teardown_fill_drive,
 )
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, hangs_until, passes
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_branch_with_file,
@@ -244,8 +244,8 @@ async def _fail_head_and_park_follower(lane: _Lane) -> None:
     host slots come free. That is the state the DISPATCH-FILL guard governs.
     """
     lane.head_gate.set()
-    outcome = await asyncio.wait_for(
-        lane.requests[HEAD].result, timeout=MERGE_RESULT_TIMEOUT
+    outcome = await wait_responsive(
+        lane.requests[HEAD].result, label=f'{HEAD} verify-fail cascade'
     )
     assert outcome.status not in ('done', 'already_merged'), (
         f'expected {HEAD} to fail its verify and cascade, got {outcome.status!r}'

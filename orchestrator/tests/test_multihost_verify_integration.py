@@ -62,7 +62,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript, passes
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_branch_with_file,
@@ -1421,7 +1421,7 @@ async def _lane_with_remote(
     async with _running_lane(git_ops, clock=_ShortSleepClock(), **ports) as (lane, queue):
         warmup = await _submitted(git_ops, config, 'hostwarm', 'hostwarm.py', 'w = 1\n')
         await queue.put(warmup)
-        await asyncio.wait_for(warmup.result, timeout=MERGE_RESULT_TIMEOUT)
+        await wait_responsive(warmup.result, label='host-allocator warmup landing')
         await _until(
             lambda: bool(lane.snapshot()['hosts']),
             what='the lane to build its host allocator',
@@ -1504,8 +1504,8 @@ class TestUnreachableHostCapstone:
 
             # (3) THE SIGNAL: the queue never stalls -- both branches land on the
             #     surviving local trust anchor.
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(req_a.result, label='A lands on surviving anchor')
+            outcome_b = await wait_responsive(req_b.result, label='B lands on surviving anchor')
             assert outcome_a.status == 'done', outcome_a
             assert outcome_b.status == 'done', outcome_b
 
@@ -1531,8 +1531,8 @@ class TestUnreachableHostCapstone:
             req_a, req_b = await self._strand_the_laptop(
                 lane, queue, host_git_ops, host_config, verifier, gate,
             )
-            await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            await wait_responsive(req_a.result, label='stranded-laptop A resolves')
+            await wait_responsive(req_b.result, label='stranded-laptop B resolves')
 
             # HOST RECOVERS -- no restart, no new allocator, no new lane.
             laptop.reachable = True
@@ -1563,8 +1563,8 @@ class TestUnreachableHostCapstone:
                 what='the re-admitted laptop to be handed a verify',
             )
             second_gate.set()
-            assert (await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)).status == 'done'
-            assert (await asyncio.wait_for(req_d.result, timeout=MERGE_RESULT_TIMEOUT)).status == 'done'
+            assert (await wait_responsive(req_c.result, label='C lands after re-admission')).status == 'done'
+            assert (await wait_responsive(req_d.result, label='D lands after re-admission')).status == 'done'
 
     async def test_a_raising_health_probe_never_crashes_the_lane(
         self, host_git_ops: GitOps, host_config: OrchestratorConfig,
@@ -1583,8 +1583,8 @@ class TestUnreachableHostCapstone:
             req_a, req_b = await self._strand_the_laptop(
                 lane, queue, host_git_ops, host_config, verifier, gate,
             )
-            await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            await wait_responsive(req_a.result, label='stranded-laptop A resolves')
+            await wait_responsive(req_b.result, label='stranded-laptop B resolves')
 
             # Every subsequent sweep now explodes inside the probe.
             probes = laptop.health_calls
@@ -1597,7 +1597,7 @@ class TestUnreachableHostCapstone:
             # THE SIGNAL: the lane is still merging -- a probe bug cannot take it down.
             req_c = await _submitted(host_git_ops, host_config, 'crash-c', 'crash_c.py', 'c = 3\n')
             await queue.put(req_c)
-            outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_c = await wait_responsive(req_c.result, label='lane still merges past a raising probe')
             assert outcome_c.status == 'done', outcome_c
             assert _host_row(lane, 'leo-laptop')['quarantined'] is True, (
                 'a raising probe must leave the quarantine in place, not clear it'
@@ -2258,7 +2258,7 @@ class TestTwoHostFalseGreenCapstone:
             anchor_gate.set()
 
             # (b1) the false-green does NOT land.
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await wait_responsive(req_b.result, label='false-green must not land')
             assert outcome_b.status != 'done', outcome_b
 
         _, main_files, _ = await _run(

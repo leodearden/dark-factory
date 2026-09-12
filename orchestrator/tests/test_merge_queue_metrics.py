@@ -27,7 +27,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -319,7 +319,7 @@ class TestMetricsFromRealMerges:
                 git_ops, config, 'metrics-land-a', 'land_a.py', 'x = 1\n',
             )
             await queue.put(request)
-            outcome = await asyncio.wait_for(request.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(request.result, label='clean landing')
             assert outcome.status == 'done', f'expected a clean landing, got {outcome!r}'
 
             metrics = lane.snapshot()['metrics']
@@ -354,12 +354,12 @@ class TestMetricsFromRealMerges:
             )
 
             await queue.put(first)
-            outcome_first = await asyncio.wait_for(first.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_first = await wait_responsive(first.result, label='item A lands')
             assert outcome_first.status == 'done', f'expected A to land, got {outcome_first!r}'
             assert lane.snapshot()['metrics']['drift_at_detection']['count'] == 0
 
             await queue.put(second)
-            outcome_second = await asyncio.wait_for(second.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_second = await wait_responsive(second.result, label='item B conflicts with A')
             assert outcome_second.status == 'conflict', (
                 f'expected B to conflict with A, got {outcome_second!r}'
             )

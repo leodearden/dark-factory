@@ -51,7 +51,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, hangs_until
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -359,7 +359,7 @@ class TestBounceDrivenByTheLane:
             tip = await _await_frozen_tip(lane)
 
             await queue.put(suffix)
-            outcome = await asyncio.wait_for(suffix.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(suffix.result, label='conflicting suffix bounce')
 
             assert outcome.status == 'blocked', (
                 f'expected the conflicting suffix item to be bounced, got {outcome!r}'
@@ -403,11 +403,11 @@ class TestBounceDrivenByTheLane:
             await queue.put(clean)
             release.set()
 
-            frozen_outcome = await asyncio.wait_for(
-                frozen.result, timeout=MERGE_RESULT_TIMEOUT,
+            frozen_outcome = await wait_responsive(
+                frozen.result, label='frozen-prefix item lands',
             )
-            clean_outcome = await asyncio.wait_for(
-                clean.result, timeout=MERGE_RESULT_TIMEOUT,
+            clean_outcome = await wait_responsive(
+                clean.result, label='non-conflicting item lands',
             )
 
             assert frozen_outcome.status == 'done', (
