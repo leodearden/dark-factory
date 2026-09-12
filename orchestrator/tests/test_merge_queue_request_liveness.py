@@ -51,6 +51,8 @@ from _merge_lane_fakes import (
     RecordingEscalations,
     fails,
     hangs_until,
+    lane_finalizing,
+    lane_state,
     make_lane,
     passes,
     raises,
@@ -290,8 +292,8 @@ class TestCheckRequestLiveness:
         worker._check_request_liveness(t0 + 2000, threshold_s=1000)
 
         assert not req.result.done()
-        assert worker._queue.empty()
-        assert not worker._operator_halt.is_set()
+        assert queue.empty()
+        assert not worker.is_wip_halted
 
     async def test_resolved_request_does_not_alarm(
         self,
@@ -520,7 +522,7 @@ class TestWedgedVerifyIntegration:
 
         # Observation-only: still wedged, nothing mutated or halted.
         assert not req.result.done()
-        assert not worker._operator_halt.is_set()
+        assert not worker.is_wip_halted
 
         # ── Release the gate and confirm clean shutdown ────────────────
         gate_release.set()
@@ -590,7 +592,7 @@ class TestOperatorHaltRequeueNoFalseAlarm:
             speculative=False,
         )
 
-        worker._operator_halt.set()
+        worker.operator_halt('test: operator halt before dispatch')
         entry = await worker._dispatch_item(item)
 
         assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
@@ -3480,7 +3482,7 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         chokepoint repair (never called here), so per-branch symmetry is
         pinned on its own.
         """
-        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+        from orchestrator.merge_queue import InflightStatus
 
         worker, q, req, vr, spy_note, _fake_eq = await self._drive_dead_abort(
             git_ops, config, 'df3082-dead-verify-requeue', 'dvr.py',
@@ -3490,10 +3492,10 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         assert vr.status == InflightStatus.REQUEUED, (
             f'a dead-verify abort must REQUEUE, got status={vr.status!r}'
         )
-        current = worker._lifecycle.current(rid)
-        assert current == ItemLifecycleState.QUEUED, (
-            f'the requeue site must return the registry to QUEUED so the request '
-            f'can re-enter through the drain; registry reads {current!r}'
+        current = lane_state(worker, rid)
+        assert current == 'queued', (
+            f'the requeue site must return the item to the census as queued so the '
+            f'request can re-enter through the drain; census reads {current!r}'
         )
         assert worker._live_items[rid] is req, (
             f'_live_items must hold the MergeRequest after the requeue: '
@@ -3544,8 +3546,8 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
             'the real waiter must NOT be handed a fabricated already_merged by the '
             'coalesce path'
         )
-        assert worker._finalizing_head_entry() is None, (
-            f'no finalize head may survive the abort: {worker._finalizing_head_entry()!r}'
+        assert lane_finalizing(worker) == [], (
+            f'no finalize head may survive the abort: {lane_finalizing(worker)!r}'
         )
         drop_warnings = [
             r.getMessage() for r in caplog.records
@@ -3618,16 +3620,16 @@ class TestSoleWaiterAbandonRetiresAtTheSite:
         assert vr.status == InflightStatus.DROPPED, (
             f'a cancelled sole waiter must DROP, got status={vr.status!r}'
         )
-        current = worker._lifecycle.current(rid)
-        assert current == ItemLifecycleState.TERMINAL, (
-            f'the abandon site must retire the registry entry itself; reads {current!r}'
+        current = lane_state(worker, rid)
+        assert current is None, (
+            f'the abandon site must retire the entry itself; census reads {current!r}'
         )
         assert rid not in worker._live_items, (
             f'dropped entry left in _live_items: {worker._live_items.get(rid)!r}'
         )
-        assert worker._finalizing_head_entry() is None, (
+        assert lane_finalizing(worker) == [], (
             f'a dropped request must never be a finalize head: '
-            f'{worker._finalizing_head_entry()!r}'
+            f'{lane_finalizing(worker)!r}'
         )
         assert q.empty(), 'a DROPPED request must NOT be re-queued'
         assert fake_eq.filed == [], (
@@ -3676,9 +3678,12 @@ def _assert_quiescent_registry(
           REAL sha, never the ``'unknown'`` sentinel: the base-chain and
           verify-base sub-checks are silently SKIPPED for 'unknown', which
           would make this pass vacuously.
-      (f) ``set(worker._lifecycle.non_terminal_items()) == set()`` — no
-          ItemLifecycle registry leak survives quiescence.  This is the
-          surface a phantom finalize head corrupts.
+      (f) ``snapshot()['entries'] == []`` — no live work survives
+          quiescence.  This is the surface a phantom finalize head
+          corrupts, and the census is a SUPERSET of the registry's
+          non-terminal items (it also enumerates undrained queue and lane
+          buffer contents), so reading it is stronger than reading the
+          registry was.
     """
     for req in requests:
         assert req.result.done() or req.result.cancelled(), (
@@ -3700,9 +3705,9 @@ def _assert_quiescent_registry(
         f'two_layer_invariants({main_sha!r}) non-empty at quiescence: {tli!r}'
     )
 
-    registry_ids = set(worker._lifecycle.non_terminal_items())
-    assert registry_ids == set(), (
-        f'ItemLifecycle registry non-terminal at quiescence: {registry_ids!r}'
+    census = worker.snapshot()['entries']
+    assert census == [], (
+        f'the lane still censuses live work at quiescence: {census!r}'
     )
 
 
@@ -3824,7 +3829,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The seven surfaces from the task's REGRESSION COVERAGE list."""
-        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+        from orchestrator.merge_queue import InflightEntry
 
         worker, req, outcome, gate, fake_eq, main_sha, snap = (
             await self._drive_abort_then_land(
@@ -3878,10 +3883,6 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
 
         # ── (2) the entry never remains finalizing / position 0 / head_of_line
         #        past its abort point.
-        assert worker._finalizing_head_entry() is None, (
-            f'a phantom finalize head survived the abort: '
-            f'{worker._finalizing_head_entry()!r}'
-        )
         finalizing = [e for e in snap['entries'] if e['state'] == 'finalizing']
         assert finalizing == [], (
             f"no snapshot entry may report state='finalizing' once quiescent: "
@@ -3902,9 +3903,9 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         assert not isinstance(_live, InflightEntry), (
             f'a non-TERMINAL InflightEntry survived in _live_items for {rid}: {_live!r}'
         )
-        _cur = worker._lifecycle.current(rid)
-        assert _cur in (None, ItemLifecycleState.TERMINAL), (
-            f'the landed request must end TERMINAL (or be retired), registry '
+        _cur = lane_state(worker, rid)
+        assert _cur is None, (
+            f'the landed request must be retired off the census, which still '
             f'reads {_cur!r}'
         )
 
@@ -4020,7 +4021,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         assert outcome.status == 'done', (
             f'the request must land unaided, got {outcome!r}'
         )
-        assert not worker._operator_halt.is_set(), (
+        assert not worker.is_wip_halted, (
             'recovery must not depend on (or leave behind) an operator halt'
         )
         assert not worker.is_wip_halted, (
