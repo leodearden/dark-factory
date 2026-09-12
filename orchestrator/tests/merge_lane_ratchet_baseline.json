@@ -1467,7 +1467,7 @@
     "orchestrator/tests/test_merge_shadow.py": {"patch_targets": ["_run_coarse_shadow_compare", "_run_cold_shadow_verify", "_run_cold_shadow_verify_suite", "_run_shadow_compare", "_run_unscoped_typechecks", "run_scoped_verification"], "private_reads": 12},
     "orchestrator/tests/test_merge_skew_end_to_end.py": {"patch_targets": ["classify_merge_failure_disposition", "enqueue_merge_request", "run_scoped_verification", "verify_failure_is_preexisting_on_main"], "private_reads": 7},
     "orchestrator/tests/test_merge_skew_tripwire.py": {"patch_targets": [], "private_reads": 3},
-    "orchestrator/tests/test_merge_speculation.py": {"patch_targets": ["_acquire_warm_verify_worktree", "_finalize_advanced_merge", "_map_advance_failure", "_maybe_run_drift_check", "_maybe_schedule_shadow_compare", "_reverify_rebased_tree", "_run_cold_shadow_verify", "_run_post_merge_verify", "classify_merge_failure_disposition", "run_scoped_verification"], "private_reads": 73},
+    "orchestrator/tests/test_merge_speculation.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_speculation_controller.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_merge_types.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_types_invariants.py": {"patch_targets": [], "private_reads": 0},
