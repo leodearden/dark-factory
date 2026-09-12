@@ -30,13 +30,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.reconciliation import preservation_specimen_guard
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    CATEGORY_PRESERVATION_SPECIMEN_STORM,
     MEM0_KIND_INVESTIGATION_OUTCOME,
+    PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     PRESERVATION_TOKEN_FAMILY,
     STRANDED_FLAG_TOKEN_FAMILY,
+    UNRESOLVED_CORROBORATION_SUBJECT,
+    PreservationSuppressionResult,
     cites_preservation,
     filter_preservation_specimen_flags,
     flag_asserts_stranded,
+    maybe_escalate_preservation_suppression_storm,
 )
 
 # ── Live corroboration strings, copied verbatim from the base branch ─────────
@@ -967,3 +973,188 @@ class TestDegradedCorroborationReads:
         assert result.kept_flags == [broken]
         assert result.suppressed_by_task == {'3105': 1}
         assert result.unresolved_task_ids == ('4102',)
+
+
+def _suppression_result(count=None, *, extra=None, unresolved=()):
+    """A PreservationSuppressionResult with task 3105 suppressed *count* times."""
+    if count is None:
+        count = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1
+    by_task = {'3105': count}
+    by_task.update(extra or {})
+    return PreservationSuppressionResult(
+        kept_flags=[],
+        suppressed_by_task=by_task,
+        citations_by_task={t: 'a8fd36a8-46db-4ca8-a21c-554c38a918ee' for t in by_task},
+        unresolved_task_ids=tuple(unresolved),
+    )
+
+
+class TestMaybeEscalatePreservationSuppressionStorm:
+    """Per-cycle storm escape (INV-4), driven against a REAL EscalationQueue.
+
+    A MagicMock cannot witness a fold, a dedupe_count, or the agreement between
+    the key written and the key read back — and the fold is the whole contract
+    on the second cycle. Stage 1 re-evaluates every cycle, so a guard that
+    storms once tends to storm every cycle.
+    """
+
+    _RUN = 'run-4223-1'
+
+    @pytest.fixture
+    def queue(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        return EscalationQueue(tmp_path / 'escalations')
+
+    @staticmethod
+    def _pending(queue, subject):
+        return queue.get_by_task(subject, status='pending', level=1)
+
+    @pytest.mark.asyncio
+    async def test_over_threshold_files_one_escalation(self, queue):
+        """One active citation hiding a flood in one cycle is worth a human look."""
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(),
+        )
+        assert escalated == ['3105']
+
+        pending = self._pending(queue, '3105')
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == CATEGORY_PRESERVATION_SPECIMEN_STORM
+        assert esc.agent_role == 'reconciliation-stage1'
+        assert esc.task_id == '3105'
+        blob = f'{esc.summary}\n{esc.detail}'
+        assert '3105' in blob
+        assert str(PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1) in blob
+        # The citation the suppression leaned on is named, so a steward can
+        # check whether it is over-broad without re-deriving it.
+        assert 'a8fd36a8-46db-4ca8-a21c-554c38a918ee' in blob
+
+    @pytest.mark.asyncio
+    async def test_at_threshold_does_not_escalate(self, queue):
+        """Strict ``>``: at the threshold, nothing is filed."""
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN,
+            _suppression_result(PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE),
+        )
+        assert escalated == []
+        assert self._pending(queue, '3105') == []
+
+    @pytest.mark.asyncio
+    async def test_ordinary_cycle_does_not_escalate(self, queue):
+        """The normal case — one specimen, one suppressed flag — is silent."""
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(1),
+        )
+        assert escalated == []
+        assert self._pending(queue, '3105') == []
+
+    @pytest.mark.asyncio
+    async def test_second_cycle_folds_rather_than_duplicating(self, queue):
+        """A recurring storm keeps ONE pending record and raises dedupe_count.
+
+        Not gated on has_open_l1 (task 3522): that skip pinned dedupe_count at
+        0, so an operator could not tell one storm from forty.
+        """
+        await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(),
+        )
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, 'run-4223-2', _suppression_result(count=99),
+        )
+
+        assert escalated == []
+        assert len(self._pending(queue, '3105')) == 1
+
+    @pytest.mark.asyncio
+    async def test_two_tasks_storming_each_file_once(self, queue):
+        """The fold key is per-task; a second storming task is not a recurrence."""
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN,
+            _suppression_result(
+                extra={'4102': PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 3},
+            ),
+        )
+
+        assert sorted(escalated) == ['3105', '4102']
+        first = self._pending(queue, '3105')[0]
+        second = self._pending(queue, '4102')[0]
+        assert first.dedupe_fingerprint != second.dedupe_fingerprint
+
+    @pytest.mark.asyncio
+    async def test_unresolved_corroboration_is_reported(self, queue):
+        """A subsystem whose corroboration reads are all failing must be audible.
+
+        Without this the fail-open degrades in total silence: every stranded
+        recommendation flows on, the stat reads 0 suppressed, and nothing
+        distinguishes that from a healthy quiet cycle.
+        """
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN,
+            _suppression_result(1, unresolved=('3105', '4102')),
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+        pending = self._pending(queue, UNRESOLVED_CORROBORATION_SUBJECT)
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == CATEGORY_PRESERVATION_SPECIMEN_STORM
+        assert esc.agent_role == 'reconciliation-stage1'
+        blob = f'{esc.summary}\n{esc.detail}'
+        assert '3105' in blob and '4102' in blob
+
+    @pytest.mark.asyncio
+    async def test_unresolved_report_is_distinct_from_a_storm(self, queue):
+        """Both can fire in one cycle, and they must not fold into each other."""
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(unresolved=('4102',)),
+        )
+
+        assert sorted(escalated) == sorted(['3105', UNRESOLVED_CORROBORATION_SUBJECT])
+        storm = self._pending(queue, '3105')[0]
+        unresolved = self._pending(queue, UNRESOLVED_CORROBORATION_SUBJECT)[0]
+        assert storm.dedupe_fingerprint != unresolved.dedupe_fingerprint
+
+    @pytest.mark.asyncio
+    async def test_clean_cycle_files_nothing(self, queue):
+        """No storm, no unresolved reads — no record."""
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN,
+            PreservationSuppressionResult([], {}, {}, ()),
+        )
+        assert escalated == []
+
+    @pytest.mark.asyncio
+    async def test_escalation_package_unavailable_returns_empty(self, queue, monkeypatch):
+        """The reconciliation package must import where escalation is not installed."""
+        monkeypatch.setattr(
+            preservation_specimen_guard, 'Escalation', None, raising=False,
+        )
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(),
+        )
+        assert escalated == []
+        assert self._pending(queue, '3105') == []
+
+    @pytest.mark.asyncio
+    async def test_submit_failure_costs_one_subject_not_the_cycle(self, tmp_path):
+        """Best-effort: a broken submit is logged and excluded, never raised."""
+        from escalation.queue import EscalationQueue
+
+        class _BrokenQueue(EscalationQueue):
+            def submit(self, escalation):
+                raise RuntimeError('boom')
+
+        queue = _BrokenQueue(tmp_path / 'escalations')
+        with caplog_at_warning() as records:
+            escalated = await maybe_escalate_preservation_suppression_storm(
+                queue, PROJECT, self._RUN, _suppression_result(),
+            )
+
+        assert escalated == []
+        assert any('3105' in message for message in records)
