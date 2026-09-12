@@ -50,7 +50,7 @@ from textual.css.query import NoMatches
 from textual.widgets import DataTable
 
 from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
-from cockpit.clipboard import CopyAttempt, copy_to_system_clipboard
+from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback, copy_to_system_clipboard
 from cockpit.panes.decision_queue import (
     DecisionQueue,
     QueueItem,
@@ -1048,6 +1048,12 @@ class CockpitApp(App):
         the operator pressed 'y', nothing reached the clipboard, and nothing
         said so (task 5448).
 
+        Both outcomes toast, and the toast names the mechanism that ran --
+        without one, a future capability regression is again invisible at
+        the moment of use. cockpit/src/cockpit/clipboard.py::copy_feedback
+        owns that wording and the fallback decision; this method owns only
+        the policy around them.
+
         Strictly READ-ONLY: never calls set_manual_boost/
         update_decision_state, preserving the pure-consumer write-
         discipline invariant (see TestCopyAction).
@@ -1059,7 +1065,19 @@ class CockpitApp(App):
         item = self._queue_items_by_key.get(key)
         if item is None:
             return
-        self._copy_runner(format_copy_payload(item))
+        payload = format_copy_payload(item)
+        try:
+            attempt = self._copy_runner(payload)
+        except Exception:
+            # copy_runner is caller-injectable, so a keypress handler must
+            # not depend on the bundled implementation's never-raise promise
+            # being kept by whatever was passed in (PRD §2).
+            _log.exception('action_copy: copy runner failed for %r', key)
+            attempt = CopyAttempt(CopyOutcome.HELPER_FAILED)
+        feedback = copy_feedback(attempt)
+        if feedback.write_osc52:
+            self.copy_to_clipboard(payload)
+        self.notify(feedback.message, title='Copy', severity=feedback.severity)
 
     def action_new_session(self) -> None:
         """'n' -- push the spawn bar's project/role/prompt picker (PRD §9 C5b).
