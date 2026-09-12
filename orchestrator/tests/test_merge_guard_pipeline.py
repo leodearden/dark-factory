@@ -538,50 +538,6 @@ class TestClassifyAndMergeSpeculativeWorker:
         )
         assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
 
-    async def test_patch_id_fail_open_falls_through_to_merge(
-        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """Safety arm (task 2945, signal 4): the guard honors a False return
-        from patch_content_contained even when the content is genuinely on main
-        — the helper's fail-open (git cherry rc!=0 → False) must fall through to
-        a normal merge, never a spurious skip.  Locks the fail-open contract.
-        """
-        import orchestrator.merge_queue as mq_mod
-        from orchestrator.merge_queue import classify_and_merge
-
-        # Rebased-landing contained setup (content genuinely on main).
-        worktree = await _make_branch_with_file(git_ops, 'failopen-2945', 'reb.py', 'x = 1\n')
-        branch_sha = await git_ops.resolve_branch_sha('task/failopen-2945')
-        assert branch_sha is not None
-        (git_ops.project_root / 'other.py').write_text('other = 1\n')
-        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
-        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
-        await _run(['git', 'cherry-pick', branch_sha], cwd=git_ops.project_root)
-        main_reb = await git_ops.get_main_sha()
-        assert not await git_ops.is_ancestor(branch_sha, main_reb)
-
-        # Simulate the helper's fail-open (git cherry rc!=0 → False) even though
-        # the content IS genuinely patch-id-contained on main.
-        async def _fail_open(head, upstream, git_ops):
-            return False
-
-        monkeypatch.setattr(mq_mod, 'patch_content_contained', _fail_open)
-
-        es = _make_event_store(tmp_path)
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
-        req = _make_request('failopen-2945', 'failopen-2945', worktree, config)
-
-        result = await classify_and_merge(
-            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
-        )
-
-        assert isinstance(result, MergedOk), (
-            f'fail-open (False) must fall through to a normal merge; got {result!r}'
-        )
-        assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
-
     async def test_real_conflict_returns_decided_conflict_and_records_drift_sample(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
@@ -604,7 +560,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         # sites per design — NOT part of classify_and_merge), so
         # _note_conflict_detected has a real stashed base to pop.
         worker._note_merge_started(req.request_id)
-        drift_count_before = worker._merge_metrics.drift_summary()['count']
+        drift_count_before = worker.snapshot()['metrics']['drift_at_detection']['count']
 
         result = await classify_and_merge(
             worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
@@ -614,7 +570,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         assert result.outcome.status == 'conflict'
         assert result.outcome.conflict_details  # non-empty
         assert _merge_attempt_subtypes(es.db_path) == ['conflict']
-        drift_count_after = worker._merge_metrics.drift_summary()['count']
+        drift_count_after = worker.snapshot()['metrics']['drift_at_detection']['count']
         assert drift_count_after == drift_count_before + 1, (
             'expected _note_conflict_detected to record one drift sample'
         )

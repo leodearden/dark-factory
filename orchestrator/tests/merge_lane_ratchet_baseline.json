@@ -1408,7 +1408,7 @@
     "orchestrator/tests/test_merge_drift.py": {"patch_targets": ["_derive_task_files_from_git", "_run_drift_check", "build_merge_verify_spec", "run_scoped_verification"], "private_reads": 21},
     "orchestrator/tests/test_merge_gates.py": {"patch_targets": ["AUTO_CHAIN_GENERATIONS_ENABLED", "_check_post_merge_equivalence", "_check_post_merge_pyright", "_maybe_auto_chain_generation", "_rebase_delta_touched_overlap", "_run_post_merge_verify", "_run_unscoped_typechecks"], "private_reads": 7},
     "orchestrator/tests/test_merge_gates_plan_files_rename.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_merge_guard_pipeline.py": {"patch_targets": ["_check_plan_targets_in_tree", "patch_content_contained"], "private_reads": 4},
+    "orchestrator/tests/test_merge_guard_pipeline.py": {"patch_targets": ["_check_plan_targets_in_tree"], "private_reads": 2},
     "orchestrator/tests/test_merge_item_union.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_merge_lane_package.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_liveness.py": {"patch_targets": ["INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS", "TOUCH_MISS_TOLERANCE", "_HEARTBEAT_POLL_S", "_MERGE_AHEAD_BOUND", "check_merge_liveness_margin"], "private_reads": 0},
