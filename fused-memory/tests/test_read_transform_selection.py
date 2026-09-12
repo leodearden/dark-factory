@@ -150,6 +150,13 @@ import copy  # noqa: E402
 
 import pytest  # noqa: E402
 
+# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
+#
+# Defined once in the sibling module so five importers cannot drift apart;
+# its docstring says why redirecting the directory is a hard boundary rather
+# than a convenience.  Autouse applies to every test in THIS module.
+from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: E402,F401
+
 
 def _rec(record_id, *, topic: str | None = 't', canonical=False, kind=None,
          content='body', claim_ids=(), parent_id=None, cluster_id='c1'):
@@ -3563,3 +3570,185 @@ class TestTheLiveExtendNeverWritesBelowProductionK:
         )
 
         assert replayed
+
+
+# ---------------------------------------------------------------------------
+# The live driver's in-use lease (task 4775)
+# ---------------------------------------------------------------------------
+#
+# `fetch_production_rankings` seeds under exactly the prefix the 6-hourly
+# reaper deletes — `config.mem0.collection_prefix = bake.ephemeral_collection_prefix()`
+# — and has its own `__main__` CLI, so it carries the identical exposure to
+# `run_bake_off` and needs its own lease.  The doubles below are the minimum
+# that lets the live driver reach its teardown; they are deliberately local
+# and are not a general harness for this file.
+
+
+def _fake_config():
+    """A config shaped like the two attributes paths the driver walks."""
+    config = types.SimpleNamespace(
+        mem0=types.SimpleNamespace(
+            collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
+            qdrant_url='http://localhost:6333',
+        ),
+        embedder=types.SimpleNamespace(
+            model='text-embedding-3-small',
+            providers=types.SimpleNamespace(
+                openai=types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
+            ),
+        ),
+        queue=types.SimpleNamespace(data_dir='./data/queue'),
+    )
+    config.model_copy = lambda deep=False: _fake_config()
+    return config
+
+
+class _FakeMemoryService:
+    """Enough service for the driver to initialise, seed and tear down."""
+
+    initialize_raises = False
+
+    def __init__(self, config):
+        self.config = config
+        self.mem0 = object()
+        self.closed = False
+
+    async def initialize(self):
+        if type(self).initialize_raises:
+            raise RuntimeError('qdrant unreachable')
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+class TestFetchProductionRankingsHoldsALease:
+    """The second live-seeding driver, and it needs its own lease.
+
+    `run_bake_off` is not the only site that seeds under a reaped prefix:
+    this one repoints `collection_prefix` at
+    `bake.ephemeral_collection_prefix()` and runs the same
+    drop -> seed -> measure -> finally-drop shape, with its own `__main__`
+    CLI where no pytest conftest exists to cover it.
+    """
+
+    @staticmethod
+    def _install_doubles(monkeypatch, *, initialize_raises=False):
+        """Patch the driver's seams at their source; return the observations.
+
+        `drop_collections` is the first statement in the driver's `try`, so
+        it fires before any collection exists — the instant the lease has to
+        already be live.
+        """
+        import fused_memory.config.schema as schema_mod  # noqa: PLC0415
+        import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+        bake = _bake_off()
+        reaper = bake.load_cleanup_script()
+        at_drop: list[list[dict]] = []
+
+        def _drop_and_look(*args, **kwargs):
+            at_drop.append(reaper.live_leases())
+
+        async def _seed(*args, **kwargs):
+            return None
+
+        async def _fetch(*args, **kwargs):
+            return {'queries': {}}
+
+        monkeypatch.setattr(_FakeMemoryService, 'initialize_raises', initialize_raises)
+        monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _fake_config)
+        monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
+        monkeypatch.setattr(bake, 'drop_collections', _drop_and_look)
+        monkeypatch.setattr(bake, 'seed_arm', _seed)
+        monkeypatch.setattr(bake, 'fetch_arm', _fetch)
+        return reaper, at_drop
+
+    async def test_a_lease_is_live_when_the_pre_run_sweep_fires(self, monkeypatch):
+        mod = _mod()
+        reaper, at_drop = self._install_doubles(monkeypatch)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert at_drop, 'the observation seam never fired'
+        assert len(at_drop[0]) == 1, at_drop[0]
+        assert mod.__name__ in at_drop[0][0]['owner'], at_drop[0][0]['owner']
+
+    async def test_the_lease_is_released_once_the_call_returns(self, monkeypatch):
+        mod = _mod()
+        reaper, _ = self._install_doubles(monkeypatch)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert reaper.live_leases() == []
+
+    async def test_the_reaper_is_resolved_before_any_resource_is_acquired(
+        self, monkeypatch,
+    ):
+        """The same acquisition-window property `run_bake_off` carries.
+
+        The temp queue directory is this pass's FIRST acquisition and the
+        service is built right after it, both before the `with`.  A
+        `bake.load_cleanup_script()` evaluated in the `with` header would sit
+        after both and before the `try` — the one window where a raise
+        (`_load_sibling_script` raises `FixtureError` when the spec cannot be
+        built) leaks the directory and skips `close()`.
+
+        Asserted as "NO resolution happens once a resource exists": the
+        `ephemeral_collection_prefix()` call above resolves the reaper either
+        way, so an index comparison would pass on the unfixed driver.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        bake = _bake_off()
+        self._install_doubles(monkeypatch)
+        order: list[str] = []
+        resolve = bake.load_cleanup_script
+        mkdtemp = tempfile.mkdtemp
+
+        def _record_resolve():
+            order.append('reaper')
+            return resolve()
+
+        def _record_mkdtemp(*args, **kwargs):
+            order.append('queue_dir')
+            return mkdtemp(*args, **kwargs)
+
+        monkeypatch.setattr(bake, 'load_cleanup_script', _record_resolve)
+        monkeypatch.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert 'queue_dir' in order, order
+        assert 'reaper' in order, order
+        assert 'reaper' not in order[order.index('queue_dir'):], order
+
+    async def test_the_raising_flag_is_restored_rather_than_left_set(self):
+        """`initialize_raises` is a CLASS attribute, so setting it directly
+        would leave the double raising for the rest of the pytest process.
+
+        Nothing breaks today only because every test that touches
+        `_FakeMemoryService` goes through `_install_doubles` first, which
+        resets it — an invariant a future test that constructs the double
+        directly has no way to know about, and whose breakage would surface
+        as an order-dependent failure under `pytest-randomly`.  Asserted
+        inside one test through a nested monkeypatch context, so it does not
+        itself depend on collection order.
+        """
+        with pytest.MonkeyPatch.context() as patcher:
+            self._install_doubles(patcher, initialize_raises=True)
+            assert _FakeMemoryService.initialize_raises is True
+
+        assert _FakeMemoryService.initialize_raises is False
+
+    async def test_the_lease_is_released_when_the_service_raises(self, monkeypatch):
+        """A failed pass must not hold the cron off any more than a failed
+        bake-off does."""
+        mod = _mod()
+        reaper, _ = self._install_doubles(monkeypatch, initialize_raises=True)
+
+        with pytest.raises(RuntimeError, match='qdrant unreachable'):
+            await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert reaper.live_leases() == []

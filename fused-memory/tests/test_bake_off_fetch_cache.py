@@ -109,6 +109,13 @@ import hashlib  # noqa: E402
 
 import pytest  # noqa: E402
 
+# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
+#
+# Defined once in the sibling module so five importers cannot drift apart;
+# its docstring says why redirecting the directory is a hard boundary rather
+# than a convenience.  Autouse applies to every test in THIS module.
+from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: E402,F401
+
 
 class TestTheScriptIsLoadedOnceNotReExecuted:
     """The loader seam must REUSE the script, not re-execute it.

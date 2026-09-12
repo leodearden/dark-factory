@@ -61,7 +61,13 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from _dashboard_helpers import extract_function_body
+from _dashboard_helpers import (
+    DF_CHARTS_DESTRUCTURE_RE,
+    DF_CHARTS_EXPORT_RE,
+    destructure_bindings,
+    extract_function_body,
+    find_function_params,
+)
 
 # ---------------------------------------------------------------------------
 # The served-asset fixtures (`charts_jsx_body`, `tab_analytics_jsx_body`,
@@ -73,30 +79,43 @@ from _dashboard_helpers import extract_function_body
 
 
 def _extract_signature(src: str, fn_name: str) -> str:
-    """Return the parameter-list text of ``function <fn_name>(...)``, parens excluded."""
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    assert m is not None, (
-        f'no `function {fn_name}(` declaration found in the source — the '
-        'component was renamed or converted to another declaration form, and '
-        'every assertion in this file would go vacuously GREEN.'
+    """Return the parameter-list text of ``function <fn_name>(...)``, parens excluded.
+
+    A thin projection over the shared `find_function_params` paren-depth walk.
+    It stays module-local rather than being hoisted because it has exactly one
+    consumer (`_default_format_y` below); what was worth sharing was the WALK,
+    not this slice of its result.  It cannot be replaced by
+    `extract_function_body` either: that returns the BODY, and the two slices
+    are disjoint — `_default_format_y` regexes `formatY = <default>` out of the
+    PARAMETER LIST, which the body excludes.
+
+    The miss message is kept file-specific: naming the vacuous-GREEN
+    consequence for THIS file is more use at this call site than the shared
+    helper's four-way wording.
+    """
+    def _miss(what: str) -> BaseException:
+        return AssertionError(
+            f'no `function {fn_name}(` declaration found in the source ({what}) '
+            '— the component was renamed or converted to another declaration '
+            'form, and every assertion in this file would go vacuously GREEN.'
+        )
+
+    # This caller wants the params, not the body that follows them, so the
+    # returned mask is unused here.
+    _masked, params_start, params_end = find_function_params(
+        src, fn_name, miss=_miss,
     )
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    assert paren_depth == 0, f'unbalanced parameter list for `function {fn_name}(`'
-    return src[m.end() : i - 1]
+    return src[params_start:params_end]
 
 
 # ---------------------------------------------------------------------------
-# Extractors.  Each asserts LOUDLY when its regex misses — a silent '' would
-# make a rename turn this whole file into a permanent false GREEN.  That is
-# also why `_component_body` needs no guard of its own: `extract_function_body`
-# raises rather than returning '' (task 3549).
+# Extractors.  Each fails LOUDLY on a miss — a silent '' would make a rename
+# turn this whole file into a permanent false GREEN.  Neither needs a guard of
+# its own any more: both are projections over shared `_dashboard_helpers`
+# helpers that RAISE rather than return '' (task 3549, task 4881).
+# `_component_body` takes the BODY via `extract_function_body`;
+# `_extract_signature` above takes the PARAMETER LIST via the same
+# `find_function_params` paren walk that helper is built on.
 # ---------------------------------------------------------------------------
 
 
@@ -193,16 +212,14 @@ def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SPARK_PATH_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_SPARK_PATH')
-# Deliberately the SAME brace-hostile pattern as test_tab_burndown.py:53's
-# `_DF_CHARTS_EXPORT_RE`, copied verbatim rather than imported (this repo's test
-# modules do not import each other).  Asserted on explicitly below so that a
-# nested `{}` in the export literal fails HERE, naming the coupling, instead of
-# there as an opaque "could not parse the DF_CHARTS exports".
-_DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
-# The CONSUMER side of that export, for the last hop of the route (tabs.jsx).
-# Same pattern as test_charts_consumer_bindings.py:43 and test_tab_burndown.py,
-# again copied rather than imported.
-_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
+# `_SPARK_PATH_DESTRUCTURE_RE` above stays LOCAL: it is a different namespace
+# and this is its only consumer.  The DF_CHARTS pair it shadows does NOT — both
+# are imported from `_dashboard_helpers` (see that module's banner for why the
+# brace-hostile `[^{}]*` must stay).  All three feed the same shared
+# `destructure_bindings`; only the projection below is this module's own.
+# The wrappers still assert on a miss explicitly, so that a nested `{}` fails
+# HERE, naming the coupling, instead of downstream as an opaque "could not
+# parse the DF_CHARTS exports".
 
 _SPARK_PATH_JS = (
     Path(__file__).resolve().parent.parent
@@ -217,7 +234,7 @@ def _binding_names(brace_body: str) -> set:
     namespace, which is the one that has to actually exist on it. A bare
     `axisY` is both source and local.
     """
-    return {part.split(':', 1)[0].strip() for part in brace_body.split(',') if part.strip()}
+    return {canonical for canonical, _local in destructure_bindings(brace_body)}
 
 
 def _spark_path_destructure(charts_jsx_body: str) -> set:
@@ -236,13 +253,16 @@ def _spark_path_destructure(charts_jsx_body: str) -> set:
 
 def _df_charts_export_names(charts_jsx_body: str) -> set:
     """Key names in the ``window.DF_CHARTS = { ... }`` export literal."""
-    m = _DF_CHARTS_EXPORT_RE.search(charts_jsx_body)
+    m = DF_CHARTS_EXPORT_RE.search(charts_jsx_body)
     assert m is not None, (
         'could not read the `window.DF_CHARTS = { ... }` export literal in '
         'charts.jsx. The overwhelmingly likely cause is a NESTED BRACE inside '
-        'that literal: the pattern is `[^{}]*` by design, and the identical '
-        'pattern in test_tab_burndown.py:53 would silently yield an empty set '
-        'and fail test_every_labels_prop_sits_on_a_chart_component with an '
+        'that literal: `_dashboard_helpers.py::DF_CHARTS_EXPORT_RE` is '
+        '`[^{}]*` by design. That is ONE shared object every DF_CHARTS '
+        'consumer imports, so a nested brace does not break this module alone '
+        '— test_tab_burndown.py reads the same pattern, where the miss is '
+        'silent and surfaces as an empty export set failing '
+        'test_every_labels_prop_sits_on_a_chart_component with an '
         'unrelated-looking message. Keep every export a bare identifier.'
     )
     return _binding_names(m.group(1))
@@ -250,7 +270,7 @@ def _df_charts_export_names(charts_jsx_body: str) -> set:
 
 def _df_charts_destructure(src: str) -> set:
     """Names ``src`` pulls off ``window.DF_CHARTS`` by destructure, across all of them."""
-    matches = list(_DF_CHARTS_DESTRUCTURE_RE.finditer(src))
+    matches = list(DF_CHARTS_DESTRUCTURE_RE.finditer(src))
     assert matches, (
         'this source no longer has a `const { ... } = window.DF_CHARTS` destructure '
         'at all — either it was rewired onto a namespace binding (`const C = '
@@ -629,15 +649,18 @@ def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
     # discoverable from the failure rather than only from the comment above.
     # It MUST come before `_df_charts_export_names`, which runs the very same
     # `search` and asserts on it internally: ordered the other way this line is
-    # unreachable, because the helper always raises first with a message that
-    # does not name test_tab_burndown.py.
-    assert _DF_CHARTS_EXPORT_RE.search(charts_jsx_body) is not None, (
+    # unreachable, because the helper always raises first with a message scoped
+    # to this module's own read, which does not spell out that the pattern is
+    # shared or where else the same nested brace surfaces.
+    assert DF_CHARTS_EXPORT_RE.search(charts_jsx_body) is not None, (
         'the window.DF_CHARTS export literal no longer parses under the '
-        r'`window\.DF_CHARTS\s*=\s*\{([^{}]*)\}` pattern that '
-        'test_tab_burndown.py:53 also uses — something in it grew a nested '
-        'brace. There it fails as an empty export set and a confusing '
-        '"not a chart component" error far from the cause. Every DF_CHARTS '
-        'export must stay a BARE IDENTIFIER.'
+        r'`window\.DF_CHARTS\s*=\s*\{([^{}]*)\}` pattern of '
+        '`_dashboard_helpers.py::DF_CHARTS_EXPORT_RE` — something in it grew a '
+        'nested brace. That pattern is the single shared object EVERY DF_CHARTS '
+        'consumer imports, so this breaks all of them at once: in '
+        'test_tab_burndown.py the same miss is silent, and surfaces as an empty '
+        'export set and a confusing "not a chart component" error far from the '
+        'cause. Every DF_CHARTS export must stay a BARE IDENTIFIER.'
     )
 
     exported = _df_charts_export_names(charts_jsx_body)
@@ -1063,10 +1086,11 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
     check" and pass forever. So each is run against a frozen source in which it
     must report the bad answer.
 
-    Also pins the ORDERING fix in the routing test: `_DF_CHARTS_EXPORT_RE` is
+    Also pins the ORDERING fix in the routing test: `DF_CHARTS_EXPORT_RE` is
     what fails on a nested-brace literal, and `_df_charts_export_names` raises on
     the identical `search`, so only the standalone assertion placed BEFORE that
-    call can ever be the one that names test_tab_burndown.py in its message.
+    call can ever be the one that spells out the shared-pattern coupling in its
+    message.
     """
     pre_fix = _df_charts_destructure(_PRE_FIX_TABS_DESTRUCTURE)
     assert 'LineChart' in pre_fix, (
@@ -1080,9 +1104,10 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
         'consumer from an unwired one and its assertion is vacuous.'
     )
 
-    assert _DF_CHARTS_EXPORT_RE.search(_NESTED_BRACE_EXPORT) is None, (
+    assert DF_CHARTS_EXPORT_RE.search(_NESTED_BRACE_EXPORT) is None, (
         'the brace-hostile export pattern now matches a literal containing a '
-        'nested brace, so neither this module nor test_tab_burndown.py:53 would '
-        'notice one being introduced — and test_tab_burndown.py would go on to '
-        'fail opaquely on an empty export set.'
+        'nested brace, so NO DF_CHARTS consumer would notice one being '
+        'introduced: they all read the single shared '
+        '`_dashboard_helpers.py::DF_CHARTS_EXPORT_RE`, and test_tab_burndown.py '
+        'would go on to fail opaquely on an empty export set.'
     )

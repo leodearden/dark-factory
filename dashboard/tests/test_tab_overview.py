@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 
 import pytest
+from _dashboard_helpers import strip_js_comments
 
 
 @pytest.fixture(scope='module')
@@ -66,7 +67,7 @@ class TestHostLoadCardStaleness:
 def tab_overview_jsx_code(tab_overview_jsx_body):
     """`tab_overview.jsx` with every comment stripped.
 
-    Copied from `test_tab_memory_evals.py`'s `tab_memory_evals_jsx_code`
+    Same shape as `test_tab_memory_evals.py`'s `tab_memory_evals_jsx_code`
     fixture, for the same reason it was created there: a substring assertion
     over the raw body is satisfied by a MENTION in a comment just as well as by
     a render site.  That false-pass mode is not hypothetical — the memory-evals
@@ -79,18 +80,12 @@ def tab_overview_jsx_code(tab_overview_jsx_body):
     `_phantom_branch` would otherwise anchor on the comment's first mention of
     `is_phantom` rather than on the `if (v?.is_phantom)` render site.
 
-    Safe to strip naively: the source contains no `//` inside a string literal
-    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
-
-    NOTE (task 3287 amendment pass, review suggestion 6): this is the fourth
-    near-identical copy of this comment-stripping fixture in this test package
-    (test_tab_escalations.py:40, test_tab_memory_evals.py:71 and :116).  The
-    right fix is one `strip_js_comments(body)` helper in `conftest.py` /
-    `_dashboard_helpers.py` with the rationale documented once — NOT done here
-    because those files and the other three call sites are outside task 3287's
-    module locks.  Filed as a follow-up.
+    The stripping itself is delegated to `_dashboard_helpers.strip_js_comments`,
+    which is quote-aware (it will not eat a `//` inside a string literal) and
+    whose contract is pinned by `TestStripJsComments` in
+    test_jsx_source_helpers.py.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_overview_jsx_body)
+    return strip_js_comments(tab_overview_jsx_body)
 
 
 class TestReconciliationHealthRowPhantom:

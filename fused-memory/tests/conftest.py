@@ -507,3 +507,54 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
             data_dir=str(tmp_path / 'queue'),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# The integration lane's in-use collection lease (task 4775)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _integration_collection_lease(request):
+    """Hold an in-use lease for the duration of every ``integration`` test.
+
+    ``scripts/cleanup_test_collections.py`` runs from cron every six hours
+    and deletes every collection under ``PREFIXES`` unconditionally.  A live
+    integration test seeds under one of those prefixes, so an unguarded
+    sweep landing between its seed and its assertions empties the corpus out
+    from under it — and leaves nothing behind pointing at the reaper.
+
+    MARKER-KEYED AND AUTOUSE, rather than a module-level
+    ``pytest.mark.usefixtures``.  A module-level opt-in could not reach two
+    of the three modules that need it: ``test_memory_eval_retrieval_probe.py``
+    and ``test_memory_eval_staleness_sweep.py`` deliberately mark
+    ``integration`` PER-TEST, because ``addopts = -m 'not integration'``
+    means a module-level mark would deselect the ~170 pure tests each of
+    them carries (both files say so in a comment).  More importantly, ANY
+    per-module opt-in is a thing a future integration module can forget, and
+    silently forgetting the guard is exactly the failure this exists to
+    prevent — the same argument the reaper's own docstring makes about a
+    prefix coined in one file and reaped by a constant in another.
+
+    Costs an unmarked test nothing: it yields immediately, loads no script
+    and creates no directory, so the merge lane (which runs under
+    ``-m 'not integration'``) never writes into the machine-global lease
+    directory the live cron reads.
+
+    The reaper is loaded LAZILY here rather than at conftest import time, for
+    the reason ``_fm_helpers.qdrant_skipif`` documents for deferring its own
+    probe: a session that never runs an integration test must not pay for
+    it.  Via ``load_script_module`` — do not add another local
+    ``spec_from_file_location`` loader (tasks 3738/3895).
+    """
+    if request.node.get_closest_marker('integration') is None:
+        yield
+        return
+
+    from _fm_helpers import load_script_module  # noqa: PLC0415
+
+    reaper = load_script_module(
+        Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py',
+    )
+    with reaper.hold_lease(owner=request.node.nodeid):
+        yield

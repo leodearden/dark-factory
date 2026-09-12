@@ -17,6 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import httpx
 import pytest
+from _dashboard_helpers import (
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 from dashboard.app import _metrics_loop, _MetricsStore
 from dashboard.config import DashboardConfig
@@ -53,48 +58,6 @@ CREATE TABLE IF NOT EXISTS account_events (
 );
 """
 
-# ---------------------------------------------------------------------------
-# MCP mock helpers (mirrors test_memory.py pattern)
-# ---------------------------------------------------------------------------
-
-
-def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps(inner_dict)},
-            ],
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_init_response(request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_notify_response() -> httpx.Response:
-    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
-
 
 class _ListTicketsHandler:
     """Mock MCP handler that returns a fixed count for list_tickets calls."""
@@ -110,13 +73,13 @@ class _ListTicketsHandler:
         request_id = body.get('id', 1)
 
         if method == 'initialize':
-            return _make_init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return _make_notify_response()
+            return mcp_notify_response()
 
         # tools/call
         self.calls.append(body)
-        return _make_mcp_response(
+        return mcp_tool_response(
             {'count': self.count, 'tickets': [], 'project_id': self.project_id},
             request_id,
         )

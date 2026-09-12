@@ -8,6 +8,12 @@ from __future__ import annotations
 
 import re
 
+from _dashboard_helpers import (
+    DF_CHARTS_DESTRUCTURE_RE,
+    DF_CHARTS_EXPORT_RE,
+    destructure_bindings,
+)
+
 # ---------------------------------------------------------------------------
 # Chart labels/values pairing probe
 # ---------------------------------------------------------------------------
@@ -49,8 +55,6 @@ _TAG_START_RE = re.compile(r'<([A-Za-z_$][\w$]*)')
 _TAG_BOUNDARY_RE = re.compile(r'</?[A-Za-z_$]')
 # A trailing call suffix such as `.map(String)` is presentation, not series identity.
 _CALL_SUFFIX_RE = re.compile(r'\.\w+\([^()]*\)$')
-_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
-_DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
 
 
 def _series_root(expr):
@@ -74,30 +78,18 @@ def _chart_component_aliases(src):
     window.DF_CHARTS` line, so the known-component list is never a hardcoded
     second copy that can drift from what the file actually renders.
     """
-    m = _DF_CHARTS_DESTRUCTURE_RE.search(src)
+    m = DF_CHARTS_DESTRUCTURE_RE.search(src)
     if not m:
         return {}
-    aliases = {}
-    for part in m.group(1).split(','):
-        part = part.strip()
-        if not part:
-            continue
-        canonical, _, alias = part.partition(':')
-        canonical = canonical.strip()
-        aliases[alias.strip() or canonical] = canonical
-    return aliases
+    return {local: canonical for canonical, local in destructure_bindings(m.group(1))}
 
 
 def _df_charts_exports(src):
     """Names exported by charts.jsx's `window.DF_CHARTS = { ... }` line."""
-    m = _DF_CHARTS_EXPORT_RE.search(src)
+    m = DF_CHARTS_EXPORT_RE.search(src)
     if not m:
         return set()
-    return {
-        part.split(':', 1)[0].strip()
-        for part in m.group(1).split(',')
-        if part.strip()
-    }
+    return {canonical for canonical, _local in destructure_bindings(m.group(1))}
 
 
 def _element_at(src, pos):

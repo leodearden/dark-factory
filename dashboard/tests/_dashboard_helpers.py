@@ -7,11 +7,12 @@ the same process.
 
 from __future__ import annotations
 
+import html.parser
 import json
 import re
 import sqlite3
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -669,15 +670,23 @@ async def make_recon_db(
 # assertion must first scope itself to one function's body — otherwise a token
 # appearing anywhere else in the file satisfies it and the test proves nothing.
 #
-# These two helpers used to be private copies in nine test modules (task 3549),
+# These helpers used to be private copies in nine test modules (task 3549),
 # under two names covering FOUR distinct implementations, so a fix had to be
 # applied nine times or not at all.  Their contract lives in
 # test_jsx_source_helpers.py.
 #
-# Both are built on ONE quote-aware scanner, `_scan_js`.  Giving them a scanner
-# each would re-create in miniature exactly the duplication this consolidation
-# removed — and they need the same answer to the same question: which stretches
-# of this text are NOT code?
+# There are three of them now.  `find_function_params` is the paren-depth walk
+# that locates a declaration's parameter list; `extract_function_body` resumes
+# from where it stops to take the body, and test_charts_axis_labels.py's
+# `_extract_signature` takes the params themselves.  Those two return DISJOINT,
+# adjacent slices of the same declaration, so neither can be built on the
+# other — but the walk that finds the boundary between them is one walk, and it
+# lives here rather than in each of them.
+#
+# All three are built on ONE quote-aware scanner, `_scan_js`.  Giving them a
+# scanner each would re-create in miniature exactly the duplication this
+# consolidation removed — and they need the same answer to the same question:
+# which stretches of this text are NOT code?
 # ---------------------------------------------------------------------------
 
 
@@ -813,6 +822,76 @@ def _mask_js(source: str, spans: Sequence[_JsSpan]) -> str:
     return masked
 
 
+def find_function_params(
+    source: str,
+    func_name: str,
+    miss: Callable[[str], BaseException] | None = None,
+) -> tuple[str, int, int]:
+    """Locate ``function <func_name>(``'s parameter list.
+
+    Returns ``(masked, params_start, params_end)`` where *masked* is the
+    `_mask_js` copy the caller keeps walking, ``source[params_start:params_end]``
+    is the parameter-list text with the parens EXCLUDED, and *params_end* is the
+    index OF the matching ``)``.  A caller wanting the body resumes with
+    ``masked.find('{', params_end + 1)``.
+
+    The search and the depth walk run over the mask, so a ``(``, ``)`` or the
+    word ``function`` inside a STRING LITERAL OR A COMMENT is not counted.  The
+    mask is length-preserving and index-aligned, so both indices address the
+    ORIGINAL source and the slice a caller takes is the real text.
+
+    Paren-DEPTH rather than "find the next ``)``": a destructured parameter
+    (``function Foo({ a, b }) {``) carries its own ``{``/``}`` pair inside the
+    parameter list, so a caller that took the first ``{`` after the opening
+    paren would get the destructuring pattern instead of the body.
+
+    The search regex is deliberately NOT line-anchored, so a declaration NESTED
+    inside another function is found (the real instance is
+    ``function statusMatches(s) {`` indented inside ``TasksTab`` in
+    tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally load-bearing in the
+    other direction: without it a prefix sibling declared earlier would shadow
+    the target — ``function TaskGraphEdges(`` at tab_tasks.jsx:33 precedes
+    ``function TaskGraph(`` at :151.
+
+    RAISES on a miss rather than returning a sentinel, because every consumer
+    slices the source by the returned indices and a sentinel would hand them a
+    silently wrong — or empty — slice, over which absence assertions pass
+    vacuously.  *miss* lets a caller supply the exception: `extract_function_body`
+    threads its own four-way wording through it, and test_charts_axis_labels.py
+    keeps a file-specific message.  The default raises ``AssertionError``.
+    """
+    def _default_miss(what: str) -> BaseException:
+        return AssertionError(
+            f'Could not locate the `function {func_name}(` parameter list: '
+            f'{what}. Either the function was removed or renamed, or it was '
+            f'rewritten as an arrow function or a class method — neither is '
+            f'matched, only a named `function` declaration is.'
+        )
+
+    _miss = miss if miss is not None else _default_miss
+
+    spans = _scan_js(source)
+    _assert_js_lexable(source, spans)
+    masked = _mask_js(source, spans)
+
+    match = re.search(rf'\bfunction\s+{re.escape(func_name)}\s*\(', masked)
+    if match is None:
+        raise _miss('no such declaration in this source')
+
+    paren_depth = 1
+    i = match.end()
+    while i < len(masked) and paren_depth > 0:
+        if masked[i] == '(':
+            paren_depth += 1
+        elif masked[i] == ')':
+            paren_depth -= 1
+        i += 1
+    if paren_depth != 0:
+        raise _miss('its parameter list is never closed')
+
+    return masked, match.end(), i - 1
+
+
 def extract_function_body(source: str, func_name: str) -> str:
     """Return the brace-delimited body of a ``function <func_name>(`` declaration.
 
@@ -859,26 +938,11 @@ def extract_function_body(source: str, func_name: str) -> str:
             f'empty body: an absence assertion over one would pass vacuously.'
         )
 
-    spans = _scan_js(source)
-    _assert_js_lexable(source, spans)
-    masked = _mask_js(source, spans)
+    masked, _params_start, params_end = find_function_params(
+        source, func_name, miss=_miss,
+    )
 
-    match = re.search(rf'\bfunction\s+{re.escape(func_name)}\s*\(', masked)
-    if match is None:
-        raise _miss('no such declaration in this source')
-
-    paren_depth = 1
-    i = match.end()
-    while i < len(masked) and paren_depth > 0:
-        if masked[i] == '(':
-            paren_depth += 1
-        elif masked[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        raise _miss('its parameter list is never closed')
-
-    start = masked.find('{', i)
+    start = masked.find('{', params_end + 1)
     if start == -1:
         raise _miss('no opening brace follows its parameter list')
 
@@ -935,3 +999,281 @@ def strip_js_comments(source: str) -> str:
     out.append(source[prev:])
 
     return ''.join(out)
+
+
+# ---------------------------------------------------------------------------
+# window.DF_CHARTS namespace destructure/export parsing.
+#
+# charts.jsx publishes its components as `window.DF_CHARTS = { ... }` and each
+# consumer picks them up with `const { ... } = window.DF_CHARTS`.  Several
+# suites parse those two lines rather than hardcoding a component list, so the
+# list they check against can never drift from what the files actually say.
+#
+# `destructure_bindings` returns (canonical, local) PAIRS, and each caller
+# projects the half it needs.  This is not fussiness — the three consumers it
+# replaces answer OPPOSITE questions over the identical line:
+#   test_charts_consumer_bindings wants the LOCAL/alias name  — what the file
+#       must actually reference, since the alias is what it renders by;
+#   test_charts_axis_labels wants the CANONICAL/source name   — what must
+#       actually exist on the namespace object;
+#   test_tab_burndown wants BOTH, as an alias -> canonical map.
+# On tabs.jsx's real `HistBar: HB` those are 'HB' and 'HistBar'.  A primitive
+# that picked one side would silently INVERT one of the two suites, which is
+# precisely the canonical-vs-alias slip test_charts_consumer_bindings.py
+# freezes a negative-control fixture against.
+#
+# The list shape is load-bearing for the same reason: order is preserved and
+# duplicates are NOT collapsed, because the callers' own collection shapes
+# differ (dict last-wins / ordered list keeping duplicates / deduped set).
+# Share the parser, not the policy — each consumer also keeps its own
+# search-vs-finditer choice and its own miss behaviour.
+#
+# The `[^{}]*` class in both patterns is brace-HOSTILE ON PURPOSE and must NOT
+# be widened.  Two independent reasons, from the two suites that documented it:
+#   - Widening to swallow the other DF_CHARTS access shapes is actively wrong,
+#     not merely extra work: a namespace binding's own name IS used, so a naive
+#     extension flags it as a false positive; and member reads off a namespace
+#     object are not statically enumerable the way a destructure list is.  The
+#     defect these suites exist to catch can only exist in the destructure
+#     shape anyway.
+#   - A NESTED brace must fail loudly at the call site that names the coupling,
+#     rather than yield a half-read binding list that turns a downstream
+#     assertion red with an unrelated-looking message.  Three call sites turn
+#     the miss into a self-naming assertion for exactly that reason.
+#
+# Contract: test_jsx_source_helpers.py::TestDfChartsDestructure.
+# ---------------------------------------------------------------------------
+
+DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
+"""The CONSUMER shape: `const { Foo, Bar: B } = window.DF_CHARTS`."""
+
+DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
+"""The PROVIDER shape: `window.DF_CHARTS = { Foo, Bar }` in charts.jsx."""
+
+
+def destructure_bindings(brace_body: str) -> list[tuple[str, str]]:
+    """Split a destructure/object-literal brace body into (canonical, local) pairs.
+
+    *brace_body* is the inside of the braces — typically ``m.group(1)`` from one
+    of the two patterns above, though the surrounding braces are harmless.
+
+    ``{ StackedAreaChart, HistBar: HB }`` yields
+    ``[('StackedAreaChart', 'StackedAreaChart'), ('HistBar', 'HB')]``: a bare
+    name is BOTH canonical and local; an aliased one splits on the FIRST colon,
+    canonical left and local right.  Both halves are whitespace-stripped, empty
+    parts (a trailing comma, say) produce no entry, and source ORDER is
+    preserved with DUPLICATES INTACT so each caller can impose its own
+    collection shape.
+    """
+    pairs: list[tuple[str, str]] = []
+    for part in brace_body.strip().strip('{}').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        canonical, _, alias = part.partition(':')
+        canonical = canonical.strip()
+        pairs.append((canonical, alias.strip() or canonical))
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# Balanced-delimiter walking, and window.DF_DATA seed-block extraction.
+#
+# The dashboard's served data.js carries its fixture payload as a
+# `window.DF_DATA = { KEY: { ... }, ... }` literal, and several suites need to
+# scope an assertion to ONE key's object so a token elsewhere in the file
+# cannot satisfy it.
+#
+# This used to be a private copy in three test modules (test_tab_escalations,
+# test_tab_memory_evals, test_tab_escalation_analytics) whose code was
+# byte-identical.  Its contract lives in
+# test_jsx_source_helpers.py::TestExtractDfDataBlock.
+#
+# The WALK is separated from the ANCHOR for the same reason `extract_function_body`
+# was rebuilt on `find_function_params`: two helpers needed the identical
+# depth loop with DIFFERENT anchors, so keeping the loop in both meant the
+# string-literal blind spot below was documented — and would have to be
+# fixed — in two places.  `walk_balanced` is the loop;
+# `extract_df_data_block` anchors it on data.js's `key: {` seed form and
+# test_tab_memory_evals.py's `_extract_const_object` anchors it on a
+# module-scope `const NAME = {`/`[` declaration.  Its own contract lives in
+# test_jsx_source_helpers.py::TestWalkBalanced.
+#
+# Two behaviours differ from the sibling `extract_function_body` and are
+# deliberately kept as they were rather than changed in the move: these return
+# `''` SILENTLY on a miss where the other RAISES (every call site already
+# asserts on the returned value, so raising would only relocate their
+# failures), and the depth walk is NOT quote-aware where the other is.  Both
+# are pinned as current behaviour, so upgrading either later is a visible
+# contract edit rather than silent drift.
+# ---------------------------------------------------------------------------
+
+
+def walk_balanced(
+    src: str, start: int, open_char: str = '{', close_char: str = '}'
+) -> str:
+    """Return ``src`` from ``start`` through the delimiter matching ``src[start]``.
+
+    ``start`` must be the index OF the opening delimiter; both callers get it
+    from a regex whose pattern ends on that delimiter (``m.end() - 1``).  The
+    walk counts ``open_char``/``close_char`` so a NESTED pair does not
+    terminate it early — which is the whole reason a ``[^}]*`` regex was
+    rejected for this job.
+
+    Returns the delimited text INCLUDING both delimiters, or the empty string
+    if the opening delimiter is never closed.  Returning ``''`` rather than
+    raising is the deliberate policy of this family (see the banner above).
+
+    Note: the depth walk does not skip delimiters inside JS string literals,
+    so a quoted ``{`` or ``}`` miscounts.  This is the single place that
+    limitation now lives; the callers document what makes it acceptable for
+    the sources they read.
+    """
+    depth = 0
+    for i in range(start, len(src)):
+        c = src[i]
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    return ''
+
+
+def extract_df_data_block(src: str, key: str) -> str:
+    """Return the body of the ``<key>: { ... }`` seed object, braces included.
+
+    Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
+    hands off to ``walk_balanced`` to find the matching close brace.
+    This is brace-aware: a simple regex ``[^}]*`` would stop at the first
+    nested ``}`` and miss later keys.
+    Returns the empty string if no matching block is found.
+
+    Note: ``walk_balanced`` does not skip ``{``/``}`` inside JS string
+    literals.  This is acceptable because the data.js seed block uses simple
+    numeric/array values and does not embed brace characters inside quoted
+    strings.
+    """
+    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
+    if m is None:
+        return ''
+    return walk_balanced(src, m.end() - 1)  # m.end() - 1 is the opening `{`
+
+
+# ---------------------------------------------------------------------------
+# Served-HTML script order.
+#
+# index.html loads its scripts as classic synchronous tags, so DOCUMENT order
+# is EXECUTION order — which is what lets a text-level test assert that a
+# provider script loads before the consumer that dereferences it at module
+# scope.  That equivalence is fragile: `defer`, `async` or `type="module"` on
+# either tag breaks it, and a position comparison over a deferred pair is a
+# false pass, not a failure.  Hence the guard below runs BEFORE the comparison.
+#
+# These three used to be private copies in FIVE test modules
+# (test_esc_flow_diagram, test_index_html, test_tab_escalation_analytics,
+# test_tab_escalations, test_tab_memory_evals), so a fix to the false-pass
+# guard had to be applied five times or not at all.  Their contract lives in
+# test_jsx_source_helpers.py::TestScriptOrderHelpers.
+#
+# The five copies agreed byte-for-byte except in one place, resolved here in
+# favour of the canonical 4-of-5 form: the ORDERING failure message ends with
+# the caller's `consumer_note`, where test_index_html.py alone substituted a
+# fixed two-sentence string.  Nothing pins that message — the only tests that
+# match this helper's failure text (test_index_html.py:303 and :338) pin the
+# GUARD phrases, which are identical across all five — so both variants were
+# green, and this one strictly carries more information: it surfaces the note
+# at index_html's 13 note-passing call sites instead of discarding the notes
+# at the other four modules' 14 sites.  The guard messages themselves are
+# carried over verbatim and MUST stay that way; index_html's
+# `_DEFERRED_CDN_CASES` / `_DEFERRED_TAB_TASKS_CASES` turn them into
+# `pytest.raises(match=...)` patterns.
+# ---------------------------------------------------------------------------
+
+
+class ScriptTagCollector(html.parser.HTMLParser):
+    """Collects the attribute dicts for every <script> start-tag encountered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.script_attrs: list[dict[str, str | None]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag == 'script':
+            self.script_attrs.append(dict(attrs))
+
+
+def find_script_position(
+    body: str, src_prefix: str
+) -> tuple[int, dict[str, str | None]] | None:
+    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
+    starts with ``src_prefix``, or ``None`` if no such tag exists.
+
+    ``index`` is the tag's 0-based position in ``ScriptTagCollector.script_attrs``
+    (document order, since the list preserves insertion order).  Returning attrs
+    alongside the position avoids a second parse when the caller also needs the
+    src or other attributes.
+    """
+    collector = ScriptTagCollector()
+    collector.feed(body)
+    for i, attrs in enumerate(collector.script_attrs):
+        if (attrs.get('src') or '').startswith(src_prefix):
+            return i, attrs
+    return None
+
+
+def assert_script_loads_before(
+    body: str,
+    before_src_prefix: str,
+    after_src_prefix: str,
+    before_label: str,
+    after_label: str,
+    consumer_note: str = '',
+) -> None:
+    """Assert that the script for ``before_src_prefix`` loads BEFORE the
+    script for ``after_src_prefix`` in ``body``.  Combines a
+    defer/async/type=module false-pass guard with the document-order
+    position comparison.
+    """
+    before_result = find_script_position(body, before_src_prefix)
+    assert before_result is not None, (
+        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
+        f'{consumer_note}'
+    )
+    before_pos, before_attrs = before_result
+    before_src = before_attrs.get('src')
+
+    after_result = find_script_position(body, after_src_prefix)
+    assert after_result is not None, (
+        f'<script src="{after_src_prefix}..."> not found in index.html — '
+        f'cannot verify load-order invariant for {before_label}.'
+    )
+    after_pos, after_attrs = after_result
+
+    # Both tags must be classic synchronous scripts — otherwise document order
+    # diverges from execution order and the position comparison below is moot.
+    for _label, _attrs in [
+        (before_label, before_attrs),
+        (after_label, after_attrs),
+    ]:
+        assert 'defer' not in _attrs, (
+            f'{_label} has a defer attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert 'async' not in _attrs, (
+            f'{_label} has an async attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert (_attrs.get('type') or '').lower() != 'module', (
+            f'{_label} has type="module"; ES modules are deferred by default, '
+            f'so document order no longer implies execution order.'
+        )
+
+    assert before_pos < after_pos, (
+        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
+        f'BEFORE {after_label} (position {after_pos}). '
+        f'{consumer_note}'
+    )
