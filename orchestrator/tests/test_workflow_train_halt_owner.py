@@ -16,59 +16,53 @@ See also: test_workflow_halt_owner.py (single-task path cancel-cleanup tests).
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import make_lane
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
-# _FakeMergeWorker — mirrors test_workflow_halt_owner._FakeMergeWorker
+# halt-owner worker -- the REAL lane, not a stub
 # ---------------------------------------------------------------------------
+#
+# The halt-owner contract these tests drive (halt_for_wip / is_wip_halted /
+# halt_owner_esc_id / set_halt_owner / is_halt_owner / unhalt_wip) is declared
+# on the lane itself, so a hand-rolled stub of it can only ever restate the
+# production state machine and then drift from it. A lane on the fakes needs
+# no git or clock to answer any of them.
 
-class _FakeMergeWorker:
-    """Minimal halt-owner state machine — same contract as MergeWorker.
 
-    Mirrors test_workflow_halt_owner._FakeMergeWorker exactly so the two test
-    files remain independently runnable without shared infrastructure.
+def _halt_worker() -> MergeLane:
+    """A lane whose halt-owner surface is the production one."""
+    return make_lane(MagicMock())
+
+
+async def _drive_group_merge(
+    wf: TaskWorkflow, merge_queue: asyncio.Queue, outcome: MergeOutcome,
+) -> WorkflowOutcome | None:
+    """Run the group merge, playing the merger for the request it enqueues.
+
+    Nothing drains *merge_queue* in these tests, so the enqueued request would
+    park forever. Taking it off and resolving it delivers *outcome* through the
+    REAL MergeRequest future the workflow is waiting on, rather than stubbing
+    the workflow's own await seam and never enqueuing at all.
     """
-
-    def __init__(self) -> None:
-        self._halted = False
-        self._owner: str | None = None
-        self.last_unhalt_reason: str | None = None
-
-    @property
-    def is_wip_halted(self) -> bool:
-        return self._halted
-
-    @property
-    def halt_owner_esc_id(self) -> str | None:
-        return self._owner
-
-    def halt_for_wip(self, reason: str) -> None:
-        self._halted = True
-        self._owner = None
-
-    def set_halt_owner(self, esc_id: str) -> None:
-        assert self._owner is None, (
-            f'halt owner already set to {self._owner!r}, '
-            f'refusing to overwrite with {esc_id!r}'
-        )
-        self._owner = esc_id
-
-    def is_halt_owner(self, esc_id: str) -> bool:
-        return self._owner is not None and self._owner == esc_id
-
-    def unhalt_wip(self, reason: str | None = None) -> None:
-        self.last_unhalt_reason = reason
-        self._halted = False
-        self._owner = None
+    run = asyncio.ensure_future(wf._maybe_enqueue_group_merge())
+    try:
+        request = await asyncio.wait_for(merge_queue.get(), timeout=10.0)
+        request.result.set_result(outcome)
+        return await asyncio.wait_for(run, timeout=10.0)
+    finally:
+        run.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +70,14 @@ class _FakeMergeWorker:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def fake_worker() -> _FakeMergeWorker:
-    return _FakeMergeWorker()
+def fake_worker() -> MergeLane:
+    return _halt_worker()
 
 
 @pytest.fixture
 def workflow(
     tmp_path: Path,
-    fake_worker: _FakeMergeWorker,
+    fake_worker: MergeLane,
     mock_orch_config: MagicMock,
 ) -> TaskWorkflow:
     """Minimal TaskWorkflow wired for train halt-owner tests.
@@ -123,7 +117,7 @@ def workflow(
 @pytest.fixture
 def workflow_no_esc(
     tmp_path: Path,
-    fake_worker: _FakeMergeWorker,
+    fake_worker: MergeLane,
     mock_orch_config: MagicMock,
 ) -> TaskWorkflow:
     """Same as workflow but with escalation_queue=None (config-absent deployment)."""
@@ -159,7 +153,7 @@ def workflow_no_esc(
 @pytest.mark.asyncio
 async def test_train_halt_wip_halted_registers_owner(
     workflow: TaskWorkflow,
-    fake_worker: _FakeMergeWorker,
+    fake_worker: MergeLane,
 ) -> None:
     """_escalate_train_halt with wip_halted registers halt owner and returns BLOCKED.
 
@@ -264,7 +258,7 @@ async def test_train_halt_other_outcomes_register_owner(
       (d) escalation category matches expected_category
       (e) detail cites the outcome-specific context (recovery_branch / UU guidance)
     """
-    worker = _FakeMergeWorker()
+    worker = _halt_worker()
     worker.halt_for_wip('test-halt')
 
     queue = EscalationQueue(tmp_path / 'esc')
@@ -336,7 +330,7 @@ async def test_train_halt_other_outcomes_register_owner(
 @pytest.mark.asyncio
 async def test_train_halt_no_escalation_queue_degrades_to_blocked(
     workflow_no_esc: TaskWorkflow,
-    fake_worker: _FakeMergeWorker,
+    fake_worker: MergeLane,
 ) -> None:
     """When escalation_queue=None, _escalate_train_halt degrades to plain BLOCKED.
 
@@ -392,7 +386,7 @@ def _make_consumer_fixture(
     """Build a TaskWorkflow suitable for testing _maybe_enqueue_group_merge.
 
     Extends the _make() pattern from test_workflow_train_completion.py with:
-      - A wired _FakeMergeWorker (optionally pre-halted)
+      - A wired lane (optionally pre-halted)
       - A real EscalationQueue (so _escalate_train_halt end-to-end registers owner)
     """
     from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
@@ -445,12 +439,11 @@ def _make_consumer_fixture(
     queue = EscalationQueue(tmp_path / f'esc-{task_id}')
     merge_queue: asyncio.Queue = asyncio.Queue()
 
-    worker = _FakeMergeWorker()
+    worker = _halt_worker()
     if worker_halted:
         worker.halt_for_wip('test-halt')
-        # If an owner was pre-set (non-None), bypass the assertion
         if worker_owner is not None:
-            worker._owner = worker_owner  # type: ignore[attr-defined]
+            worker.set_halt_owner(worker_owner)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -511,9 +504,7 @@ async def test_consumer_routes_halt_outcome_to_escalate_and_own(
         recovery_branch='wip/recovery-t1',
         merge_sha='abcd1234',
     )
-    wf._await_cancellable = AsyncMock(return_value=halt_outcome)  # type: ignore[method-assign]
-
-    result = await wf._maybe_enqueue_group_merge()
+    result = await _drive_group_merge(wf, merge_queue, halt_outcome)
 
     # Probe fired → owner registered.
     assert worker.halt_owner_esc_id is not None, (
@@ -566,9 +557,7 @@ async def test_consumer_non_halt_blocked_preserves_existing_path(
         status='blocked',
         reason='Train merge rejected: tip branch rebase conflict on main',
     )
-    wf._await_cancellable = AsyncMock(return_value=non_halt_outcome)  # type: ignore[method-assign]
-
-    result = await wf._maybe_enqueue_group_merge()
+    result = await _drive_group_merge(wf, merge_queue, non_halt_outcome)
 
     # Owner stays None — not a halt outcome.
     assert worker.halt_owner_esc_id is None, (
@@ -631,9 +620,7 @@ async def test_consumer_halt_already_owned_skips_escalate(
 
     # A halt-inducing outcome that would trigger _escalate_train_halt if unowned.
     halt_outcome = MergeOutcome(status='wip_halted', overlap_files=['z.py'])
-    wf._await_cancellable = AsyncMock(return_value=halt_outcome)  # type: ignore[method-assign]
-
-    result = await wf._maybe_enqueue_group_merge()
+    result = await _drive_group_merge(wf, merge_queue, halt_outcome)
 
     # (a) Pre-existing owner NOT overwritten.
     assert worker.halt_owner_esc_id == 'esc-preexisting-1', (
@@ -721,6 +708,7 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
     esc_queue.submit = MagicMock()
     esc_queue.get_by_task = MagicMock(return_value=[])
 
+    merge_queue: asyncio.Queue = asyncio.Queue()
     wf = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -729,7 +717,7 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
         briefing=MagicMock(),
         mcp=MagicMock(),
         escalation_queue=esc_queue,  # type: ignore[arg-type]
-        merge_queue=asyncio.Queue(),
+        merge_queue=merge_queue,
         # merge_worker intentionally omitted → None
     )
     wf.artifacts = MagicMock()
@@ -743,9 +731,7 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
     failed_outcome = MergeOutcome(
         'blocked', reason='Train merge rejected: tip branch rebase conflict on main',
     )
-    wf._await_cancellable = AsyncMock(return_value=failed_outcome)  # type: ignore[method-assign]
-
-    result = await wf._maybe_enqueue_group_merge()
+    result = await _drive_group_merge(wf, merge_queue, failed_outcome)
 
     # merge_worker is None → probe is False → plain _mark_blocked.
     mock_mb.assert_awaited_once()
@@ -766,7 +752,8 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
 @pytest.mark.asyncio
 async def test_escalate_train_halt_releases_orphan_halt_on_submit_failure(
     workflow: TaskWorkflow,
-    fake_worker: _FakeMergeWorker,
+    fake_worker: MergeLane,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A pre-engaged merger halt is released when submit() raises inside
     _escalate_train_halt, via the new guard in _submit_halt_owning_escalation.
@@ -792,7 +779,8 @@ async def test_escalate_train_halt_releases_orphan_halt_on_submit_failure(
     workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
 
     try:
-        with pytest.raises(RuntimeError, match='disk full'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'), \
+                pytest.raises(RuntimeError, match='disk full'):
             await workflow._escalate_train_halt(  # type: ignore[attr-defined]
                 MergeOutcome(status='wip_halted', overlap_files=['a.py']),
                 'T-train-1',
@@ -808,6 +796,13 @@ async def test_escalate_train_halt_releases_orphan_halt_on_submit_failure(
     assert fake_worker.halt_owner_esc_id is None, (
         'halt_owner_esc_id must remain None — set_halt_owner was never reached'
     )
-    assert fake_worker.last_unhalt_reason is not None, (
-        'last_unhalt_reason must be set — guard fired on ownerless orphan halt'
+    # The un-halt carried a REASON, which is what says the orphan-halt guard
+    # fired rather than some unrelated resume: the lane logs it.
+    unhalts = [
+        r.getMessage() for r in caplog.records
+        if 'all lanes un-halted' in r.getMessage()
+    ]
+    assert unhalts and unhalts[-1].strip() != 'Merge queue: all lanes un-halted', (
+        f'the un-halt must cite a reason — guard fired on ownerless orphan '
+        f'halt; got {unhalts!r}'
     )

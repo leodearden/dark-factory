@@ -121,18 +121,27 @@ class TestGenericMergeBlockedSurfacing:
         workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
         workflow._write_merge_failure_review = MagicMock()
 
-        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
-            request.result.set_result(generic_outcome)
+        # A REAL queue, so the REAL enqueue path runs and the blocked outcome
+        # this test surfaces is delivered to the request the production code
+        # actually enqueued. Nothing drains the queue, so the test plays the
+        # merger: take the request off, resolve it, let the submit finish.
+        queue: asyncio.Queue = asyncio.Queue()
+        workflow.merge_queue = queue
 
-        workflow.merge_queue = asyncio.Queue()
-        with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
-        ):
-            result = asyncio.run(
+        async def _drive() -> WorkflowOutcome:
+            submit = asyncio.ensure_future(
                 workflow._submit_to_merge_queue(
                     'task/42', pre_rebased=False, merge_phase=True,
                 )
             )
+            try:
+                request = await asyncio.wait_for(queue.get(), timeout=10.0)
+                request.result.set_result(generic_outcome)
+                return await asyncio.wait_for(submit, timeout=10.0)
+            finally:
+                submit.cancel()
+
+        result = asyncio.run(_drive())
 
         assert result == WorkflowOutcome.BLOCKED
 
