@@ -42,6 +42,20 @@ in a hand-authored list.  That also closes the gap 5080 and 5104 were filed in:
 a specimen is protected on the first cycle it is documented, not on the first
 cycle somebody remembers to write a suppression record for it.
 
+COMPOSITE TASK IDS, AND THE DEFECT THIS AVOIDS.  A flag's OWN ``task_id`` is
+routinely comma-joined — 29 of 235 live ``stage1_flag_marker`` ledger rows are,
+and task 3105 appears as ``'3105,5080'``, ``'3105,5080,5104'`` and
+``'3105,4223'`` — so every candidate id is DECOMPOSED before corroboration and
+the counters key on the corroborated COMPONENT, not on the raw string.  That is
+a correctness requirement rather than a refinement, and the reason is visible in
+the sibling: ``flag_dedup.filter_suppressed._keep`` looks its flag's task_id up
+VERBATIM while only the suppression ROW side is decomposed (see
+``_decompose_suppression_task_id``'s docstring, which scopes itself to that
+side), so a suppression row for ``'3105'`` still does not match a finding
+carrying ``'3105,4223'``.  Inheriting that gap would make this guard
+zero-recall on exactly the task it exists to protect.  The flag-side splitter
+followed here is ``_cluster_growth_candidate_task_ids`` (task 3476).
+
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
 ``investigation_outcome`` mem0 kind) and ``services.memory_service`` (for the
@@ -303,23 +317,44 @@ def flag_asserts_stranded(flag: Any) -> bool:
 
 
 
-def _flag_task_id(flag: dict[str, Any]) -> str:
-    """The flag's own task id as a ``str``, or ``''`` when there is none usable.
+def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
+    """Every task id *flag* names, in order, deduped; ``()`` when none is usable.
 
-    Accepts the two shapes ``items_flagged`` actually carries: a ``str`` (taken
-    as written, whitespace-stripped) and an ``int`` straight off a task dict.
-    Everything else — ``None``, a list, a nested dict, a ``bool``, a
-    non-positive int — is NOT a task id and yields ``''``, so a malformed value
-    can never be stringified into a junk backend query.
+    Stage 1 routinely emits COMPOSITE task_ids — 29 of 235 live
+    ``stage1_flag_marker`` ledger rows are comma-joined, and task 3105 is flagged
+    as ``'3105,5080'``, ``'3105,5080,5104'`` and ``'3105,4223'`` — so a verbatim
+    lookup would find nothing for exactly the task this guard exists to protect.
+    Components are stripped, so an LLM-authored ``'3105, 4223'`` resolves too,
+    and a separator-only value (``','``) yields no candidates rather than a junk
+    id.
+
+    This follows :func:`~fused_memory.reconciliation.flag_dedup._cluster_growth_candidate_task_ids`
+    (task 3476), the existing FLAG-side splitter — deliberately not
+    ``_decompose_suppression_task_id``, whose docstring scopes it to the
+    suppression ROW side only.
+
+    Accepts the two value shapes ``items_flagged`` actually carries: a ``str``
+    (split on ``','``) and an ``int`` straight off a task dict.  Everything else
+    — ``None``, a list, a nested dict, a ``bool``, a non-positive int — is NOT a
+    task id and yields ``()``, so a malformed value can never be stringified
+    into a backend query.
 
     Pure, sync, no I/O.
     """
     task_id = flag.get('task_id')
-    if isinstance(task_id, str):
-        return task_id.strip()
     if isinstance(task_id, int) and not isinstance(task_id, bool) and task_id > 0:
-        return str(task_id)
-    return ''
+        return (str(task_id),)
+    if not isinstance(task_id, str):
+        return ()
+    seen: set[str] = set()
+    components: list[str] = []
+    for part in task_id.split(','):
+        component = part.strip()
+        if component and component not in seen:
+            seen.add(component)
+            components.append(component)
+    return tuple(components)
+
 
 
 @dataclass(frozen=True)
@@ -573,13 +608,18 @@ async def filter_preservation_specimen_flags(
     so recurrence history survives until the preservation citation is retired.
     """
     batch = list(flags or ())
-    # One pass fixes each flag's candidate task id (``''`` = not a candidate),
-    # so neither the discriminator nor the id coercion is recomputed below.
-    candidacy: list[tuple[dict[str, Any], str]] = [
-        (flag, _flag_task_id(flag) if isinstance(flag, dict) and flag_asserts_stranded(flag) else '')
+    # One pass fixes each flag's candidate task ids (``()`` = not a candidate),
+    # so neither the discriminator nor the decomposition is recomputed below.
+    candidacy: list[tuple[dict[str, Any], tuple[str, ...]]] = [
+        (
+            flag,
+            _flag_task_ids(flag)
+            if isinstance(flag, dict) and flag_asserts_stranded(flag)
+            else (),
+        )
         for flag in batch
     ]
-    candidates = sorted({task_id for _, task_id in candidacy if task_id})
+    candidates = sorted({tid for _, task_ids in candidacy for tid in task_ids})
     if not candidates:
         return PreservationSuppressionResult(
             kept_flags=batch, suppressed_by_task={}, citations_by_task={},
@@ -599,25 +639,43 @@ async def filter_preservation_specimen_flags(
     kept: list[dict[str, Any]] = []
     suppressed_by_task: dict[str, int] = {}
     citations_by_task: dict[str, str] = {}
-    for flag, task_id in candidacy:
-        verdict = verdicts.get(task_id) if task_id else None
-        citation = verdict.citation if verdict is not None else None
-        if citation is None:
+    kept_task_ids: set[str] = set()
+    for flag, task_ids in candidacy:
+        cited = next(
+            (
+                (tid, verdict.citation)
+                for tid in task_ids
+                if (verdict := verdicts.get(tid)) is not None and verdict.citation is not None
+            ),
+            None,
+        )
+        if cited is None:
             kept.append(flag)
+            kept_task_ids.update(task_ids)
             continue
-        suppressed_by_task[task_id] = suppressed_by_task.get(task_id, 0) + 1
-        citations_by_task[task_id] = citation
+        # Counters key on the CORROBORATED COMPONENT, never the raw composite:
+        # task 3105 is flagged as '3105,5080', '3105,5080,5104' and '3105,4223',
+        # and keying on the string would scatter one task's suppressions across
+        # three counters — the storm threshold would never trip and the citation
+        # audit trail would fragment.
+        cited_task, citation = cited
+        suppressed_by_task[cited_task] = suppressed_by_task.get(cited_task, 0) + 1
+        citations_by_task[cited_task] = citation
         log.info(
-            'preservation_specimen_guard: suppressed flag_type=%r for task %s in '
-            'project %s — corroborated as a preserved specimen by %s',
-            flag.get('flag_type'), task_id, project_id, citation,
+            'preservation_specimen_guard: suppressed flag_type=%r (task_id=%r) for '
+            'task %s in project %s — corroborated as a preserved specimen by %s',
+            flag.get('flag_type'), flag.get('task_id'), cited_task, project_id, citation,
         )
 
+    # Disclose a degraded verdict only for a task that is actually LEFT
+    # UNPROTECTED by it — one whose flags were kept.  A component whose read
+    # failed alongside a sibling that DID corroborate changed no outcome, and
+    # reporting it would raise a false alarm about an unprotected specimen.
     return PreservationSuppressionResult(
         kept_flags=kept,
         suppressed_by_task=suppressed_by_task,
         citations_by_task=citations_by_task,
-        unresolved_task_ids=tuple(unresolved),
+        unresolved_task_ids=tuple(t for t in unresolved if t in kept_task_ids),
     )
 
 
