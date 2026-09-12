@@ -209,18 +209,35 @@ class _FakeEscalationQueue:
         self.submitted.append(esc)
 
 
-def _real_worker(git_ops: GitOps, *, remotes: list[str] | None = None):
+def _real_worker(
+    git_ops: GitOps,
+    *,
+    remotes: list[str] | None = None,
+    escalation_queue: _FakeEscalationQueue | None = None,
+):
     """Bare worker + a REAL HostAllocator sharing worker._runner_quarantine.
 
     Deliberately NOT a MagicMock: slot state and quarantine membership must be
     genuine for these tests to mean anything.
     """
     q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops, q)
+    worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=escalation_queue)
     runners = [_FakeRemoteRunner(n) for n in (remotes if remotes is not None else ['laptop'])]
     alloc = HostAllocator(runners, quarantine=worker._runner_quarantine)
     worker._host_allocator = alloc
     return worker, alloc, {r.name: r for r in runners}
+
+
+async def _quarantine_remote(alloc: HostAllocator, name: str) -> None:
+    """Quarantine a managed remote through the allocator's public pair.
+
+    acquire_remote() then quarantine_and_release() is the sequence production
+    runs on the RUNNER_UNAVAILABLE path, so the shared set is written the way
+    the worker itself writes it.
+    """
+    lease = alloc.acquire_remote()
+    assert lease is not None and lease.name == name
+    await alloc.quarantine_and_release(lease)
 
 
 def _seed_ru(
@@ -292,8 +309,8 @@ class TestSnapshotHostsBlock:
 
     async def test_case_a_ru_quarantined(self, git_ops: GitOps) -> None:
         """(a) Quarantined AND RU-tracked → class 'ru', RU fields populated."""
-        worker, _alloc, _ = _real_worker(git_ops)
-        worker._runner_quarantine.add('laptop')
+        worker, alloc, _ = _real_worker(git_ops)
+        await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop', streak=4, first_unavailable_at=1000.0,
                  reason='ssh: connect timed out')
 
@@ -313,9 +330,8 @@ class TestSnapshotHostsBlock:
         — "Skip divergence-quarantined hosts, not tracked as RunnerUnavailable"),
         so the snapshot can never disagree with the reprobe path.
         """
-        worker, _alloc, _ = _real_worker(git_ops)
-        worker._runner_quarantine.add('laptop')
-        assert 'laptop' not in worker._runner_unavailable
+        worker, alloc, _ = _real_worker(git_ops)
+        await _quarantine_remote(alloc, 'laptop')
 
         laptop = _by_name(worker.snapshot())['laptop']
 
@@ -327,10 +343,10 @@ class TestSnapshotHostsBlock:
 
     async def test_ru_tracked_but_not_quarantined_stays_visible(self, git_ops: GitOps) -> None:
         """Sub-threshold failures are visible: RU fields set, quarantine fields not."""
-        worker, _alloc, _ = _real_worker(git_ops)
+        worker, alloc, _ = _real_worker(git_ops)
         _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=555.0,
                  reason='ssh: connection reset')
-        assert 'laptop' not in worker._runner_quarantine
+        assert not alloc.is_quarantined('laptop')
 
         laptop = _by_name(worker.snapshot())['laptop']
 
@@ -350,12 +366,12 @@ class TestSnapshotHostsBlock:
         worker, alloc, _ = _real_worker(git_ops)
         lease = alloc.acquire_remote()
         assert lease is not None and lease.name == 'laptop'
-        assert not worker._inflight, 'the leak is: slot held, nothing in flight'
 
         snap = worker.snapshot()
         laptop = _by_name(snap)['laptop']
         occ = snap['occupancy']
 
+        assert occ['inflight_total'] == 0, 'the leak is: slot held, nothing in flight'
         # Half 1: the allocator says the slot is held...
         assert laptop['slot_state'] == 'busy'
         assert laptop['quarantined'] is False
@@ -377,7 +393,6 @@ class TestSnapshotHostsBlock:
         """No allocator yet (no verify dispatched) → [] — never a fabricated local."""
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        assert worker._host_allocator is None
 
         snap = worker.snapshot()
 
@@ -406,8 +421,9 @@ class TestSnapshotHostsBlock:
         The literal acceptance clause: `1/2 hosts` is never again ambiguous
         between "quarantined" and "not asked for".
         """
-        worker, alloc, runners = _real_worker(git_ops)
-        worker._escalation_queue = _FakeEscalationQueue()
+        worker, alloc, runners = _real_worker(
+            git_ops, escalation_queue=_FakeEscalationQueue(),
+        )
         worker._unreachable_escalate_after_secs = 5.0
         worker._unreachable_escalate_after_n = 3
 
@@ -489,10 +505,15 @@ class TestSnapshotHostsBlock:
         allocator hosts would make exactly that host invisible — the same blind
         spot this block exists to close.
         """
-        worker, _alloc, _ = _real_worker(git_ops)
+        worker, alloc, _ = _real_worker(git_ops)
         _seed_ru(worker, 'departed-host', streak=7, first_unavailable_at=500.0,
                  reason='host removed from pool')
-        worker._runner_quarantine.add('departed-host')
+        # A departed host has no slot left to acquire, so the same public
+        # writer takes a synthesised lease: the name joins the shared set and
+        # the slot release no-ops.
+        await alloc.quarantine_and_release(
+            HostLease(name='departed-host', runner=MagicMock(), is_local=False)
+        )
 
         snap = worker.snapshot()
         by_name = _by_name(snap)
@@ -668,6 +689,9 @@ class TestSnapshotOccupancyLossless:
 # ── 3275/step-7 RED: heartbeat names a quarantined host inline ────────────────
 
 
+_HEARTBEAT_INTERVAL_S = 1.0
+
+
 def _read_heartbeat_hosts(db_path: Path):
     """Read the persisted merge_heartbeat event's `hosts` key back out of sqlite."""
     conn = sqlite3.connect(str(db_path))
@@ -699,11 +723,21 @@ class TestHeartbeatDegradation:
     RED until 3275/step-8 adds the segment.
     """
 
-    def _worker_with_events(self, git_ops: GitOps, tmp_path: Path, name: str = 'deg'):
+    def _worker_with_events(
+        self,
+        git_ops: GitOps,
+        tmp_path: Path,
+        name: str = 'deg',
+        *,
+        queue: asyncio.Queue[MergeRequest] | None = None,
+        escalation_queue: _FakeEscalationQueue | None = None,
+    ):
         event_store = EventStore(db_path=tmp_path / f'{name}.db', run_id=f'{name}-test')
-        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q, event_store=event_store)
-        worker._heartbeat_interval_s = 1.0
+        q = queue if queue is not None else asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, q, event_store=event_store, escalation_queue=escalation_queue,
+        )
+        worker._heartbeat_interval_s = _HEARTBEAT_INTERVAL_S
         runners = [_FakeRemoteRunner('laptop')]
         alloc = HostAllocator(runners, quarantine=worker._runner_quarantine)
         worker._host_allocator = alloc
@@ -720,9 +754,9 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """A DEGRADED segment names the host and its quarantine class."""
-        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path)
+        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path)
         self._add_local_inflight(worker, config, git_repo)
-        worker._runner_quarantine.add('laptop')
+        await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
@@ -738,9 +772,9 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """The degradation segment is APPENDED, not a replacement."""
-        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg2')
+        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg2')
         self._add_local_inflight(worker, config, git_repo)
-        worker._runner_quarantine.add('laptop')
+        await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
@@ -758,10 +792,9 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """No RU tracker entry → the line says 'divergence', not 'ru'."""
-        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg3')
+        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg3')
         self._add_local_inflight(worker, config, git_repo)
-        worker._runner_quarantine.add('laptop')
-        assert 'laptop' not in worker._runner_unavailable
+        await _quarantine_remote(alloc, 'laptop')
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
@@ -774,9 +807,9 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """Regression guard: nothing quarantined → no DEGRADED substring at all."""
-        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg4')
+        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg4')
         self._add_local_inflight(worker, config, git_repo)
-        assert not worker._runner_quarantine
+        assert not alloc.is_quarantined('laptop')
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
@@ -796,10 +829,12 @@ class TestHeartbeatDegradation:
         occupancy has nothing to say, but the pool IS degraded.  The
         degradation segment must be built independently of that gate.
         """
-        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg5')
-        req = _make_req('hb-queued', 'task/hb-queued', config, git_repo)
-        worker._register_item(req)
-        worker._runner_quarantine.add('laptop')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker, alloc, _runner, _db = self._worker_with_events(
+            git_ops, tmp_path, 'deg5', queue=queue,
+        )
+        queue.put_nowait(_make_req('hb-queued', 'task/hb-queued', config, git_repo))
+        await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
         snap = worker.snapshot()
@@ -818,9 +853,9 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
     ) -> None:
         """The log line must not be the only carrier (structured-facts-at-failure)."""
-        worker, _alloc, _runner, db_path = self._worker_with_events(git_ops, tmp_path, 'deg6')
+        worker, alloc, _runner, db_path = self._worker_with_events(git_ops, tmp_path, 'deg6')
         self._add_local_inflight(worker, config, git_repo)
-        worker._runner_quarantine.add('laptop')
+        await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
         assert worker._maybe_log_queue_heartbeat(time.time()) is True
@@ -838,8 +873,9 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """After the host recovers, the next heartbeat is clean again."""
-        worker, alloc, runner, db_path = self._worker_with_events(git_ops, tmp_path, 'deg7')
-        worker._escalation_queue = _FakeEscalationQueue()
+        worker, alloc, runner, db_path = self._worker_with_events(
+            git_ops, tmp_path, 'deg7', escalation_queue=_FakeEscalationQueue(),
+        )
         worker._unreachable_escalate_after_secs = 5.0
         worker._unreachable_escalate_after_n = 3
         self._add_local_inflight(worker, config, git_repo)
@@ -858,9 +894,11 @@ class TestHeartbeatDegradation:
         await worker._reprobe_quarantined_hosts(now)
 
         caplog.clear()
-        worker._last_heartbeat_at = 0.0
+        # The rate limit is `now - _last_heartbeat_at < _heartbeat_interval_s`,
+        # so a `now` past the interval reopens the gate.
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
-            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+            later = time.time() + 2 * _HEARTBEAT_INTERVAL_S
+            assert worker._maybe_log_queue_heartbeat(later) is True
 
         assert 'DEGRADED' not in _hb_message(caplog), _hb_message(caplog)
         rows = _read_heartbeat_hosts(db_path)
