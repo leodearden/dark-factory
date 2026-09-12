@@ -111,12 +111,11 @@ def _make_worker(
 ) -> SpeculativeMergeWorker:
     """Build a bare worker, optionally carrying an injected event store.
 
+    ``event_store=`` is a real parameter of
+    ``merge_queue.py::SpeculativeMergeWorker.__init__``, so the tests here hold
+    the store they injected and read their speculative events straight off it.
     Local to this file rather than the sibling ``_make_worker``
-    (test_merge_queue_two_layer_integration, merge-lane test group γ4): that one
-    forwards nothing, so an event store could only be attached by assigning
-    ``worker._event_store`` afterwards.  ``event_store=`` is a real constructor
-    parameter (merge_queue.py:9387, stored at :9404), so the tests here hold the
-    store they injected and read their speculative events straight off it.
+    (test_merge_queue_two_layer_integration), which forwards nothing.
     """
     return SpeculativeMergeWorker(git_ops, asyncio.Queue(), event_store=event_store)
 
@@ -124,9 +123,10 @@ def _make_worker(
 def _awaiting_host(worker: SpeculativeMergeWorker) -> list[str]:
     """Task ids of the items parked for re-dispatch, read from ``snapshot()``.
 
-    ``snapshot()`` enumerates the front-priority re-dispatch queue as entries in
-    state ``'awaiting_host'`` (merge_queue.py:13654-13659) — the public view of
-    the parking a voided verdict's re-merged replacement lands in.
+    ``merge_queue.py::SpeculativeMergeWorker.snapshot`` enumerates the
+    front-priority re-dispatch queue as entries in state ``'awaiting_host'`` —
+    the public view of the parking a voided verdict's re-merged replacement
+    lands in.
     """
     return [
         entry['task_id'] for entry in worker.snapshot()['entries']
@@ -653,7 +653,13 @@ class TestCascadeStragglerCaughtComposition:
         await asyncio.sleep(0.05)
         await _drive_cascade_recording(worker)
 
-        assert _DOWN_C in worker._dead_base_commits  # precondition for phase 2
+        # Precondition for phase 2, and both ends of enforcement point (c): the
+        # cascade records the FAILED head's own merge commit dead as well as the
+        # downstream entries' — a straggler stacked directly on the head is
+        # caught at dispatch only if the head's commit is in this set too.
+        dead = worker._dead_base_commits
+        assert _DOWN_C in dead, "the downstream entry's old merge commit must be dead"
+        assert _HEAD_C in dead, "the FAILED head's own merge commit must be dead"
 
         # ── Phase 2: the built-awaiting-host straggler finally dispatches ─────
         # Its base_sha is DOWN_C — the commit the cascade re-merged away.  Give it
