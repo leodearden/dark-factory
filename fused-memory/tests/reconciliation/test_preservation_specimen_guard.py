@@ -1158,3 +1158,173 @@ class TestMaybeEscalatePreservationSuppressionStorm:
 
         assert escalated == []
         assert any('3105' in message for message in records)
+
+
+class TestCompositeFlagTaskIds:
+    """A flag's OWN task_id is routinely comma-joined, and must be decomposed.
+
+    This is a correctness requirement, not a refinement. 29 of 235 live
+    ``stage1_flag_marker`` ledger rows carry a composite task_id, and task 3105
+    specifically appears as ``'3105,5080'``, ``'3105,5080,5104'`` and
+    ``'3105,4223'``. A guard that looked its flag's task_id up VERBATIM would
+    find nothing for those and let the destructive recommendation through on
+    exactly the task it exists to protect.
+
+    ``filter_suppressed._keep`` has precisely this gap — it looks the flag
+    task_id up verbatim while only the suppression ROW side is decomposed. This
+    guard must not inherit it. ``_cluster_growth_candidate_task_ids`` (task
+    3476) is the existing flag-side splitter and the precedent followed here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_composite_with_a_corroborated_component_is_suppressed(self):
+        """The live shape: '3105,4223' where only 3105 is a preserved specimen."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flag = _stranded_flag(task_id='3105,4223')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+
+    @pytest.mark.asyncio
+    async def test_counters_key_on_the_component_not_the_composite(self):
+        """Aggregation must be per REAL task, not per string permutation.
+
+        Task 3105 is flagged as '3105,5080', '3105,5080,5104' and '3105,4223'.
+        Keying on the raw composite would scatter one task's suppressions across
+        three counters, so the storm threshold would never trip and the citation
+        audit trail would fragment.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flags = [
+            _stranded_flag(task_id='3105,5080'),
+            _stranded_flag(task_id='3105,5080,5104'),
+            _stranded_flag(task_id='3105,4223'),
+        ]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 3}
+        assert result.citations_by_task == {
+            '3105': 'd489942a-96b8-45a2-a0a2-fdad36741ff2',
+        }
+
+    @pytest.mark.asyncio
+    async def test_each_component_is_corroborated_independently(self):
+        """Every component is looked up — the citation may be on any of them."""
+        memory_service = _make_memory_service(rows={'4223': [LIVE_MEM0_ROW]})
+        flag = _stranded_flag(task_id='3105,4223')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'4223': 1}
+
+    @pytest.mark.asyncio
+    async def test_composite_of_uncorroborated_ids_is_kept(self):
+        """No component corroborated → the finding still reaches Stage 2."""
+        memory_service = _make_memory_service()
+        flag = _stranded_flag(task_id='4102,4103')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert memory_service.get_memories_by_metadata.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_whitespace_padded_components_resolve(self):
+        """LLM-authored joins carry spaces; '3105, 4223' must still resolve."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105, 4223')],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('task_id', [',', ',,', ' , ', ''])
+    async def test_separator_only_task_id_yields_no_candidates(self, task_id):
+        """A degenerate composite is not a task, and costs no backend read."""
+        memory_service = _make_memory_service()
+        flag = _stranded_flag(task_id=task_id)
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert memory_service.get_memories_by_metadata.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_shared_component_costs_one_read(self):
+        """Memoization keys on the COMPONENT, so a shared id is read once."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flags = [
+            _stranded_flag(task_id='3105,5080'),
+            _stranded_flag(task_id='3105,5104'),
+        ]
+
+        await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        queried = sorted(
+            call.kwargs['filters']['task_id']
+            for call in memory_service.get_memories_by_metadata.await_args_list
+        )
+        assert queried == ['3105', '5080', '5104']
+
+    @pytest.mark.asyncio
+    async def test_one_unreadable_component_does_not_hide_a_citation(self):
+        """A corroborated component still suppresses when a sibling read fails.
+
+        The citation WAS resolved, so the task is not unresolved — degradation
+        is only disclosed when it actually changed the verdict.
+        """
+        def _scroll(project_id, filters):
+            if filters['task_id'] == '5080':
+                raise TimeoutError('down')
+            return {'3105': [LIVE_MEM0_ROW]}.get(filters['task_id'], [])
+
+        memory_service = MagicMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+        memory_service.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,5080')],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+
+    @pytest.mark.asyncio
+    async def test_unreadable_component_of_an_uncorroborated_flag_is_disclosed(self):
+        """With no citation anywhere, an unreadable component IS disclosed."""
+        memory_service = _make_memory_service(
+            mem0_error=TimeoutError('down'), entity_error=RuntimeError('also down'),
+        )
+        flag = _stranded_flag(task_id='4102,4103')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.unresolved_task_ids == ('4102', '4103')
