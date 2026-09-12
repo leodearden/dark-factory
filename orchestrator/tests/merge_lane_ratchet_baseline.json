@@ -1437,7 +1437,7 @@
     "orchestrator/tests/test_merge_queue_lifecycle_registry.py": {"patch_targets": [], "private_reads": 158},
     "orchestrator/tests/test_merge_queue_main_health.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_main_health_deferred.py": {"patch_targets": ["_run_post_merge_verify", "_spawn_main_health_probe", "verify_failure_is_preexisting_on_main"], "private_reads": 19},
-    "orchestrator/tests/test_merge_queue_metrics.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 51},
+    "orchestrator/tests/test_merge_queue_metrics.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_multihost_wiring.py": {"patch_targets": ["LocalRunner", "_build_remote_runners", "_derive_task_files_from_git", "_maybe_run_drift_check", "_maybe_schedule_shadow_compare", "_run_drift_check", "_run_post_merge_verify", "_run_unscoped_typechecks", "build_merge_verify_spec", "logger.warning", "resolve_local_df_checkout", "run_scoped_verification"], "private_reads": 363},
     "orchestrator/tests/test_merge_queue_no_landings_breaker.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_orphan_reaper.py": {"patch_targets": ["_HEARTBEAT_POLL_S", "os.scandir"], "private_reads": 40},
