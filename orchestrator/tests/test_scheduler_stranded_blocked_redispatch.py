@@ -1418,44 +1418,61 @@ class TestBlockedRedispatchConsumesTheSharedPredicate:
         assert rows[0]['data']['reason'] == 'escalation_store_unavailable'
 
 
-@pytest.mark.asyncio
-class TestHarnessAndSchedulerCannotDriftAgain:
-    """THE parity signal: both mechanisms ask ONE function, and agree.
+#: The six record shapes the two sites used to disagree about.
+_PARITY_FIXTURES = [
+    ('empty', []),
+    ('lone-remediable', [_esc('esc-1', category=_REMEDIABLE)]),
+    ('lone-human-concern', [_esc('esc-1', category='task_failure')]),
+    ('mixed', [
+        _esc('esc-1', category=_REMEDIABLE),
+        _esc('esc-2', category='task_failure'),
+    ]),
+    ('info-only', [_esc('esc-1', severity='info', category='task_failure')]),
+    ('dead-l0', [_esc('esc-1', level=0, category='task_failure')]),
+]
+_PARITY_IDS = [label for label, _ in _PARITY_FIXTURES]
 
-    Asserted structurally rather than by re-driving the harness sweep here: a
-    behavioural comparison would only prove the two agreed on the six fixtures
-    it happened to try, whereas proving they call the SAME function with
-    equivalent arguments makes disagreement impossible for ANY input.
+
+class TestBothSitesNameTheSamePredicate:
+    """Parity, asserted STRUCTURALLY — the half no fixture list can weaken.
+
+    A behavioural comparison only proves the two agreed on the cases it
+    happened to try; function IDENTITY makes disagreement impossible for ANY
+    input, which is what "the drift cannot silently reopen" requires.
     """
 
-    #: The six record shapes the two sites used to disagree about.
-    _FIXTURES = [
-        ('empty', []),
-        ('lone-remediable', [_esc('esc-1', category=_REMEDIABLE)]),
-        ('lone-human-concern', [_esc('esc-1', category='task_failure')]),
-        ('mixed', [
-            _esc('esc-1', category=_REMEDIABLE),
-            _esc('esc-2', category='task_failure'),
-        ]),
-        ('info-only', [_esc('esc-1', severity='info', category='task_failure')]),
-        ('dead-l0', [_esc('esc-1', level=0, category='task_failure')]),
-    ]
-
-    def test_both_sites_name_the_same_function(self) -> None:
+    def test_the_scheduler_imports_the_shared_predicate(self) -> None:
         from orchestrator import recovery_pins
         from orchestrator import scheduler as scheduler_mod
-        from orchestrator import task_ground_truth as tgt
 
         assert (
             scheduler_mod.records_pin_blocked_recovery
             is recovery_pins.records_pin_blocked_recovery
-        ), 'the scheduler must import the shared predicate, not a local copy'
+        ), 'the scheduler must import the shared predicate, not keep a local copy'
+
+    def test_the_harness_adapter_wraps_the_shared_predicate(self) -> None:
+        from orchestrator import recovery_pins
+        from orchestrator import task_ground_truth as tgt
+
         assert (
             tgt.records_pin_blocked_recovery
             is recovery_pins.records_pin_blocked_recovery
         ), 'the harness reaches the same function through report_pins_blocked_recovery'
 
-    @pytest.mark.parametrize('label,rows', _FIXTURES, ids=[f[0] for f in _FIXTURES])
+
+@pytest.mark.asyncio
+class TestHarnessAndSchedulerCannotDriftAgain:
+    """THE parity signal, behavioural half: each side ACTS on that one answer.
+
+    Identity of the predicate (above) is not enough on its own — a site could
+    call it and then ignore the result.  These pin that the disposition each
+    mechanism reaches IS the shared answer, over the six record shapes the two
+    used to disagree about.
+    """
+
+    _FIXTURES = _PARITY_FIXTURES
+
+    @pytest.mark.parametrize('label,rows', _PARITY_FIXTURES, ids=_PARITY_IDS)
     async def test_the_scheduler_acts_on_exactly_that_answer(
         self, tmp_path: Path, label: str, rows: list,
     ) -> None:
@@ -1476,7 +1493,7 @@ class TestHarnessAndSchedulerCannotDriftAgain:
         )
         assert flipped is not expected_pin, label
 
-    @pytest.mark.parametrize('label,rows', _FIXTURES, ids=[f[0] for f in _FIXTURES])
+    @pytest.mark.parametrize('label,rows', _PARITY_FIXTURES, ids=_PARITY_IDS)
     async def test_the_harness_adapter_returns_exactly_that_answer(
         self, label: str, rows: list,
     ) -> None:

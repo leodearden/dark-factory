@@ -60,6 +60,7 @@ from orchestrator.recovery_emission import (
     should_emit_event,
     veto_signature,
 )
+from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
@@ -6479,10 +6480,20 @@ class Scheduler:
         cancelled/parked it and its finally-block teardown may still be
         writing state, mirrors harness Fix #1b gate 4), not within its
         dispatch/requeue cooldown window, genuinely stranded
-        (claimant-liveness), deps resolved, and no open escalation (mirrors
-        Fix #1b gate 5 — protects a non-deterministic human ``/unblock``
-        park, whose null claimant is otherwise indistinguishable from a
-        crash-strand).
+        (claimant-liveness), deps resolved, and no open escalation that PINS
+        (mirrors Fix #1b gate 5 — protects a non-deterministic human
+        ``/unblock`` park, whose null claimant is otherwise indistinguishable
+        from a crash-strand).
+
+        "Pins" is ``recovery_pins.records_pin_blocked_recovery``, shared
+        verbatim with the harness blocked arm (task 3541, INV-5).  It
+        discriminates three pin classes and one category relaxation: a
+        QUEUE_HANDOFF (L1/L2, or an L0 whose filer is still live) pins; a
+        DEAD_L0 does not, because its handoff has no consumer left; an
+        ``info`` record never pins at any level; and a record set consisting
+        ENTIRELY of merge-remediable categories does not pin, because those
+        records ASK for the remediation this sweep performs.  The precedence
+        chain itself is documented once, in ``escalation/pins.py``.
 
         Fails safe (never flips) when the sweep is disabled via
         ``config.stranded_blocked_redispatch_enabled``, when
@@ -6610,15 +6621,42 @@ class Scheduler:
                         rows=None,
                     )
                     continue
-                # The veto predicate is `bool(rows)`, VERBATIM.  Task 3541
-                # owns relaxing it to `classify_pins(...).pins` — which would
-                # stop an info-severity record vetoing here, a real
-                # disposition change — and owns the resulting deliberate
-                # difference from the already-landed dispatch gate's
-                # predicate.  Until then classify_pins is consulted inside the
-                # emission adapter for id bucketing only, never for this
-                # answer.
-                if rows:
+                # THE VETO — the SHARED predicate (task 3541, INV-5), not a
+                # local `bool(rows)`.  This sweep and
+                # `Harness._reconcile_one_stranded`'s blocked arm decide the
+                # same question ("do this blocked task's open records pin it
+                # against its sweep-side remediation?") and used to answer it
+                # differently: the harness relaxed on merge-remediable
+                # categories (PRD leaf δ) while this site could not, because
+                # the relaxation was a private `Harness` staticmethod no
+                # scheduler import could reach.  Both now call
+                # `recovery_pins.records_pin_blocked_recovery`, so the
+                # relaxation matches BY CONSTRUCTION rather than by two
+                # maintainers keeping two copies in step.  The two mechanisms
+                # still TAKE different actions — the harness re-files or marks
+                # done, this sweep re-pends; only the predicate is unified.
+                #
+                # Consequences at this site, all deliberate: a lone
+                # `stranded_blocked` record — the reaper's OWN "please re-pend
+                # this task" request, which is exactly what this sweep
+                # performs — no longer vetoes its own remediation; an
+                # info-severity ANNOTATION no longer vetoes (PRD boundary #8);
+                # and a blocking L0 no longer vetoes because its filer is
+                # provably dead.  Every escape hatch against a redispatch loop
+                # is untouched above: the kill switch, the `_dispatched`
+                # membership gate, `workflow_cancel_recent`, the requeue
+                # cooldown, `_deps_satisfied`, and the reblock guard.
+                #
+                # `live_claimant=False` is EXACT, not an assumption:
+                # `is_stranded_blocked(task, ...)` returned True immediately
+                # above, so no incarnation holds this task and `classify_pins`
+                # link 4 reaches its identity-independent branch.
+                #
+                # `rows` is never `None` here — the `except` arm above already
+                # emitted and `continue`d — so the predicate's
+                # always-pin-on-unreadable-store branch is a contract this site
+                # RELIES on but never reaches.
+                if records_pin_blocked_recovery(tid, rows, live_claimant=False):
                     described.add(tid)
                     self._emit_recovery_disposition(
                         tid,
