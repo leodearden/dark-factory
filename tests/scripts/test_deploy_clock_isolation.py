@@ -51,6 +51,7 @@ from df_pytest_isolation import (  # noqa: E402
     CLOCK_PROVENANCE_SOURCE_KEY,
     PROTECTED_DEPLOY_CLOCK_RELPATHS,
     PYTEST_SESSION_TOKEN_ENV,
+    DeployClockRedeployWarning,
     clock_stamp_provenance,
     deploy_clock_change_report,
     deploy_clock_guard_roots,
@@ -1379,6 +1380,14 @@ class TestTheGuardAttributesTheStampEndToEnd:
         is the silent fail-soft this repo's invariants forbid — so the assertion
         is on the nested run's own output, which is where an operator would read
         it.
+
+        The CATEGORY is asserted alongside the message because the category is
+        the whole reason the class exists: a suite wanting the old strictness
+        filters exactly this one warning to an error, and a warn site that
+        drifted to a bare ``UserWarning`` would take that filterability away
+        while leaving the class definition — and every other test here — green.
+        pytest's warnings summary renders ``<file>:<line>: <Category>: <msg>``,
+        so the run output pins it at the warn site rather than at the class.
         """
         result = _nested_run(tmp_path, scenario='external')
         combined = result.stdout + result.stderr
@@ -1391,6 +1400,11 @@ class TestTheGuardAttributesTheStampEndToEnd:
         assert 'a REAL deploy stamped a protected clock' in combined, (
             'the benign verdict was not surfaced in the run output; a warning '
             f'nobody can read is indistinguishable from silence. output={combined!r}'
+        )
+        assert DeployClockRedeployWarning.__name__ in combined, (
+            'the benign verdict surfaced under some OTHER warning category, so '
+            'the one filter a strict suite would write no longer selects it. '
+            f'output={combined!r}'
         )
         assert 'falsified a REAL deploy clock' not in combined, combined
 
