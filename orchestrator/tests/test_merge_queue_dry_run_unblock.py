@@ -22,6 +22,7 @@ import contextlib
 import os
 import shutil
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -110,7 +111,7 @@ class _SpawningVerifier(FakeVerifier):
     in ``investigations``.
     """
 
-    def dry_run_unblock(self, **investigation: object):
+    def dry_run_unblock(self, **investigation: Any):
         self.investigations.append(investigation)
         return PRODUCTION_VERIFIER.dry_run_unblock(**investigation)
 

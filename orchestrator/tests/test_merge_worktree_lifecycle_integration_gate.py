@@ -314,12 +314,11 @@ from _orch_helpers import make_placeholder_future
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
-from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
-    PRODUCTION_CLOCK,
+from orchestrator.merge_lane import (
     coalesce_or_enqueue_merge_request,
     retire_cancelled_merge_request,
 )
+from orchestrator.merge_queue import PRODUCTION_CLOCK
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_types import (
     InFlightMergeRegistry,
@@ -976,7 +975,7 @@ class _TreeLivenessVerifier(FakeVerifier):
         self.observations: list[bool] = []
 
     async def run_scoped(  # type: ignore[override]
-        self, worktree: Path, *args: object, **options: object,
+        self, worktree: Path, *args: Any, **options: Any,
     ) -> VerifyResult:
         self.worktrees.append(worktree)
         self.observations.append(worktree.exists())
@@ -1131,7 +1130,11 @@ class TestFiveThreeTwoSixReplayGate:
         release = asyncio.Event()
         verifier = _TreeLivenessVerifier(entered, release)
         escalations = RecordingEscalations()
-        lane: MergeLane | None = None
+        # A facade name cannot be used in a union annotation: the exports
+        # resolve through `orchestrator.merge_lane.__getattr__`, so
+        # `MergeLane | None` narrows to a bare None and pyright then rejects
+        # every attribute access on it.
+        lane: Any = None
         worker_task: asyncio.Task | None = None
 
         try:
