@@ -6,7 +6,10 @@ Task 3473. ``verify_command_timeout_secs`` is a PER-COMMAND budget, and
 of every other module's and of the repo root's. A module that declares none
 does NOT get something "inherit-ish": per ``verify._resolve_verify_timeout``'s
 cascade it is a hard fall-through to ``config.verify_command_timeout_secs``,
-the whole-fleet ceiling (3600s warm). Declaring is the only way to narrow.
+the whole-fleet ceiling — an OPERATOR-TUNABLE value (3600s warm when this guard
+was written; raised since, see ``RULED_INTERIM_BUDGET_EXCEPTIONS``) sized for
+nine subprojects chained into ONE shell command. Declaring is the only way to
+narrow.
 
 Before this task, seven of nine discovered module configs declared nothing, so
 a hang in any of them surfaced only after the whole-fleet ceiling — about an
@@ -19,8 +22,9 @@ THAT LAST GAP IS NOW CLOSED (task 5422). ``orchestrator`` declares its own
 budget, ``MODULE_BUDGET_EXCLUSIONS`` is EMPTY, and every discovered module
 config declares a warm budget — so this guard's advertised reach and its real
 reach are the same again, which is the property the SCOPE note below insists
-on. Orchestrator's budget is the one that is deliberately ABOVE the fleet
-ceiling rather than below it; see ``RULED_INTERIM_BUDGET_EXCEPTIONS``.
+on. Orchestrator's budget is the one that deliberately does NOT narrow below
+the fleet ceiling — it sits AT OR ABOVE it, and which of the two it is today is
+the operator's doing; see ``RULED_INTERIM_BUDGET_EXCEPTIONS``.
 
 GENERALISED FROM, not imported from, two sibling guards:
 ``tests/scripts/test_scripts_module_config.py::
@@ -224,9 +228,9 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 fleet census of the BYTE-IDENTICAL orchestrator verify
 #                 command across .worktrees/*/.task/verify/*.summary.json —
 #                 n=92 runs, 19 timed out, six GREEN completions above the
-#                 3600s budget at 5288 / 5269 / 5196 / 5093 / 4991 / 4708s,
-#                 three of them on 2026-09-08 alone. W = 5288.0, the max
-#                 green, per this table's worst-RUN rule. RE-MEASURE BY
+#                 THEN-3600s budget at 5288 / 5269 / 5196 / 5093 / 4991 /
+#                 4708s, three of them on 2026-09-08 alone. W = 5288.0, the
+#                 max green, per this table's worst-RUN rule. RE-MEASURE BY
 #                 REPEATING THAT CENSUS over the same summary.json corpus, so
 #                 the next figure is a repeat rather than a re-derivation.
 #                 The census is LATER than, and larger than, the
@@ -269,17 +273,30 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 #
 # `orchestrator` is RULED BY LEO (esc-4211-6, 2026-09-07 option B, unstuck
 # 2026-09-11 option C, recorded on task 3353; split out as task 5422) to
-# carry a per-module budget of 7200s — DELIBERATELY ABOVE the 3600s
-# repo-root whole-fleet ceiling, the opposite of every other module's
-# per-module budget, which narrows below it. That is the deliberate remedy
-# for false infra_timeouts on healthy branches (green runs have reached
-# ~5288s, already past 3600s), not a relabelling — so assertion (c), which
-# exists to stop a per-module budget from merely restating the fleet
-# ceiling, does not apply: this module's budget is materially DIFFERENT
-# from the ceiling (above it, not equal to it). Assertion (b) would also
-# reject it: min_budget(5288.0) demands ~10500s, sizing against an
-# unsharded, still-growing suite — exactly the moving-target problem
+# carry a per-module budget of 7200s, which deliberately does NOT narrow
+# below the repo-root whole-fleet ceiling — the opposite of every other
+# module's per-module budget. That is the remedy for false infra_timeouts
+# on healthy branches (green runs have reached ~5288s, past the 3600s
+# ceiling in force when the ruling was made), so assertion (c) — strictly
+# below the fleet ceiling — cannot be satisfied here without re-creating
+# the defect the ruling exists to remove. Assertion (b) would also reject
+# it: min_budget(5288.0) demands ~10500s, sizing against an unsharded,
+# still-growing suite — exactly the moving-target problem
 # MODULE_BUDGET_EXCLUSIONS declined to chase while task 3353 owned it.
+#
+# AT the ceiling or ABOVE it is the OPERATOR's choice, not this module's,
+# which is why the excepted branch below compares with `>=` and not `>`.
+# The ruling set 7200 against a 3600s fleet ceiling; commit 36c4c71eb4
+# (Leo, 2026-09-12) then raised the FLEET ceiling 3600 -> 7200 as a stopgap
+# — dark-factory-orchestrator.yaml says in as many words that "7200 is the
+# figure already ruled as task 3353 scope B" — so the two coincide TODAY.
+# That same operator note carries the revert condition, "when ... the
+# module declares its own budget, put these back to 3600/5400", which is
+# this very declaration, after which they separate again. A `>` here is
+# red today and a `==` red after the revert; `>=` is the relation the
+# RULING implies in both worlds, and it is the ruling this dict excepts
+# against. Same lesson as commit e9d1055ed8: a guard must not pin an
+# operator-tunable live yaml value.
 #
 # INTERIM, AND NOT YET D-DERIVED (Leo's ruling D16', 2026-09-08): 7200 is an
 # operator estimate — ~1.6x headroom over the ~4400s loaded extrapolation
@@ -291,7 +308,7 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 #
 # WHAT THE EXCEPTION DOES NOT BUY. It drops (b)'s ~2x min_budget MULTIPLE,
 # not the measurement floor underneath it. The excepted branch asserts the
-# declared budget is above the fleet ceiling AND still clears
+# declared budget is at or above the fleet ceiling AND still clears
 # MEASURED_MODULE_SUITE_WORST_SECS[prefix] — so this dict cannot be used to
 # park a budget inside the band where green runs have already been observed
 # to land, which is the failure mode the ruling exists to remove and the one
@@ -305,8 +322,9 @@ RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
         "esc-4211-6 (2026-09-07 option B / 2026-09-11 option C), Leo's ruling "
         "D16' (2026-09-08): verify_command_timeout_secs=7200 is a deliberate, "
         'documented INTERIM exception to assertions (b) and (c) — a budget '
-        'above the fleet ceiling to stop false infra_timeouts on a suite '
-        "whose green runs already exceed it — and is NOT yet D-derived. Task "
+        'that does not narrow below the fleet ceiling, to stop false '
+        'infra_timeouts on a suite whose green runs already exceed the 3600s '
+        "ceiling the ruling was made against — and is NOT yet D-derived. Task "
         '3353 scope D refines it with a measured distribution.'
     ),
 }
@@ -388,13 +406,14 @@ def test_module_carries_its_own_measured_verify_budget(
       dropping (b) for cheap modules would make the parametrization
       non-uniform.
     * ASSERTIONS (b) AND (c) HAVE ONE RULED, DOCUMENTED EXCEPTION: `orchestrator`
-      (see ``RULED_INTERIM_BUDGET_EXCEPTIONS``). Its budget is deliberately
-      ABOVE the fleet ceiling rather than derived from ``min_budget``, per
-      Leo's ruling esc-4211-6 — so this test asserts the RULING's own shape
-      for that one module instead of (b)/(c), and every other assertion
-      ((a), (d), (e), (f)) still runs unchanged for it. THE EXCEPTION IS NOT A
+      (see ``RULED_INTERIM_BUDGET_EXCEPTIONS``). Its budget deliberately does
+      NOT narrow below the fleet ceiling, and is an operator estimate rather
+      than derived from ``min_budget``, per Leo's ruling esc-4211-6 — so this
+      test asserts the RULING's own shape for that one module instead of
+      (b)/(c), and every other assertion ((a), (d), (e), (f)) still runs
+      unchanged for it. THE EXCEPTION IS NOT A
       FREE PASS: the replacement is TWO assertions, not none — the budget must
-      sit above the fleet ceiling AND still clear the module's own worst
+      sit AT OR ABOVE the fleet ceiling AND still clear the module's own worst
       recorded green run. Only (b)'s ~2x multiple is dropped, and only because
       the ruling rejected it as a moving target; the measurement floor itself
       survives, which is what stops a later edit from lowering the budget back
@@ -456,18 +475,21 @@ def test_module_carries_its_own_measured_verify_budget(
         )
     else:
         # RULED EXCEPTION (see RULED_INTERIM_BUDGET_EXCEPTIONS for the full
-        # reason): this module's budget is DELIBERATELY ABOVE the fleet
-        # ceiling rather than narrower than it — the opposite of (c) — and is
-        # an operator estimate rather than min_budget(worst) — the opposite
-        # of (b). Assert the ruling's own shape instead of skipping outright,
-        # so this branch still checks something.
-        assert mc.verify_command_timeout_secs > root_warm, (
+        # reason, including why this comparison is `>=` and not `>`): this
+        # module's budget deliberately does NOT narrow below the fleet ceiling
+        # — the opposite of (c) — and is an operator estimate rather than
+        # min_budget(worst) — the opposite of (b). Assert the ruling's own
+        # shape instead of skipping outright, so this branch still checks
+        # something. root_warm is operator-tunable and currently sits ON this
+        # module's ruled figure; the floor that actually holds the budget up
+        # is the measurement assertion below, not this one.
+        assert mc.verify_command_timeout_secs >= root_warm, (
             f'{prefix} is listed in RULED_INTERIM_BUDGET_EXCEPTIONS '
-            f'({ruled_exception}) as a budget deliberately ABOVE the '
-            f'repo-root ceiling, but its declared verify_command_timeout_secs='
-            f'{mc.verify_command_timeout_secs} is not greater than '
-            f'{root_warm}. Either the ruling no longer applies — narrow the '
-            f'budget below {root_warm} and remove this prefix from '
+            f'({ruled_exception}) as a budget that deliberately does NOT '
+            f'narrow below the repo-root ceiling, but its declared '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs} is '
+            f'below verify_command_timeout_secs={root_warm}. Either the ruling '
+            f'no longer applies — remove this prefix from '
             f'RULED_INTERIM_BUDGET_EXCEPTIONS so (b)/(c) apply in full — or '
             f'{prefix}/orchestrator.yaml regressed'
         )
@@ -477,11 +499,14 @@ def test_module_carries_its_own_measured_verify_budget(
         # rejected as a moving target against an unsharded, still-growing
         # suite — but it deliberately does NOT drop the measurement floor
         # altogether. Without this line the only surviving floor would be
-        # root_warm, and root_warm sits INSIDE the band where green runs have
-        # already been observed to land (5288/5269/5196/5093/4991/4708s; see
-        # the MEASURED_MODULE_SUITE_WORST_SECS caveat for the census). A
-        # future edit lowering the budget to, say, 3700 would then keep this
-        # guard green while re-manufacturing the exact false infra_timeout the
+        # root_warm — an operator-tunable value that has sat INSIDE the band
+        # where green runs have already been observed to land, and is due to
+        # again under commit 36c4c71eb4's own revert condition: at the 3600s
+        # ceiling this exception was ruled against, green runs of
+        # 5288/5269/5196/5093/4991/4708s were already clearing it (see the
+        # MEASURED_MODULE_SUITE_WORST_SECS caveat for the census). A future
+        # edit lowering the budget to, say, 3700 would then keep this guard
+        # green while re-manufacturing the exact false infra_timeout the
         # ruling exists to remove. This is also what makes this module's W
         # entry load-bearing rather than decorative: everywhere else in the
         # excepted branch, `worst` reaches only assertion (a)'s message.

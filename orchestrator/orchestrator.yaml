@@ -17,14 +17,25 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/"
 # recorded alongside) is what refines it later. No later reader should
 # mistake this for a measured budget.
 #
-# DELIBERATELY ABOVE the repo-root whole-fleet ceiling (dark-factory-
-# orchestrator.yaml verify_command_timeout_secs: 3600) — the opposite of
-# every other module's per-module budget, which narrows below it. This is
-# the deliberate remedy for false infra_timeouts on healthy branches, not a
-# relabelling: green orchestrator runs have reached ~5288s, already past the
-# 3600s fleet ceiling this module's verify also has to clear, so a budget
-# below that ceiling would make the false-timeout failure MORE common, not
-# less. The documented, single-entry exception this overrides — for both the
+# DELIBERATELY NOT NARROWER than the repo-root whole-fleet ceiling — the
+# opposite of every other module's per-module budget, which narrows below
+# it. Green orchestrator runs have reached ~5288s, past the 3600s fleet
+# ceiling in force when this was ruled, so a budget below that ceiling would
+# make the false-timeout failure MORE common, not less.
+#
+# EQUAL TO THAT CEILING TODAY RATHER THAN ABOVE IT, and that is the
+# OPERATOR's doing, not this module's: commit 36c4c71eb4 (Leo, 2026-09-12)
+# raised the fleet ceiling 3600 -> 7200 as a stopgap, recording in
+# dark-factory-orchestrator.yaml that "7200 is the figure already ruled as
+# task 3353 scope B" — this figure. That same note states the revert
+# condition, "when ... the module declares its own budget, put these back to
+# 3600/5400" — i.e. this declaration — so the two are expected to separate
+# again. THE DECLARATION IS NOT REDUNDANT WHILE THEY COINCIDE: the fleet
+# ceiling is operator-tunable and this figure is RULED, so the module keeps
+# 7200 through that revert instead of falling back to 3600 with it. The
+# guard below therefore asserts at-or-above rather than strictly-above.
+#
+# The documented, single-entry exception this overrides — for both the
 # "at least ~2x worst measured" and the "strictly below the fleet ceiling"
 # checks — lives in tests/scripts/test_module_verify_budgets.py::
 # RULED_INTERIM_BUDGET_EXCEPTIONS.
@@ -35,19 +46,24 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/"
 # WARM-ONLY REMEDY, DELIBERATELY — do not read the value below as covering a
 # cold verify. Per verify._resolve_verify_timeout's cascade an unset module
 # cold knob does NOT inherit the warm budget: a COLD verify of this module
-# falls through to the repo-root verify_cold_command_timeout_secs (5400),
-# which is BELOW the 7200 declared here and only ~2% above the 5288s worst
-# observed green WARM run. A cold run also pays verify_cold_preprovision_
-# command (`uv sync --all-packages && npm ci ...`) and unwarmed caches on top,
-# so it is strictly COSTLIER than the warm path it already cannot reliably
-# fit. THE CONSEQUENCE, STATED RATHER THAN LEFT FOR A READER TO DISCOVER: the
-# false-infra_timeout mode esc-4211-6 documents REMAINS LIVE ON THE COLD LANE
-# after this change. Not fixed here by choice — a cold budget is a second
-# number needing its own basis, and task 3353's scope D (the measured
+# falls through to the repo-root verify_cold_command_timeout_secs, and pays
+# verify_cold_preprovision_command (`uv sync --all-packages && npm ci ...`)
+# and unwarmed caches on top of the warm cost this number sizes.
+#
+# WHETHER THAT FALL-THROUGH IS ADEQUATE IS AN OPERATOR-TUNABLE QUESTION, and
+# the answer has already changed once. At the 5400s cold ceiling it was NOT:
+# 5400 is BELOW the 7200 declared here and only ~2% above the 5288s worst
+# observed green WARM run, on a path that is strictly costlier — so the
+# false-infra_timeout mode esc-4211-6 documents was LIVE ON THE COLD LANE.
+# Commit 36c4c71eb4 raised cold 5400 -> 10800, which clears both; under that
+# commit's own revert condition ("put these back to 3600/5400") the hazard
+# returns. NOT CLOSED HERE BY CHOICE, IN EITHER STATE — a cold budget is a
+# second number needing its own basis, and task 3353's scope D (the measured
 # distribution that refines this whole block) is where the cold lane belongs.
-# The 5400s fall-through is pinned exactly as it stands by assertion (f) of
-# the guard named below, which is also the assertion to update if a cold
-# budget is ever declared here.
+# Assertion (f) of the guard named below pins the fall-through RELATION —
+# cold resolves to the repo-root cold ceiling, whatever the operator has set
+# it to, and never to this warm value — rather than either literal. It is
+# also the assertion to update if a cold budget is ever declared here.
 #
 # COUNT THE RETRIES — the wall clock a genuine hang costs is a MULTIPLE of
 # 7200, not 7200. config.verify_timeout_retries defaults to 2
