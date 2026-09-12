@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from escalation.queue import EscalationQueue
 from shared.task_metadata import RetryLedger
 from test_merge_queue_main_health import (
@@ -35,7 +36,6 @@ from test_merge_queue_main_health import (
 from orchestrator.event_store import EventStore
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
-    MergeOutcome,
     OutcomeKind,
     RealMergeItem,
     SpeculativeMergeWorker,
@@ -190,138 +190,6 @@ class TestSpawnDedup:
 
 
 # ---------------------------------------------------------------------------
-# Step-5: regression — main_health_probe_handles=None (every existing
-# caller) must still spawn nothing through the full _run_post_merge_verify
-# chokepoint. This is already true today (handles=None short-circuits
-# _spawn_main_health_probe before it ever reaches asyncio.create_task), so
-# unlike the two classes above this one is expected to already pass.
-# ---------------------------------------------------------------------------
-
-
-class TestNoneHandlesSpawnsNothing:
-    def test_none_handles_spawns_nothing_and_does_not_raise(
-        self, tmp_path: Path,
-    ) -> None:
-        config = _make_config(tmp_path, escalate_preexisting=True)
-        git_ops = _make_git_ops(tmp_path)
-        merge_wt = tmp_path / 'merge-wt'
-        merge_wt.mkdir()
-        req = _make_req('99', tmp_path / 'task-wt', config)
-        (tmp_path / 'task-wt').mkdir()
-
-        create_task_spy = MagicMock()
-
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-                patch(
-                    'orchestrator.merge_queue.asyncio.create_task',
-                    new=create_task_spy,
-                ),
-            ):
-                return await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={},
-                    enospc_retries={},
-                    max_timeouts=3,
-                    max_enospc=1,
-                    main_health_probe_handles=None,
-                )
-
-        outcome = asyncio.run(_run())
-
-        assert outcome is not None
-        assert outcome.reason.startswith('Post-merge verification failed'), (
-            f'Expected normal task-fault outcome; got {outcome.reason!r}'
-        )
-        assert create_task_spy.call_count == 0, (
-            f'main_health_probe_handles=None must spawn nothing; '
-            f'asyncio.create_task called {create_task_spy.call_count} time(s)'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Task 2565 step-5 (RED): _spawn_main_health_probe must forward
-# origin_is_local into the spawned _run_deferred_main_health_probe
-# coroutine, defaulting to True (local) when the caller omits it — so a
-# future _run_post_merge_verify caller's HOST-AFFINITY signal actually
-# reaches the probe. Fails today: origin_is_local is an unknown kwarg of
-# _spawn_main_health_probe (TypeError).
-# ---------------------------------------------------------------------------
-
-
-class TestSpawnForwardsOriginIsLocal:
-    """_spawn_main_health_probe must forward its origin_is_local kwarg into
-    the spawned _run_deferred_main_health_probe coroutine (task 2565)."""
-
-    def test_forwards_explicit_origin_is_local_false(
-        self, tmp_path: Path,
-    ) -> None:
-        config = _make_config(tmp_path, escalate_preexisting=True)
-        git_ops = _make_git_ops(tmp_path)
-        req = _make_req('42', tmp_path / 'task-wt', config)
-        (tmp_path / 'task-wt').mkdir()
-
-        spy = AsyncMock(return_value=None)
-
-        async def _run() -> None:
-            handles = _MainHealthProbeHandles(background_tasks=set())
-            with patch(
-                'orchestrator.merge_queue._run_deferred_main_health_probe',
-                new=spy,
-            ):
-                _spawn_main_health_probe(
-                    handles, git_ops, req, COMPILE_ERROR_RESULT,
-                    origin_is_local=False,
-                )
-                pending = set(handles.background_tasks)
-                for t in pending:
-                    await t
-
-        asyncio.run(_run())
-
-        assert spy.call_count == 1
-        kwargs = spy.call_args.kwargs
-        assert kwargs.get('origin_is_local') is False, f'kwargs={kwargs}'
-
-    def test_defaults_to_origin_is_local_true_when_omitted(
-        self, tmp_path: Path,
-    ) -> None:
-        config = _make_config(tmp_path, escalate_preexisting=True)
-        git_ops = _make_git_ops(tmp_path)
-        req = _make_req('42', tmp_path / 'task-wt', config)
-        (tmp_path / 'task-wt').mkdir()
-
-        spy = AsyncMock(return_value=None)
-
-        async def _run() -> None:
-            handles = _MainHealthProbeHandles(background_tasks=set())
-            with patch(
-                'orchestrator.merge_queue._run_deferred_main_health_probe',
-                new=spy,
-            ):
-                _spawn_main_health_probe(
-                    handles, git_ops, req, COMPILE_ERROR_RESULT,
-                )
-                pending = set(handles.background_tasks)
-                for t in pending:
-                    await t
-
-        asyncio.run(_run())
-
-        assert spy.call_count == 1
-        kwargs = spy.call_args.kwargs
-        assert kwargs.get('origin_is_local') is True, f'kwargs={kwargs}'
-
-
-# ---------------------------------------------------------------------------
 # Task 2565 step-7 (RED): _run_post_merge_verify must derive origin_is_local
 # from the `runner` it receives and forward it into _spawn_main_health_probe
 # on the DEFERRED path — a REMOTE runner (is_local=False) means
@@ -387,12 +255,8 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
 
         async def _run() -> None:
             handles = _MainHealthProbeHandles(background_tasks=set())
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch('orchestrator.merge_queue._spawn_main_health_probe', new=spy),
+            with patch(
+                'orchestrator.merge_queue._spawn_main_health_probe', new=spy,
             ):
                 await _run_post_merge_verify(
                     git_ops, req, merge_wt,
@@ -402,6 +266,9 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
                     max_enospc=1,
                     main_health_probe_handles=handles,
                     runner=None,
+                    verifier=FakeVerifier(
+                        default=VerifyScript(result=COMPILE_ERROR_RESULT),
+                    ),
                 )
 
         asyncio.run(_run())
@@ -679,73 +546,13 @@ class TestDeferredProbeDedupeFold:
 
 
 # ---------------------------------------------------------------------------
-# Step-15 (RED): production wiring — the SpeculativeMergeWorker
-# ._run_inflight_verify call site must pass a live main_health_probe_handles,
-# bound to self._background_tasks, into _run_post_merge_verify (mirrors
-# test_merge_queue_dry_run_unblock.py's TestRunInflightVerifyPassesHandles,
-# which pins the same call-site-threading shape for dry_run_handles). Also
-# pins that the worker's EXISTING _background_tasks shutdown drain already
-# cancels a task named main-health-probe-<id> — no new drain code needed
-# once the call site is wired (step-16).
+# Step-15 (RED): the worker's EXISTING _background_tasks shutdown drain
+# already cancels a task named main-health-probe-<id> — no new drain code
+# needed once the _run_inflight_verify call site is wired (step-16).  That
+# call site's own threading of a live main_health_probe_handles, bound to
+# self._background_tasks, is pinned below by
+# TestRunInflightVerifyPassesAutoHealCallback.
 # ---------------------------------------------------------------------------
-
-
-class TestRunInflightVerifyPassesMainHealthProbeHandles:
-    """Step-15 (RED): _run_inflight_verify must thread a live
-    main_health_probe_handles — bound to self._background_tasks — into
-    _run_post_merge_verify, so a spawned probe task shares the SAME
-    background-task lifetime/drain as the dry-run investigation handles.
-    """
-
-    def test_run_inflight_verify_passes_main_health_probe_handles(
-        self, tmp_path: Path,
-    ) -> None:
-        git_ops = _make_git_ops(tmp_path)
-        config = _make_config(tmp_path)
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
-
-        req = _make_req('99', tmp_path / 'task-wt', config)
-        (tmp_path / 'task-wt').mkdir()
-        merge_wt = tmp_path / 'merge-wt'
-        merge_wt.mkdir()
-        merge_result = MagicMock()
-        merge_result.merge_commit = 'abc123def456789abc1'
-        item = RealMergeItem(
-            request=req,
-            merge_result=merge_result,
-            merge_wt=merge_wt,
-            base_sha='base123',
-            speculative=False,
-        )
-
-        # REMOTE lease — bypasses the local warm-swap path, keeping this
-        # test focused on the main_health_probe_handles kwarg (mirrors
-        # test_merge_queue_dry_run_unblock.py's REMOTE-lease builder).
-        fake_runner = MagicMock()
-        fake_runner.name = 'leo-laptop'
-        fake_runner.is_local = False
-        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
-
-        spy = AsyncMock(return_value=None)
-
-        async def _run() -> None:
-            with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
-                await worker._run_inflight_verify(item, lease)
-
-        asyncio.run(_run())
-
-        assert spy.await_args is not None, '_run_post_merge_verify was not called'
-        handles = spy.await_args.kwargs.get('main_health_probe_handles')
-        assert handles is not None, (
-            '_run_inflight_verify must pass a live main_health_probe_handles '
-            'into _run_post_merge_verify — the call site has not been wired'
-        )
-        assert handles.background_tasks is worker._background_tasks, (
-            '_run_inflight_verify must pass main_health_probe_handles bound '
-            'to the SAME set instance as worker._background_tasks — a '
-            'spawned probe task strong-ref must live exactly as long as the '
-            'worker and be drained by its existing shutdown drain'
-        )
 
 
 class TestShutdownDrainsMainHealthProbeTask:
@@ -796,8 +603,8 @@ class TestRunInflightVerifyPassesAutoHealCallback:
     """_run_inflight_verify must thread
     worker._auto_heal_main_health_deferred (bound-method identity) as the
     auto_heal callback on main_health_probe_handles, alongside the existing
-    background_tasks=worker._background_tasks wiring (step-16, pinned above
-    by TestRunInflightVerifyPassesMainHealthProbeHandles).
+    background_tasks=worker._background_tasks wiring (step-16), which this
+    test pins too.
     """
 
     def test_run_inflight_verify_passes_auto_heal_callback(
@@ -823,7 +630,7 @@ class TestRunInflightVerifyPassesAutoHealCallback:
 
         # REMOTE lease — bypasses the local warm-swap path, keeping this
         # test focused on the main_health_probe_handles kwarg (mirrors
-        # TestRunInflightVerifyPassesMainHealthProbeHandles above).
+        # test_merge_queue_dry_run_unblock.py's REMOTE-lease builder).
         fake_runner = MagicMock()
         fake_runner.name = 'leo-laptop'
         fake_runner.is_local = False
