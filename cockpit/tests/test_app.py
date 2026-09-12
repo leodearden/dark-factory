@@ -1697,6 +1697,211 @@ class TestCopyAction:
             assert copy_runner.payloads == []
 
 
+class RecordingOsc52:
+    """Spy for Textual's PUBLIC App.copy_to_clipboard -- i.e. the OSC 52 leg.
+
+    A documented public method, replaced on the instance: a
+    collaborator-boundary assertion, not a reach into internals. The
+    attribute it used to set, `app._clipboard`, is precisely what cannot
+    answer "did the escape actually get written, and did it reach a
+    clipboard" -- see TestCopyAction's class docstring.
+    """
+
+    def __init__(self):
+        self.texts: list[str] = []
+
+    def __call__(self, text):
+        self.texts.append(text)
+
+
+class RecordingNotify:
+    """Spy for Textual's PUBLIC App.notify; records (message, severity) per toast.
+
+    Takes **kwargs rather than notify's exact keyword list so a Textual
+    release adding a parameter widens this spy for free.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, message, **kwargs):
+        self.calls.append((message, kwargs.get('severity', 'information')))
+
+
+class ExplodingCopyRunner:
+    """A copy_runner that raises: the seam is caller-injectable, so action_copy guards it.
+
+    The bundled copy_to_system_clipboard never raises, but a keypress
+    handler must not depend on that promise being kept by whatever the
+    constructor was handed (PRD §2 -- a view, never a dependency).
+    """
+
+    def __init__(self):
+        self.payloads: list[str] = []
+
+    def __call__(self, text):
+        self.payloads.append(text)
+        raise RuntimeError('clipboard helper exploded')
+
+
+def _write_copyable_decision(tmp_path):
+    """One highlightable decision row, mirroring TestCopyAction's fixture."""
+    decision = sr.DecisionRecord(
+        id='dec-1',
+        project='df',
+        text='Which port do we bind?',
+        filed_at='2026-07-07T00:00:00+00:00',
+        task_id='2517',
+        escalation_id='esc-42',
+    )
+    assert sr.write_decision(decision, root=tmp_path)
+
+
+def _spy_on_clipboard_surface(monkeypatch, app):
+    """Replace Textual's PUBLIC copy_to_clipboard/notify with recorders; return both."""
+    osc52 = RecordingOsc52()
+    notifications = RecordingNotify()
+    monkeypatch.setattr(app, 'copy_to_clipboard', osc52)
+    monkeypatch.setattr(app, 'notify', notifications)
+    return osc52, notifications
+
+
+class TestCopyFallbackAndFeedback:
+    """action_copy's policy: when OSC 52 still runs, and what the operator is told.
+
+    The incident's primary complaint was that 'y' produced no signal in
+    either direction, which is how a total no-op survived a whole task
+    cycle. Both paths now toast, and the toast names the mechanism.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_a_successful_local_copy_skips_osc52_and_toasts_information(
+        self, tmp_path, monkeypatch
+    ):
+        """A local helper took the payload -- no wasted escape write, and a success toast."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.clipboard import CopyAttempt, CopyOutcome
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        _write_copyable_decision(tmp_path)
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=RecordingCopyRunner(CopyAttempt(CopyOutcome.COPIED, ('xclip',))),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert osc52.texts == []
+            assert len(notifications.calls) == 1
+            assert notifications.calls[0][1] == 'information'
+
+    @pytest.mark.timeout(10)
+    async def test_no_local_helper_falls_back_to_osc52_and_warns(self, tmp_path, monkeypatch):
+        """The over-SSH case: the same payload goes out as OSC 52, and the toast says so."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.clipboard import CopyAttempt, CopyOutcome
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        _write_copyable_decision(tmp_path)
+
+        copy_runner = RecordingCopyRunner(CopyAttempt(CopyOutcome.NO_HELPER))
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=copy_runner,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert osc52.texts == copy_runner.payloads
+            assert len(notifications.calls) == 1
+            assert notifications.calls[0][1] == 'warning'
+
+    @pytest.mark.timeout(10)
+    async def test_a_raising_copy_runner_still_falls_back_and_warns(self, tmp_path, monkeypatch):
+        """An exception out of the injected seam must not take the cockpit down.
+
+        The keypress completes, the operator still gets the OSC 52 fallback
+        with the same payload, and the toast reports the failure rather than
+        silently claiming success.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        _write_copyable_decision(tmp_path)
+
+        copy_runner = ExplodingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=copy_runner,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert copy_runner.payloads
+            assert osc52.texts == copy_runner.payloads
+            assert len(notifications.calls) == 1
+            assert notifications.calls[0][1] == 'warning'
+
+    @pytest.mark.timeout(10)
+    async def test_empty_queue_neither_falls_back_nor_toasts(self, tmp_path, monkeypatch):
+        """No highlighted row: nothing was copied, so there is nothing to say about it."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=RecordingCopyRunner(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one(DecisionQueue).row_count == 0
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert osc52.texts == []
+            assert notifications.calls == []
+
+
 class TestDeferResetsAge:
     @pytest.mark.timeout(10)
     async def test_defer_resets_age_live_without_writing_registry(self, tmp_path):
