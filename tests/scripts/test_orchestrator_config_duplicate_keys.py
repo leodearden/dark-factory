@@ -48,6 +48,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 REPO_ROOT = Path(__file__).parents[2]
 
 ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
+DEFAULTS_PATH = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'defaults.yaml'
 
 
 @dataclass(frozen=True)
@@ -351,6 +352,34 @@ def test_a_second_top_level_verify_env_block_silently_drops_the_earlier_keys(
         'the detector must flag the very shape the production loader just '
         'swallowed, or it would not have caught task 4635 either'
     )
+
+
+def _orchestrator_config_paths(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> list[Path]:
+    """Every yaml file the orchestrator's own loaders read, in a deterministic order.
+
+    DISCOVERY IS DELEGATED to the production walk rather than to an
+    ``rglob('orchestrator.yaml')``, which inherits config.py's pruning of
+    ``.worktrees/``, ``.venv/``, ``node_modules/``, ``build/`` and nested
+    checkouts. A hand-rolled glob run from the main checkout would descend every
+    sibling worktree and sweep other branches' copies of these same files, so it
+    could fail for a config this branch does not contain — and, worse, could
+    drift from the set the orchestrator actually registers.
+
+    ``defaults.yaml`` IS ANCHORED AT ``REPO_ROOT``, deliberately NOT at
+    ``importlib.resources.files('orchestrator')`` as ``_load_defaults`` resolves
+    it in production. First-party members are installed editable and an agent
+    shell inherits the MAIN checkout's ``VIRTUAL_ENV``, so that resource path
+    can resolve into a DIFFERENT checkout's tree; the guard would then report
+    green about a file this branch never changed. Identical trap and identical
+    remedy to ``tests/scripts/conftest.py::ROOT_CONFIG_PATH``.
+    """
+    return [
+        ROOT_CONFIG_PATH,
+        DEFAULTS_PATH,
+        *(REPO_ROOT / prefix / 'orchestrator.yaml' for prefix in discover_module_configs()),
+    ]
 
 
 def test_every_orchestrator_config_the_loader_reads_has_no_duplicate_keys(
