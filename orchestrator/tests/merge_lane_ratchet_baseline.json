@@ -1424,7 +1424,7 @@
     "orchestrator/tests/test_merge_queue_depth_telemetry.py": {"patch_targets": ["_run_post_merge_verify"], "private_reads": 14},
     "orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py": {"patch_targets": [], "private_reads": 29},
     "orchestrator/tests/test_merge_queue_disposition_wiring.py": {"patch_targets": ["_run_post_merge_verify", "classify_merge_failure_disposition", "run_scoped_verification", "verify_failure_is_preexisting_on_main"], "private_reads": 2},
-    "orchestrator/tests/test_merge_queue_dry_run_unblock.py": {"patch_targets": ["SpeculativeMergeWorker", "_ensure_verify_disk_space", "_run_post_merge_verify", "enforce_merge_liveness_margin", "enforce_persistent_worktree_serial_lane", "run_dry_run_unblock", "run_scoped_verification", "verify_failure_is_preexisting_on_main"], "private_reads": 23},
+    "orchestrator/tests/test_merge_queue_dry_run_unblock.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_duplicate_submission.py": {"patch_targets": [], "private_reads": 39},
     "orchestrator/tests/test_merge_queue_equivalence.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_finalize_head_visibility.py": {"patch_targets": [], "private_reads": 18},
