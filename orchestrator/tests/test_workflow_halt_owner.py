@@ -54,11 +54,15 @@ class _FakeMergeWorker:
     Mirrors test_halt_owner._FakeMergeWorker and extends it to:
     - accept an optional ``reason`` keyword on ``unhalt_wip``
     - record the most-recent reason as ``last_unhalt_reason`` for assertion
+    - hold the owner in a PUBLIC ``owner_esc_id``, so the two rows that plant a
+      FOREIGN owner (deliberately bypassing ``set_halt_owner``'s
+      owner-collision assertion) write a declared attribute of this double
+      rather than reaching into a private one
     """
 
     def __init__(self) -> None:
         self._halted = False
-        self._owner: str | None = None
+        self.owner_esc_id: str | None = None
         self.last_unhalt_reason: str | None = None
 
     @property
@@ -67,26 +71,26 @@ class _FakeMergeWorker:
 
     @property
     def halt_owner_esc_id(self) -> str | None:
-        return self._owner
+        return self.owner_esc_id
 
     def halt_for_wip(self, reason: str) -> None:
         self._halted = True
-        self._owner = None
+        self.owner_esc_id = None
 
     def set_halt_owner(self, esc_id: str) -> None:
-        assert self._owner is None, (
-            f'halt owner already set to {self._owner!r}, '
+        assert self.owner_esc_id is None, (
+            f'halt owner already set to {self.owner_esc_id!r}, '
             f'refusing to overwrite with {esc_id!r}'
         )
-        self._owner = esc_id
+        self.owner_esc_id = esc_id
 
     def is_halt_owner(self, esc_id: str) -> bool:
-        return self._owner is not None and self._owner == esc_id
+        return self.owner_esc_id is not None and self.owner_esc_id == esc_id
 
     def unhalt_wip(self, reason: str | None = None) -> None:
         self.last_unhalt_reason = reason
         self._halted = False
-        self._owner = None
+        self.owner_esc_id = None
 
 
 @pytest.fixture
@@ -548,7 +552,7 @@ async def test_submit_failure_does_not_release_foreign_owned_halt(
 
     # Pre-engage the halt AND set a FOREIGN owner (bypass the assertion in set_halt_owner).
     fake_worker.halt_for_wip('wip_overlap')
-    fake_worker._owner = 'esc-other-1'  # type: ignore[attr-defined]
+    fake_worker.owner_esc_id = 'esc-other-1'
     assert fake_worker.is_wip_halted
     assert fake_worker.halt_owner_esc_id == 'esc-other-1'
 
@@ -892,7 +896,7 @@ async def test_trio_never_refiles_sibling_halt_category(
     tripping ``_FakeMergeWorker``'s owner-collision assertion.
     """
     fake_worker.halt_for_wip(handler_id)
-    fake_worker._owner = 'esc-foreign-1'  # type: ignore[attr-defined]
+    fake_worker.owner_esc_id = 'esc-foreign-1'
     _forbid_waiting_helper(workflow)
 
     outcome = await asyncio.wait_for(
