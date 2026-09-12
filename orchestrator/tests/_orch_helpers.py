@@ -199,17 +199,19 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 300
 # The marker wins UNCONDITIONALLY.  `config._env_timeout` -- fed by CLI
 # `--timeout`, then `PYTEST_TIMEOUT`, then the ini `timeout` -- is consulted
 # ONLY when the marker yielded None.  So `@pytest.mark.timeout(N)` is a TWO-WAY
-# override: it raises the budget under a bare local `pytest` (ini default 60)
-# and LOWERS it under verify (CLI 300).
+# override: whatever budget is in force it REPLACES, raising it wherever the
+# ambient budget is smaller and LOWERING it under verify's `--timeout=300`.
 #
-# THE INVERSION BAND.  Those two budgets bracket every test here, giving a
-# marker at N three distinct regimes:
-#   * N <= PYPROJECT_DEFAULT_TIMEOUT -- tightens under BOTH, so unambiguously a
-#     deliberate tight bound (test_verify_clock_stop.py's 15s watchdog marks
-#     exist precisely to assert something fires FAST);
-#   * PYPROJECT_DEFAULT_TIMEOUT < N < VERIFY_CLI_PER_TEST_TIMEOUT -- INVERTS.
-#     The author wrote N>60 intending to LOOSEN against the ini default in
-#     front of them, and under verify the sign flips: 300 silently becomes N;
+# THE INVERSION BAND.  A marker at N falls in one of three regimes:
+#   * N <= DELIBERATE_TIGHT_BOUND_CEILING -- small enough that it reads as a
+#     deliberate tight bound rather than a slow test's opt-out
+#     (test_verify_clock_stop.py's 15s watchdog marks exist precisely to
+#     assert something fires FAST);
+#   * DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT --
+#     INVERTS.  Too large to read as a deliberate fast bound, and below the
+#     budget verify passes, so the author's intended LOOSENING for a slow test
+#     silently becomes a TIGHTENING of the run that gates their merge: 300
+#     becomes N;
 #   * N >= VERIFY_CLI_PER_TEST_TIMEOUT -- loosens under both.  Safe.
 # Only the middle band contradicts its author's evident intent, and a breach
 # there is not a red test: `timeout_method = "thread"` makes pytest-timeout
@@ -232,6 +234,31 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 300
 # TestVerifyCliBudgetConstant re-reads orchestrator/orchestrator.yaml at
 # runtime and fails if the two disagree.  Never-narrow.
 VERIFY_CLI_PER_TEST_TIMEOUT = 300
+
+
+# task 5147: the band's LOWER edge -- the largest N that still reads as a
+# DELIBERATE tight bound rather than a slow test's opt-out.
+#
+# A LITERAL, and deliberately NOT `PYPROJECT_DEFAULT_TIMEOUT`, which it merely
+# EQUALLED until 2026-09-12.  It was first written as that mirror, while the
+# ini default was 60 and a marker above it read to its author as a loosening.
+# Commit 64e24b547f then raised the ini default 60 -> 300 in every package, and
+# a mirror would have followed it: (300, 300) is EMPTY, so every sweep built on
+# this band would pass VACUOUSLY -- green because nothing can offend -- while
+# the 61 in-band markers it was built to ratchet stayed untouched in the tree.
+#
+# The raise did not remove the hazard, only one framing of it.  A marker at 120
+# still REPLACES verify's 300, still `os._exit()`s the xdist worker when a
+# loaded host starves it, and is still what blamed tasks 4176, 4384 and 4405.
+# What the raise removed is the SIGN-FLIP: an author reading `timeout = 300`
+# who writes 120 is now knowingly tightening rather than reaching for what
+# looks like a loosening. The edge therefore stays at the value the design
+# always used -- pinned by test_timeout_marker_inversion_guard.py::
+# test_the_band_edges_are_exactly_where_the_design_puts_them -- and stops
+# borrowing a number that can move underneath it. The ini default is expected
+# to move again: 64e24b547f records 300 as INTERIM and judgement-picked, with a
+# follow-up task owning the measured value.
+DELIBERATE_TIGHT_BOUND_CEILING = 60
 
 
 # task 3540: the claimant-liveness TTL the row builder below derives its
@@ -486,7 +513,7 @@ async def wait_responsive(
     ------------------
     Any class using this MUST carry an adequate ``@pytest.mark.timeout`` —
     exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.
-    orchestrator/pyproject.toml sets ``timeout = 60`` with
+    orchestrator/pyproject.toml sets ``timeout = 300`` with
     ``timeout_method = "thread"`` and ``--max-worker-restart=0``: exceeding
     the per-test timeout does not fail the test, it ``os._exit()``s the xdist
     worker, degrading a clean per-test failure into a worker death.  A

@@ -1,9 +1,10 @@
 """Guard: no ``@pytest.mark.timeout(N)`` may INVERT into a tighter clamp under verify.
 
-THE RULE, in one line: a marker at ``PYPROJECT_DEFAULT_TIMEOUT < N <
-VERIFY_CLI_PER_TEST_TIMEOUT`` reads as a LOOSENING against the ini default its
-author is looking at and silently TIGHTENS the verify run that gates their
-merge, because a pytest-timeout marker is a two-way override and never a floor.
+THE RULE, in one line: a marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
+VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight bound
+and still sits below the budget verify passes, so the loosening its author
+meant for a slow test silently TIGHTENS the verify run that gates their merge,
+because a pytest-timeout marker is a two-way override and never a floor.
 
 The derivation -- the ``pytest_timeout._get_item_settings`` precedence it
 follows from, the three regimes the two budgets carve out, and why a breach
@@ -25,8 +26,8 @@ property of the ``(ini timeout, verify --timeout)`` PAIR, not of this package,
 and all eight segments of dark-factory-orchestrator.yaml's fleet chain pass
 ``--timeout=300``.  MEASURED by running this module's own extractor over the
 siblings: fused-memory has 15 in-band sites of 41, under the same
-``timeout = 60`` / ``timeout_method = "thread"`` / ``-n auto`` settings that
-make a breach here cost a worker; shared has 1 of 21; escalation, dashboard,
+``timeout_method = "thread"`` / ``-n auto`` settings that make a breach here
+cost a worker; shared has 1 of 21; escalation, dashboard,
 sampler and tests/scripts have none.  Covering them means lifting the extractor
 and :func:`_inverts` into a shared home -- orchestrator.pytest_markers already
 owns the marker grammar this module imports -- and instantiating the guard per
@@ -57,6 +58,7 @@ import _orch_helpers
 import pytest
 import yaml
 from _orch_helpers import (
+    DELIBERATE_TIGHT_BOUND_CEILING,
     ORCH_DIR,
     PYPROJECT_DEFAULT_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
@@ -333,9 +335,10 @@ def _timeout_marker_sites_in(tree: ast.Module) -> tuple[_Site, ...]:
 def _inverts(seconds: float | None) -> bool:
     """True iff a marker at *seconds* TIGHTENS verify while reading as a loosening.
 
-    The band is ``(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)``,
-    open at both ends -- a mark AT the ini default expresses no opinion against
-    it, and one AT the CLI budget is the recommended remediation.  Named
+    The band is ``(DELIBERATE_TIGHT_BOUND_CEILING,
+    VERIFY_CLI_PER_TEST_TIMEOUT)``, open at both ends -- a mark AT the ceiling
+    is still a deliberate tight bound, and one AT the CLI budget is the
+    recommended remediation.  Named
     against the constants rather than their numbers, and why those two edges
     and not the task text's literal ``N < 300``: the
     ``VERIFY_CLI_PER_TEST_TIMEOUT`` comment block in _orch_helpers.py.
@@ -343,7 +346,10 @@ def _inverts(seconds: float | None) -> bool:
     None is not a number and cannot invert: unresolvable means "no opinion",
     never "too small".
     """
-    return seconds is not None and PYPROJECT_DEFAULT_TIMEOUT < seconds < VERIFY_CLI_PER_TEST_TIMEOUT
+    return (
+        seconds is not None
+        and DELIBERATE_TIGHT_BOUND_CEILING < seconds < VERIFY_CLI_PER_TEST_TIMEOUT
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -473,21 +479,26 @@ class TestVerifyCliBudgetConstant:
     """
 
     def test_the_inversion_band_is_non_empty(self) -> None:
-        """The band ``(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)`` must be real.
+        """The band ``(DELIBERATE_TIGHT_BOUND_CEILING, VERIFY_CLI_PER_TEST_TIMEOUT)`` must be real.
 
-        The entire guard is the predicate "N sits strictly between the ini
-        default and the verify CLI budget".  If the two ever converge or
-        invert, that predicate becomes unsatisfiable and every sweep below
-        would pass VACUOUSLY -- green because nothing can offend, not because
-        nothing does.  Asserted rather than assumed, since both edges are
-        mirrors of config files that can move independently.
+        The entire guard is the predicate "N sits strictly between the
+        deliberate-tight-bound ceiling and the verify CLI budget".  If the two
+        ever converge or invert, that predicate becomes unsatisfiable and every
+        sweep below would pass VACUOUSLY -- green because nothing can offend,
+        not because nothing does.  Asserted rather than assumed: the upper edge
+        mirrors a config file that moves independently.
+
+        THIS EXACT COLLAPSE HAPPENED ONCE (2026-09-12, commit 64e24b547f), back
+        when the lower edge mirrored the ini default and that default was
+        raised 60 -> 300 fleet-wide.  See DELIBERATE_TIGHT_BOUND_CEILING's
+        comment in _orch_helpers.py for why the edge is now a literal.
         """
-        assert PYPROJECT_DEFAULT_TIMEOUT < VERIFY_CLI_PER_TEST_TIMEOUT, (
-            f'the inversion band ({PYPROJECT_DEFAULT_TIMEOUT}, '
-            f'{VERIFY_CLI_PER_TEST_TIMEOUT}) is empty -- the ini default has '
-            'caught up with the verify CLI budget, so nothing can invert and '
-            'this whole module would pass vacuously. Revisit it before '
-            'changing either constant.'
+        assert DELIBERATE_TIGHT_BOUND_CEILING < VERIFY_CLI_PER_TEST_TIMEOUT, (
+            f'the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING}, '
+            f'{VERIFY_CLI_PER_TEST_TIMEOUT}) is empty -- the tight-bound '
+            'ceiling has caught up with the verify CLI budget, so nothing can '
+            'invert and this whole module would pass vacuously. Revisit it '
+            'before changing either constant.'
         )
 
     def test_constant_mirrors_the_real_verify_test_command(self) -> None:
@@ -520,7 +531,7 @@ class TestVerifyCliBudgetConstant:
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}) no '
             f'longer mirrors --timeout={configured} in {_ORCH_YAML}. Update the '
             'constant in orchestrator/tests/_orch_helpers.py -- the inversion '
-            'band this module polices is (PYPROJECT_DEFAULT_TIMEOUT, '
+            'band this module polices is (DELIBERATE_TIGHT_BOUND_CEILING, '
             'VERIFY_CLI_PER_TEST_TIMEOUT), so a stale upper edge either lets a '
             'genuinely-inverting marker through or manufactures false '
             'offenders.'
@@ -567,7 +578,7 @@ class TestSanctionedNameMirrors:
             'and it matches on the TRAILING name only. An entry reading HIGHER '
             'than the real constant fails SILENTLY: the site is waved through '
             'as safe while it really pins a value inside the inversion band '
-            f'({PYPROJECT_DEFAULT_TIMEOUT} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}). '
+            f'({DELIBERATE_TIGHT_BOUND_CEILING} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}). '
             'Update the map to the real value -- and if the real value has '
             'moved INTO the band, fix the constant instead, not the mirror.\n\n'
             'A `seconds` of None means the definition left the literal '
@@ -854,7 +865,7 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
     ] == [
         False,  # None       -- unresolvable: no opinion, never an offence
         False,  # 15         -- test_verify_clock_stop.py's watchdog marks
-        False,  # 60         -- exactly the ini default: expresses no opinion
+        False,  # 60         -- exactly the ceiling: a deliberate tight bound
         True,  # 61          -- first inverting value
         True,  # 90          -- measured, test_merge_queue.py
         True,  # 120         -- measured, the named regression instance
@@ -1084,10 +1095,10 @@ def _sweep_is_healthy(scan: _TreeScan) -> str:
 def test_no_new_inverting_timeout_marker() -> None:
     """No marker in the inversion band, except the grandfathered census.
 
-    THE RATCHET.  A marker at ``PYPROJECT_DEFAULT_TIMEOUT < N <
-    VERIFY_CLI_PER_TEST_TIMEOUT`` reads as a loosening against the ini default
-    its author was looking at and silently becomes a TIGHTENING under verify's
-    CLI budget.  Under ``timeout_method = "thread"`` a breach is not a red
+    THE RATCHET.  A marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
+    VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight
+    bound, so it was written to give a slow test room -- and it silently
+    becomes a TIGHTENING under verify's CLI budget.  Under ``timeout_method = "thread"`` a breach is not a red
     test: pytest-timeout ``os._exit()``s the xdist worker,
     ``--max-worker-restart=0`` declines to replace it, and the session is
     truncated with the blame landing on whatever innocent test shared the dead
@@ -1129,12 +1140,11 @@ def test_no_new_inverting_timeout_marker() -> None:
         )
         raise AssertionError(
             f'{len(new_offenders)} NEW timeout marker(s) in the inversion band '
-            f'({PYPROJECT_DEFAULT_TIMEOUT} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}).\n\n'
-            'A marker there is a TWO-WAY override, not a floor: it raises the '
-            f'budget under a bare local `pytest` (ini default '
-            f'{PYPROJECT_DEFAULT_TIMEOUT}s) and LOWERS it under verify, which '
-            f'passes --timeout={VERIFY_CLI_PER_TEST_TIMEOUT}. So a number '
-            'picked to loosen against the default in front of you silently '
+            f'({DELIBERATE_TIGHT_BOUND_CEILING} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}).\n\n'
+            'A marker there is a TWO-WAY override, not a floor: it REPLACES '
+            'the ambient budget in both directions, so a number big enough to '
+            'give a slow test room, yet below the '
+            f'--timeout={VERIFY_CLI_PER_TEST_TIMEOUT} verify passes, silently '
             'tightens the run that actually gates your merge. Exceeding it '
             "does NOT fail the test: pytest-timeout's thread method os._exit()s "
             'the xdist worker, --max-worker-restart=0 declines to replace it, '
@@ -1143,11 +1153,12 @@ def test_no_new_inverting_timeout_marker() -> None:
             'Write one of:\n\n'
             '    from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT\n'
             '    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)   # slow test\n\n'
-            f'    @pytest.mark.timeout(N)  # N <= {PYPROJECT_DEFAULT_TIMEOUT}, a '
+            f'    @pytest.mark.timeout(N)  # N <= {DELIBERATE_TIGHT_BOUND_CEILING}, a '
             'DELIBERATE tight bound\n\n'
             'The second is for a test that asserts something happens FAST (see '
-            "test_verify_clock_stop.py's 15s watchdog marks); it tightens under "
-            'both budgets, which is why it is allowed. Anything in between '
+            "test_verify_clock_stop.py's 15s watchdog marks); it is small "
+            'enough to read as that deliberate bound, which is why it is '
+            'allowed. Anything in between '
             'inverts. Full rationale: the VERIFY_CLI_PER_TEST_TIMEOUT comment '
             'block in _orch_helpers.py.\n\n'
             '_GRANDFATHERED is a shrinking census of pre-existing sites and may '
