@@ -2929,7 +2929,23 @@ class TaskCurator:
         # deliberate choice, not an oversight (see this task's plan design
         # decision 3; pinned by
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
+        #
+        # The same evidence breaks the class-agnostic degraded streak and
+        # re-arms its one-shot alarm latch (task 4448): a completed batch
+        # round-trip says the backend is working for the whole service, not
+        # just for the single-item path that resets the streak today. Without
+        # this, size-1 bisect and serial-fallback degradations accumulate
+        # across arbitrarily many healthy BATCH calls in a batch-dominant
+        # deployment, and the alarm's own escalation text ('N consecutive
+        # curations — every candidate in that run was filed without dedupe')
+        # is false of the service it describes. The asymmetry with the
+        # increment side is deliberate: batch items are not counted here
+        # because every batch-originated degradation that reaches the
+        # classification point is already counted through _degraded_create on
+        # the bisect/serial curate() fallback. Pinned by
+        # TestDegradedStreakBatchReset.
         self._reset_zero_output_breaker()
+        self._reset_degraded_streak()
 
         return _parse_batch_decisions(
             agent_result,
