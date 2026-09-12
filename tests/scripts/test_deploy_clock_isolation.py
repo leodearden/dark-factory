@@ -251,13 +251,11 @@ _LEGACY_BODY = b'{"ts": 1787849070, "iso": "2026-08-28T09:24:30+00:00"}\n'
 class TestClockStampProvenance:
     """Who wrote the stamp — the whole discriminator, parsed from the body alone.
 
-    Task 4823. The pre-existing guard could see only that the bytes moved, so a
-    REAL fleet redeploy straddling a suite was indistinguishable from a test
-    falsifying the clock; it failed closed and blocked four innocent branches.
-    This parser is the attribution half of the fix. Every case here is built
-    from a LITERAL body so the parser's contract is pinned independently of any
-    writer, in either direction: a writer that stops emitting provenance must
-    fail these, not silently degrade the guard.
+    The attribution half of task 4823; ``df_pytest_isolation.py::
+    deploy_clock_change_report`` states what the attribution is for. Every case
+    here is built from a LITERAL body so the parser's contract is pinned
+    independently of any writer, in either direction: a writer that stops
+    emitting provenance must fail these, not silently degrade the guard.
     """
 
     def test_the_env_var_and_key_names_are_the_cross_tier_contract(self) -> None:
@@ -573,12 +571,10 @@ def _stamp(*, token: str, source: str = _FLEET_SOURCE, ts: int = 1787849070) -> 
 class TestDeployClockChangeReport:
     """The attributing entry point: WHAT changed, and WHO changed it (task 4823).
 
-    ``deploy_clock_violation_reason`` could only see that the bytes moved, so a
-    REAL fleet redeploy straddling a suite was indistinguishable from a test
-    falsifying the clock. It failed closed, which is the right default and the
-    wrong answer often enough to have blocked four innocent branches. This
-    function keeps that default for every unattributable change and downgrades
-    exactly one case: a provenance-bearing stamp written with no pytest
+    Its own docstring is the normative statement of the incident, the
+    discriminator and the verdict table; these pin the table cell by cell. The
+    default — fail — is unchanged for every unattributable change, and exactly
+    one case downgrades: a provenance-bearing stamp written with no pytest
     ancestor.
     """
 
@@ -861,20 +857,10 @@ class TestDeployClockChangeReport:
 class TestAFalsificationIsNeverMaskedByABenignChange:
     """A benign change to an EARLIER clock must not hide a falsified LATER one.
 
-    The two protected clocks have DIFFERENT writers —
-    ``scripts/restart-all-orchestrators.sh`` stamps the fleet clock,
-    ``scripts/orchestrator-watchdog.py`` the fused-memory one — so within a
-    single run they can genuinely disagree about who wrote them. A real fleet
-    redeploy (documented 8h cadence) straddling a 26-41 min post-merge verify is
-    the NORMAL case this task exists for, not a corner; if a test falsifies the
-    fm clock during that same window, the fleet clock's benign attribution must
-    not buy the run an exemption it did not earn.
-
-    The precedence rule these pin: ``falsified`` anywhere outranks
-    ``external_redeploy`` anywhere. One clock being provably external is no
-    evidence at all about a DIFFERENT file — the benign verdict is a statement
-    about the run's innocence, and a run that falsified something is not
-    innocent.
+    The precedence rule these pin, cell by cell: ``FALSIFIED`` anywhere outranks
+    ``EXTERNAL_REDEPLOY`` anywhere. ``df_pytest_isolation.py::
+    deploy_clock_change_report`` states why, and why the two clocks can
+    genuinely disagree within one run.
 
     ``test_the_first_offender_in_protected_order_is_reported`` cannot catch this:
     it writes provenance-free bodies to BOTH clocks, so both are ``falsified``
@@ -1383,10 +1369,8 @@ class TestTheGuardAttributesTheStampEndToEnd:
     ) -> None:
         """A REAL redeploy straddling the run must cost the run NOTHING.
 
-        This is the whole point of the task: on a busy merge queue a post-merge
-        verify runs for tens of minutes against a documented 8h redeploy
-        cadence, and the old guard's fail-closed default blocked four innocent
-        branches across two recovery sessions.
+        The whole point of the task, observed at the only place that can show
+        it: the run's own exit code.
 
         The warning must SURFACE, not merely be raised — a warning nobody sees
         is the silent fail-soft this repo's invariants forbid — so the assertion

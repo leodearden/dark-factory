@@ -6522,10 +6522,10 @@ def test_stamp_and_read_fm_deploy_clock_roundtrip(
 # task 4823: the clock stamp carries its own provenance
 #
 # The watchdog is the SECOND of the two clock writers (restart-all-orchestrators.sh
-# is the first) and it owns three clocks through one _stamp_clock primitive. The
-# pytest-side deploy-clock guard could previously see only that a protected clock
-# had MOVED, never who moved it, so a real redeploy straddling a suite failed
-# innocent runs. These pin this writer's half of the contract.
+# is the first) and it owns three clocks through one _stamp_clock primitive.
+# These pin this writer's half of the contract;
+# df_pytest_isolation.py::deploy_clock_change_report states what the provenance
+# is for and what it buys.
 #
 # Every key is named through the df_pytest_isolation constants rather than a
 # literal of this file's own: that is what makes these drift pins rather than

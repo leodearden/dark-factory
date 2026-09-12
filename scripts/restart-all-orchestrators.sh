@@ -443,26 +443,19 @@ stamp_fleet_deploy_clock() {
     # verify or the early no-running-units exit -- so a failed fleet restart
     # can never silence the watchdog backstop (I2).
     #
-    # The two provenance keys are ADDITIVE (task 4823) and inert to every
-    # reader -- all three extract `ts` and nothing else. They exist for the
-    # pytest-side deploy-clock guard, which before them could see only that a
-    # protected clock had MOVED, never who moved it, and so failed innocent
-    # runs that a real redeploy merely straddled:
-    #   source          -- which writer stamped this, for an operator reading
-    #                      the file by hand. Triage prose; nothing branches on
-    #                      it (a test driving THIS script emits it too).
-    #   pytest_session  -- the ambient $DF_PYTEST_SESSION_TOKEN, which a
-    #                      test-spawned run inherits and a real deploy does
-    #                      not. ALWAYS present: empty is the positive
-    #                      statement "no pytest session was an ancestor of
-    #                      this write", which is what the guard actually
-    #                      reads, whereas an omitted key is indistinguishable
-    #                      from a pre-4823 writer.
-    # The pytest-side contract is df_pytest_isolation.py::
-    # CLOCK_PROVENANCE_SOURCE_KEY / ::CLOCK_PROVENANCE_SESSION_KEY /
-    # ::PYTEST_SESSION_TOKEN_ENV -- neither side can import the other, so both
-    # mirrors are pinned together by
+    # `source` and `pytest_session` are ADDITIVE (task 4823) and inert to
+    # every reader -- all three extract `ts` and nothing else. They mirror
+    # df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
+    # ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV, which
+    # df_pytest_isolation.py::deploy_clock_change_report reads and is the one
+    # place that explains what they are for. Neither side can import the
+    # other, so both mirrors are pinned together by
     # tests/scripts/test_restart_all_orchestrators.py.
+    #
+    # The one contract this writer must hold on its own: `pytest_session` is
+    # ALWAYS present, empty included. Empty is the positive statement "no
+    # pytest session was an ancestor of this write"; an OMITTED key is
+    # indistinguishable from a pre-4823 writer and fails the run.
     local clock_dir tmp_file raw_token session_token
     clock_dir="$(dirname "$CLOCK_FILE")"
     mkdir -p "$clock_dir"

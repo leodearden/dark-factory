@@ -276,17 +276,16 @@ def test_unit_never_fresh_through_grace_still_fails(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # task 4823: the stamp carries its own provenance
 #
-# The clock guard in df_pytest_isolation could only see that a protected clock
-# moved, never who moved it, so a REAL redeploy straddling a suite was
-# indistinguishable from a test falsifying the clock. These pin the WRITE side
-# of the fix, end-to-end through the real script.
+# The WRITE side of the fix, pinned end-to-end through the real script;
+# df_pytest_isolation.py::deploy_clock_change_report states what the provenance
+# is for and what it buys.
 #
 # Every assertion below names the key through the df_pytest_isolation constants
 # rather than through a string of its own. That is what makes this a drift pin
 # rather than a tautology: the pytest guard reads the keys it defines, so if
 # this script's literals ever diverged from them, the guard would stop
-# recognising production writes and go back to failing innocent runs — with
-# every test here still green if they compared literals to literals.
+# recognising production writes — with every test here still green if they
+# compared literals to literals.
 # ---------------------------------------------------------------------------
 
 # The `source` value this script must claim: its own filename, which is what an
@@ -323,8 +322,8 @@ def test_a_production_stamp_carries_an_empty_session_token(
     An empty token is a positive statement — "no pytest session was an ancestor
     of this write" — not an omission, which is why the key is always present.
     An omitted key would be indistinguishable from a pre-4823 writer and would
-    (correctly, but uselessly) keep failing the innocent runs this task exists
-    to unblock. This is the exact input to the guard's external_redeploy verdict.
+    (correctly, but uselessly) keep failing. This is the exact input to the
+    guard's EXTERNAL_REDEPLOY verdict.
     """
     monkeypatch.delenv(PYTEST_SESSION_TOKEN_ENV, raising=False)
     clock_file = tmp_path / "last_redeploy_orchestrator.json"

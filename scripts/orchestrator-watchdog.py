@@ -187,19 +187,14 @@ try:
 except (KeyError, ValueError):
     ORCH_RESTART_MIN_INTERVAL_SECS = 28800
 
-# Provenance recorded in every clock this script stamps (task 4823). The
-# pytest-side deploy-clock guard could previously see only that a protected
-# clock had MOVED, never who moved it, so a REAL redeploy straddling a suite
-# failed innocent runs. CLOCK_SOURCE names the writer (triage prose; nothing
-# branches on it) and PYTEST_SESSION_TOKEN_ENV carries the ambient token a
-# test-spawned run inherits and a real deploy does not — the actual
-# discriminator.
-#
-# These MIRROR df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
-# ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV and cannot import
-# them: this script is stdlib-only and imports no first-party package (the same
-# constraint that forced the four-way FLEET_DEPLOY_CLOCK_RELPATH mirror below).
-# Both mirrors are pinned together by tests/scripts/test_orchestrator_watchdog.py.
+# Provenance recorded in every clock this script stamps (task 4823). These
+# MIRROR df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
+# ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV, which
+# df_pytest_isolation.py::deploy_clock_change_report reads and is the one place
+# that explains what they are for. They cannot be imported: this script is
+# stdlib-only and imports no first-party package (the same constraint that
+# forced the four-way FLEET_DEPLOY_CLOCK_RELPATH mirror below). Both mirrors are
+# pinned together by tests/scripts/test_orchestrator_watchdog.py.
 CLOCK_SOURCE = "orchestrator-watchdog.py"
 PYTEST_SESSION_TOKEN_ENV = "DF_PYTEST_SESSION_TOKEN"
 
@@ -1107,21 +1102,21 @@ def _stamp_clock(path: str) -> bool:
 
     SCHEMA {ts, iso, source, pytest_session} (task 4823; ts/iso predate it).
     The two provenance keys are ADDITIVE and inert to every reader — all three
-    extract `ts` and nothing else, so nothing downstream needs to know about
-    them. They exist for the pytest-side deploy-clock guard
-    (df_pytest_isolation.py::_df_deploy_clocks_unwritten), which before them
-    could see only that a protected clock had MOVED and so failed innocent runs
-    that a real redeploy merely straddled. `pytest_session` is the ambient
-    $DF_PYTEST_SESSION_TOKEN, ALWAYS present: empty is the positive statement
-    "no pytest session was an ancestor of this write", which is what the guard
-    reads, whereas an omitted key is indistinguishable from a pre-4823 writer.
+    extract `ts` and nothing else — and what they are FOR is stated once, in
+    df_pytest_isolation.py::deploy_clock_change_report. The one contract this
+    writer must hold on its own: `pytest_session` is ALWAYS present, empty
+    included, because empty is the positive statement "no pytest session was an
+    ancestor of this write" whereas an omitted key is indistinguishable from a
+    pre-4823 writer and fails the run.
 
     NO SANITISER HERE, unlike the bash sibling, and the asymmetry is deliberate
     rather than an oversight: _atomic_write_json serialises through json.dumps,
     which escapes any value correctly. stamp_fleet_deploy_clock builds its body
     with printf, which cannot escape JSON at all, so it must strip the token
-    first or risk emitting a corrupt clock — and _read_clock_epoch fails OPEN on
-    a corrupt body, which would disarm the very cap the stamp arms.
+    first (falling back to a non-empty sentinel, since stripping to "" would
+    forge the one value that forgives a change) or risk emitting a corrupt clock
+    — and _read_clock_epoch fails OPEN on a corrupt body, which would disarm the
+    very cap the stamp arms.
 
     Fail-soft by inheritance from _atomic_write_json: a makedirs/temp/rename
     error is logged and swallowed rather than raised, and reported back as
