@@ -46,20 +46,21 @@ def _solo_gate(target_task_id: str, gate_release: asyncio.Event) -> FakeVerifier
     """A ``VerifyPort`` that parks *target_task_id*'s solo verify on *gate_release*.
 
     Injected as ``SpeculativeMergeWorker(..., verifier=...)``.  A dispatched
-    single reaches it through ``LocalRunner(run_scoped=self._verifier
-    .run_scoped, task_id=req.task_id)`` (merge_queue.py:21217) and the runner
-    forwards that ``task_id`` into ``run_scoped`` (verify_runner.py:829),
-    so the script selects exactly one request rather than blocking the first
-    verify positionally.  Every other task verifies green immediately.
+    single reaches it through the ``LocalRunner(run_scoped=self._verifier
+    .run_scoped, task_id=req.task_id)`` built in
+    ``merge_queue.py::SpeculativeMergeWorker._dispatch_item``, and
+    ``verify_runner.py::LocalRunner.run_merge_verify`` forwards that ``task_id``
+    into ``run_scoped``, so the script selects exactly one request rather than
+    blocking the first verify positionally.  Every other task verifies green immediately.
 
     A dispatch-order change therefore produces a deterministic TimeoutError
     from :func:`_await_parked_verify` rather than deadlocking by blocking the
     wrong request (train instead of solo → train never lands → mark_done never
     fires → all_done/train_done never set → the release never triggers).
 
-    The TRAIN's own verify does not pass through here at all: ``_do_train_merge``
-    calls ``_run_post_merge_verify`` without a ``verifier=``
-    (merge_queue.py:7297), so it takes the production verifier — bound by
+    The TRAIN's own verify does not pass through here at all:
+    ``merge_queue.py::_do_train_merge`` calls ``_run_post_merge_verify``
+    without a ``verifier=``, so it takes the production verifier — bound by
     conftest's autouse ``_mock_merge_queue_verification`` to passed=True — and
     lands while the gate is still held.
     """
@@ -941,13 +942,8 @@ class TestBookkeeping:
         # before the acquire site), so the verifier never releases it either.
         # Both sides are clean.
         #
-        # Stays a private read (task 5446): _merge_ahead_cap has no snapshot()
-        # key, and speculation_accounting_violations()'s cap identity (b) is
-        # tautological against a leak — both its operands come from the ledger
-        # (merge_queue.py::speculation_accounting_violations docstring), so an
-        # acquired-and-never-released permit keeps it green.  The missing seam
-        # is a merge-ahead-cap availability key on SpeculativeMergeWorker
-        # .snapshot(), alongside speculation.slot_available.
+        # Read privately because snapshot() exposes no merge-ahead-cap key
+        # (task 5446).
         assert not worker._merge_ahead_cap.locked(), (
             '_merge_ahead_cap must be unlocked after the train lands; '
             'trains are structurally exempt from Mechanism 1 (DecidedItem has no '
