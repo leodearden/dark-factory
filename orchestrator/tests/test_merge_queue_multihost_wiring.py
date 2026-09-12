@@ -21,6 +21,7 @@ from typing import TypeGuard, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.merge_types import QueuedBranch
@@ -262,6 +263,32 @@ def _make_merge_request(config, *, task_files=None, worktree=None):
     )
 
 
+class _RecordingVerifier(FakeVerifier):
+    """``FakeVerifier`` that also records every scoped verify it is asked for.
+
+    The port's own recorder keeps task ids (``verified``); these tests need
+    the call itself, and the lease-ordering ones need a hook that fires at
+    the moment the verify runs.  Injected through the existing ``verifier=``
+    keyword, so no module attribute is substituted.
+    """
+
+    def __init__(self, *, on_scoped=None, **kwargs):
+        super().__init__(**kwargs)
+        self.scoped_calls: list[dict] = []
+        self._on_scoped = on_scoped
+
+    async def run_scoped(self, worktree, config, module_configs, task_files=None, **options):
+        self.scoped_calls.append({
+            'worktree': worktree, 'config': config,
+            'module_configs': module_configs, 'task_files': task_files, **options,
+        })
+        if self._on_scoped is not None:
+            self._on_scoped()
+        return await super().run_scoped(
+            worktree, config, module_configs, task_files, **options,
+        )
+
+
 def _make_git_ops_mock():
     """Build a minimal async mock for GitOps."""
     mock = MagicMock()
@@ -308,15 +335,14 @@ class TestRunPostMergeVerifyPoolWiring:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 emitted.append({'event_type': event_type, 'data': data or {}})
 
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
-             patch('orchestrator.merge_queue.run_scoped_verification',
-                   new=AsyncMock(return_value=_make_pass_result())):
+        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]):
             outcome = await _run_post_merge_verify(
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 event_store=FakeEventStore(),
                 merge_sha='abc123',
+                verifier=FakeVerifier(),
             )
 
         assert outcome is None  # verify passed
@@ -338,17 +364,12 @@ class TestRunPostMergeVerifyPoolWiring:
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
 
-        spec_calls = []
-
-        import orchestrator.verify_runner as _vr
-        orig_build = _vr.build_merge_verify_spec
-
-        def spy_build_spec(config, module_configs, task_files, **kw):
-            spec_calls.append(task_files)
-            return orig_build(config, module_configs, task_files, **kw)
+        # The derived scope is observed where it LANDS -- the scope the verify
+        # was actually asked to run -- rather than on the spec builder that
+        # computes it.
+        verifier = _RecordingVerifier()
 
         with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
-             patch('orchestrator.merge_queue.build_merge_verify_spec', side_effect=spy_build_spec), \
              patch('orchestrator.merge_queue._derive_task_files_from_git',
                    new=AsyncMock(return_value=['src/x.py'])):
             await _run_post_merge_verify(
@@ -356,10 +377,13 @@ class TestRunPostMergeVerifyPoolWiring:
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 merge_sha='abc123',
+                verifier=verifier,
             )
 
-        assert len(spec_calls) >= 1
-        assert spec_calls[0] == ('src/x.py',)
+        assert len(verifier.scoped_calls) >= 1
+        # The tuple is what the spec carried, unchanged -- the assertion the
+        # builder spy used to make, now made where the scope is consumed.
+        assert verifier.scoped_calls[0]['task_files'] == ('src/x.py',)
 
     async def test_gate_no_derivation_when_no_enabled_runners(self, tmp_path):
         """With no enabled runners + task_files=None, _run_post_merge_verify does NOT
@@ -370,35 +394,29 @@ class TestRunPostMergeVerifyPoolWiring:
         req = _make_merge_request(config, task_files=None, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
 
-        spec_calls = []
-        import orchestrator.verify_runner as _vr
-        orig_build = _vr.build_merge_verify_spec
-
-        def spy_build_spec(conf, module_configs, task_files, **kw):
-            spec_calls.append(task_files)
-            return orig_build(conf, module_configs, task_files, **kw)
-
         # Track proactive calls to _derive_task_files_from_git from _run_post_merge_verify.
         # We patch run_scoped_verification so the local runner doesn't actually run verify
         # (which would also call _derive internally), isolating the upstream derivation.
         derive_mock = AsyncMock(return_value=['src/x.py'])
 
-        with patch('orchestrator.merge_queue.build_merge_verify_spec', side_effect=spy_build_spec), \
-             patch('orchestrator.merge_queue.run_scoped_verification',
-                   new=AsyncMock(return_value=_make_pass_result())), \
-             patch('orchestrator.merge_queue._derive_task_files_from_git',
+        verifier = _RecordingVerifier()
+
+        with patch('orchestrator.merge_queue._derive_task_files_from_git',
                    new=derive_mock):
             await _run_post_merge_verify(
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 merge_sha='abc123',
+                verifier=verifier,
             )
 
         # The proactive derivation must NOT have been called when Lever C is off
         derive_mock.assert_not_called()
-        # spec must have received task_files=None (byte-identical local-only path)
-        assert spec_calls[0] is None
+        # The verify must have been asked for the UNSCOPED run (task_files=None
+        # -- the byte-identical local-only path), which is the observable the
+        # spec's task_files argument existed to prove.
+        assert verifier.scoped_calls[0]['task_files'] is None
 
 
 # ---------------------------------------------------------------------------
@@ -543,15 +561,14 @@ class TestRunPostMergeVerifyLocalOnly:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 emitted.append({'event_type': event_type, 'data': data or {}})
 
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
-             patch('orchestrator.merge_queue.run_scoped_verification',
-                   new=AsyncMock(return_value=_make_pass_result())):
+        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]):
             outcome = await _run_post_merge_verify(
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 event_store=FakeEventStore(),
                 merge_sha='abc123',
+                verifier=FakeVerifier(),
             )
 
         assert outcome is None  # verify passed
@@ -639,10 +656,6 @@ class TestCrossCheckHoldsLaneLockLease:
 
         git_ops.merge_verify_lease = fake_lease
 
-        async def fake_scoped(*_args, **_kwargs):
-            order.append('verify-ran')
-            return _make_pass_result()
-
         class FakeEventStore(EventStore):
             def __init__(self):
                 object.__init__(self)
@@ -650,17 +663,15 @@ class TestCrossCheckHoldsLaneLockLease:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 pass
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', new=fake_scoped), \
-             patch('orchestrator.merge_queue._run_unscoped_typechecks',
-                   new=AsyncMock(return_value=MagicMock(broken=False))):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=FakeEventStore(),
-                merge_sha='abc123',
-                runner=fake_remote,
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=FakeEventStore(),
+            merge_sha='abc123',
+            runner=fake_remote,
+            verifier=_RecordingVerifier(on_scoped=lambda: order.append('verify-ran')),
+        )
 
         # AGREE (remote green + local green) → land proceeds.
         assert outcome is None
@@ -713,10 +724,6 @@ class TestCrossCheckHoldsLaneLockLease:
 
         git_ops.merge_verify_lease = fake_lease
 
-        async def fake_scoped(*_args, **_kwargs):
-            order.append('verify-ran')
-            return _make_pass_result()
-
         class FakeEventStore(EventStore):
             def __init__(self):
                 object.__init__(self)
@@ -724,17 +731,15 @@ class TestCrossCheckHoldsLaneLockLease:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 pass
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', new=fake_scoped), \
-             patch('orchestrator.merge_queue._run_unscoped_typechecks',
-                   new=AsyncMock(return_value=MagicMock(broken=False))):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=FakeEventStore(),
-                merge_sha='abc123',
-                runner=fake_remote,
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=FakeEventStore(),
+            merge_sha='abc123',
+            runner=fake_remote,
+            verifier=_RecordingVerifier(on_scoped=lambda: order.append('verify-ran')),
+        )
 
         # AGREE (remote green + local green) → land proceeds.
         assert outcome is None
@@ -791,7 +796,7 @@ class TestCrossCheckLeaseContentionFailsSafe:
         git_ops.merge_verify_lease = contended_lease
 
         # Spy: the local trust-anchor verify must NEVER run under a contended lane.
-        scoped_spy = AsyncMock(return_value=_make_pass_result())
+        verifier = _RecordingVerifier()
 
         emitted: list = []
 
@@ -805,24 +810,26 @@ class TestCrossCheckLeaseContentionFailsSafe:
         quarantine: set[str] = set()
         fake_eq = _FakeEscalationQueue(open_l1=False)
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', new=scoped_spy):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=FakeEventStore(),
-                merge_sha='abc123',
-                runner=fake_remote,
-                quarantine=quarantine,
-                escalation_queue=fake_eq,
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=FakeEventStore(),
+            merge_sha='abc123',
+            runner=fake_remote,
+            quarantine=quarantine,
+            escalation_queue=fake_eq,
+            verifier=verifier,
+        )
 
         # (1) The land PROCEEDS on the remote green — contention did NOT
         #     propagate out (would reach the LOCAL-path requeue handler, wrong).
         assert outcome is None
         # (2) The local trust-anchor verify never ran (running it under an
         #     actively-reseeding lane reproduces the ENOENT-clobber).
-        assert not scoped_spy.called, 'local cross-check verify must NOT run on a contended lane'
+        assert verifier.scoped_calls == [], (
+            'local cross-check verify must NOT run on a contended lane'
+        )
         # (3) A contended lane is NOT a divergence — no quarantine, no
         #     verify_cross_check_mismatch escalation.
         assert quarantine == set()
