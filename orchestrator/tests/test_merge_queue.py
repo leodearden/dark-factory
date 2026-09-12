@@ -28,7 +28,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, passes, raises
+from _merge_lane_fakes import FakeClock, FakeVerifier, VerifyScript, passes, raises
 from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec
 from _serial_merge_worker import MergeWorker
@@ -23030,27 +23030,26 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         )
 
     async def test_heartbeat_loop_touches_ledger_and_freezes_on_stop(
-        self, git_ops: GitOps, config: OrchestratorConfig, caplog, monkeypatch,
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
     ):
-        """_heartbeat_loop wires touch into per-tick; mtime freezes after stop().
+        """_heartbeat_loop touches the ledger every tick, and stops ticking on stop().
 
-        Scenario:
-          1. monkeypatch.setattr _HEARTBEAT_POLL_S to a small value (0.02 s).
-          2. Set _heartbeat_interval_s high (9999 s) so rate-limited log stays quiet.
-          3. Create a real _merge-* worktree; register it; force mtime to 0.
-          4. Start _heartbeat_loop as a standalone task (set _running=True).
-          5. Poll ≤ 1 s asserting mtime advanced to near-now (touched).
-          6. Set _running=False, cancel/await task (await ensures task is done).
-          7. Confirm task.done() before sampling frozen mtime; sleep > 2× poll;
-             assert mtime unchanged (frozen).
+        The subject is the LOOP's cadence, so the instrument is the injected
+        clock rather than wall time: ``_heartbeat_loop`` awaits
+        ``self._clock.sleep(_HEARTBEAT_POLL_S)``, so a ``FakeClock`` both
+        records every tick the loop asks for and returns from it immediately.
+        That makes the two assertions exact instead of probabilistic — "it
+        ticked" is a recorded sleep, and "it stopped" is the recorded count no
+        longer growing — where the previous wall-clock version raced a real
+        0.02 s poll against a 1 s deadline and a 0.12 s "> 2× poll" margin.
 
-        RED because _heartbeat_loop does not call _touch_owned_merge_worktrees yet.
+        Nothing here patches ``_HEARTBEAT_POLL_S``: with the clock injected,
+        how long a tick claims to be no longer costs the test anything.
         """
         import os as _os
 
-        import orchestrator.merge_queue as mq_mod
-
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        clock = FakeClock(time=time.time())
         worker = SpeculativeMergeWorker(git_ops, queue)
         worker._heartbeat_interval_s = 9999.0  # suppress rate-limited log
 
@@ -23065,19 +23064,20 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         _os.utime(str(merge_wt), (0, 0))
         assert merge_wt.stat().st_mtime == 0
 
-        # Start heartbeat with fast poll; monkeypatch handles restoration
-        monkeypatch.setattr(mq_mod, '_HEARTBEAT_POLL_S', 0.02)
         worker._running = True
         task = asyncio.create_task(worker._heartbeat_loop())
         try:
-            # Poll up to 1 s for mtime to advance
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while asyncio.get_running_loop().time() < deadline:
-                if merge_wt.stat().st_mtime > time.time() - 5:
+            # Yield until the loop has taken a few ticks THROUGH THE CLOCK.
+            for _ in range(200):
+                if len(clock.sleeps) >= 3:
                     break
-                await asyncio.sleep(0.05)
-            assert merge_wt.stat().st_mtime > time.time() - 5, (
-                f'mtime not advanced after heartbeat loop ran; '
+                await asyncio.sleep(0)
+            assert len(clock.sleeps) >= 3, (
+                f'heartbeat loop did not tick through the injected clock; '
+                f'recorded sleeps: {clock.sleeps}'
+            )
+            assert merge_wt.stat().st_mtime > 0, (
+                f'mtime not advanced after the heartbeat loop ticked; '
                 f'st_mtime={merge_wt.stat().st_mtime}'
             )
         finally:
@@ -23086,11 +23086,17 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        # Confirm task is truly done before sampling mtime — avoids a race
-        # where a final in-flight tick fires after stop() during the sleep window.
+        # Confirm the task is truly done before sampling, so a final in-flight
+        # tick cannot fire inside the observation window.
         assert task.done(), 'Heartbeat task must be done after cancel+await'
         frozen_mtime = merge_wt.stat().st_mtime
-        await asyncio.sleep(0.12)  # > 2× poll
+        ticks_at_stop = len(clock.sleeps)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert len(clock.sleeps) == ticks_at_stop, (
+            f'the stopped loop kept asking the clock to sleep: '
+            f'{ticks_at_stop} -> {len(clock.sleeps)}'
+        )
         assert merge_wt.stat().st_mtime == frozen_mtime, (
             'mtime advanced after worker stopped — heartbeat leaked'
         )
