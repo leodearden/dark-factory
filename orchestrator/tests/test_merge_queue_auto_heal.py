@@ -805,7 +805,7 @@ class TestAutoHealOwnerTiedResume:
         esc_id = 'esc-owner-001'
         assert real_worker.lane_owned_by(esc_id) == 'normal', (
             f'esc-owner-001 must own the normal-lane halt; '
-            f'owner state: {real_worker._lane_halt_owner!r}'
+            f"owner state: {real_worker.snapshot()['halt_owner_esc_id']!r}"
         )
 
         # Owner-tied resume: unhalt_lanes_owned_by returns ['normal'] and clears the halt
@@ -1024,13 +1024,13 @@ class TestAutoHealHaltOwnerIsDedupeParent:
         # (2) the PARENT escalation (the one that resolves) owns the halt
         assert real_worker.lane_owned_by('parent-esc-999') == 'normal', (
             f'parent-esc-999 must own the normal-lane halt (surviving parent); '
-            f'owner state: {real_worker._lane_halt_owner!r}'
+            f"owner state: {real_worker.snapshot()['halt_owner_esc_id']!r}"
         )
 
         # (3) the folded child must NOT own the halt
         assert real_worker.lane_owned_by('esc-child-001') is None, (
             f'esc-child-001 (folded child) must NOT own the halt; '
-            f'owner state: {real_worker._lane_halt_owner!r}'
+            f"owner state: {real_worker.snapshot()['halt_owner_esc_id']!r}"
         )
 
         # (4) owner-tied resume: unhalt_lanes_owned_by(parent) resumes normal lane
