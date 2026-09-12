@@ -34,6 +34,7 @@ from _fm_helpers import install_identity_mocks
 from test_referent_verification import _WRITE_PRIMITIVES, assert_never_repaired
 
 from fused_memory.backends.graphiti_client import ActiveEdgesError, EdgeNotFoundError
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
@@ -2307,7 +2308,9 @@ class TestTheStormGateProjectRoot:
             'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
         )
         service.set_known_projects({})
-        service.config.taskmaster.project_root = '/tmp/server-cwd-trap'
+        # `mock_config` leaves `taskmaster` at its schema default of None, so the
+        # trap value has to be planted as a whole section rather than a leaf.
+        service.config.taskmaster = TaskmasterConfig(project_root='/tmp/server-cwd-trap')
 
         await service._repair_episode_referents(
             _stats(_finding()), group_id='dark_factory',
