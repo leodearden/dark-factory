@@ -62,51 +62,6 @@ def _sentinel_entry() -> InflightEntry:
     return cast(InflightEntry, object())
 
 
-def _make_bare_worker() -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for pure unit tests.
-
-    No event loop or real git_ops required — mirrors test_halt_owner.py's
-    ``SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())``
-    construction style.
-    """
-    return SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
-
-
-# ---------------------------------------------------------------------------
-# step-9 RED / step-10 GREEN: _verify_frontier_depth()
-# ---------------------------------------------------------------------------
-
-
-class TestVerifyFrontierDepth:
-    """_verify_frontier_depth() == len(_frozen_inflight_entries()) (ε=1890).
-
-    Pure/synchronous delegation test — lightly stubs _frozen_inflight_entries()
-    so this test is isolated from the frozen-prefix computation itself
-    (already covered by test_merge_queue_frozen_prefix.py) and asserts only
-    the depth helper's own wiring.
-
-    RED until step-10 GREEN adds the method.
-    """
-
-    def test_empty_frontier_returns_zero(self) -> None:
-        """No frozen/verifying entries ahead -> depth 0 (head verify vs real main)."""
-        worker = _make_bare_worker()
-        worker._frozen_inflight_entries = lambda: []
-        assert worker._verify_frontier_depth() == 0
-
-    def test_one_frozen_entry_returns_one(self) -> None:
-        """One speculated item ahead -> depth 1."""
-        worker = _make_bare_worker()
-        worker._frozen_inflight_entries = lambda: [_sentinel_entry()]
-        assert worker._verify_frontier_depth() == 1
-
-    def test_three_frozen_entries_returns_three(self) -> None:
-        """Three speculated items ahead -> depth 3."""
-        worker = _make_bare_worker()
-        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(3)]
-        assert worker._verify_frontier_depth() == 3
-
-
 # ---------------------------------------------------------------------------
 # step-11 RED / step-12 GREEN: depth/speculative plumbing
 # ---------------------------------------------------------------------------
@@ -357,32 +312,44 @@ class TestRunPostMergeVerifyChainItemsPlumbing:
         assert calls[0]['chain_items'] == 1
 
 
+def _item_and_lease(
+    tmp_path: Path, task_id: str, *, speculative: bool = True,
+) -> tuple[RealMergeItem, object]:
+    """A merged item and the host lease a dispatch would verify it under."""
+    from orchestrator.verify_runner import HostLease
+
+    config = _make_bare_config()
+    req = _make_request(task_id, f'task/{task_id}', tmp_path, config)
+    item = RealMergeItem(
+        request=req,
+        merge_result=MergeResult(
+            success=True, merge_commit='deadbeef', merge_worktree=tmp_path,
+        ),
+        merge_wt=tmp_path,
+        base_sha='dead' * 10,
+        speculative=speculative,
+    )
+    return item, HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
+
+
 @pytest.mark.asyncio
 class TestRunInflightVerifyDepthWiring:
-    """_run_inflight_verify forwards depth + item.speculative into
-    _run_post_merge_verify (task 2340).
+    """_run_inflight_verify's depth + item.speculative reach the merge_verify
+    event (task 2340).
 
-    RED until step-12 GREEN adds the depth kwarg on _run_inflight_verify
-    and forwards depth/speculative into its _run_post_merge_verify call.
+    Observed where the two fields are consumed — verify_runner.py's
+    ``EventType.merge_verify`` emit — rather than by capturing the kwargs of
+    the _run_post_merge_verify call in between.
     """
 
-    async def test_depth_and_speculative_forwarded_to_run_post_merge_verify(
+    async def test_depth_and_speculative_reach_the_merge_verify_event(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.verify_runner import HostLease
-
-        config = _make_bare_config()
-        req = _make_request('t-wire', 'task/t-wire', tmp_path, config)
-        item = RealMergeItem(
-            request=req,
-            merge_result=MergeResult(
-                success=True, merge_commit='deadbeef', merge_worktree=tmp_path,
-            ),
-            merge_wt=tmp_path,
-            base_sha='dead' * 10,
-            speculative=True,
+        item, lease = _item_and_lease(tmp_path, 't-wire', speculative=True)
+        es = _CapturingEventStore()
+        worker = SpeculativeMergeWorker(
+            git_ops=_make_git_ops_mock(), queue=asyncio.Queue(), event_store=es,
         )
-        lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
 
         captured: dict = {}
 
@@ -390,16 +357,15 @@ class TestRunInflightVerifyDepthWiring:
             captured.update(kwargs)
             return None  # pass
 
-        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
-
         with patch(
             'orchestrator.merge_queue._run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
-            await worker._run_inflight_verify(item, lease, depth=2)  # RED: no depth kwarg yet
+            await worker._run_inflight_verify(item, lease, depth=2)
 
-        assert captured.get('depth') == 2
-        assert captured.get('speculative') is True
+        (event,) = es.events_of(EventType.merge_verify)
+        assert event['data']['depth'] == 2
+        assert event['data']['speculative'] is True
 
 
 # ---------------------------------------------------------------------------
@@ -416,52 +382,40 @@ class TestRunInflightVerifyDepthWiring:
 
 @pytest.mark.asyncio
 class TestRunInflightVerifyChainItemsWiring:
-    """_run_inflight_verify forwards chain_items into _run_post_merge_verify."""
+    """_run_inflight_verify's chain_items reaches the merge_verify event."""
 
-    def _item_and_lease(self, tmp_path: Path, *, speculative: bool = True):
-        from orchestrator.verify_runner import HostLease
-
-        config = _make_bare_config()
-        req = _make_request('t-ci-wire', 'task/t-ci-wire', tmp_path, config)
-        item = RealMergeItem(
-            request=req,
-            merge_result=MergeResult(
-                success=True, merge_commit='deadbeef', merge_worktree=tmp_path,
-            ),
-            merge_wt=tmp_path,
-            base_sha='dead' * 10,
-            speculative=speculative,
+    async def _verify_event(self, tmp_path: Path, **verify_kwargs) -> dict:
+        item, lease = _item_and_lease(tmp_path, 't-ci-wire')
+        es = _CapturingEventStore()
+        worker = SpeculativeMergeWorker(
+            git_ops=_make_git_ops_mock(), queue=asyncio.Queue(), event_store=es,
         )
-        lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
-        return item, lease
 
-    async def _captured_kwargs(self, tmp_path: Path, **verify_kwargs) -> dict:
-        item, lease = self._item_and_lease(tmp_path)
         captured: dict = {}
 
         async def _fake_run_post_merge_verify(*_args, **kwargs):
             captured.update(kwargs)
             return None  # pass
 
-        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
         with patch(
             'orchestrator.merge_queue._run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
             await worker._run_inflight_verify(item, lease, **verify_kwargs)
-        return captured
+        (event,) = es.events_of(EventType.merge_verify)
+        return event['data']
 
     async def test_chain_items_is_forwarded(self, tmp_path: Path) -> None:
-        captured = await self._captured_kwargs(tmp_path, depth=2, chain_items=3)
+        data = await self._verify_event(tmp_path, depth=2, chain_items=3)
 
-        assert captured.get('chain_items') == 3
+        assert data['chain_items'] == 3
 
     async def test_omitted_chain_items_defaults_to_one(self, tmp_path: Path) -> None:
         """Keeps _merge_queue_harness.drive_verify_and_advance and the other
         direct-call test paths byte-identical."""
-        captured = await self._captured_kwargs(tmp_path, depth=2)
+        data = await self._verify_event(tmp_path, depth=2)
 
-        assert captured.get('chain_items') == 1
+        assert data['chain_items'] == 1
 
 
 @pytest.mark.asyncio
@@ -665,28 +619,31 @@ async def _make_branch_with_file(
 
 @pytest.mark.asyncio
 class TestSpeculativeMergeEventDepth:
-    """classify_and_merge's speculative_merge event carries depth (task 2340).
+    """classify_and_merge's speculative_merge event carries the frontier
+    height (task 2340).
 
-    RED until step-14 GREEN adds depth=worker._verify_frontier_depth() to the
-    _emit_speculative(EventType.speculative_merge, ...) call in
-    classify_and_merge (merge_queue.py, inside the
-    `if speculative and isinstance(worker, SpeculativeMergeWorker):` guard).
+    The height is asserted at every frontier the pipeline can be in, and
+    through the event that publishes it rather than through the private
+    helper that computes it — the event IS the contract
+    ``_verify_frontier_depth`` exists to serve.
     """
 
+    @pytest.mark.parametrize('frontier', [0, 1, 2, 3])
     async def test_speculative_merge_event_carries_depth(
-        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        self, git_ops: GitOps, config: OrchestratorConfig, frontier: int,
     ) -> None:
-        worktree = await _make_branch_with_file(
-            git_ops, 'spec-depth-1', 'f.py', 'x = 1\n',
-        )
+        branch = f'spec-depth-{frontier}'
+        worktree = await _make_branch_with_file(git_ops, branch, 'f.py', 'x = 1\n')
         es = _CapturingEventStore()
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
-        # Two speculated items already frozen/verifying ahead of this one
-        # joining the frontier -> depth 2 (see _verify_frontier_depth()).
-        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(2)]
+        # `frontier` speculated items already frozen/verifying ahead of this
+        # one joining the frontier -> reported depth == frontier.
+        worker._frozen_inflight_entries = lambda: [
+            _sentinel_entry() for _ in range(frontier)
+        ]
 
-        req = _make_request('spec-depth-1', 'spec-depth-1', worktree, config)
+        req = _make_request(branch, branch, worktree, config)
         main_sha = await git_ops.get_main_sha()
 
         result = await classify_and_merge(
@@ -697,7 +654,7 @@ class TestSpeculativeMergeEventDepth:
         events = es.events_of(EventType.speculative_merge)
         assert len(events) == 1
         # _emit_speculative str-converts every data value.
-        assert events[0]['data']['depth'] == '2'
+        assert events[0]['data']['depth'] == str(frontier)
         assert events[0]['data']['base_sha'] == main_sha
 
         if result.merge_wt:
