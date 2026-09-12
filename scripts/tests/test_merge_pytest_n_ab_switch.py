@@ -61,8 +61,9 @@ class _FakeEscalationMcp:
       * `tools/call` -> 200 `text/event-stream`, SSE-framed;
       * `DELETE` (session termination) -> 200.
 
-    `received` records every (headers, payload) seen, so a test asserts the
-    script really handshook rather than merely exited 0.
+    `received` records every (verb, headers, payload) seen, so a test asserts
+    the script really handshook — and really released the session — rather
+    than merely exited 0.
 
     `initialize_reply` / `tool_call_reply` each override one step of that
     exchange with a literal (status, headers, body) triple, which is how the
@@ -98,11 +99,11 @@ class _FakeEscalationMcp:
                     payload = json.loads(raw) if raw else {}
                 except json.JSONDecodeError:
                     payload = {"_raw": raw.decode()}
-                outer.received.append((dict(self.headers), payload))
+                outer.received.append((self.command, dict(self.headers), payload))
                 self._reply(*outer._respond(self.headers, payload))
 
             def do_DELETE(self):
-                outer.received.append((dict(self.headers), {}))
+                outer.received.append((self.command, dict(self.headers), {}))
                 self._reply(200, {}, "")
 
             def _reply(self, status, headers, body):
@@ -156,16 +157,27 @@ class _FakeEscalationMcp:
 
 def _rpc_methods(server):
     """The JSON-RPC methods the server saw, in order (a DELETE carries none)."""
-    return [payload["method"] for _, payload in server.received if payload.get("method")]
+    return [payload["method"] for _, _, payload in server.received if payload.get("method")]
 
 
 def _called_tools(server):
     """The tool names every `tools/call` the server saw asked for."""
     return [
         (payload.get("params") or {}).get("name")
-        for _, payload in server.received
+        for _, _, payload in server.received
         if payload.get("method") == "tools/call"
     ]
+
+
+def _delete_count(server):
+    """How many session-terminating DELETEs the server saw.
+
+    Read by the wire test rather than left to census_trigger's own suite: the
+    server this script talks to is the long-lived escalation process, and a
+    session it never releases stays in `StreamableHTTPSessionManager`'s
+    registry with a live anyio task behind it, one per run.
+    """
+    return sum(1 for verb, _, _ in server.received if verb == "DELETE")
 
 
 def _report(**overrides):
@@ -203,31 +215,47 @@ def _git(repo, *args):
     )
 
 
-def _make_repo(tmp_path, verify_env_value, *, marker=False):
-    """Build a real temp git repo at <tmp_path>/repo carrying a
-    dark-factory-orchestrator.yaml whose top-level `verify_env:` block pins
-    KEY to *verify_env_value*, and commit it so the tree is clean.
+def _init_repo(tmp_path):
+    """An empty real git repo at <tmp_path>/repo, ready to commit into.
 
     A real repo (rather than a faked `git`) makes both halves of step 2
     faithful -- the `git rev-parse --show-toplevel` resolution and the
     "nothing to commit" idempotent path this bug lives on -- with no fake to
-    drift. `marker=True` precedes the key with an `  # A/B arm: ...` line,
-    the state a previously-switched config file is left in.
-
-    Returns the yaml path.
+    drift.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
+    return repo
 
+
+def _commit_config(repo, text):
+    """Write *text* as *repo*'s dark-factory-orchestrator.yaml and commit it,
+    so the tree the script sees is clean. Returns the yaml path."""
+    config = repo / "dark-factory-orchestrator.yaml"
+    config.write_text(text)
+    _git(repo, "add", "dark-factory-orchestrator.yaml")
+    _git(repo, "commit", "-q", "-m", "seed")
+    return config
+
+
+def _make_repo(tmp_path, verify_env_value, *, marker=False):
+    """A committed temp repo whose config's top-level `verify_env:` block pins
+    KEY to *verify_env_value* -- the state every switch starts from.
+
+    `marker=True` precedes the key with an `  # A/B arm: ...` line, the state
+    a previously-switched config file is left in.
+
+    Returns the yaml path.
+    """
     marker_line = (
         f'  # A/B arm: {KEY} set to "{verify_env_value}" at '
         "2026-09-10T12:42:14Z by scripts/merge-pytest-n-ab-switch.sh\n"
     )
-    config = repo / "dark-factory-orchestrator.yaml"
-    config.write_text(
+    return _commit_config(
+        _init_repo(tmp_path),
         "project_root: /nowhere\n"
         "max_concurrent_tasks: 3\n"
         "\n"
@@ -237,28 +265,28 @@ def _make_repo(tmp_path, verify_env_value, *, marker=False):
         '  PYTHONWARNINGS: "ignore"\n'
         "\n"
         "review:\n"
-        "  enabled: true\n"
+        "  enabled: true\n",
     )
-    _git(repo, "add", "dark-factory-orchestrator.yaml")
-    _git(repo, "commit", "-q", "-m", "seed")
-    return config
 
 
 # ---------------------------------------------------------------------------
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run(server, config_path, value, *, script=SCRIPT, env=None):
+def _run(server, config_path, value, *, script=SCRIPT, env=None, cwd=None, flags=()):
     """Run the script for *value* against *config_path*, pointing its reload
     at *server*'s real ephemeral port.
 
     *script* and *env* are the seams the interpreter-resolution tests need: a
     COPY of the script in a checkout with no venv, and a PATH whose `python3`
-    cannot import the transport.
+    cannot import the transport. *cwd* is the seam the relative-config_path
+    case needs (the client cwd is what a relative path is resolved against),
+    and *flags* carries `--dry-run`.
     """
     return subprocess.run(
-        ["bash", str(script), value, str(config_path), str(server.port)],
-        env=env, capture_output=True, text=True, timeout=60,
+        ["bash", str(script), value, str(config_path), str(server.port), *flags],
+        env=env, cwd=None if cwd is None else str(cwd),
+        capture_output=True, text=True, timeout=60,
     )
 
 
@@ -372,6 +400,10 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
     as a fixed list: `post_mcp_envelope` is deliberately ADAPTIVE, sending
     the envelope session-less first and handshaking only on the 400, so the
     real wire also carries a rejected tools/call ahead of the handshake.
+
+    The session it opened is asserted CLOSED for the same reason it is
+    asserted opened: both are wire facts this script depends on and cannot
+    see from its own exit code.
     """
     config = _make_repo(tmp_path, "8", marker=True)
 
@@ -383,12 +415,73 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
         proc = _run(server, config, "8")
         methods = _rpc_methods(server)
         tools = _called_tools(server)
+        deletes = _delete_count(server)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
     assert _verdict(proc)["outcome"] == "already_converged"
     assert "initialize" in methods, methods
     assert "tools/call" in methods[methods.index("initialize"):], methods
     assert set(tools) == {"reload_config"}, f"methods={methods}"
+    assert deletes == 1, (
+        f"the session was opened and not released, one leaked anyio task per "
+        f"run in the long-lived escalation process; the server saw {methods} "
+        f"and {deletes} DELETEs"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 1's own two exits, both of which end the run before the orchestrator is
+# ever contacted: the rehearsal, and the refusal to edit a config it cannot
+# find a verify_env block in.
+# ---------------------------------------------------------------------------
+
+def test_dry_run_neither_commits_nor_reloads(tmp_path):
+    """`--dry-run` shows the operator the change and stops there.
+
+    A whole separate exit path -- temp copy, `diff -u`, its own verdict shape
+    -- so a regression in it would let a rehearsal diverge from the real run
+    silently, which is the one thing a rehearsal must not do.
+    """
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before_head = _head(repo)
+    before_bytes = config.read_bytes()
+
+    with _FakeEscalationMcp(_report(config_path=str(config))) as server:
+        proc = _run(server, config, "8", flags=("--dry-run",))
+        received = list(server.received)
+
+    assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
+    assert _verdict(proc) == {"dry_run": True, "would_set": "8"}
+    assert f'+  {KEY}: "8"' in proc.stdout, (
+        f"a rehearsal that shows no diff rehearses nothing: {proc.stdout}"
+    )
+    assert _head(repo) == before_head, "a rehearsal must not commit"
+    assert config.read_bytes() == before_bytes, "a rehearsal must not edit in place"
+    assert received == [], f"a rehearsal must not reach the orchestrator: {received}"
+
+
+def test_a_config_with_no_verify_env_block_is_refused_before_the_commit(tmp_path):
+    """Pointed at a config carrying no top-level `verify_env:`, the editor
+    refuses rather than inventing one -- and refuses BEFORE the commit, so a
+    config it cannot safely edit leaves no trace in git either.
+    """
+    repo = _init_repo(tmp_path)
+    config = _commit_config(
+        repo, "project_root: /nowhere\nreview:\n  enabled: true\n"
+    )
+    before_head = _head(repo)
+    before_bytes = config.read_bytes()
+
+    with _FakeEscalationMcp(_report(config_path=str(config))) as server:
+        proc = _run(server, config, "8")
+        received = list(server.received)
+
+    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert "refusing to invent one" in proc.stderr, f"stderr={proc.stderr}"
+    assert _head(repo) == before_head, "the refusal must precede the commit"
+    assert config.read_bytes() == before_bytes
+    assert received == [], f"a refused edit must not reload anything: {received}"
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +545,28 @@ _UNCORROBORATED_ABSENCE = {
         lambda config, other: _report(reloaded=True, config_path=None),
         "re-read a different file",
     ),
+    # A RELATIVE config_path is the reporting orchestrator's own
+    # ORCH_CONFIG_PATH, resolved by ITS cwd -- resolving it against ours makes
+    # any unit configured with the bare filename match us whenever the script
+    # runs from the config's checkout, which is exactly how it is run (and how
+    # this group runs it below). Uncomparable, therefore not corroborating.
+    "relative_config_path": (
+        lambda config, other: _report(
+            reloaded=True, config_path="dark-factory-orchestrator.yaml",
+        ),
+        "re-read a different file",
+    ),
+    # verify_env DID change, but was bucketed as restart-required instead of
+    # hot-applied, so the arm is committed and NOT live -- and it is absent
+    # from `applied` exactly like a converged one. Latent while verify_env
+    # stays in RELOADABLE_FIELDS; a fail-open the moment it does not.
+    "verify_env_is_restart_required": (
+        lambda config, other: _report(
+            reloaded=True, config_path=str(config),
+            restart_required={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
+        ),
+        "restart-required, not hot-applied",
+    ),
 }
 
 
@@ -469,7 +584,10 @@ def test_uncorroborated_absence_is_not_convergence(tmp_path, build_report, diagn
     other.write_text(f'verify_env:\n  {KEY}: "2"\n')
 
     with _FakeEscalationMcp(build_report(config, other)) as server:
-        proc = _run(server, config, "8")
+        # From the config's own checkout, as an operator runs it -- and the
+        # only cwd from which a relative reported config_path could realpath
+        # onto ours and falsely corroborate.
+        proc = _run(server, config, "8", cwd=config.parent)
 
     assert proc.returncode != 0, (
         f"an uncorroborated absence was read as success: stdout={proc.stdout}"

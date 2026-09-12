@@ -38,6 +38,7 @@ VALUE="${ARGS[0]}"
 CONFIG="${ARGS[1]:-/home/leo/src/dark-factory/dark-factory-orchestrator.yaml}"
 PORT="${ARGS[2]:-8102}"
 [[ "$VALUE" =~ ^[0-9]+$ ]] || die "value must be a positive integer, got '$VALUE'"
+[[ "$PORT" =~ ^[0-9]+$ ]] || die "escalation_port must be a port number, got '$PORT'"
 [ -f "$CONFIG" ] || die "config not found: $CONFIG"
 # The reload step imports its MCP transport from the checkout the SCRIPT lives
 # in — never from $REPO below, which is the CONFIG's checkout and may be a
@@ -130,9 +131,9 @@ fi
 #    the converged re-run — and absence is the ONLY converged signal on the
 #    wire, because `unchanged` is a bare int COUNT of equal leaves
 #    (config.py::ConfigDiff), naming no keys and carrying no values. Absence is
-#    weaker than convergence, though: a rolled-back reload and a reload of a
-#    DIFFERENT orchestrator both produce it, which is what the two corroborators
-#    below exclude.
+#    weaker than convergence, though: a rolled-back reload, a reload of a
+#    DIFFERENT orchestrator, and a verify_env bucketed as restart-required all
+#    produce it, which is what the three corroborators below exclude.
 "$PY" - "$SCRIPT_DIR" "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$PORT" <<'RELOAD_PY'
 import json, os, sys
 script_dir, key, value, sha, config_path, port = sys.argv[1:7]
@@ -178,9 +179,24 @@ if entry is None:
         print(f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
               f'(a failed reload rolls every leaf back, so the live config is untouched)', file=sys.stderr)
         sys.exit(1)
-    if not reported or os.path.realpath(reported) != config_path:
+    # `reported` is the ORCHESTRATOR's own ORCH_CONFIG_PATH, so a RELATIVE one
+    # is resolved by the SERVER's cwd — realpath here would resolve it against
+    # OURS, and a different unit whose ORCH_CONFIG_PATH is the bare
+    # `dark-factory-orchestrator.yaml` would then match us whenever this runs
+    # from our project root. Uncomparable is not a match.
+    if not reported or not os.path.isabs(reported) or os.path.realpath(reported) != config_path:
         print(f'reload reported no verify_env change, but re-read a different file: '
               f'config_path={reported!r} expected={config_path!r}', file=sys.stderr)
+        sys.exit(1)
+    # verify_env is in RELOADABLE_FIELDS today, so a change to it is never
+    # bucketed as restart-required (config.py::diff_config) and this never
+    # fires. One allowlist edit away it would: a genuine flip then produces
+    # this branch's exact shape — reloaded, our file, nothing under `applied`
+    # — while the arm is committed and NOT live.
+    if 'verify_env' in (tool.get('restart_required') or {}):
+        print(f'verify_env changed but is restart-required, not hot-applied: '
+              f'restart_required_keys={sorted(tool.get("restart_required") or {})} '
+              f'(committed as {sha}; the value lands at the next restart)', file=sys.stderr)
         sys.exit(1)
     outcome = 'already_converged'
 else:
