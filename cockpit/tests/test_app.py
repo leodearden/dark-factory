@@ -1526,15 +1526,50 @@ class TestReorderTargetsAreDeduped:
             assert backend.reorder_calls[-1] == [target_a, target_b]
 
 
+class RecordingCopyRunner:
+    """A CockpitApp `copy_runner` double: records each payload, reports a scripted CopyAttempt.
+
+    The seam CockpitApp actually holds is Callable[[str], CopyAttempt] --
+    the app has no business knowing about argv, `which` or $DISPLAY (those
+    are cockpit.clipboard's own injected knobs, exercised at the process
+    boundary in test_clipboard.py). Recording the payload here is what pins
+    the app half of the leaf signal: which text 'y' hands to the clipboard.
+    """
+
+    def __init__(self, attempt=None):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome
+
+        self.payloads: list[str] = []
+        self._attempt = (
+            attempt if attempt is not None else CopyAttempt(CopyOutcome.COPIED, ('xclip',))
+        )
+
+    def __call__(self, text):
+        self.payloads.append(text)
+        return self._attempt
+
+
 class TestCopyAction:
+    """'y' hands the highlighted row's payload to the clipboard seam.
+
+    These tests previously asserted on `app._clipboard`, Textual's private
+    record of the last copy_to_clipboard call. That was the false green task
+    5448 re-opened 2517 to fix: Textual sets that attribute BEFORE writing
+    the OSC 52 escape and regardless of whether the terminal understands it,
+    so the assertion passed against a copy that reached no clipboard on
+    Konsole 23.08.5. The replacement asserts on the injected seam (here) and
+    on Textual's PUBLIC copy_to_clipboard/notify (TestCopyFallbackAndFeedback
+    below) -- never a private attribute.
+    """
+
     @pytest.mark.timeout(10)
     async def test_copy_highlighted_decision_puts_question_and_ids_on_clipboard(self, tmp_path):
-        """'y' (the copy affordance, task 2517 / esc-2303-1 F4) copies the
-        highlighted DecisionQueue row's question text + ids onto the system
-        clipboard via Textual's in-app OSC 52 App.copy_to_clipboard --
-        terminal-native, no xclip/wl-copy subprocess -- and is strictly
-        READ-ONLY, never touching sessions/ or decisions/ (mirrors
-        TestWriteDiscipline's before/after _snapshot_tree diff).
+        """'y' (the copy affordance, task 2517 / esc-2303-1 F4) hands the
+        highlighted DecisionQueue row's question text + ids to the system-
+        clipboard seam (cockpit.clipboard::copy_to_system_clipboard in
+        production, a recorder here), and is strictly READ-ONLY, never
+        touching sessions/ or decisions/ (mirrors TestWriteDiscipline's
+        before/after _snapshot_tree diff).
         """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
@@ -1558,7 +1593,10 @@ class TestCopyAction:
         sr.write_record(awaiting, root=tmp_path)
 
         backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        copy_runner = RecordingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=backend, poll_interval=0.05, copy_runner=copy_runner
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1572,11 +1610,12 @@ class TestCopyAction:
             await pilot.press('y')
             await pilot.pause()
 
-            # (a) the row's question + ids landed on the clipboard.
-            assert app._clipboard
-            assert 'Which port do we bind?' in app._clipboard
-            assert 'esc-42' in app._clipboard
-            assert '2517' in app._clipboard
+            # (a) the row's question + ids reached the clipboard seam, once.
+            assert len(copy_runner.payloads) == 1
+            payload = copy_runner.payloads[0]
+            assert 'Which port do we bind?' in payload
+            assert 'esc-42' in payload
+            assert '2517' in payload
 
             # (b) strictly read-only -- no sessions/ or decisions/ write.
             after = _snapshot_tree(tmp_path)
@@ -1584,8 +1623,8 @@ class TestCopyAction:
 
     @pytest.mark.timeout(10)
     async def test_copy_highlighted_session_puts_slug_and_question_on_clipboard(self, tmp_path):
-        """'y' on a SESSION-backed row (no decision behind it) copies the
-        session slug + question text onto the clipboard. Covers the
+        """'y' on a SESSION-backed row (no decision behind it) hands the
+        session slug + question text to the clipboard seam. Covers the
         app-level action_copy -> highlighted SESSION row -> clipboard path
         end-to-end -- the decision-row case above and format_copy_payload's
         own pure-formatter unit tests don't exercise this branch through
@@ -1604,7 +1643,10 @@ class TestCopyAction:
         sr.write_record(awaiting, root=tmp_path)
 
         backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        copy_runner = RecordingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=backend, poll_interval=0.05, copy_runner=copy_runner
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1618,10 +1660,11 @@ class TestCopyAction:
             await pilot.press('y')
             await pilot.pause()
 
-            # (a) the session row's question + slug landed on the clipboard.
-            assert app._clipboard
-            assert 'Which region?' in app._clipboard
-            assert 'awaiting-99' in app._clipboard
+            # (a) the session row's question + slug reached the clipboard seam.
+            assert len(copy_runner.payloads) == 1
+            payload = copy_runner.payloads[0]
+            assert 'Which region?' in payload
+            assert 'awaiting-99' in payload
 
             # (b) strictly read-only -- a session is never cockpit-written.
             after = _snapshot_tree(tmp_path)
@@ -1630,16 +1673,19 @@ class TestCopyAction:
     @pytest.mark.timeout(10)
     async def test_copy_with_empty_queue_is_a_fail_soft_no_op(self, tmp_path):
         """'y' against an EMPTY queue -- highlighted_key() returns None,
-        mirroring action_drop/action_defer's own fail-soft guard -- must
-        not crash and must leave the clipboard untouched (reviewer_comprehensive
-        test_coverage suggestion's optional no-highlight/no-op case).
+        mirroring action_drop/action_defer's own fail-soft guard -- must not
+        crash and must never reach the clipboard seam at all (no stray
+        subprocess, no misleading toast for a row that doesn't exist).
         """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
         backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        copy_runner = RecordingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=backend, poll_interval=0.05, copy_runner=copy_runner
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1648,7 +1694,7 @@ class TestCopyAction:
             await pilot.press('y')
             await pilot.pause()
 
-            assert app._clipboard == ''
+            assert copy_runner.payloads == []
 
 
 class TestDeferResetsAge:
