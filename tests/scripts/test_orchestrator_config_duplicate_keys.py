@@ -36,7 +36,7 @@ is orchestrator misconfiguration.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Collection, Hashable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -425,15 +425,22 @@ def test_a_second_top_level_verify_env_block_silently_drops_the_earlier_keys(
     )
 
 
-def _orchestrator_config_paths(
-    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
-) -> list[Path]:
+def _orchestrator_config_paths(module_configs: dict[str, ModuleConfig]) -> list[Path]:
     """Every yaml file the orchestrator's own loaders read, in a deterministic order.
 
-    DISCOVERY IS DELEGATED to the production walk rather than to an
-    ``rglob('orchestrator.yaml')``, which inherits config.py's pruning of
-    ``.worktrees/``, ``.venv/``, ``node_modules/``, ``build/`` and nested
-    checkouts. A hand-rolled glob run from the main checkout would descend every
+    TAKES THE ALREADY-DISCOVERED MAPPING, never the callable that produces it.
+    ``_discover_module_configs`` is a full recursive walk of the repo — its own
+    docstring flags the cost on a large tree — so a caller that wants both the
+    paths and the prefixes behind them would run it twice, and would then be
+    reasoning about two separate OBSERVATIONS of discovery rather than one.
+    Neither test here poisons ``ORCH_CONFIG_PATH`` between construction and the
+    walk, so there is no reason to defer it the way this directory's
+    ``executed_for_touched`` guards must.
+
+    THE MAPPING MUST COME FROM the production walk, never from an
+    ``rglob('orchestrator.yaml')``: delegating is what inherits config.py's
+    pruning of ``.worktrees/``, ``.venv/``, ``node_modules/``, ``build/`` and
+    nested checkouts. A hand-rolled glob run from the main checkout would descend every
     sibling worktree and sweep other branches' copies of these same files, so it
     could fail for a config this branch does not contain — and, worse, could
     drift from the set the orchestrator actually registers.
@@ -449,8 +456,15 @@ def _orchestrator_config_paths(
     return [
         ROOT_CONFIG_PATH,
         DEFAULTS_PATH,
-        *(REPO_ROOT / prefix / 'orchestrator.yaml' for prefix in discover_module_configs()),
+        *(REPO_ROOT / prefix / 'orchestrator.yaml' for prefix in module_configs),
     ]
+
+
+def _is_module_config_of(path: Path, prefixes: Collection[str]) -> bool:
+    """True when *path* is the ``<prefix>/orchestrator.yaml`` of a discovered prefix."""
+    if path.name != 'orchestrator.yaml' or not path.parent.is_relative_to(REPO_ROOT):
+        return False
+    return path.parent.relative_to(REPO_ROOT).as_posix() in prefixes
 
 
 def test_every_orchestrator_config_the_loader_reads_has_no_duplicate_keys(
@@ -463,7 +477,7 @@ def test_every_orchestrator_config_the_loader_reads_has_no_duplicate_keys(
     """
     findings = [
         finding
-        for path in _orchestrator_config_paths(discover_module_configs)
+        for path in _orchestrator_config_paths(discover_module_configs())
         for finding in duplicate_keys(path)
     ]
 
@@ -489,11 +503,20 @@ def test_the_swept_set_is_the_set_the_loader_actually_reads(
     written down as a roster: a literal list or count of today's module configs
     rots on the next one added, and this directory has already recorded
     hard-coded counts of directory contents going stale as a measured defect.
-    """
-    prefixes = list(discover_module_configs())
-    paths = _orchestrator_config_paths(discover_module_configs)
 
-    assert prefixes, (
+    DERIVED, BUT NOT A COPY OF THE CONSTRUCTION. An earlier form of this test
+    asserted set equality against the very expression ``_orchestrator_config_
+    paths`` builds its list from, fed by a second call to the same walk: it could
+    only have failed if two consecutive walks disagreed, never for the drift its
+    own message named. What is asserted instead is the SHAPE every swept path
+    must have — ``<prefix>/orchestrator.yaml`` under a prefix discovery actually
+    registered, and a file that exists — which does go red if the construction
+    rule changes.
+    """
+    module_configs = discover_module_configs()
+    paths = _orchestrator_config_paths(module_configs)
+
+    assert module_configs, (
         'the production module-config walk found NO module configs, which would '
         'make the sweep above pass while checking almost nothing. Either discovery '
         'broke, or every <prefix>/orchestrator.yaml in the repo was removed'
@@ -506,17 +529,17 @@ def test_the_swept_set_is_the_set_the_loader_actually_reads(
         f'{DEFAULTS_PATH} is the package-bundled layer _load_defaults reads, and a '
         'duplicate key there degrades every project this orchestrator serves'
     )
-    assert sorted(set(paths) - {ROOT_CONFIG_PATH, DEFAULTS_PATH}) == sorted(
-        REPO_ROOT / prefix / 'orchestrator.yaml' for prefix in prefixes
-    ), (
-        'the swept module configs must be exactly one <prefix>/orchestrator.yaml per '
-        f'discovered prefix ({prefixes!r}), or the sweep has drifted from the set '
-        '_discover_module_configs actually registers'
-    )
-    assert len(paths) == len(prefixes) + 2, (
-        f'expected {len(prefixes)} module configs plus the root config and '
-        f'defaults.yaml, got {len(paths)} paths — a duplicate entry would make the '
-        'sweep read one file twice and report on it twice'
+    strays = [
+        path
+        for path in paths
+        if path not in (ROOT_CONFIG_PATH, DEFAULTS_PATH)
+        and not _is_module_config_of(path, module_configs)
+    ]
+    assert not strays, (
+        f'{strays!r} are swept but are not the <prefix>/orchestrator.yaml of any '
+        f'prefix the production walk registered ({sorted(module_configs)!r}), so the '
+        'sweep is reading files the orchestrator does not — a guard whose scope has '
+        'drifted from the loader it claims to cover'
     )
     missing = [path for path in paths if not path.is_file()]
     assert not missing, (
