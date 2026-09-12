@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.agents.triage import is_declared_simple_task
 from orchestrator.config import load_config
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import (
@@ -129,26 +130,6 @@ DF_VERIFY = {
     'typecheck': 'cd orchestrator && uv run pyright src/',
 }
 
-# Every key load_task's consumers read that this builder deliberately does NOT
-# emit, so the runner's documented default stands. Pinned as an executable
-# absence assertion rather than left to the module docstring's prose.
-OMITTED_KEYS = (
-    'reference',
-    'post_task_commit',
-    'setup_commands',
-    'timeout_minutes',
-    'max_execute_iterations',
-    'max_review_cycles',
-    'judge_after_each_iteration',
-    'max_architect_turns',
-    'adversarial',
-    'complexity',
-    'project',
-    'cohort',
-    'provenance',
-    'verify_outcome',
-)
-
 
 class TestBuildLiveFixtureKeySurface:
     """Exactly the eight emitted keys, key by key — and the omissions."""
@@ -207,6 +188,10 @@ class TestBuildLiveFixtureKeySurface:
         assert self._build(tmp_path, plan=plan)['plan'] == plan
 
     def test_emits_exactly_the_eight_keys(self, tmp_path):
+        # The executable contract for the omissions too: an exact-set
+        # assertion pins the absence of every key the builder deliberately
+        # does not emit — including ones not yet invented — so the module
+        # docstring's omission table needs no parallel absence test.
         assert set(self._build(tmp_path)) == {
             'id',
             'name',
@@ -217,10 +202,6 @@ class TestBuildLiveFixtureKeySurface:
             'modules',
             'plan',
         }
-
-    @pytest.mark.parametrize('key', OMITTED_KEYS)
-    def test_deliberately_omits(self, tmp_path, key):
-        assert key not in self._build(tmp_path)
 
     def test_missing_details_becomes_an_empty_string(self, tmp_path):
         task = live_task()
@@ -330,6 +311,80 @@ class TestBuildLiveFixtureRefuses:
         del task['id']
         with pytest.raises(ValueError, match='id'):
             self._build(tmp_path, task=task)
+
+    @pytest.mark.parametrize(
+        'verify_commands',
+        [
+            {},
+            {'test': 't', 'lint': 'l'},
+            {'test': 't', 'typecheck': 'ty'},
+            {'test': 't', 'lint': 'l', 'typecheck': ''},
+            {'test': 't', 'lint': '   ', 'typecheck': 'ty'},
+            {'test': 't', 'lint': 'l', 'typecheck': None},
+        ],
+        ids=['empty', 'no-typecheck', 'no-lint', 'blank', 'whitespace', 'null'],
+    )
+    def test_verify_commands_must_carry_all_three_gates(
+        self, tmp_path, verify_commands
+    ):
+        # The one bad input whose consumer degrades into a PLAUSIBLE
+        # measurement instead of a failure: build_eval_orch_config resolves a
+        # missing gate to the BASE config's command, so the cell runs and is
+        # scored against different gates than the corpus baseline it is being
+        # compared against, with nothing anywhere recording the substitution.
+        with pytest.raises(ValueError, match='verify_commands'):
+            self._build(tmp_path, verify_commands=verify_commands)
+
+    def test_the_refusal_names_the_missing_gates(self, tmp_path):
+        with pytest.raises(ValueError) as excinfo:
+            self._build(tmp_path, verify_commands={'test': 't'})
+        message = str(excinfo.value)
+        assert 'lint' in message and 'typecheck' in message
+
+    @pytest.mark.parametrize(
+        'verify_commands', [None, 'uv run pytest', ['test', 'lint']],
+        ids=['none', 'str', 'list'],
+    )
+    def test_verify_commands_must_be_a_mapping(self, tmp_path, verify_commands):
+        with pytest.raises(ValueError, match='verify_commands'):
+            self._build(tmp_path, verify_commands=verify_commands)
+
+    @pytest.mark.parametrize(
+        'project_root', [None, '', 'relative/checkout', Path('relative')],
+        ids=['none', 'empty', 'relative-str', 'relative-path'],
+    )
+    def test_project_root_must_be_a_non_empty_absolute_path(
+        self, tmp_path, project_root
+    ):
+        # Neither bad value FAILS downstream, which is why refusal belongs
+        # here: load_task silently rewrites a non-existent project_root to the
+        # repo root above the fixture file (so the cell reruns against
+        # whatever checkout the JSON was written under), and an empty string
+        # escapes that rewrite to reach build_eval_orch_config as Path('') —
+        # the cwd. Both score a cell against the wrong tree.
+        with pytest.raises(ValueError, match='project_root'):
+            self._build(tmp_path, project_root=project_root)
+
+    @pytest.mark.parametrize(
+        'modules',
+        ['orchestrator/evals', ['orchestrator/evals', 7], {'a': 'b'}, 3],
+        ids=['bare-str', 'non-str-entry', 'dict', 'int'],
+    )
+    def test_malformed_metadata_modules_is_refused(self, tmp_path, modules):
+        # `list('orchestrator/evals')` explodes into one module per
+        # character, and run_eval hands the result straight to
+        # TaskAssignment(modules=...) and the eval scheduler — so the cell
+        # would run with nonsense module scoping and still be scored.
+        task = live_task(metadata={'modules': modules})
+        with pytest.raises(ValueError, match='modules'):
+            self._build(tmp_path, task=task)
+
+    @pytest.mark.parametrize('modules', [None, [], ()], ids=['none', 'empty', 'tuple'])
+    def test_an_absent_or_empty_modules_list_is_a_thin_task_not_a_bad_one(
+        self, tmp_path, modules
+    ):
+        task = live_task(metadata={'modules': modules})
+        assert self._build(tmp_path, task=task)['modules'] == []
 
     @pytest.mark.parametrize(
         'overrides',
@@ -606,13 +661,39 @@ class TestLiveStratum:
 
     def test_declared_simple_is_vetoed_by_a_blocker_token(self):
         # classify_path reuses production's has_simple_task_blocker veto, so
-        # the stratum matches how the orchestrator would actually have routed
-        # the task — not merely what its author declared.
+        # the stratum tracks the contradiction the veto exists to catch — not
+        # merely what the task's author declared.
         task = live_task(
             title='Refactor the shadow coordinator',
             description='Touches the architecture of the merge lane.',
             metadata={'complexity': 'simple'},
         )
+        # Here the sampler's axis and production's routing agree: the blocker
+        # is in the description, which is the text production itself reads.
+        assert is_declared_simple_task(task) is False
+        assert live_stratum(task, project='dark_factory') == ('df', 'refactor', 'full')
+
+    def test_a_blocker_in_the_title_only_strata_full_though_production_ran_simple(
+        self,
+    ):
+        # The one reachable case where the path axis and production's routing
+        # DIVERGE, pinned so the trade is visible rather than discovered.
+        # classify_path applies the veto to title + description (a deliberate
+        # conservative superset, task_sampler.py::classify_path); production's
+        # is_declared_simple_task applies it to the description alone. So a
+        # blocker token confined to the title strata this cell 'full' while
+        # production dispatched the task down the 'simple' path.
+        #
+        # live_stratum holds the full record and COULD ask production's
+        # predicate directly; it deliberately does not, because a cell that
+        # strata differently from the corpus fixture for the same task is
+        # incomparable with it, and comparability is what the stratum is for.
+        task = live_task(
+            title='Rename the migration helper',
+            description='A one-line rename of a private helper.',
+            metadata={'complexity': 'simple'},
+        )
+        assert is_declared_simple_task(task) is True
         assert live_stratum(task, project='dark_factory') == ('df', 'refactor', 'full')
 
     def test_project_selects_the_repo_axis(self):

@@ -20,20 +20,15 @@ that already owns that worktree). A builder that went looking would bind the
 fixture's base to whenever it happened to run, making a cell's inputs
 unreproducible from its ``shadow_cells`` row.
 
-Emitted keys, and what the omissions mean
------------------------------------------
-
-``runner.load_task``'s consumers read far more keys than this builder emits.
-Every omission is deliberate — the runner's documented default stands in — and
-the table below is the interface contract, pinned executably by
-``test_eval_live_fixture.py``'s absence assertion:
+Emitted keys, and why the omissions are omissions
+-------------------------------------------------
 
 ===========================  ===============================================
 Emitted                      Value
 ===========================  ===============================================
 ``id``                       ``shadow_<task_id>_<cell_id>``
 ``name``                     the task title
-``project_root``             ``str(project_root)`` — see the field note below
+``project_root``             ``str(project_root)``, absolute
 ``pre_task_commit``          ``base_sha``, byte-equal, unnormalised
 ``task_definition``          ``{title, description, details}``, always all 3
 ``verify_commands``          the caller's gates (a copy)
@@ -41,36 +36,39 @@ Emitted                      Value
 ``plan``                     the caller's plan (a deep copy)
 ===========================  ===============================================
 
-===============================  ===========================================
-Omitted                          What stands in its place
-===============================  ===========================================
-``reference``                    settle-time data a cell does not have yet
-``post_task_commit``             ditto — production has not landed
-``setup_commands``               ``None``; ``uv run`` self-syncs, and the
-                                 live fixture corpus minted by
-                                 ``build_fixture_record`` sets it null
-``timeout_minutes``              every run path takes ``timeout_override``,
-                                 so wall clock is the coordinator's call
-``max_execute_iterations``       runner default 20
-``max_review_cycles``            runner default 1
-``judge_after_each_iteration``   runner default True
-``max_architect_turns``          runner default 50
-``adversarial``                  a live task is never an adversarial fixture
-``complexity`` / ``project``     provenance only; read by
-``cohort`` / ``provenance``      ``task_sampler.audit_fixture_corpus``, which
-``verify_outcome``               audits the on-disk corpus a live cell never
-                                 joins
-===============================  ===========================================
+Every other key ``runner.load_task``'s consumers read is omitted, so the
+runner's own documented default stands. ``test_eval_live_fixture.py``'s
+exact-set assertion is what PINS that; the grouping below is the reasoning
+behind it, and deliberately restates none of the default VALUES —
+``runner.py`` is their SPOT.
 
-The four runner knobs are omitted rather than pinned because no live task
-determines them and the runner defaults are the standard the INCUMBENT is also
-measured under — writing them here would silently fork shadow cells from the
-corpus baseline the comparison depends on.
+- *Not knowable yet* — ``reference`` and ``post_task_commit`` are the
+  settle-time reference a live cell does not have at build time (C3 forbids
+  emitting them here).
+- *Not the fixture's to decide* — ``timeout_minutes`` (every run path takes a
+  ``timeout_override``, so wall clock is the coordinator's call-site concern)
+  and the four runner knobs ``max_execute_iterations`` /
+  ``max_review_cycles`` / ``judge_after_each_iteration`` /
+  ``max_architect_turns``. No live task determines any of them, and the runner
+  defaults are the standard the INCUMBENT is also measured under — pinning
+  them here would silently fork shadow cells from the corpus baseline the
+  whole comparison depends on.
+- *Parity with the corpus* — ``setup_commands`` is omitted, as the ζ-minted
+  corpus records also omit it; ``uv run`` self-syncs, so emitting a guessed
+  sync command would be new behaviour rather than parity.
+- *Harmful if present* — ``adversarial``: a live production task is never an
+  adversarial fixture, and ``scoring.py::compute_recovery_score`` indexes
+  ``adversarial['recovery_rubric']`` unguarded once the key is truthy.
+- *No runtime consumer at all* — ``complexity`` / ``project`` / ``cohort`` /
+  ``provenance`` / ``verify_outcome`` are provenance read only by
+  ``task_sampler.audit_fixture_corpus``, which audits the on-disk corpus a
+  live cell never joins.
 """
 
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 
@@ -90,6 +88,12 @@ __all__ = [
     'live_verify_commands',
 ]
 
+# The gates every cell must carry explicitly. A cell missing one silently
+# inherits the BASE config's command from
+# ``runner.py::build_eval_orch_config`` — a different gate than the corpus
+# baseline it is scored against.
+_REQUIRED_GATES = ('test', 'lint', 'typecheck')
+
 
 class ShadowShape(StrEnum):
     """The closed vocabulary of shadow-cell shapes (C1, ``shadow_cells.shape``).
@@ -98,6 +102,18 @@ class ShadowShape(StrEnum):
     closed, so a member IS the value stored in the TEXT column and read back
     with ``ShadowShape(raw)``, while the plan rule below lives beside the
     vocabulary it constrains instead of being re-derived at each call site.
+
+    Sited in this module deliberately, and not to be re-litigated: leaf α
+    (C1's ``shadow_cells`` store in ``run_store.py``) and this leaf are both
+    ``Prereqs: none``, so this one cannot import α, and it is the vocabulary's
+    first consumer. When α lands it imports this enum rather than restating
+    the four values (heuristic 11, SPOT) — accepting that ``run_store`` then
+    reaches up into ``orchestrator.evals`` and drags ``task_sampler``'s git
+    and sqlite glue along with it. If α would rather not carry that import,
+    relocating the enum down beside its ``ShadowCell`` record (the way
+    ``LandingReason`` lives beside its consumers) is α's call to make, with
+    this module importing it back. What must not happen either way is a second
+    copy of the four values.
     """
 
     IMPLEMENTER = 'implementer'
@@ -109,17 +125,17 @@ class ShadowShape(StrEnum):
     def requires_plan(self) -> bool:
         """Whether a cell of this shape must be built with a plan.
 
-        Tracks C1's ``plan_source`` column: ``'production'`` for the
-        ``implementer`` shape (the cell runs production's own accepted plan),
-        ``'candidate'`` for ``architect-consequence`` — consequence leg 2, the
-        incumbent implementer run over the candidate architect's plan — and
-        NULL for the two shapes whose architect is live, ``architect`` (the
-        leg-1 architect cell) and ``end-to-end``, neither of whose runners
+        Tracks C1's ``plan_source`` column: ``'production'`` for
+        ``implementer`` (the cell runs production's own accepted plan),
+        ``'candidate'`` for ``architect-consequence`` (consequence leg 2, the
+        incumbent implementer run over the candidate architect's plan), and
+        NULL for the two shapes whose architect is live — ``architect`` (the
+        leg-1 architect cell) and ``end-to-end`` — neither of whose runners
         reads a plan at all.
 
-        So plan presence is a total function of shape, which is what lets
-        ``build_live_fixture`` refuse in both directions rather than letting a
-        stray plan be silently ignored.
+        Plan presence is therefore a total function of shape, which is what
+        lets ``build_live_fixture`` refuse in both directions rather than
+        letting a stray plan be silently ignored.
         """
         return self in (ShadowShape.IMPLEMENTER, ShadowShape.ARCHITECT_CONSEQUENCE)
 
@@ -138,6 +154,91 @@ def _resolved_shape(shape: str) -> ShadowShape:
         raise ValueError(
             f'build_live_fixture: unknown shape {shape!r} (expected one of {valid})'
         ) from None
+
+
+def _resolved_project_root(project_root: Path | str) -> str:
+    """Coerce *project_root* to an absolute path string, refusing a bad one.
+
+    ``str``, not ``Path``: the fixture must be JSON-serialisable to round-trip
+    at all, and ``runner.py::load_task`` reads the key as
+    ``raw_root.startswith(...)``, where a ``Path`` (or a null) is an
+    ``AttributeError``. Normalised once, here, so no caller has to know that.
+    Refused rather than passed through because, uniquely among the emitted
+    paths, a bad value fails SILENTLY downstream — each raise below names how.
+    """
+    if not project_root:
+        raise ValueError(
+            f'build_live_fixture: project_root must be non-empty (got '
+            f'{project_root!r}); an empty one reaches build_eval_orch_config '
+            f'as Path("") == cwd and the cell is scored against that tree'
+        )
+    text = str(project_root)
+    if not Path(text).is_absolute():
+        raise ValueError(
+            f'build_live_fixture: project_root must be an absolute path (got '
+            f'{text!r}); load_task silently rewrites a project_root that does '
+            f'not exist to the repo root above the fixture file, so a bad one '
+            f'reruns the cell against the wrong checkout instead of failing'
+        )
+    return text
+
+
+def _resolved_gates(verify_commands: Mapping[str, str]) -> dict[str, str]:
+    """Copy *verify_commands*, refusing a set that does not carry all 3 gates.
+
+    ``runner.py::build_eval_orch_config`` resolves each gate as
+    ``task.get('verify_commands', {}).get(<gate>, base.<command>)``, so a
+    missing gate is the one bad input that degrades into a PLAUSIBLE
+    measurement rather than a failure. The copy follows
+    ``build_fixture_record``'s own ``dict(verify_commands)`` (heuristic 8).
+    """
+    if not isinstance(verify_commands, Mapping):
+        raise ValueError(
+            f'build_live_fixture: verify_commands must be a mapping of '
+            f'{"/".join(_REQUIRED_GATES)} to command strings (got '
+            f'{type(verify_commands).__name__})'
+        )
+    missing = sorted(
+        gate
+        for gate in _REQUIRED_GATES
+        if not str(verify_commands.get(gate) or '').strip()
+    )
+    if missing:
+        raise ValueError(
+            f'build_live_fixture: verify_commands must carry '
+            f'{"/".join(_REQUIRED_GATES)} (missing or blank: {missing}); a '
+            f'missing gate silently falls back to the base config\'s command, '
+            f'which would score the cell against different gates than the '
+            f'corpus baseline it is compared against'
+        )
+    return dict(verify_commands)
+
+
+def _resolved_modules(metadata: Mapping[str, object]) -> list[str]:
+    """Copy ``metadata.modules``, refusing anything but strings in a sequence.
+
+    An absent or empty value is a thin task, not a malformed one, and yields
+    ``[]``. ``runner.py::run_eval`` hands the result straight to
+    ``TaskAssignment(modules=...)`` and the eval scheduler, which scope the
+    cell by it and score it either way.
+    """
+    modules = metadata.get('modules')
+    if not modules:
+        return []
+    if isinstance(modules, str) or not isinstance(modules, (list, tuple)):
+        raise ValueError(
+            f'build_live_fixture: task.metadata.modules must be a list of '
+            f'module-path strings (got {modules!r}); a bare string would be '
+            f'exploded into one module per character and scoped the cell to '
+            f'nonsense'
+        )
+    non_strings = [entry for entry in modules if not isinstance(entry, str)]
+    if non_strings:
+        raise ValueError(
+            f'build_live_fixture: task.metadata.modules must contain only '
+            f'module-path strings (got {non_strings!r} in {modules!r})'
+        )
+    return list(modules)
 
 
 def build_live_fixture(
@@ -167,10 +268,13 @@ def build_live_fixture(
 
     Raises ``ValueError`` — never logs and continues — on an unrecognised
     *shape*, a *plan* that disagrees with the shape's ``requires_plan``, a
-    *base_sha* that is not a 40-hex sha, an empty *cell_id*, or a record with
-    no task id. All of these are data-plumbing bugs in the caller, and every
-    one of them survives to a LATER failure that has already created an eval
-    worktree if it is not refused here.
+    *base_sha* that is not a 40-hex sha, an empty *cell_id*, a record with no
+    task id, a relative or empty *project_root*, a *verify_commands* missing
+    any of the three gates, or a malformed ``metadata.modules``. Every one of
+    those is a data-plumbing bug in the caller that, unrefused, survives into
+    a LATER failure with an eval worktree already created — or worse into a
+    cell that runs and is SCORED against the wrong tree, the wrong gates or
+    nonsense module scoping, with nothing in the record to show it.
     """
     resolved_shape = _resolved_shape(shape)
     if resolved_shape.requires_plan and not plan:
@@ -202,30 +306,27 @@ def build_live_fixture(
             f'build_live_fixture: task record has no id (got '
             f'{task.get("id")!r}); the id is half the fixture id'
         )
+    resolved_root = _resolved_project_root(project_root)
+    resolved_gates = _resolved_gates(verify_commands)
+    resolved_modules = _resolved_modules(task.get('metadata') or {})
 
-    metadata = task.get('metadata') or {}
     return {
         'id': f'shadow_{task_id}_{cell_id}',
         'name': str(task.get('title') or ''),
-        # str, not Path: the fixture must be JSON-serialisable to round-trip
-        # at all, and load_task reads this key as `raw_root.startswith(...)`,
-        # where a Path (or a null) is an AttributeError. Accepted as either
-        # and normalised once, here, so no caller has to know that.
-        'project_root': str(project_root),
+        'project_root': resolved_root,
         'pre_task_commit': base_sha,
         'task_definition': {
             'title': str(task.get('title') or ''),
             'description': str(task.get('description') or ''),
             'details': str(task.get('details') or ''),
         },
-        'verify_commands': dict(verify_commands),
-        'modules': list(metadata.get('modules') or []),
+        'verify_commands': resolved_gates,
+        'modules': resolved_modules,
         # Deep, not shallow: run_eval hands this plan to a real workflow that
         # flips step status in place, and the dict the coordinator passed in is
-        # production's freshly-read .task-meta/<worktree>/plan.json. A shadow
-        # cell must never write through to the live task's plan. The fixture
-        # stays `==` to the caller's plan, which is all C3's "plan as given"
-        # asks; it is simply not the same object.
+        # production's freshly-read plan.json. A shadow cell must never write
+        # through to the live task's plan. The fixture stays `==` to the
+        # caller's plan, which is all C3's "plan as given" asks.
         'plan': copy.deepcopy(plan),
     }
 
@@ -279,10 +380,18 @@ def _candidate_from_live_task(task: dict, project: str) -> CompletedTaskCandidat
 def live_stratum(task: dict, *, project: str) -> Cell:
     """Return the ``(repo, kind, path)`` stratification cell for a LIVE *task*.
 
-    The sampler's own three axes applied to a live record, so a shadow cell
-    and a corpus fixture land in the same cell for the same reasons —
-    including ``classify_path``'s reuse of production's
-    ``has_simple_task_blocker`` veto, which comes along for free.
+    The sampler's own three axes applied to a live record, so a shadow cell and
+    a corpus fixture land in the same cell for the same reasons. That
+    comparability is the point, and it fixes the reading of the path axis:
+    ``classify_path`` strata the way the SAMPLER strata the corpus, which is a
+    deliberate conservative superset of how production actually routed the
+    task — it applies ``has_simple_task_blocker`` to ``title + description``
+    where ``triage.is_declared_simple_task`` applies it to the description
+    alone (see ``task_sampler.py::classify_path``). So a task carrying a
+    blocker token only in its TITLE strata as ``'full'`` here while production
+    dispatched it down the ``'simple'`` path. Asking production's predicate
+    directly would be more faithful to that one task and would make the cell
+    incomparable with every corpus fixture, which is the worse trade.
 
     Returns the structured triple rather than the ``<repo>×<kind>×<path>``
     text: rendering it as a delimited string and splitting it back would be an
