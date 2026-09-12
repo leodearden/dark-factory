@@ -540,11 +540,17 @@ class TestSerialLaneTripwireWiredIntoDispatch:
                 fut.cancel()
 
     def _bare_worker(self, git_ops: GitOps, rec):
-        """A worker at the production single-host shape: bound=1, num_hosts=1."""
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), event_store=rec)
-        # speculation_depth stays at its default (_MERGE_AHEAD_BOUND = 1) and
-        # _host_allocator stays None so num_hosts resolves to 1.
-        assert worker._speculation_depth == 1
+        """A worker at the production single-host shape: bound=1, num_hosts=1.
+
+        ``speculation_depth=1`` is passed explicitly — it is the constructor's
+        own parameter and also what the ``_MERGE_AHEAD_BOUND`` default resolves
+        to, so the shape is stated rather than asserted after the fact.
+        """
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), event_store=rec, speculation_depth=1,
+        )
+        # No host_allocator constructor parameter exists, so the single-host
+        # shape (num_hosts == 1) still has to be read off the attribute.
         assert worker._host_allocator is None
         return worker
 
@@ -614,10 +620,9 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         assert worker._inflight_append(entry_a) is None
         assert worker._inflight_append(entry_b) is None
 
-        assert len(worker._inflight) == 2
-        assert list(worker._inflight) == [entry_a, entry_b]
-        # inflight_by_host is the LOSSLESS occupancy view (the sibling by_host
-        # collapses two entries sharing a host, last-writer-wins).
+        # Both entries landed, in order. inflight_by_host is the LOSSLESS
+        # occupancy view (the sibling by_host collapses two entries sharing a
+        # host, last-writer-wins), so it pins count AND order publicly.
         assert worker.snapshot()['occupancy']['inflight_by_host']['local'] == ['9004', '9005']
 
     async def test_third_local_dispatch_fires_again(
