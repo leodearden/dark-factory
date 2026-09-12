@@ -279,6 +279,80 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
 
 
 # ---------------------------------------------------------------------------
+# Task 2565: the spawn -> probe HOP.  _spawn_main_health_probe must forward
+# its origin_is_local kwarg (and its `= True` default) into the coroutine it
+# spawns.  Observed on the emitted signal rather than on a patched
+# _run_deferred_main_health_probe, so the hop is closed without re-acquiring
+# that lane-private patch leaf.
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnForwardsOriginIsLocal:
+    """The spawned probe records the origin the SPAWN was told about.
+
+    TestRunPostMergeVerifyDerivesOriginIsLocal pins the kwarg ARRIVING at
+    _spawn_main_health_probe (it patches the spawn out entirely), and
+    TestDeferredProbeOriginHostTelemetry pins what
+    _run_deferred_main_health_probe does with one handed to it DIRECTLY.
+    Neither crosses the spawn boundary, so without this class a regression that
+    drops the kwarg from the _run_deferred_main_health_probe(...) call inside
+    _spawn_main_health_probe records origin_host='local' for every
+    remote-origin post-merge failure with the suite green.
+    """
+
+    @staticmethod
+    def _red_signals(tmp_path: Path, **spawn_kwargs: object) -> list[dict]:
+        """Drive the real spawn to completion; return its main_health_red data.
+
+        The probe verdict is forced positive so the signal is emitted at all;
+        origin_host is the field under test and the probe path never reads it.
+        """
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        event_store = MagicMock(spec=EventStore)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                spawned = _spawn_main_health_probe(
+                    handles, git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=EscalationQueue(tmp_path / 'escalations'),
+                    event_store=event_store,
+                    **spawn_kwargs,
+                )
+                assert spawned is True, 'no guard may skip this spawn'
+                for task in set(handles.background_tasks):
+                    await task
+
+        asyncio.run(_run())
+        return [
+            call.kwargs['data']
+            for call in event_store.emit.call_args_list
+            if call.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+
+    def test_explicit_remote_origin_reaches_the_signal(
+        self, tmp_path: Path,
+    ) -> None:
+        red = self._red_signals(tmp_path, origin_is_local=False)
+        assert len(red) == 1, f'Expected one main_health_red event; got {red}'
+        assert red[0].get('origin_host') == 'remote', f'data={red[0]}'
+        assert red[0].get('probe_host') == 'local', f'data={red[0]}'
+
+    def test_omitted_origin_takes_the_local_default(
+        self, tmp_path: Path,
+    ) -> None:
+        red = self._red_signals(tmp_path)
+        assert len(red) == 1, f'Expected one main_health_red event; got {red}'
+        assert red[0].get('origin_host') == 'local', f'data={red[0]}'
+
+
+# ---------------------------------------------------------------------------
 # Step-9 (RED): _run_deferred_main_health_probe happy path — files a dedup'd
 # preexisting_main_break escalation and emits the main_health_red signal for
 # a confirmed pre-existing break; a negative or raising probe files nothing.
