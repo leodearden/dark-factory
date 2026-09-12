@@ -28,6 +28,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -175,3 +176,43 @@ def copy_to_system_clipboard(
     if not commands:
         return CopyAttempt(CopyOutcome.NO_HELPER)
     return CopyAttempt(CopyOutcome.HELPER_FAILED, commands[-1])
+
+
+# A generic stand-in when a failure carries no argv (CockpitApp.action_copy's
+# guarded-exception path): fail-soft must not mean a toast reading 'None'.
+_ANONYMOUS_HELPER = 'clipboard helper'
+
+_FALLBACK_NOTE = 'wrote the OSC 52 fallback instead (some terminals ignore it)'
+
+
+@dataclass(frozen=True)
+class CopyFeedback:
+    """What to tell the operator, and whether the OSC 52 fallback still runs.
+
+    *severity* is Textual's own SeverityLevel vocabulary narrowed to the two
+    levels this module emits, so pyright checks the value at the App.notify
+    call site instead of it being a free-form string.
+    """
+
+    message: str
+    severity: Literal['information', 'warning']
+    write_osc52: bool
+
+
+def copy_feedback(attempt: CopyAttempt) -> CopyFeedback:
+    """Map a CopyAttempt to the operator's toast and the fallback decision.
+
+    Pure — no clock, no IO, no Textual — so the wording and the policy are
+    both pinnable without a terminal (see cockpit/tests/test_clipboard.py::
+    TestCopyFeedback). A success toast names the mechanism that ran, which
+    is what makes the diagnosis Leo had to run by hand ("is anything
+    happening at all, and through which path?") readable from the UI.
+    """
+    helper = ' '.join(attempt.command) if attempt.command else _ANONYMOUS_HELPER
+    if attempt.outcome is CopyOutcome.COPIED:
+        return CopyFeedback(f'Copied to clipboard ({helper})', 'information', write_osc52=False)
+    if attempt.outcome is CopyOutcome.NO_HELPER:
+        return CopyFeedback(
+            f'No clipboard helper on this host — {_FALLBACK_NOTE}', 'warning', write_osc52=True
+        )
+    return CopyFeedback(f'{helper} failed — {_FALLBACK_NOTE}', 'warning', write_osc52=True)
