@@ -128,6 +128,18 @@ def _make_git_ops(repo: Path, *, pool: bool = True, size: int = 1) -> GitOps:
     )
 
 
+
+def _lifecycle_states(worker: SpeculativeMergeWorker) -> dict[str, str]:
+    """Published projection of the item-lifecycle registry: {request_id: state}.
+
+    ``snapshot()['entries']`` is built by iterating
+    ``ItemLifecycle.non_terminal_items()`` and mapping each state through
+    ``_REGISTRY_STATE_TO_WIRE`` (``orchestrator/merge_queue.py::SpeculativeMergeWorker.snapshot``),
+    so comparing this map before and after a call is the published form of
+    "the queue's lifecycle state is untouched".
+    """
+    return {e['request_id']: e['state'] for e in worker.snapshot()['entries']}
+
 def _make_config(repo: Path, git_config: GitConfig | None = None) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=repo, git=git_config or _make_spec_git_config(),
@@ -641,12 +653,12 @@ class TestChainBuildLane:
         assert await git_ops._is_registered_worktree(lane)
         assert await _rev_parse(lane) == head_sha
         assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool._lanes[lane] == LaneState.ASSIGNED
+        assert git_ops.spec_warm_lane_pool.state(lane) is LaneState.ASSIGNED
 
         await release_chain_build_lane(git_ops, lane, warm=warm)
 
         # Warm release: pool FREE, worktree retained (target/ stays warm).
-        assert git_ops.spec_warm_lane_pool._lanes[lane] == LaneState.FREE
+        assert git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
         assert await git_ops._is_registered_worktree(lane)
 
     async def test_cold_path_when_pool_knob_off(self, git_repo: Path):
@@ -865,11 +877,11 @@ class TestChainSnapshot:
         worker._lane_buffers['normal'].extend(
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102)
         )
-        before = dict(worker._lifecycle._states)
+        before = _lifecycle_states(worker)
 
         worker.chain_snapshot()
 
-        assert dict(worker._lifecycle._states) == before
+        assert _lifecycle_states(worker) == before
 
     async def test_is_idempotent(self, git_repo: Path):
         """Two consecutive calls return equal tuples."""
@@ -988,8 +1000,8 @@ class TestBuildChainDegenerate:
         assert calls == []
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
 
     async def test_cap_zero_is_the_kill_switch(self, git_repo: Path, monkeypatch):
@@ -1154,7 +1166,7 @@ class TestBuildChainClean:
         assert res.lane == git_ops.worktree_base / '_spec-0'
         assert res.lane_warm is True
         assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool._lanes[res.lane] == LaneState.ASSIGNED
+        assert git_ops.spec_warm_lane_pool.state(res.lane) is LaneState.ASSIGNED
 
         # Cumulative tree correctness — the chain is a real superset, which is
         # why ONE verify can authorise the whole prefix.
@@ -1172,7 +1184,7 @@ class TestBuildChainClean:
 
         # The documented release path works end to end.
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
-        assert git_ops.spec_warm_lane_pool._lanes[res.lane] == LaneState.FREE
+        assert git_ops.spec_warm_lane_pool.state(res.lane) is LaneState.FREE
 
     async def test_clean_chain_from_a_frozen_merge_commit_head(self, git_repo: Path):
         """head == a prior merge commit (the frozen-prefix-non-empty variant)."""
@@ -1269,19 +1281,6 @@ def _spy_merges(git_ops: GitOps, monkeypatch) -> list[str]:
         return original(worktree, branch)
 
     monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _recording)
-    return calls
-
-
-def _spy_merge_attempt_events(monkeypatch) -> list[tuple[str, object]]:
-    """Replace ``merge_queue._emit_merge_attempt`` with a recorder."""
-    from orchestrator import merge_queue as _mq
-
-    calls: list[tuple[str, object]] = []
-
-    def _recording(_event_store, task_id, outcome, **_kw) -> None:
-        calls.append((task_id, outcome))
-
-    monkeypatch.setattr(_mq, '_emit_merge_attempt', _recording)
     return calls
 
 
@@ -1422,7 +1421,6 @@ class TestBuildChainTruncation:
         config = _make_config(git_repo)
         store = _RecordingEventStore()
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store)  # type: ignore[arg-type]
-        emitted = _spy_merge_attempt_events(monkeypatch)
         await self._conflicting_trio(git_repo)
         head = await _rev_parse(git_repo)
         worker._lane_buffers['normal'].extend(
@@ -1434,7 +1432,6 @@ class TestBuildChainTruncation:
         )
 
         assert res.truncated_at == '102'
-        assert emitted == []
         assert store.events == []
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
@@ -1453,7 +1450,7 @@ class TestBuildChainTruncation:
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
         )
         buffers_before = {k: list(v) for k, v in worker._lane_buffers.items()}
-        lifecycle_before = dict(worker._lifecycle._states)
+        lifecycle_before = _lifecycle_states(worker)
 
         res = await build_chain(
             git_ops, worker.chain_snapshot(), head, cap=6, target_depth=3,
@@ -1467,7 +1464,7 @@ class TestBuildChainTruncation:
             assert len(after[lane_name]) == len(items)
             for got, want in zip(after[lane_name], items, strict=True):
                 assert got is want
-        assert dict(worker._lifecycle._states) == lifecycle_before
+        assert _lifecycle_states(worker) == lifecycle_before
         assert noted == []
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
@@ -1623,8 +1620,8 @@ class TestBuildChainTruncation:
         assert res.lane_warm is False
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
         assert not snap[0].result.done()
 
@@ -1735,8 +1732,8 @@ class TestBuildChainTruncation:
         assert res.lane_warm is False
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
         assert not snap[0].result.done()
 
@@ -1794,8 +1791,8 @@ class TestBuildChainTruncation:
         # stranded ASSIGNED by the unwinding cancellation.
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
         # A WARM release deliberately retains the worktree for pool reuse, so
         # the worktree set legitimately grows — what must not happen is a
@@ -1804,7 +1801,7 @@ class TestBuildChainTruncation:
             n for n in (await _worktree_names(git_ops)) - before
             if n.startswith('_spec-')
         }
-        assert leaked <= {p.name for p in git_ops.spec_warm_lane_pool._lanes}
+        assert leaked <= {p.name for p in git_ops.spec_warm_lane_pool.lane_paths()}
         # Purity (decision #4) holds on the cancellation path too: no outcome
         # was emitted for either item, including the one that DID chain.
         assert not snap[0].result.done()
@@ -1832,7 +1829,7 @@ def _fail_rev_parse_head(monkeypatch, *, after_merge: bool) -> dict[str, int]:
     """
     from orchestrator import git_ops as _go
 
-    real = _go._run
+    real = _run
     state = {'merged': 0, 'failed': 0}
 
     async def _fake(cmd, cwd=None, *, input_text=None):
