@@ -176,7 +176,16 @@ filterwarnings = [
 # starved of CPU on a loaded 32-core host trips it and — under thread mode
 # plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself.
 # 300 is INTERIM and judgement-picked, not measured).
-# Slow tests opt out with @pytest.mark.timeout(N).
+# Slow tests opt out with @pytest.mark.timeout(N) — but N is NOT free, and
+# that line used to imply it was. A marker OVERRIDES the budget in BOTH
+# directions rather than raising a floor under it, so any N below the
+# --timeout=300 verify passes silently TIGHTENS the run that gates your merge.
+# That inversion cost tasks 4176, 4384 and 4405. Write either N <= 60 (a
+# DELIBERATE tight bound, for a test asserting something happens FAST) or
+# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py
+# — whose comment block on that constant is the SINGLE home of this rationale,
+# including why the marker beats this setting. Enforced by
+# tests/test_timeout_marker_inversion_guard.py.
 # timeout_method: signal mode was paired with serial execution; once xdist
 # was enabled here (matching fused-memory/pyproject.toml) the worker
 # subprocesses run pytest in a thread, so signal-based interruption is no
