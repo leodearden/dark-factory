@@ -65,17 +65,21 @@ class FakeVerifier:
     ``run_scoped`` follows ``scripts[task_id]``, or ``default`` for a task
     without a script, and records every task id it was asked about in
     ``verified``. The gates a merge passes through after a green scoped
-    verify all report clean, the disk guard always proceeds, and dry-run
-    investigations are recorded in ``investigations`` rather than run.
+    verify all report clean, the disk guard reports *disk_reason* (``None``,
+    the default, being "proceed"), and dry-run investigations are recorded
+    in ``investigations`` rather than run.
     """
 
     def __init__(
         self,
         default: VerifyScript | None = None,
         scripts: Mapping[str | None, VerifyScript] | None = None,
+        *,
+        disk_reason: str | None = None,
     ) -> None:
         self.default = passes() if default is None else default
         self.scripts: dict[str | None, VerifyScript] = dict(scripts or {})
+        self.disk_reason = disk_reason
         self.verified: list[str | None] = []
         self.investigations: list[dict[str, Any]] = []
 
@@ -121,7 +125,7 @@ class FakeVerifier:
         task_id: str,
         keep_worktrees: Collection[Path] | None = None,
     ) -> DiskGuardOutcome:
-        return DiskGuardOutcome(reason=None)
+        return DiskGuardOutcome(reason=self.disk_reason)
 
     async def cold_shadow(
         self, git_ops: Any, req: Any, merge_commit: str, event_store: Any,
