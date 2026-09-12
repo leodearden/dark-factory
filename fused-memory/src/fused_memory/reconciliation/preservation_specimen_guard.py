@@ -236,6 +236,26 @@ def flag_asserts_stranded(flag: Any) -> bool:
     )
 
 
+
+def _flag_task_id(flag: dict[str, Any]) -> str:
+    """The flag's own task id as a ``str``, or ``''`` when there is none usable.
+
+    Accepts the two shapes ``items_flagged`` actually carries: a ``str`` (taken
+    as written, whitespace-stripped) and an ``int`` straight off a task dict.
+    Everything else — ``None``, a list, a nested dict, a ``bool``, a
+    non-positive int — is NOT a task id and yields ``''``, so a malformed value
+    can never be stringified into a junk backend query.
+
+    Pure, sync, no I/O.
+    """
+    task_id = flag.get('task_id')
+    if isinstance(task_id, str):
+        return task_id.strip()
+    if isinstance(task_id, int) and not isinstance(task_id, bool) and task_id > 0:
+        return str(task_id)
+    return ''
+
+
 @dataclass(frozen=True)
 class PreservationSuppressionResult:
     """Outcome of :func:`filter_preservation_specimen_flags`.
@@ -398,29 +418,58 @@ async def filter_preservation_specimen_flags(
 ) -> PreservationSuppressionResult:
     """Drop stranded-class recon flags for tasks documented as preserved specimens.
 
-    Each flag's task is corroborated by :func:`_corroborate_preservation`; a
-    corroborated task's flag is dropped and the citation recorded.
+    Narrow, then corroborate, then drop:
+
+    1. Candidates are the tasks named by flags that pass
+       :func:`flag_asserts_stranded`.  Nothing else is ever looked up, which is
+       what keeps a preserved task's UNRELATED findings reaching Stage 2 — the
+       guard drops the adjudicated class, not the task.
+    2. Each candidate is corroborated ONCE by
+       :func:`_corroborate_preservation`, positive and negative verdicts alike,
+       so a task appearing on N flags costs one corroboration pass.
+    3. A corroborated task's stranded flags are dropped and the citation
+       recorded.
+
+    An empty candidate set short-circuits before any I/O, so a cycle with
+    nothing in this class — the overwhelming majority — costs zero backend
+    calls.  The corroboration loop is sequential rather than an
+    ``asyncio.gather``: the candidate population is tiny, and a serial loop
+    keeps per-task error attribution exact (the reason
+    ``curator_gate_resolution_sweep`` gives for its own).
 
     Returns a :class:`PreservationSuppressionResult`; the caller assigns
     ``kept_flags`` back to ``items_flagged``.  Suppression is NOT resolution —
     the caller excludes suppressed flags' signatures from marker acknowledgment
-    so recurrence history survives.
+    so recurrence history survives until the preservation citation is retired.
     """
+    batch = list(flags or ())
+    # One pass fixes each flag's candidate task id (``''`` = not a candidate),
+    # so neither the discriminator nor the id coercion is recomputed below.
+    candidacy: list[tuple[dict[str, Any], str]] = [
+        (flag, _flag_task_id(flag) if isinstance(flag, dict) and flag_asserts_stranded(flag) else '')
+        for flag in batch
+    ]
+    candidates = sorted({task_id for _, task_id in candidacy if task_id})
+    if not candidates:
+        return PreservationSuppressionResult(
+            kept_flags=batch, suppressed_by_task={}, citations_by_task={},
+            unresolved_task_ids=(),
+        )
+
+    verdicts: dict[str, str | None] = {}
+    for task_id in candidates:
+        verdicts[task_id] = await _corroborate_preservation(
+            memory_service, project_id, task_id,
+        )
+
     kept: list[dict[str, Any]] = []
     suppressed_by_task: dict[str, int] = {}
     citations_by_task: dict[str, str] = {}
-
-    for flag in flags or ():
-        task_id = str(flag.get('task_id') or '')
-        if not task_id:
-            kept.append(flag)
-            continue
-
-        citation = await _corroborate_preservation(memory_service, project_id, task_id)
+    for flag, task_id in candidacy:
+        citation = verdicts.get(task_id) if task_id else None
         if citation is None:
             kept.append(flag)
             continue
-
         suppressed_by_task[task_id] = suppressed_by_task.get(task_id, 0) + 1
         citations_by_task[task_id] = citation
         log.info(
