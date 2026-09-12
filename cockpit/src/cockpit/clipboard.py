@@ -26,6 +26,8 @@ import os
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -117,3 +119,59 @@ def run_clipboard_command(
         logger.warning('run_clipboard_command: %s failed: %s', list(argv), exc)
         return _UNAVAILABLE
     return completed.returncode
+
+
+class CopyOutcome(Enum):
+    """What the local-helper path achieved. The caller's whole decision input."""
+
+    COPIED = 'copied'
+    NO_HELPER = 'no_helper'
+    HELPER_FAILED = 'helper_failed'
+
+
+@dataclass(frozen=True)
+class CopyAttempt:
+    """The outcome of one copy_to_system_clipboard call, plus the helper it names.
+
+    *command* is the argv that succeeded (COPIED), the last one tried
+    (HELPER_FAILED), or empty (NO_HELPER, and the guarded-exception case in
+    CockpitApp.action_copy). Structured rather than a status string the
+    caller would have to parse, so the toast can name the mechanism that
+    actually ran.
+    """
+
+    outcome: CopyOutcome
+    command: tuple[str, ...] = ()
+
+
+# argv + text -> POSIX return code. Deliberately NOT cockpit.backends.base's
+# CommandRunner: that alias carries no stdin channel and returns a
+# CommandResult whose stdout/stderr a clipboard helper never produces (they
+# are DEVNULL by design, see run_clipboard_command). The
+# nonzero-means-unavailable reading is shared; the type is not.
+ClipboardRunner = Callable[[Sequence[str], str], int]
+
+
+def copy_to_system_clipboard(
+    text: str,
+    *,
+    environ: Mapping[str, str] = os.environ,
+    which: Callable[[str], str | None] = shutil.which,
+    runner: ClipboardRunner = run_clipboard_command,
+) -> CopyAttempt:
+    """Hand *text* to the first local clipboard helper that takes it.
+
+    Tries available_copy_commands() in order and stops at the first zero
+    exit code. Never raises: with no usable helper the result is NO_HELPER
+    and nothing is spawned; with every helper refusing it is HELPER_FAILED
+    naming the last one tried. Either way the caller still owes the
+    operator an OSC 52 fallback and a toast — see copy_feedback.
+    """
+    commands = available_copy_commands(environ=environ, which=which)
+    for command in commands:
+        if runner(command, text) == 0:
+            return CopyAttempt(CopyOutcome.COPIED, command)
+        logger.warning('copy_to_system_clipboard: %s did not take the payload', list(command))
+    if not commands:
+        return CopyAttempt(CopyOutcome.NO_HELPER)
+    return CopyAttempt(CopyOutcome.HELPER_FAILED, commands[-1])
