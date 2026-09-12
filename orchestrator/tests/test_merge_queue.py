@@ -15250,14 +15250,16 @@ class TestUnscopedTypecheckGate:
 class TestFinalizeAdvancedMerge:
     """Direct unit tests for the _finalize_advanced_merge module-level helper."""
 
-    def _make_git_ops(self, *, last_advanced_sha: str | None = 'abc123def') -> MagicMock:
+    #: The sha a test passes as the explicit `advanced_sha=` kwarg. A constant
+    #: rather than a value stashed on `git_ops`: task 1997 retired the
+    #: `GitOps._last_advanced_sha` side channel, so the helper reads this value
+    #: only from its own argument and the mock has no business carrying it.
+    ADVANCED_SHA = 'abc123def'
+
+    def _make_git_ops(self) -> MagicMock:
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        # Test-local stash spot for the value under test — NOT the retired
-        # GitOps._last_advanced_sha side channel (task 1997 retired that;
-        # _finalize_advanced_merge takes advanced_sha as an explicit kwarg).
-        git_ops.stub_advanced_sha = last_advanced_sha
         return git_ops
 
     def _make_req(self) -> MagicMock:
@@ -15297,11 +15299,11 @@ class TestFinalizeAdvancedMerge:
                 cas_retries=cas_retries,
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
-                advanced_sha=git_ops.stub_advanced_sha,
+                advanced_sha=self.ADVANCED_SHA,
             )
 
         assert outcome.status == 'done'
-        assert outcome.merge_sha == git_ops.stub_advanced_sha
+        assert outcome.merge_sha == self.ADVANCED_SHA
         assert outcome.push_status == 'pushed'
         git_ops.push_main.assert_awaited_once()
         assert req.task_id not in cas_retries
@@ -15380,7 +15382,7 @@ class TestFinalizeAdvancedMerge:
         """(d) advanced_sha kwarg omitted (defaults to None) → falls back to merge_commit_fallback."""
         from orchestrator.merge_queue import _finalize_advanced_merge
 
-        git_ops = self._make_git_ops(last_advanced_sha=None)
+        git_ops = self._make_git_ops()
         req = self._make_req()
         cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
@@ -15873,7 +15875,7 @@ class TestFinalizeAdvancedMerge:
         SECONDP = 'secondparent01'
         SNAP = 'snaptip99'
 
-        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        git_ops = self._make_git_ops()
         req = self._make_req()
         req.snapshot_tip = SNAP
 
@@ -15932,7 +15934,7 @@ class TestFinalizeAdvancedMerge:
 
         ADVANCED = 'deadbeef1234'
 
-        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        git_ops = self._make_git_ops()
         req = self._make_req()
         req.snapshot_tip = None  # fallback path: snapshot_tip absent
 
@@ -15985,7 +15987,7 @@ class TestFinalizeAdvancedMerge:
 
         ADVANCED = 'cafebabe5678'
 
-        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        git_ops = self._make_git_ops()
         req = self._make_req()
         req.snapshot_tip = None
 
@@ -16045,7 +16047,7 @@ class TestFinalizeAdvancedMerge:
         )
 
         LINEAR_SHA = 'aabbccdd1234567890' * 2  # fake but deterministic
-        git_ops = self._make_git_ops(last_advanced_sha=LINEAR_SHA)
+        git_ops = self._make_git_ops()
         req = self._make_req()
         req.snapshot_tip = None  # ensure term-3 = None
         cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
@@ -16191,8 +16193,7 @@ class TestFinalizeAdvancedMerge:
             _finalize_advanced_merge,
         )
 
-        MERGE_SHA = 'ffee1234' * 5
-        git_ops = self._make_git_ops(last_advanced_sha=MERGE_SHA)
+        git_ops = self._make_git_ops()
         req = self._make_req()
         req.snapshot_tip = None  # term-3 = None
         cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
@@ -16255,17 +16256,19 @@ class TestFinalizeAdvancedMerge:
 class TestMapAdvanceFailure:
     """Direct unit tests for the _map_advance_failure module-level helper."""
 
+    #: The sha a test passes as the explicit `advanced_sha=` kwarg — a
+    #: constant, because the retired `_last_advanced_sha` side channel is no
+    #: longer read by production and the mock must not carry the value either.
+    ADVANCED_SHA = 'adv-sha-123'
+
     def _make_git_ops(self) -> MagicMock:
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
         # _last_recovery_branch/_last_overlap_files are real getattr side
         # channels _map_advance_failure still reads (out of scope for task
-        # 1997 — see plan). stub_advanced_sha is just this test's stash
-        # spot for the advanced_sha kwarg value; the retired
-        # _last_advanced_sha side channel is NOT read by production anymore.
+        # 1997 — see plan).
         git_ops._last_recovery_branch = 'recovery/branch-abc'
         git_ops._last_overlap_files = ['foo.py', 'bar.py']
-        git_ops.stub_advanced_sha = 'adv-sha-123'
         return git_ops
 
     async def test_wip_overlap_halts_returns_wip_halted(self) -> None:
@@ -16305,13 +16308,13 @@ class TestMapAdvanceFailure:
             git_ops, 'pop_conflict',
             task_id=task_id, merge_commit_fallback='fallback-sha',
             halt=halt, unhalt=unhalt, cas_retries=cas_retries,
-            advanced_sha=git_ops.stub_advanced_sha,
+            advanced_sha=self.ADVANCED_SHA,
         )
 
         assert outcome.status == 'done_wip_recovery'
         assert outcome.recovery_branch == git_ops._last_recovery_branch
         assert outcome.push_status == 'pushed'
-        assert outcome.merge_sha == git_ops.stub_advanced_sha
+        assert outcome.merge_sha == self.ADVANCED_SHA
         halt.assert_called_once_with('advance_main: pop_conflict')
         git_ops.push_main.assert_awaited_once()
         unhalt.assert_not_called()  # success path must NOT un-halt
@@ -16444,6 +16447,23 @@ class TestMapAdvanceFailure:
 # ---------------------------------------------------------------------------
 # TestWipHaltMixin — unit tests pinning the _WipHaltMixin shared contract
 # ---------------------------------------------------------------------------
+
+
+def test_speculative_worker_inherits_the_halt_mixin() -> None:
+    """The production worker INHERITS the halt state machine, not a copy of it.
+
+    Deliberately not part of the parametrized class below: that one exercises
+    halt BEHAVIOUR through the public methods, which a copy-pasted second
+    state machine on ``SpeculativeMergeWorker`` would satisfy just as well
+    while quietly duplicating the single source. The matching fact for the
+    retired serial fixture is pinned by
+    ``orchestrator/tests/test_merge_worker_retired.py::test_serial_reference_fixture_available``.
+    """
+    from orchestrator.merge_queue import _WipHaltMixin
+
+    assert issubclass(SpeculativeMergeWorker, _WipHaltMixin), (
+        'SpeculativeMergeWorker must inherit the shared halt-state-machine mixin'
+    )
 
 
 @pytest.mark.asyncio
