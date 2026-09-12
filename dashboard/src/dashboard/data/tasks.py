@@ -571,7 +571,7 @@ async def _walk_pages(
             # pages is misbehaving in exactly the way that amplifies the
             # walk, and is caught here rather than paid for.
             page_budget = math.ceil(total / max(chunk_size, 1)) + 2
-        elif total > first_total:
+        elif total != first_total:
             # A `total` that CHANGES mid-walk — in EITHER direction — means the
             # tree changed underneath the read: the pages in hand are from
             # different states of the world, so the assembled list is not a
