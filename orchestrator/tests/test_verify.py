@@ -1372,6 +1372,11 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
     pytest-timeout — which, under this package's ``timeout_method =
     "thread"``, ``os._exit()``s the xdist worker and reds a shifting victim
     (see the ``--max-worker-restart=0`` note in orchestrator/pyproject.toml).
+
+    The probe submitted before the clock starts is not setup noise: it
+    asserts the saturation precondition directly, so that if the pool ever
+    stops being saturated (pool-size default, singleton reset, poll loop)
+    this guard fails loudly instead of passing vacuously forever.
     """
 
     @pytest.mark.real_verify_admission
@@ -1403,6 +1408,19 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
             # Let both worker threads actually enter the blocking flock poll
             # loop (0.1s poll interval), so the pool is genuinely saturated.
             await asyncio.sleep(0.3)
+
+            # Assert that precondition rather than inferring it: a probe job
+            # can only stay queued if no worker is free. Not a timing race —
+            # a saturated pool leaves it queued until `holder_fd` closes
+            # below, so the 0.05s is job-pickup settle margin with no upper
+            # bound to be tight against.
+            probe = verify._admission_executor().submit(lambda: None)
+            await asyncio.sleep(0.05)
+            assert not probe.done(), (
+                'admission executor was NOT saturated — this guard would pass '
+                'vacuously; check _ADMISSION_EXECUTOR_MAX_WORKERS patching and '
+                'that both task-role acquisitions are blocked on the held slot'
+            )
 
             try:
                 async with asyncio.timeout(1.0), verify._admission_slot('merge', config):
