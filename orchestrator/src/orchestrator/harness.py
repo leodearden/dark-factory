@@ -37,6 +37,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import digest as digest_mod
+from orchestrator import recovery_pins
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -146,7 +147,6 @@ from orchestrator.systemd_inspect import (
 from orchestrator.task_ground_truth import (
     BranchStateKind,
     ClaimantSource,
-    EscalationRef,
     RecoveryAction,
     TaskGroundTruth,
     leave_reason,
@@ -5593,51 +5593,18 @@ class Harness:
     # by omission (the callback never touches them).
     _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = SUCCESS_TRANSIENT_MERGE_STATUSES
 
-    # Escalation categories a MERGE can itself remediate (PRD leaf δ §2.2).
-    #
-    # The stranded-blocked reaper's own `stranded_blocked` L1 is filed to
-    # REQUEST exactly the remediation the verified-green auto-merge performs —
-    # so letting it veto that merge is an anti-synergy: the escalation asking
-    # for the merge blocks the merge.  Membership here means "an open
-    # escalation of this class does NOT veto the sweep-side self-heal", and
-    # nothing more: the merge is still gated by detect_verified_green's 3-part
-    # shape check and the merge queue's own re-verify (§2.2 "never bypasses").
-    #
-    # Deliberately MINIMAL — widen only with evidence:
-    #   * `stranded_merge_failed` is EXCLUDED on purpose.  It is the DURABLE
-    #     merge/verify-failure born-at-L2 (see _file_stranded_merge_failed): a
-    #     re-merge cannot remediate a branch that already failed the queue's
-    #     verify, so a task carrying only that escalation must keep vetoing or
-    #     the reaper would re-submit into the same failure.
-    #   * every human-concern class (design_concern / task_failure /
-    #     review_issues / operator-action / infra_issue / ...) is excluded by
-    #     omission — it names a problem a merge does not fix, and must keep
-    #     holding the task for its handler.
-    MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = frozenset({
-        'stranded_blocked',
-    })
-
-    @staticmethod
-    def _only_merge_remediable(
-        open_escalations: Sequence[EscalationRef],
-    ) -> bool:
-        """Are *open_escalations* ALL of a merge-remediable class?
-
-        The single category authority for the relaxed verified-green veto
-        (INV-5): called at both sweep-side upgrade clauses in
-        :meth:`_reconcile_one_stranded` in place of the former
-        ``not report.open_escalations``.
-
-        Vacuously ``True`` for an empty list — so a task with no open
-        escalation classifies exactly as it does today.  ``False`` as soon as
-        ONE escalation falls outside :attr:`MERGE_REMEDIABLE_ESC_CATEGORIES`,
-        preserving the safety invariant that a human-concern escalation still
-        vetoes the self-heal.
-        """
-        return all(
-            ref.category in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
-            for ref in open_escalations
-        )
+    # The merge-remediable relaxation MOVED to `orchestrator.recovery_pins`
+    # (task 3541): the single authority for both the category set and the
+    # `all(...)` predicate now lives there, so `scheduler.py` — which cannot
+    # import this class — consumes the SAME relaxation instead of re-deriving a
+    # bare `bool(rows)`.  The two names below are DELEGATIONS, not a second
+    # copy: they exist only so existing call sites and the tests that assert on
+    # `Harness._only_merge_remediable(...)` directly keep their spelling.  The
+    # rationale for the set's membership is documented once, in recovery_pins.
+    MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = (
+        recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES
+    )
+    _only_merge_remediable = staticmethod(recovery_pins.only_merge_remediable)
 
     def _on_stranded_merge_done(
         self, fut: asyncio.Future, *, tid: str,

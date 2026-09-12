@@ -89,7 +89,8 @@ class TestMergeRemediableCategories:
     """
 
     def test_the_set_is_exactly_stranded_blocked(self) -> None:
-        assert MERGE_REMEDIABLE_ESC_CATEGORIES == frozenset({'stranded_blocked'})
+        assert isinstance(MERGE_REMEDIABLE_ESC_CATEGORIES, frozenset)
+        assert sorted(MERGE_REMEDIABLE_ESC_CATEGORIES) == ['stranded_blocked']
 
     def test_empty_is_vacuously_true(self) -> None:
         """No open escalation -> True, byte-identical to `not report.open_escalations`."""
