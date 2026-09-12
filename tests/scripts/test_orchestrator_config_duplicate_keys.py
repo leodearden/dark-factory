@@ -36,14 +36,14 @@ is orchestrator misconfiguration.
 """
 from __future__ import annotations
 
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 REPO_ROOT = Path(__file__).parents[2]
 
@@ -350,4 +350,76 @@ def test_a_second_top_level_verify_env_block_silently_drops_the_earlier_keys(
     assert [f.key for f in duplicate_keys(mutant)] == ['verify_env'], (
         'the detector must flag the very shape the production loader just '
         'swallowed, or it would not have caught task 4635 either'
+    )
+
+
+def test_every_orchestrator_config_the_loader_reads_has_no_duplicate_keys(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """The guard itself: no config the orchestrator loads repeats a mapping key.
+
+    Aggregated across the whole set rather than stopping at the first offender,
+    so one red run names every file that needs folding.
+    """
+    findings = [
+        finding
+        for path in _orchestrator_config_paths(discover_module_configs)
+        for finding in duplicate_keys(path)
+    ]
+
+    assert not findings, (
+        'duplicate mapping key(s) in orchestrator config(s) the loader reads:\n'
+        + '\n'.join(
+            f'  {finding.path.relative_to(REPO_ROOT)}: {finding.key!r} declared at '
+            f'line {finding.first_line} and again at line {finding.duplicate_line}'
+            for finding in findings
+        )
+        + '\nPyYAML keeps only the LAST occurrence and reports nothing, so every key '
+        'in the earlier block is silently absent from the effective config. Remedy: '
+        'fold the blocks into a single mapping.'
+    )
+
+
+def test_the_swept_set_is_the_set_the_loader_actually_reads(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """The scope-honesty assertion, because a sweep over an empty set reports green.
+
+    The expectation is DERIVED from the same production walk the sweep uses, not
+    written down as a roster: a literal list or count of today's module configs
+    rots on the next one added, and this directory has already recorded
+    hard-coded counts of directory contents going stale as a measured defect.
+    """
+    prefixes = list(discover_module_configs())
+    paths = _orchestrator_config_paths(discover_module_configs)
+
+    assert prefixes, (
+        'the production module-config walk found NO module configs, which would '
+        'make the sweep above pass while checking almost nothing. Either discovery '
+        'broke, or every <prefix>/orchestrator.yaml in the repo was removed'
+    )
+    assert ROOT_CONFIG_PATH in paths, (
+        f'{ROOT_CONFIG_PATH} is the file YamlSettingsSource reads and the one task '
+        '4635 actually regressed; a sweep that skips it guards nothing that matters'
+    )
+    assert DEFAULTS_PATH in paths, (
+        f'{DEFAULTS_PATH} is the package-bundled layer _load_defaults reads, and a '
+        'duplicate key there degrades every project this orchestrator serves'
+    )
+    assert sorted(set(paths) - {ROOT_CONFIG_PATH, DEFAULTS_PATH}) == sorted(
+        REPO_ROOT / prefix / 'orchestrator.yaml' for prefix in prefixes
+    ), (
+        'the swept module configs must be exactly one <prefix>/orchestrator.yaml per '
+        f'discovered prefix ({prefixes!r}), or the sweep has drifted from the set '
+        '_discover_module_configs actually registers'
+    )
+    assert len(paths) == len(prefixes) + 2, (
+        f'expected {len(prefixes)} module configs plus the root config and '
+        f'defaults.yaml, got {len(paths)} paths — a duplicate entry would make the '
+        'sweep read one file twice and report on it twice'
+    )
+    missing = [path for path in paths if not path.is_file()]
+    assert not missing, (
+        f'{missing!r} do not exist, so duplicate_keys was never going to read them. '
+        'A swept path that is not a file is a silently empty leg of this guard'
     )
