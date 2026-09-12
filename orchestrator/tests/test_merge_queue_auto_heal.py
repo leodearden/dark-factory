@@ -20,10 +20,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeClock, FakeVerifier
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
@@ -764,7 +766,6 @@ class TestAutoHealOwnerTiedResume:
     """Signal b: after happy path, unhalt_lanes_owned_by(esc_id) resumes normal lane."""
 
     def test_owner_tied_resume_primitive(self, tmp_path: Path) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt'
@@ -774,9 +775,13 @@ class TestAutoHealOwnerTiedResume:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL SpeculativeMergeWorker so _WipHaltMixin state is exercised
+        # Use a REAL lane so _WipHaltMixin state is exercised, with the ports
+        # faked: nothing in this scene may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
-        real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+        real_worker = MergeLane(
+            git_ops=git_ops, queue=asyncio.Queue(),
+            verifier=FakeVerifier(), clock=FakeClock(),
+        )
         workflow.merge_worker = real_worker
 
         escalation_queue = MagicMock()
@@ -973,7 +978,6 @@ class TestAutoHealHaltOwnerIsDedupeParent:
     """
 
     def test_halt_owner_is_surviving_parent_on_fold(self, tmp_path: Path) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt-fold'
@@ -983,10 +987,13 @@ class TestAutoHealHaltOwnerIsDedupeParent:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL SpeculativeMergeWorker so _WipHaltMixin lane-owner state is
-        # exercised.
+        # Use a REAL lane so _WipHaltMixin lane-owner state is exercised, with
+        # the ports faked: nothing here may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
-        real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+        real_worker = MergeLane(
+            git_ops=git_ops, queue=asyncio.Queue(),
+            verifier=FakeVerifier(), clock=FakeClock(),
+        )
         workflow.merge_worker = real_worker
 
         # make_id returns the CHILD (locally-built) escalation id
