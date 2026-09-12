@@ -41,6 +41,10 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_terminal_metadata_flags,
     maybe_escalate_suppression_storm,
 )
+from fused_memory.reconciliation.preservation_specimen_guard import (
+    filter_preservation_specimen_flags,
+    maybe_escalate_preservation_suppression_storm,
+)
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
@@ -316,9 +320,94 @@ class MemoryConsolidator(BaseStage):
         # Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt.
         report.stats['entity_standing_decision_suppressed'] = 0
 
+        # ── Preservation-specimen corroboration guard (task 4223) ──────────────
+        # Decline stranded/reset recommendations for tasks whose odd state is
+        # DOCUMENTED as deliberate — a preserved validation specimen.  Task 3105
+        # is in-progress with a null claimant and a null heartbeat on purpose,
+        # and this finding twice became an operator-gate task asking for it to be
+        # reset (5080, and 5104 born-at-L2 critical); both were declined by hand.
+        #
+        # Placement is the whole point, and it is NOT beside Hook A below.  The
+        # remediation early-return three lines down sits ABOVE the entire filter
+        # chain, so anything wired next to filter_entity_standing_decisions is
+        # unreachable on a remediation pass — and a BLANKET stage1_flag_suppression
+        # for task 3105 (mem0 63905117, widened 2026-09-07) failed to stop the
+        # recurrence for exactly that reason: the two post-widening recurrences
+        # (run f16954ae 2026-08-26, run 720ebf37 2026-09-11) were both remediation
+        # runs.  This is the placement verify_cited_memories already uses to cover
+        # both passes, for the same reason.
+        #
+        # Both stats are pre-inited here, above the return, so neither key is ever
+        # conditionally absent from a remediation report (the always-present
+        # convention the three pre-inits above follow).
+        #
+        # Best-effort: a guard failure must never abort the stage or leave
+        # items_flagged partially mutated, so items_flagged is reassigned only on
+        # success and the stats stay at their pre-inited 0.
+        report.stats['preservation_specimen_suppressed'] = 0
+        report.stats['preservation_specimen_unresolved'] = 0
+        preservation_suppressed_signatures: set = set()
+        preservation_result = None
+        try:
+            _pre_preservation_flags = list(report.items_flagged or [])
+            preservation_result = await filter_preservation_specimen_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                flags=report.items_flagged,
+            )
+            report.items_flagged = preservation_result.kept_flags
+            report.stats['preservation_specimen_suppressed'] = sum(
+                preservation_result.suppressed_by_task.values()
+            )
+            # INV-11: a cycle whose corroboration reads FAILED is not a clean
+            # cycle.  Surfacing the count here keeps the degradation visible in
+            # the blob Stage 2's prompt serializes, not only in the process log.
+            report.stats['preservation_specimen_unresolved'] = len(
+                preservation_result.unresolved_task_ids
+            )
+            # Suppression is NOT resolution: these signatures are excluded from
+            # acknowledge_resolved_flags below so the persisted stage1_flag_marker
+            # (and thus recurrence history) survives until the preservation
+            # citation is retired.
+            _preservation_kept_signatures = {
+                sig for f in report.items_flagged
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None
+            }
+            preservation_suppressed_signatures = {
+                sig for f in _pre_preservation_flags
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None and sig not in _preservation_kept_signatures
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'preservation-specimen guard failed for project %s (best-effort — '
+                'passing %d flag(s) through unfiltered this cycle)',
+                self.project_id, len(report.items_flagged or []),
+            )
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
+
+        # Per-cycle "storm escape" for the guard above (INV-4), and its
+        # unreadable-corroboration disclosure.  Full-cycle only, mirroring the
+        # Hook A storm call below; skipped when no escalation queue is wired
+        # (nothing would consume the escalation).
+        #
+        # Deliberately NOT inside the ``if report.items_flagged:`` block below:
+        # a storm is precisely the cycle in which the guard may have suppressed
+        # EVERY flag, which would leave that block unentered and the storm
+        # unreported — the one cycle it most needs filing.
+        if self._escalation_queue is not None and preservation_result is not None:
+            await maybe_escalate_preservation_suppression_storm(
+                escalation_queue=self._escalation_queue,
+                project_id=self.project_id,
+                run_id=run_id,
+                result=preservation_result,
+            )
 
         # ── Resolved human-curator-gate sweep (task 3084) ──────────────────────
         # Flag open ``operational_mode == 'gate'`` tasks for which the reify
@@ -670,6 +759,10 @@ class MemoryConsolidator(BaseStage):
             # acknowledge_resolved_flags so the persisted stage1_flag_marker (and thus
             # recurrence history) survives until the standing decision is lifted.
             suppressed_signatures |= esd_suppressed_signatures
+            # Same reasoning for the preservation-specimen guard (task 4223): a
+            # specimen's stranded flag is HIDDEN, not resolved, so its marker must
+            # survive for when the preservation citation is retired.
+            suppressed_signatures |= preservation_suppressed_signatures
             # ── Deletion guard: drop absence-type flags that cannot be confirmed absent ──
             # filter_false_absence_flags is fail-closed: keeps an absence-asserting flag
             # ONLY when get_task POSITIVELY confirms the task does not exist.  Present or

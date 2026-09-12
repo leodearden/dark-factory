@@ -1,5 +1,6 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
+import contextlib
 import json
 import logging
 from contextlib import contextmanager
@@ -2046,6 +2047,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 2896 γ): stays 0 on the empty-flags path — the
             # entity-standing-decision filter only runs inside `if items_flagged`.
             'entity_standing_decision_suppressed': 0,
+            # Always present (task 4223): the preservation-specimen guard runs
+            # ABOVE the remediation early-return, so both keys are on EVERY
+            # report. Both stay 0 here — no flag was emitted, so the guard
+            # short-circuits before any corroboration read.
+            'preservation_specimen_suppressed': 0,
+            'preservation_specimen_unresolved': 0,
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -2174,6 +2181,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 2896 γ): stays 0 on the empty-flags path — the
             # entity-standing-decision filter only runs inside `if items_flagged`.
             'entity_standing_decision_suppressed': 0,
+            # Always present (task 4223): the preservation-specimen guard runs
+            # ABOVE the remediation early-return, so both keys are on EVERY
+            # report. Both stay 0 here — no flag was emitted, so the guard
+            # short-circuits before any corroboration read.
+            'preservation_specimen_suppressed': 0,
+            'preservation_specimen_unresolved': 0,
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -16421,20 +16434,34 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         stage.memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
 
     @staticmethod
-    def _full_cycle_patches(**extra):
-        """The filter-chain stubs a full cycle needs, plus any *extra* patches."""
-        patches = {
+    @contextlib.contextmanager
+    def _full_cycle(base_report, **extra):
+        """BaseStage.run stubbed to *base_report*, plus the filter-chain stubs.
+
+        An ExitStack rather than a parenthesized ``with``: the stub set is built
+        per test, and ``with (a, *stubs)`` parses as a TUPLE, not as a group of
+        context managers.
+        """
+        stubs = {
             'dedup_flags': AsyncMock(side_effect=lambda **kw: kw.get('flags', [])),
             'filter_false_absence_flags': AsyncMock(
                 side_effect=lambda taskmaster, project_root, flags: flags,
             ),
             'acknowledge_resolved_flags': AsyncMock(return_value=0),
         }
-        patches.update(extra)
-        return [
-            patch(f'fused_memory.reconciliation.stages.memory_consolidator.{name}', new=mock)
-            for name, mock in patches.items()
-        ]
+        stubs.update(extra)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            )
+            for name, mock in stubs.items():
+                stack.enter_context(
+                    patch(
+                        f'fused_memory.reconciliation.stages.memory_consolidator.{name}',
+                        new=mock,
+                    ),
+                )
+            yield
 
     @pytest.mark.asyncio
     async def test_full_cycle_suppresses_corroborated_stranded_flag(self, mock_deps):
@@ -16446,10 +16473,7 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         unrelated = {'task_id': '4102', 'flag_type': 'missing_deliverable'}
         base_report = self._make_base_report([specimen, unrelated])
 
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            *self._full_cycle_patches(),
-        ):
+        with self._full_cycle(base_report):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='p'), prior_reports=[],
                 run_id='r-4223-full',
@@ -16500,10 +16524,7 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
 
         base_report = self._make_base_report([{'task_id': '9', 'flag_type': 'task_absent'}])
 
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            *self._full_cycle_patches(),
-        ):
+        with self._full_cycle(base_report):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='p'), prior_reports=[],
                 run_id='r-4223-quiet',
@@ -16541,10 +16562,7 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         specimen = self._stranded_flag()
         base_report = self._make_base_report([specimen])
 
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            *self._full_cycle_patches(),
-        ):
+        with self._full_cycle(base_report):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='p'), prior_reports=[],
                 run_id='r-4223-degraded',
@@ -16565,13 +16583,14 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         self._corroborating_memory(stage)
 
         specimen = self._stranded_flag()
-        base_report = self._make_base_report([specimen])
+        # A surviving flag is required, not decoration: the acknowledgment block
+        # is guarded on ``if report.items_flagged:``, so suppressing the only
+        # flag would skip the very path this test is about.
+        survivor = {'task_id': '4102', 'flag_type': 'missing_deliverable'}
+        base_report = self._make_base_report([specimen, survivor])
         ack_mock = AsyncMock(return_value=0)
 
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            *self._full_cycle_patches(acknowledge_resolved_flags=ack_mock),
-        ):
+        with self._full_cycle(base_report, acknowledge_resolved_flags=ack_mock):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='p'), prior_reports=[],
                 run_id='r-4223-ack',
@@ -16590,10 +16609,11 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         specimen = self._stranded_flag()
         base_report = self._make_base_report([specimen])
 
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch(self._GUARD, new=AsyncMock(side_effect=RuntimeError('guard exploded'))),
-            *self._full_cycle_patches(),
+        with self._full_cycle(
+            base_report,
+            filter_preservation_specimen_flags=AsyncMock(
+                side_effect=RuntimeError('guard exploded'),
+            ),
         ):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='p'), prior_reports=[],
@@ -16628,6 +16648,7 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
     async def test_storm_escalation_filed_on_a_full_cycle(self, mock_deps, tmp_path):
         """The INV-4 escape is wired, and only where an escalation queue exists."""
         from escalation.queue import EscalationQueue
+
         from fused_memory.reconciliation.preservation_specimen_guard import (
             PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
         )
@@ -16641,10 +16662,7 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         storm_flags = [self._stranded_flag(flag_type=f'task_stranded_v{i}') for i in range(n)]
         base_report = self._make_base_report(storm_flags)
 
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            *self._full_cycle_patches(),
-        ):
+        with self._full_cycle(base_report):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='p'), prior_reports=[],
                 run_id='r-4223-storm',
