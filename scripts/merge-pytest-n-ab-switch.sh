@@ -115,8 +115,20 @@ script_dir, key, value, sha, config_path, port = sys.argv[1:7]
 sys.path.insert(0, script_dir)
 from legibility import census_trigger
 
-tool = census_trigger.post_mcp_tool_call(
-    f'http://127.0.0.1:{port}/mcp', 'reload_config', {})
+try:
+    tool = census_trigger.post_mcp_tool_call(
+        f'http://127.0.0.1:{port}/mcp', 'reload_config', {})
+except Exception as exc:
+    # Broad on purpose, and the breadth is the point: census_trigger raises
+    # StatusFetchUnavailable for a malformed or error envelope, RuntimeError
+    # for a failed handshake, and httpx's own exceptions for a dead socket —
+    # all three mean the live config is UNKNOWN, and a deploy gate must not
+    # pass on an unknown. Naming the TRANSPORT keeps this distinct from the
+    # rolled-back-reload diagnostic below, which is about a reload that ran.
+    print(f'reload_config never reached the tool: {type(exc).__name__}: {exc} '
+          f'(committed as {sha}; the value lands at the next restart)', file=sys.stderr)
+    sys.exit(1)
+
 # reload_config's OWN error field: a config that failed to parse, reported by a
 # perfectly successful tools/call. `_raise_on_mcp_error` inspects the JSON-RPC
 # envelope and never sees this one.
