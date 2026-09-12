@@ -14,12 +14,20 @@
 #   [escalation_port] default 8102 (dark-factory's escalation MCP)
 #   --dry-run         edit a temp copy, print the diff, no commit, no reload
 #
-# Modelled on scripts/merge-deep-set-cap.sh (same commit --only + single-shot
-# MCP tools/call reload). Exit 0 on either of the two ways the value can be
-# live: the reload hot-applied it ('applied'), or the running config already
-# carried it and the reload provably re-read THIS config file
-# ('already_converged'). The last stdout line is a JSON verdict —
-# {switched_to, commit, outcome} — for a kind='predicate' before_done note.
+# Shares scripts/merge-deep-set-cap.sh's `git commit --only` shape, and that
+# alone: the escalation MCP is STATEFUL, so a single-shot `tools/call` POST is
+# rejected at the TRANSPORT layer — `Bad Request: Missing session ID`, HTTP 400,
+# measured live on 2026-09-12 — before any tool runs, and `curl` without -f
+# exits 0 on it. The reload therefore goes through
+# legibility.census_trigger.post_mcp_tool_call, which handshakes.
+# (merge-deep-set-cap.sh still carries that single-shot defect; copying from it
+# again would reintroduce this bug.)
+#
+# Exit 0 on either of the two ways the value can be live: the reload
+# hot-applied it ('applied'), or the running config already carried it and the
+# reload provably re-read THIS config file ('already_converged'). The last
+# stdout line is a JSON verdict — {switched_to, commit, outcome} — for a
+# kind='predicate' before_done note.
 set -euo pipefail
 die() { echo "merge-pytest-n-ab-switch: $*" >&2; exit 1; }
 
@@ -31,7 +39,18 @@ CONFIG="${ARGS[1]:-/home/leo/src/dark-factory/dark-factory-orchestrator.yaml}"
 PORT="${ARGS[2]:-8102}"
 [[ "$VALUE" =~ ^[0-9]+$ ]] || die "value must be a positive integer, got '$VALUE'"
 [ -f "$CONFIG" ] || die "config not found: $CONFIG"
+# The reload step imports its MCP transport from the checkout the SCRIPT lives
+# in — never from $REPO below, which is the CONFIG's checkout and may be a
+# different project entirely. That transport is not stdlib (httpx, pydantic),
+# so the interpreter is resolved for the same reason: inheriting whatever
+# `python3` a login shell offers makes this gate unreachable. This tree's one
+# root .venv (CLAUDE.md, "Locating installed code"), else the caller's python3.
+# Derived from the path rather than `git rev-parse` so a copy of this script
+# outside any checkout still resolves under `set -e`.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECKOUT="$SCRIPT_DIR/.."
+PY="$CHECKOUT/.venv/bin/python3"
+[ -x "$PY" ] || PY=python3
 REPO="$(cd "$(dirname "$CONFIG")" && git rev-parse --show-toplevel)" || die "config is not inside a git checkout"
 CONFIG_BASE="$(realpath --relative-to="$REPO" "$CONFIG")"
 KEY='PYTEST_XDIST_AUTO_NUM_WORKERS'
@@ -96,10 +115,15 @@ else
 fi
 
 # 3. Hot-reload via the escalation MCP, and assert the value is live.
-#    The escalation MCP is STATEFUL, so reaching it takes a session handshake
-#    and an SSE decoder rather than one POST; `legibility.census_trigger`
-#    already owns that transport and is imported from the SCRIPT's own
-#    directory, never from $REPO (which is the CONFIG's checkout).
+#    `legibility.census_trigger.post_mcp_tool_call` is the single transport
+#    definition every consumer of this server goes through (task 3644). It
+#    supplies the four things one POST cannot: the session-less `initialize`
+#    handshake the stateful server demands, SSE decoding of the reply, raising
+#    on both an envelope-level JSON-RPC `error` and `result.isError`, and the
+#    session-terminating DELETE without which every run leaks a live anyio task
+#    in the long-lived escalation process. None of it is re-implemented here:
+#    three legibility posters each hand-rolled this transport and all three
+#    silently dropped every escalation they ever filed.
 #
 #    The value is live in either of two shapes. `applied` carrying verify_env
 #    with the new value is the flip. ABSENCE of verify_env from `applied` is
@@ -109,11 +133,23 @@ fi
 #    weaker than convergence, though: a rolled-back reload and a reload of a
 #    DIFFERENT orchestrator both produce it, which is what the two corroborators
 #    below exclude.
-python3 - "$SCRIPT_DIR" "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$PORT" <<'PY'
+"$PY" - "$SCRIPT_DIR" "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$PORT" <<'RELOAD_PY'
 import json, os, sys
 script_dir, key, value, sha, config_path, port = sys.argv[1:7]
 sys.path.insert(0, script_dir)
-from legibility import census_trigger
+try:
+    from legibility import census_trigger
+except ImportError as exc:
+    # Not stdlib: httpx, and pydantic via census_trigger's legibility.config
+    # import. Name the interpreter and the remedy rather than emitting a
+    # traceback — an operator hitting this from a login shell has no other clue
+    # that the interpreter, not the code, is what is wrong.
+    print(f'the MCP reload transport is not importable under {sys.executable}: {exc}\n'
+          f'  sys.path entry added: {script_dir}\n'
+          f'  remedy: sync this checkout so {script_dir}/../.venv exists, or re-run\n'
+          f'  this script under `uv run --project shared`',
+          file=sys.stderr)
+    sys.exit(1)
 
 try:
     tool = census_trigger.post_mcp_tool_call(
@@ -155,4 +191,4 @@ else:
         sys.exit(1)
     outcome = 'applied'
 print(json.dumps({'switched_to': value, 'commit': sha, 'outcome': outcome}))
-PY
+RELOAD_PY
