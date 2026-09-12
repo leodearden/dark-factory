@@ -1587,3 +1587,201 @@ class TestSubmitVerifiedGreenMergeRequest:
 
         assert queue.qsize() == 1
         assert req.request_id.startswith('mr-')
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the two blocked-arm clauses consume the SHARED predicate.
+#
+# Before eta both read `self._only_merge_remediable(report.open_escalations)` —
+# a CATEGORY judgement with no notion of pin class, so an `info` annotation in
+# a non-remediable category vetoed the self-heal exactly as loudly as a
+# blocking L1, and a blocking L0 whose filer was provably dead did too.  After
+# eta they read `not report_pins_blocked_recovery(report)`: the same category
+# relaxation, now composed with `escalation.pins`' pin class.
+#
+# `report_pins_blocked_recovery` is `pins and not only_merge_remediable(...)`,
+# in that order and over ALL records.  Both halves are asserted below, INCLUDING
+# the case where the two disagree: a NON-pinning info record in a
+# non-remediable category still defeats the relaxation, because
+# `only_merge_remediable` is an `all(...)` over `category` and does not filter
+# by pin class.  That is a deliberate, conservative preservation — it is
+# byte-identical to what `_only_merge_remediable` does today — and it is pinned
+# here so the ordering is a checked decision rather than an accident.
+# ---------------------------------------------------------------------------
+
+
+def _seed_info(queue: EscalationQueue, tid: str, category: str, *, level: int = 0) -> str:
+    """Seed one INFO-severity pending record of *category* for *tid*."""
+    esc_id = f'esc-info-{category}-{tid}'
+    queue.submit(Escalation(
+        id=esc_id, task_id=tid, agent_role='steward', severity='info',
+        category=category, summary=f'annotation {category}', level=level,
+    ))
+    return esc_id
+
+
+@pytest.mark.asyncio
+class TestBlockedArmConsumesTheSharedPinPredicate:
+    """The pin-CLASS half the blocked clauses could not see before task eta."""
+
+    @staticmethod
+    def _arm(harness: Harness, tmp_path: Path, tid: str, name: str) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / f'esc_{name}')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        return queue
+
+    async def test_info_only_pin_no_longer_vetoes_the_on_main_self_heal(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """An ANNOTATION must not hold a landed task blocked forever.
+
+        Today `_only_merge_remediable([info/task_failure])` is False — the
+        category is non-remediable — so the MARK_DONE upgrade never fires and
+        the task sits blocked behind a record that never pinned anything.
+        """
+        tid = _TID
+        self._arm(harness, tmp_path, tid, 'info_on_main')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_info(harness._escalation_queue, tid, 'task_failure')
+
+        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+
+        assert _done_provenance(harness, tid) is not None
+
+    async def test_dead_l0_pin_no_longer_vetoes_the_on_main_self_heal(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """The clauses already require `report.live_claimant is None`.
+
+        So `classify_pins` link 4 reaches its identity-independent branch and
+        PROVES the filing incarnation dead — the handoff has no consumer left,
+        and holding the task for it helps nobody.
+        """
+        tid = _TID
+        self._arm(harness, tmp_path, tid, 'deadl0_on_main')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(harness._escalation_queue, tid, 'task_failure', level=0)
+
+        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+
+        assert _done_provenance(harness, tid) is not None
+
+    async def test_human_concern_l1_still_vetoes_the_on_main_self_heal(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """The relaxation is preserved verbatim: an L1 is a live handoff."""
+        tid = _TID
+        self._arm(harness, tmp_path, tid, 'l1_on_main')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(harness._escalation_queue, tid, 'task_failure', level=1)
+
+        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+
+        assert _done_provenance(harness, tid) is None
+
+    async def test_info_only_pin_no_longer_vetoes_the_off_main_upgrade(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Same relaxation on the EXISTS_OFF_MAIN RE_FILE_ESCALATION clause."""
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'info_off_main')
+        _wire_exists_off_main(harness, tid)
+        seeded = _seed_info(queue, tid, 'task_failure')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert harness._merge_queue.qsize() == 1, (
+            'the upgrade must fire: an info record is not a handoff'
+        )
+        assert seeded in {e.id for e in queue.get_by_task(tid, status='pending')}
+
+    async def test_human_concern_l1_still_vetoes_the_off_main_upgrade(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'l1_off_main')
+        _wire_exists_off_main(harness, tid)
+        _seed_pending(queue, tid, 'task_failure', level=1)
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert harness._merge_queue.qsize() == 0
+        _asserted_no_repend(harness, tid)
+
+    async def test_a_remediable_pin_plus_an_info_of_the_same_class_still_relaxes(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Mixed severities within the remediable class: the relaxation holds.
+
+        `only_merge_remediable` is an `all(...)` over CATEGORY, so both records
+        are inside the set and the upgrade fires exactly as for the lone
+        `stranded_blocked` L1.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'mixed_same_class')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(queue, tid, 'stranded_blocked', level=1)
+        _seed_info(queue, tid, 'stranded_blocked')
+
+        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+
+        assert _done_provenance(harness, tid) is not None
+
+    async def test_a_remediable_pin_plus_a_foreign_class_info_still_vetoes(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """THE COMPOSITION ORDER, asserted rather than assumed.
+
+        `records_pin_blocked_recovery` narrows the pin answer by
+        `only_merge_remediable(records)` over ALL records, so a NON-pinning
+        info record in a foreign category still defeats the relaxation.  This
+        is byte-identical to today's `_only_merge_remediable`, i.e. the
+        conservative direction, and it is asserted here so a future reader
+        finds the ordering decided rather than incidental: relaxing it would
+        let an unrelated annotation authorise a merge, which is a widening no
+        measurement in this task supports.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'mixed_foreign_class')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(queue, tid, 'stranded_blocked', level=1)
+        _seed_info(queue, tid, 'design_concern')
+
+        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+
+        assert _done_provenance(harness, tid) is None
+
+    async def test_an_unreadable_store_still_takes_the_upgrade_path(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """UNCHANGED on a store outage — the clauses never pass `records=None`.
+
+        With no queue bound, `_resolve_open_escalations` reports
+        `open_escalations=[]` plus `escalation_store_unavailable=True`.  The
+        clauses pass that LIST, so the store-unavailable non-fold is preserved
+        uniformly across the resolver AND its sweep-side clauses.  The
+        `records=None` -> always-pin arm is the SCHEDULER's contract and is
+        unit-tested in test_recovery_pins.py; it is not reached from here.
+        """
+        tid = _TID
+        harness._escalation_queue = None
+        harness._loop = asyncio.get_running_loop()
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+
+        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+
+        assert _done_provenance(harness, tid) is not None

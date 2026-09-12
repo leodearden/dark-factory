@@ -2397,3 +2397,131 @@ class TestLandedButPinnedZombieLoop:
         ) != _CONVERTED
         for call in enforce_harness.scheduler.set_task_status.await_args_list:
             assert 'blocked' not in call.args
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the CONVERT SCOPING CLAUSE consumes the same predicate.
+#
+# The clause exists to answer ONE question: "would the blocked-arm upgrade
+# clauses pick this converted row straight back up next sweep?"  Before eta it
+# asked that question with `_only_merge_remediable`, which was the blocked
+# arm's whole predicate at the time.  Now the blocked arm reads
+# `report_pins_blocked_recovery`, so the scoping clause must read it too — the
+# two are the SAME question asked at two moments, and letting them drift is how
+# review finding #3's two-sweep-auto-done hazard reopens.
+#
+# That coherence CHANGES one population, deliberately: a CONVERT row pinned
+# solely by a DEAD-filer L0 in a non-remediable category.  Under
+# `_only_merge_remediable` it converted; under the shared predicate the blocked
+# arm would now move it, so it is held at its pre-3539 LEAVE instead.  Spec S6
+# assigns that row's visibility to the ORPHAN-L0 REAPER (part 4 of this same
+# task), which promotes the aged-out L0 to L1 — after which it is a genuine
+# QUEUE_HANDOFF and converts on the very next sweep.
+# ---------------------------------------------------------------------------
+
+DEAD_L0_PIN = EscalationRef(
+    id='esc-3541-deadl0', level=0, category='task_failure', severity='blocking',
+)
+INFO_PIN = EscalationRef(
+    id='esc-3541-info', level=0, category='task_failure', severity='info',
+)
+
+
+@pytest.mark.asyncio
+class TestConvertScopingClauseTracksTheBlockedArm:
+    """The scoping clause and the blocked arm must agree, by construction."""
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_a_merge_remediable_pin_is_still_held_silently(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """UNCHANGED — review finding #3's hazard stays closed.
+
+        The reaper's own `stranded_blocked` is relaxed by the blocked arm, so
+        converting the row would hand it straight back to that arm next sweep.
+        """
+        from orchestrator.event_store import EventType
+
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
+
+        result = await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+        rows = _recovery_rows(enforce_harness)
+        assert len(rows) == 1, rows
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['data'].get('reason') == 'escalation_pinned', (
+            'LeaveReason.escalation_pinned must still be threaded explicitly — '
+            'the report still classifies CONVERT, so leave_reason alone would '
+            'drop the row this clause is counted in'
+        )
+
+    async def test_a_human_concern_l1_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """The measured 3717 population is untouched by the rewiring."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[PIN_REFS[1]],
+        ))
+
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_a_dead_l0_only_pin_is_now_held_not_converted(
+        self, enforce_harness,
+    ) -> None:
+        """THE ONE POPULATION THIS REWIRING MOVES, and why it is correct.
+
+        `report.live_claimant is None` here — the CONVERT rows all require it —
+        so `classify_pins` link 4 PROVES the filer dead and the blocked arm no
+        longer vetoes on this record.  Converting would therefore produce
+        exactly the two-sweep auto-done review finding #3 named: `blocked`,
+        then MARK_DONE on the next pass.  Holding is the coherent answer, and
+        the row stops being invisible when the orphan-L0 reaper promotes it.
+        """
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[DEAD_L0_PIN],
+        ))
+
+        result = await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None, (
+            'a dead-L0-pinned row must not convert into a shape the blocked '
+            'arm would immediately auto-done'
+        )
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+
+    async def test_a_dead_l0_beside_a_live_handoff_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """One QUEUE_HANDOFF record is enough to make `blocked` genuinely at rest."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[DEAD_L0_PIN, PIN_REFS[2]],
+        ))
+
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_an_info_record_cannot_reach_this_clause_at_all(
+        self, enforce_harness,
+    ) -> None:
+        """Link 1 short-circuits upstream: an info-only report never CONVERTs.
+
+        Asserted so the clause is never "fixed" to handle a case the resolver
+        already excludes — `_shape`'s element is False, so the table maps this
+        shape to a plain MARK_DONE/REVERT row (PRD boundary #8).
+        """
+        report = _pinned_in_progress(BranchStateKind.ON_MAIN, refs=[INFO_PIN])
+        assert classify_recovery(report) != RecoveryAction.CONVERT_TO_BLOCKED
+
+        _bind(enforce_harness, report)
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) != _CONVERTED
