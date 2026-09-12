@@ -1405,7 +1405,7 @@
     "orchestrator/tests/test_merge_cancel_retire.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_completion.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_disposition.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_merge_drift.py": {"patch_targets": ["_derive_task_files_from_git", "_run_drift_check", "build_merge_verify_spec", "run_scoped_verification"], "private_reads": 21},
+    "orchestrator/tests/test_merge_drift.py": {"patch_targets": ["_derive_task_files_from_git", "_run_drift_check", "build_merge_verify_spec", "run_scoped_verification"], "private_reads": 12},
     "orchestrator/tests/test_merge_gates.py": {"patch_targets": ["AUTO_CHAIN_GENERATIONS_ENABLED", "_check_post_merge_equivalence", "_check_post_merge_pyright", "_maybe_auto_chain_generation", "_rebase_delta_touched_overlap", "_run_post_merge_verify", "_run_unscoped_typechecks"], "private_reads": 7},
     "orchestrator/tests/test_merge_gates_plan_files_rename.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_guard_pipeline.py": {"patch_targets": ["_check_plan_targets_in_tree"], "private_reads": 2},

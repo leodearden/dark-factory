@@ -173,7 +173,9 @@ class TestDriftCheckStatePersistence:
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_drift_check_guards_against_non_positive_every_n() -> None:
+async def test_maybe_run_drift_check_guards_against_non_positive_every_n(
+    tmp_path: Path,
+) -> None:
     """0 or negative verify_drift_check_every_n_lands must degrade to a no-op.
 
     ``OrchestratorConfig`` enforces ``ge=1`` at construction (see
@@ -183,21 +185,35 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n() -> No
     solely on that upstream validation — a 0-or-negative value must not raise
     ``ZeroDivisionError`` via ``worker._drift_land_count % every_n``.
     """
-    from orchestrator.merge_drift import _maybe_run_drift_check
+    from orchestrator.merge_drift import (
+        _load_drift_check_state,
+        _maybe_run_drift_check,
+    )
 
     git_ops = MagicMock()
     req = MagicMock()
     req.config.enabled_verify_runners = ['laptop']
     req.config.verify_drift_check_every_n_lands = 0
 
-    worker = MagicMock()
-    worker._drift_land_count = 0
-    worker._drift_check_tasks = set()
+    state_path = _drift_state_path(tmp_path)
+    worker = _build_drift_worker(state_path)
 
     await _maybe_run_drift_check(worker, git_ops, req, 'commit-sha')
 
-    assert worker._drift_land_count == 0, 'land count must not advance on the disabled path'
+    assert _load_drift_check_state(state_path).land_count == 0, (
+        'land count must not advance on the disabled path'
+    )
     assert len(worker._drift_check_tasks) == 0, 'no drift-check task should be scheduled'
+
+
+def _drift_state_path(root: Path) -> Path:
+    """The drift-check state path production derives from a project root.
+
+    Byte-identical to what ``merge_queue.py::SpeculativeMergeWorker.__init__``
+    computes, so a test asserting on this file is asserting on the same path
+    the worker really writes.
+    """
+    return root / 'data' / 'orchestrator' / 'drift_check_state.json'
 
 
 def _build_drift_worker(state_path: Path) -> MagicMock:
@@ -206,6 +222,11 @@ def _build_drift_worker(state_path: Path) -> MagicMock:
     Fresh in-memory ``_drift_land_count=0`` (models the post-restart reset) but a
     caller-supplied ``_drift_state_path`` so the PERSISTED cadence can be shared
     across simulated restarts (fix 1a).
+
+    The private attributes below are the function-under-test's OWN parameter
+    surface: ``_maybe_run_drift_check`` takes the worker and reads them, so a
+    stand-in must carry them.  Retiring these needs a production signature
+    change, which task 5031 forbids.
     """
     w = MagicMock()
     w._drift_land_count = 0
@@ -261,7 +282,10 @@ class TestDriftCheckCadencePersistence:
         assert reachback.await_count == 1
 
     async def test_cadence_survives_simulated_restart(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import _maybe_run_drift_check
+        from orchestrator.merge_drift import (
+            _load_drift_check_state,
+            _maybe_run_drift_check,
+        )
 
         state_path = tmp_path / 'drift_check_state.json'
         git_ops = MagicMock()
@@ -283,7 +307,9 @@ class TestDriftCheckCadencePersistence:
             # because the persisted count (2) carried over — proving the
             # cadence does not depend on the in-memory _drift_land_count.
             worker_b = _build_drift_worker(state_path)
-            assert worker_b._drift_land_count == 0  # in-memory counter reset
+            # The persisted count (2) is what must carry over; the fresh
+            # worker's in-memory counter is vestigial (merge_drift.py:407-420).
+            assert _load_drift_check_state(state_path).land_count == 2
             await _maybe_run_drift_check(worker_b, git_ops, req, 'c3')
             assert len(worker_b._drift_check_tasks) == 1
             for t in list(worker_b._drift_check_tasks):
@@ -292,144 +318,36 @@ class TestDriftCheckCadencePersistence:
 
 
 @pytest.mark.asyncio
-class TestReachBackRouting:
-    """Reach-back / string-path monkeypatch routing contract.
-
-    See the module docstring above for why this diverges from the original
-    plan's "(4) _run_drift_check → _run_cold_shadow_verify / _run_shadow_compare"
-    description: that call does not exist in the extracted body.
+class TestDriftCheckFullGateSpecNoDerivation:
+    """The drift check re-dispatches a FULL-GATE spec and never derives
+    task_files, on BOTH the explicit-task_files and the task_files=None
+    branch (the latter is the one that USED to derive dispatching-host files).
     """
 
-    async def test_maybe_run_drift_check_reachback_to_run_drift_check(self) -> None:
-        """(5) _maybe_run_drift_check must resolve _run_drift_check via
-        orchestrator.merge_queue, not the co-located merge_drift copy."""
-        from orchestrator.merge_drift import _maybe_run_drift_check
-
-        git_ops = MagicMock()
-        req = MagicMock()
-        req.config.enabled_verify_runners = ['laptop']
-        req.config.verify_drift_check_every_n_lands = 1
-
-        worker = MagicMock()
-        worker._drift_land_count = 0
-        worker._drift_check_tasks = set()
-        worker._ensure_host_allocator = MagicMock(return_value=MagicMock())
-
-        naive = AsyncMock(side_effect=AssertionError(
-            'naive merge_drift._run_drift_check must not be called'
-        ))
-        reachback = AsyncMock(return_value=None)
-
-        with (
-            patch('orchestrator.merge_drift._run_drift_check', naive),
-            patch('orchestrator.merge_queue._run_drift_check', reachback),
-        ):
-            await _maybe_run_drift_check(worker, git_ops, req, 'commit-sha')
-            assert len(worker._drift_check_tasks) == 1, (
-                'expected exactly one drift-check task to be scheduled'
-            )
-            task = next(iter(worker._drift_check_tasks))
-            await task
-
-        naive.assert_not_called()
-        reachback.assert_awaited_once()
-
-    async def test_run_drift_check_reachback_to_verify_pool_deps(
-        self, tmp_path: Path,
+    @pytest.mark.parametrize('task_files', [None, ['src/foo.py']])
+    async def test_run_drift_check_builds_full_gate_spec(
+        self, tmp_path: Path, task_files: list[str] | None,
     ) -> None:
-        """_run_drift_check must resolve build_merge_verify_spec,
-        VerifyRunnerPool, LocalRunner, and run_scoped_verification via
-        orchestrator.merge_queue, not the co-located merge_drift imports.
+        """Fix 1b (task 2886, PRD §8δ): the drift check must re-dispatch a
+        FULL-GATE spec (task_files=None) to both hosts, NOT the scoped/
+        no-source spec that produced the (trivial) pass under investigation.
+        Re-dispatching the SAME scoped spec trivially passes on both hosts and
+        structurally cannot catch the trivial-pass divergence class.
 
-        Uses a real HostAllocator + a fake remote runner (mirrors
-        TestRunDriftCheck in test_merge_queue_multihost_wiring.py) so the
-        allocator-branch construction path is exercised end to end; a
-        local/remote agreement is observed via the verdict_parity_ok event,
-        which only fires if DriftDetector.check ever gets a real LocalRunner
-        talking to the merge_queue-patched run_scoped_verification.
-        """
-        from orchestrator.event_store import EventStore, EventType
-        from orchestrator.merge_drift import _run_drift_check
-        from orchestrator.verify_runner import HostAllocator
+        Both branches are covered by the one parameter:
 
-        git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        * ``task_files=None``   — the branch that USED to derive
+          dispatching-host task_files.  It must build a full-gate spec and NOT
+          invoke ``_derive_task_files_from_git``.
+        * ``['src/foo.py']``    — a scoping signal PRESENT, which the pre-fix
+          code would tuple-ify straight into ``build_merge_verify_spec``.
 
-        req = MagicMock()
-        req.task_id = 'task-drift-reachback'
-        req.task_files = ['src/foo.py']
-        req.module_configs = []
-        req.config = OrchestratorConfig(project_root=tmp_path)
+        Both assert the identical outcome (``spec_calls[0] is None``, no
+        derivation), which is why they are one test.
 
-        pass_result = VerifyResult(
-            passed=True, test_output='', lint_output='', type_output='', summary='ok',
-        )
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        allocator = HostAllocator([fake_remote], quarantine=set())
-
-        class _FakeEventStore(EventStore):
-            def __init__(self) -> None:
-                object.__init__(self)
-                self.emitted: list = []
-
-            def emit(self, event_type, *, task_id=None, data=None, **kw) -> None:  # type: ignore[override]
-                self.emitted.append(event_type)
-
-        event_store = _FakeEventStore()
-
-        with (
-            patch(
-                'orchestrator.merge_drift.build_merge_verify_spec',
-                MagicMock(side_effect=AssertionError('naive build_merge_verify_spec used')),
-            ),
-            patch(
-                'orchestrator.merge_drift.VerifyRunnerPool',
-                MagicMock(side_effect=AssertionError('naive VerifyRunnerPool used')),
-            ),
-            patch(
-                'orchestrator.merge_drift.LocalRunner',
-                MagicMock(side_effect=AssertionError('naive LocalRunner used')),
-            ),
-            patch(
-                'orchestrator.merge_drift.run_scoped_verification',
-                AsyncMock(side_effect=AssertionError('naive run_scoped_verification used')),
-            ),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=pass_result),
-            ),
-        ):
-            await _run_drift_check(
-                git_ops, req, 'commit-sha', None, event_store, set(),
-                allocator=allocator,
-            )
-
-        assert EventType.verdict_parity_ok in event_store.emitted, (
-            f'expected the orchestrator.merge_queue-patched dependency chain to '
-            f'govern _run_drift_check and reach a local/remote parity agreement, '
-            f'emitted event types: {event_store.emitted!r}'
-        )
-
-    async def test_run_drift_check_full_gate_when_task_files_none(
-        self, tmp_path: Path,
-    ) -> None:
-        """Fix 1b (task 2886): with req.task_files=None + enabled Lever-C
-        runners — the branch that USED to derive dispatching-host task_files —
-        _run_drift_check must now build a FULL-GATE spec (task_files=None) and
-        NOT invoke _derive_task_files_from_git.
-
-        Complements TestDriftCheckFullGateSpec's explicit-task_files case by
-        covering the previously-deriving branch.  Still exercises reach-back
-        routing (the build_merge_verify_spec spy only captures calls when
-        _run_drift_check resolves it via orchestrator.merge_queue).  Before
-        fix 1b this asserted the derived files flowed into the spec; that
-        derivation path is gone.
+        Still exercises reach-back routing: the ``build_merge_verify_spec`` spy
+        only captures calls when ``_run_drift_check`` resolves it via
+        ``orchestrator.merge_queue``.
         """
         import orchestrator.verify_runner as _vr
         from orchestrator.event_store import EventStore
@@ -443,8 +361,8 @@ class TestReachBackRouting:
         git_ops.cleanup_merge_worktree = AsyncMock()
 
         req = MagicMock()
-        req.task_id = 'task-drift-derive'
-        req.task_files = None
+        req.task_id = 'task-drift-fullgate'
+        req.task_files = task_files
         req.module_configs = []
         # enabled_verify_runners is a read-only property derived from
         # verify_runners — must be populated at construction, not assigned.
@@ -474,7 +392,7 @@ class TestReachBackRouting:
 
         event_store = _FakeEventStore()
 
-        spec_calls = []
+        spec_calls: list = []
         orig_build_spec = _vr.build_merge_verify_spec
 
         def spy_build_spec(config, module_configs, task_files, **kw):
@@ -487,6 +405,7 @@ class TestReachBackRouting:
                 'orchestrator.merge_queue.build_merge_verify_spec',
                 side_effect=spy_build_spec,
             ),
+            # A full-gate drift spec must NOT derive/scope task_files at all.
             patch(
                 'orchestrator.merge_queue._derive_task_files_from_git',
                 derive_spy,
@@ -503,94 +422,10 @@ class TestReachBackRouting:
 
         assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
         assert spec_calls[0] is None, (
-            f'drift spec must be FULL-GATE (task_files=None) even when '
-            f'req.task_files is None; got task_files={spec_calls[0]!r}'
-        )
-        derive_spy.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-class TestDriftCheckFullGateSpec:
-    """Fix 1b (task 2886, PRD §8δ): the drift check must re-dispatch a
-    FULL-GATE spec (task_files=None) to both hosts, NOT the scoped/no-source
-    spec that produced the (trivial) pass under investigation.
-
-    Re-dispatching the SAME scoped spec trivially passes on both hosts and
-    structurally cannot catch the trivial-pass divergence class — so the drift
-    check must force the complete workspace gate on the local trust-anchor AND
-    the eligible remote.
-
-    RED (pre step-6): _run_drift_check scopes the spec to req.task_files (or the
-    git-derived task_files) instead of passing task_files=None.
-    """
-
-    async def test_run_drift_check_builds_full_gate_spec(self, tmp_path: Path) -> None:
-        import orchestrator.verify_runner as _vr
-        from orchestrator.merge_drift import _run_drift_check
-        from orchestrator.verify_runner import HostAllocator
-
-        git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
-
-        req = MagicMock()
-        req.task_id = 'task-drift-fullgate'
-        # Scoping signal PRESENT: an explicit task_files list that the pre-fix
-        # code would tuple-ify and pass straight into build_merge_verify_spec.
-        req.task_files = ['src/foo.py']
-        req.module_configs = []
-        req.config = OrchestratorConfig(
-            project_root=tmp_path,
-            verify_runners=[  # type: ignore[arg-type]
-                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
-            ],
-        )
-
-        pass_result = VerifyResult(
-            passed=True, test_output='', lint_output='', type_output='', summary='ok',
-        )
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        allocator = HostAllocator([fake_remote], quarantine=set())
-
-        spec_calls: list = []
-        orig_build_spec = _vr.build_merge_verify_spec
-
-        def spy_build_spec(config, module_configs, task_files, **kw):
-            spec_calls.append(task_files)
-            return orig_build_spec(config, module_configs, task_files, **kw)
-
-        with (
-            patch(
-                'orchestrator.merge_queue.build_merge_verify_spec',
-                side_effect=spy_build_spec,
-            ),
-            # A full-gate drift spec must NOT derive/scope task_files at all.
-            patch(
-                'orchestrator.merge_queue._derive_task_files_from_git',
-                AsyncMock(side_effect=AssertionError(
-                    'drift check must NOT derive task_files for a full-gate spec'
-                )),
-            ),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=pass_result),
-            ),
-        ):
-            await _run_drift_check(
-                git_ops, req, 'commit-sha', None, None, set(),
-                allocator=allocator,
-            )
-
-        assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
-        assert spec_calls[0] is None, (
             f'drift spec must be FULL-GATE (task_files=None) so both hosts run the '
             f'complete suite and CAN diverge; got task_files={spec_calls[0]!r}'
         )
+        derive_spy.assert_not_awaited()
 
 
 def test_merge_queue_reexports_identical_objects() -> None:
