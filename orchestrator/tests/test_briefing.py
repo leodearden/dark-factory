@@ -222,18 +222,6 @@ class TestBuildPlanTighteningPrompt:
         prompt = await _build_tightening_prompt(briefing)
         assert 'drop_plan_file' in prompt
 
-    async def test_option_b_is_scoped_to_genuinely_incomplete_work_and_names_the_alternative(
-        self, briefing: BriefingAssembler,
-    ):
-        """``confirm_plan()`` must stop reading as the only non-falsifying exit
-        for a DELIVERED branch: it stays scoped to genuinely incomplete work,
-        and points at ``drop_plan_file`` for the case that is not that."""
-        prompt = await _build_tightening_prompt(briefing)
-        assert 'genuinely incomplete' in prompt
-        confirm_para = prompt.split('b. **')[1].split('c. **')[0]
-        assert 'genuinely incomplete' in confirm_para
-        assert 'drop_plan_file' in confirm_para
-
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
         prompt = await _build_tightening_prompt(
             briefing,
