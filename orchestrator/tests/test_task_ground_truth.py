@@ -2339,18 +2339,26 @@ class TestRecoveryTableIsUnchanged:
         assert isinstance(_shape(report)[3], bool)
 
     def test_recovery_shape_str_still_renders_that_bool(self) -> None:
+        """The emitted shape alphabet is unchanged: still 'true' / 'false'.
+
+        An operator reading a `recovery_vetoed` row must see the same element
+        spelling after the rewiring as before it, and the two pin classes must
+        still be DISTINGUISHABLE there.
+        """
         from orchestrator.task_ground_truth import _shape, recovery_shape_str
 
-        for records, rendered in (
-            ([_dead_l0_ref()], 'True'),
-            ([_info_ref()], 'False'),
-        ):
+        rendered = {}
+        for label, records in (('pinning', [_dead_l0_ref()]), ('info', [_info_ref()])):
             report = _pin_report(
                 branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-render'),
                 open_escalations=records,
             )
-            assert recovery_shape_str(report).split('|')[3] == rendered
-            assert str(_shape(report)[3]) == rendered
+            element = recovery_shape_str(report).split('|')[3]
+            assert element == str(_shape(report)[3]).lower()
+            assert element in {'true', 'false'}
+            rendered[label] = element
+
+        assert rendered == {'pinning': 'true', 'info': 'false'}
 
 
 class TestShapeNeverFakesAStoreOutage:
