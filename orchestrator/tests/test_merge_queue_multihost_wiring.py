@@ -1164,8 +1164,8 @@ class TestMaybeRunDriftCheck:
         worker = MagicMock()
         worker._drift_land_count = 0
         worker._runner_quarantine = set()
-        worker._escalation_queue = MagicMock()
-        worker._event_store = MagicMock()
+        # _escalation_queue / _event_store need no setup: a MagicMock worker
+        # already answers those reads with MagicMocks.
         # Bare-worker (no project_root): _drift_state_path is None, so the drift
         # cadence uses the in-memory _drift_land_count (task 2886 fix 1a
         # None-safe fallback).  The persisted-path cadence + restart survival
@@ -1256,8 +1256,6 @@ class TestDriftCheckTaskGCSafety:
         worker._drift_land_count = 0
         worker._runner_quarantine = set()
         worker._drift_check_tasks = set()
-        worker._escalation_queue = MagicMock()
-        worker._event_store = MagicMock()
         # Bare-worker: _drift_state_path None → in-memory cadence (fix 1a).
         worker._drift_state_path = None
         return worker
@@ -2113,8 +2111,15 @@ class TestAlarmVerifyWorktreeContention:
 # ``spec_warm`` so the warm ``_spec-``-lane RU case can be constructed).
 
 
-def _make_ru_worker(*, escalate_after_n=2):
-    """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
+_DEFAULT_EQ = object()
+
+
+def _make_ru_worker(*, escalate_after_n=2, escalation_queue=_DEFAULT_EQ):
+    """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue.
+
+    The queue goes in through the ``escalation_queue=`` constructor keyword —
+    pass one explicitly (or ``None``) to choose a different sink.
+    """
     import asyncio
 
     from orchestrator.merge_queue import SpeculativeMergeWorker
@@ -2122,12 +2127,12 @@ def _make_ru_worker(*, escalate_after_n=2):
     git_ops = _make_git_ops_mock()
     git_ops.project_root = None  # no real git needed for this test
     q: asyncio.Queue = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+    eq = (
+        _FakeEscalationQueue(open_l1=False)
+        if escalation_queue is _DEFAULT_EQ else escalation_queue
+    )
+    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q, escalation_queue=eq)
     worker._unreachable_escalate_after_n = escalate_after_n
-
-    # Fake escalation queue
-    eq = _FakeEscalationQueue(open_l1=False)
-    worker._escalation_queue = eq
 
     # Fake host allocator with async quarantine_and_release
     fake_alloc = MagicMock()
@@ -2840,6 +2845,37 @@ class _FakeAllocatorForReprobe:
         return name in self._parked
 
 
+def make_reprobe_worker(*, escalate_after_secs: float = 5.0, escalate_after_n: int = 3):
+    """A bare worker whose escalations land in a queue the caller can read.
+
+    Module-level so the four reprobe classes share ONE builder instead of
+    reaching into a sibling test class for it; the queue goes in through the
+    constructor keyword.
+    """
+    import asyncio
+
+    from orchestrator.merge_queue import SpeculativeMergeWorker
+
+    git_ops = _make_git_ops_mock()
+    git_ops.project_root = None
+    q: asyncio.Queue = asyncio.Queue()
+    eq = _FakeEscalationQueueWithResolution()
+    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q, escalation_queue=eq)
+    worker._unreachable_escalate_after_secs = escalate_after_secs
+    worker._unreachable_escalate_after_n = escalate_after_n
+    return worker, eq
+
+
+def seed_ru_tracker(worker, host: str, first_unavailable_at: float, streak: int = 5):
+    """Seed the RU tracker so *host* reads back as RU-quarantined."""
+    from orchestrator.merge_queue import _HostUnavailability
+    worker._runner_unavailable[host] = _HostUnavailability(
+        streak=streak,
+        first_unavailable_at=first_unavailable_at,
+        reason='ssh: connect refused',
+    )
+
+
 @pytest.mark.asyncio
 class TestReprobeQuarantinedHosts:
     """worker._reprobe_quarantined_hosts(now) async method (task 1795 step-13).
@@ -2847,41 +2883,9 @@ class TestReprobeQuarantinedHosts:
     RED until step-14 GREEN implements the method.
     """
 
-    def _make_worker_with_reprobe(
-        self,
-        *,
-        escalate_after_secs: float = 5.0,
-        escalate_after_n: int = 3,
-    ):
-        """Build a bare worker with fake allocator + escalation queue."""
-        import asyncio
-
-        from orchestrator.merge_queue import SpeculativeMergeWorker
-
-        git_ops = _make_git_ops_mock()
-        git_ops.project_root = None
-        q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-        worker._unreachable_escalate_after_secs = escalate_after_secs
-        worker._unreachable_escalate_after_n = escalate_after_n
-
-        eq = _FakeEscalationQueueWithResolution()
-        worker._escalation_queue = eq
-
-        return worker, eq
-
-    def _seed_ru_tracker(self, worker, host: str, first_unavailable_at: float, streak: int = 5):
-        """Manually seed the RU tracker so the host appears RU-quarantined."""
-        from orchestrator.merge_queue import _HostUnavailability
-        worker._runner_unavailable[host] = _HostUnavailability(
-            streak=streak,
-            first_unavailable_at=first_unavailable_at,
-            reason='ssh: connect refused',
-        )
-
     async def test_unhealthy_stays_quarantined(self):
         """health()=False → clear_quarantine not called, tracker entry stays."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=False)
@@ -2890,7 +2894,7 @@ class TestReprobeQuarantinedHosts:
 
         # Seed as RU-quarantined, not yet past time threshold
         now = 1000.0
-        self._seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 2.0)
+        seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 2.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -2899,7 +2903,7 @@ class TestReprobeQuarantinedHosts:
 
     async def test_unhealthy_past_time_threshold_fires_time_based_alarm(self):
         """health()=False AND past T threshold → time-based alarm fires (dedup'd)."""
-        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=5.0)
+        worker, eq = make_reprobe_worker(escalate_after_secs=5.0)
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=False)
@@ -2907,7 +2911,7 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -2919,7 +2923,7 @@ class TestReprobeQuarantinedHosts:
 
     async def test_unhealthy_time_based_alarm_is_deduped(self):
         """Second reprobe with open L1 does not submit a second alarm."""
-        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=5.0)
+        worker, eq = make_reprobe_worker(escalate_after_secs=5.0)
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=False)
@@ -2927,7 +2931,7 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
 
         # First call fires the alarm
         await worker._reprobe_quarantined_hosts(now)
@@ -2941,7 +2945,7 @@ class TestReprobeQuarantinedHosts:
 
     async def test_healthy_host_clear_quarantine_called(self):
         """health()=True → clear_quarantine called for the host."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
@@ -2949,7 +2953,7 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+        seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -2957,7 +2961,7 @@ class TestReprobeQuarantinedHosts:
 
     async def test_healthy_host_tracker_cleared(self):
         """health()=True → _record_runner_recovered clears the tracker entry."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
@@ -2965,7 +2969,7 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+        seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -2974,7 +2978,7 @@ class TestReprobeQuarantinedHosts:
     async def test_healthy_host_recovery_escalation_submitted(self):
         """health()=True with an open alarm → _clear_verify_host_unreachable submits info escalation."""
         from orchestrator.merge_queue import _verify_host_unreachable_sentinel
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
@@ -2982,7 +2986,7 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+        seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
         # Pre-seed an open L1 alarm so _clear_verify_host_unreachable emits the
         # recovery signal (mirrors the realistic path where _finalize_inflight
         # already fired the alarm via the streak-based path).
@@ -2995,7 +2999,7 @@ class TestReprobeQuarantinedHosts:
 
     async def test_divergence_quarantined_host_is_skipped(self):
         """CRITICAL: host in allocator quarantine but NOT in RU tracker is never touched."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
@@ -3014,14 +3018,14 @@ class TestReprobeQuarantinedHosts:
 
     async def test_no_op_when_no_host_allocator(self):
         """_reprobe_quarantined_hosts is a no-op when host_allocator is None."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
         worker._host_allocator = None
         # Must not raise
         await worker._reprobe_quarantined_hosts(1000.0)
 
     async def test_one_host_failure_does_not_abort_sweep(self):
         """An exception probing one host does not prevent other hosts from being probed."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         bad_runner = MagicMock()
         bad_runner.health = AsyncMock(side_effect=Exception('unexpected ssh crash'))
@@ -3035,8 +3039,8 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'crash-host', first_unavailable_at=now - 10.0)
-        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'crash-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
 
         # Must not raise even when one host's health() blows up
         await worker._reprobe_quarantined_hosts(now)
@@ -3054,7 +3058,7 @@ class TestReprobeQuarantinedHosts:
         reprobe call — a bug this test surfaces.
         """
         # Build a worker with the time-based trip disabled (secs=0)
-        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+        worker, eq = make_reprobe_worker(escalate_after_secs=0.0)
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=False)
@@ -3063,7 +3067,7 @@ class TestReprobeQuarantinedHosts:
 
         now = 1000.0
         # Very large downtime — would trip the alarm if the guard is `>= 0`
-        self._seed_ru_tracker(worker, 'zero-secs-host', first_unavailable_at=now - 9999)
+        seed_ru_tracker(worker, 'zero-secs-host', first_unavailable_at=now - 9999)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3080,7 +3084,7 @@ class TestReprobeQuarantinedHosts:
         With secs=0 and health()=True the host must still be recovered (clear_quarantine
         called, tracker cleared) and no L1 alarm must be submitted.
         """
-        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+        worker, eq = make_reprobe_worker(escalate_after_secs=0.0)
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
@@ -3088,7 +3092,7 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'recover-host', first_unavailable_at=now - 9999)
+        seed_ru_tracker(worker, 'recover-host', first_unavailable_at=now - 9999)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3148,8 +3152,6 @@ class TestReprobeIsTrackerDriven:
 
     # Reuse the 1795 suite's construction helpers verbatim (not copies), so the
     # tracker-driven cases are built exactly like the quarantine-driven ones.
-    _make_worker_with_reprobe = TestReprobeQuarantinedHosts._make_worker_with_reprobe
-    _seed_ru_tracker = TestReprobeQuarantinedHosts._seed_ru_tracker
 
     # ── (a) STRAND CASE: tracked but NOT quarantined ────────────────────────
 
@@ -3159,7 +3161,7 @@ class TestReprobeIsTrackerDriven:
         `quarantined_remote_runners()` returns [] for this host, so today's
         conjunction never even reaches its `health()` call.
         """
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3170,7 +3172,7 @@ class TestReprobeIsTrackerDriven:
         )
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'strand-host', first_unavailable_at=now - 300.0)
+        seed_ru_tracker(worker, 'strand-host', first_unavailable_at=now - 300.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3181,7 +3183,7 @@ class TestReprobeIsTrackerDriven:
         from orchestrator.event_store import EventType
         from orchestrator.merge_queue import _verify_host_unreachable_sentinel
 
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
         es = _FakeEventStore()
         worker._event_store = es  # type: ignore[assignment]
 
@@ -3191,7 +3193,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'strand-host', first_unavailable_at=now - 300.0)
+        seed_ru_tracker(worker, 'strand-host', first_unavailable_at=now - 300.0)
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('strand-host'))
 
         await worker._reprobe_quarantined_hosts(now)
@@ -3212,7 +3214,7 @@ class TestReprobeIsTrackerDriven:
         discards the quarantine leaves the host unquarantined, untracked AND
         non-acquirable — invisible to every recovery mechanism.
         """
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3220,7 +3222,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+        seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3237,7 +3239,7 @@ class TestReprobeIsTrackerDriven:
         running there"; freeing the slot on mere ssh reachability could
         double-dispatch onto a host still churning on the previous merge.
         """
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3248,7 +3250,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 300.0)
+        seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 300.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3259,7 +3261,7 @@ class TestReprobeIsTrackerDriven:
 
     async def test_parked_host_with_clean_probe_is_readmitted(self):
         """health() green AND probe_clean() True → re-admitted and tracker popped."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3270,7 +3272,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 300.0)
+        seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 300.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3279,7 +3281,7 @@ class TestReprobeIsTrackerDriven:
 
     async def test_runner_without_probe_clean_is_treated_as_clean(self):
         """A parked host whose runner has no probe_clean attribute still recovers."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = _RunnerNoProbeClean(healthy=True)
         assert not hasattr(runner, 'probe_clean'), 'fixture precondition'
@@ -3289,7 +3291,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'simple-host', first_unavailable_at=now - 300.0)
+        seed_ru_tracker(worker, 'simple-host', first_unavailable_at=now - 300.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3300,7 +3302,7 @@ class TestReprobeIsTrackerDriven:
 
     async def test_unparked_host_is_not_gated_on_probe_clean(self):
         """The probe_clean gate applies ONLY to a PARKED slot."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3310,7 +3312,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'free-host', first_unavailable_at=now - 30.0)
+        seed_ru_tracker(worker, 'free-host', first_unavailable_at=now - 30.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3325,7 +3327,7 @@ class TestReprobeIsTrackerDriven:
         Tracker-driven candidacy must keep skipping it — clearing on mere ssh
         reachability would bypass the verdict parity gate (Invariant 5).
         """
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3342,7 +3344,7 @@ class TestReprobeIsTrackerDriven:
 
     async def test_divergence_host_skipped_while_tracked_host_recovers(self):
         """One sweep: the tracked host recovers, the divergence-quarantined one does not."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         diverged = MagicMock()
         diverged.health = AsyncMock(return_value=True)
@@ -3352,7 +3354,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'ru-host', first_unavailable_at=now - 30.0)
+        seed_ru_tracker(worker, 'ru-host', first_unavailable_at=now - 30.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3367,10 +3369,10 @@ class TestReprobeIsTrackerDriven:
         The sweep pops entries itself (via _record_runner_recovered), so it must
         iterate a snapshot of the tracker keys, not the live dict.
         """
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         async def _health_that_mutates_tracker():
-            self._seed_ru_tracker(worker, 'late-host', first_unavailable_at=999.0)
+            seed_ru_tracker(worker, 'late-host', first_unavailable_at=999.0)
             return True
 
         runner = MagicMock()
@@ -3379,7 +3381,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'mutator-host', first_unavailable_at=now - 30.0)
+        seed_ru_tracker(worker, 'mutator-host', first_unavailable_at=now - 30.0)
 
         # Must not raise RuntimeError: dictionary changed size during iteration
         await worker._reprobe_quarantined_hosts(now)
@@ -3389,7 +3391,7 @@ class TestReprobeIsTrackerDriven:
 
     async def test_one_host_failure_does_not_abort_tracker_driven_sweep(self):
         """A raising health() on one tracked host still lets the others recover."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         bad = MagicMock()
         bad.health = AsyncMock(side_effect=Exception('unexpected ssh crash'))
@@ -3401,8 +3403,8 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'crash-host', first_unavailable_at=now - 10.0)
-        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'crash-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3411,7 +3413,7 @@ class TestReprobeIsTrackerDriven:
 
     async def test_unresolvable_runner_does_not_abort_sweep(self):
         """A tracked host with no resolvable runner is skipped, not fatal."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         good = MagicMock()
         good.health = AsyncMock(return_value=True)
@@ -3420,8 +3422,8 @@ class TestReprobeIsTrackerDriven:
 
         now = 1000.0
         # 'ghost-host' is tracked but the allocator knows nothing about it.
-        self._seed_ru_tracker(worker, 'ghost-host', first_unavailable_at=now - 10.0)
-        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'ghost-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3430,7 +3432,7 @@ class TestReprobeIsTrackerDriven:
 
     async def test_still_unreachable_tracked_host_keeps_time_based_alarm(self):
         """The time-based alarm branch is unchanged on the tracker-driven path."""
-        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=5.0)
+        worker, eq = make_reprobe_worker(escalate_after_secs=5.0)
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=False)
@@ -3438,7 +3440,7 @@ class TestReprobeIsTrackerDriven:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 60.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3491,14 +3493,12 @@ class TestReprobeObservability:
     RED until step-14 adds the decision logging.
     """
 
-    _make_worker_with_reprobe = TestReprobeQuarantinedHosts._make_worker_with_reprobe
-    _seed_ru_tracker = TestReprobeQuarantinedHosts._seed_ru_tracker
 
     # ── (a) one decision record per probed host ─────────────────────────────
 
     async def test_recovery_emits_one_decision_record(self, caplog):
         """health()=True → exactly one merge_queue record naming the host."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3506,7 +3506,7 @@ class TestReprobeObservability:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 300.0)
+        seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 300.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3520,7 +3520,7 @@ class TestReprobeObservability:
 
     async def test_still_unreachable_emits_one_decision_record(self, caplog):
         """health()=False → exactly one merge_queue record naming the host + downtime."""
-        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+        worker, eq = make_reprobe_worker(escalate_after_secs=0.0)
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=False)
@@ -3528,7 +3528,7 @@ class TestReprobeObservability:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 450.0)
+        seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 450.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3542,7 +3542,7 @@ class TestReprobeObservability:
 
     async def test_each_host_in_a_multi_host_sweep_is_named(self, caplog):
         """A mixed sweep emits one record per host — no host is silently skipped."""
-        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+        worker, eq = make_reprobe_worker(escalate_after_secs=0.0)
 
         up = MagicMock()
         up.health = AsyncMock(return_value=True)
@@ -3552,8 +3552,8 @@ class TestReprobeObservability:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 10.0)
-        self._seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 10.0)
+        seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 10.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3569,7 +3569,7 @@ class TestReprobeObservability:
         It must also not cost the rest of the sweep: a second, resolvable
         tracked host is still probed and still recovered.
         """
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         good = MagicMock()
         good.health = AsyncMock(return_value=True)
@@ -3578,8 +3578,8 @@ class TestReprobeObservability:
         assert alloc.remote_runner('ghost-host') is None, 'fixture precondition'
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'ghost-host', first_unavailable_at=now - 60.0)
-        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'ghost-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 60.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3600,11 +3600,11 @@ class TestReprobeObservability:
 
     async def test_missing_allocator_with_tracked_hosts_warns(self, caplog):
         """_host_allocator is None + non-empty tracker → WARNING naming the count."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
         worker._host_allocator = None
 
-        self._seed_ru_tracker(worker, 'host-a', first_unavailable_at=900.0)
-        self._seed_ru_tracker(worker, 'host-b', first_unavailable_at=900.0)
+        seed_ru_tracker(worker, 'host-a', first_unavailable_at=900.0)
+        seed_ru_tracker(worker, 'host-b', first_unavailable_at=900.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(1000.0)  # must not raise
@@ -3626,7 +3626,7 @@ class TestReprobeObservability:
 
     async def test_missing_allocator_with_empty_tracker_is_silent(self, caplog):
         """The common no-verify-yet case must not log every interval."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
         worker._host_allocator = None
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
@@ -3638,7 +3638,7 @@ class TestReprobeObservability:
 
     async def test_empty_tracker_emits_nothing(self, caplog):
         """No tracked hosts → no records at all (no per-interval log noise)."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3657,7 +3657,7 @@ class TestReprobeObservability:
 
     async def test_park_safety_skip_emits_one_record(self, caplog):
         """health green but probe_clean() False → one record naming the host."""
-        worker, eq = self._make_worker_with_reprobe()
+        worker, eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3668,7 +3668,7 @@ class TestReprobeObservability:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 60.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3739,8 +3739,6 @@ class TestReprobeCompatAndErrorPaths:
     skipped".
     """
 
-    _make_worker_with_reprobe = TestReprobeQuarantinedHosts._make_worker_with_reprobe
-    _seed_ru_tracker = TestReprobeQuarantinedHosts._seed_ru_tracker
 
     def _healthy_runner(self):
         runner = MagicMock()
@@ -3752,7 +3750,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_recovers_via_quarantined_remote_runners_fallback(self):
         """`remote_runner` absent → resolve through quarantined_remote_runners()."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         runner = self._healthy_runner()
         alloc = _AllocatorWithoutRemoteRunner({'legacy-host': runner})
@@ -3760,7 +3758,7 @@ class TestReprobeCompatAndErrorPaths:
         assert not hasattr(alloc, 'remote_runner'), 'fixture precondition'
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'legacy-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'legacy-host', first_unavailable_at=now - 60.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3769,7 +3767,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_fallback_map_is_built_at_most_once_per_sweep(self):
         """The hoisted map is loop-INVARIANT — not rebuilt per tracked host."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         runners = {f'legacy-{i}': self._healthy_runner() for i in range(4)}
         alloc = _AllocatorWithoutRemoteRunner(runners)
@@ -3786,7 +3784,7 @@ class TestReprobeCompatAndErrorPaths:
 
         now = 1000.0
         for name in runners:
-            self._seed_ru_tracker(worker, name, first_unavailable_at=now - 60.0)
+            seed_ru_tracker(worker, name, first_unavailable_at=now - 60.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3800,7 +3798,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_recovery_falls_back_to_clear_quarantine(self):
         """`readmit` absent → recovery still un-quarantines via clear_quarantine."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         runner = self._healthy_runner()
         alloc = _AllocatorWithoutReadmit({'legacy-host': runner})
@@ -3808,7 +3806,7 @@ class TestReprobeCompatAndErrorPaths:
         assert not hasattr(alloc, 'readmit'), 'fixture precondition'
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'legacy-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'legacy-host', first_unavailable_at=now - 60.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3819,7 +3817,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_missing_is_parked_treats_the_host_as_unparked(self):
         """`is_parked` absent → no PARK gate, so recovery is not blocked by it."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3832,7 +3830,7 @@ class TestReprobeCompatAndErrorPaths:
         assert not hasattr(alloc, 'is_parked'), 'fixture precondition'
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'legacy-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'legacy-host', first_unavailable_at=now - 60.0)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3846,7 +3844,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_probe_clean_raising_leaves_the_host_tracked(self, caplog):
         """A raising probe falls to `except Exception`: host stays tracked + parked."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(return_value=True)
@@ -3857,7 +3855,7 @@ class TestReprobeCompatAndErrorPaths:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'flaky-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'flaky-host', first_unavailable_at=now - 60.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)  # must not raise
@@ -3870,7 +3868,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_health_raising_does_not_abort_the_sweep(self, caplog):
         """One host's exception must not cost the remaining hosts their probe."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         bad = MagicMock()
         bad.health = AsyncMock(side_effect=OSError('connection reset'))
@@ -3881,8 +3879,8 @@ class TestReprobeCompatAndErrorPaths:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 60.0)
-        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 60.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3894,7 +3892,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_unexpected_error_emits_one_record_naming_the_host(self, caplog):
         """"No host is silently skipped" must hold for the error branch as well."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         runner = MagicMock()
         runner.health = AsyncMock(side_effect=OSError('connection reset'))
@@ -3902,7 +3900,7 @@ class TestReprobeCompatAndErrorPaths:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 60.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3925,7 +3923,7 @@ class TestReprobeCompatAndErrorPaths:
         HostAllocator (cancel_and_release calls probe_clean() unconditionally on
         the very path that PARKs).  So it stays permissive, and WARNs.
         """
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         runner = _RunnerNoProbeClean(healthy=True)
         alloc = _FakeAllocatorForReprobe(
@@ -3934,7 +3932,7 @@ class TestReprobeCompatAndErrorPaths:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        self._seed_ru_tracker(worker, 'simple-host', first_unavailable_at=now - 60.0)
+        seed_ru_tracker(worker, 'simple-host', first_unavailable_at=now - 60.0)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(now)
@@ -3957,7 +3955,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_still_unreachable_is_rate_limited_after_the_first_sweeps(self, caplog):
         """A permanently-gone host must not emit an INFO line every 120s forever."""
-        worker, _eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+        worker, _eq = make_reprobe_worker(escalate_after_secs=0.0)
         worker.REPROBE_STILL_DOWN_INFO_SWEEPS = 2
         worker.REPROBE_STILL_DOWN_INFO_PERIOD_SECS = 1800.0
 
@@ -3966,7 +3964,7 @@ class TestReprobeCompatAndErrorPaths:
         alloc = _FakeAllocatorForReprobe({}, unquarantined={'gone-host': runner})
         worker._host_allocator = alloc  # type: ignore[assignment]
 
-        self._seed_ru_tracker(worker, 'gone-host', first_unavailable_at=0.0)
+        seed_ru_tracker(worker, 'gone-host', first_unavailable_at=0.0)
 
         with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
             for sweep in range(10):          # 10 sweeps x 120 s = 20 min
@@ -3983,7 +3981,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_a_streak_change_re_raises_the_record_to_info(self, caplog):
         """A CHANGE is news: a fresh dispatch failure re-surfaces the host at INFO."""
-        worker, _eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+        worker, _eq = make_reprobe_worker(escalate_after_secs=0.0)
         worker.REPROBE_STILL_DOWN_INFO_SWEEPS = 1
 
         runner = MagicMock()
@@ -3991,7 +3989,7 @@ class TestReprobeCompatAndErrorPaths:
         alloc = _FakeAllocatorForReprobe({}, unquarantined={'gone-host': runner})
         worker._host_allocator = alloc  # type: ignore[assignment]
 
-        self._seed_ru_tracker(worker, 'gone-host', first_unavailable_at=0.0, streak=1)
+        seed_ru_tracker(worker, 'gone-host', first_unavailable_at=0.0, streak=1)
 
         with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(120.0)     # INFO (first sweep)
@@ -4004,7 +4002,7 @@ class TestReprobeCompatAndErrorPaths:
 
     async def test_recovery_resets_the_rate_limit_for_the_next_episode(self, caplog):
         """A NEW downtime episode logs at INFO again — throttle state is per-episode."""
-        worker, _eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+        worker, _eq = make_reprobe_worker(escalate_after_secs=0.0)
         worker.REPROBE_STILL_DOWN_INFO_SWEEPS = 1
 
         runner = MagicMock()
@@ -4012,7 +4010,7 @@ class TestReprobeCompatAndErrorPaths:
         alloc = _FakeAllocatorForReprobe({}, unquarantined={'flappy-host': runner})
         worker._host_allocator = alloc  # type: ignore[assignment]
 
-        self._seed_ru_tracker(worker, 'flappy-host', first_unavailable_at=0.0)
+        seed_ru_tracker(worker, 'flappy-host', first_unavailable_at=0.0)
         with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(120.0)   # INFO
             await worker._reprobe_quarantined_hosts(240.0)   # DEBUG
@@ -4023,7 +4021,7 @@ class TestReprobeCompatAndErrorPaths:
         )
 
         caplog.clear()
-        self._seed_ru_tracker(worker, 'flappy-host', first_unavailable_at=600.0)
+        seed_ru_tracker(worker, 'flappy-host', first_unavailable_at=600.0)
         with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
             await worker._reprobe_quarantined_hosts(720.0)
 
@@ -4046,11 +4044,10 @@ class TestLocalQuarantineIsLoud:
     no-silent-fail-soft design invariant rule out.
     """
 
-    _make_worker_with_reprobe = TestReprobeQuarantinedHosts._make_worker_with_reprobe
 
     async def test_local_host_is_still_a_state_noop(self, caplog):
         """The never-quarantine-local rule is unchanged."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             worker._quarantine_unreachable_host('local', 'boom', 1000.0)
@@ -4060,7 +4057,7 @@ class TestLocalQuarantineIsLoud:
 
     async def test_local_host_emits_one_warning(self, caplog):
         """…but the event is greppable instead of vanishing."""
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             worker._quarantine_unreachable_host('local', 'ssh: connect refused', 1000.0)
@@ -4079,7 +4076,7 @@ class TestLocalQuarantineIsLoud:
         """The guard reads the allocator's local_name, not a hard-coded 'local'."""
         from orchestrator.verify_runner import HostAllocator
 
-        worker, _eq = self._make_worker_with_reprobe()
+        worker, _eq = make_reprobe_worker()
         worker._host_allocator = HostAllocator(
             [], quarantine=worker._runner_quarantine, local_name='anchor-01',
         )
@@ -4287,9 +4284,8 @@ class TestQuarantineUnreachableHostChokepoint:
 
     def test_no_second_escalation_while_one_is_open(self):
         """Dedup via has_open_l1 — one alarm per downtime episode."""
-        worker, _eq, _alloc = _make_ru_worker(escalate_after_n=2)
         eq = _DedupingEscalationQueue(open_l1=False)
-        worker._escalation_queue = eq
+        worker, _eq, _alloc = _make_ru_worker(escalate_after_n=2, escalation_queue=eq)
 
         for t in (1000.0, 1060.0, 1120.0, 1180.0):
             worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', t)
@@ -4341,8 +4337,7 @@ class TestQuarantineUnreachableHostChokepoint:
 
     def test_no_escalation_queue_does_not_raise(self):
         """_escalation_queue is None → no raise, state still recorded."""
-        worker, _eq, _alloc = _make_ru_worker(escalate_after_n=1)
-        worker._escalation_queue = None
+        worker, _eq, _alloc = _make_ru_worker(escalate_after_n=1, escalation_queue=None)
 
         worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
 
