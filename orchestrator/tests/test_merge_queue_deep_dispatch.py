@@ -234,6 +234,29 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
 
+def _queued_in_lane(worker: SpeculativeMergeWorker, lane: str = 'normal') -> list[str]:
+    """Task ids ``snapshot()`` reports as queued in *lane*, head-of-line first.
+
+    The public read of lane placement: snapshot() stamps every entry with its
+    lane, state and position, and lists lane-buffered requests ahead of
+    anything still sitting undrained on the outer queue — so a requeue that the
+    lane buffer alone could not report shows up here at the tail.
+    """
+    return [
+        entry['task_id'] for entry in worker.snapshot()['entries']
+        if entry['lane'] == lane and entry['state'] == 'queued'
+    ]
+
+
+def _owns_merge_worktree(worker: SpeculativeMergeWorker, wt: Path) -> bool:
+    """Whether ``snapshot()`` still reports *wt* on the merge-worktree ledger.
+
+    ``owned_merge_worktrees`` is that ledger's public view: the resolved path
+    strings ``_touch_owned_merge_worktrees`` heartbeats.
+    """
+    return str(wt.resolve()) in worker.snapshot()['owned_merge_worktrees']
+
+
 # ── event capture (from test_merge_queue_depth_telemetry.py:163-181) ──────────
 
 
@@ -1294,7 +1317,7 @@ class TestDeepChainPlacementBuild:
         assert conflicts == []
         assert store.events_of(EventType.merge_attempt) == []
         assert all(not r.result.done() for r in queued_reqs)
-        assert list(worker._lane_buffers['normal']) == queued_reqs, 'queue untouched'
+        assert _queued_in_lane(worker) == [r.task_id for r in queued_reqs], 'queue untouched'
 
         await merge_liveness.release_chain_build_lane(
             git_ops, res.lane, warm=res.lane_warm,
@@ -1952,7 +1975,7 @@ class TestRunInflightVerifyChainRedirect:
             outcome=None if passed else _fail_verify_result(), raises=raises,
         )
 
-        assert ephemeral not in worker._owned_merge_worktrees
+        assert not _owns_merge_worktree(worker, ephemeral)
         assert cleaned == [ephemeral]
 
     async def test_adopting_tip_pass_hands_the_ephemeral_worktree_onward(
@@ -1972,7 +1995,7 @@ class TestRunInflightVerifyChainRedirect:
         )
 
         assert cleaned == [], 'the adopting exit hands the tree to the finalize half'
-        assert ephemeral in worker._owned_merge_worktrees, (
+        assert _owns_merge_worktree(worker, ephemeral), (
             'still REGISTERED, so the heartbeat keeps it alive and the I6 '
             'ledger stays consistent until the finalize half disposes of it'
         )
@@ -2061,9 +2084,8 @@ class TestDeepTipVerifyNeverAdopts:
             await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
-            _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
-        )
+        queued_reqs = [_make_req(tid, tid, config, git_repo) for tid in ('102', '103')]
+        worker._lane_buffers['normal'].extend(queued_reqs)
         store = _CapturingEventStore()
         worker._event_store = store
         item = _make_item(
@@ -2082,7 +2104,6 @@ class TestDeepTipVerifyNeverAdopts:
             monkeypatch, outcome=None if passed else _fail_verify_result(),
             raises=raises,
         )
-        queued_reqs = list(worker._lane_buffers['normal'])
         main_before = await _rev_parse(git_repo, 'main')
 
         res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
@@ -2157,7 +2178,13 @@ class TestDeepTipVerifyNeverAdopts:
         )
 
         assert worker._chain_halving_state == 1, '3 built items -> max(1, 3 // 2)'
-        assert list(worker._lane_buffers['normal']) == queued, 'same items, same order'
+        # snapshot() reports the lane buffer AND the undrained outer queue, both
+        # `queued`, so the red tip this arm REQUEUED is visible at the tail — a
+        # fact the lane buffer alone could not report. The chained members are
+        # still there, still in order, ahead of it.
+        assert _queued_in_lane(worker) == [*(r.task_id for r in queued), '101'], (
+            'same items, same order, with the requeued tip behind them'
+        )
         assert all(not r.result.done() for r in queued)
         assert store.events_of(EventType.merge_attempt) == []
 
@@ -2178,7 +2205,7 @@ class TestDeepTipVerifyNeverAdopts:
         )
 
         assert worker._chain_halving_state is None
-        assert list(worker._lane_buffers['normal']) == queued
+        assert _queued_in_lane(worker) == [r.task_id for r in queued]
 
     @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
     async def test_finalize_disposes_the_entry_without_a_phantom_head(
