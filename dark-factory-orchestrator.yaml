@@ -1364,6 +1364,39 @@ orchestrator_restart_watch_prefixes:
 starvation_watchdog:
   idle_only_secs: 2592000.0
 
+# Recovery-veto-streak alarm: silence the ESCALATION arm only (Leo, 2026-09-12,
+# authorizing the standing request in cockpit decision veto-streak-alarm-retune-df,
+# filed 2026-08-22 and unactioned since).
+#
+# WHY THE NARROW SWITCH AND NOT A THRESHOLD BUMP. The alarm fires on hold
+# DURATION, and the holds it reports are CORRECT — mostly milestone_gates and
+# design_concerns parked awaiting a human ruling. Verified noise at 51/51 across
+# four batches (15/15, 17/17, 12/12, 7/7): every pin resolved to a legitimate
+# pending L2, zero orphans. A longer veto_streak_min_span_secs only delays a
+# filing that a correct, human-gated hold guarantees will come — the alarm
+# cannot self-quiet while the hold is the intended state, so raising the
+# thresholds trades noise volume for noise latency and nothing else.
+#
+# COST IT WAS IMPOSING: it drove the L1 auto-watcher into its
+# ROTATION_ESCALATIONS limit, TRUNCATING that rotation's drain and deferring
+# unrelated real findings — i.e. a false alarm was displacing true ones. 38 more
+# records minted since 09-10, and four of the eleven pending L2s on 2026-09-12
+# are veto-streak records or their do-not-close pins.
+#
+# WHAT IS KEPT: `enabled` stays true, so recovery_vetoed / recovery_left events
+# and the streak counter keep flowing. Only the blocking-L1 write is suppressed,
+# which is exactly what this field is documented for
+# (orchestrator/src/orchestrator/config.py::RecoveryEmissionConfig). Already-filed
+# L1s still auto-resolve when their veto stops.
+#
+# Green tier (RELOADABLE_FIELDS) — applied by hot reload, no restart needed.
+# SCOPE: dark_factory only. Each project carries its own config, so reify and the
+# other five still have the alarm armed.
+# REVERT by deleting this block if the streak alarm is ever made hold-aware
+# (i.e. taught not to charge a streak whose veto is a legitimate open L2).
+recovery_emission:
+  streak_escalation_enabled: false
+
 # Verify-scope inversion — σ capstone (plans/verify-scope-inversion-prd.md).
 # Flips the broad merge-role verify gate on and enables merge-train formation
 # now that ξ (boundary suite) is green and 2501 (per-project verify-slot
