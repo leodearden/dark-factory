@@ -24,9 +24,18 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from collections.abc import Callable, Mapping
+import subprocess
+from collections.abc import Callable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
+
+# Mirrors cockpit/src/cockpit/backends/base.py::_COMMAND_TIMEOUT_SECONDS, so
+# the two external-command seams read alike.
+_COPY_TIMEOUT_SECONDS = 5.0
+
+# POSIX's "command not executable/found" code, reused for every degraded
+# outcome: the caller only ever asks "was this zero?".
+_UNAVAILABLE = 126
 
 # Structured argv tuples, not strings split at call time (heuristic 12 — no
 # ad-hoc parser between here and subprocess). Each entry is (env_var,
@@ -71,3 +80,40 @@ def available_copy_commands(
         for env_var, argv in _CANDIDATES
         if environ.get(env_var) and which(argv[0]) is not None
     )
+
+
+def run_clipboard_command(
+    argv: Sequence[str], text: str, *, timeout: float = _COPY_TIMEOUT_SECONDS
+) -> int:
+    """Run *argv*, feeding *text* on its stdin; return its exit code, fail-soft.
+
+    Never raises (PRD §2): a missing or non-executable binary (OSError) and
+    a helper that never exits (TimeoutExpired) both log at WARNING and
+    return a nonzero code. Mirrors cockpit/src/cockpit/backends/base.py::
+    run_command's nonzero-means-unavailable reading — a nonzero code here
+    says only "this helper did not take the text", which lets the caller
+    try the next candidate or fall back to OSC 52.
+
+    WHY stdout/stderr ARE DEVNULL AND NOT CAPTURED — do not "improve" this
+    into capture_output to log the helper's stderr. A clipboard helper owns
+    the X/Wayland selection by forking a background child that outlives the
+    exec'd process and inherits its pipes, so a captured call blocks until
+    the CHILD exits, i.e. until the operator replaces the clipboard.
+    Measured in this worktree: 5.01s against a 5s background sleeper with
+    capture_output=True, versus 0.19s with DEVNULL. This call happens on
+    the cockpit's UI thread on every 'y' press, so capturing would be an
+    unbounded interface freeze, not a cosmetic choice. The exit code is the
+    only signal the caller needs.
+    """
+    try:
+        completed = subprocess.run(  # noqa: S603 -- argv comes from _CANDIDATES, not shell text
+            list(argv),
+            input=text.encode('utf-8'),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning('run_clipboard_command: %s failed: %s', list(argv), exc)
+        return _UNAVAILABLE
+    return completed.returncode
