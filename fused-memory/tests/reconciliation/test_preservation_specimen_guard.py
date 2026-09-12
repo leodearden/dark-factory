@@ -23,12 +23,16 @@ Covers:
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    MEM0_KIND_INVESTIGATION_OUTCOME,
     PRESERVATION_TOKEN_FAMILY,
     STRANDED_FLAG_TOKEN_FAMILY,
     cites_preservation,
+    filter_preservation_specimen_flags,
     flag_asserts_stranded,
 )
 
@@ -283,3 +287,191 @@ class TestFlagAssertsStranded:
         assert 'strand' in STRANDED_FLAG_TOKEN_FAMILY
         for naming in OBSERVED_STRANDED_FLAG_TYPES:
             assert any(stem in naming for stem in STRANDED_FLAG_TOKEN_FAMILY)
+
+
+# ── filter_preservation_specimen_flags ───────────────────────────────────────
+
+#: A Mem0 row shaped exactly like the live Qdrant payload
+#: ``get_memories_by_metadata`` returns: ``metadata`` is the FULL payload, so
+#: the prose lives under ``metadata['data']`` and is reachable only through the
+#: canonical ``_mem0_content`` key fallback.
+LIVE_MEM0_ROW = {
+    'id': 'd489942a-96b8-45a2-a0a2-fdad36741ff2',
+    'created_at': '2026-08-10T17:22:17.388627+00:00',
+    'metadata': {
+        'kind': 'investigation_outcome',
+        'entity_uuid': '95719d7c-3778-4687-8b50-10ec5ad46e75',
+        'actionable': False,
+        'run_id': 'c2e75c48-5cb5-427b-bc13-8964a00726ab',
+        'task_id': '3105',
+        'category': 'observations_and_summaries',
+        'agent_id': 'recon-stage-task_knowledge_sync',
+        'data': LIVE_MEM0_PRESERVATION_PROSE,
+    },
+}
+
+#: The live Graphiti shape for ``get_entity('Task 3105', ...)``.
+LIVE_GRAPHITI_ENTITY = {
+    'nodes': [
+        {
+            'uuid': '95719d7c-3778-4687-8b50-10ec5ad46e75',
+            'name': 'Task 3105',
+            'summary': LIVE_PRESERVATION_SENTENCES[-1],
+            'labels': ['Entity'],
+        },
+    ],
+    'edges': [
+        {
+            'uuid': 'a8a68220-2a9c-418e-b358-cb39c554e067',
+            'fact': 'Any urgent-intervention concern about task 3105 must be '
+                    "recorded in task 3546's own description.",
+        },
+        {'uuid': 'a8fd36a8-46db-4ca8-a21c-554c38a918ee', 'fact': LIVE_GRAPHITI_EDGE_FACT},
+    ],
+}
+
+PROJECT = 'dark_factory'
+
+
+def _stranded_flag(task_id='3105', flag_type='task_stranded_no_claimant', **extra):
+    """A Stage-1 stranded finding, shaped like the ones actually emitted."""
+    flag = {
+        'task_id': task_id,
+        'flag_type': flag_type,
+        'category': 'task_memory_mismatch',
+        'severity': 'moderate',
+        'actionable': True,
+        'description': f'Task {task_id} is in-progress with no claimant and no heartbeat.',
+        'suggested_action': f'File an operator gate task to reset task {task_id} to pending.',
+    }
+    flag.update(extra)
+    return flag
+
+
+def _make_memory_service(*, rows=None, entities=None, mem0_error=None, entity_error=None):
+    """MagicMock memory_service with AsyncMock readers for both channels.
+
+    Mirrors ``_make_memory_service`` in test_curator_gate_resolution_sweep.py.
+    *rows* maps a str task_id to the Mem0 scroll result for it; *entities* maps
+    an entity NAME (``'Task 3105'``) to the ``get_entity`` result.  Either
+    channel can be made to raise by passing an exception instance.
+    """
+    rows = rows or {}
+    entities = entities or {}
+
+    def _scroll(project_id, filters):
+        if mem0_error is not None:
+            raise mem0_error
+        return rows.get(str(filters.get('task_id')), [])
+
+    def _entity(name, project_id, **kwargs):
+        if entity_error is not None:
+            raise entity_error
+        return entities.get(name, {'nodes': [], 'edges': []})
+
+    memory_service = MagicMock()
+    memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+    memory_service.get_entity = AsyncMock(side_effect=_entity)
+    return memory_service
+
+
+class TestFilterPreservationSpecimenFlagsMem0Channel:
+    """The Mem0 corroboration channel — the concrete task-3105 repro."""
+
+    @pytest.mark.asyncio
+    async def test_corroborated_stranded_flag_is_suppressed(self):
+        """The exact finding that twice became a destructive gate task is dropped."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+        assert result.unresolved_task_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_suppression_cites_the_memory_it_relied_on(self):
+        """A suppression is never anonymous — it names its evidence.
+
+        Without this an operator reading "one flag suppressed" has no way to
+        check whether the citation is real, current, or over-broad.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert result.citations_by_task['3105'] == 'd489942a-96b8-45a2-a0a2-fdad36741ff2'
+
+    @pytest.mark.asyncio
+    async def test_queries_the_deterministic_metadata_filter(self):
+        """Exact payload equality, never semantic search.
+
+        ``actionable: False`` is ANDed in deliberately: Qdrant ANDs equality
+        conditions, so the term is what makes a retrieved row a RECORDED
+        not-actionable adjudication rather than any passing mention of the task.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        memory_service.get_memories_by_metadata.assert_awaited_once_with(
+            project_id=PROJECT,
+            filters={
+                'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
+                'task_id': '3105',
+                'actionable': False,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_row_without_preservation_prose_does_not_suppress(self):
+        """An investigation_outcome that says something else is not a citation."""
+        row = {
+            'id': 'aaaaaaaa-0000-0000-0000-000000000000',
+            'metadata': {
+                'kind': 'investigation_outcome',
+                'task_id': '3105',
+                'actionable': False,
+                'data': 'Investigation outcome: the flagged escalation was already '
+                        'resolved by the steward; no further action is needed.',
+            },
+        }
+        memory_service = _make_memory_service(rows={'3105': [row]})
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+
+    @pytest.mark.asyncio
+    async def test_reads_prose_through_the_canonical_key_fallback(self):
+        """A row storing its text under 'memory' rather than 'data' still matches.
+
+        The raw-payload key order (``data`` -> ``memory`` -> ``content``) is
+        owned by ``memory_service._MEM0_CONTENT_KEYS`` and imported, not
+        re-spelled here — guessing one key is exactly the mistake that helper
+        exists to prevent.
+        """
+        row = {
+            'id': 'bbbbbbbb-0000-0000-0000-000000000000',
+            'metadata': {'memory': LIVE_GRAPHITI_EDGE_FACT},
+        }
+        memory_service = _make_memory_service(rows={'3105': [row]})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert result.kept_flags == []
+        assert result.citations_by_task['3105'] == 'bbbbbbbb-0000-0000-0000-000000000000'
