@@ -6,6 +6,7 @@ born-at-L2 alarm on divergence.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,6 +35,7 @@ from orchestrator.merge_queue import (  # noqa: E402
     diff_per_test_results,
     parse_per_test_results,
 )
+from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
 # Step-1: cadence predicate _shadow_compare_due
@@ -1269,23 +1271,114 @@ def _shadow_state_path(root: Path) -> Path:
     return root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
 
 
-def _make_worker_stub(
-    tmp_path: Path,
-    *,
-    shadow_compare_on: bool = True,
-    every_n: int = 40,
-    nightly_interval: float = 86400.0,
-) -> MagicMock:
+def _make_worker_stub(tmp_path: Path, *, bare: bool = False) -> MagicMock:
     """Build a minimal SpeculativeMergeWorker stub for scheduler tests.
 
     ``_shadow_compare_tasks`` / ``_shadow_state_path`` are
     ``_maybe_schedule_shadow_compare``'s OWN parameter surface — it takes the
-    worker and reads them — so a stand-in must carry them.
+    worker and reads them — so a stand-in must carry them.  ``bare=True``
+    models the bare-harness worker that has no project root, and so no
+    shadow state path.
     """
     worker = MagicMock()
     worker._shadow_compare_tasks = set()
-    worker._shadow_state_path = _shadow_state_path(tmp_path)
+    worker._shadow_state_path = None if bare else _shadow_state_path(tmp_path)
     return worker
+
+
+@dataclasses.dataclass(frozen=True)
+class _ColdLegCall:
+    """One invocation of the cold compare leg, named as production names it."""
+
+    git_ops: object
+    req: object
+    merge_commit: str
+    warm_results: dict[str, str]
+    escalation_queue: object
+    event_store: object
+
+
+class _ColdLegDouble:
+    """Stand-in for ``_run_shadow_compare``, the leg the scheduler spawns.
+
+    Watching the leg is what lets these tests stop reading the worker's
+    in-flight ``_shadow_compare_tasks`` set: "a task was spawned" becomes "the
+    leg was invoked", and draining that set becomes awaiting :meth:`drain`.
+    A double built with a *gate* stays in flight until released, which is how
+    the non-blocking contract is observed and how the single-in-flight guard
+    is held open.
+    """
+
+    def __init__(self, *, gate: asyncio.Event | None = None) -> None:
+        self.calls: list[_ColdLegCall] = []
+        self._gate = gate
+        self._started = asyncio.Event()
+        self._finished = asyncio.Event()
+
+    async def __call__(
+        self,
+        git_ops: object,
+        req: object,
+        merge_commit: str,
+        warm_results: dict[str, str],
+        escalation_queue: object,
+        event_store: object,
+    ) -> None:
+        self.calls.append(_ColdLegCall(
+            git_ops, req, merge_commit, warm_results, escalation_queue, event_store,
+        ))
+        self._started.set()
+        if self._gate is not None:
+            await self._gate.wait()
+        self._finished.set()
+
+    @property
+    def in_flight(self) -> bool:
+        """The leg has begun and has not finished."""
+        return self._started.is_set() and not self._finished.is_set()
+
+    async def await_start(self, timeout: float = 10.0) -> None:
+        """Block until the spawned leg actually begins running."""
+        await asyncio.wait_for(self._started.wait(), timeout)
+
+    async def drain(self, timeout: float = 10.0) -> None:
+        """Release the gate, if any, and wait for the leg to finish.
+
+        Replaces the ``for t in worker._shadow_compare_tasks: await t`` drain.
+        Draining here is the test's own job either way: unlike the drift
+        lane's ``_drift_check_tasks``, ``_shadow_compare_tasks`` is NOT
+        drained by ``SpeculativeMergeWorker.stop()``.
+        """
+        if self._gate is not None:
+            self._gate.set()
+        await asyncio.wait_for(self._finished.wait(), timeout)
+        await _settle()
+
+
+async def _settle(rounds: int = 3) -> None:
+    """Yield to the loop enough times for an already-spawned task to run.
+
+    This is what makes ``cold_leg.calls == []`` mean "no cold leg ran" rather
+    than "no cold leg ran YET".
+    """
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+async def _schedule_with_cold_leg_doubled(
+    cold_leg: _ColdLegDouble,
+    worker: MagicMock,
+    req: MagicMock,
+    *,
+    warm: dict[str, str],
+    merge_commit: str = 'sha',
+) -> None:
+    """Run the scheduler once against a doubled cold leg, then settle."""
+    with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+        await _maybe_schedule_shadow_compare(
+            worker, MagicMock(), req, merge_commit, warm, None, None
+        )
+        await _settle()
 
 
 def _make_shadow_config(
@@ -1310,21 +1403,18 @@ class TestMaybeScheduleShadowCompare:
     Guarantees: shadow leg does not block/occupy the serial merge lane.
     """
 
-    # Knob OFF → no task, state file untouched
+    # Knob OFF → no cold leg, state file untouched
     def test_knob_off_no_task_scheduled(self, tmp_path: Path) -> None:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, shadow_compare_on=False)
-        warm = {'t1': 'pass'}
+        cold_leg = _ColdLegDouble()
 
-        # Should be a sync or async function; call synchronously via asyncio.run
-        asyncio.run(
-            _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha', warm, None, None
-            )
-        )
+        asyncio.run(_schedule_with_cold_leg_doubled(
+            cold_leg, worker, req, warm={'t1': 'pass'},
+        ))
 
-        assert len(worker._shadow_compare_tasks) == 0
+        assert cold_leg.calls == []
         assert not _shadow_state_path(tmp_path).exists()
 
     # _shadow_state_path is None (bare-harness worker) + knob ON → no-op, no raise
@@ -1337,21 +1427,18 @@ class TestMaybeScheduleShadowCompare:
         early-return is present.  This pins the consumer-side None-safety that
         the Path|None field (task 1712, Step-2) requires.
         """
-        worker = _make_worker_stub(tmp_path)
-        worker._shadow_state_path = None  # exercise the project_root-absent path
-
+        worker = _make_worker_stub(tmp_path, bare=True)
         req = MagicMock()
         # Knob ON + non-empty warm so knob/empty early-exits do NOT fire —
         # the function must reach the None-guard to prove it's guarded.
         req.config = _make_shadow_config(tmp_path, shadow_compare_on=True)
+        cold_leg = _ColdLegDouble()
 
-        asyncio.run(
-            _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha', {'t1': 'pass'}, None, None
-            )
-        )
+        asyncio.run(_schedule_with_cold_leg_doubled(
+            cold_leg, worker, req, warm={'t1': 'pass'},
+        ))
 
-        assert len(worker._shadow_compare_tasks) == 0
+        assert cold_leg.calls == []
 
     # Knob ON + not due (count < every_n, nightly not elapsed) →
     # increments counter, persists, NO task
@@ -1359,23 +1446,21 @@ class TestMaybeScheduleShadowCompare:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
-        warm = {'t1': 'pass'}
+        cold_leg = _ColdLegDouble()
 
         # Pre-set state: count=5, last_run recent enough that nightly won't fire
         state = ShadowCompareState(merges_since_last_shadow=5, last_shadow_run_at=1e10)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        asyncio.run(
-            _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha', warm, None, None
-            )
-        )
+        asyncio.run(_schedule_with_cold_leg_doubled(
+            cold_leg, worker, req, warm={'t1': 'pass'},
+        ))
 
         # Counter must have been incremented (5 → 6, still below 10)
         saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
         assert saved.merges_since_last_shadow == 6
-        # No task scheduled
-        assert len(worker._shadow_compare_tasks) == 0
+        # No cold leg scheduled
+        assert cold_leg.calls == []
 
     # Knob ON + due (count == every_n) → task spawned, state reset, returns immediately
     @pytest.mark.asyncio
@@ -1383,63 +1468,44 @@ class TestMaybeScheduleShadowCompare:
         self, tmp_path: Path
     ) -> None:
         """(e) core: _maybe_schedule_shadow_compare returns BEFORE the cold leg completes."""
-        gate = asyncio.Event()
-
-        async def gated_shadow_compare(*args: object, **kwargs: object) -> None:
-            """Gate that blocks until the test releases it."""
-            await gate.wait()
-
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
         warm = {'t1': 'pass'}
+        cold_leg = _ColdLegDouble(gate=asyncio.Event())
 
         # Seed state at threshold
         state = ShadowCompareState(merges_since_last_shadow=9, last_shadow_run_at=0.0)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        with patch(
-            'orchestrator.merge_queue._run_shadow_compare',
-            new=gated_shadow_compare,
-        ):
-            # This call must RETURN before the gate is released
+        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            # This call must RETURN before the gated leg can complete
             await _maybe_schedule_shadow_compare(
                 worker, MagicMock(), req, 'sha123', warm, None, None
             )
-            # At this point the cold leg is still blocked on gate.wait() →
-            # _maybe_schedule_shadow_compare returned immediately
-            assert not gate.is_set(), (
+            await cold_leg.await_start()
+            assert cold_leg.in_flight, (
                 '_maybe_schedule_shadow_compare must return before the cold leg completes'
             )
-            # A task must have been spawned
-            assert len(worker._shadow_compare_tasks) == 1
+            assert len(cold_leg.calls) == 1
 
-            # Release gate, await the task
-            gate.set()
-            pending = list(worker._shadow_compare_tasks)
-            for t in pending:
-                await t
+            await cold_leg.drain()
 
     # Due → state reset to 0 + last_shadow_run_at updated
     def test_due_resets_persisted_state(self, tmp_path: Path) -> None:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
-        warm = {'t1': 'pass'}
+        cold_leg = _ColdLegDouble()
 
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        with patch(
-            'orchestrator.merge_queue._run_shadow_compare',
-            new=AsyncMock(return_value=None),
-        ):
-            asyncio.run(
-                _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha', warm, None, None
-                )
-            )
+        asyncio.run(_schedule_with_cold_leg_doubled(
+            cold_leg, worker, req, warm={'t1': 'pass'},
+        ))
 
+        assert len(cold_leg.calls) == 1
         saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
         assert saved.merges_since_last_shadow == 0
         assert saved.last_shadow_run_at > 0.0  # updated to now
@@ -1447,29 +1513,23 @@ class TestMaybeScheduleShadowCompare:
     # In-flight guard: when a task is already pending, second call schedules nothing
     @pytest.mark.asyncio
     async def test_in_flight_guard_skips_second_call(self, tmp_path: Path) -> None:
-        gate = asyncio.Event()
-
-        async def gated_shadow_compare(*args: object, **kwargs: object) -> None:
-            await gate.wait()
-
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
         warm = {'t1': 'pass'}
+        cold_leg = _ColdLegDouble(gate=asyncio.Event())
 
         # Both calls see state with count=10 (due)
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        with patch(
-            'orchestrator.merge_queue._run_shadow_compare',
-            new=gated_shadow_compare,
-        ):
-            # First call: spawns task (cold leg gated)
+        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            # First call: spawns the leg, which stays in flight on its gate
             await _maybe_schedule_shadow_compare(
                 worker, MagicMock(), req, 'sha', warm, None, None
             )
-            assert len(worker._shadow_compare_tasks) == 1
+            await cold_leg.await_start()
+            assert len(cold_leg.calls) == 1
 
             # Second call while first is still in-flight: must NOT spawn another
             # Reset state so it looks "due" again
@@ -1479,13 +1539,11 @@ class TestMaybeScheduleShadowCompare:
             await _maybe_schedule_shadow_compare(
                 worker, MagicMock(), req, 'sha2', warm, None, None
             )
-            # Still only 1 task
-            assert len(worker._shadow_compare_tasks) == 1
+            await _settle()
+            # Still only the one leg
+            assert len(cold_leg.calls) == 1
 
-            # Release gate, await the task
-            gate.set()
-            for t in list(worker._shadow_compare_tasks):
-                await t
+            await cold_leg.drain()
 
     # --- Amendment: in-flight guard must still persist incremented counter (suggestion 3) ---
 
@@ -1500,29 +1558,23 @@ class TestMaybeScheduleShadowCompare:
         discarded.  This test verifies the counter is saved even when skipping
         due to an in-flight task.
         """
-        gate = asyncio.Event()
-
-        async def gated_shadow_compare(*args: object, **kwargs: object) -> None:
-            await gate.wait()
-
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
         warm = {'t1': 'pass'}
+        cold_leg = _ColdLegDouble(gate=asyncio.Event())
 
-        # First call: state at threshold (10 = due), spawns the in-flight task
+        # First call: state at threshold (10 = due), spawns the in-flight leg
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        with patch(
-            'orchestrator.merge_queue._run_shadow_compare',
-            new=gated_shadow_compare,
-        ):
-            # First call: due → spawns task, resets counter to 0
+        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            # First call: due → spawns the leg, resets counter to 0
             await _maybe_schedule_shadow_compare(
                 worker, MagicMock(), req, 'sha', warm, None, None
             )
-            assert len(worker._shadow_compare_tasks) == 1
+            await cold_leg.await_start()
+            assert len(cold_leg.calls) == 1
 
             # Manually set state to look "due" again (as if 10 more merges landed)
             state2 = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
@@ -1533,6 +1585,7 @@ class TestMaybeScheduleShadowCompare:
             await _maybe_schedule_shadow_compare(
                 worker, MagicMock(), req, 'sha2', warm, None, None
             )
+            await _settle()
 
             # Counter must have been incremented (10 → 11) even though in-flight
             saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
@@ -1540,12 +1593,10 @@ class TestMaybeScheduleShadowCompare:
                 f"Expected 11 (incremented from 10), got "
                 f"{saved.merges_since_last_shadow} — in-flight guard must persist counter"
             )
-            # Still only 1 task in flight
-            assert len(worker._shadow_compare_tasks) == 1
+            # Still only the one leg in flight
+            assert len(cold_leg.calls) == 1
 
-        gate.set()
-        for t in list(worker._shadow_compare_tasks):
-            await t
+            await cold_leg.drain()
 
 
 # ---------------------------------------------------------------------------
@@ -1580,21 +1631,27 @@ def _make_warm_cold_config(
     return OrchestratorConfig(project_root=project_root, git=git)
 
 
-class TestSMWEscalationQueueInit:
-    """(1) SpeculativeMergeWorker.__init__ wiring — escalation_queue, _shadow_compare_tasks,
-    and _shadow_state_path must all be present after construction.
-    """
+#: A warm verify output that PARSES into a per-test map.  The map is what
+#: routes the scheduler down the per-test cold leg; an empty map would degrade
+#: it to the coarse suite-level leg instead.
+_WARM_TEST_OUTPUT = '        PASS [   0.1s] crate some::test\n'
 
-    def test_smw_accepts_escalation_queue_param(self, tmp_path: Path) -> None:
-        """SMW must accept escalation_queue kwarg without TypeError."""
-        fake_eq = MagicMock()
-        mock_git_ops = MagicMock()
-        mock_git_ops.project_root = tmp_path
-        # Will raise TypeError until step-16 adds the parameter
-        worker = SpeculativeMergeWorker(
-            mock_git_ops, asyncio.Queue(), escalation_queue=fake_eq
-        )
-        assert worker._escalation_queue is fake_eq
+
+def _warm_verifier() -> FakeVerifier:
+    """A passing verify port whose output carries a parseable warm map."""
+    return FakeVerifier(default=VerifyScript(result=VerifyResult(
+        passed=True, test_output=_WARM_TEST_OUTPUT,
+        lint_output='', type_output='', summary='fake warm verify passed',
+    )))
+
+
+class TestSMWShadowStateInit:
+    """(1) SpeculativeMergeWorker.__init__ wiring for the shadow-compare fields.
+
+    The ``escalation_queue`` half of this wiring is pinned BEHAVIOURALLY by
+    ``TestVerifyAndAdvanceShadowCompareScheduling`` instead — the queue handed
+    to the constructor is the one the scheduled cold leg receives.
+    """
 
     def test_smw_has_shadow_compare_tasks_set(self, tmp_path: Path) -> None:
         """_shadow_compare_tasks must be an empty set after __init__."""
@@ -1624,7 +1681,6 @@ class TestRunPostMergeVerifyOnResultCallback:
     ) -> None:
         """Passing on_result= must not raise TypeError (kwarg must exist)."""
         from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
-        from orchestrator.verify import VerifyResult  # noqa: PLC0415
 
         received: list[VerifyResult] = []
         merge_wt = tmp_path / 'wt'
@@ -1729,97 +1785,98 @@ def _make_smw_req(task_id: str, branch: str, worktree: Path, config: Orchestrato
 
 
 class TestVerifyAndAdvanceShadowCompareScheduling:
-    """(3) _verify_and_advance calls _maybe_schedule_shadow_compare without blocking.
+    """(3) A warm-verify land runs the real shadow-compare scheduler, off the lane.
 
     Knobs: persistent_merge_worktree=True, warm_verify_shadow_compare=True,
     safety_valve not due (default every_n=0 means no valve).
 
-    Key guarantee (e): the call returns 'done' BEFORE the cold compare leg finishes.
+    The SCHEDULER is not doubled here — only the cold leg it spawns — so the
+    guarantee (e) is observed on the production scheduler itself: the
+    MergeOutcome arrives while that leg is still in flight.
     """
 
     @pytest.mark.asyncio
-    async def test_maybe_schedule_called_on_done_land(
+    async def test_done_land_schedules_the_cold_leg(
         self, wcs_git_ops: GitOps, wcs_repo: Path,
     ) -> None:
-        """_maybe_schedule_shadow_compare must be called after a warm-verify 'done' land."""
+        """A warm-verify 'done' land spawns the cold leg and persists the cadence.
+
+        Also pins the constructor wiring the deleted
+        ``test_smw_accepts_escalation_queue_param`` only asserted structurally:
+        the escalation queue handed to ``SpeculativeMergeWorker(...)`` is the
+        one that reaches the leg.
+        """
         cfg = _make_warm_cold_config(wcs_repo, persistent=True, shadow_compare=True)
         wt = await _make_task_branch(wcs_git_ops, 'task-sched', 'f.py', 'x = 1\n')
         req = _make_smw_req('task-sched', 'task-sched', wt, cfg)
 
-        sched_calls: list[tuple] = []
-
-        async def _capture_schedule(*args: object, **kwargs: object) -> None:
-            sched_calls.append(args)
-
+        cold_leg = _ColdLegDouble()
+        escalations = _make_escalation_queue()
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         # A passing verify port, INJECTED (model: test_merge_lane_package.py),
         # replaces the _run_post_merge_verify patch this used to need.
         worker = SpeculativeMergeWorker(
-            wcs_git_ops, queue, event_store=None, verifier=FakeVerifier(),
+            wcs_git_ops, queue, event_store=None,
+            escalation_queue=escalations, verifier=_warm_verifier(),
         )
         worker_task = asyncio.create_task(worker.run())
 
-        with patch(
-            'orchestrator.merge_queue._maybe_schedule_shadow_compare',
-            new=_capture_schedule,
-        ):
+        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=60)
+            await cold_leg.await_start()
 
         await worker.stop()
         await worker_task
 
         assert outcome.status == 'done', f'Expected done; got {outcome}'
-        # _maybe_schedule_shadow_compare must have been called
-        assert len(sched_calls) >= 1, (
-            '_maybe_schedule_shadow_compare must be called on a warm-verify done land'
+        (call,) = cold_leg.calls
+        assert call.warm_results == parse_per_test_results(_WARM_TEST_OUTPUT)
+        assert call.escalation_queue is escalations, (
+            'the escalation queue handed to the SMW constructor must reach the '
+            'cold leg it schedules'
         )
+        saved = _load_shadow_compare_state(_shadow_state_path(wcs_repo))
+        assert saved.merges_since_last_shadow == 0
+        assert saved.last_shadow_run_at > 0.0
 
     @pytest.mark.asyncio
     async def test_done_land_does_not_await_cold_leg(
         self, wcs_git_ops: GitOps, wcs_repo: Path,
     ) -> None:
-        """The 'done' outcome must arrive BEFORE the cold compare completes (non-blocking)."""
+        """The 'done' outcome must arrive BEFORE the cold compare completes.
+
+        The leg is gated, so it cannot finish until this test releases it: an
+        outcome that arrives at all arrived while the cold compare was still
+        running.  ``await_start`` is what keeps that non-vacuous — it proves a
+        leg really was spawned rather than skipped.
+        """
         cfg = _make_warm_cold_config(wcs_repo, persistent=True, shadow_compare=True)
         wt = await _make_task_branch(
             wcs_git_ops, 'task-noblock', 'g.py', 'y = 2\n'
         )
         req = _make_smw_req('task-noblock', 'task-noblock', wt, cfg)
 
-        gate = asyncio.Event()
-
-        async def _gated_schedule(*args: object, **kwargs: object) -> None:
-            """Pretend to be _maybe_schedule_shadow_compare — blocks until released."""
-            await gate.wait()
-
+        cold_leg = _ColdLegDouble(gate=asyncio.Event())
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            wcs_git_ops, queue, event_store=None, verifier=FakeVerifier(),
+            wcs_git_ops, queue, event_store=None, verifier=_warm_verifier(),
         )
         worker_task = asyncio.create_task(worker.run())
 
-        outcome_fut = req.result
-
-        with patch(
-            'orchestrator.merge_queue._maybe_schedule_shadow_compare',
-            new=_gated_schedule,
-        ):
+        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
             await queue.put(req)
-            # The outcome must arrive without releasing the gate
-            outcome = await asyncio.wait_for(outcome_fut, timeout=60)
+            # The outcome must arrive without the cold leg being released
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            await cold_leg.await_start()
+            assert cold_leg.in_flight, (
+                '_verify_and_advance must not await the cold shadow leg to '
+                'completion; the land must return while it is still running'
+            )
+            assert outcome.status == 'done', f'Expected done; got {outcome}'
 
-        # Gate still unset → _maybe_schedule_shadow_compare is non-blocking (or gated mock)
-        # In the GREEN state, _maybe_schedule_shadow_compare returns IMMEDIATELY because
-        # it spawns a task rather than awaiting the cold leg. The gated mock blocks the
-        # SCHEDULER CALL ITSELF here, so this test verifies the scheduler is not awaited
-        # by _verify_and_advance — if it IS awaited, the outcome would never arrive.
-        assert not gate.is_set(), (
-            '_verify_and_advance must not await _maybe_schedule_shadow_compare to completion; '
-            'the call must return immediately (non-blocking detective control)'
-        )
-        assert outcome.status == 'done', f'Expected done; got {outcome}'
+            await cold_leg.drain()
 
-        gate.set()
         await worker.stop()
         await worker_task
 
