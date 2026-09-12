@@ -22,11 +22,13 @@ import os
 import re
 import sqlite3
 import time
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript, passes, raises
 from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec
 from _serial_merge_worker import MergeWorker
@@ -42,11 +44,14 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
+from orchestrator.merge_lane.ports import VerifyPort
+from orchestrator.merge_lane.types import DiskGuardOutcome
 from orchestrator.merge_queue import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     MERGE_LANES,
     NEEDS_REBASE_REASON_PREFIX,
+    PRODUCTION_VERIFIER,
     TRAIN_INCOMPLETE_REASON_PREFIX,
     TRAIN_PARTIAL_FLIP_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
@@ -14190,6 +14195,94 @@ def _infra_category_verify_result(category: str = 'semaphore_timeout') -> Verify
     )
 
 
+class _ScriptedVerifier(FakeVerifier):
+    """A :class:`FakeVerifier` that answers per CALL instead of per task id.
+
+    The direct ``_run_post_merge_verify`` tests each drive ONE task, and most
+    of them are about what the SECOND answer does — an infra-transient
+    failure that clears on the bounded retry, a narrowed retry budget running
+    out, a disk guard that relents after a prune. ``answers`` and
+    ``disk_reasons`` are consumed one entry per call and the last entry
+    repeats once exhausted, so a test scripts only the calls whose answer it
+    cares about.
+
+    Unlike a mock's ``side_effect`` list, an exhausted script repeats rather
+    than raising, so an over-eager caller is caught by the call-count
+    assertion the test already makes rather than by an opaque StopIteration.
+
+    ``scoped_calls`` and ``disk_guard_calls`` record what each step was asked,
+    the way the parent records ``verified`` and ``investigations``.
+    """
+
+    def __init__(
+        self,
+        *,
+        answers: Sequence[VerifyScript] = (),
+        gates: Sequence[Any] = (),
+        disk_reasons: Sequence[str | None] = (None,),
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.answers = list(answers)
+        self.gates = list(gates)
+        self.disk_reasons = list(disk_reasons)
+        self.scoped_calls: list[dict[str, Any]] = []
+        self.disk_guard_calls: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _consume(script: list[Any]) -> Any:
+        """Take the next entry, or keep answering with the last one."""
+        return script.pop(0) if len(script) > 1 else script[0]
+
+    async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
+        self.scoped_calls.append(options)
+        if self.answers:
+            self.default = self._consume(self.answers)
+        return await super().run_scoped(*args, **options)
+
+    async def run_unscoped_typechecks(self, *args: Any, **options: Any) -> Any:
+        if not self.gates:
+            return await super().run_unscoped_typechecks(*args, **options)
+        return self._consume(self.gates)
+
+    async def ensure_disk_space(
+        self,
+        git_ops: Any,
+        merge_wt: Path,
+        min_free_bytes: int,
+        task_id: str,
+        keep_worktrees: Collection[Path] | None = None,
+    ) -> DiskGuardOutcome:
+        self.disk_guard_calls.append({
+            'merge_wt': merge_wt,
+            'min_free_bytes': min_free_bytes,
+            'task_id': task_id,
+            'keep_worktrees': keep_worktrees,
+        })
+        return DiskGuardOutcome(reason=self._consume(self.disk_reasons))
+
+
+async def _disk_always_free(*_args: Any, **_kwargs: Any) -> None:
+    """Pre-verify disk guard that always proceeds."""
+    return None
+
+
+def _production_verifier_with(**steps: Any) -> VerifyPort:
+    """``PRODUCTION_VERIFIER`` with individual steps replaced by *steps*.
+
+    For the three tests whose subject lives BELOW the port — the unscoped
+    type-check gate runs a real ``type_check_command``, and the reachback pin
+    asserts the scoped step is resolved through the module namespace at call
+    time — every step they do not name must stay production. Each value is a
+    plain callable, wrapped here in the zero-argument resolver shape
+    :class:`ProductionVerifier` holds its steps in.
+    """
+    return dataclasses.replace(
+        PRODUCTION_VERIFIER,
+        **{step: (lambda fn=fn: fn) for step, fn in steps.items()},
+    )
+
+
 @pytest.mark.asyncio
 class TestRunPostMergeVerify:
     """Direct unit tests for the _run_post_merge_verify module-level helper.
@@ -14225,15 +14318,13 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         passed_result = MagicMock(passed=True, summary='', timed_out=False)
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts=timeouts, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts=timeouts, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is None
         git_ops.cleanup_merge_worktree.assert_not_awaited()
@@ -14247,15 +14338,13 @@ class TestRunPostMergeVerify:
         merge_wt = MagicMock()
         disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: no space'
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=disk_reason)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock()) as mock_verify,
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(disk_reasons=[disk_reason])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14265,7 +14354,7 @@ class TestRunPostMergeVerify:
             '"verify skipped: low disk" instead of "passed=False"'
         )
         git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
-        mock_verify.assert_not_awaited()
+        assert verifier.verified == [], 'the disk guard must short-circuit before verify runs'
 
     async def test_verify_fails_non_enospc_blocks_and_cleans(self) -> None:
         """(c) verify fails (non-ENOSPC) → MergeOutcome('blocked') reason starts 'Post-merge verification failed:' and merge_wt cleaned."""
@@ -14283,15 +14372,13 @@ class TestRunPostMergeVerify:
         failed_result.lint_output = ''
         failed_result.type_output = ''
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=failed_result)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14319,15 +14406,13 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=timed_out_result)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts=timeouts, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts=timeouts, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14346,18 +14431,13 @@ class TestRunPostMergeVerify:
 
         enospc_result = _enospc_verify_result()
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=enospc_result),
-            ),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14391,22 +14471,19 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(side_effect=[_infra_category_verify_result(category=category), passing]),
-            ) as mock_verify,
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=_infra_category_verify_result(category=category)), VerifyScript(result=passing)],
+        )
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is None, f'expected None (verify eventually passed), got: {result!r}'
-        assert mock_verify.call_count == 2, (
-            f'expected exactly one bounded infra retry (2 total calls), got {mock_verify.call_count}'
+        assert len(verifier.verified) == 2, (
+            f'expected exactly one bounded infra retry (2 total calls), got {len(verifier.verified)}'
         )
 
     @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
@@ -14419,7 +14496,10 @@ class TestRunPostMergeVerify:
         Parametrized over every INFRA_TRANSIENT_CATEGORIES member (task 2591
         amendment, reviewer_comprehensive/test_coverage).
         """
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_queue import (
+            _DryRunInvestigationHandles,
+            _run_post_merge_verify,
+        )
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -14429,34 +14509,31 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result(category=category)
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=infra_result),
-            ) as mock_verify,
-            patch(
-                'orchestrator.merge_queue._spawn_merge_verify_dry_run',
-            ) as mock_spawn_dry_run,
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts=timeouts, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts=timeouts, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            # Live handles, so "no investigation spawned" is a real assertion
+            # rather than one the None-safe no-op would satisfy anyway.
+            dry_run_handles=_DryRunInvestigationHandles(scheduler=MagicMock()),
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
         assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
             f'expected transient-infra reason, got: {result.reason!r}'
         )
-        assert mock_verify.call_count == 2, (
-            f'expected exactly one bounded infra retry (2 total calls), got {mock_verify.call_count}'
+        assert len(verifier.verified) == 2, (
+            f'expected exactly one bounded infra retry (2 total calls), got {len(verifier.verified)}'
         )
         assert timeouts == {}, (
             f'classified-infra outcome must not bump the timeout loop-breaker: {timeouts}'
         )
-        mock_spawn_dry_run.assert_not_called()
+        assert verifier.investigations == [], (
+            'a classified-infra hold must not spawn a dry-run debugger'
+        )
         assert result.failure_category == '', (
             f'persistent classified-infra-transient outcome must leave failure_category '
             f'empty (byte-identical to the persistent-ENOSPC branch), so the TRAIN verify '
@@ -14489,26 +14566,21 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(side_effect=[
-                    _infra_category_verify_result(category='env_transient'), passing,
-                ]),
-            ) as mock_verify,
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=_infra_category_verify_result(category='env_transient')), VerifyScript(result=passing)],
+        )
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is None, f'expected None (verify eventually passed), got: {result!r}'
-        assert mock_verify.call_count == 2, (
+        assert len(verifier.verified) == 2, (
             f'expected the merge-side wrapper to retry once more on top of whatever '
             f'internal env_serial retry already happened inside the mocked '
-            f'run_scoped_verification, got {mock_verify.call_count} calls'
+            f'run_scoped_verification, got {len(verifier.verified)} calls'
         )
 
     async def test_classified_infra_transient_zero_retry_after_shared_budget_exhausted(self) -> None:
@@ -14524,7 +14596,10 @@ class TestRunPostMergeVerify:
         retry chance. Seeds enospc_retries[task_id]=max_enospc to simulate
         the budget already being spent.
         """
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_queue import (
+            _DryRunInvestigationHandles,
+            _run_post_merge_verify,
+        )
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -14536,21 +14611,16 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result()
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=infra_result),
-            ) as mock_verify,
-            patch(
-                'orchestrator.merge_queue._spawn_merge_verify_dry_run',
-            ) as mock_spawn_dry_run,
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts=timeouts, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts=timeouts, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            # Live handles, so "no investigation spawned" is a real assertion
+            # rather than one the None-safe no-op would satisfy anyway.
+            dry_run_handles=_DryRunInvestigationHandles(scheduler=MagicMock()),
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14558,16 +14628,18 @@ class TestRunPostMergeVerify:
             f'expected transient-infra reason even with the retry budget already '
             f'spent, got: {result.reason!r}'
         )
-        assert mock_verify.call_count == 1, (
+        assert len(verifier.verified) == 1, (
             f'expected NO in-place retry once the shared enospc_retries/max_enospc '
             f'budget is exhausted (a regression risk from the shared-budget '
-            f'coupling), got {mock_verify.call_count} calls'
+            f'coupling), got {len(verifier.verified)} calls'
         )
         assert timeouts == {}, (
             f'classified-infra outcome must not bump the timeout loop-breaker even '
             f'when the retry budget is exhausted: {timeouts}'
         )
-        mock_spawn_dry_run.assert_not_called()
+        assert verifier.investigations == [], (
+            'a classified-infra hold must not spawn a dry-run debugger'
+        )
 
     async def test_genuine_test_failure_not_treated_as_infra_transient(self) -> None:
         """(task ν) NARROWNESS: a genuine test_failure category is NOT retried
@@ -14590,18 +14662,13 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=test_failure_result),
-            ) as mock_verify,
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.reason.startswith('Post-merge verification failed:'), (
@@ -14610,9 +14677,9 @@ class TestRunPostMergeVerify:
         assert not result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
             f'a genuine test_failure must NOT take the transient-infra path: {result.reason!r}'
         )
-        assert mock_verify.call_count == 1, (
+        assert len(verifier.verified) == 1, (
             f'a non-infra-transient category must not trigger the infra retry, '
-            f'got {mock_verify.call_count} calls'
+            f'got {len(verifier.verified)} calls'
         )
 
     async def test_verify_exception_propagates_no_cleanup(self) -> None:
@@ -14623,18 +14690,15 @@ class TestRunPostMergeVerify:
         req = self._make_req()
         merge_wt = MagicMock()
 
+        verifier = _ScriptedVerifier(answers=[raises(RuntimeError('boom'))])
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(side_effect=RuntimeError('boom')),
-            ),
             pytest.raises(RuntimeError, match='boom'),
         ):
             await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
+                verifier=verifier,
             )
 
         git_ops.cleanup_merge_worktree.assert_not_awaited()
@@ -14665,15 +14729,13 @@ class TestRunPostMergeVerify:
         failing_verify.lint_output = ''
         failing_verify.type_output = ''
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=failing_verify)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failing_verify)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14694,23 +14756,19 @@ class TestRunPostMergeVerify:
         l1 = Path('/fake/_merge-l1')
         l2 = Path('/fake/_merge-l2')
 
-        mock_disk_guard = AsyncMock(return_value=None)
         passed_result = MagicMock(passed=True, summary='', timed_out=False)
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', mock_disk_guard),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                keep_worktrees={l1, l2},
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            keep_worktrees={l1, l2},
+            verifier=verifier,
+        )
 
         assert result is None
-        assert mock_disk_guard.await_args is not None
-        call_kwargs = mock_disk_guard.await_args.kwargs
-        assert call_kwargs['keep_worktrees'] == {l1, l2}
+        assert len(verifier.disk_guard_calls) == 1
+        assert verifier.disk_guard_calls[0]['keep_worktrees'] == {l1, l2}
 
     async def test_enospc_retry_prunes_with_keep_set_union(self) -> None:
         """ENOSPC retry passes keep = {merge_wt} | keep_worktrees to prune."""
@@ -14724,19 +14782,14 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=enospc_result),
-            ),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-                keep_worktrees={l1, l2},
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            keep_worktrees={l1, l2},
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14753,18 +14806,13 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=enospc_result),
-            ),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries=enospc_retries,
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries=enospc_retries,
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked'
@@ -14787,33 +14835,19 @@ class TestRunPostMergeVerify:
         req.config.project_root = tmp_path
         merge_wt = MagicMock()
 
-        captured_kwargs: list[dict] = []
-
-        async def spy_run_scoped(*args, **kwargs):
-            captured_kwargs.append(kwargs)
-            return VerifyResult(
-                passed=True, test_output='', lint_output='', type_output='', summary='ok',
-            )
-
         expected_archive_root = tmp_path / 'data' / 'verify-logs'
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', spy_run_scoped),
-            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(
-                return_value=MagicMock(broken=False, timed_out=False, failing_subprojects=[],
-                                       timed_out_subprojects=[]),
-            )),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-            )
+        verifier = _ScriptedVerifier(answers=[passes(summary='ok')])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
 
         assert result is None, f'Expected None (pass), got {result!r}'
-        assert captured_kwargs, 'run_scoped_verification must have been called'
-        actual_archive_root = captured_kwargs[0].get('archive_root')
+        assert verifier.scoped_calls, 'the scoped verify must have been dispatched'
+        actual_archive_root = verifier.scoped_calls[0].get('archive_root')
         assert actual_archive_root == expected_archive_root, (
             f'Expected archive_root={expected_archive_root!r}, '
             f'got {actual_archive_root!r}'
@@ -14843,15 +14877,15 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=timed_out_result)),
             patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
         ):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=99, max_enospc=1,
+                verifier=verifier,
             )
 
         assert result is not None
@@ -14886,15 +14920,15 @@ class TestRunPostMergeVerify:
         test_fail_result.lint_output = ''
         test_fail_result.type_output = ''
 
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_fail_result)])
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=test_fail_result)),
             patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
         ):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
+                verifier=verifier,
             )
 
         assert result is not None
@@ -14930,12 +14964,10 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
+        )
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            # task 3059: the payload is now BUILT from attempt-0's own result
-            # inside the retry branch, not read from a pre-dispatch sidecar.
-            # These budget tests only care that narrowing SUCCEEDED, so the
-            # builder is stubbed with an opaque non-None payload.
             patch(
                 'orchestrator.merge_queue._build_attempt0_payload',
                 AsyncMock(return_value=object()),
@@ -14944,26 +14976,18 @@ class TestRunPostMergeVerify:
                 'orchestrator.merge_queue._assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(side_effect=[
-                    _infra_category_verify_result('semaphore_timeout'),
-                    _infra_category_verify_result('semaphore_timeout'),
-                    _infra_category_verify_result('semaphore_timeout'),
-                    passing,
-                ]),
-            ) as mock_verify,
         ):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries=(er := {}),
                 max_timeouts=2, max_enospc=1,
                 max_narrowed=3, narrowed_retries=(nr := {}),
+                verifier=verifier,
             )
 
         assert result is None, f'expected None (verify eventually passed), got: {result!r}'
-        assert mock_verify.call_count == 4, (
-            f'expected 1 initial + 3 narrowed retries (4 total calls), got {mock_verify.call_count}'
+        assert len(verifier.verified) == 4, (
+            f'expected 1 initial + 3 narrowed retries (4 total calls), got {len(verifier.verified)}'
         )
         assert nr[req.task_id] == 3, (
             f'expected the separate narrowed counter to reach 3, got: {nr}'
@@ -14998,12 +15022,8 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            # task 3059: the payload is now BUILT from attempt-0's own result
-            # inside the retry branch, not read from a pre-dispatch sidecar.
-            # These budget tests only care that narrowing SUCCEEDED, so the
-            # builder is stubbed with an opaque non-None payload.
             patch(
                 'orchestrator.merge_queue._build_attempt0_payload',
                 AsyncMock(return_value=object()),
@@ -15012,22 +15032,19 @@ class TestRunPostMergeVerify:
                 'orchestrator.merge_queue._assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=test_failure_result),
-            ) as mock_verify,
         ):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries=(er := {}),
                 max_timeouts=2, max_enospc=1,
                 max_narrowed=3, narrowed_retries=(nr := {}),
+                verifier=verifier,
             )
 
         assert result is not None
-        assert mock_verify.call_count == 1, (
+        assert len(verifier.verified) == 1, (
             f'a deterministic-red category must NOT be narrowed-retried even with '
-            f'narrowing on and a generous budget, got {mock_verify.call_count} calls'
+            f'narrowing on and a generous budget, got {len(verifier.verified)} calls'
         )
         assert result.reason.startswith('Post-merge verification failed:'), (
             f'unexpected reason: {result.reason!r}'
@@ -15064,12 +15081,10 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=test_failure_result)],
+        )
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            # task 3059: the payload is now BUILT from attempt-0's own result
-            # inside the retry branch, not read from a pre-dispatch sidecar.
-            # These budget tests only care that narrowing SUCCEEDED, so the
-            # builder is stubbed with an opaque non-None payload.
             patch(
                 'orchestrator.merge_queue._build_attempt0_payload',
                 AsyncMock(return_value=object()),
@@ -15078,26 +15093,20 @@ class TestRunPostMergeVerify:
                 'orchestrator.merge_queue._assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(side_effect=[
-                    _infra_category_verify_result('semaphore_timeout'),
-                    test_failure_result,
-                ]),
-            ) as mock_verify,
         ):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 max_narrowed=3, narrowed_retries=(nr := {}),
+                verifier=verifier,
             )
 
         assert result is not None
-        assert mock_verify.call_count == 2, (
+        assert len(verifier.verified) == 2, (
             f'expected exactly one narrowed retry (attempt-0 + 1 retry), then the loop '
             f'stops because the category is no longer infra-transient, got '
-            f'{mock_verify.call_count} calls'
+            f'{len(verifier.verified)} calls'
         )
         assert nr[req.task_id] == 1, f'expected the narrowed counter at 1, got: {nr}'
         assert result.reason.startswith('Post-merge verification failed:'), (
@@ -15133,24 +15142,19 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=infra_result),
-            ) as mock_verify,
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries=(er := {}),
-                max_timeouts=2, max_enospc=1,
-                max_narrowed=5, narrowed_retries=(nr := {}),
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries=(er := {}),
+            max_timeouts=2, max_enospc=1,
+            max_narrowed=5, narrowed_retries=(nr := {}),
+            verifier=verifier,
+        )
 
         assert result is not None
-        assert mock_verify.call_count == 2, (
+        assert len(verifier.verified) == 2, (
             f'expected only the legacy single ENOSPC-budget retry (2 total calls), '
-            f'NOT 6 from max_narrowed=5, got {mock_verify.call_count} calls'
+            f'NOT 6 from max_narrowed=5, got {len(verifier.verified)} calls'
         )
         assert er.get(req.task_id) == 1, (
             f'expected the legacy enospc_retries counter used, got: {er}'
@@ -15179,12 +15183,8 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            # task 3059: the payload is now BUILT from attempt-0's own result
-            # inside the retry branch, not read from a pre-dispatch sidecar.
-            # These budget tests only care that narrowing SUCCEEDED, so the
-            # builder is stubbed with an opaque non-None payload.
             patch(
                 'orchestrator.merge_queue._build_attempt0_payload',
                 AsyncMock(return_value=object()),
@@ -15193,22 +15193,19 @@ class TestRunPostMergeVerify:
                 'orchestrator.merge_queue._assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(return_value=infra_result),
-            ) as mock_verify,
         ):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries=(er := {}),
                 max_timeouts=2, max_enospc=1,
                 max_narrowed=2, narrowed_retries=(nr := {}),
+                verifier=verifier,
             )
 
         assert result is not None
-        assert mock_verify.call_count == 3, (
+        assert len(verifier.verified) == 3, (
             f'expected 1 initial + 2 narrowed retries (3 total calls) before the '
-            f'narrowed budget is exhausted, got {mock_verify.call_count} calls'
+            f'narrowed budget is exhausted, got {len(verifier.verified)} calls'
         )
         assert nr[req.task_id] == 2, (
             f'expected the narrowed counter to reach max_narrowed=2, got: {nr}'
@@ -15241,12 +15238,10 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
+        )
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            # task 3059: the payload is now BUILT from attempt-0's own result
-            # inside the retry branch, not read from a pre-dispatch sidecar.
-            # These budget tests only care that narrowing SUCCEEDED, so the
-            # builder is stubbed with an opaque non-None payload.
             patch(
                 'orchestrator.merge_queue._build_attempt0_payload',
                 AsyncMock(return_value=object()),
@@ -15255,14 +15250,6 @@ class TestRunPostMergeVerify:
                 'orchestrator.merge_queue._assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(side_effect=[
-                    _infra_category_verify_result('semaphore_timeout'),
-                    _infra_category_verify_result('semaphore_timeout'),
-                    passing,
-                ]),
-            ) as mock_verify,
         ):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -15271,13 +15258,14 @@ class TestRunPostMergeVerify:
                 timeouts={}, enospc_retries=(er := {req.task_id: 1}),
                 max_timeouts=2, max_enospc=1,
                 max_narrowed=2, narrowed_retries=(nr := {}),
+                verifier=verifier,
             )
 
         assert result is None, f'expected None (verify eventually passed), got: {result!r}'
-        assert mock_verify.call_count == 3, (
+        assert len(verifier.verified) == 3, (
             f'expected 1 initial + 2 narrowed retries (3 total calls) — the '
             f'already-exhausted ENOSPC budget must not starve the narrowed '
-            f'retry, got {mock_verify.call_count} calls'
+            f'retry, got {len(verifier.verified)} calls'
         )
         assert nr[req.task_id] == 2, (
             f'expected the narrowed loop to consume its own full budget, got: {nr}'
@@ -15364,15 +15352,17 @@ class TestUnscopedTypecheckGate:
         req.config = config
 
         scoped_pass = MagicMock(passed=True, summary='', timed_out=False)
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=scoped_pass)),
-        ):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-            )
+        # Only the scoped verify and the disk guard are injected: the unscoped
+        # gate under test must run the real `type_check_command`.
+        outcome = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=_production_verifier_with(
+                disk_guard=_disk_always_free,
+                scoped=AsyncMock(return_value=scoped_pass),
+            ),
+        )
 
         assert outcome is not None, 'Expected MergeOutcome(blocked), got None'
         assert outcome.status == 'blocked', f'Expected blocked, got {outcome.status!r}'
@@ -15474,15 +15464,17 @@ class TestUnscopedTypecheckGate:
         timeout_result = MagicMock(passed=False, timed_out=True)
 
         timeouts: dict[str, int] = {}
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=scoped_pass)),
-            patch('orchestrator.merge_queue.run_verification', AsyncMock(return_value=timeout_result)),
-        ):
+        # The unscoped gate itself must be the real one, so `run_verification`
+        # — which it calls, one layer BELOW the port — stays patched.
+        with patch('orchestrator.merge_queue.run_verification', AsyncMock(return_value=timeout_result)):
             outcome = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts=timeouts, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
+                verifier=_production_verifier_with(
+                    disk_guard=_disk_always_free,
+                    scoped=AsyncMock(return_value=scoped_pass),
+                ),
             )
 
         # (a) fail-closed: timeout → blocked (NOT fail-open)
@@ -22117,18 +22109,18 @@ class TestRunPostMergeVerifyRouting:
         )
         clean_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
-            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=clean_gate)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=event_store,
-                merge_sha='sha-abc123',
-            )
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=passed_result)],
+            gates=[clean_gate],
+        )
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=event_store,
+            merge_sha='sha-abc123',
+            verifier=verifier,
+        )
 
         assert result is None, f'expected None on pass, got {result!r}'
 
@@ -22170,16 +22162,20 @@ class TestRunPostMergeVerifyRouting:
             )
 
         clean_gate = MagicMock(broken=False, failing_subprojects=[], timed_out_subprojects=[])
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=capturing_verify),
-            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=clean_gate)),
-        ):
+        # `scoped` is deliberately NOT injected: this test's whole subject is
+        # that the module-level patch still intercepts, which only means
+        # anything while the port resolves that name at call time.
+        verifier = _production_verifier_with(
+            disk_guard=_disk_always_free,
+            unscoped=AsyncMock(return_value=clean_gate),
+        )
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=capturing_verify):
             await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 merge_sha='abc',
+                verifier=verifier,
             )
 
         assert intercepted, 'run_scoped_verification was not intercepted by patch'
@@ -22197,9 +22193,8 @@ class TestRunPostMergeVerifyRouting:
             summary='test-fail',
         )
 
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=failed_result)),
             patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)) as mock_mh,
         ):
             result = await _run_post_merge_verify(
@@ -22207,6 +22202,7 @@ class TestRunPostMergeVerifyRouting:
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 merge_sha='sha-scoped-fail',
+                verifier=verifier,
             )
 
         assert result is not None
@@ -22234,10 +22230,11 @@ class TestRunPostMergeVerifyRouting:
             timed_out_subprojects=[], detail='type errors here',
         )
 
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=passed_scoped)],
+            gates=[broken_gate],
+        )
         with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_scoped)),
-            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=broken_gate)),
             patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock()) as mock_mh,
         ):
             result = await _run_post_merge_verify(
@@ -22245,6 +22242,7 @@ class TestRunPostMergeVerifyRouting:
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
                 merge_sha='sha-unscoped-fail',
+                verifier=verifier,
             )
 
         assert result is not None
@@ -22274,17 +22272,17 @@ class TestRunPostMergeVerifyRouting:
         )
 
         timeouts: dict = {}
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_scoped)),
-            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=timeout_gate)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts=timeouts, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                merge_sha='sha-unscoped-timeout',
-            )
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=passed_scoped)],
+            gates=[timeout_gate],
+        )
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts=timeouts, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='sha-unscoped-timeout',
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked', f'expected blocked, got {result.status!r}'
@@ -22311,16 +22309,14 @@ class TestRunPostMergeVerifyRouting:
             lint_output='', type_output='', summary='disk full',
         )
 
-        with (
-            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=enospc_result)),
-        ):
-            result = await _run_post_merge_verify(
-                git_ops, req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                merge_sha='sha-enospc',
-            )
+        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='sha-enospc',
+            verifier=verifier,
+        )
 
         assert result is not None
         assert result.status == 'blocked', f'expected blocked, got {result.status!r}'
