@@ -77,9 +77,25 @@ LIVE_PRESERVATION_SENTENCES = (
     "Task 3105's in-progress/null-claimant/null-heartbeat state remains the "
     'deliberately preserved SOLE live validation specimen for gate task 3546'
     "'s mu-gate soak/flip checklist",
-    # Graphiti node 95719d7c summary line.
+    # Graphiti node 95719d7c's summary, verbatim and WHOLE.  The Graphiti
+    # channel matches against the entire summary string and each entire edge
+    # fact — never a single line in isolation — so the whole blob is the
+    # honest fixture.  Note only one of these seven lines carries the citation;
+    # requiring each line to match on its own would force the family wider than
+    # the live evidence justifies, which is the over-suppression the
+    # under-suppression bias forbids.
+    "Any urgent-intervention concern about task 3105 must be recorded in task "
+    "3546's own description.\n"
+    'Task 3105 is the sole preserved live validation specimen for gate task 3546.\n'
+    'Task 3546 nominates task 3105 as the substitute traced specimen.\n'
+    "Task 3105's state is keyed by task_ground_truth.py based on its status and "
+    'other attributes.\n'
     "Task 3105's preservation is documented as a precedent due to the harm "
-    'caused when twin specimen task 3371 lost its pin in a bulk close.',
+    'caused when twin specimen task 3371 lost its pin in a bulk close.\n'
+    'The open escalation for task 3105 is the preservation mechanism, as it '
+    'falls through to RecoveryAction.LEAVE.\n'
+    'The preserved set for dark_factory task 3371 was recorded as SIZE-1, which '
+    'includes task 3105 only.',
 )
 
 #: Recon prose with nothing to do with a preserved specimen.  A family member
