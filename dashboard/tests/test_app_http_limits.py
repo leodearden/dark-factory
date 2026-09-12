@@ -6,16 +6,25 @@ constructed with no ``limits=``, so it inherited httpx's stock
 ``DEFAULT_LIMITS`` — ``max_connections=100``, ``max_keepalive_connections=20``,
 ``keepalive_expiry=5.0``.
 
-Two things are wrong with the stock defaults *for this client specifically*:
+This client overrides two of httpx's stock defaults, for two different
+reasons:
 
 1. The bound is a fixed 100 regardless of how many orchestrators are
    onboarded, so it is simultaneously too loose for a one-project install and
-   unrelated to the real peak (projects x concurrent endpoint families).
-2. ``keepalive_expiry=5.0`` is a DEAD TIE with the server side: the escalation
-   MCP servers — one per orchestrator, and the target of most of the
-   dashboard's fan-out — are served by uvicorn with no ``timeout_keep_alive``
-   override, and uvicorn's default is 5s. The client therefore considers a
-   connection reusable at precisely the moment the server may close it.
+   unrelated to the real peak (projects x concurrent endpoint families). This
+   one IS a real defect in the stock default — see ``TestBuildHttpLimits``
+   below.
+2. ``keepalive_expiry`` is pinned explicitly at 4.0 rather than left at
+   httpx's stock 5.0 (or omitted). This is NOT fixing a race against the
+   server's close: httpcore evaluates ``keepalive_expiry`` lazily, only when
+   the pool is next used, with no background reaper, so it can never pre-empt
+   a server-side close regardless of its value (verified mechanism:
+   ``dashboard/src/dashboard/app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS``).
+   Omitting the argument would leave httpx's stock 5.0, which the same
+   verified-mechanism block measured as behaviourally IDENTICAL to 4.0 on
+   this install — so 4.0 is pinned explicitly not because it behaves any
+   differently, but to keep the shipped number visible and reviewable at
+   the call site.
 
 This is a GUARD on worst-case pool growth, not a leak fix. It does NOT fix
 CLOSE-WAIT accumulation (owned by the task-3857 re-spec).
@@ -35,11 +44,6 @@ import httpx
 
 from dashboard.config import DashboardConfig
 
-# The uvicorn `timeout_keep_alive` default that the escalation MCP servers run
-# on (orchestrator/src/orchestrator/harness.py sets no override). The client's
-# keepalive_expiry must sit strictly BELOW this or it races the server's close.
-_UVICORN_KEEPALIVE_DEFAULT = 5.0
-
 # merge_halt.py's module docstring names a "3s polling loop". keepalive_expiry
 # must sit strictly ABOVE this or a connection never survives one poll cycle
 # and every cycle pays a fresh handshake.
@@ -47,8 +51,10 @@ _DASHBOARD_POLL_INTERVAL = 3.0
 
 # httpx's stock DEFAULT_LIMITS (httpx/_config.py): max_connections=100,
 # max_keepalive_connections=20. Spelled out here rather than read off
-# `httpx.Limits()`, whose no-arg defaults are None — DEFAULT_LIMITS is a
-# separate module constant that httpx does not re-export publicly.
+# `httpx.Limits()`, whose no-arg defaults are None for these two `max_*`
+# fields specifically (`keepalive_expiry` defaults to 5.0, not None) — and
+# DEFAULT_LIMITS itself is a separate module constant that httpx does not
+# re-export publicly, so it can't be read off that way either.
 _HTTPX_STOCK_MAX_CONNECTIONS = 100
 _HTTPX_STOCK_MAX_KEEPALIVE = 20
 
@@ -76,24 +82,38 @@ class TestBuildHttpLimits:
         limits = _build_http_limits(_config(tmp_path, escalation=1, fused=1))
         assert isinstance(limits, httpx.Limits)
 
-    def test_keepalive_expiry_undercuts_the_server_and_clears_the_poll(
+    def test_keepalive_expiry_pins_the_shipped_value_above_the_poll_interval(
         self, tmp_path,
     ):
-        """Strictly below uvicorn's 5s close, strictly above the ~3s poll."""
-        from dashboard.app import _build_http_limits
+        """Pins the shipped value, plus the one band assertion with a real reason.
+
+        keepalive_expiry is evaluated only lazily, at pool reuse, with no
+        background reaper (see
+        ``dashboard/src/dashboard/app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS`` for
+        the verified mechanism), so it neither races nor pre-empts any
+        server-side close, regardless of its value. Two things are therefore
+        worth pinning and nothing else is: the shipped number, so a re-tune
+        has to be deliberate and visible; and the one band that carries a
+        true, independent rationale — a pooled connection must survive one
+        ~3s poll cycle or pooling is defeated and every poll pays a fresh
+        handshake.
+        """
+        from dashboard.app import _HTTP_KEEPALIVE_EXPIRY_SECONDS, _build_http_limits
 
         expiry = _build_http_limits(_config(tmp_path, escalation=1, fused=1)).keepalive_expiry
 
-        assert expiry is not None, 'keepalive_expiry must be set, not left None'
-        assert expiry < _UVICORN_KEEPALIVE_DEFAULT, (
-            f'keepalive_expiry={expiry} does not undercut the {_UVICORN_KEEPALIVE_DEFAULT}s '
-            f"uvicorn timeout_keep_alive default the escalation MCP servers run on — "
-            f"httpx's own default is exactly 5.0, a dead tie with the server's close"
+        assert expiry is not None
+        assert expiry == _HTTP_KEEPALIVE_EXPIRY_SECONDS, (
+            f'keepalive_expiry={expiry} must equal the shipped '
+            f'_HTTP_KEEPALIVE_EXPIRY_SECONDS={_HTTP_KEEPALIVE_EXPIRY_SECONDS} — '
+            f'either a re-tune moved the value without moving this pin, or '
+            f'the keepalive_expiry= kwarg was dropped from _build_http_limits '
+            f"(which leaves httpx's stock 5.0)"
         )
         assert expiry > _DASHBOARD_POLL_INTERVAL, (
             f'keepalive_expiry={expiry} is at-or-below the ~{_DASHBOARD_POLL_INTERVAL}s '
             f'dashboard poll interval, so a connection would never survive one '
-            f'poll cycle and every cycle would pay a fresh handshake'
+            f'poll cycle before this setting expires it, defeating reuse entirely'
         )
 
     def test_max_connections_scales_with_endpoint_count(self, tmp_path):
@@ -109,6 +129,47 @@ class TestBuildHttpLimits:
             f'a 48-endpoint config must get a larger pool than a 2-endpoint one '
             f'({large.max_connections} vs {small.max_connections}) — otherwise the '
             f'bound silently becomes wrong as projects are onboarded'
+        )
+
+    def test_floor_binds_below_the_crossover_and_the_derived_term_takes_over_at_it(
+        self, tmp_path,
+    ):
+        """Pin both sides of the floor-vs-derived boundary.
+
+        Where the crossover sits, and why it matters, is documented once
+        beside the sizing constants that
+        ``dashboard/src/dashboard/app.py::_build_http_limits`` combines — not
+        restated here. What was missing is a test that locates the boundary:
+        ``test_max_connections_scales_with_endpoint_count`` only compares 2
+        vs 48 endpoints, and ``test_small_install_is_never_tighter_than_httpx_stock``
+        only asserts ``>= 100``. A future re-tune of ``_HTTP_CONNS_PER_ENDPOINT``,
+        ``_HTTP_ASSUMED_CONCURRENT_VIEWERS`` or ``_HTTP_MIN_CONNECTIONS`` should
+        fail here with a legible reason rather than silently moving the crossover.
+        """
+        from dashboard.app import (
+            _HTTP_ASSUMED_CONCURRENT_VIEWERS,
+            _HTTP_CONNS_PER_ENDPOINT,
+            _build_http_limits,
+        )
+
+        # Reported, not asserted: a re-tune's failure message must carry the
+        # number the constants now produce, not the one they produced when
+        # this test was written.
+        per_endpoint = _HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS
+
+        at_floor = _build_http_limits(_config(tmp_path, escalation=5, fused=3))
+        assert at_floor.max_connections == _HTTPX_STOCK_MAX_CONNECTIONS, (
+            f'8 endpoints: the derived term ({per_endpoint * 8}) must be '
+            f'discarded by the floor, so max_connections must equal the httpx '
+            f'stock {_HTTPX_STOCK_MAX_CONNECTIONS} exactly — got '
+            f'{at_floor.max_connections}'
+        )
+
+        past_crossover = _build_http_limits(_config(tmp_path, escalation=5, fused=4))
+        assert past_crossover.max_connections == 108, (
+            f'9 endpoints: the derived term ({per_endpoint * 9}) must bind and '
+            f'exceed the httpx stock {_HTTPX_STOCK_MAX_CONNECTIONS} floor — got '
+            f'{past_crossover.max_connections}'
         )
 
     def test_empty_config_still_gets_a_workable_floor(self, tmp_path):

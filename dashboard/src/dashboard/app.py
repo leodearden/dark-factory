@@ -423,25 +423,57 @@ async def _metrics_loop(
 # `limits=` it inherited httpx's stock DEFAULT_LIMITS — max_connections=100,
 # max_keepalive_connections=20, keepalive_expiry=5.0 (httpx/_config.py).
 #
-# THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention and stops
-# the client from racing the server's keep-alive close, while letting the
-# concurrency ceiling track the fleet (see the two-dimensions note below). It
-# does NOT fix the CLOSE-WAIT accumulation — that diagnosis is owned by the
-# task-3857 re-spec, and nothing here should be read as addressing it.
+# THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention, while
+# letting the concurrency ceiling track the fleet (see the two-dimensions
+# note below). It does NOT fix the CLOSE-WAIT accumulation — that diagnosis
+# is owned by the task-3857 re-spec, and nothing here should be read as
+# addressing it.
 #
-# keepalive_expiry is derived from the SMALLER of the two server populations
-# the dashboard talks to, because the smaller one binds:
+# For reference, the two server-side keepalive settings the dashboard talks
+# to:
 #   * escalation MCP servers (one per orchestrator, and the target of most of
 #     the fan-out) are served by uvicorn with NO timeout_keep_alive override
 #     — orchestrator/src/orchestrator/harness.py — and uvicorn's default is 5s.
-#   * fused-memory sets keepalive_timeout: 120 (fused-memory/config/config.yaml),
-#     far looser, so 4.0 clears it comfortably too.
-# httpx's own default is exactly 5.0 — a DEAD TIE with the escalation servers'
-# close, i.e. the client considers a connection reusable at precisely the
-# moment the server may close it. 4.0 buys 1s of margin under that close while
-# staying above the ~3s dashboard poll interval (merge_halt.py names a "3s
-# polling loop"), so a connection still survives one poll cycle rather than
-# reconnecting every time. Below ~3.5 destroys reuse; >= 5.0 keeps the race.
+#   * fused-memory sets keepalive_timeout: 120 (fused-memory/config/config.yaml).
+#
+# VERIFIED MECHANISM (checked directly against the installed httpx 0.28.1 /
+# httpcore 1.0.9 — re-check after an upgrade). keepalive_expiry is NOT a race
+# against either server-side setting above, and cannot be one, because
+# httpcore evaluates it lazily — only when the pool is next USED, never on a
+# timer:
+#   * has_expired()'s sole pool-side consumer is
+#     httpcore/_async/connection_pool.py::AsyncConnectionPool._assign_requests_to_connections,
+#     whose own docstring says it is "Called whenever a new request is added
+#     or removed from the pool". Nothing in the pool module schedules a
+#     Thread, create_task or call_later — there is no background reaper — so
+#     an expired idle connection is never proactively closed, and this
+#     setting cannot pre-empt a server-side close that happens while the pool
+#     sits idle.
+#   * httpcore/_async/http11.py::HTTP11Connection.has_expired separately
+#     returns True on `server_disconnected` (state IDLE with the socket
+#     already readable) as a term independent of the `now > self._expire_at`
+#     age term this setting controls. The reap that actually matters —
+#     noticing the server already closed — is not gated on keepalive_expiry
+#     at all, which is why arming it at 4.0 vs 5.0 was measured to produce
+#     IDENTICAL behaviour (task-3857 refutation work): on this install the
+#     age term is empirically inert.
+#
+# What keepalive_expiry actually does: it bounds how stale a pooled
+# connection is allowed to be at the moment it is next REUSED — nothing more.
+# A value at or below the dashboard's own ~3s poll interval (merge_halt.py
+# names a "3s polling loop") would defeat pooling outright, since every poll
+# would find its connection already expired and pay a fresh handshake; 4.0
+# stays above that.
+#
+# 4.0 is KEPT here rather than removed, even though no value was ever shown
+# to beat any other: omitting the argument would leave httpx's own stock
+# 5.0 (httpx 0.28.1), which the measurement two paragraphs above found
+# behaviourally IDENTICAL to 4.0 on this install — the other value already
+# shown not to matter, not a looser or unarmed configuration. The explicit
+# 4.0 is retained NOT because any behavioural difference was demonstrated,
+# but to keep the shipped number pinned and reviewable at this call site,
+# and to keep this correction comment-only rather than moving a runtime
+# value.
 _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 
 # TWO DIMENSIONS, BOUNDED DIFFERENTLY — the distinction matters:
@@ -460,14 +492,18 @@ _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 #     dashboard is ever put in front of a larger audience.
 #
 #     _HTTP_MIN_CONNECTIONS is deliberately httpx's own stock max_connections:
-#     for a small install the derived product lands below it, and this change
-#     must never make the pool TIGHTER than what already shipped. Sizing below
-#     stock would convert ordinary queueing into httpx.PoolTimeout — which,
-#     now that the per-call budget also bounds pool acquisition, would render
-#     as an "offline" pill on a perfectly healthy orchestrator. (When that
-#     does happen it is diagnosable: mcp_fanout.describe_exc names the
-#     exception type, so 'PoolTimeout' in the log distinguishes local
-#     saturation from a dead endpoint.)
+#     the derived product (_HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS
+#     * endpoints, i.e. 12 * endpoints) only overtakes this floor at
+#     endpoints >= 9 (12*8=96 < 100; 12*9=108 > 100). Below that threshold
+#     _build_http_limits returns EXACTLY this stock number and the derived
+#     term is inert — a small install gets a floor, not a fleet-scaled bound.
+#     That is deliberate: this change must never make the pool TIGHTER than
+#     what already shipped. Sizing below stock would convert ordinary queueing
+#     into httpx.PoolTimeout — which, now that the per-call budget also bounds
+#     pool acquisition, would render as an "offline" pill on a perfectly
+#     healthy orchestrator. (When that does happen it is diagnosable:
+#     mcp_fanout.describe_exc names the exception type, so 'PoolTimeout' in
+#     the log distinguishes local saturation from a dead endpoint.)
 #
 #   * IDLE RETENTION (max_keepalive_connections) is held FLAT at httpx's stock
 #     20, NOT scaled as a fraction of the total. A `max_connections // 2` rule
@@ -484,6 +520,9 @@ _HTTP_MAX_KEEPALIVE_CONNECTIONS = 20
 
 def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
     """Derive the shared client's connection-pool bound from *config*.
+
+    The sizing constants, and the floor-vs-derived crossover they imply, are
+    documented once where they are defined, directly above.
 
     Pure by design: ``httpx.AsyncClient`` exposes no public accessor for its
     limits, so a helper is the only way to test the sizing without asserting
