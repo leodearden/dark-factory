@@ -19,6 +19,7 @@ reaching the steward path, so its signature never enters the counter.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -113,6 +114,25 @@ def _persisted_metadata(update_task: AsyncMock) -> dict:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+async def _submit_with_outcome(
+    wf: TaskWorkflow, merge_queue: asyncio.Queue, outcome: MergeOutcome,
+) -> WorkflowOutcome | None:
+    """Submit to the merge queue and hand the request *outcome* off that queue.
+
+    Nothing drains *merge_queue* here, so the request the production enqueue
+    path parks on it would wait forever. Taking it off and resolving it
+    delivers *outcome* through the REAL MergeRequest the workflow is awaiting,
+    rather than substituting the lane's enqueue entry point.
+    """
+    submit = asyncio.ensure_future(wf._submit_to_merge_queue('99', pre_rebased=False))
+    try:
+        request: MergeRequest = await asyncio.wait_for(merge_queue.get(), timeout=10.0)
+        request.result.set_result(outcome)
+        return await asyncio.wait_for(submit, timeout=10.0)
+    finally:
+        submit.cancel()
 
 
 @pytest.mark.asyncio
@@ -319,7 +339,7 @@ async def test_caller_reads_prev_signature_from_retry_ledger():
 
 @pytest.mark.asyncio
 async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ):
     """Fix 2 short-circuits dropped_plan_targets → never enters thrash counter.
 
@@ -337,24 +357,18 @@ async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
     wf = f.wf
     wf.worktree = tmp_path / 'wt'
     wf.worktree.mkdir(parents=True, exist_ok=True)
-    wf.merge_queue = MagicMock()
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    wf.merge_queue = merge_queue
     wf.plan = {'files': []}
     wf._module_configs = []
     # Pre-seed with a sentinel so we can distinguish "never touched" (good)
     # from "reset to None coincidentally" (would silently pass a weaker test).
     wf._last_merge_block_reason = 'sentinel'
 
-    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
-        req.result.set_result(MergeOutcome(
-            'blocked',
-            reason=f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: foo.py',
-        ))
-
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
-    )
-
-    outcome = await wf._submit_to_merge_queue('99', pre_rebased=False)
+    outcome = await _submit_with_outcome(wf, merge_queue, MergeOutcome(
+        'blocked',
+        reason=f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: foo.py',
+    ))
 
     # (a) outcome is BLOCKED
     assert outcome == WorkflowOutcome.BLOCKED
@@ -371,7 +385,7 @@ async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
 
 @pytest.mark.asyncio
 async def test_post_merge_pyright_broken_short_circuits_to_l1_excluded_from_thrash(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ):
     """post_merge_pyright_broken reason routes to L1 without entering thrash counter.
 
@@ -382,13 +396,12 @@ async def test_post_merge_pyright_broken_short_circuits_to_l1_excluded_from_thra
       (c) call _write_merge_failure_review with kind='post_merge_pyright_broken'
       (d) NOT touch _last_merge_block_reason (returns before the steward-path capture)
     """
-    from unittest.mock import MagicMock
-
     f = _make()
     wf = f.wf
     wf.worktree = tmp_path / 'wt'
     wf.worktree.mkdir(parents=True, exist_ok=True)
-    wf.merge_queue = MagicMock()
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    wf.merge_queue = merge_queue
     wf.plan = {'files': []}
     wf._module_configs = []
     wf._last_merge_block_reason = 'sentinel'
@@ -401,14 +414,9 @@ async def test_post_merge_pyright_broken_short_circuits_to_l1_excluded_from_thra
         'type-check failed for subpkg on abc123456789. error: src/foo.py:10: ...'
     )
 
-    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
-        req.result.set_result(MergeOutcome('blocked', reason=broken_reason))
-
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
+    outcome = await _submit_with_outcome(
+        wf, merge_queue, MergeOutcome('blocked', reason=broken_reason),
     )
-
-    outcome = await wf._submit_to_merge_queue('99', pre_rebased=False)
 
     # (a) outcome is BLOCKED
     assert outcome == WorkflowOutcome.BLOCKED
