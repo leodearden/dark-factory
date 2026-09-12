@@ -146,13 +146,14 @@ async def _drive_merge_boundary(
     """Drive the REAL ``_run_post_merge_verify`` — the single funnel every
     production merge verify flows through.
 
-    Patches, at the ``merge_queue`` lookup sites the boundary resolves at
-    ``LocalRunner`` construction time:
-      * ``run_scoped_verification`` -> a failing VerifyResult naming
-        *failing_node_id* (this also re-patches over the autouse
-        ``_mock_merge_queue_verification`` conftest stub, the standard idiom);
-      * ``_run_unscoped_typechecks`` -> a clean ``PostMergePyrightResult``, so
-        the post-scoped pyright gate never decides the outcome here;
+The scoped verify and the post-scoped pyright gate both come from the
+    INJECTED verify port (``verifier=``), which is also what makes this
+    independent of the autouse ``_mock_merge_queue_verification`` conftest stub:
+      * ``run_scoped`` -> a failing VerifyResult naming *failing_node_id*;
+      * ``run_unscoped_typechecks`` -> ``FakeVerifier``'s clean
+        ``PostMergePyrightResult``, so the pyright gate never decides the
+        outcome here.
+    One patch remains, and it is not a lane module:
       * ``orchestrator.verify.run_verification`` -> the isolated re-run engine
         ``_merge_gate_isolated_rerun`` calls, passing or failing per
         *isolated_rerun_passes*.
@@ -175,17 +176,7 @@ async def _drive_merge_boundary(
 
     rerun = _passing_result() if isolated_rerun_passes else _failing_rerun_result()
 
-    with (
-        patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            new=AsyncMock(return_value=_failing_scoped_result(failing_node_id)),
-        ),
-        patch(
-            'orchestrator.merge_queue._run_unscoped_typechecks',
-            new=AsyncMock(return_value=PostMergePyrightResult()),
-        ),
-        patch.object(verify, 'run_verification', new=AsyncMock(return_value=rerun)),
-    ):
+    with patch.object(verify, 'run_verification', new=AsyncMock(return_value=rerun)):
         return await _run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={},
@@ -195,6 +186,7 @@ async def _drive_merge_boundary(
             event_store=event_store,
             escalation_queue=escalation_queue,
             merge_sha=_MERGE_SHA,
+            verifier=_BoundaryVerifier(_failing_scoped_result(failing_node_id)),
         )
 
 
@@ -547,18 +539,13 @@ async def _capture_boundary_consumers(
         captured['spec'] = spec
         return spec
 
-    with (
-        patch('orchestrator.merge_queue.build_merge_verify_spec', new=_spy_build),
-        patch.object(
-            merge_queue_module.VerifyRunnerPool, 'dispatch',
-            new=AsyncMock(return_value=_passing_result()),
-        ),
-    ):
+    with patch('orchestrator.merge_queue.build_merge_verify_spec', new=_spy_build):
         await _run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=3, max_enospc=1,
             merge_sha=_MERGE_SHA,
+            verifier=verifier,
         )
 
     return captured
