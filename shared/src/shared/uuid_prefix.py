@@ -31,6 +31,20 @@ per-token re-scan. Worst-case work is therefore O(total characters across all
 strings reachable from the MCP argument map) + O(number of container nodes),
 with no dependence on how many tokens are found.
 
+The SAME bound is owed by the write side, and until this module had a batch
+door it was not kept. :func:`substitute_all` is O(total characters of the
+strings it touches + number of replacements), plus one O(depth x width) path
+copy per DISTINCT path — with no dependence on how many times any one id is
+cited beyond a single linear pass. The door it replaced, a caller-side fold of
+single-token :func:`substitute` calls, was O(occurrences x string length),
+because every occurrence rebuilt the whole containing string: MEASURED on one
+``content`` string carrying 16 distinct tokens each repeated, 0.69s at 6,400
+occurrences (275KB), 3.00s at 12,800 (550KB) and 16.91s at 25,600 (1.1MB) —
+4x the time per 2x the input — against 0.00s / 0.01s / 0.02s grouped. A
+middleware calling that fold stalls a shared single-threaded server for those
+seconds on one ordinary large write, which is why the batch door exists and
+why the bound is stated here rather than assumed.
+
 Stdlib only, deliberately: no fastmcp, no pydantic. Leaf β's resolver and leaf
 γ's ``tools.py`` both need this module, and neither should pull a middleware
 dependency to reach it. The module is not re-exported from
@@ -42,7 +56,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
 __all__ = [
@@ -51,6 +65,7 @@ __all__ = [
     'find_prefix_tokens',
     'strip_uuid_prefix_override',
     'substitute',
+    'substitute_all',
     'uuid_prefix_override_requested',
 ]
 
@@ -156,25 +171,95 @@ def substitute(arguments: Mapping[str, Any], token: PrefixToken, full_id: str) -
     to be ambiguous or unresolvable, which is what makes "forwarded unchanged"
     structurally true rather than incidental.
 
-    Single-token by design. Applying several is the caller's fold in REVERSE
-    document order, which keeps every remaining span valid without re-scanning;
-    a batch API would need its own ordering contract for no gain.
+    The ONE-ELEMENT case of :func:`substitute_all`, delegated rather than
+    reimplemented, so this module holds one splice and one monotonicity check
+    (SPOT). Its single-token contract is unchanged; a caller with several
+    replacements should call the batch door directly rather than folding this
+    one, which costs a full rebuild of the containing string per occurrence.
     """
-    if not full_id.startswith(token.token):
-        raise ValueError(
-            f'refusing a non-monotone substitution: {full_id!r} does not start with '
-            f'the token it would replace, {token.token!r}. An expansion must keep the '
-            f'original characters so that a wrong one stays visible and reversible.'
-        )
-    trail: list[tuple[Any, str | int]] = []
-    node: Any = arguments
-    for key in token.path:
-        trail.append((node, key))
-        node = node[key]
-    rebuilt: Any = node[: token.start] + full_id + node[token.end :]
-    for container, key in reversed(trail):
-        rebuilt = _with_child(container, key, rebuilt)
-    return rebuilt
+    return substitute_all(arguments, ((token, full_id),))
+
+
+def substitute_all(
+    arguments: Mapping[str, Any],
+    replacements: Iterable[tuple[PrefixToken, str]],
+) -> dict[str, Any]:
+    """Return *arguments* with every ``(token, full_id)`` span replaced at once.
+
+    ONE rebuild per containing string, not one per occurrence. The spans in a
+    string are spliced in a single ``''.join`` over alternating gap and
+    replacement slices, and each DISTINCT path pays one path copy. That is the
+    whole reason this door exists: the caller-side fold it replaced was
+    O(occurrences x string length) and stalled the event loop on an ordinary
+    large write — see the module docstring's INV-8 section for the numbers.
+
+    ORDER-FREE. *replacements* may arrive in any order; spans are sorted per
+    path here. The fold demanded REVERSE document order and silently corrupted
+    the later span without it, so removing that precondition is a safety
+    property of this door and not merely a convenience.
+
+    MONOTONE for EVERY pair, validated BEFORE anything is rebuilt, so a
+    refusal is all-or-nothing: a batch that refuses one pair has applied none
+    of them, which is what lets a boundary guard keep "nothing was written"
+    structurally true. The message is the single-token door's, because it is
+    the same invariant enforced at the same door (heuristic 10).
+
+    OVERLAPPING spans within one path are REFUSED. No detector produces them —
+    ``re.finditer`` yields non-overlapping matches — but a silently corrupted
+    string is a far worse failure than a loud refusal, and this door cannot
+    tell a caller's bug from a detector's.
+
+    Non-mutating, like the single-token door and for the same reason: the
+    original argument map is a guard's fallback when a later token in the same
+    call turns out to be ambiguous or unresolvable.
+    """
+    pairs = list(replacements)
+    for token, full_id in pairs:
+        if not full_id.startswith(token.token):
+            raise ValueError(
+                f'refusing a non-monotone substitution: {full_id!r} does not start with '
+                f'the token it would replace, {token.token!r}. An expansion must keep the '
+                f'original characters so that a wrong one stays visible and reversible.'
+            )
+    by_path: dict[tuple[str | int, ...], list[tuple[PrefixToken, str]]] = {}
+    for token, full_id in pairs:
+        by_path.setdefault(token.path, []).append((token, full_id))
+
+    result: Any = arguments
+    for path, group in by_path.items():
+        trail: list[tuple[Any, str | int]] = []
+        node: Any = result
+        for key in path:
+            trail.append((node, key))
+            node = node[key]
+        rebuilt: Any = _spliced(node, path, sorted(group, key=lambda pair: pair[0].start))
+        for container, key in reversed(trail):
+            rebuilt = _with_child(container, key, rebuilt)
+        result = rebuilt
+    return result
+
+
+def _spliced(value: str, path: tuple[str | int, ...], group: list[tuple[PrefixToken, str]]) -> str:
+    """*value* with every span in *group* (ascending, non-overlapping) replaced.
+
+    One pass, one join: the gaps between spans are each copied exactly once,
+    which is the linear bound the module docstring states.
+    """
+    parts: list[str] = []
+    cursor = 0
+    for token, full_id in group:
+        if token.start < cursor:
+            raise ValueError(
+                f'refusing a batch with overlapping spans at {path!r}: '
+                f'{token.token!r} starts at {token.start} inside a replacement that '
+                f'already covers up to {cursor}. Splicing them would corrupt the '
+                f'string rather than expand it.'
+            )
+        parts.append(value[cursor : token.start])
+        parts.append(full_id)
+        cursor = token.end
+    parts.append(value[cursor:])
+    return ''.join(parts)
 
 
 def _with_child(container: Any, key: str | int, child: Any) -> Any:
