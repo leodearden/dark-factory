@@ -1375,7 +1375,7 @@
     "orchestrator/tests/test_harness_offline_lane.py": {"patch_targets": [], "private_reads": 39},
     "orchestrator/tests/test_harness_orphan_merge_reaper_wiring.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_harness_plan_step_rederive.py": {"patch_targets": [], "private_reads": 12},
-    "orchestrator/tests/test_harness_reblock_guard.py": {"patch_targets": [], "private_reads": 21},
+    "orchestrator/tests/test_harness_reblock_guard.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_harness_task_runtime.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_harness_terminal_lane_record_reclaim.py": {"patch_targets": [], "private_reads": 26},
     "orchestrator/tests/test_harness_train_callbacks.py": {"patch_targets": ["SpeculativeMergeWorker", "enforce_merge_liveness_margin", "enforce_persistent_worktree_serial_lane"], "private_reads": 6},
