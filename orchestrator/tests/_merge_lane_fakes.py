@@ -5,7 +5,8 @@ Injected in place of the production adapters through
 ``FakeVerifier`` scripts the verify outcome per task id; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it instead of waiting;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
-the lane filed. ``make_lane`` builds a lane on all three at once, so a test
+the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
+the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
 that owns its worker never falls back to a production adapter by omission.
 
 Imported by bare module name (``from _merge_lane_fakes import ...``), like
@@ -23,6 +24,38 @@ from orchestrator.merge_gates import PostMergePyrightResult
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.types import DiskGuardOutcome
 from orchestrator.verify import VerifyResult
+
+
+def lane_entry(lane: MergeLane, request_id: str) -> dict[str, Any] | None:
+    """The ``snapshot()['entries']`` dict for *request_id*, or None.
+
+    The lane's own public census, looked up by request id -- what a
+    dashboard, a heartbeat line or a liveness probe sees.
+    """
+    for entry in lane.snapshot()['entries']:
+        if entry['request_id'] == request_id:
+            return entry
+    return None
+
+
+def lane_state(lane: MergeLane, request_id: str) -> str | None:
+    """The wire state ``snapshot()`` reports for *request_id*.
+
+    ``None`` means the lane no longer tracks it at all -- retired, or never
+    seen. Outside the lane those are the same observation ("done with it"),
+    which is why this is the public expression of a retired item.
+    """
+    entry = lane_entry(lane, request_id)
+    return None if entry is None else entry['state']
+
+
+def lane_finalizing(lane: MergeLane) -> list[dict[str, Any]]:
+    """Census entries in the post-verify ``finalizing`` window.
+
+    At most one entry at a time, so ``[]`` is the public reading of "no
+    entry is stuck mid-finalize".
+    """
+    return [e for e in lane.snapshot()['entries'] if e['state'] == 'finalizing']
 
 
 @dataclasses.dataclass(frozen=True)

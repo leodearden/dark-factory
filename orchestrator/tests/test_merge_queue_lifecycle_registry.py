@@ -38,6 +38,9 @@ from _merge_lane_fakes import (
     FakeVerifier,
     RecordingEscalations,
     hangs_until,
+    lane_entry,
+    lane_finalizing,
+    lane_state,
     make_lane,
     raises,
 )
@@ -146,17 +149,13 @@ class TestLifecycleRegistryPresence:
     into ``SpeculativeMergeWorker.__init__``.
     """
 
-    def test_lifecycle_is_an_item_lifecycle_instance(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import ItemLifecycle
-
+    def test_a_fresh_lane_reports_an_empty_census(self, git_ops: GitOps) -> None:
         worker = make_lane(git_ops)
 
-        assert isinstance(worker._lifecycle, ItemLifecycle)
-
-    def test_live_items_starts_empty(self, git_ops: GitOps) -> None:
-        worker = make_lane(git_ops)
-
-        assert worker._live_items == {}
+        snapshot = worker.snapshot()
+        assert snapshot['entries'] == []
+        assert snapshot['depth'] == 0
+        assert snapshot['head_of_line'] is None
 
 
 class TestNoteTransitionBestEffort:
@@ -269,12 +268,13 @@ class TestMergerDrainRegistersAndTransitions:
         producer's put() — the module-level enqueue helpers have no
         reference to the worker/registry.
         """
-        worker = make_lane(git_ops)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = make_lane(git_ops, queue)
         req = _make_request('pre-registry', 'pre-registry', git_ops.project_root, config)
 
         assert worker._lifecycle.current(req.request_id) is None
 
-        await worker._queue.put(req)
+        await queue.put(req)
 
         # Still sitting in _queue, undrained — still pre-registry.
         assert worker._lifecycle.current(req.request_id) is None
@@ -575,13 +575,16 @@ class TestRequeueToQueuedSites:
         )
         worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
 
-        worker._operator_halt.set()
+        worker.operator_halt('test: pre-dispatch halt')
         entry = await worker._dispatch_item(item)
 
         assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
-        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.QUEUED
+        assert lane_state(worker, req.request_id) == 'queued', (
+            f'a pre-dispatch halt must re-arm the request as queued: '
+            f'{lane_entry(worker, req.request_id)!r}'
+        )
         assert worker._live_items[req.request_id] is req
-        assert not queue.empty(), 'req must be put back on _queue by the halt branch'
+        assert not queue.empty(), 'req must be put back on the queue by the halt branch'
         assert len(fake_eq.filed) == 0, (
             f'requeue must not escalate: {fake_eq.filed!r}'
         )
@@ -628,7 +631,7 @@ class TestRequeueToQueuedSites:
             speculative=False,
         )
 
-        worker._operator_halt.set()
+        worker.operator_halt('test: pre-dispatch halt')
         entry = await worker._dispatch_item(item)
 
         assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
@@ -812,7 +815,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         assert vr_dv.status == InflightStatus.REQUEUED, f'{vr_dv!r}'
 
         # ── CONTROL 2: pre-dispatch operator halt (:14727/:14730) ────────────
-        # LAST, because setting _operator_halt would otherwise route the two
+        # LAST, because an operator halt would otherwise route the two
         # _run_inflight_verify drives above into the operator-halt abort
         # (trigger 2) instead of the branches under test.
         req_ph = _make_request('df3082-pair-halt', 'df3082-pair-halt', tmp_path, config)
@@ -821,7 +824,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             merge_wt=tmp_path / 'merge_wt_ph', base_sha='deadbeef', speculative=False,
         )
         worker._register_item(item_ph, initial=ItemLifecycleState.DISPATCHING)
-        worker._operator_halt.set()
+        worker.operator_halt('test: pre-dispatch halt')
         entry_ph = await worker._dispatch_item(item_ph)
         assert entry_ph is not None
         assert entry_ph.status == InflightStatus.REQUEUED_PREDISPATCH, f'{entry_ph!r}'
@@ -836,8 +839,8 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             f'unpaired={sorted(set(ledger_rids) - set(registry_rids))!r}'
         )
         for rid in expected:
-            assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED, (
-                f'{rid} must be left at QUEUED; reads {worker._lifecycle.current(rid)!r}'
+            assert lane_state(worker, rid) == 'queued', (
+                f'{rid} must be left queued; census reads {lane_entry(worker, rid)!r}'
             )
 
     async def test_every_on_requeued_call_site_has_a_sibling_note_requeue(self) -> None:
@@ -1142,7 +1145,8 @@ class TestRequeueRequestHelperContract:
     ) -> None:
         from orchestrator.merge_queue import ItemLifecycleState
 
-        worker = make_lane(git_ops)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = make_lane(git_ops, queue)
         req = _make_request('df3204-helper', 'df3204-helper', tmp_path, config)
         rid = worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
         worker._request_ledger.on_dequeue(req, now=0.0)
@@ -1150,13 +1154,13 @@ class TestRequeueRequestHelperContract:
 
         worker._requeue_request(req)
 
-        assert worker._queue.qsize() == 1, 'the request must be back on _queue'
-        assert worker._queue.get_nowait() is req
+        assert queue.qsize() == 1, 'the request must be back on the queue'
+        assert queue.get_nowait() is req
         assert rid not in worker._request_ledger.open_request_ids(), (
             'the ledger entry must be removed so this parked request never ages out'
         )
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED, (
-            f'registry must read QUEUED; reads {worker._lifecycle.current(rid)!r}'
+        assert lane_state(worker, rid) == 'queued', (
+            f'the census must read queued; reads {lane_entry(worker, rid)!r}'
         )
         # The OBJECT SWAP is what actually prevents a phantom finalize head:
         # `_finalizing_head_entry()` only counts `isinstance(obj, InflightEntry)`.
@@ -1597,8 +1601,10 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
         ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
 
-        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
-        assert req.request_id not in worker._live_items
+        assert lane_state(worker, req.request_id) is None, (
+            f'a retired request must leave the public census: '
+            f'{lane_entry(worker, req.request_id)!r}'
+        )
 
         await worker.stop()
         await worker_task
@@ -1675,8 +1681,10 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         )
         assert observed_live_obj is entry
 
-        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
-        assert req.request_id not in worker._live_items
+        assert lane_state(worker, req.request_id) is None, (
+            f'a retired request must leave the public census: '
+            f'{lane_entry(worker, req.request_id)!r}'
+        )
 
     async def test_passthrough_entry_retires_directly_without_finalizing(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -1725,8 +1733,10 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         assert observed == [
             (ItemLifecycleState.DISPATCHING, ItemLifecycleState.TERMINAL),
         ], f'unexpected transition sequence: {observed!r}'
-        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
-        assert req.request_id not in worker._live_items
+        assert lane_state(worker, req.request_id) is None, (
+            f'a retired request must leave the public census: '
+            f'{lane_entry(worker, req.request_id)!r}'
+        )
 
     async def test_runner_unavailable_cascade_finalizing_merging_redispatch_parked(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -1997,7 +2007,7 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
         reads VERIFYING when finalize runs.  The hop must NOT fire — a
         requeued item is not finalizing.
         """
-        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+        from orchestrator.merge_queue import InflightStatus
 
         fake_eq = RecordingEscalations()
         worker, req, entry = await _make_verifying_entry_with_sentinel(
@@ -2009,14 +2019,12 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
         advanced = await worker._finalize_inflight(entry)
 
         assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
-        current = worker._lifecycle.current(rid)
-        assert current != ItemLifecycleState.FINALIZING, (
-            f'a requeued item was recorded as FINALIZING (phantom finalize head); '
-            f'registry reads {current!r}'
+        assert lane_state(worker, rid) != 'finalizing', (
+            f'a requeued item was left mid-finalize (phantom finalize head); '
+            f'the census reads {lane_entry(worker, rid)!r}'
         )
-        assert worker._finalizing_head_entry() is None, (
-            f'requeued entry left as the finalize head: '
-            f'{worker._finalizing_head_entry()!r} (registry={current!r})'
+        assert lane_finalizing(worker) == [], (
+            f'requeued entry left as the finalize head: {lane_finalizing(worker)!r}'
         )
         assert not req.result.done(), (
             'a requeued request must be left PENDING for its re-dispatch, not resolved'
@@ -2062,8 +2070,8 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
             f'_live_items must hold the MergeRequest (the object swap is what '
             f'clears the finalize head): {worker._live_items.get(rid)!r}'
         )
-        assert worker._finalizing_head_entry() is None, (
-            f'requeued entry left as the finalize head: {worker._finalizing_head_entry()!r}'
+        assert lane_finalizing(worker) == [], (
+            f'requeued entry left as the finalize head: {lane_finalizing(worker)!r}'
         )
         assert not req.result.done(), (
             'a requeued request must be left PENDING for its re-dispatch, not resolved'
@@ -2116,7 +2124,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         pipeline for this request_id, so TERMINAL + a ``_live_items`` pop is
         the only correct end state.
         """
-        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+        from orchestrator.merge_queue import InflightStatus
 
         fake_eq = RecordingEscalations()
         worker, req, entry = await _make_verifying_entry_with_sentinel(
@@ -2127,16 +2135,13 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             advanced = await worker._finalize_inflight(entry)
-            head = worker._finalizing_head_entry()
+            head = lane_finalizing(worker)
 
         assert advanced is False, f'a DROPPED sentinel must not advance main: {advanced!r}'
-        assert head is None, f'dropped entry left as the finalize head: {head!r}'
-        assert rid not in worker._live_items, (
-            f'dropped entry left in _live_items: {worker._live_items.get(rid)!r}'
-        )
-        current = worker._lifecycle.current(rid)
-        assert current == ItemLifecycleState.TERMINAL, (
-            f'a dropped request must be retired to TERMINAL; registry reads {current!r}'
+        assert head == [], f'dropped entry left as the finalize head: {head!r}'
+        assert lane_state(worker, rid) is None, (
+            f'a dropped request must be retired out of the census: '
+            f'{lane_entry(worker, rid)!r}'
         )
         assert _accretion_warnings(caplog) == [], (
             f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
@@ -2167,10 +2172,10 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             advanced = await worker._finalize_inflight(entry)
-            head = worker._finalizing_head_entry()
+            head = lane_finalizing(worker)
 
         assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
-        assert head is None, f'requeued entry left as the finalize head: {head!r}'
+        assert head == [], f'requeued entry left as the finalize head: {head!r}'
         assert worker._live_items[rid] is req, (
             f'_live_items must hold the MergeRequest, not the InflightEntry: '
             f'{worker._live_items.get(rid)!r}'
@@ -2245,8 +2250,8 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
             f'_live_items must still hold the MergeRequest the drain buffered: '
             f'{worker._live_items.get(rid)!r}'
         )
-        assert worker._finalizing_head_entry() is None, (
-            f'no phantom finalize head may survive: {worker._finalizing_head_entry()!r}'
+        assert lane_finalizing(worker) == [], (
+            f'no phantom finalize head may survive: {lane_finalizing(worker)!r}'
         )
         assert _accretion_warnings(caplog) == [], (
             f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
@@ -2307,7 +2312,7 @@ class TestStopMidFlightRetiresEveryContainer:
         # the pre-registry producer-boundary case; this one IS registered).
         req_q = _make_request('kappa-stop-q', 'kappa-stop-q', tmp_path, config)
         worker._register_item(req_q, initial=ItemLifecycleState.QUEUED)
-        worker._queue.put_nowait(req_q)
+        queue.put_nowait(req_q)
 
         # 3. Harvested-but-unprocessed item sitting in the persistent
         # verifier getter's already-done Future.
@@ -2361,12 +2366,9 @@ class TestStopMidFlightRetiresEveryContainer:
         await worker.stop()
 
         for req in all_reqs:
-            assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL, (
-                f'{req.task_id} ({req.request_id}) did not retire to TERMINAL: '
-                f'{worker._lifecycle.current(req.request_id)!r}'
-            )
-            assert req.request_id not in worker._live_items, (
-                f'{req.task_id} ({req.request_id}) still present in _live_items after stop()'
+            assert lane_state(worker, req.request_id) is None, (
+                f'{req.task_id} ({req.request_id}) did not retire out of the '
+                f'census after stop(): {lane_entry(worker, req.request_id)!r}'
             )
             assert req.result.done(), f'{req.task_id}: Future must be resolved by stop()'
 
@@ -2421,8 +2423,10 @@ class TestAbandonPredispatchRetiresRegistry:
         await queue.put(req)
         await asyncio.wait_for(retired.wait(), timeout=10)
 
-        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
-        assert req.request_id not in worker._live_items
+        assert lane_state(worker, req.request_id) is None, (
+            f'a retired request must leave the public census: '
+            f'{lane_entry(worker, req.request_id)!r}'
+        )
         assert req.result.cancelled(), 'the abandon drop must never overwrite the cancellation'
 
         await worker.stop()
@@ -2458,8 +2462,10 @@ class TestAbandonPredispatchRetiresRegistry:
         entry = await worker._dispatch_item(item)
 
         assert entry is not None and entry.status == InflightStatus.ABANDONED_PREDISPATCH
-        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
-        assert req.request_id not in worker._live_items
+        assert lane_state(worker, req.request_id) is None, (
+            f'a retired request must leave the public census: '
+            f'{lane_entry(worker, req.request_id)!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2531,10 +2537,10 @@ class TestCoalesceSupersededRetiresRegistry:
 
         for req in (req1, req2, req3):
             assert req.result.done() and req.result.result().status == 'superseded'
-            assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL, (
-                f'{req.task_id} did not retire after being absorbed into the train'
+            assert lane_state(worker, req.request_id) is None, (
+                f'{req.task_id} did not retire after being absorbed into the '
+                f'train: {lane_entry(worker, req.request_id)!r}'
             )
-            assert req.request_id not in worker._live_items
 
         # The new train's OWN request_id is a DIFFERENT registry entry —
         # already registered at LANE_BUFFERED (step-4), untouched by the
@@ -2552,32 +2558,28 @@ class TestCoalesceSupersededRetiresRegistry:
 
 @pytest.mark.asyncio
 class TestRegistrySnapshotAgreementAtSamplingPoints:
-    """At each of several deliberate mid-pipeline sampling points, the SET
-    of request_ids the registry considers non-terminal must exactly equal
-    the SET of request_ids visible in ``snapshot()['entries']`` — proving
-    kappa's wiring gives snapshot()/the registry a single, agreeing census
-    (task 2169 step-11). Reuses the exact gates already proven reliable by
-    the step-3/step-7/step-9 ``_live_items``-agreement tests above (gate on
-    ``get_main_sha``/``advance_main``), extended here to compare full SETS
-    rather than a single item's identity. Single-item drives (not
-    concurrent multi-item) so there is no ambiguity from the producer-
-    boundary asymmetry (an undrained raw-``_queue`` item would legitimately
-    show up in snapshot() before it is registered).
+    """``snapshot()`` must surface the request at EVERY mid-pipeline
+    sampling point — the census has no blind spot (task 2169 step-11).
 
-    The DISPATCHING window WAS the one exception: ``_dispatching_item`` was
-    documented as census-only, deliberately absent from
-    ``snapshot()['entries']`` (task 2068) — a pre-existing gap outside kappa
-    step-11/12's scope. Task 2435 (kappa-b) closes it by repointing
-    snapshot()'s registry-sourced entry loop to surface DISPATCHING, so the
-    DISPATCHING sample below now asserts equality too, exactly like every
-    other sampling point in this class.
+    Each test gates on the census itself (``lane_state``) inside a real
+    ``get_main_sha``/``advance_main`` call and asserts the gate fired: a
+    window the census skipped never fires, which is the incident these
+    samples exist to prevent. The captured entry is then checked for the
+    fields a dashboard/heartbeat consumer reads. Single-item drives (not
+    concurrent multi-item) so there is no ambiguity from the producer-
+    boundary asymmetry (an undrained raw-queue item legitimately shows up
+    in the census before the drain registers it).
+
+    The DISPATCHING window was the one former exception: an item mid
+    ``_dispatch_item`` was census-only, deliberately absent from
+    ``snapshot()['entries']`` (task 2068). Task 2435 (kappa-b) closed the
+    gap, so the DISPATCHING sample below asserts presence exactly like
+    every other sampling point here.
     """
 
     async def test_agreement_at_merging_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
-
         wt = await _make_branch_with_file(
             git_ops, 'kappa-sample-merging', 'file_ksm.py', 'm = 1\n',
         )
@@ -2585,25 +2587,15 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
         worker = make_lane(git_ops, queue)
         req = _make_request('kappa-sample-merging', 'kappa-sample-merging', wt, config)
 
-        captured: list[tuple[set, set]] = []
+        captured: list[dict | None] = []
         original_get_main_sha = git_ops.get_main_sha
         fired = False
 
         async def _spying_get_main_sha() -> str:
             nonlocal fired
-            # Gate on the registry (task 2435 kappa-b: formerly
-            # worker._inflight_req is not None).
-            if (
-                worker._lifecycle.current(req.request_id) == ItemLifecycleState.MERGING
-                and not fired
-            ):
+            if lane_state(worker, req.request_id) == 'merging' and not fired:
                 fired = True
-                snap_ids = {e['request_id'] for e in worker.snapshot()['entries']}
-                registry_ids = {
-                    rid for rid, st in worker._lifecycle._states.items()
-                    if st != ItemLifecycleState.TERMINAL
-                }
-                captured.append((snap_ids, registry_ids))
+                captured.append(lane_entry(worker, req.request_id))
             return await original_get_main_sha()
 
         worker_task = asyncio.create_task(worker.run())
@@ -2615,13 +2607,13 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             outcome = await asyncio.wait_for(req.result, timeout=60)
             assert outcome.status == 'done', f'{outcome}'
 
-        assert fired, 'expected the get_main_sha gate to fire while MERGING'
-        snap_ids, registry_ids = captured[0]
-        assert snap_ids == registry_ids, (
-            f'registry/snapshot disagree at MERGING sample: '
-            f'snapshot only={snap_ids - registry_ids}, registry only={registry_ids - snap_ids}'
+        assert fired, (
+            'the census never reported the request as merging while the real '
+            'merge ran — the blind spot this sample exists to catch'
         )
-        assert req.request_id in registry_ids
+        entry = captured[0]
+        assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
+        assert entry['branch'] == req.branch.bare_id, f'{entry!r}'
 
         await worker.stop()
         await worker_task
@@ -2637,8 +2629,6 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
         ``test_agreement_at_merging_window``/``test_agreement_at_finalizing_window``
         above.
         """
-        from orchestrator.merge_queue import ItemLifecycleState
-
         wt = await _make_branch_with_file(
             git_ops, 'kappa-sample-dispatching', 'file_ksd.py', 'd = 1\n',
         )
@@ -2648,25 +2638,15 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             'kappa-sample-dispatching', 'kappa-sample-dispatching', wt, config,
         )
 
-        captured: list[tuple[set, set]] = []
+        captured: list[dict | None] = []
         original_get_main_sha = git_ops.get_main_sha
         fired = False
 
         async def _spying_get_main_sha() -> str:
             nonlocal fired
-            # Gate on the registry (task 2435 kappa-b: formerly
-            # worker._dispatching_item is not None).
-            if (
-                worker._lifecycle.current(req.request_id) == ItemLifecycleState.DISPATCHING
-                and not fired
-            ):
+            if lane_state(worker, req.request_id) == 'dispatching' and not fired:
                 fired = True
-                snap_ids = {e['request_id'] for e in worker.snapshot()['entries']}
-                registry_ids = {
-                    rid for rid, st in worker._lifecycle._states.items()
-                    if st != ItemLifecycleState.TERMINAL
-                }
-                captured.append((snap_ids, registry_ids))
+                captured.append(lane_entry(worker, req.request_id))
             return await original_get_main_sha()
 
         worker_task = asyncio.create_task(worker.run())
@@ -2678,13 +2658,12 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             outcome = await asyncio.wait_for(req.result, timeout=60)
             assert outcome.status == 'done', f'{outcome}'
 
-        assert fired, 'expected the get_main_sha gate to fire while DISPATCHING'
-        snap_ids, registry_ids = captured[0]
-        assert req.request_id in registry_ids
-        assert snap_ids == registry_ids, (
-            f'registry/snapshot disagree at DISPATCHING sample: '
-            f'snapshot only={snap_ids - registry_ids}, registry only={registry_ids - snap_ids}'
+        assert fired, (
+            'the census never reported the request as dispatching — the '
+            'task-2068 blind spot, reopened'
         )
+        entry = captured[0]
+        assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
 
         await worker.stop()
         await worker_task
@@ -2692,8 +2671,6 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
     async def test_agreement_at_finalizing_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
-
         wt = await _make_branch_with_file(
             git_ops, 'kappa-sample-finalizing', 'file_ksf.py', 'f = 1\n',
         )
@@ -2703,16 +2680,11 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             'kappa-sample-finalizing', 'kappa-sample-finalizing', wt, config,
         )
 
-        captured: list[tuple[set, set]] = []
+        captured: list[dict | None] = []
         original_advance = git_ops.advance_main
 
         async def _capturing_advance(*args: Any, **kwargs: Any) -> Any:
-            snap_ids = {e['request_id'] for e in worker.snapshot()['entries']}
-            registry_ids = {
-                rid for rid, st in worker._lifecycle._states.items()
-                if st != ItemLifecycleState.TERMINAL
-            }
-            captured.append((snap_ids, registry_ids))
+            captured.append(lane_entry(worker, req.request_id))
             return await original_advance(*args, **kwargs)
 
         worker_task = asyncio.create_task(worker.run())
@@ -2725,12 +2697,13 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             assert outcome.status == 'done', f'{outcome}'
 
         assert len(captured) >= 1, 'advance_main must have been called at least once'
-        snap_ids, registry_ids = captured[0]
-        assert snap_ids == registry_ids, (
-            f'registry/snapshot disagree at FINALIZING sample: '
-            f'snapshot only={snap_ids - registry_ids}, registry only={registry_ids - snap_ids}'
+        entry = captured[0]
+        assert entry is not None, (
+            'the census dropped the request while advance_main ran — the '
+            'phantom/blind-spot window this sample exists to catch'
         )
-        assert req.request_id in registry_ids
+        assert entry['state'] == 'finalizing', f'{entry!r}'
+        assert entry['task_id'] == req.task_id, f'{entry!r}'
 
         await worker.stop()
         await worker_task
@@ -2752,8 +2725,6 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
     async def test_three_items_all_reach_terminal_no_leaks(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
-
         wts = [
             await _make_branch_with_file(
                 git_ops, f'kappa-quiesce-{i}', f'file_kq{i}.py', f'{chr(97 + i)} = {i}\n',
@@ -2777,17 +2748,12 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
 
         assert all(o.status == 'done' for o in outcomes), f'{outcomes}'
 
-        for req in reqs:
-            assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL, (
-                f'{req.task_id} leaked at '
-                f'{worker._lifecycle.current(req.request_id)!r} instead of TERMINAL'
-            )
-            assert req.request_id not in worker._live_items
-
-        snap_ids_after = {e['request_id'] for e in worker.snapshot()['entries']}
-        assert snap_ids_after.isdisjoint({r.request_id for r in reqs}), (
-            'a completed request must not still appear in snapshot() entries'
-        )
+        leaked = {
+            req.task_id: lane_entry(worker, req.request_id)
+            for req in reqs
+            if lane_state(worker, req.request_id) is not None
+        }
+        assert leaked == {}, f'completed requests still in the census: {leaked!r}'
 
         await worker.stop()
         await worker_task
