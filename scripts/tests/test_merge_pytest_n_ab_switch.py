@@ -19,6 +19,7 @@ one the test itself owns, bound to an ephemeral port.
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -28,6 +29,12 @@ import pytest
 
 SCRIPT = Path(__file__).parent.parent / "merge-pytest-n-ab-switch.sh"
 KEY = "PYTEST_XDIST_AUTO_NUM_WORKERS"
+
+
+def _sse_frame(payload):
+    """One `event: message` SSE frame -- how the escalation MCP frames every
+    `tools/call` reply."""
+    return f"event: message\ndata: {json.dumps(payload)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -54,18 +61,28 @@ class _FakeEscalationMcp:
 
     `received` records every (headers, payload) seen, so a test asserts the
     script really handshook rather than merely exited 0.
+
+    `initialize_reply` / `tool_call_reply` each override one step of that
+    exchange with a literal (status, headers, body) triple, which is how the
+    transport-fault cases below are built without restating the handshake.
     """
 
     SESSION_ID = "sess-5379-fake"
 
-    MISSING_SESSION = {
-        "jsonrpc": "2.0",
-        "id": "server-error",
-        "error": {"code": -32600, "message": "Bad Request: Missing session ID"},
-    }
+    MISSING_SESSION_REPLY = (
+        400,
+        {"Content-Type": "application/json"},
+        json.dumps({
+            "jsonrpc": "2.0",
+            "id": "server-error",
+            "error": {"code": -32600, "message": "Bad Request: Missing session ID"},
+        }),
+    )
 
-    def __init__(self, report):
+    def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None):
         self.report = report
+        self.initialize_reply = initialize_reply
+        self.tool_call_reply = tool_call_reply
         self.received = []
         outer = self
 
@@ -106,20 +123,23 @@ class _FakeEscalationMcp:
         """(status, headers, body) for one request."""
         method = payload.get("method")
         if method != "initialize" and not headers.get("mcp-session-id"):
-            return (400, {"Content-Type": "application/json"},
-                    json.dumps(self.MISSING_SESSION))
+            return self.MISSING_SESSION_REPLY
         if method == "initialize":
-            return (200,
-                    {"Content-Type": "application/json",
-                     "mcp-session-id": self.SESSION_ID},
-                    json.dumps({"jsonrpc": "2.0", "id": payload.get("id"),
-                                "result": {"protocolVersion": "2024-11-05"}}))
+            return self.initialize_reply or (
+                200,
+                {"Content-Type": "application/json",
+                 "mcp-session-id": self.SESSION_ID},
+                json.dumps({"jsonrpc": "2.0", "id": payload.get("id"),
+                            "result": {"protocolVersion": "2024-11-05"}}),
+            )
         if method == "notifications/initialized":
             return (202, {}, "")
-        inner = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"),
-                            "result": {"structuredContent": self.report}})
-        return (200, {"Content-Type": "text/event-stream"},
-                f"event: message\ndata: {inner}\n\n")
+        return self.tool_call_reply or (
+            200,
+            {"Content-Type": "text/event-stream"},
+            _sse_frame({"jsonrpc": "2.0", "id": payload.get("id"),
+                        "result": {"structuredContent": self.report}}),
+        )
 
     def __enter__(self):
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -466,3 +486,132 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
     assert proc.returncode != 0, f"stdout={proc.stdout}"
     assert "applied.verify_env does not carry" in proc.stderr
     assert not _converged_verdict_lines(proc)
+
+
+# ---------------------------------------------------------------------------
+# The reload never reached the tool
+#
+# A transport rejection must never be readable as a rolled-back reload. The
+# defect this file exists to close was not that the script passed when it
+# should have failed -- it was that it failed while naming the WRONG cause:
+# every session-less POST got a 400 before any tool ran, and the script
+# reported `reloaded=None` and blamed an in-orchestrator rollback for it.
+# ---------------------------------------------------------------------------
+
+TRANSPORT_MARKER = "reload_config never reached the tool"
+
+_INITIALIZE_WITHOUT_A_SESSION = (
+    200,
+    {"Content-Type": "application/json"},
+    json.dumps({"jsonrpc": "2.0", "id": 1,
+                "result": {"protocolVersion": "2024-11-05"}}),
+)
+
+_ENVELOPE_LEVEL_ERROR = (
+    200,
+    {"Content-Type": "text/event-stream"},
+    _sse_frame({"jsonrpc": "2.0", "id": 1,
+                "error": {"code": -32602, "message": "Unknown tool: reload_config"}}),
+)
+
+_TOOL_IS_ERROR = (
+    200,
+    {"Content-Type": "text/event-stream"},
+    _sse_frame({"jsonrpc": "2.0", "id": 1, "result": {
+        "isError": True,
+        "content": [{"type": "text", "text": "ToolError: reload_config failed"}],
+    }}),
+)
+
+_TRANSPORT_FAULTS = {
+    # The shape a raw single-shot POST hits against the live server today --
+    # the direct regression test for the defect.
+    "always_400": {"initialize_reply": _FakeEscalationMcp.MISSING_SESSION_REPLY},
+    # census_trigger raises a RuntimeError naming this; the script must
+    # surface it rather than swallow it.
+    "initialize_assigns_no_session": {"initialize_reply": _INITIALIZE_WITHOUT_A_SESSION},
+    # The request reached the server but never a tool.
+    "envelope_level_error": {"tool_call_reply": _ENVELOPE_LEVEL_ERROR},
+    # FastMCP's shape for a raised ToolError: the tool ran and failed.
+    "tool_is_error": {"tool_call_reply": _TOOL_IS_ERROR},
+}
+
+
+class _ClosedPort:
+    """A port with nothing listening on it, for the dead-socket case.
+
+    Bound and released, so it is free -- and the script's connect is the only
+    thing racing for it. Carries the same `port` attribute `_run` reads from a
+    real server, so the no-server case is driven by the same helper.
+    """
+
+    def __init__(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+
+
+def _assert_failed_closed_on_the_transport(proc):
+    """The one verdict every transport fault must reach: a loud failure that
+    names the TRANSPORT, and never the in-orchestrator rollback it is not."""
+    assert proc.returncode != 0, f"a transport fault was read as success: {proc.stdout}"
+    assert not _converged_verdict_lines(proc)
+    assert TRANSPORT_MARKER in proc.stderr, f"stderr={proc.stderr}"
+    assert "rolls every leaf back" not in proc.stderr, (
+        f"a request that never ran a tool was blamed on a rollback: {proc.stderr}"
+    )
+    assert "reloaded=None" not in proc.stderr, f"stderr={proc.stderr}"
+
+
+@pytest.mark.parametrize(
+    "fault", list(_TRANSPORT_FAULTS.values()), ids=list(_TRANSPORT_FAULTS)
+)
+def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, fault):
+    """Every way the transport can refuse to deliver reload_config."""
+    config = _make_repo(tmp_path, "8", marker=True)
+    repo = config.parent
+    before_head = _head(repo)
+
+    with _FakeEscalationMcp(_report(config_path=str(config)), **fault) as server:
+        proc = _run(server, config, "8")
+
+    _assert_failed_closed_on_the_transport(proc)
+    assert _head(repo) == before_head, "a failed reload must not land a commit"
+
+
+def test_a_dead_socket_fails_closed(tmp_path):
+    """Nothing listening at all -- httpx's own transport exception, which is
+    neither of the two census_trigger raises and must fail the same way."""
+    config = _make_repo(tmp_path, "8", marker=True)
+    repo = config.parent
+    before_head = _head(repo)
+
+    proc = _run(_ClosedPort(), config, "8")
+
+    _assert_failed_closed_on_the_transport(proc)
+    assert _head(repo) == before_head, "a failed reload must not land a commit"
+
+
+def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
+    """On the FLIP path the commit HAS landed, so the operator needs to know
+    which sha carries the value and that a restart will pick it up.
+
+    That is what the deleted `curl ... || die "... (committed as ${SHA}; the
+    value lands at the next restart)"` carried; losing it when curl went away
+    would leave an operator with a failed deploy and no next step.
+    """
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+
+    with _FakeEscalationMcp(
+        initialize_reply=_FakeEscalationMcp.MISSING_SESSION_REPLY,
+    ) as server:
+        proc = _run(server, config, "8")
+
+    _assert_failed_closed_on_the_transport(proc)
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert sha in proc.stderr, f"stderr={proc.stderr}"
+    assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
