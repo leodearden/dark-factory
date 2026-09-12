@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeClock
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.landing_evidence import LandingEvidenceVerdict
@@ -2923,12 +2924,18 @@ class TestAwaitUnadvancedPredecessor:
     ) -> None:
         """Fail-safe: an interlock that could hang the merger forever would be
         worse than the derail it prevents, so an expired wait proceeds (and is
-        logged) instead of blocking.  Driven through the real timeout
-        arithmetic by giving the predecessor's config a tiny verify budget.
+        logged) instead of blocking.
+
+        Driven through the REAL timeout arithmetic — the config's real verify
+        budget and the real settle slack — because the deadline is measured
+        against the worker's clock, and that clock is the test's.  The proof
+        that the wait really ran to its deadline rather than falling out early
+        is the clock's own record of what it was asked to sleep.
         """
         config = _make_config(tmp_path).model_copy(
             update={'verify_command_timeout_secs': 0.05})
         queue: asyncio.Queue = asyncio.Queue()
+        clock = FakeClock()
         worker = _make_worker(queue, config)
         pred = _make_single_req('pred', config=config)
         worker._last_merged_request = pred
@@ -2938,6 +2945,10 @@ class TestAwaitUnadvancedPredecessor:
         ):
             assert await worker._await_unadvanced_predecessor('train-x') is True
 
+        assert sum(clock.sleeps) >= config.verify_command_timeout_secs, (
+            'the interlock must poll all the way to its deadline before '
+            f'proceeding; the clock was asked to sleep {clock.sleeps!r}'
+        )
         assert not pred.result.done(), (
             'the interlock must never resolve or cancel the predecessor Future'
         )
