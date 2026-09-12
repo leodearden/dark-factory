@@ -1414,7 +1414,7 @@
     "orchestrator/tests/test_merge_liveness.py": {"patch_targets": ["INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS", "TOUCH_MISS_TOLERANCE", "_HEARTBEAT_POLL_S", "_MERGE_AHEAD_BOUND", "check_merge_liveness_margin"], "private_reads": 0},
     "orchestrator/tests/test_merge_queue.py": {"patch_targets": ["AUTO_CHAIN_GENERATIONS_ENABLED", "_HEARTBEAT_POLL_S", "_assemble_retry_verify_env", "_build_attempt0_payload", "_check_plan_targets_in_tree", "_check_post_merge_equivalence", "_check_post_merge_pyright", "_classify_branch_presence", "_classify_main_health_red", "_commit_is_linear", "_do_train_merge", "_emit_merge_attempt", "_ensure_verify_disk_space", "_finalize_advanced_merge", "_map_advance_failure", "_rebase_delta_touched_overlap", "_resolve_second_parent", "_reverify_rebased_tree", "_run", "_run_post_merge_verify", "_run_unscoped_typechecks", "_spawn_merge_verify_dry_run", "classify_tip_relation", "dataclasses.replace", "enqueue_merge_request", "patch_content_contained", "resolve_divergent", "run_scoped_verification", "run_verification", "shutil.disk_usage"], "private_reads": 339},
     "orchestrator/tests/test_merge_queue_auto_heal.py": {"patch_targets": ["enqueue_merge_request"], "private_reads": 46},
-    "orchestrator/tests/test_merge_queue_bounce.py": {"patch_targets": [], "private_reads": 60},
+    "orchestrator/tests/test_merge_queue_bounce.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_build_chain.py": {"patch_targets": ["_emit_merge_attempt"], "private_reads": 37},
     "orchestrator/tests/test_merge_queue_c3_submit_identity.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_chain_intact.py": {"patch_targets": [], "private_reads": 75},
