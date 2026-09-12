@@ -289,7 +289,8 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     # asserts the abandoned stash_failed early-out does NOT reach the mapper
     # must patch it at the merge_queue lookup site — patching merge_gates would
     # install the spy off the resolution path and pass vacuously (task 2758).
-    # Same genuinely-unavoidable reach-back as test_merge_speculation.py below.
+    # Same genuinely-unavoidable reach-back as the other ('_map_advance_failure')
+    # consumers here.
     ('test_merge_queue.py', '_map_advance_failure'),
     ('test_merge_queue.py', '_rebase_delta_touched_overlap'),
     ('test_merge_queue.py', '_resolve_second_parent'),
@@ -318,13 +319,6 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_shadow.py', '_run_cold_shadow_verify'),
     ('test_merge_shadow.py', '_run_cold_shadow_verify_suite'),
     ('test_merge_shadow.py', '_run_shadow_compare'),
-    ('test_merge_speculation.py', '_acquire_warm_verify_worktree'),
-    ('test_merge_speculation.py', '_finalize_advanced_merge'),
-    ('test_merge_speculation.py', '_map_advance_failure'),
-    ('test_merge_speculation.py', '_maybe_run_drift_check'),
-    ('test_merge_speculation.py', '_maybe_schedule_shadow_compare'),
-    ('test_merge_speculation.py', '_reverify_rebased_tree'),
-    ('test_merge_speculation.py', '_run_cold_shadow_verify'),
     # Task 3539 — the already-landed carve-out's workflow-side tests.  Same
     # genuinely-unavoidable reach-back as ('test_workflow.py', ...) above: the
     # consumer in `_submit_to_merge_queue` resolves this name through the
