@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
-from _orch_helpers import make_placeholder_future, pydantic_spec
+from _orch_helpers import make_placeholder_future, pydantic_spec, wait_responsive
 from escalation.models import BORN_AT_L2_SEVERITIES
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1821,13 +1821,19 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         )
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            await cold_leg.await_start()
-
-        await worker.stop()
-        await worker_task
+        # try/finally, not straight-line: wait_responsive gives up by raising
+        # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
+        # would be skipped and leak a live worker into teardown (esc-3980-4).
+        try:
+            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result, label='task-sched merge outcome'
+                )
+                await cold_leg.await_start()
+        finally:
+            await worker.stop()
+            await worker_task
 
         assert outcome.status == 'done', f'Expected done; got {outcome}'
         (call,) = cold_leg.calls
@@ -1864,21 +1870,26 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         )
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
-            await queue.put(req)
-            # The outcome must arrive without the cold leg being released
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            await cold_leg.await_start()
-            assert cold_leg.in_flight, (
-                '_verify_and_advance must not await the cold shadow leg to '
-                'completion; the land must return while it is still running'
-            )
-            assert outcome.status == 'done', f'Expected done; got {outcome}'
-
+        # try/finally for the same reason as the sibling test above: a
+        # wait_responsive give-up is a BaseException. The gated leg is released
+        # in the finally too, so a mid-block assert cannot leave it parked.
+        try:
+            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+                await queue.put(req)
+                # The outcome must arrive without the cold leg being released
+                outcome = await wait_responsive(
+                    req.result, label='task-noblock merge outcome'
+                )
+                await cold_leg.await_start()
+                assert cold_leg.in_flight, (
+                    '_verify_and_advance must not await the cold shadow leg to '
+                    'completion; the land must return while it is still running'
+                )
+                assert outcome.status == 'done', f'Expected done; got {outcome}'
+        finally:
             await cold_leg.drain()
-
-        await worker.stop()
-        await worker_task
+            await worker.stop()
+            await worker_task
 
 
 class TestHarnessStartMergeWorkerPassesEscalationQueue:
