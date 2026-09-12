@@ -874,7 +874,9 @@ async def test_stop_does_not_preempt_finalizing_head_mid_advance(
     # pre-empting it — unlike the VERIFYING-sub-case tests above, where stop()
     # is expected to resolve the request itself.
     worker = SpeculativeMergeWorker(
-        _GatedAdvanceGitOps(git_ops, advance_gate), queue, verifier=FakeVerifier(),
+        _GatedAdvanceGitOps(git_ops, advance_gate),  # type: ignore[arg-type]
+        queue,
+        verifier=FakeVerifier(),
     )
 
     worker_task = asyncio.create_task(worker.run())
