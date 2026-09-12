@@ -258,6 +258,54 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
 
+# ── public observation helpers (the lane's own snapshot()) ───────────────────
+
+
+def _entries(worker: SpeculativeMergeWorker) -> list[dict]:
+    """The lane's public per-item census — ``snapshot()['entries']``."""
+    return worker.snapshot()['entries']
+
+
+def _queued(worker: SpeculativeMergeWorker, lane: str | None = None) -> list[dict]:
+    """Every entry still waiting for the merger, in pipeline order.
+
+    ``snapshot()`` enumerates the lane buffers first (priority order) and the
+    not-yet-drained external-queue arrivals after them, so a REQUEUED head
+    reads as the LAST queued entry.  That is what keeps the requeue assertions
+    below order-sensitive rather than set-shaped.
+    """
+    return [
+        e for e in _entries(worker)
+        if e['state'] == 'queued' and (lane is None or e['lane'] == lane)
+    ]
+
+
+def _queued_request_ids(
+    worker: SpeculativeMergeWorker, lane: str | None = None,
+) -> list[str]:
+    """Queued request_ids, in pipeline order — identity, publicly observed."""
+    return [e['request_id'] for e in _queued(worker, lane)]
+
+
+def _queued_task_ids(
+    worker: SpeculativeMergeWorker, lane: str | None = None,
+) -> list[str]:
+    return [e['task_id'] for e in _queued(worker, lane)]
+
+
+def _state_of(worker: SpeculativeMergeWorker, request_id: str) -> str | None:
+    """*request_id*'s public pipeline state, or None once it has retired.
+
+    The wire strings are ``snapshot()``'s, not the registry's: LANE_BUFFERED
+    and QUEUED both report ``'queued'`` (merge_queue.py::_REGISTRY_STATE_TO_WIRE),
+    and a TERMINAL — or never-registered — request is simply absent.
+    """
+    for e in _entries(worker):
+        if e['request_id'] == request_id:
+            return e['state']
+    return None
+
+
 # ── event capture (from test_merge_queue_deep_dispatch.py:240-262) ────────────
 
 
@@ -602,10 +650,12 @@ def _assert_quiescent(
           REAL sha, never 'unknown': the base-chain and verify-base
           sub-checks are silently skipped for the 'unknown' sentinel, which
           would make this assertion pass vacuously rather than meaningfully.
-      (f) set(worker._lifecycle.non_terminal_items()) == set() — the
-          ItemLifecycle registry has retired every request_id; no registry
-          leak survives quiescence.  Placed after the request-ledger sweep
-          (d) so it samples a truly-drained pipeline.
+      (f) worker.snapshot()['entries'] == [] — the lane's public census is
+          empty: every request_id has left both the containers and the
+          ItemLifecycle registry (snapshot's own non-terminal section is
+          registry-sourced), so no leak survives quiescence.  Placed after
+          the request-ledger sweep (d) so it samples a truly-drained
+          pipeline.
 
     Cloned rather than imported for the no-``__init__.py`` reason above.
     """
@@ -642,9 +692,10 @@ def _assert_quiescent(
         f'two_layer_invariants({main_sha!r}) non-empty at quiescence: {tli_violations!r}'
     )
 
-    registry_ids = set(worker._lifecycle.non_terminal_items())
-    assert registry_ids == set(), (
-        f'ItemLifecycle registry non-terminal at quiescence: {registry_ids!r}'
+    pipeline = _entries(worker)
+    assert pipeline == [], (
+        'lane pipeline non-empty at quiescence: '
+        f'{[(e["task_id"], e["state"]) for e in pipeline]!r}'
     )
 
 
@@ -701,11 +752,11 @@ def _canary_predicate_items_per(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _finalized_rows(db_path: Path) -> list[dict]:
-    """Return every ``merge_finalized`` row's parsed ``data`` dict, in order.
+def _event_rows(db_path: Path, event_type: str) -> list[dict]:
+    """Return every *event_type* row's parsed ``data`` dict, in order.
 
     Reads the durable tier through real sqlite (the idiom at
-    test_merge_queue.py:7588-7605) rather than a capturing fake, because the
+    test_merge_queue.py:7588-7605) rather than a capturing fake, because a
     field only reaches η1 if it survives ``json.dumps`` into the ``data``
     column — a fake that records the dict by reference would pass even for a
     value the real emit path drops or cannot serialise.
@@ -716,12 +767,17 @@ def _finalized_rows(db_path: Path) -> list[dict]:
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
-            "SELECT data FROM events WHERE event_type = 'merge_finalized' "
-            'ORDER BY rowid'
+            'SELECT data FROM events WHERE event_type = ? ORDER BY rowid',
+            (event_type,),
         ).fetchall()
     finally:
         conn.close()
     return [json.loads(r[0]) for r in rows]
+
+
+def _finalized_rows(db_path: Path) -> list[dict]:
+    """Every ``merge_finalized`` row's ``data``, in order."""
+    return _event_rows(db_path, 'merge_finalized')
 
 
 @pytest.mark.asyncio
@@ -923,9 +979,8 @@ class TestTipPassAdoptionSignal:
             await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
-            _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
-        )
+        queued = [_make_req(tid, tid, config, git_repo) for tid in ('102', '103')]
+        worker._lane_buffers['normal'].extend(queued)
         store = _CapturingEventStore()
         worker._event_store = store
         item = _make_item(
@@ -941,7 +996,6 @@ class TestTipPassAdoptionSignal:
             raises=raises,
         )
         releases = _spy_chain_lane_release(monkeypatch)
-        queued = list(worker._lane_buffers['normal'])
 
         res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
         return git_ops, worker, item, chain, res, store, queued, releases
@@ -974,7 +1028,10 @@ class TestTipPassAdoptionSignal:
             "_finalize_inflight's PASS arm asserts merge_wt is not None and "
             'threads it into advance_main'
         )
-        assert worker._queue.qsize() == 0, 'an adopted item is not re-queued'
+        assert _queued_request_ids(worker) == [r.request_id for r in _q], (
+            'an adopted item is not re-queued: the two buffered followers are '
+            'still the whole queue'
+        )
         assert not item.request.result.done(), (
             'the verify half never resolves the future — the finalize half does'
         )
@@ -1096,9 +1153,9 @@ class TestTipPassAdoptionSignal:
         assert res.outcome is None, 'a defer renders no MergeOutcome at all'
         assert res.merge_wt is None, 'the fail arm disposes its own worktrees'
         assert not item.request.result.done()
-        assert worker._queue.qsize() == 1
-        assert worker._queue.get_nowait() is item.request
-        assert list(worker._lane_buffers['normal']) == queued, 'same items, same order'
+        assert _queued_request_ids(worker) == [
+            *(r.request_id for r in queued), item.request.request_id,
+        ], 'the followers keep their order; the deferred head goes behind them'
         assert all(not r.result.done() for r in queued)
         assert store.events_of(EventType.merge_attempt) == []
         assert worker._chain_halving_state == 1, '3 built items -> max(1, 3 // 2)'
@@ -1124,13 +1181,13 @@ class TestTipPassAdoptionSignal:
         assert res.status == InflightStatus.REQUEUED
         assert res.outcome is None
         assert not item.request.result.done()
-        assert worker._queue.qsize() == 1
-        assert worker._queue.get_nowait() is item.request
         assert '101' in worker._chain_error_suppressed, (
             'the one-shot suppression is what makes an infra blip cost exactly '
             'one non-chained round'
         )
-        assert list(worker._lane_buffers['normal']) == queued
+        assert _queued_request_ids(worker) == [
+            *(r.request_id for r in queued), item.request.request_id,
+        ], 'the followers keep their order; the deferred head goes behind them'
         assert store.events_of(EventType.merge_attempt) == []
         assert len(releases) == 1
 
@@ -1413,25 +1470,19 @@ class TestInOrderCasWalk:
         A link that lands but stays in its lane buffer would be re-picked by
         the merger and merged onto main a second time — the double-land hazard
         `_requeue_request`'s three effects exist to make impossible on the
-        non-adopting arms.  Retirement is the registry half of the same claim.
+        non-adopting arms.  Retirement is the registry half of the same claim,
+        and ``snapshot()`` carries both: a landed link is absent from the
+        census entirely, a still-queued one is present as ``'queued'``.
         """
-        from orchestrator.merge_types import ItemLifecycleState
-
         s = await self._scene(git_repo, tmp_path, monkeypatch)
         worker = s['worker']
-        still_queued = {
-            r.task_id for lane in ('high', 'normal')
-            for r in worker._lane_buffers[lane]
-        }
 
-        assert still_queued == {_DELTA_TRUNCATOR}
-        assert worker._queue.qsize() == 0
+        assert _queued_task_ids(worker) == [_DELTA_TRUNCATOR], (
+            'the truncator is the only thing still waiting for the merger'
+        )
         for tid in ('101', *_DELTA_LINKS):
-            rid = s['reqs'][tid].request_id
-            current = worker._lifecycle.current(rid)
-            assert current in (None, ItemLifecycleState.TERMINAL), (
-                f'task {tid} left at {current!r} after landing'
-            )
+            state = _state_of(worker, s['reqs'][tid].request_id)
+            assert state is None, f'task {tid} left at {state!r} after landing'
 
     async def test_the_truncated_item_gets_no_outcome_and_no_event(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
@@ -1444,8 +1495,6 @@ class TestInOrderCasWalk:
         (and thence `consecutive_merge_thrash`) a deterministic false signature
         on every deep round.
         """
-        from orchestrator.merge_types import ItemLifecycleState
-
         s = await self._scene(git_repo, tmp_path, monkeypatch)
         trunc = s['reqs'][_DELTA_TRUNCATOR]
 
@@ -1453,10 +1502,9 @@ class TestInOrderCasWalk:
         assert _events_for_task(s['db_path'], _DELTA_TRUNCATOR) == ['merge_queued'], (
             'only its own enqueue event — the walk emits nothing for it'
         )
-        assert trunc in list(s['worker']._lane_buffers['normal'])
-        assert s['worker']._lifecycle.current(trunc.request_id) == (
-            ItemLifecycleState.LANE_BUFFERED
-        ), 'it stays queued for its ordinary sequential path'
+        assert _queued_request_ids(s['worker'], 'normal') == [trunc.request_id], (
+            'it stays queued for its ordinary sequential path'
+        )
 
 
     async def test_on_merge_landed_reports_the_predecessor_as_base_sha(
@@ -1609,10 +1657,10 @@ def _abort_hook_at(call_no: int, *, outcome=None, raises=None, bump_repo=None):
 
 
 def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
-    """Return the lane whose buffer currently holds *task_id*, or None."""
-    for lane in ('high', 'normal'):
-        if any(r.task_id == task_id for r in worker._lane_buffers[lane]):
-            return lane
+    """Return the lane ``snapshot()`` reports *task_id* waiting in, or None."""
+    for e in _queued(worker):
+        if e['task_id'] == task_id:
+            return e['lane']
     return None
 
 
@@ -1670,9 +1718,9 @@ class TestStaleCasAbortLeavesTheRestAlone:
                 ['git', 'merge-base', '--is-ancestor', sha, 'main'], cwd=git_repo,
             )
             assert rc == 0, f'{sha[:8]} un-landed by the abort'
-        assert not set(worker._lifecycle.non_terminal_items()) & {
-            reqs[t].request_id for t in ('101', '102')
-        }
+        assert all(
+            _state_of(worker, reqs[t].request_id) is None for t in ('101', '102')
+        ), 'a landed member is gone from the lane census, not merely resolved'
 
     async def test_unlanded_links_are_left_exactly_as_they_were(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
@@ -1684,7 +1732,6 @@ class TestStaleCasAbortLeavesTheRestAlone:
         submission order for the next round's ``chain_snapshot``.
         """
         from orchestrator.git_ops import AdvanceOutcome
-        from orchestrator.merge_types import ItemLifecycleState
 
         s = await self._aborting_scene(
             git_repo, tmp_path, monkeypatch,
@@ -1697,14 +1744,12 @@ class TestStaleCasAbortLeavesTheRestAlone:
             req = reqs[tid]
             assert not req.result.done(), f'task {tid} must render NO outcome'
             assert _lane_of(worker, tid) is not None, f'task {tid} left its buffer'
-            assert worker._lifecycle.current(req.request_id) == (
-                ItemLifecycleState.LANE_BUFFERED
-            ), f'task {tid} left LANE_BUFFERED'
+            assert _state_of(worker, req.request_id) == 'queued', (
+                f'task {tid} stopped waiting for the merger'
+            )
         # Submission order preserved inside the lane, so the next round's
         # chain_snapshot sees the same prefix it would have seen without δ.
-        assert [
-            r.task_id for r in worker._lane_buffers['normal']
-        ] == ['103', '104', _DELTA_TRUNCATOR]
+        assert _queued_task_ids(worker, 'normal') == ['103', '104', _DELTA_TRUNCATOR]
 
     async def test_the_walk_stops_at_the_first_failure(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
@@ -1779,7 +1824,9 @@ class TestStaleCasAbortLeavesTheRestAlone:
         # walks lane buffers), which is a different scenario.  Everything the
         # claim is about — the three links — is still buffered where round 1
         # left it, so the rebuild sees exactly the prefix it saw before.
-        assert worker._queue.qsize() == 1, 'the fail arm must have requeued the head'
+        assert _queued_request_ids(worker)[-1] == s['reqs']['101'].request_id, (
+            'the fail arm must have requeued the head, behind the links'
+        )
         item2 = dataclasses.replace(
             s['item'], merge_wt=_ephemeral_merge_wt(git_ops, 'tipfail2'),
         )
@@ -1921,8 +1968,6 @@ class TestContendedLeaseDeferInheritance:
         self, which: str, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
         """Never the bare-RuntimeError -> ``MergeOutcome('blocked')`` path."""
-        from orchestrator.merge_types import ItemLifecycleState
-
         exc = (
             self._contended(tmp_path) if which == 'contended'
             else self._held(tmp_path)
@@ -1938,9 +1983,7 @@ class TestContendedLeaseDeferInheritance:
                 f'task {tid} rendered an outcome on a transient lane refusal'
             )
             assert _lane_of(worker, tid) is not None
-            assert worker._lifecycle.current(reqs[tid].request_id) == (
-                ItemLifecycleState.LANE_BUFFERED
-            )
+            assert _state_of(worker, reqs[tid].request_id) == 'queued'
         # …and the prefix that DID land is untouched by the defer.
         for tid in ('101', '102'):
             assert reqs[tid].result.result().status == 'done'
@@ -3772,16 +3815,20 @@ def _delta_round_transcript(scene: _DeltaScene, idx: int) -> dict:
     did the round advance main, and did anything carry δ's landing stamp.
     """
     rec = scene.calls[idx]
-    posted = scene.posted[idx]
+    # The round's verify is read off the event the dispatcher emits, not off a
+    # stub's recorded kwargs: `merge_verify` carries merge_sha / depth /
+    # chain_items (verify_runner.py:2328-2349), so the transcript is a fact
+    # about what the lane published rather than about what a double captured.
+    verify = _event_rows(scene.db_path, 'merge_verify')[idx]
     item = rec['item']
     outcome = rec['req'].result.result() if rec['req'].result.done() else None
     return {
         'chain': rec['chain'],
-        'chain_items': rec['chain_items'],
-        'depth': rec['depth'],
+        'chain_items': verify['chain_items'],
+        'depth': verify['depth'],
         'probe_base': rec['probe_base'],
         'verified_the_items_own_merge_commit':
-            posted['merge_sha'] == item.merge_result.merge_commit,
+            verify['merge_sha'] == item.merge_result.merge_commit,
         'result_status': rec['result'].status,
         'result_has_worktree': rec['result'].merge_wt is not None,
         'advanced': rec['advanced'],
@@ -3909,18 +3956,16 @@ class TestDeepLandingEndToEnd:
                 f'task {tid} was handed a verdict no verify produced'
             )
         assert not scene.reqs['101'].result.done()
-        # Every FOLLOWER kept its exact lane slot — the chain took nothing.
-        assert {
-            lane: [r.task_id for r in scene.worker._lane_buffers[lane]]
-            for lane in ('high', 'normal')
-        } == {'high': [], 'normal': list(_DELTA_E2E_FOLLOWERS)}, (
-            'the chain mutated the queue on a red tip'
-        )
-        # The head itself went back on `_queue` through the requeue chokepoint,
-        # unresolved — "deferred", not "failed".
-        assert scene.worker._queue.qsize() == 1
+        # Every FOLLOWER kept its exact lane slot — the chain took nothing —
+        # and the head itself went back on the queue through the requeue
+        # chokepoint, behind them, unresolved: "deferred", not "failed".
+        assert _queued_task_ids(scene.worker) == [
+            *_DELTA_E2E_FOLLOWERS, '101',
+        ], 'the chain mutated the queue on a red tip'
+        assert _queued_task_ids(scene.worker, 'high') == []
+        # Taking it back off is a DRIVE, not an observation: round 2 re-dispatches
+        # this very request, and a copy left on the queue would land twice.
         requeued = scene.worker._queue.get_nowait()
-        assert requeued is scene.reqs['101']
         assert not requeued.result.done()
         assert scene.worker._chain_halving_state == max(1, 4 // 2)
 
