@@ -203,7 +203,10 @@ class TestTheArchiveInclusiveGateCheckIsDocumented:
     to be asserted separately rather than assumed covered.
     """
 
-    _MARKER = "agent_role=DETERMINISTIC_AGENT_ROLE"
+    #: The gate check's OWN call — the two-argument, `status`-less form.
+    #: `agent_role=DETERMINISTIC_AGENT_ROLE` alone appears more than once in
+    #: harness.py, so anchoring on that would find an unrelated site.
+    _MARKER = 'tid, agent_role=DETERMINISTIC_AGENT_ROLE,'
 
     def test_the_gate_check_is_still_archive_inclusive(self) -> None:
         source = _module_source('harness.py')

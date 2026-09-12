@@ -6358,9 +6358,9 @@ class Scheduler:
 
             # Shared with the Harness's twin adapter rather than hand-rolled
             # here: classify_pins is consulted ONLY to bucket the ids for the
-            # payload and never for the veto answer — that stays the caller's
-            # own untouched ``bool(rows)`` predicate (rewiring it is task
-            # 3541).
+            # payload, never for the veto answer.  Since task 3541 the caller
+            # has already decided, via `records_pin_blocked_recovery` — the
+            # same classification, read for the other question.
             pins = pin_buckets(task_id, rows, store_unavailable=store_unavailable)
             buckets = pins.buckets
 

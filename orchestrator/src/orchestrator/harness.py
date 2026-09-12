@@ -6100,22 +6100,25 @@ class Harness:
             #
             # CONVERSION IS NOT COMPLETION.  The converted row arrives in
             # `blocked` STILL CARRYING ITS PIN; its exit is a human or task
-            # 3541's `classify_pins` veto collapse, never an automatic
-            # self-heal.  No `done_provenance` is written and no escalation is
-            # filed — the task is already pinned, and a second record would be
+            # the shared `classify_pins` predicate ceasing to call its record
+            # pinning — a human resolves it, or the orphan-L0 reaper promotes a
+            # dead-filer L0 to L1 and a supervised consumer takes it.  Never an
+            # automatic self-heal.  No `done_provenance` is written and no
+            # escalation is filed — the task is already pinned, and a second record would be
             # the duplicate/competing-escalation hazard rows (g)/(h) exist to
             # avoid.
             #
             # That invariant is TRUE OF EVERY ROW THAT REACHES HERE because of
-            # the merge-remediable scoping clause above, not by luck: a pin
-            # inside `MERGE_REMEDIABLE_ESC_CATEGORIES` would be picked up again
-            # by the blocked-arm upgrade clauses on the next sweep, so those
-            # rows are held before they ever get here (review finding #3).
+            # the scoping clause above, not by luck: a row the blocked-arm
+            # upgrade clauses would move again next sweep is held before it
+            # ever gets here (review finding #3).  Since task 3541 that clause
+            # asks those clauses' OWN question, through the same shared
+            # predicate, so the two cannot drift apart.
             logger.warning(
                 'Reconcile: converting task %s in-progress -> blocked '
                 '(shape=%s, branch=%s, pinned by %s) — pinned and unclaimed, '
                 'so it can no longer be re-dispatched; it keeps its pin and '
-                'its exit is a human or task 3541, NOT a self-heal',
+                'its exit is a human or a resolved pin, NOT a self-heal',
                 tid,
                 recovery_shape_str(report),
                 report.branch_state.kind.value,
@@ -6381,11 +6384,19 @@ class Harness:
                 # — and the verified-green submit just declined (non-match).
                 # Re-filing would stack a SECOND stranded_blocked L1 on a task
                 # that already has one pending, so leave the existing
-                # escalation for its handler.  A plain truthiness check
-                # suffices: merge-remediable-ness is already established
-                # upstream, keeping _only_merge_remediable the sole category
-                # authority (INV-5).  The empty case — every task that reached
-                # here before δ — falls through to the unchanged re-file.
+                # escalation for its handler.
+                #
+                # CARVE-OUT (task 3541): this is the ONE surviving bare
+                # truthiness test over open_escalations in this file, and it is
+                # deliberate.  It is a DEDUP, not a veto — "would I be stacking
+                # a SECOND record?" — for which ANY open record is the right
+                # answer, info-severity and dead-L0 included: both would still
+                # be a duplicate sitting on the task.  It is reached only AFTER
+                # the shared predicate (`report_pins_blocked_recovery`, in the
+                # clauses above) has already let the caller through, so it
+                # re-derives no policy.  Asserted, not merely stated:
+                # test_recovery_veto_predicate_collapse.py allowlists exactly
+                # this site and requires this comment.
                 if report.open_escalations:
                     return None
 
@@ -10541,9 +10552,10 @@ class Harness:
           the healthy majority of every sweep, and emitting for it would bury
           the strands this mechanism exists to surface.
 
-        ``classify_pins`` is consulted ONLY to bucket ids for the payload; the
-        veto answer stays with the caller's own untouched predicate (rewiring
-        that is task eta / 3541).
+        ``classify_pins`` is consulted ONLY to bucket ids for the payload.
+        Since task 3541 the veto answer is the caller's, taken from the SAME
+        classifier through ``orchestrator.recovery_pins`` before it ever
+        reaches this method — describing and deciding stay separate.
 
         ``task_id=None`` is a PROCESS-scoped notice with no single subject —
         "this whole site has no escalation queue to read".  With no subject
@@ -14716,6 +14728,25 @@ class Harness:
                     # predicates that stays separate and documented, so
                     # emitting here would blur a boundary drawn on purpose.
                     # Its silence is asserted by a test, not accidental.
+                    #
+                    # CARVE-OUT (task 3541): this check STAYS separate from the
+                    # shared pin predicate, and the reason is the question it
+                    # asks.  Every pin predicate reads only OPEN records and
+                    # asks "is a handoff still holding this task?".  This one
+                    # asks "did a human already ACT?", which is why `status` is
+                    # unset — the read is archive-INCLUSIVE, so a RESOLVED
+                    # record counts.  Narrowing it to `status='pending'` to
+                    # match the pin reads would make a human-resolved gate look
+                    # like a fresh strand and re-fire over it.
+                    #
+                    # PRD D3 names a SECOND carve-out,
+                    # `workflow.py::_is_gating_escalation`.  That one is
+                    # PRODUCER-side and task 3541 deliberately does not touch
+                    # it: task 5222 owns narrowing it (and the
+                    # `_wait_for_resolution` short-circuit) onto
+                    # `escalation.pins.is_queue_handoff` from task 5221, so a
+                    # comment there claiming permanence would be false on
+                    # arrival.  The boundary is recorded here instead.
                     if self._escalation_queue.get_by_task(
                         tid, agent_role=DETERMINISTIC_AGENT_ROLE,
                     ):
