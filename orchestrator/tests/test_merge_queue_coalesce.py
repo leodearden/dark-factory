@@ -1019,6 +1019,21 @@ class TestDebounce:
 
 # ─── Step 13 ────────────────────────────────────────────────────────────────
 
+def _gated_verify(
+    gate_release: asyncio.Event,
+    gate_entered: asyncio.Event | None = None,
+):
+    """A ``run_scoped_verification``-shaped gate wrapping :class:`_GatedVerifier`.
+
+    For the two callers that must still patch the module global rather than
+    inject the port: the TRAIN scene below (see its comment — _do_train_merge
+    does not forward the worker's verifier) and out-of-group
+    test_coalesce_integration_gate.py, which imports this name. One gate
+    implementation, two ways of installing it.
+    """
+    return AsyncMock(side_effect=_GatedVerifier(gate_release, gate_entered).run_scoped)
+
+
 class _GatedVerifier(FakeVerifier):
     """The verify port, holding its FIRST verify open until *gate_release*.
 
@@ -1147,7 +1162,7 @@ class TestEndToEndWiring:
         # object the port-injected scenes use, not a second implementation.
         with patch(
             'orchestrator.merge_queue.run_scoped_verification',
-            AsyncMock(side_effect=_GatedVerifier(gate_release, gate_entered).run_scoped),
+            _gated_verify(gate_release, gate_entered),
         ):
             worker_task = asyncio.create_task(worker.run())
 
