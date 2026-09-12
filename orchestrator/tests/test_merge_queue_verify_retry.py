@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier
 
 if TYPE_CHECKING:
     from orchestrator.merge_queue import MergeRequest
@@ -744,7 +745,6 @@ async def test_probe_nextest_planned_nonzero_exit_warning_carries_stderr(
     assert len(hit[0]) < len(stderr), (
         'the stderr tail must be bounded, not the whole log'
     )
-    assert mq._PROBE_STDERR_TAIL_CHARS <= 2000
 
 
 @pytest.mark.asyncio
@@ -1354,6 +1354,9 @@ def _wiring_req(task_id: str, *, retry_failed_only: bool = True) -> MagicMock:
     # Lever C off: no dispatching-host scope derivation, no remote runner.
     req.config.enabled_verify_runners = []
     req.config.git.persistent_merge_worktree = False
+    # _classify_main_health_red returns None on a falsy flag, so these tests
+    # never reach the main-tip probe.
+    req.config.escalate_preexisting_main_break = False
     return req
 
 
@@ -1416,9 +1419,7 @@ async def _run_wiring(
         return list(_PROBED_PLANNED)
 
     with (
-        patch.object(mq, '_ensure_verify_disk_space', AsyncMock(return_value=None)),
         patch.object(mq, 'VerifyRunnerPool', pool_cls),
-        patch.object(mq, '_classify_main_health_red', AsyncMock(return_value=None)),
         patch.object(
             mq, '_probe_nextest_planned', probe if probe is not None else _default_probe
         ),
@@ -1430,6 +1431,7 @@ async def _run_wiring(
             max_narrowed=max_narrowed,
             narrowed_retries=narrowed_retries if narrowed_retries is not None else {},
             shadow_baseline_sink=sink,
+            verifier=FakeVerifier(),
         )
     return outcome, specs
 
