@@ -13967,6 +13967,10 @@ class _ScriptedVerifier(FakeVerifier):
 
     ``scoped_calls`` and ``disk_guard_calls`` record what each step was asked,
     the way the parent records ``verified`` and ``investigations``.
+
+    Per-CALL and the parent's per-TASK-ID scripting are mutually exclusive:
+    the parent resolves ``scripts[task_id]`` first, so a caller that supplied
+    both would silently never run its ``answers``.
     """
 
     def __init__(
@@ -13977,6 +13981,18 @@ class _ScriptedVerifier(FakeVerifier):
         disk_reasons: Sequence[str | None] = (None,),
         **kwargs: Any,
     ) -> None:
+        if answers and 'scripts' in kwargs:
+            raise TypeError(
+                '_ScriptedVerifier answers per call: `answers` and the parent '
+                "FakeVerifier's per-task `scripts` cannot both be supplied, "
+                'because the task-id script wins and no answer would ever run.'
+            )
+        if not disk_reasons:
+            raise ValueError(
+                '`disk_reasons` must name at least one outcome — the last entry '
+                'is what repeats once the script is exhausted. Omit the argument '
+                'for the always-free default.'
+            )
         super().__init__(**kwargs)
         self.answers = list(answers)
         self.gates = list(gates)
@@ -13986,14 +14002,27 @@ class _ScriptedVerifier(FakeVerifier):
 
     @staticmethod
     def _consume(script: list[Any]) -> Any:
-        """Take the next entry, or keep answering with the last one."""
+        """Take the next entry, or keep answering with the last one.
+
+        Every caller guarantees a non-empty script — ``answers`` and ``gates``
+        at their call sites, ``disk_reasons`` in ``__init__`` — so this says so
+        by name rather than letting an empty list surface as an IndexError from
+        somewhere inside the step it was scripting.
+        """
+        assert script, '_consume called with an empty script'
         return script.pop(0) if len(script) > 1 else script[0]
 
     async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
         self.scoped_calls.append(options)
-        if self.answers:
-            self.default = self._consume(self.answers)
-        return await super().run_scoped(*args, **options)
+        if not self.answers:
+            return await super().run_scoped(*args, **options)
+        # This call's answer is played through a parent instance holding it as
+        # its only script: how a VerifyScript resolves (release / error /
+        # result) stays defined in exactly one place, and `self.default` is
+        # never rewritten to smuggle the answer down into the parent.
+        self.verified.append(options.get('task_id'))  # recorded as the parent would
+        answer = FakeVerifier(default=self._consume(self.answers))
+        return await answer.run_scoped(*args, **options)
 
     async def run_unscoped_typechecks(self, *args: Any, **options: Any) -> Any:
         if not self.gates:
@@ -22806,6 +22835,10 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         # Non-existent path
         gone_path = git_ops.worktree_base / '_merge-gone-enoent'
         worker._owned_merge_worktrees.add(gone_path)
+        assert gone_path in _ledger_paths(worker), (
+            'seeded path must be visible in the published ledger, or the '
+            'removal assertion below passes vacuously'
+        )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             n = worker._touch_owned_merge_worktrees()
@@ -22950,10 +22983,15 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         clock rather than wall time: ``_heartbeat_loop`` awaits
         ``self._clock.sleep(_HEARTBEAT_POLL_S)``, so a ``FakeClock`` both
         records every tick the loop asks for and returns from it immediately.
-        That makes the two assertions exact instead of probabilistic — "it
-        ticked" is a recorded sleep, and "it stopped" is the recorded count no
-        longer growing — where the previous wall-clock version raced a real
-        0.02 s poll against a 1 s deadline and a 0.12 s "> 2× poll" margin.
+        "It ticked" is therefore an exact recorded sleep count rather than the
+        previous wall-clock version's race between a real 0.02 s poll, a 1 s
+        deadline and a 0.12 s "> 2× poll" margin.
+
+        "It stopped" is the un-cancelled ``asyncio.wait_for(task)`` returning:
+        the loop is never parked in a real sleep, so clearing ``_running`` is
+        the ONLY thing that can end it, and a loop that ignored the flag fails
+        here as a timeout. Sampling the clock again after that join would prove
+        nothing — the task is already finished, so no tick could follow.
 
         Nothing here patches ``_HEARTBEAT_POLL_S``: with the clock injected,
         how long a tick claims to be no longer costs the test anything.
@@ -23000,21 +23038,6 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             # measured, it does: with `while self._running` mutated to
             # `while True` the cancel-then-await version still passed.
             await asyncio.wait_for(task, timeout=5)
-
-        # The task is done before sampling, so a final in-flight tick cannot
-        # fire inside the observation window.
-        assert task.done(), 'Heartbeat task must be done once _running is cleared'
-        frozen_mtime = merge_wt.stat().st_mtime
-        ticks_at_stop = len(clock.sleeps)
-        for _ in range(50):
-            await asyncio.sleep(0)
-        assert len(clock.sleeps) == ticks_at_stop, (
-            f'the stopped loop kept asking the clock to sleep: '
-            f'{ticks_at_stop} -> {len(clock.sleeps)}'
-        )
-        assert merge_wt.stat().st_mtime == frozen_mtime, (
-            'mtime advanced after worker stopped — heartbeat leaked'
-        )
 
         await git_ops.cleanup_merge_worktree(merge_wt)
 
@@ -23100,6 +23123,10 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         assert merge_wt_a is not None and merge_wt_a.exists()
 
         worker._owned_merge_worktrees.add(merge_wt_a)
+        assert merge_wt_a in _ledger_paths(worker), (
+            'seeded path must be visible in the published ledger, or the '
+            'deregistration assertion below passes vacuously'
+        )
         await worker._cleanup_owned_merge_worktree(merge_wt_a)
 
         assert merge_wt_a not in _ledger_paths(worker), (
@@ -23117,6 +23144,10 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         assert merge_wt_b is not None
 
         worker._owned_merge_worktrees.add(merge_wt_b)
+        assert merge_wt_b in _ledger_paths(worker), (
+            'seeded path must be visible in the published ledger, or the '
+            'deregistration assertion below passes vacuously'
+        )
 
         original_cleanup = git_ops.cleanup_merge_worktree
 
