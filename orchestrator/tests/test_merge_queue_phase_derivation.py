@@ -39,6 +39,12 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 
+# The worker reports every age against its own clock, so pinning that clock is
+# what makes ``snapshot()``'s ages assertable: a request enqueued ENTRY_AGE_SECS
+# before NOW reports exactly that age.
+NOW = 1_000_000.0
+ENTRY_AGE_SECS = 42.0
+
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
 # test_merge_queue_lifecycle_registry.py; there is no shared worker conftest).
@@ -120,6 +126,7 @@ def _make_request(
         config=config,
         result=asyncio.get_running_loop().create_future(),
         lane='normal',
+        enqueued_at=NOW - ENTRY_AGE_SECS,
     )
 
 
@@ -197,6 +204,11 @@ class TestPhaseDerivesFromRegistry:
 
         snap = worker.snapshot()
         assert snap['entries'][0]['state'] == 'verifying'
+        assert snap['depth'] == 1
+        assert snap['entries'][0]['age_secs'] == ENTRY_AGE_SECS, (
+            'the entry is aged by the worker\'s own clock; got '
+            f"{snap['entries'][0]['age_secs']!r}."
+        )
         assert snap['verify_in_progress']['phase'] == 'verifying'
         assert rid in worker.frozen_prefix()
 
@@ -296,11 +308,12 @@ class TestInflightEntryHasNoPhaseField:
         )
         worker._inflight.append(entry)
 
-        assert worker._entry_phase(entry) == 'verifying', (
-            f'expected _entry_phase to derive verifying from the registry '
-            f'for {rid!r} with no phase field present on the entry.'
-        )
-
         snap = worker.snapshot()
-        assert snap['entries'][0]['state'] == 'verifying'
+        assert snap['depth'] == 1
+        assert snap['entries'][0]['state'] == 'verifying', (
+            f'expected the reported state to derive verifying from the '
+            f'registry for {rid!r} with no phase field present on the entry; '
+            f"got {snap['entries'][0]['state']!r}."
+        )
+        assert snap['entries'][0]['age_secs'] == ENTRY_AGE_SECS
         assert snap['verify_in_progress']['phase'] == 'verifying'
