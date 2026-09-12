@@ -1339,3 +1339,232 @@ class TestReviewerEscalationPromotion:
             checkpoint.escalation_queue, synthetic, seconds_ago=1.0, level=1,
         )
         assert checkpoint._promote_reviewer_escalations(review_id) == 0
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta), part 4 — THE IMMORTAL-L0 FIX (spec S6).
+#
+# The reaper's two liveness gates (`esc.task_id in _escalation_events`, and
+# `scheduler.is_actively_held`) ask "is ANY workflow live for this task?".
+# Spec S6 says the question is a different one: "is the incarnation that FILED
+# this record still live?"  A newer incarnation never keeps a prior
+# incarnation's unconsumed L0 alive — but under the task-level gates it does,
+# forever, because a re-dispatched task is perpetually "live".
+#
+# The gates also move BELOW the age check, so the cheap filters stay cheap: a
+# `get_task` is paid only for records that are BOTH aged out AND currently
+# deferred, and it is reused by the divergence / done-step-commit branches
+# rather than adding a second RPC.
+# ---------------------------------------------------------------------------
+
+_FILER_ID = 'run-old/sess-old/pid=111'
+_LIVE_ID = 'run-new/sess-new/pid=222'
+
+
+def _submit_aged_blocking(
+    queue: EscalationQueue,
+    task_id: str,
+    seconds_ago: float,
+    *,
+    filing_claimant_run_id: str | None = None,
+    severity: str = 'blocking',
+) -> Escalation:
+    """An aged L0 that is L0-LEGAL and non-info, so link 4 can decide it.
+
+    `_submit_aged`'s default `severity='info'` buckets NON_PINNING at link 1,
+    which is neither `dead_l0` nor `queue_handoff` — correct for the tests that
+    use it, and deliberately outside the new promotion arm.
+    """
+    ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='implementer',
+        severity=severity,
+        category='design_concern',
+        summary=f'aged {seconds_ago}s',
+        detail='detail',
+        suggested_action='investigate',
+        timestamp=ts,
+        level=0,
+        filing_claimant_run_id=filing_claimant_run_id,
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _make_live(harness: Harness, tid: str, *, claimant_run_id: str | None) -> AsyncMock:
+    """Make *tid* read as held by an incarnation stamped *claimant_run_id*."""
+    harness.scheduler.is_actively_held = MagicMock(return_value=True)
+    getter = AsyncMock(return_value={
+        'status': 'in-progress',
+        'claimant_run_id': claimant_run_id,
+        'metadata': {},
+    })
+    harness.scheduler.get_task = getter  # type: ignore[method-assign]
+    return getter
+
+
+@pytest.mark.asyncio
+class TestOrphanL0PromotesOnFilingIncarnationDeath:
+    """Spec S6: liveness is judged against the FILER, never against the task."""
+
+    async def test_a_prior_incarnations_l0_is_promoted_under_a_newer_workflow(
+        self, harness: Harness,
+    ) -> None:
+        """THE FIX.  Both task-level gates say "live"; the record still promotes.
+
+        Without it this record is immortal: every sweep sees a live workflow
+        for the task and defers, while the incarnation that could consume the
+        handoff died long ago.
+        """
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        harness._escalation_events['T1'] = MagicMock()
+        _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+    async def test_the_filers_own_live_l0_is_still_deferred(
+        self, harness: Harness,
+    ) -> None:
+        """A genuinely live handoff — the consumer is still there to consume it."""
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        _make_live(harness, 'T1', claimant_run_id=_FILER_ID)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+    @pytest.mark.parametrize(
+        ('filed_by', 'live_id'),
+        [
+            pytest.param(None, _LIVE_ID, id='legacy-record-no-filing-identity'),
+            pytest.param(_FILER_ID, None, id='in-memory-holder-no-identity'),
+            pytest.param('bare-session-id', _LIVE_ID, id='filer-not-composed'),
+            pytest.param(_FILER_ID, 'bare-session-id', id='live-not-composed'),
+            pytest.param('', _LIVE_ID, id='blank-filing-identity'),
+        ],
+    )
+    async def test_every_unprovable_case_is_still_deferred(
+        self, harness: Harness, filed_by: str | None, live_id: str | None,
+    ) -> None:
+        """FAIL-SAFE, inherited from `classify_pins` rather than re-derived.
+
+        The classifier may only convert an L0 when it can PROVE the filing
+        incarnation dead.  An unknown identity on EITHER side — absent, blank,
+        or not in `compose_claimant_run_id` shape — is not proof, so the record
+        stays a QUEUE_HANDOFF and the reaper behaves exactly as it does today.
+        """
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=filed_by,
+        )
+        _make_live(harness, 'T1', claimant_run_id=live_id)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+    async def test_no_live_incarnation_promotes_without_a_task_read(
+        self, harness: Harness,
+    ) -> None:
+        """UNCHANGED, and still free: the common case pays no `get_task`."""
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        getter = AsyncMock(return_value={'status': 'in-progress', 'metadata': {}})
+        harness.scheduler.get_task = getter  # type: ignore[method-assign]
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+        getter.assert_not_awaited()
+
+    async def test_a_young_record_is_skipped_without_a_task_read(
+        self, harness: Harness,
+    ) -> None:
+        """The gates moved BELOW the age check, so cheap filters stay cheap."""
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 1.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        getter = _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+        getter.assert_not_awaited()
+
+    async def test_at_most_one_task_read_per_record(
+        self, harness: Harness,
+    ) -> None:
+        """The divergence branch reuses the row this arm already fetched."""
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        getter = _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
+
+        await harness._reap_orphan_l0_escalations()
+
+        assert getter.await_count <= 1, (
+            f'one record must cost at most one get_task, got '
+            f'{getter.await_count}'
+        )
+
+
+@pytest.mark.asyncio
+class TestInfoSeverityL0IsUntouchedByThisArm:
+    """THE AMENDMENT RESTRICTION, asserted explicitly rather than incidentally.
+
+    An info L0 buckets NON_PINNING at link 1, so it is neither `dead_l0` nor
+    `queue_handoff` and the `dead_l0`-only guard leaves it exactly where it is.
+    Task 5223 owns replacing the info-L0 path wholesale and must not find it
+    already moved.
+    """
+
+    async def test_an_info_l0_is_still_deferred_while_any_workflow_is_live(
+        self, harness: Harness,
+    ) -> None:
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID, severity='info',
+        )
+        _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
+
+        assert await harness._reap_orphan_l0_escalations() == 0, (
+            'an info L0 must NOT ride the new dead-filer promotion arm'
+        )
+
+    async def test_an_info_l0_is_still_promoted_when_nothing_is_live(
+        self, harness: Harness,
+    ) -> None:
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID, severity='info',
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+
+@pytest.mark.asyncio
+class TestPromotedRecordStillCarriesTheReapersIdentity:
+    """The promoted L1 is stamped by the REAPER, not by the dead filer."""
+
+    async def test_the_promoted_l1_carries_the_reapers_filing_identity(
+        self, harness: Harness,
+    ) -> None:
+        _submit_aged_blocking(
+            harness._escalation_queue, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        harness._escalation_events['T1'] = MagicMock()
+        _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        promoted = [
+            e for e in harness._escalation_queue.get_pending() if e.level == 1
+        ]
+        assert len(promoted) == 1
+        assert promoted[0].filing_claimant_run_id == harness._filing_claimant_run_id
+        assert promoted[0].filing_claimant_run_id != _FILER_ID
