@@ -4495,3 +4495,288 @@ class TestReconcileSweepSummaryAlwaysSpeaks:
             r for r in caplog.records
             if r.levelno >= logging.WARNING and 'held=' in r.getMessage()
         ] == []
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the IN-PROGRESS APPLIER stops re-deriving resolver policy.
+#
+# E7 names this site: "the in-progress applier re-derives resolver policy in
+# guard order (INV-5)".  Its `if report.open_escalations: return None` is the
+# fifth hand-rolled `bool(open)` copy, and it now disagrees with the resolver —
+# `_shape` stopped counting an info record as a pin in step-4, but this guard
+# still holds the strand, so the revert boundary #8 asks for never happens.
+#
+# The surgical change is the PREDICATE only.  The rest of the tail STAYS, and
+# these tests pin why: the log-mode downgrade must still hold a pinned strand
+# (demand-1), and the R3 mid-run PLAN_LOCK exception is a fact `_shape`
+# structurally cannot express.
+# ---------------------------------------------------------------------------
+
+
+def _submit_open(
+    harness: Harness,
+    tmp_path: Path,
+    tid: str,
+    *,
+    severity: str = 'blocking',
+    category: str = 'task_failure',
+    level: int = 1,
+) -> Escalation:
+    """Bind a real queue and open ONE record on *tid*."""
+    harness._escalation_queue = EscalationQueue(tmp_path / f'esc_{tid}')
+    esc = Escalation(
+        id=harness._escalation_queue.make_id(tid),
+        task_id=tid,
+        agent_role='steward',
+        severity=severity,
+        category=category,
+        summary=f'{severity} {category} on {tid}',
+        level=level,
+        status='pending',
+    )
+    harness._escalation_queue.submit(esc)
+    return esc
+
+
+def _off_main_in_progress(harness: Harness, tid: str) -> None:
+    """Wire *tid* as a stranded in-progress task whose branch is EXISTS_OFF_MAIN."""
+    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value='b' * 40)
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+
+
+@pytest.mark.asyncio
+class TestInProgressApplierConsumesTheSharedPredicate:
+    """The applier's veto becomes the resolver's own answer (INV-5)."""
+
+    async def test_log_mode_downgraded_pin_still_holds(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """DEMAND-1 REGRESSION GUARD — the case a naive deletion would break.
+
+        Under `convert_to_blocked_enforce=False` (the production default) a
+        CONVERT row is downgraded to LEAVE and falls all the way through to
+        this tail.  If the guard simply went away, the strand would be reverted
+        underneath its responder — precisely the violation conversion exists to
+        prevent.  The rewired predicate folds `downgraded_reason` in for this
+        reason, so the hold survives the rewiring.
+        """
+        harness.config.convert_to_blocked_enforce = False
+        _off_main_in_progress(harness, '3541')
+        _submit_open(harness, tmp_path, '3541')
+
+        result = await harness._reconcile_one_stranded(
+            '3541', 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()
+
+    async def test_info_only_strand_is_reverted_to_pending(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """PRD boundary #8, END TO END through the applier.
+
+        Step-4's resolver change is what delivers this one: `_shape` keys row
+        (c), and the explicit `action == REVERT_TO_PENDING` arm returns BEFORE
+        the guard tail, so the tail's own `bool(open_escalations)` copy never
+        sees it.  Pinned here anyway, because the tail is what step-6 edits and
+        nothing else asserts that the two cannot start disagreeing about this
+        shape.
+        """
+        _off_main_in_progress(harness, '3542')
+        _submit_open(harness, tmp_path, '3542', severity='info', level=0)
+
+        result = await harness._reconcile_one_stranded(
+            '3542', 'in-progress', mid_run=False,
+        )
+
+        assert result == 'reverted'
+        harness.scheduler.set_task_status.assert_awaited_once_with('3542', 'pending')
+
+    async def test_dead_l0_strand_is_still_held(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """A dead-filer L0 keys the CONVERT rows, so log mode holds it.
+
+        `records_pin_recovery` alone would call this unpinned — the hold comes
+        from `downgraded_reason`, which is exactly why that disjunct is not
+        redundant.
+        """
+        harness.config.convert_to_blocked_enforce = False
+        _off_main_in_progress(harness, '3543')
+        _submit_open(harness, tmp_path, '3543', level=0)
+
+        result = await harness._reconcile_one_stranded(
+            '3543', 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()
+
+    async def test_pinned_hold_emits_exactly_one_recovery_row(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The chokepoint owns the emission; the tail must not double it."""
+        harness.config.convert_to_blocked_enforce = False
+        _off_main_in_progress(harness, '3544')
+        _submit_open(harness, tmp_path, '3544')
+
+        with patch.object(
+            harness, '_emit_recovery_disposition', wraps=harness._emit_recovery_disposition,
+        ) as spy:
+            await harness._reconcile_one_stranded('3544', 'in-progress', mid_run=False)
+
+        assert spy.call_count == 1, (
+            'the tail arm is belt-and-braces for a future refactor, not a '
+            'second live emission path'
+        )
+
+
+@pytest.mark.asyncio
+class TestMidRunPlanLockExceptionSurvives:
+    """R3: a fact `_shape` structurally cannot express, so the tail keeps it.
+
+    A plan.lock's `owner_pid` is usually the harness's OWN pid, so a live lock
+    proves nothing mid-run — while `_shape` sees only `live_claimant is not
+    None`.  Deleting the applier tail wholesale would drop this recovery path.
+    """
+
+    @staticmethod
+    def _stage_live_plan_lock(harness: Harness, tid: str) -> None:
+        worktree = harness.git_ops.worktree_base / tid
+        worktree.mkdir(parents=True, exist_ok=True)
+        lock_dir = _resolver_lock_dir(worktree)
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'plan.lock').write_text(json.dumps({
+            'session_id': f'{tid}-x',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        }))
+
+    async def test_mid_run_plan_lock_claimant_with_no_records_reverts(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc_r3_empty')
+        _off_main_in_progress(harness, '3545')
+        self._stage_live_plan_lock(harness, '3545')
+
+        result = await harness._reconcile_one_stranded(
+            '3545', 'in-progress', mid_run=True,
+        )
+
+        assert result == 'reverted'
+        harness.scheduler.set_task_status.assert_awaited_once_with('3545', 'pending')
+
+    async def test_mid_run_plan_lock_claimant_with_a_pinning_record_holds(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        _off_main_in_progress(harness, '3546')
+        _submit_open(harness, tmp_path, '3546')
+        self._stage_live_plan_lock(harness, '3546')
+
+        result = await harness._reconcile_one_stranded(
+            '3546', 'in-progress', mid_run=True,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()
+
+    async def test_mid_run_plan_lock_claimant_with_an_info_record_reverts(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """THE reachable disposition the tail's predicate actually decides.
+
+        A live claimant sends the report to the table's LEAVE default, so this
+        shape reaches the guard tail with a non-empty `open_escalations` — the
+        one live route that does.  Today the tail's `bool(open_escalations)`
+        copy holds it, which pins a strand on an ANNOTATION and silently
+        overrides the R3 mid-run PLAN_LOCK recovery path.  With the shared
+        predicate the record does not pin, and R3 recovers the strand exactly
+        as it does when no record is open at all.
+        """
+        _off_main_in_progress(harness, '3547')
+        _submit_open(harness, tmp_path, '3547', severity='info', level=0)
+        self._stage_live_plan_lock(harness, '3547')
+
+        result = await harness._reconcile_one_stranded(
+            '3547', 'in-progress', mid_run=True,
+        )
+
+        assert result == 'reverted'
+        harness.scheduler.set_task_status.assert_awaited_once_with('3547', 'pending')
+
+    async def test_mid_run_plan_lock_claimant_with_a_dead_l0_still_holds(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """Fail-safe: a plan.lock with no run_id resolves an UNKNOWN identity.
+
+        `classify_pins` may only convert an L0 when it can PROVE the filing
+        incarnation dead.  It cannot here — neither side carries a composed
+        identity — so the record stays a QUEUE_HANDOFF and the hold survives.
+        """
+        _off_main_in_progress(harness, '3548')
+        _submit_open(harness, tmp_path, '3548', level=0)
+        self._stage_live_plan_lock(harness, '3548')
+
+        result = await harness._reconcile_one_stranded(
+            '3548', 'in-progress', mid_run=True,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()
+
+
+class TestApplierHasNoLocalOpenEscalationTruthiness:
+    """The grep-provable half, scoped to this one method.
+
+    `_reconcile_one_stranded` may test `report.open_escalations` for truthiness
+    in exactly ONE place — the re-file DEDUP guard, which asks a DIFFERENT
+    question ("would I be stacking a second record?") for which any open
+    record, info or dead-L0 included, is the right answer.  The allowlist names
+    it by its own source so the carve-out is asserted, not assumed.
+    """
+
+    #: A source fragment unique to the one permitted site (task 3541's
+    #: design decision).  Matched on TEXT, never on a line number, so it does
+    #: not rot as the file drifts.
+    _DEDUP_GUARD_MARKER = 'Re-filing would stack a SECOND stranded_blocked L1'
+
+    @staticmethod
+    def _method_source() -> str:
+        import inspect
+
+        return inspect.getsource(Harness._reconcile_one_stranded)
+
+    def test_only_the_dedup_guard_tests_open_escalations_for_truth(self) -> None:
+        import ast
+        import textwrap
+
+        lines = textwrap.dedent(self._method_source()).splitlines()
+        offenders = [
+            node.lineno
+            for node in ast.walk(ast.parse('\n'.join(lines)))
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Attribute)
+            and node.test.attr == 'open_escalations'
+            and isinstance(node.test.value, ast.Name)
+            and node.test.value.id == 'report'
+        ]
+
+        assert len(offenders) <= 1, (
+            '_reconcile_one_stranded re-derives the veto locally at '
+            f'{len(offenders)} sites (method-relative lines {offenders}) — '
+            'every recovery veto must consume the shared predicate (INV-5)'
+        )
+        if offenders:
+            # The survivor must be the DEDUP guard, whose body is a bare
+            # `return None` — not a veto arm with an emission.
+            assert lines[offenders[0]].strip() == 'return None', lines[offenders[0]]
+
+    def test_the_dedup_carve_out_is_documented_in_code(self) -> None:
+        source = self._method_source()
+        assert self._DEDUP_GUARD_MARKER in source, (
+            'the one permitted bare truthiness test must keep its comment '
+            'explaining that it is a dedup, not a veto'
+        )
