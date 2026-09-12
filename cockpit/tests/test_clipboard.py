@@ -181,3 +181,79 @@ class TestRunClipboardCommand:
         code = run_clipboard_command(['sh', '-c', 'sleep 30'], 'payload', timeout=0.2)
 
         assert code != 0
+
+
+class RecordingRunner:
+    """A ClipboardRunner double: records (argv, text) per call, returns scripted codes.
+
+    `codes[i]` is the i-th call's return code; calls past the end reuse the
+    last entry, so a test only scripts the prefix it cares about.
+    """
+
+    def __init__(self, codes=(0,)):
+        self.calls: list[tuple[tuple[str, ...], str]] = []
+        self._codes = tuple(codes)
+
+    def __call__(self, argv, text):
+        self.calls.append((tuple(argv), text))
+        return self._codes[min(len(self.calls) - 1, len(self._codes) - 1)]
+
+
+class TestCopyToSystemClipboard:
+    """The candidate walk, asserted at the process boundary it hands off to.
+
+    THIS is the assertion task 2517 never made: the exact argv and the exact
+    text that reach a clipboard helper. `app._clipboard` could not have made
+    it — Textual sets that attribute before the escape write and regardless
+    of whether the terminal understands OSC 52 at all.
+    """
+
+    def test_first_working_helper_receives_the_exact_argv_and_text(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(0,))
+
+        attempt = copy_to_system_clipboard(
+            _UNICODE_PAYLOAD, environ={'DISPLAY': ':0'}, which=_which_all, runner=runner
+        )
+
+        assert runner.calls == [(_XCLIP, _UNICODE_PAYLOAD)]
+        assert attempt == CopyAttempt(CopyOutcome.COPIED, _XCLIP)
+
+    def test_a_failing_helper_falls_through_to_the_next_candidate(self):
+        """rc 1 from xclip is not the end: xsel is tried, and COPIED names the one that worked."""
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(1, 0))
+
+        attempt = copy_to_system_clipboard(
+            'payload', environ={'DISPLAY': ':0'}, which=_which_all, runner=runner
+        )
+
+        assert [argv for argv, _ in runner.calls] == [_XCLIP, _XSEL]
+        assert attempt == CopyAttempt(CopyOutcome.COPIED, _XSEL)
+
+    def test_every_helper_failing_reports_helper_failed_with_the_last_command(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(1,))
+
+        attempt = copy_to_system_clipboard(
+            'payload', environ={'DISPLAY': ':0'}, which=_which_all, runner=runner
+        )
+
+        assert [argv for argv, _ in runner.calls] == [_XCLIP, _XSEL]
+        assert attempt == CopyAttempt(CopyOutcome.HELPER_FAILED, _XSEL)
+
+    def test_no_candidates_reports_no_helper_without_spawning_anything(self):
+        """The over-SSH case: NO_HELPER, no command, and the runner is never called."""
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(0,))
+
+        attempt = copy_to_system_clipboard(
+            'payload', environ={}, which=_which_all, runner=runner
+        )
+
+        assert runner.calls == []
+        assert attempt == CopyAttempt(CopyOutcome.NO_HELPER, ())
