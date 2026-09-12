@@ -195,8 +195,8 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 here that does not exist.
 #
 #   shared        W was RE-MEASURED by task 5131 under a real NINE-WAY gather
-#                 at base 1b3c50e98f, so unlike the other five entries here it
-#                 is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
+#                 at base 1b3c50e98f, so unlike the other entries drawn from
+#                 the task-3473 sweep it is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
 #                 4802 (+48%) over that epoch, but the worst-run wall clock
 #                 grew only ~35.5% (219.08s -> 296.88s) — LESS than the count
 #                 ratio predicts. Do NOT scale this figure by a test-count
