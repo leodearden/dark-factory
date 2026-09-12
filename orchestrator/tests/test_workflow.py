@@ -180,7 +180,7 @@ class TestSubmitToMergeQueuePlanTightening:
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
         events = _RecordingEventStore()
-        wf.event_store = events
+        wf.event_store = events  # type: ignore[assignment]
 
         # Stub architect: write a narrowed plan to disk so read_plan() returns it.
         async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
@@ -252,7 +252,7 @@ class TestSubmitToMergeQueuePlanTightening:
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
         events = _RecordingEventStore()
-        wf.event_store = events
+        wf.event_store = events  # type: ignore[assignment]
 
         # Architect leaves plan.json untouched.
         async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
@@ -300,7 +300,7 @@ class TestSubmitToMergeQueuePlanTightening:
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
         events = _RecordingEventStore()
-        wf.event_store = events
+        wf.event_store = events  # type: ignore[assignment]
 
         async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
             assert wf.artifacts is not None
@@ -1109,7 +1109,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
         events = _RecordingEventStore()
-        wf.event_store = events
+        wf.event_store = events  # type: ignore[assignment]
 
         submit_task = asyncio.create_task(
             wf._submit_to_merge_queue('B', merge_phase=True)
@@ -1240,7 +1240,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
         events = _RecordingEventStore()
-        wf.event_store = events
+        wf.event_store = events  # type: ignore[assignment]
 
         submit_task = asyncio.create_task(
             wf._submit_to_merge_queue('B', merge_phase=True)

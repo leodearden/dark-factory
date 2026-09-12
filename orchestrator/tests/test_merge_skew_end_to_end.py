@@ -487,10 +487,11 @@ class TestFirstAttemptSkewL1Escalation:
             # Queue and event_store is None (None-safe), so a drain task
             # standing in for the merge worker delivers the outcome — the
             # shape test_workflow.py and the model test both use.
-            workflow.merge_queue = asyncio.Queue()
+            merge_q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+            workflow.merge_queue = merge_q
 
             async def _drain() -> None:
-                request = await workflow.merge_queue.get()
+                request = await merge_q.get()
                 request.result.set_result(outcome)
 
             drain = asyncio.ensure_future(_drain())
