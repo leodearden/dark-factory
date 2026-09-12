@@ -4901,18 +4901,41 @@ class TestOrphanGuardPreservesCancellation:
 
         worker, item = self._make_worker_and_item(tmp_path)
 
-        real_warning = logging.getLogger('orchestrator.merge_queue').warning
+        class _WedgedFilter(logging.Filter):
+            """A real logging fault: a filter that raises on the guard's record.
 
-        def _explode(msg, *args, **kwargs):
-            if 'RunnerUnavailable' in str(msg):
-                raise RuntimeError('wedged log handler')
-            return real_warning(msg, *args, **kwargs)
+            Installed through the stdlib logging API rather than by replacing
+            the module's logger attribute, so the raise comes out of the
+            genuine `logger.warning(...)` call the guard makes. A filter is
+            the fault site that PROPAGATES: Logger.handle runs filters before
+            callHandlers, while an exception inside a handler is swallowed by
+            Handler.handleError and could never reach the guard.
+            """
 
-        with patch('orchestrator.merge_queue.logger.warning', side_effect=_explode):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wedged = 0
+
+            def filter(self, record: logging.LogRecord) -> bool:
+                if 'RunnerUnavailable' in str(record.msg):
+                    self.wedged += 1
+                    raise RuntimeError('wedged log handler')
+                return True
+
+        mq_logger = logging.getLogger('orchestrator.merge_queue')
+        wedge = _WedgedFilter()
+        mq_logger.addFilter(wedge)
+        try:
             outer = await self._cancel_midflight(
                 worker, item, self._remote_lease(), _fake_verify,
             )
+        finally:
+            mq_logger.removeFilter(wedge)
 
+        assert wedge.wedged >= 1, (
+            'the guard never logged the record this test wedges — the fault '
+            'was never injected and the assertions below prove nothing'
+        )
         assert outer.cancelled() is True, 'a failing log must not change the outcome'
         assert 'leo-laptop' in worker._runner_unavailable, (
             'a failing WARNING cost the tracker record — the host is stranded'
