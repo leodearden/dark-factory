@@ -2204,3 +2204,144 @@ class TestTheCeilingOnDistinctPrefixes:
         h = build_harness(answers={BFF: unique(BFF_FULL)})
         await h.call('add_memory', prose([BFF] * 50))
         assert h.resolver.prefixes == [BFF]
+
+
+# ---------------------------------------------------------------------------
+# The apply phase is ONE call to the substitution door, whatever the
+# occurrence count.
+# ---------------------------------------------------------------------------
+#
+# The twin of ``test_repeated_citations_of_one_id_never_approach_it`` above, on
+# the other side of the call. That one pins that 50 repeats cost ONE resolver
+# walk, because MAX_DISTINCT_PREFIXES_PER_CALL bounds DISTINCT tokens. Nothing
+# bounded the APPLY side at all: a per-occurrence fold rebuilt the whole
+# containing string once per citation, which is O(occurrences x string length)
+# and stalls a shared single-threaded server for seconds on one ordinary large
+# write. The bound is pinned DETERMINISTICALLY — how many times the door is
+# called — rather than by a wall clock that cannot see a C-level memcpy.
+
+
+class _CountingDoor:
+    """A counting delegate that FORWARDS to the real substitution door.
+
+    Explicitly written rather than a ``MagicMock``: the real door still has to
+    run, because the point is that one call does all the work correctly, not
+    that one call happened. (``scripts/check_bare_magicmock_config.py`` gates
+    ``shared/tests`` for the same reason ``_FakeResolver`` is a table.)
+    """
+
+    def __init__(self, door: Callable[..., dict[str, Any]]) -> None:
+        self.door = door
+        self.calls = 0
+
+    def __call__(self, arguments: Mapping[str, Any], replacements: Any) -> dict[str, Any]:
+        self.calls += 1
+        return self.door(arguments, replacements)
+
+
+REPEATS = 50
+
+
+class TestTheApplyPhaseIsOneDoorCallPerGuardedCall:
+    """One id cited 50 times in prose and twice more in a nested list."""
+
+    def call(self) -> dict[str, Any]:
+        arguments = prose([BFF] * REPEATS)
+        arguments['metadata'] = {'cluster_memory_ids': [BFF, BFF]}
+        return arguments
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL)})
+
+    def counting(self, monkeypatch: pytest.MonkeyPatch) -> _CountingDoor:
+        door = _CountingDoor(guard.substitute_all)
+        monkeypatch.setattr(guard, 'substitute_all', door)
+        return door
+
+    async def test_the_door_is_called_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """52 occurrences across THREE paths, one call.
+
+        Grouping is the door's own concern, so the guard hands it every planned
+        expansion at once — including the ones on different paths — rather than
+        looping per path and quietly reintroducing a per-site rebuild.
+        """
+        door = self.counting(monkeypatch)
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert door.calls == 1
+
+    async def test_the_store_is_still_walked_once(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert h.resolver.prefixes == [BFF]
+
+    async def test_every_occurrence_in_the_prose_is_expanded(self) -> None:
+        """Correctness, so the count above cannot be met by skipping work.
+
+        A byte-exact equality rather than a count: the separators between the
+        citations are what a grouped rebuild would drop or duplicate if it got
+        the gaps wrong.
+        """
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert h.recorder.args['content'] == ' and '.join([BFF_FULL] * REPEATS)
+
+    async def test_both_nested_occurrences_are_expanded(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', self.call())
+        assert h.recorder.args['metadata'] == {'cluster_memory_ids': [BFF_FULL, BFF_FULL]}
+
+    async def test_one_substitution_record_per_occurrence_with_its_own_path(self) -> None:
+        """A substitution is still per OCCURRENCE — batching the apply changed
+        what it COSTS, not what is reported."""
+        h = self.harness()
+        result = await h.call('add_memory', self.call())
+        repair = repair_of(result)
+        assert repair is not None
+        records = repair['substitutions']
+        assert [record['path'] for record in records] == (
+            [['content']] * REPEATS
+            + [['metadata', 'cluster_memory_ids', 0], ['metadata', 'cluster_memory_ids', 1]]
+        )
+        assert {record['from'] for record in records} == {BFF}
+        assert {record['to'] for record in records} == {BFF_FULL}
+
+    async def test_a_mixed_call_still_rejects_whole_with_the_door_never_called(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The resolve-then-apply split still holds under batching.
+
+        ``door.calls == 0`` is the structural form of "nothing was written":
+        the rejection is decided before the only code that can edit the
+        arguments has run.
+        """
+        door = self.counting(monkeypatch)
+        h = build_harness(answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS})
+        submitted = f'{BFF} supersedes {AMB}'
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_memory',
+                {'content': submitted, 'project_id': PROJECT, 'agent_id': AGENT},
+            )
+        assert door.calls == 0
+        assert h.recorder.calls == []
+        assert rejection_payload(excinfo)['original_call']['content'] == submitted
+
+    async def test_an_outage_after_a_unique_answer_forwards_byte_identical(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The first token resolved unique, the second raised: nothing applied."""
+        door = self.counting(monkeypatch)
+        h = build_harness(
+            answers={F1C: unique(F1C_FULL)},
+            raises={BFF: guard.ResolverUnavailable(OUTAGE)},
+        )
+        submitted = f'{F1C} supersedes {BFF}'
+        result = await h.call(
+            'add_memory', {'content': submitted, 'project_id': PROJECT, 'agent_id': AGENT}
+        )
+        assert door.calls == 0
+        assert h.recorder.args['content'] == submitted
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
