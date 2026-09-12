@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _merge_lane_census import queued_in_lane, queued_request_ids
 
 from orchestrator import merge_liveness, merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -232,20 +233,6 @@ def _ephemeral_merge_wt(git_ops: GitOps, tag: str) -> Path:
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
-
-
-def _queued_in_lane(worker: SpeculativeMergeWorker, lane: str = 'normal') -> list[str]:
-    """Task ids ``snapshot()`` reports as queued in *lane*, head-of-line first.
-
-    The public read of lane placement: snapshot() stamps every entry with its
-    lane, state and position, and lists lane-buffered requests ahead of
-    anything still sitting undrained on the outer queue — so a requeue that the
-    lane buffer alone could not report shows up here at the tail.
-    """
-    return [
-        entry['task_id'] for entry in worker.snapshot()['entries']
-        if entry['lane'] == lane and entry['state'] == 'queued'
-    ]
 
 
 def _owns_merge_worktree(worker: SpeculativeMergeWorker, wt: Path) -> bool:
@@ -1317,7 +1304,14 @@ class TestDeepChainPlacementBuild:
         assert conflicts == []
         assert store.events_of(EventType.merge_attempt) == []
         assert all(not r.result.done() for r in queued_reqs)
-        assert _queued_in_lane(worker) == [r.task_id for r in queued_reqs], 'queue untouched'
+        assert queued_in_lane(worker) == [r.task_id for r in queued_reqs], 'queue untouched'
+        # ORDER above, IDENTITY here.  A request object silently replaced by a
+        # fresh one carrying the same task id — what this module's coalesce /
+        # duplicate-submission machinery can produce — reads identical on task
+        # ids; request_id is minted per object, so it does not.
+        assert queued_request_ids(worker) == [r.request_id for r in queued_reqs], (
+            'the same request OBJECTS, not fresh ones wearing their task ids'
+        )
 
         await merge_liveness.release_chain_build_lane(
             git_ops, res.lane, warm=res.lane_warm,
@@ -2173,7 +2167,7 @@ class TestDeepTipVerifyNeverAdopts:
         no conflict rendered for any of them — build_chain's decision-4 purity
         surviving all the way through its first real caller.
         """
-        _git_ops, worker, _item, _chain, _res, store, queued = await self._fixture(
+        _git_ops, worker, item, _chain, _res, store, queued = await self._fixture(
             git_repo, monkeypatch, passed=False,
         )
 
@@ -2182,9 +2176,15 @@ class TestDeepTipVerifyNeverAdopts:
         # `queued`, so the red tip this arm REQUEUED is visible at the tail — a
         # fact the lane buffer alone could not report. The chained members are
         # still there, still in order, ahead of it.
-        assert _queued_in_lane(worker) == [*(r.task_id for r in queued), '101'], (
+        assert queued_in_lane(worker) == [*(r.task_id for r in queued), '101'], (
             'same items, same order, with the requeued tip behind them'
         )
+        # ORDER above, IDENTITY here: request_id is minted per ``MergeRequest``
+        # object, so this also says the tip at the tail is the very request
+        # that was requeued rather than a fresh one for task 101.
+        assert queued_request_ids(worker) == [
+            *(r.request_id for r in queued), item.request.request_id,
+        ], 'the same request OBJECTS, not fresh ones wearing their task ids'
         assert all(not r.result.done() for r in queued)
         assert store.events_of(EventType.merge_attempt) == []
 
@@ -2205,7 +2205,10 @@ class TestDeepTipVerifyNeverAdopts:
         )
 
         assert worker._chain_halving_state is None
-        assert _queued_in_lane(worker) == [r.task_id for r in queued]
+        assert queued_in_lane(worker) == [r.task_id for r in queued]
+        assert queued_request_ids(worker) == [r.request_id for r in queued], (
+            'the same request OBJECTS, not fresh ones wearing their task ids'
+        )
 
     @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
     async def test_finalize_disposes_the_entry_without_a_phantom_head(

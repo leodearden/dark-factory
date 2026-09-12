@@ -55,6 +55,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from _merge_lane_census import census_for
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -180,28 +181,6 @@ def _make_request(
     )
 
 
-def _census_for(worker: Any, request_id: str) -> list[tuple[str, str]]:
-    """``(state, lane)`` for every ``snapshot()`` entry carrying *request_id*.
-
-    ``snapshot()`` is the merge worker's public answer to "where is this
-    request?", so one call pins both facts these tests assert: a request
-    wrongly appended to a lane buffer is sourced from snapshot's CONTAINER
-    section and therefore dropped from its registry section
-    (``merge_queue.py::SpeculativeMergeWorker.snapshot``), surfacing as
-    ``queued`` rather than its registry state, and a divergent second pipeline
-    item under the same request_id would surface as a second tuple.
-
-    ``ItemLifecycleState.QUEUED`` and ``LANE_BUFFERED`` share the one wire
-    string ``queued`` (``merge_queue.py::_REGISTRY_STATE_TO_WIRE``), so a test
-    that must tell those two apart still reads the registry directly.
-    """
-    return [
-        (entry['state'], entry['lane'])
-        for entry in worker.snapshot()['entries']
-        if entry['request_id'] == request_id
-    ]
-
-
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: _advance_if_at shared re-entry-tolerant primitive
 # ---------------------------------------------------------------------------
@@ -279,7 +258,7 @@ class TestAdvanceIfAt:
             )
 
         assert result is False
-        assert _census_for(worker, rid) == [('finalizing', 'normal')]
+        assert census_for(worker, rid) == [('finalizing', 'normal')]
         assert fake_eq.submitted == [], (
             f'tolerant no-op must NOT escalate: {fake_eq.submitted!r}'
         )
@@ -330,7 +309,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         )
 
         assert result is False
-        assert _census_for(worker, rid) == [('dispatching', 'normal')], (
+        assert census_for(worker, rid) == [('dispatching', 'normal')], (
             'a rejected transition must leave the registry state unchanged'
         )
         assert len(fake_eq.submitted) == 1, (
@@ -359,7 +338,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         )
 
         assert result is False
-        assert _census_for(worker, rid) == [('verifying', 'normal')]
+        assert census_for(worker, rid) == [('verifying', 'normal')]
         assert len(fake_eq.submitted) == 1
         assert fake_eq.submitted[0].category == 'merge_lifecycle_transition_rejected'
 
@@ -394,7 +373,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
             )
 
         assert result is False
-        assert _census_for(worker, rid) == [('merging', 'normal')]
+        assert census_for(worker, rid) == [('merging', 'normal')]
         assert fake_eq.submitted == [], (
             f'a named-tolerated downstream state must NOT escalate: {fake_eq.submitted!r}'
         )
@@ -446,7 +425,7 @@ class TestBufferOwnedRequestDuplicateDrain:
         assert fake_eq.submitted == [], (
             f'a recognized duplicate/re-entrant drain must not escalate: {fake_eq.submitted!r}'
         )
-        assert _census_for(worker, rid) == [('verifying', 'normal')], (
+        assert census_for(worker, rid) == [('verifying', 'normal')], (
             'the coalesced duplicate must neither be buffered into a lane (which '
             'would surface as a queued entry) nor touch the registry'
         )
@@ -489,7 +468,7 @@ class TestBufferOwnedRequestDuplicateDrain:
             f'a duplicate drain onto an already-FINALIZING request_id must not '
             f'escalate: {fake_eq.submitted!r}'
         )
-        assert _census_for(worker, rid) == [('finalizing', 'normal')], (
+        assert census_for(worker, rid) == [('finalizing', 'normal')], (
             'the coalesced duplicate must neither be buffered into a lane (which '
             'would surface as a queued entry) nor touch the registry'
         )
@@ -723,7 +702,7 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
             f'the LIVE original\'s real waiter must not be handed a fabricated '
             f'outcome: {req.result.result() if req.result.done() else None!r}'
         )
-        census = _census_for(worker, rid)
+        census = census_for(worker, rid)
         assert census == [('verifying', 'normal')], (
             f'a re-entrant drain must neither be buffered as a divergent second '
             f'item nor touch the live original\'s registry state; reads {census!r}'
@@ -827,7 +806,7 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
             f'outcome when _live_items holds a {shape}: '
             f'{req.result.result() if req.result.done() else None!r}'
         )
-        census = _census_for(worker, rid)
+        census = census_for(worker, rid)
         assert census == [('verifying', 'normal')], (
             f'a re-entrant drain must neither be buffered as a divergent second '
             f'item nor touch the live original\'s registry state, whatever shape '

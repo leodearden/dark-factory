@@ -323,6 +323,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import pytest
+from _merge_lane_census import lanes_by_task, queued_in_lane
 from shared.task_metadata import RetryLedger
 
 from orchestrator import merge_queue
@@ -1153,42 +1154,6 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
                 req.result.cancel()
             worker._retire_item(req.request_id)
     return drained
-
-
-def _queued_in_lane(worker: SpeculativeMergeWorker, lane: str) -> list[str]:
-    """Task ids still QUEUED in *lane*, in queue order, off ``snapshot()``.
-
-    ``snapshot()`` enumerates the lane buffers in priority order and stamps
-    every entry with its lane, state and position (merge_queue.py::
-    SpeculativeMergeWorker.snapshot), so this IS the public reading of the
-    claim the composition rows make: what is still waiting, in which lane, and
-    in what order.  Order matters as much as membership — submission order
-    inside a lane is the next round's ``chain_snapshot``, and a membership-only
-    check cannot see a reorder.
-
-    It reads WIDER than the lane buffer alone, deliberately: ``snapshot()``
-    lists the buffered items first and then anything not yet drained off the
-    outer queue, both as ``queued``.  A red tip requeued by the round it failed
-    is therefore visible here, at the TAIL — which is the true state of the
-    pipeline, and a fact the buffer alone could not report at all.
-    """
-    return [
-        e['task_id'] for e in worker.snapshot()['entries']
-        if e['state'] == 'queued' and e['lane'] == lane
-    ]
-
-
-def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
-    """Return the lane that currently holds *task_id* queued, or ``None``.
-
-    MEMBERSHIP, not position — the weaker claim that still needs saying: the
-    item is on the queue at all, in the lane it was submitted to, rather than
-    having been silently promoted or dropped.
-    """
-    for lane in ('high', 'normal'):
-        if task_id in _queued_in_lane(worker, lane):
-            return lane
-    return None
 
 
 # ── durable-tier readers ─────────────────────────────────────────────────────
@@ -3927,15 +3892,15 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         # the outer queue, and `_pair` re-dispatches the same object on round 2
         # by design (its docstring says why) instead of consuming round 1's
         # requeue, so the one request is queued twice over.
-        assert _queued_in_lane(worker, 'normal') == [
+        assert queued_in_lane(worker, 'normal') == [
             *_gate_followers(_ROW8_FOLLOWERS), '101', '101',
         ], (
             f'the followers left their submission order: '
-            f'{_queued_in_lane(worker, "normal")!r}'
+            f'{queued_in_lane(worker, "normal")!r}'
         )
-        assert _queued_in_lane(worker, 'high') == [], (
+        assert queued_in_lane(worker, 'high') == [], (
             f'nothing was ever enqueued high; got '
-            f'{_queued_in_lane(worker, "high")!r}'
+            f'{queued_in_lane(worker, "high")!r}'
         )
 
     async def test_the_pair_leaves_the_shipped_thrash_ladder_byte_identical(
@@ -4717,13 +4682,18 @@ class TestBoundaryRowsComposed:
 
         # ── every item still queued: the followers at their ORIGINAL lane
         #    index, then the red tip requeued behind them ────────────────────
-        assert _queued_in_lane(worker, 'normal') == [*followers, '101'], (
+        assert queued_in_lane(worker, 'normal') == [*followers, '101'], (
             f'the chain mutated the queue on a red tip: '
-            f'{_queued_in_lane(worker, "normal")!r}'
+            f'{queued_in_lane(worker, "normal")!r}'
         )
+        # ONE census for the whole block: each `snapshot()` walks the in-flight
+        # set, the verifier queue, both lane buffers, the outer queue and the
+        # lifecycle registry, so a per-task lookup would pay for that walk once
+        # per follower.
+        lanes = lanes_by_task(worker)
         for tid in followers:
-            assert _lane_of(worker, tid) == 'normal', (
-                f'task {tid} left its lane on a red tip'
+            assert lanes.get(tid) == 'normal', (
+                f'task {tid} left its lane on a red tip: {lanes.get(tid)!r}'
             )
             assert not scene.reqs[tid].result.done(), (
                 f'task {tid} was handed a verdict no verify produced'
@@ -4944,12 +4914,12 @@ class TestBoundaryRowsComposed:
             assert rc == 0, f'{sha[:8]} is no longer on main after the abort'
 
         # ── every unlanded link is back at its EXACT lane index, unresolved ─
-        assert _queued_in_lane(worker, 'normal') == [
+        assert queued_in_lane(worker, 'normal') == [
             '103', '104', '105', '106',
         ], (
             f'submission order must survive the abort — it is the next round\'s '
             f'chain_snapshot; got '
-            f'{_queued_in_lane(worker, "normal")!r}'
+            f'{queued_in_lane(worker, "normal")!r}'
         )
         for tid in ('103', '104', '105', '106'):
             req = scene.reqs[tid]
@@ -5315,10 +5285,10 @@ class TestRow4ConflictTruncatesSilently:
         )
 
         # ── every offered item is UNTOUCHED, in its original lane position ──
-        assert _queued_in_lane(worker, 'normal') == followers, (
+        assert queued_in_lane(worker, 'normal') == followers, (
             f'submission order must survive a truncation — it is the next '
             f'round\'s chain_snapshot; got '
-            f'{_queued_in_lane(worker, "normal")!r}'
+            f'{queued_in_lane(worker, "normal")!r}'
         )
         for tid in followers:
             req = scene.reqs[tid]
@@ -5643,11 +5613,11 @@ class TestDeepGateCapstone:
             f'the head and its first link landed before the bump; got '
             f'{r5["landed"]!r}'
         )
-        assert _queued_in_lane(worker, 'normal')[:4] == [
+        assert queued_in_lane(worker, 'normal')[:4] == [
             '110', '111', '112', '113',
         ], (
             f'every unlanded link returns to its EXACT lane index; got '
-            f'{_queued_in_lane(worker, "normal")[:4]!r}'
+            f'{queued_in_lane(worker, "normal")[:4]!r}'
         )
         _conserved(r5)
 
