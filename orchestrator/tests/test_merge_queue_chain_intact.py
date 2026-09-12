@@ -42,7 +42,7 @@ from test_merge_queue_verify_base_invariant import _fake_local_allocator
 from test_merge_speculation import _LateArrivalFakeEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     DecidedItem,
@@ -107,7 +107,7 @@ _LIVE_DEEP = 'e' * 40
 
 
 def _make_worker(
-    git_ops: GitOps, *, event_store: object = None,
+    git_ops: GitOps, *, event_store: EventStore | None = None,
 ) -> SpeculativeMergeWorker:
     """Build a bare worker, optionally carrying an injected event store.
 
