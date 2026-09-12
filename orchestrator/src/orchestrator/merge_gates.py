@@ -1693,22 +1693,52 @@ def _ls_tree_object_type(ls_out: str) -> str | None:
     return None
 
 
+class _RenameProbeUnmeasurable:
+    """Sentinel type: git could not ANSWER the rename probe.
+
+    Distinct from ``None`` ("git answered, and there is no rename pair
+    here") so the resolver can fail CLOSED on an unmeasurable probe
+    instead of silently degrading to the weaker basename heuristic.
+
+    An out-of-band sentinel TYPE, not the in-band ``_OVERLAP_GIT_ERROR_SENTINEL``
+    value idiom used elsewhere in this module: that sentinel is a
+    non-empty list, safely distinguishable because its callers never
+    expect a real list back, but ``_rename_pair_for``'s real return value
+    IS a tuple, so only a distinct type is safely distinguishable from a
+    genuine result.  Not an ``Exception`` subclass, to match this module's
+    control flow (rc-checking plus sentinel returns, no private
+    control-flow exceptions) — named without "Error"/"Exception" so a
+    future reader is not tempted to ``raise`` or ``except`` it (either
+    would be a ``TypeError`` at runtime, since it inherits from neither).
+    """
+
+    __slots__ = ()
+
+
+_RENAME_PROBE_UNMEASURABLE = _RenameProbeUnmeasurable()
+
+
 async def _rename_pair_for(
     path: str,
     branch_head: str,
     git_ops: GitOps,
     *,
     task_id: str | None = None,
-) -> tuple[str, str] | None:
-    """One hop of git's own rename detection for *path*, or ``None``.
+) -> tuple[str, str] | _RenameProbeUnmeasurable | None:
+    """One hop of git's own rename detection for *path*.
 
     Finds the commit reachable from *branch_head* that DELETED *path*
     (``git log --diff-filter=D -1``), then re-reads that commit with
     rename detection on (``git show --name-status -M``) looking for an
     ``R<score>\\t<old>\\t<new>`` pair whose old side is *path*.
 
-    Returns ``(new_path, deleting_sha)``.  Fails CLOSED: a git error, no
-    deleting commit, or no pairable rename all return ``None``.
+    Three-valued outcome: returns ``(new_path, deleting_sha)`` when a pair
+    is found; ``None`` when git answered and there genuinely is no
+    deleting commit or no pairable rename; and ``_RENAME_PROBE_UNMEASURABLE`` when
+    a git error means the question could not be answered at all.  Callers
+    MUST distinguish the last from ``None`` — see
+    :func:`_resolve_renamed_plan_path`, which fails CLOSED on it rather
+    than falling through to the basename heuristic on unmeasured evidence.
     """
     rc, del_out, del_err = await _run(
         ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', path],
@@ -1722,7 +1752,7 @@ async def _rename_pair_for(
             'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
             rc, (del_err or '').strip()[:400],
         )
-        return None
+        return _RENAME_PROBE_UNMEASURABLE
 
     del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
     if not del_sha:
@@ -1740,7 +1770,7 @@ async def _rename_pair_for(
             f'git show --name-status -M --format= {del_sha[:12]}',
             rc, (show_err or '').strip()[:400],
         )
-        return None
+        return _RENAME_PROBE_UNMEASURABLE
 
     for line in show_out.splitlines():
         fields = line.split('\t')
@@ -1794,19 +1824,33 @@ async def _resolve_renamed_plan_path(
     tree_paths: Callable[[], Awaitable[list[str] | None]],
     *,
     task_id: str | None = None,
-) -> tuple[str, str] | None:
+) -> list[tuple[str, str]]:
     """Resolve a declared path that is ABSENT from the branch tree to its
-    current name, or ``None`` when no resolution is recoverable.
+    current name(s), or ``[]`` when no resolution is recoverable.
 
-    Returns ``(resolved_path, mechanism)`` where *mechanism* is a short
-    human-readable description for the audit log.
+    Returns a PREFERENCE-ORDERED list of ``(resolved_path, mechanism)``
+    candidates, where *mechanism* is a short human-readable description
+    for the audit log.  A LIST rather than a single winner deliberately:
+    mechanism 2 can produce two independently-bounded candidates (the
+    last resolved hop's basename and the originally declared path's), and
+    the tie-breaker that actually matters — which candidate the branch
+    TOUCHED — is known only to the caller, which owns the touched set.
+    Picking a single winner here would let a coincidental hop match
+    SHADOW a declared-key candidate that the branch genuinely delivered,
+    re-introducing the very false-positive class this gate exists to
+    remove (task 4158 review).  The caller
+    (:func:`_check_plan_files_touched_in_branch`) selects the first
+    candidate that is in the touched set, and falls back to the first
+    candidate overall for the audit trail when none is touched.  Ordering
+    is therefore the resolver's only preference statement: mechanism 1's
+    authoritative answer, else hop-key before declared-key.
 
-    **Invariant: a returned ``resolved_path`` always EXISTS in the branch
-    tree at ``branch_head``.**  Both mechanisms enforce it (mechanism 1
-    verifies each hop against the tree listing; mechanism 2 draws its
-    candidates from that listing), so a resolution can never point a human
-    at a second phantom path, and an entry that resolved is never
-    ``missing_from_tree``.
+    **Invariant: every returned ``resolved_path`` always EXISTS in the
+    branch tree at ``branch_head``.**  Both mechanisms enforce it
+    (mechanism 1 verifies each hop against the tree listing; mechanism 2
+    draws its candidates from that listing), so a resolution can never
+    point a human at a second phantom path, and an entry that resolved is
+    never ``missing_from_tree``.
 
     Mechanism 1 (authoritative — git's own rename detection): follow the
     rename CHAIN from *norm*, hop by hop, via :func:`_rename_pair_for`.
@@ -1825,15 +1869,72 @@ async def _resolve_renamed_plan_path(
     *tree_paths*.  Mechanism 1 cannot see a relocation staged as SEPARATE
     delete and add commits (git pairs renames only within one commit),
     which is exactly how the reify harness-consolidation programme staged
-    its moves.  The fallback is deliberately conservative and bounded four
-    ways: it requires EXACTLY ONE candidate; it only runs for a path that
-    exists nowhere in the branch tree; it only runs for a path with actual
-    history under its declared name (see
-    :func:`_path_existed_in_branch_history` — an invented path is a stale
-    declaration, not a rename); and a resolution never passes the gate on
-    its own — the caller additionally requires the resolved path to be in
-    the touched set.  So an ambiguous or coincidental basename cannot
-    silently satisfy the gate.
+    its moves.  TWO keys are tried and BOTH surviving candidates are
+    RETURNED, in preference order: the LAST RESOLVED HOP (``current``)
+    first, then the ORIGINALLY DECLARED path (``norm``).  The hop is
+    ordered first because it is the more RECENTLY PROVEN name — mechanism 1
+    produced authoritative git rename evidence for it — whereas ``norm`` is
+    the one name mechanism 1 already showed is stale (``current == norm``
+    when the chain never advanced, so the no-chain case yields a single
+    candidate because the two keys coincide).  The declared path is kept,
+    not discarded, because a chain hop can CHANGE a file's basename and a
+    LATER hop can RESTORE it: the hop is evidence of the file's current
+    name only when it actually HAS a match, not strictly better evidence
+    in every shape.  Critically, the hop candidate does NOT SHADOW the
+    declared one — both are handed to the caller, which prefers whichever
+    the branch actually TOUCHED, and only falls back to this ordering when
+    the touched set cannot break the tie.  That is what makes the two-key
+    lookup a genuine SUPERSET of either single-key behaviour at the GATE:
+    every resolution the ``norm`` key made in production before task 4158
+    still passes the gate, and the chained-rename resolutions the
+    ``current`` key added pass too.  (Ordering alone would NOT be a
+    superset — a coincidental, untouched hop match would shadow a touched
+    declared match and wrongly block; measured against real git in the
+    task 4158 review.)  Both keys are
+    bounded the SAME four ways: each requires EXACTLY ONE candidate; the
+    lookup only runs for a path that exists nowhere in the branch tree; it
+    only runs for a path with actual history under its ORIGINALLY DECLARED
+    name, checked via :func:`_path_existed_in_branch_history` on ``norm``
+    (never ``current``, which would be vacuous — a hop only exists because
+    a commit deleted it; an invented path is a stale declaration, not a
+    rename); and a resolution never passes the gate on its own — the
+    caller additionally requires the resolved path to be in the touched
+    set.  So an ambiguous or coincidental basename cannot silently satisfy
+    the gate on EITHER key, and returning a second candidate escapes none
+    of these bounds — it only widens which name they are evaluated
+    against.  Ambiguity WITHIN a key fails closed (``len(matches) == 1``);
+    ambiguity ACROSS keys is not silently collapsed here at all — both
+    candidates are returned and the caller breaks the tie on the touched
+    set, which is the only evidence that distinguishes them.
+
+    Known, ACCEPTED limitation, shared by BOTH keys: none of the four
+    bounds above can distinguish "the file was relocated again as separate
+    delete+add commits" (the case the two-key lookup exists to resolve)
+    from "the file was genuinely DELETED OUTRIGHT" (removed, never
+    re-added anywhere).  If an unrelated file elsewhere in the tree
+    happens to share a dead hop's (or the declared path's) basename,
+    mechanism 2 resolves the declared path to that unrelated file even
+    though nothing on the branch actually delivered against it.  This is
+    NOT a new class of risk introduced by trying ``current`` — the
+    no-chain case (``current == norm``) already has it, since a path that
+    was committed and later deleted outright still has git history under
+    its own name, so :func:`_path_existed_in_branch_history` does not stop
+    it either; the hop key only extends the SAME accepted tradeoff to
+    chained renames, where a hop's basename is more likely to be generic
+    (``mod.rs``, ``__init__.py``, ``index.ts``) than the originally
+    declared path's.  A tighter bound is possible (e.g. requiring the
+    candidate to have been ADDED at-or-after the commit that deleted the
+    lookup key) but is deliberately not implemented here.  The tradeoff is
+    bounded in practice by the surrounding invariants — EXACTLY ONE
+    candidate, the resolved path must additionally be in the touched set —
+    and every resolution that passes is logged loudly at WARNING regardless
+    of mechanism or key, so the false-positive class this paragraph
+    documents is never silent.  The declared-path fallback key carries the
+    identical tradeoff under the identical bounds — a coincidental
+    basename match on the declared name is exactly as unable to
+    distinguish a re-relocation from an outright deletion as one on a hop
+    is.  See ``TestHopBasenameAcceptedTradeoff`` in the test module for the
+    pinned shape on the hop key.
 
     *tree_paths* is an async provider, not a list, so the (single) tree
     listing is shelled out at most ONCE per gate invocation, shared across
@@ -1852,7 +1953,8 @@ async def _resolve_renamed_plan_path(
     renaming commit is necessarily an ancestor of ``branch_head``.
 
     Fails CLOSED — any git error, missing deleting commit, or unmatched
-    rename pair returns ``None`` and the caller still blocks.  (Contrast
+    rename pair returns ``[]`` (NO candidates) and the caller still
+    blocks.  (Contrast
     with the whole-gate fail-OPEN on the touched-set fetch: a transient
     error there would block every plan entry at once, whereas a per-entry
     probe failure can only leave one already-suspect entry flagged.)
@@ -1874,6 +1976,15 @@ async def _resolve_renamed_plan_path(
     shas: list[str] = []
     for _hop in range(_MAX_RENAME_HOPS):
         pair = await _rename_pair_for(current, branch_head, git_ops, task_id=task_id)
+        if isinstance(pair, _RenameProbeUnmeasurable):
+            logger.warning(
+                'plan-files-touched: rename-probe UNMEASURABLE for %s (declared %s) '
+                'at head=%s — resolution abandoned and the basename fallback '
+                'deliberately not attempted (fail CLOSED: never resolve on evidence '
+                'we could not measure). task_id=%s',
+                current, norm, branch_head, task_id or '<unknown>',
+            )
+            return []
         if pair is None:
             break
         new_path, del_sha = pair
@@ -1886,13 +1997,15 @@ async def _resolve_renamed_plan_path(
 
         live = await _tree_set()
         if live is None:
-            return None
+            return []
         if current in live:
             mechanism = (
                 f'rename in {shas[0][:12]}' if len(shas) == 1
                 else f'{len(shas)}-hop rename chain ending in {shas[-1][:12]}'
             )
-            return current, mechanism
+            # Authoritative: git's own rename evidence, verified live in
+            # the tree.  A single candidate — mechanism 2 never runs.
+            return [(current, mechanism)]
         # The hop landed on a path that is itself gone from the tree: it was
         # relocated again.  Keep walking rather than returning a dead answer.
 
@@ -1900,7 +2013,20 @@ async def _resolve_renamed_plan_path(
     # Reached when no commit deleted the path (never created, or the
     # relocation predates any reachable delete), when the deleting commit
     # carried no pairable rename (separate delete+add commits), or when
-    # the chain dead-ended on a path that is absent from the tree.
+    # the chain dead-ended on a path that is absent from the tree.  TWO
+    # keys are tried and BOTH surviving candidates are RETURNED, ordered:
+    # `current` — the LAST RESOLVED HOP, which equals `norm` when the
+    # chain never advanced — FIRST, because mechanism 1 produced
+    # authoritative git rename evidence for it; then `norm` — the
+    # ORIGINALLY DECLARED path — because a chain hop can CHANGE a file's
+    # basename and a LATER hop can RESTORE it, so a hop with no unique
+    # candidate is not evidence that the declared name has none.
+    #
+    # The hop candidate must NOT SHADOW the declared one: a hop match can
+    # be a coincidental, untouched file while the declared key resolves
+    # to the file the branch actually delivered (task 4158 review,
+    # reproduced against real git).  Only the caller holds the touched
+    # set, so only the caller can break that tie — hand it both, ordered.
     if not await _path_existed_in_branch_history(
         norm, branch_head, git_ops, task_id=task_id,
     ):
@@ -1910,20 +2036,61 @@ async def _resolve_renamed_plan_path(
             'never existed is an invented declaration, not a rename). task_id=%s',
             norm, branch_head, task_id or '<unknown>',
         )
-        return None
+        return []
 
     live = await _tree_set()
     if live is None:
-        return None
+        return []
 
-    basename = posixpath.basename(norm)
-    if not basename:
-        return None
-    candidates = [p for p in live if posixpath.basename(p) == basename]
-    if len(candidates) == 1:
-        return candidates[0], 'unique basename match'
+    # `live` is narrowed to `set[str]` above; rebind so the closure below
+    # keeps that narrowing (pyright does not carry narrowing into a nested
+    # function through the original name).
+    live_set = live
 
-    return None
+    def _sole_candidate(key: str) -> str | None:
+        """The ONE tree path sharing *key*'s basename, or None.
+
+        None covers both "no candidate" and "ambiguous" — mechanism 2's
+        `len(candidates) == 1` bound applies identically to BOTH lookup
+        keys, so the fallback can never be looser than the first attempt.
+        """
+        base = posixpath.basename(key)
+        if not base:
+            return None
+        matches = [p for p in live_set if posixpath.basename(p) == base]
+        return matches[0] if len(matches) == 1 else None
+
+    candidates: list[tuple[str, str]] = []
+
+    # First candidate: the LAST RESOLVED HOP.  Mechanism 1 produced
+    # authoritative git rename evidence for it, whereas `norm` is the one
+    # name already PROVEN stale — so when the touched set cannot break
+    # the tie, this ordering makes the hop win.
+    hop_match = _sole_candidate(current)
+    if hop_match is not None:
+        candidates.append((
+            hop_match,
+            'unique basename match' if current == norm
+            else f'unique basename match on {current} (after {len(shas)}-hop rename chain)',
+        ))
+
+    # Second candidate: the ORIGINALLY DECLARED path.  A chain hop can
+    # CHANGE the basename and a later hop can RESTORE it, so a hop match
+    # is not evidence that the declared name's match is wrong — it is
+    # offered alongside, never overwritten by, the hop's.  Skipped when
+    # the chain never advanced (`current == norm`: the two keys coincide,
+    # so the lookup would be identical) or when both keys land on the
+    # same tree path (one candidate, not two).
+    if current != norm:
+        declared_match = _sole_candidate(norm)
+        if declared_match is not None and declared_match != hop_match:
+            candidates.append((
+                declared_match,
+                f'unique basename match on declared {norm} '
+                f'(after {len(shas)}-hop rename chain dead-ended on {current})',
+            ))
+
+    return candidates
 
 
 async def _check_plan_files_touched_in_branch(
@@ -2062,16 +2229,26 @@ async def _check_plan_files_touched_in_branch(
         # Path is ABSENT from the branch tree: the declared path is stale,
         # so the touched set can say nothing about it.  Try to resolve the
         # rename before blaming the branch (task 3110).
-        resolution = await _resolve_renamed_plan_path(
+        candidates = await _resolve_renamed_plan_path(
             norm, branch_head, git_ops, _tree_paths, task_id=task_id,
         )
-        if resolution is not None:
-            resolved, mechanism = resolution
+        if candidates:
+            # The resolver hands back every candidate that survived its
+            # bounds, in ITS preference order, because only this site holds
+            # the touched set — the evidence that actually distinguishes a
+            # coincidental basename match from the file the branch
+            # delivered.  Prefer the first TOUCHED candidate; when none is
+            # touched the tie is unbreakable, so fall back to the
+            # resolver's own ordering for the audit trail (task 4158).
+            chosen, mechanism = next(
+                ((c, m) for c, m in candidates if c in touched_set),
+                candidates[0],
+            )
             # Key on the ORIGINAL declared string so the diagnostic names
             # exactly what plan.json says (composes with task 1587's
             # ./-prefix normalization instead of re-solving it).
-            resolved_renames[entry] = resolved
-            if resolved in touched_set:
+            resolved_renames[entry] = chosen
+            if chosen in touched_set:
                 # A resolved rename means the task's declared metadata.files
                 # is stale — a real data-quality signal on a path that
                 # otherwise produces no output at all.  Log it LOUD even
@@ -2079,7 +2256,7 @@ async def _check_plan_files_touched_in_branch(
                 logger.warning(
                     'plan-files-touched: declared %s resolved to %s via %s; '
                     'branch touched the resolved path — gate PASSES. task_id=%s',
-                    entry, resolved, mechanism, task_id or '<unknown>',
+                    entry, chosen, mechanism, task_id or '<unknown>',
                 )
                 continue
         else:

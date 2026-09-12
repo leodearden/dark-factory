@@ -111,6 +111,10 @@ summarized here so this batch's substrate story is complete in one artifact.
 
 ## §δ — stage-2 screen run gate
 
+> **2026-08-30 (ruling D9):** tranche 1 stopped at **53 of 66 cells**; cap-excluded
+> symmetry satisfied (**0 vs 0 → SYMMETRIC**), so the gate's acceptance criterion was
+> met. Remaining cells will not be run — the design is superseded. See §ζ.
+
 - `architect-fable-max` producer: ρ (upstream). **PASS**
 - Harness bypasses `routing.allowed_models`: `run_architect_eval` calls
   `invoke_agent` directly with `model=config.model`; the allowlist check
@@ -121,6 +125,11 @@ summarized here so this batch's substrate story is complete in one artifact.
   parameter choices, no runner surgery. **PASS**
 
 ## §ζ — v2 decision record
+
+> **DELIVERED 2026-08-30 — campaign terminated (ruling D9).** Record committed at
+> `plans/fable-architect-trial-v2-decision-2026-08-30.md`. The 66-cell tranche-1
+> design is SUPERSEDED, not paused; the record's standing is FORENSIC-ONLY. No config
+> change was applied — admission remains Leo-ratified at η.
 
 - Analysis inputs: δ's results artifact; validity bounding via σ's marker;
   cap symmetry via per-config cap_excluded. All upstream. **PASS**

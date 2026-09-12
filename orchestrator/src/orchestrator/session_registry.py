@@ -214,6 +214,24 @@ def _coerce_owner_pid(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _coerce_session_id(value: Any) -> str | None:
+    """Read ``claude_session_id`` from a record body, tolerating junk.
+
+    Mirrors ``_coerce_owner_pid``: anything that is not a ``str`` reads as
+    None ("no session id bound") instead of surviving to the hook trio's
+    ``(record.claude_session_id or '').strip()`` call, where a non-str would
+    raise AttributeError outside the ownership probe's try/except and lose
+    the whole hook event. A str value is stripped, and a whitespace-only
+    string also reads as None. Never raises: this is on ``from_dict``'s
+    path, and a hand-edited or older record body must not be what breaks a
+    session hook.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -255,6 +273,8 @@ class SessionRecord:
         ``session_hooks.hook_session_slug`` compares it against the current
         hook's stdin session_id to tell the session spawn-claude.sh launched
         from a nested claude that merely inherited CLAUDE_SPAWN_SESSION_ID.
+        A non-str or whitespace-only value in a record body reads back as
+        None instead of surviving unchanged (see ``_coerce_session_id``).
     claude_owner_pid: pid of the ``claude`` PROCESS that bound
         ``claude_session_id``, stamped at the same moment, or None for a
         record bound before this field existed (or where the pid could not
@@ -263,7 +283,9 @@ class SessionRecord:
         alone cannot tell "the owner re-minted" from "a nested claude
         inherited the env var". The owning process keeps its pid across a
         re-mint; a nested ``claude`` never shares it. See
-        ``session_hooks._env_slug_is_owned``.
+        ``session_hooks._env_slug_is_owned``. A non-int, bool, or
+        non-positive value in a record body reads back as None instead of
+        surviving unchanged (see ``_coerce_owner_pid``).
     """
 
     session_slug: str
@@ -338,7 +360,7 @@ class SessionRecord:
             spawn_mode=data.get('spawn_mode', SpawnMode.CHILD),
             display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
-            claude_session_id=data.get('claude_session_id'),
+            claude_session_id=_coerce_session_id(data.get('claude_session_id')),
             claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
         )
 
@@ -662,8 +684,8 @@ def _atomic_write_text(path: Path, text: str) -> None:
     ``test_session_registry.py::TestStdlibOnlySelfContainment`` — which
     mutation-tests it by injecting this very import — and this
     function is recorded in ``_ALLOWED_RENAMERS`` in
-    ``shared/tests/test_safe_io.py`` so the anti-regrowth guard reads it as the
-    documented exception it is rather than a fresh copy.
+    ``tests/scripts/test_atomic_write_regrowth.py`` so the anti-regrowth guard
+    reads it as the documented exception it is rather than a fresh copy.
 
     The cost is conscious: the repo keeps two hand-rolled copies of this
     pattern instead of one. A documented, allowlisted, test-pinned second copy
@@ -809,22 +831,77 @@ def refresh_record(
     A *corrupt* existing body is NOT treated as absent -- it continues to
     raise ``CorruptSessionRecord`` rather than silently overwriting data the
     reaper's own 'corrupt' rule already accounts for.
+
+    The upsert body itself lives in ``apply_refresh`` (the pure half); this
+    function is read -> apply_refresh -> write, so there is exactly ONE
+    definition of what a freshly-upserted record looks like.
+    ``session_hooks.py::_run_status_refresh_and_retitle`` is the caller that
+    needs those semantics WITHOUT a second read -- it already holds the
+    record, from the ownership probe's own read -- and composes
+    ``apply_refresh`` with a single ``write_record`` instead of calling this.
+    It still calls this on its unreadable-body fault lane, precisely for the
+    corrupt-propagation guarantee above.
+
+    NON-GOAL, deliberate: this is not a compare-and-swap. ``write_record``
+    is an atomic whole-body replace with no CAS, so registry writes are
+    last-writer-wins here and everywhere else.
     """
     try:
-        record = read_record(slug, root=root)
+        prior = read_record(slug, root=root)
     except FileNotFoundError:
+        prior = None
+    record = apply_refresh(slug, prior, status=status)
+    write_record(record, root=root)
+    return record
+
+
+def apply_refresh(
+    slug: str,
+    prior: SessionRecord | None,
+    *,
+    status: Status | None = None,
+) -> SessionRecord:
+    """PURE (no-I/O) half of ``refresh_record``: the upsert body alone.
+
+    Performs NO filesystem access whatsoever -- it neither reads nor writes.
+    *prior* is the already-read record for *slug*, or None when no record
+    exists at that key yet.
+
+    When *prior* is not None it is MUTATED AND RETURNED IN PLACE (the same
+    read-modify contract ``refresh_record``/``update_status`` have always
+    had), so a caller holding the object sees the applied status. When
+    *prior* is None a fresh, well-formed ``SessionRecord`` is synthesized
+    under the same key: schema_version/session_slug/start_ts/status are
+    populated and every other field is left at its documented default.
+
+    Why this exists as its own function:
+    ``session_hooks.py::_run_status_refresh_and_retitle`` already holds the
+    record (the ownership probe read it) and must settle one hook event on
+    ONE snapshot and ONE write -- calling ``refresh_record`` would force a
+    redundant re-read and a second write. It cannot instead re-derive the
+    upsert inline: the module docstring's PRD Section 6 G5 rule is that
+    consumers import the shared record contract and never re-derive it, so
+    there must stay exactly one definition of what a freshly-upserted
+    record looks like. This is that definition.
+
+    Note *prior* being None is the ABSENT state only. A record that exists
+    but is unreadable must NOT be routed here as None -- see
+    ``refresh_record``'s corrupt-body guarantee, which callers preserve by
+    letting ``CorruptSessionRecord`` propagate rather than synthesizing over
+    the body.
+    """
+    if prior is None:
         # No prior write for this slug: synthesize a fresh record. LAUNCHING
         # is the sensible default identity for "a record just came into
         # being" when the caller upserts without an explicit status.
-        record = SessionRecord(
+        return SessionRecord(
             session_slug=slug,
             status=status if status is not None else Status.LAUNCHING,
             start_ts=datetime.now(UTC).isoformat(),
         )
     if status is not None:
-        record.status = status
-    write_record(record, root=root)
-    return record
+        prior.status = status
+    return prior
 
 
 def write_decision(record: DecisionRecord, root: Path | str | None = None) -> bool:

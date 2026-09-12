@@ -47,7 +47,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
-from orchestrator import verify
+from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
@@ -363,14 +363,50 @@ class MergeVerifySpec:
 def result_to_dict(vr: VerifyResult) -> dict:
     """Serialise a VerifyResult to a plain dict of JSON-native types.
 
-    Uses ``dataclasses.asdict`` which recursively converts nested dataclasses
-    and preserves all field types (all VerifyResult fields are JSON-native).
+    Uses ``dataclasses.asdict``, which recursively converts nested dataclasses and
+    preserves all field types.  Every field is JSON-native EXCEPT ``flake_suppression``
+    (task 3789 ε), which is a nested ``FlakeSuppression``: ``asdict`` flattens it to a
+    dict here, and ``json.dumps`` flattens its ``StrEnum`` members to their values and
+    its tuple to an array — so this direction still needs no special handling.  The
+    asymmetry is entirely on the READ side; see :func:`result_from_dict`.
     """
     return dataclasses.asdict(vr)
 
 
 def result_from_dict(d: dict) -> VerifyResult:
-    """Reconstruct a VerifyResult from a dict (as produced by result_to_dict)."""
+    """Reconstruct a VerifyResult from a dict (as produced by result_to_dict).
+
+    Generic ``VerifyResult(**d)`` for every field but one.  ``flake_suppression`` (task
+    3789 ε) is a nested dataclass, so ``asdict``/JSON hands it back as a plain dict with
+    ``verdict``/``call_site`` as strings and ``test_ids`` as a list — passing that
+    straight through would leave the field's TYPED annotation a lie on exactly the
+    deserialized path it exists to serve.  Rebuild it first, in the same
+    ``d.get(key)`` / ``X(v) if v is not None else None`` shape
+    ``orchestrator/src/orchestrator/verify_runner.py::MergeVerifySpec.from_dict`` uses for
+    its optional nested ``global_verify_command`` — this file's established idiom for a
+    newly-added optional field.
+
+    ``flake_suppression_from_wire`` NEVER raises: a malformed sub-payload degrades to
+    ``None`` with a loud warning, because anything raising out of here becomes a
+    ``RunnerUnavailable`` in
+    ``orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify`` and
+    costs a whole local re-verify.
+
+    The codec's strictness is otherwise UNCHANGED — an unknown top-level key is still a
+    ``TypeError`` (pinned by test_verify_runner's characterization tests), the
+    pre-existing behaviour shared by every optional field added before this one.
+    """
+    # `isinstance` guard, not a bare `d.get`: a buggy remote can send a valid JSON
+    # LIST, and that must keep failing exactly as it does today — `VerifyResult(**d)`
+    # raising TypeError, which
+    # `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify`
+    # catches — instead of a fresh
+    # AttributeError that no handler on the merge path expects.
+    if isinstance(d, dict):
+        raw = d.get('flake_suppression')
+        if raw is not None:
+            # Shallow COPY — never mutate the caller's dict, which it may still inspect.
+            d = {**d, 'flake_suppression': flake_ledger.flake_suppression_from_wire(raw)}
     return VerifyResult(**d)
 
 
@@ -733,7 +769,6 @@ class LocalRunner:
         task_id: str | None = None,
         archive_root: Path | None = None,
         event_store: EventStore | None = None,
-        escalation_queue: Any = None,
     ) -> None:
         """Initialise LocalRunner.
 
@@ -744,13 +779,20 @@ class LocalRunner:
         cold-shadow / drift intentionally leave this ``None`` so they are
         auto-excluded from archival without any extra deny-list logic.
 
-        *event_store* / *escalation_queue* thread the merge-flake suppression gate's
-        (PRD task α) fact-emission and storm-escalation side-effects.  Both default
-        to ``None`` — byte-identical for the CLI ``run_merge_verify_on_worktree`` /
-        remote-runner paths, which cannot reach the dispatching host's stores; only
-        the authoritative local merge path (merge_queue.py) wires them.  The gate
-        still runs when they are ``None`` (it just emits no fact and bumps no streak),
-        mirroring the optional ``archive_root`` threading above.
+        *event_store* threads the dispatching store into ``run_scoped``'s merge
+        gate, so a trivial pass emits ``trivial_pass_escalated`` (INV-1, task 2883).
+        It defaults to ``None`` — byte-identical for the CLI
+        ``run_merge_verify_on_worktree`` / remote-runner paths, which cannot reach
+        the dispatching host's store — mirroring the optional ``archive_root``
+        threading above.
+
+        There is deliberately NO *escalation_queue* (task ε).  It fed only the
+        merge-flake storm-streak bump, and that side-effect now happens on the
+        DISPATCHER, from the ``FlakeSuppression`` the returned ``VerifyResult``
+        carries — see ``verify.apply_merge_flake_suppression``.  A LocalRunner
+        runs where the WORKTREE is and cannot reach the dispatching host's queue,
+        so accepting one here only ever invited re-wiring a side-effect onto the
+        host that cannot perform it.
         """
         self._merge_wt = merge_wt
         self._config = config
@@ -761,7 +803,6 @@ class LocalRunner:
         self._task_id = task_id
         self._archive_root = archive_root
         self._event_store = event_store
-        self._escalation_queue = escalation_queue
 
     async def health(self) -> bool:
         return True
@@ -809,19 +850,22 @@ class LocalRunner:
             # isolated + serial in THIS merge worktree; if they all pass, the red
             # was a CPU-starvation flake — suppress it (returns a PASSED result)
             # so the merge proceeds INTO the unscoped gate below, rather than
-            # short-circuiting here.  On a non-confirmation the original failing
-            # result is returned unchanged (merge stays red).  Never raises
-            # (fail-closed) — merge_queue.py has no VerifyInfraError handler.
-            # Resolved via the verify module so it stays monkeypatchable.
+            # short-circuiting here.  On a non-confirmation the failing result is
+            # returned (merge stays red).  Never raises (fail-closed) —
+            # merge_queue.py has no VerifyInfraError handler.  Resolved via the
+            # verify module so it stays monkeypatchable.
+            #
+            # Task ε: the hook takes only what the OBSERVATION needs.  Its two
+            # side-effects — the merge_flake_suppressed emit and the INV-4 storm
+            # streak — now happen on the DISPATCHER, driven off the
+            # FlakeSuppression the returned result carries, because THIS code runs
+            # wherever the worktree is and on the remote path that host has no
+            # event store and a private copy of the streak counter.
             scoped = await verify.apply_merge_flake_suppression(
                 scoped,
                 worktree=self._merge_wt,
                 config=self._config,
                 module_configs=self._module_configs,
-                merge_sha=merge_sha,
-                event_store=self._event_store,
-                escalation_queue=self._escalation_queue,
-                task_id=self._task_id,
             )
             if not scoped.passed:
                 return scoped
@@ -850,6 +894,15 @@ class LocalRunner:
                 summary=summary,
                 timed_out=timed_out,
                 category=category,
+                # Task ε: carry the merge-flake observation through this FRESH
+                # result.  The scoped red WAS observed (and possibly suppressed),
+                # so the observation must still reach the dispatcher's recorder
+                # even though the unscoped gate independently failed the merge.
+                # Dropping it here would under-count the ledger and silently
+                # disarm the INV-4 streak for exactly the compound failure most
+                # likely to occur under load — and would REGRESS an emission that
+                # happened inline before the recorder was split out.
+                flake_suppression=getattr(scoped, 'flake_suppression', None),
             )
 
         return scoped
@@ -2233,6 +2286,43 @@ class VerifyRunnerPool:
                 raise
         duration_ms = round((time.monotonic() - t0) * 1000)
 
+        # Task 3789 (ε): re-stamp the carried observation's `runner`.
+        #
+        # `FlakeSuppression.runner` means WHERE the isolated re-run executed, and the
+        # discriminator can only stamp 'local' — a host-RELATIVE truth that reads as a
+        # lie once the observation crosses the wire.  THIS is the only scope that knows
+        # which runner really ran, and it knows it only HERE, after the
+        # RunnerUnavailable->local fallback above: `merge_queue` passes a `runner`
+        # argument reflecting the runner it INTENDED, so recording the correction at
+        # the recorder's call site would file a fallback verify's flakes against an
+        # innocent remote.  θ's class-3 systemic check reads this column to tell a bad
+        # HOST from a bad SUITE, so a fleet-wide 'local' would make that undecidable.
+        #
+        # A pure `dataclasses.replace` and nothing else: `dispatch` is a TRANSPORT
+        # concern, and the ledger write / event / streak bump belong to
+        # `flake_recorder` on the merge path (recording here too would double-count).
+        #
+        # BOTH objects `replace` touches are guarded, not just the inner one: the
+        # observation must be a real `FlakeSuppression` (a payload that somehow arrived
+        # as a bare dict degrades to an un-stamped observation) AND `result` must be a
+        # dataclass INSTANCE, since a runner returning a Protocol-conformant fake or a
+        # test double would otherwise raise `TypeError` out of the OUTER `replace` and
+        # into the merge path — which has no VerifyInfraError handler.  Mirrors
+        # `verify._is_attachable`: an observation is evidence ABOUT a verdict and must
+        # never be able to destroy the verdict it describes.
+        carried = getattr(result, 'flake_suppression', None)
+        if (
+            isinstance(carried, flake_ledger.FlakeSuppression)
+            and dataclasses.is_dataclass(result)
+            and not isinstance(result, type)
+        ):
+            result = dataclasses.replace(
+                result,
+                flake_suppression=dataclasses.replace(
+                    carried, runner=actual_runner.name,
+                ),
+            )
+
         if self._event_store is not None:
             self._event_store.emit(
                 EventType.merge_verify,
@@ -2621,6 +2711,17 @@ class DriftCheckResult:
     verdict:       AGREE / DIVERGE / INCONCLUSIVE.
     local_passed:  bool verdict from the local runner (None when INCONCLUSIVE).
     remote_passed: bool verdict from the remote runner (None when INCONCLUSIVE).
+    local_category:  VerifyResult.category from the local runner, defaulting to ''.
+    remote_category: VerifyResult.category from the remote runner, defaulting to ''.
+                   Both are always populated when a comparison actually happened,
+                   and both stay '' when INCONCLUSIVE (nothing was compared --
+                   `verdict` is the disambiguator, exactly as it is for
+                   local_passed/remote_passed, which stay None there even when
+                   the local arm genuinely produced a result).  '' is ALSO the
+                   ordinary value for a clean verify result carrying no sentinel
+                   category, so '' never means "missing".  A non-empty value such
+                   as 'merge_flake_suppressed' marks an arm whose verdict came
+                   from a sentinel path rather than a clean first-pass run.
     escalated:     True when a new divergence escalation was submitted.
     quarantined:   True when the remote runner was quarantined.
     """
@@ -2628,6 +2729,10 @@ class DriftCheckResult:
     verdict: DriftVerdict
     local_passed: bool | None = None
     remote_passed: bool | None = None
+    # Field order mirrors ParityRow (local_passed, remote_passed, local_category,
+    # remote_category) -- the sibling record of the same two-arm comparison.
+    local_category: str = ''
+    remote_category: str = ''
     escalated: bool = False
     quarantined: bool = False
 
@@ -2676,7 +2781,9 @@ class DriftDetector:
         """Run *merge_sha* on both runners and compare verdicts.
 
         Returns DriftCheckResult.  Side-effects:
-        - AGREE   → emit verdict_parity_ok event (None-safe).
+        - AGREE   → emit verdict_parity_ok event (None-safe), whose data carries
+          merge_sha, local_runner, remote_runner, passed, and both arms'
+          local_category / remote_category ('' for a clean, sentinel-free arm).
         - DIVERGE → dedup'd L1 escalation (None-safe) + quarantine remote.
         - INCONCLUSIVE → no side-effects.
         """
@@ -2699,6 +2806,12 @@ class DriftDetector:
 
         local_passed = local_result.passed
         remote_passed = remote_result.passed
+        # Same defensive getattr form run_verdict_parity uses: merge_drift wraps
+        # this whole check in a broad `except Exception`, so a bare .category
+        # AttributeError against an odd result object would silently kill the
+        # detective control rather than degrade one telemetry field.
+        local_category = getattr(local_result, 'category', '')
+        remote_category = getattr(remote_result, 'category', '')
 
         if local_passed == remote_passed:
             # Agree — emit verdict_parity_ok event.
@@ -2712,6 +2825,12 @@ class DriftDetector:
                         'local_runner': local.name,
                         'remote_runner': remote.name,
                         'passed': local_passed,
+                        # Emitted UNCONDITIONALLY ('' for a clean arm) so the
+                        # payload shape is uniform across every drift parity
+                        # event -- a consumer never has to tell an absent key
+                        # apart from a clean result.
+                        'local_category': local_category,
+                        'remote_category': remote_category,
                     },
                 )
             return DriftCheckResult(
@@ -2719,12 +2838,31 @@ class DriftDetector:
                 verdict=DriftVerdict.AGREE,
                 local_passed=local_passed,
                 remote_passed=remote_passed,
+                local_category=local_category,
+                remote_category=remote_category,
             )
 
         # Diverge — dedup'd escalation + quarantine.
         escalated = False
         if self._escalation_queue is not None and not self._escalation_queue.has_open_l1(_DRIFT_SENTINEL):
             from escalation.models import Escalation
+            # Explain the suppression sentinel ONLY when an arm actually carries it.
+            # The structured local_category=/remote_category= echo below stays
+            # unconditional (that is the task's always-populated contract); it is
+            # just this ~40-word operator footnote that would otherwise dilute
+            # every divergence escalation with hypothetical guidance.
+            # The literal is matched, not imported: the only cycle-safe home for a
+            # shared constant is verify.py, which this task does not own.  A rename
+            # there degrades to "footnote not shown" -- never to a lost signal, since
+            # the raw category is still echoed verbatim in the structured fields.
+            suppression_note = ''
+            if 'merge_flake_suppressed' in (local_category, remote_category):
+                suppression_note = (
+                    ' A category of "merge_flake_suppressed" on either arm means that '
+                    "arm's green came from an isolated flake-suppression rerun "
+                    '(verify.apply_merge_flake_suppression), not a clean first-pass '
+                    'run -- weigh that when deciding which host is wrong.'
+                )
             esc = Escalation(
                 id=self._escalation_queue.make_id(_DRIFT_SENTINEL),
                 task_id=_DRIFT_SENTINEL,
@@ -2738,8 +2876,11 @@ class DriftDetector:
                 ),
                 detail=(
                     f'merge_sha={merge_sha!r} local_runner={local.name!r} '
-                    f'({local_passed}) remote_runner={remote.name!r} ({remote_passed}). '
+                    f'({local_passed}, local_category={local_category!r}) '
+                    f'remote_runner={remote.name!r} '
+                    f'({remote_passed}, remote_category={remote_category!r}). '
                     f'A remote PASS / local FAIL split can land unverified code on main.'
+                    f'{suppression_note}'
                 ),
                 suggested_action='Re-prove laptop env via run_verdict_parity; call pool.clear_quarantine after parity is restored.',
             )
@@ -2754,6 +2895,8 @@ class DriftDetector:
             verdict=DriftVerdict.DIVERGE,
             local_passed=local_passed,
             remote_passed=remote_passed,
+            local_category=local_category,
+            remote_category=remote_category,
             escalated=escalated,
             quarantined=True,
         )

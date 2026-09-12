@@ -32,6 +32,7 @@ from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_recorder import record_merge_flake_suppression
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
     AdvanceOutcome,
@@ -85,6 +86,15 @@ from orchestrator.merge_gates import (  # noqa: F401  re-export shim
     _resolve_second_parent,
     _reverify_rebased_tree,
 )
+from orchestrator.merge_lane.ports import (
+    ClockPort,
+    EscalationPort,
+    ProductionClock,
+    ProductionVerifier,
+    VerifyPort,
+    escalation_port,
+)
+from orchestrator.merge_lane.types import EscalationRecord
 from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     _MERGE_WORKER_LOOP_DIED_SENTINEL,
     _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
@@ -92,16 +102,20 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     MergeLivenessAssessment,
     MergeLivenessConfigError,
     PersistentWorktreeConfigError,
+    SerialLaneAssessment,
     _acquire_warm_verify_worktree,
     _alarm_verify_host_unreachable,
     _clear_verify_host_unreachable,
     _safety_valve_due,
     _verify_host_unreachable_sentinel,
     acquire_chain_build_lane,
+    alarm_serial_lane_breach,
     check_merge_liveness_margin,
+    check_serial_lane_tripwire,
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
     newest_content_mtime,
+    per_host_inflight_bound,
     release_chain_build_lane,
 )
 from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
@@ -839,6 +853,18 @@ async def _ensure_verify_disk_space(
     )
 
 
+PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
+    scoped=lambda: run_scoped_verification,
+    unscoped=lambda: _run_unscoped_typechecks,
+    post_merge_pyright=lambda: _check_post_merge_pyright,
+    post_merge_equivalence=lambda: _check_post_merge_equivalence,
+    disk_guard=lambda: _ensure_verify_disk_space,
+    cold_shadow_verify=lambda: _run_cold_shadow_verify,
+    dry_run=lambda: run_dry_run_unblock,
+)
+PRODUCTION_CLOCK: ClockPort = ProductionClock(content_mtime=lambda: newest_content_mtime)
+
+
 def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> str:
     """Compose a dedupe fingerprint for a preexisting-main-break outcome.
 
@@ -1230,6 +1256,7 @@ def _spawn_merge_verify_dry_run(
     detail: str,
     *,
     event_store: EventStore | None = None,
+    verifier: VerifyPort = PRODUCTION_VERIFIER,
 ) -> None:
     """Fire-and-forget: spawn an autonomous dry-run investigation for a
     MERGE_VERIFY_RED post-merge-verify block.
@@ -1294,7 +1321,7 @@ def _spawn_merge_verify_dry_run(
         return
     try:
         task = asyncio.create_task(
-            run_dry_run_unblock(
+            verifier.dry_run_unblock(
                 task_id=req.task_id,
                 worktree=str(req.worktree),
                 reason=reason,
@@ -2457,6 +2484,49 @@ def _merge_boundary_module_configs(
     return effective_merge_module_configs(config, module_configs)
 
 
+def _record_flake_observation(
+    result: VerifyResult,
+    req: MergeRequest,
+    *,
+    merge_sha: str,
+    event_store: EventStore | None,
+    escalation_queue: Any,
+) -> None:
+    """Record whatever flake observation *result* carries (PRD task ε, §5.8).
+
+    Binds this call site's context once — project root, project id, merge SHA,
+    task id and both stores — so the two recording points below cannot drift
+    apart in what they attribute an observation to.
+
+    THE topology rule ε encodes: the DISCRIMINATOR runs where the WORKTREE is
+    (local host or remote runner — only there can the failing tests be re-run);
+    the RECORDER runs HERE, on the dispatcher, because ``_run_post_merge_verify``
+    is the only scope where a local OR remote ``VerifyResult`` sits alongside an
+    ``EventStore``, an escalation queue, ``project_root``, ``merge_sha`` and
+    ``task_id`` at once.
+
+    That co-location is what makes the three side-effects — the durable
+    ``flake_occurrence`` row, the ``merge_flake_suppressed`` fact and the INV-4
+    storm-streak bump — unconditional BY CONSTRUCTION rather than dependent on
+    which host happened to run the verify.  Before ε they fired inline inside the
+    producer, so a REMOTE verify landed none of the three: no ledger call existed
+    at all, the remote host has no event store, and its streak counter died with
+    its process.
+
+    Never raises (the recorder owns that guarantee), so a lost measurement can
+    never fail a verify or stall the merge queue.
+    """
+    record_merge_flake_suppression(
+        result,
+        project_root=req.config.project_root,
+        project_id=req.config.fused_memory.project_id,
+        merge_sha=merge_sha,
+        task_id=req.task_id,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -2485,6 +2555,7 @@ async def _run_post_merge_verify(
     chain_build_ms: int | None = None,
     merge_base_sha: str | None = None,
     main_sha: str | None = None,
+    verifier: VerifyPort = PRODUCTION_VERIFIER,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -2714,14 +2785,14 @@ async def _run_post_merge_verify(
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
     # infra rather than entering a doomed multi-minute ENOSPC build.
-    disk_reason = await _ensure_verify_disk_space(
+    disk = await verifier.ensure_disk_space(
         git_ops, merge_wt,
         req.config.merge_verify_min_free_disk_bytes, req.task_id,
         keep_worktrees=keep_worktrees,
     )
-    if disk_reason is not None:
+    if disk.reason is not None:
         await git_ops.cleanup_merge_worktree(merge_wt)
-        return MergeOutcome('blocked', reason=disk_reason, verify_skipped=True)
+        return MergeOutcome('blocked', reason=disk.reason, verify_skipped=True)
 
     # Build the spec (carried for forward-compat with γ/δ remote runners;
     # the LocalRunner does not use it to drive execution).
@@ -2813,14 +2884,16 @@ async def _run_post_merge_verify(
         pool = VerifyRunnerPool(
             [LocalRunner(
                 merge_wt, req.config, effective_module_configs, task_files_tuple,
-                run_scoped=run_scoped_verification,
-                run_unscoped=_run_unscoped_typechecks,
+                run_scoped=verifier.run_scoped,
+                run_unscoped=verifier.run_unscoped_typechecks,
                 task_id=req.task_id,
                 archive_root=req.config.project_root / 'data' / 'verify-logs',
-                # PRD task α: thread the fact-emission + storm-escalation stores
-                # into the merge-flake suppression gate (LocalRunner.run_merge_verify).
+                # INV-1 (task 2883): thread the dispatching store so run_scoped's
+                # merge gate emits trivial_pass_escalated.  The merge-flake gate's
+                # own side-effects are NOT threaded here — task ε moved them to the
+                # dispatcher (_run_post_merge_verify), driven off the
+                # FlakeSuppression the returned VerifyResult carries.
                 event_store=event_store,
-                escalation_queue=escalation_queue,
             )],
             event_store=event_store,
             task_id=req.task_id,
@@ -2862,6 +2935,25 @@ async def _run_post_merge_verify(
         ):
             await stack.enter_async_context(git_ops.merge_verify_lease())
 
+        # Task ε: attempts whose VERDICT is superseded by a retry below, but whose
+        # OBSERVATION is not.  §5.5 records the observation, not the remedy — and the
+        # compound case is real: `apply_merge_flake_suppression` runs on the SCOPED
+        # leg, so an attempt can suppress a scoped red (a genuine `passes_in_isolation`
+        # observation) and STILL come back failing because the unscoped gate then broke
+        # or the run hit ENOSPC.  That result is retried, `verify` is rebound, and
+        # recording only the settled verdict would silently drop the observation —
+        # exactly the load-correlated shape this PRD exists to measure, and one that
+        # WAS emitted inline (at the moment of observation) before ε moved recording to
+        # the dispatcher.  §8.3's `(test_id, observed_at, call_site)` dedup keeps a
+        # replay idempotent, and each attempt stamps its own `observed_at`, so every
+        # attempt contributes exactly one row per test.
+        superseded_observations: list[VerifyResult] = []
+
+        def _remember_superseded(v: VerifyResult) -> None:
+            """Stash *v* iff it carries an observation, just BEFORE `verify` is rebound."""
+            if getattr(v, 'flake_suppression', None) is not None:
+                superseded_observations.append(v)
+
         verify = await pool.dispatch(
             merge_sha, spec, depth=depth, speculative=speculative,
             chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -2884,6 +2976,7 @@ async def _run_post_merge_verify(
                     'stale merge worktree(s), retrying verify once',
                     req.task_id, len(pruned),
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
                     chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -2993,11 +3086,37 @@ async def _run_post_merge_verify(
                     '(category=%s); retrying verify (attempt=%d, budget=%d, narrowed=%s)',
                     req.task_id, verify.category, retries[req.task_id], budget, narrowed,
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=retries[req.task_id], depth=depth,
                     speculative=speculative, chain_items=chain_items,
                     chain_build_ms=chain_build_ms,
                 )
+
+    # Task ε: record EVERY attempt's flake observation, oldest first.
+    #
+    # Placed after BOTH retry loops (ENOSPC and infra-transient) have finished
+    # rebinding `verify`, so the recording order matches the observation order and
+    # a single pass covers both loops.  A superseded attempt's VERDICT is dead, but
+    # its OBSERVATION is not (§5.5 — record the observation, not the remedy): an
+    # attempt whose SCOPED red was suppressed can still come back failing on the
+    # unscoped gate or on ENOSPC and be retried, and that suppression is a real
+    # masked red that the inline pre-ε emit would have reported at the moment it
+    # happened.  `superseded_observations` is empty on every path where no retry
+    # carried an observation, which is the overwhelmingly common case.
+    for superseded in superseded_observations:
+        _record_flake_observation(
+            superseded, req,
+            merge_sha=merge_sha,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+        )
+    _record_flake_observation(
+        verify, req,
+        merge_sha=merge_sha,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
@@ -3054,12 +3173,11 @@ async def _run_post_merge_verify(
     ):
         cross_check_runner = LocalRunner(
             merge_wt, req.config, effective_module_configs, task_files_tuple,
-            run_scoped=run_scoped_verification,
-            run_unscoped=_run_unscoped_typechecks,
+            run_scoped=verifier.run_scoped,
+            run_unscoped=verifier.run_unscoped_typechecks,
             task_id=req.task_id,
             archive_root=req.config.project_root / 'data' / 'verify-logs',
             event_store=event_store,
-            escalation_queue=escalation_queue,
         )
         try:
             # task 2873: defense-in-depth lane-lock for the REMOTE-path
@@ -3085,6 +3203,18 @@ async def _run_post_merge_verify(
                         git_ops.merge_verify_lease(lane_dir=merge_wt)
                     )
                 local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
+            # Task ε: the cross-check ran its OWN merge gate on the local trust
+            # anchor, so it can carry its own observation.  Its LocalRunner had
+            # both stores wired before ε and therefore emitted + bumped inline;
+            # recording it here is what keeps this detective-control path from
+            # regressing.  Inside the `try`, after the await, so a raised verify
+            # (handled below) records nothing — there is no verdict to record.
+            _record_flake_observation(
+                local_verify, req,
+                merge_sha=merge_sha,
+                event_store=event_store,
+                escalation_queue=escalation_queue,
+            )
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
@@ -3425,7 +3555,7 @@ async def _run_post_merge_verify(
             if verify.category != UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
                 _spawn_merge_verify_dry_run(
                     dry_run_handles, req, reason, detail,
-                    event_store=event_store,
+                    event_store=event_store, verifier=verifier,
                 )
             return MergeOutcome('blocked', reason=reason)
 
@@ -3596,7 +3726,7 @@ async def _run_post_merge_verify(
         if not verify.timed_out:
             _spawn_merge_verify_dry_run(
                 dry_run_handles, req, reason, detail,
-                event_store=event_store,
+                event_store=event_store, verifier=verifier,
             )
         # DEFERRED mode: spawn the off-critical-path main-health
         # classification now that the provisional outcome is fully built.
@@ -8976,7 +9106,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # automatically safe the moment a remote runner is turned on. The BLIND
     # SPOT above (toolchains writing outside merge_wt) applies verbatim to
     # the cross-check leg of the REMOTE arm too.
-    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
+    #
+    # INVARIANT (task 4659 incident, 2026-08-29): this budget MUST EXCEED the
+    # longest PER-COMMAND verify timeout the target can authorise, because a
+    # command that is still within its own sanctioned runtime is by definition
+    # healthy and must never be killed here. pytest writes its junit XML only
+    # at command COMPLETION, so a single verify command legitimately produces
+    # ZERO writes under merge_wt for its entire duration — the no-progress
+    # signal cannot distinguish that from a hang, and must not try to.
+    # dark-factory authorises up to `verify_command_timeout_secs: 3600` on the
+    # global fallback path (the path a zero-.py / cross-cutting diff routes
+    # to), above every per-module budget (max: scripts/ at 2400s). The old
+    # 1800.0 sat BELOW that 3600s ceiling, so this watchdog could fire on a
+    # verify with 30 minutes of authorised runtime still to go.
+    # It did: under host oversubscription (load 76-137 on 32 cores) three
+    # consecutive head-of-line verifies — tasks 4659, 4810, 4055 — were each
+    # killed at 1800s and re-queued, main took ZERO landings for 3+ hours, and
+    # the queue grew 1 -> 19 while the scheduler kept dispatching the task
+    # pytest runs that caused the contention. A livelock, not a hang.
+    # 5400s clears the 3600s ceiling with 1800s of headroom. Raise this again
+    # if any per-command budget is ever raised past 5400s; the ordering is the
+    # contract, not the number.
+    # Cost of the raise, accepted deliberately: a genuinely hung verify now
+    # holds the (single) verifier host 90min x MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+    # = 4.5h before resolving `blocked`, up from 1.5h. That is strictly better
+    # than the livelock above, which had no terminating condition at all.
+    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 5400.0
     # Throttle for the newest_content_mtime() worktree-subtree walk that
     # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
     # the walk cost is bounded independently of the 10s abort-poll cadence.
@@ -9241,6 +9396,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         usage_gate: Any = None,
         cost_store: Any = None,
         provenance_conflict_sink: Any = None,
+        verifier: VerifyPort = PRODUCTION_VERIFIER,
+        clock: ClockPort = PRODUCTION_CLOCK,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -9290,6 +9447,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # PRD §10 invariant 6(b): born-at-L2 shadow compare escalation queue.
         # None-safe so bare-worker/bare-harness tests stay green without wiring.
         self._escalation_queue: Any = escalation_queue
+        self._verifier: VerifyPort = verifier
+        self._clock: ClockPort = clock
+        self._escalation: EscalationPort = escalation_port(escalation_queue)
         # Shared done_evidence_stale sink (task 2677): injected BY REFERENCE
         # from the harness's single ProvenanceConflictSink instance so a
         # coalesce re-drive's rejection folds into the same memo + dedupe
@@ -9676,7 +9836,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Seeding to real construction time instead defers the first
         # periodic sweep by a full _reap_interval_s, giving startup recovery
         # time to settle first.
-        self._last_reap_at: float = time.time()
+        self._last_reap_at: float = self._clock.now()
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _heartbeat_interval_s / _shutdown_timeout override precedent.
         self._reap_interval_s: float = 300.0
@@ -9811,7 +9971,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._loop_restart_window_s: float = 300.0
         # Injectable clock for restart-window accounting; mirrors the
         # _maybe_log_queue_heartbeat clock-injection convention.
-        self._restart_clock: Callable[[], float] = time.monotonic
+        self._restart_clock: Callable[[], float] = self._clock.monotonic
         # Per-loop restart timestamp rings (pruned to the rolling window).
         self._loop_restart_times: dict[str, collections.deque[float]] = {
             'merger': collections.deque(),
@@ -10027,7 +10187,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         would find the elapsed budget already blown and cap out on the FIRST
         defer of a new streak.
         """
-        _defer_now = time.monotonic()
+        _defer_now = self._clock.monotonic()
         _waited = float(getattr(exc, 'wait_secs', 0.0) or 0.0)
         _prev_defer_at = self._contended_lease_last_defer_at.get(task_id)
         _streak_stale_after = max(
@@ -12433,7 +12593,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # than assert: this is the OPTIONAL deep path, and it must never be
             # the thing that crashes a dispatch.
             return None
-        _build_t0 = time.monotonic()
+        _build_t0 = self._clock.monotonic()
         try:
             async with asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS):
                 result = await build_chain(
@@ -12777,7 +12937,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             base = getattr(self._git_ops, 'worktree_base', None)
             if base is None or not base.is_dir():
                 return []
-            effective_now = now if now is not None else time.time()
+            effective_now = now if now is not None else self._clock.now()
             grace = (
                 grace_secs
                 if grace_secs is not None
@@ -12929,7 +13089,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._register_owned_merge_worktree(wt)
                 readopted.append(str(wt.resolve()))
 
-        effective_now = now if now is not None else time.time()
+        effective_now = now if now is not None else self._clock.now()
         grace = (
             min_age_secs
             if min_age_secs is not None
@@ -13329,7 +13489,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           'dispatching' is net-new, closing the task-2068 census gap.)
         """
         entries: list[dict] = []
-        now = time.time()
+        now = self._clock.now()
 
         def _entry(
             req: MergeRequest,
@@ -14090,15 +14250,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         worker.
         """
         while self._running:
-            await asyncio.sleep(_HEARTBEAT_POLL_S)
+            await self._clock.sleep(_HEARTBEAT_POLL_S)
             try:
                 self._touch_owned_merge_worktrees()
-                self._maybe_log_queue_heartbeat(time.time())
+                self._maybe_log_queue_heartbeat(self._clock.now())
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
             try:
                 await asyncio.wait_for(
-                    self._maybe_reap_orphaned_merge_worktrees(time.time()),
+                    self._maybe_reap_orphaned_merge_worktrees(self._clock.now()),
                     timeout=self._reap_sweep_timeout_s,
                 )
             except Exception:
@@ -14115,9 +14275,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _heartbeat_loop) so a probe bug can never crash the worker.
         """
         while self._running:
-            await asyncio.sleep(self._reprobe_interval_s)
+            await self._clock.sleep(self._reprobe_interval_s)
             try:
-                await self._reprobe_quarantined_hosts(time.time())
+                await self._reprobe_quarantined_hosts(self._clock.now())
             except Exception:
                 logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
 
@@ -14267,11 +14427,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         suggested_action: str,
         id_key: str,
     ) -> None:
-        """None-safe helper: build and submit a loop-supervisor escalation.
+        """Build a loop-supervisor escalation and file it through the escalation port.
 
-        Centralises the None-guard, local ``escalation.models`` import, traceback
-        rendering, ``Escalation`` construction, and ``submit`` call that were
-        previously duplicated verbatim across
+        Centralises the traceback rendering and the ``EscalationRecord`` filed
+        through the worker's escalation port, previously duplicated verbatim across
         ``_emit_loop_death_escalation`` and ``_emit_loop_terminal_escalation``.
 
         Args:
@@ -14285,13 +14444,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             suggested_action: Operator instructions.
             id_key: Unique key used for both ``make_id`` and ``task_id``.
         """
-        if self._escalation_queue is None:
-            return
-        from escalation.models import Escalation  # local import — escalation optional dep
         tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         detail = f'{detail_prefix}\n\n{tb_label}:\n{tb_str}'
-        esc = Escalation(
-            id=self._escalation_queue.make_id(id_key),
+        self._escalation.file(EscalationRecord(
             task_id=id_key,
             agent_role='orchestrator-merge-worker-supervisor',
             severity=severity,
@@ -14300,8 +14455,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             summary=summary,
             detail=detail,
             suggested_action=suggested_action,
-        )
-        self._escalation_queue.submit(esc)
+        ))
 
     def _emit_loop_terminal_escalation(
         self, name: str, exc: BaseException, restart_count: int
@@ -14312,7 +14466,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The ``orchestrator-`` agent_role prefix marks it as a harness sentinel so the
         escalation server never downgrades the severity.
 
-        None-safe (delegated to ``_submit_loop_escalation``).
+        Filed through the escalation port; a worker built without a queue files nothing.
         """
         self._submit_loop_escalation(
             name, exc,
@@ -14342,7 +14496,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     def _emit_loop_death_escalation(self, name: str, exc: BaseException) -> None:
         """Emit a loud L1 ``'merge_worker_loop_died'`` escalation.
 
-        None-safe (delegated to ``_submit_loop_escalation``).
+        Filed through the escalation port; a worker built without a queue files nothing.
 
         The ``agent_role='orchestrator-merge-worker-supervisor'`` prefix marks these as
         harness sentinels so the escalation server never downgrades their severity.
@@ -15060,24 +15214,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'cannot recover from a lost CAS (timeout=%.0fs)',
             train_id, pred.task_id, timeout,
         )
-        t_wait = time.monotonic()
+        t_wait = self._clock.monotonic()
         deadline = t_wait + timeout
         while (
             self._running
             and not pred.result.done()
-            and time.monotonic() < deadline
+            and self._clock.monotonic() < deadline
         ):
-            await asyncio.sleep(_TRAIN_PREDECESSOR_SETTLE_POLL_SECS)
+            await self._clock.sleep(_TRAIN_PREDECESSOR_SETTLE_POLL_SECS)
         if not pred.result.done():
             logger.warning(
                 'Train %s: predecessor %s still unfinalized after %.1fs — '
                 'proceeding anyway; the train may lose the CAS and derail',
-                train_id, pred.task_id, time.monotonic() - t_wait,
+                train_id, pred.task_id, self._clock.monotonic() - t_wait,
             )
         else:
             logger.info(
                 'Train %s: predecessor %s finalized after %.1fs — proceeding',
-                train_id, pred.task_id, time.monotonic() - t_wait,
+                train_id, pred.task_id, self._clock.monotonic() - t_wait,
             )
         return True
 
@@ -15406,7 +15560,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # await.  RequestLedger.on_dequeue is idempotent (it keeps
                     # the earliest dequeued_at), so the shared hook below still
                     # covers both branches and re-arming there is a no-op.
-                    self._request_ledger.on_dequeue(req, now=time.time())
+                    self._request_ledger.on_dequeue(req, now=self._clock.now())
 
                 # γ/1719 retroactive coalescing pass — design decisions summary:
                 # • DD1: gated on controller.can_coalesce() — no prefetched item
@@ -15512,7 +15666,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # is consumed.  Consumption itself is covered: the top of the
                 # loop arms a just-taken prefetched item BEFORE the coalescing
                 # pass's awaits, so the window never spans those either.
-                self._request_ledger.on_dequeue(req, now=time.time())
+                self._request_ledger.on_dequeue(req, now=self._clock.now())
 
                 # MQ-reliability kappa-b (task 2435): no self._inflight_req
                 # assignment needed here (field deleted) — `req` always came
@@ -15547,7 +15701,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         phase='merge',
                         data={'branch': req.branch.bare_id, 'queue_depth': self._queue.qsize()},
                     )
-                t0 = time.monotonic()
+                t0 = self._clock.monotonic()
                 merge_result_local: MergeResult | None = None
                 try:
                     spec = self._speculation_controller.spec_base
@@ -16073,6 +16227,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ItemLifecycleState.VERIFYING, live_obj=entry,
         )
         self._inflight.append(entry)
+
+        # ── PRD C4 / task 2930 η: serial-lane tripwire (DETECTION ONLY) ──
+        # Runs AFTER the append (never before) so no existing transition or
+        # append semantics shift and the just-appended entry IS counted.
+        #
+        # `_frozen_inflight_entries()`, not a raw `self._inflight` scan:
+        # `_finalize_inflight` pops the head via `_inflight_popleft` BEFORE
+        # awaiting the long verify, so an entry can still be verifying while
+        # absent from `_inflight`.  Counting `_inflight` alone would MISS
+        # exactly the overlap C4 exists to catch.  Reusing the helper also
+        # avoids restating the frozen-window definition (INV-5).
+        #
+        # `self._host_allocator.host_names` is a PROPERTY ACCESS, NOT A CALL.
+        # `HostAllocator.host_names` is decorated `@property`; writing
+        # `host_names()` raises `TypeError: 'list' object is not callable`,
+        # which the fail-open arm below would SWALLOW SILENTLY — the tripwire
+        # would be permanently dead in production while unit tests that leave
+        # `_host_allocator = None` still passed.  This expression is lifted
+        # VERBATIM from this file's own `snapshot()` occupancy block, `is not
+        # None` guard included.  test_merge_serial_lane_tripwire.py's
+        # `test_real_host_allocator_does_not_break_the_hook` is the regression
+        # guard that keeps it honest.
+        #
+        # `except Exception` fail-open: merge_queue.py is the #1-reliability
+        # file and a tripwire bug must never wedge dispatch.  Two corollaries
+        # worth stating out loud: (i) enforcement can NEVER be added here by
+        # making the alarm raise — this arm would swallow it silently; and
+        # (ii) any future edit inside the `try` must be covered by a test that
+        # exercises it with a real allocator, or it can rot invisibly.
+        #
+        # No hard block: the append already happened above; this block has no
+        # `return`, no `raise`, and no veto.
+        try:
+            _local = sum(
+                1 for _e in self._frozen_inflight_entries()
+                if getattr(_e.lease, 'is_local', False)
+            )
+            _hosts = (
+                len(self._host_allocator.host_names)
+                if self._host_allocator is not None else 1
+            )
+            alarm_serial_lane_breach(
+                check_serial_lane_tripwire(
+                    _local,
+                    merge_ahead_bound=self._speculation_depth,
+                    num_hosts=_hosts,
+                ),
+                event_store=self._event_store,
+                task_id=entry.item.request.task_id,
+                branch=entry.item.request.branch.bare_id,
+                request_id=entry.item.request.request_id,
+                host=getattr(entry.lease, 'name', None),
+            )
+        except Exception:
+            logger.warning('serial-lane tripwire check failed', exc_info=True)
 
     def _inflight_popleft(self) -> InflightEntry:
         """Pop and return the head of ``self._inflight`` (verifier-owned single-writer choke point).
@@ -17204,7 +17413,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         lease.name,
                         f'verify cancel/probe failed against {lease.name!r} — '
                         'host slot PARKED (presumed unreachable)',
-                        time.time(),
+                        self._clock.now(),
                     )
             except Exception:
                 logger.warning(
@@ -17985,7 +18194,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 chain_items=chain_items,
                 chain_build_ms=chain_build_ms,
                 merge_base_sha=merge_base_sha,
-                main_sha=main_sha,
+                main_sha=main_sha, verifier=self._verifier,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728), revised by
             # task 4579: no-progress budget seed.  Content-mtime is sampled
@@ -18003,7 +18212,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # remote lease would make the first probe hit the
             # `_last_content_mtime is None` arm and hand a genuinely
             # coasting remote lease one free budget window.
-            _last_content_mtime = newest_content_mtime(merge_wt)
+            _last_content_mtime = self._clock.newest_content_mtime(merge_wt)
             # task 2420 amend (reviewer finding, robustness): time.monotonic(),
             # not time.time(), for _last_progress_at/_last_probe_at/_now below
             # — all three are pure duration references (never persisted or
@@ -18014,7 +18223,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # false-'block' a healthy task. Matches the time.monotonic()
             # convention used elsewhere in this file (e.g. _elapsed_ms,
             # per-attempt t0 at the top of the dequeue loop).
-            _last_progress_at = time.monotonic()
+            _last_progress_at = self._clock.monotonic()
             _last_probe_at = _last_progress_at
             # task 2420 amend (reviewer finding, correctness); revised by task
             # 4579: guard against INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not
@@ -18180,7 +18389,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # archive outside merge_wt, and the busy-loop cap counts only actual aborts — so the
                 # residual exposure can DELAY a coast abort by a foreign write's timing, never
                 # suppress it the way a permanent mask would.
-                _now = time.monotonic()
+                _now = self._clock.monotonic()
                 # Evidence B is checked FIRST and short-circuits evidence A: while a remote dispatch
                 # is live it is already progress on its own, so probing content-mtime too would only
                 # re-confirm what B already established, at the cost of a synchronous os.walk of
@@ -18202,7 +18411,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # evidence B is not already live.
                 elif _now - _last_probe_at >= _progress_probe_secs:
                     _last_probe_at = _now
-                    _cur_content_mtime = newest_content_mtime(merge_wt)
+                    _cur_content_mtime = self._clock.newest_content_mtime(merge_wt)
                     if _cur_content_mtime is not None and (
                         _last_content_mtime is None
                         or _cur_content_mtime > _last_content_mtime
@@ -18589,7 +18798,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # streak-staleness window), so it is reused rather than re-derived.
             _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
             if _backoff:
-                await asyncio.sleep(_backoff)
+                await self._clock.sleep(_backoff)
             self._requeue_request(req)
             return InflightVerifyResult(
                 outcome=None,
@@ -18819,7 +19028,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ):
                     with contextlib.suppress(Exception):
                         self._quarantine_unreachable_host(
-                            lease.name, str(_orphan_exc), time.time(),
+                            lease.name, str(_orphan_exc), self._clock.now(),
                         )
                     with contextlib.suppress(Exception):
                         logger.warning(
@@ -19992,7 +20201,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._quarantine_unreachable_host(
                         entry.lease.name,
                         vr.reason or '<unknown>',
-                        time.time(),
+                        self._clock.now(),
                     )
                 # ── Dispose of the RU'd merge worktree (task 3251) ──────────
                 # _run_inflight_verify returns merge_wt UN-cleaned precisely so
@@ -20826,7 +21035,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     merge_wt=None,
                     was_speculative=item_was_speculative,
                     passthrough_outcome=item.immediate_outcome,
-                    started_at=time.time(),
+                    started_at=self._clock.now(),
                     permit=item_permit,
                 )
             # item: RealMergeItem re-based on live main — falls through to the
@@ -20971,7 +21180,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_wt=None,
                         was_speculative=item_was_speculative,
                         passthrough_outcome=item.immediate_outcome,
-                        started_at=time.time(),
+                        started_at=self._clock.now(),
                         permit=item_permit,
                     )
                 # item: RealMergeItem again (post-remerge fallthrough; task ο).
@@ -21005,8 +21214,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _req_for_factory.config, _req_for_factory.module_configs,
                 ),
                 None,   # task_files — derived inside _run_post_merge_verify
-                run_scoped=run_scoped_verification,
-                run_unscoped=_run_unscoped_typechecks,
+                run_scoped=self._verifier.run_scoped,
+                run_unscoped=self._verifier.run_unscoped_typechecks,
                 task_id=_req_for_factory.task_id,
             )
 
@@ -21212,7 +21421,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # other entry vr.merge_wt stays the post-verify one.
             merge_wt=item.merge_wt,
             was_speculative=item_was_speculative,
-            started_at=time.time(),
+            started_at=self._clock.now(),
             permit=item_permit,
             chain=chain,
             verify_wt=verify_wt,

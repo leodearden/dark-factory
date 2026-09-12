@@ -32,6 +32,24 @@ _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# Make THIS directory importable by name, so the uniquely-named sibling
+# test-support modules here (`_escalation_http.py`) resolve in every collection
+# configuration.  This is load-bearing, not decoration -- MEASURED: without it
+# `escalation/tests` is on `sys.path` only when pytest is invoked as
+# `cd escalation && pytest tests/` (the tests dir lands at `sys.path[0]`); in a
+# repo-root MULTI-PACKAGE run another subproject's tests dir wins that slot,
+# `escalation/tests` is nowhere, and a module-level
+# `from _escalation_http import ...` raises `ModuleNotFoundError` at COLLECTION
+# time.  Enforced by `tests/scripts/test_pytest_workspace_collection.py`
+# (`_SUBPROJECTS_WITH_CONFTEST`), which also fixes the spelling.
+#
+# Note this is `insert(0, ...)`, deliberately unlike the `REPO_ROOT` *append*
+# lower in this file: a tests dir contributes no package-shadowing directories,
+# and `insert(0, ...)` is the spelling the enforcing test requires.
+_TESTS_DIR = Path(__file__).parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+
 # ---------------------------------------------------------------------------
 # Orchestrator/shared path injection for TestMergeRequestDedup /
 # TestGetMergeQueue tests.
@@ -102,6 +120,7 @@ if str(REPO_ROOT) not in sys.path:
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
 
@@ -126,6 +145,17 @@ def pytest_configure(config):
 # scope/shape adapters over the factory below); `test_legibility_census_
 # escalation_e2e.py` already drove it. There is no other copy to keep in
 # lockstep — which is the point, per INV-5.
+#
+# The harness has TWO halves and they live apart BY NATURE OF THE THING, not by
+# convenience. This conftest owns the SERVER-LIFECYCLE half, because scoped
+# setup/teardown genuinely is a fixture. `escalation/tests/_escalation_http.py`
+# owns the CALL half (`escalation_http_call` / `capability_headers`), because a
+# plain function is not a fixture and is unreachable from the module-level
+# `async def` partials that call it — so it goes in a uniquely-named sibling
+# module, the house convention for non-fixture test helpers (task 4345, which
+# folded the last two copies of the call half; the sibling import is enabled by
+# the `_TESTS_DIR` insert at the top of this file). Neither half has a second
+# copy.
 #
 # It is exposed at TWO scopes — `serve_escalation_mcp` (function) and
 # `serve_escalation_mcp_module` (module) — both of which are thin `yield from`

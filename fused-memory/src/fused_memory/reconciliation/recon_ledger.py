@@ -86,6 +86,17 @@ SCHEMA_SQL = TABLE_SQL + INDEX_SQL
 # memory uuids out of both. Adding it would mean an id collision between a
 # memory uuid and a terminal task id could delete the audit trail of the very
 # record an auditor is investigating.
+#
+# Reciprocal pointer (task 4375): for the 'flag_for_stage2' kind, the same
+# terminal-task-closure test gc() applies to LEDGER rows below is now also
+# applied on the MEM0 side by
+# stages/task_knowledge_sync.py::_sweep_stale_mem0_pool, which is where that
+# pool actually lives (no code path upserts a flag_for_stage2 row here, so
+# gc()'s record_kind clause never matches one — see
+# recon_self_model.MARKER_LIFECYCLE for that declared-vs-actual gap). The two
+# sides deliberately share semantics, including the exact-string match that
+# makes a comma-joined multi-task task_id never terminal-match. A reader
+# changing either side should check the other.
 MARKER_KINDS = ('stage1_flag_marker', 'stage2_persistence_marker', 'flag_for_stage2')
 
 # record_kind for a recon-initiated Mem0 deletion tombstone (task 3041).

@@ -1804,6 +1804,68 @@ def _task_external_deps(task: dict) -> list[str]:
     return metadata.external_deps
 
 
+def _reject_contradictory_metadata_mode(
+    metadata_mode: str | None, append: bool
+) -> None:
+    """Raise if a metadata write asks for both 'merge' and additive semantics.
+
+    THE single definition of the contradictory-pair rejection (task 3890),
+    shared by ``Scheduler.update_task`` and by the ``FakeMetadataBackend`` test
+    double in ``orchestrator/tests/_workflow_helpers.py``.  It lives at module
+    scope, and the fake calls THIS function rather than restating the
+    condition, so the double cannot drift back into being more permissive than
+    production: a later narrowing or widening of the rule lands in both callers
+    at once, by construction.  (Test-infrastructure-lies-about-production drift
+    is the exact failure class this guard was added to close, so re-opening it
+    by hand-copying the condition would be self-defeating.)
+
+    The check has to live client-side, not be delegated downwards: because
+    ``append`` is deliberately never forwarded on the wire by
+    ``Scheduler.update_task`` (``append=False`` would resolve to a destructive
+    REPLACE on the backend), the pair can never reach the backend's
+    ``sqlite_task_backend.py::_resolve_metadata_mode``, so without this every
+    orchestrator caller would be permanently exempt from any backend-side
+    rejection of it.  Task 3581 is the sibling backend fix for the same
+    contradiction one layer down, and it HAS landed — but that does not make
+    this one redundant belt-and-braces: because ``append`` never reaches the
+    wire, 3581's guard is structurally unreachable from any orchestrator
+    caller.  Exactly one guard fires per path — this one for orchestrator
+    callers, 3581's for direct-MCP callers (interactive / curator / recon) —
+    so removing either would leave its path unguarded.
+
+    Deliberately exactly one cell wide: ``('replace', True)`` (the sanctioned
+    destructive co-signal) and ``('additive', True)`` (both signals agree) stay
+    honored, and ``('merge', append=False/omitted)`` — the default-safe #4271
+    path — is untouched.  The *append* test is truthiness, NOT ``is True``,
+    deliberately: the mode resolver it guards reads ``'additive' if append``,
+    so an identity check would let a truthy non-bool (``append=1`` from a
+    dict-splat or a JSON-derived flag) slip past the guard while still reading
+    as additive intent to the resolver — resolving to 'merge' and forwarding
+    the very clobber this rejects.  Truthiness preserves the same one-cell
+    narrowness, since ``append=False``/omitted is falsy either way.
+
+    Raises
+    ------
+    ValueError
+        If ``metadata_mode='merge'`` is passed alongside a truthy ``append``.
+    """
+    if metadata_mode == 'merge' and append:
+        raise ValueError(
+            "Refusing a contradictory metadata_mode='merge' + append=True "
+            'update_task call: append=True asks for the ADDITIVE recursive '
+            "union merge while metadata_mode='merge' asks for a SHALLOW "
+            'last-write-wins overwrite, and there is no coherent way to do '
+            "both.  Resolving it silently to 'merge' overwrote nested keys "
+            "wholesale — a task's whole memory_hints blob (authored "
+            'entities/queries and all) replaced by the incoming stub '
+            'instead of unioned with it.  State intent explicitly: pass '
+            "metadata_mode='additive' (or append=True alone) to UNION "
+            'nested list/dict fields into the existing blob, or drop '
+            "append=True and keep metadata_mode='merge' to CONFIRM a "
+            'shallow top-level last-write-wins overwrite.'
+        )
+
+
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
@@ -4372,7 +4434,9 @@ class Scheduler:
             preserved, supplied keys overwrite wholesale.  This is the #4271
             fix: no-append callers (prd-tagger, module-tagger, auto-eval
             back-link) now preserve sibling keys like _causation_id and
-            memory_hints instead of silently clobbering them.
+            memory_hints instead of silently clobbering them.  Passing
+            ``'merge'`` together with ``append=True`` is a contradiction and
+            raises :class:`ValueError` — see the ``append`` parameter below.
             ``'additive'``: recursive list-union, dict-recursive, scalar
             OLD-wins.  Use for list-growth writes (e.g. dry_run_proposals).
             ``'replace'``: whole-blob overwrite, delete-by-omission.  Also
@@ -4383,9 +4447,33 @@ class Scheduler:
             ``metadata_mode='replace'`` call to repair.
         append:
             Legacy shorthand kept for back-compat.  Resolved to
-            ``'additive'`` when ``True``.  Ignored when ``metadata_mode``
-            is set explicitly.  Precedence: metadata_mode > append > merge.
+            ``'additive'`` when ``True``.  Precedence: ``metadata_mode`` >
+            ``append`` > merge, with ONE carve-out: ``metadata_mode='merge'``
+            alongside ``append=True`` is **rejected** as a contradiction
+            rather than silently letting 'merge' win (see Raises).  The other
+            explicit/append combinations are honored unchanged —
+            ``('replace', True)`` stays 'replace' (the sanctioned destructive
+            co-signal) and ``('additive', True)`` stays 'additive' (both
+            signals agree).
+
+        Raises
+        ------
+        ValueError
+            If ``metadata_mode='merge'`` is passed alongside a truthy
+            ``append`` — see ``_reject_contradictory_metadata_mode``.
         """
+        # The contradictory-pair guard has to live HERE, client-side, and not be
+        # delegated downwards: because 'append' is deliberately never forwarded
+        # on the wire (see below), the pair can never reach the backend's
+        # _resolve_metadata_mode, so without this check every orchestrator
+        # caller would be permanently exempt from any backend-side rejection of
+        # it.  The condition and its message live in the module-level
+        # ``_reject_contradictory_metadata_mode`` (which carries the full
+        # rationale, the one-cell-narrowness carve-outs, and why the *append*
+        # test is truthiness rather than ``is True``) so the FakeMetadataBackend
+        # test double can call the SAME function instead of restating it and
+        # drifting.
+        _reject_contradictory_metadata_mode(metadata_mode, append)
         # Resolve mode: explicit metadata_mode wins; append=True → additive;
         # default → merge (the #4271 fix — NOT replace).
         # NEVER forward 'append' on the wire: append=False resolves to REPLACE

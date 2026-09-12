@@ -1143,20 +1143,23 @@ class ReconReportState:
         silently defaulting to ``actionable=True``), which is the exact bug
         class this default exists to close. As of this writing,
         ``'cross_project_routing'`` is the only production category
-        matching the prefix — filed with an explicit ``actionable=False``
-        by ``autopilot_video.py`` and the Stage 2 prompt template. The
-        Stage 3 prompt template also omits ``actionable`` for its
-        ``cross_project_routing`` example, so it likewise inherits this
-        computed default — but that example (``severity='serious'``,
-        "get_task returned task from project X, expected Y") is a
-        wrong-``project_root`` data-integrity signal, not an
-        informational routing note, so this docstring does not assert
-        that relying on the default there is correct; combined with the
-        read-time-suppression ripple below, such a finding is a candidate
-        to silently vanish from ``flagged_items`` if its citations happen
-        to trace exclusively to Stage 1. Whether the Stage 3 template
-        should instead pass ``actionable=True`` explicitly is tracked as
-        a follow-up rather than fixed in this docstring-only pass.
+        matching the prefix, and every one of its filers now passes
+        ``actionable`` EXPLICITLY rather than relying on this computed
+        default. ``autopilot_video.py`` and the Stage 2 prompt template
+        pass ``actionable=False``: those findings are informational
+        routing notes ("this work belongs to another project, please
+        route"). The Stage 3 prompt template passes ``actionable=True``:
+        its example (``severity='serious'``, "get_task returned task from
+        project X, expected Y") is a wrong-``project_root``
+        data-integrity signal, not a routing note, and must never become
+        a candidate for the read-time suppression described below — which
+        the computed default would have made it whenever its citations
+        traced exclusively to Stage 1 (task 4347). Same category,
+        opposite actionability, which is exactly why neither filer may
+        rely on a single computed value here. The Stage 3 template's
+        kwarg is machine-checked by
+        ``tests/test_stage3_cross_project_routing_actionable.py``; this
+        paragraph is not the source of truth for it.
 
         Prefix breadth is local to *this* default only: downstream
         consumers that also branch on the ``cross_project_routing``
@@ -2171,7 +2174,25 @@ class ReconReportState:
         task's title has since changed, a re-citation is still skipped and
         the stored citation keeps the original title rather than refreshing
         it. Titles are cosmetic display text, not part of the citation's
-        identity, so this staleness is accepted rather than reconciled.
+        identity.
+
+        THE CONSUMER NOW AGREES (task 4864). That last sentence used to end
+        "so this staleness is accepted rather than reconciled", which was only
+        half true: the consumer disagreed. ``flag_dedup._cited_fix_task_live``
+        required the cited title to EQUAL the live record's, so an ordinary
+        retitle silently disabled the cross-project fix-task suppression gate
+        for that citation, permanently. That contradiction is resolved in
+        THIS side's favour — titles are cosmetic — and the consumer was
+        changed to match: it admits on live presence plus a non-abandoned
+        status, and a stale or absent title downgrades the decision to a
+        WARNING (``cross_project_fix_task_title_uncorroborated``) instead of
+        disabling suppression. A title this method cannot resolve at all is
+        likewise cited (the existence check passed) and logged at WARNING
+        here, rather than written silently as ``title=''``. Note the STRICT
+        sibling ``flag_dedup._cited_task_corroborated``, used by the phantom
+        task-creation guard, still requires title equality — a wrong drop
+        there has no bounded expiry — so a title-less citation genuinely does
+        cost corroborating power on that path.
 
         Two in-run folds anchor on this call — BOTH are CHECKED before
         EITHER registers, so a call that folds under either one always
@@ -2276,6 +2297,26 @@ class ReconReportState:
         # Guard against data=None (some get_task paths return data: null explicitly)
         data = result.get('data') if isinstance(result.get('data'), dict) else {}
         title = result.get('title') or data.get('title', '')
+        if not title:
+            # The one permanently-degraded citation this VALIDATING producer
+            # mints itself (task 4864).  The existence check above PASSED, so
+            # the citation stands — a title is cosmetic display text, not part
+            # of the citation's identity, and dropping the citation here would
+            # discard the very evidence the consumer gate needs.  But an empty
+            # title is a real loss of corroborating signal, and it used to
+            # happen in total silence: downstream,
+            # ``flag_dedup._titles_corroborate`` can never match ``''``, so
+            # every consumer that reads a title degrades to its weak path for
+            # the life of this citation (titles are never refreshed — see the
+            # first-cited-title-wins contract in the docstring above).  Say so
+            # once, here, where the project/task is still in hand.
+            logger.warning(
+                'recon_report.cite_task_title_unresolved project_id=%s task_id=%s'
+                ' — the task exists but neither the top-level record nor its'
+                ' data sub-dict carried a title; citing with title=%r, which'
+                ' downstream consumers cannot corroborate',
+                project_id, task_id, title,
+            )
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
 
         # In-run cited-task folds (task-2425 project-scoped; task-2432
@@ -2447,7 +2488,12 @@ class ReconReportState:
         # duplicate rows. Keyed on (project_id, task_id) only, NOT title —
         # first-cited title wins; a re-citation after the upstream title
         # changed is still skipped rather than refreshing the stored title
-        # (see cite_task's docstring).
+        # (see cite_task's docstring). Task 4864 reconciled the CONSUMER to
+        # that contract rather than the other way round: flag_dedup's
+        # cross-project fix-task gate no longer treats title equality as
+        # identity, so a title left stale here downgrades that gate to a
+        # WARNING instead of silently disabling it. The strict phantom guard
+        # (flag_dedup._cited_task_corroborated) still requires equality.
         already_cited = any(
             c['project_id'] == project_id and c['task_id'] == task_id
             for c in finding.cited_tasks
@@ -2847,13 +2893,67 @@ class ReconReportState:
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tool classification (task 3878)
+# ---------------------------------------------------------------------------
+# REGISTERING A NEW @mcp.tool() BELOW MEANS CLASSIFYING IT INTO EXACTLY ONE OF
+# THREE BUCKETS. Two of them are declared here; the third is the derived
+# remainder, so most tools need no edit at all:
+#
+#   shared guidance  — every OTHER registered tool, i.e. the derived remainder
+#                      (`set(get_recon_report_tool_signatures()) -
+#                      HARNESS_CALLED_REPORT_TOOLS - STAGE_GATED_REPORT_TOOLS`).
+#                      These are rendered into the STAGE-AGNOSTIC guidance block
+#                      that reconciliation/prompts/__init__.py's
+#                      render_recon_report_tool_guidance() interpolates into ALL
+#                      THREE stage prompts. A new tool lands here by default and
+#                      is rendered automatically — that default is deliberate:
+#                      it is what makes silently omitting a tool from the
+#                      guidance structurally impossible.
+#   harness-called   — the harness calls it for the agent before the stage
+#                      begins, so a call example would be actively wrong.
+#                      start_report is the only one.
+#   stage-gated      — held by some stages but DENIED in others, so it must stay
+#                      out of the stage-agnostic block.
+#
+# Why stage-gated needs its own bucket rather than being swept into the shared
+# block: `--disallowed-tools` OMITS a denied tool rather than surfacing it and
+# rejecting the call (cli_stage_runner.py). So naming a denied tool in the
+# shared block does not produce a clean refusal — it tells Stage 1 and Stage 3
+# about an action they cannot take, and in write_entity_standing_decision's case
+# licenses a durable SQLite-ledger write from stages that are read-only with
+# respect to the ledger (repair_memory_citation is the same shape one level
+# over: denied in Stage 3 via DISALLOW_RECON_REPORT_JOURNAL_WRITES because it
+# writes the durable ReconciliationJournal, and Stage 3 is read-only by
+# contract). That is precisely the norm
+# render_escalation_boundary_note() codifies in reconciliation/prompts/__init__.py:
+# never tell a stage about an action it is not sanctioned to take, and never
+# license a durable write from a read-only stage.
+#
+# Counter-example, so the boundary is not over-applied: delete_finding is NOT
+# stage-gated. It writes only in-process ReconReportState, sits in no disallow
+# list, and cli_stage_runner.py's carve-out NOTE plus stage3.py's own
+# post-guidance NOTE sanction it in every stage — so it is a shared-guidance
+# tool and belongs in the block.
+#
+# tests/test_recon_report_guidance_drift.py fails loudly until a newly
+# registered tool is classified: TestReportToolClassificationPartitionsTheLiveToolSet
+# additionally cross-checks STAGE_GATED_REPORT_TOOLS against
+# DISALLOW_RECON_REPORT_LEDGER_WRITES + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+# (cli_stage_runner.py) — the lists that actually reach --disallowed-tools — so
+# these must move together.
+HARNESS_CALLED_REPORT_TOOLS: frozenset[str] = frozenset({'start_report'})
+STAGE_GATED_REPORT_TOOLS: frozenset[str] = frozenset(
+    {'write_entity_standing_decision', 'repair_memory_citation'}
+)
+
 RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
        cite_entity, cite_edge, cite_task, cite_memory, cite_run,
-       repair_memory_citation.
+       write_entity_standing_decision, repair_memory_citation.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.  Idempotent:
@@ -2895,8 +2995,42 @@ Citation tools (call after add_finding, before or after complete):
                   from a fresh tool result's run_id/metadata.run_id field —
                   never re-type or paraphrase it from memory.
 
+Ledger write (Stage 2 ONLY):
+11. write_entity_standing_decision(project_id, entity_uuid, grounds, [evidence])
+                  — record that a class of complaint about entity_uuid,
+                  identified by grounds (a closed-enum value), has been
+                  investigated and dismissed, so later stages can filter or
+                  annotate future recon flags instead of re-raising them.
+                  Stage-2 ONLY: blocked in Stage 1 and Stage 3 via
+                  DISALLOW_RECON_REPORT_LEDGER_WRITES
+                  (reconciliation/cli_stage_runner.py), because this is the
+                  first recon-report tool that writes past in-process
+                  ReconReportState — it upserts a row into the durable SQLite
+                  reconciliation ledger.  It takes NO run_id (the decision is
+                  about an entity, not scoped to a report entry) and NO
+                  authorized_by: the write is ALWAYS evidence-gated, and
+                  succeeds only if EITHER arm holds — arm 1: >=1 cited,
+                  locally-resolvable, human-authored mem0 evidence record;
+                  arm 2: >=3 investigation_outcome mem0 records for this
+                  entity with actionable=false and distinct run_ids.
+                  evidence is OPTIONAL (bracketed above, matching the
+                  generated guidance block's convention): a list of cited-ref
+                  dicts ({type, id, ...}), defaulting to none.  Omit it when
+                  relying on arm 2, which is satisfied by the mem0 record
+                  history alone and cites nothing — do NOT fabricate an
+                  evidence list to reach that path.  Supply it for arm 1: mem0
+                  refs are resolved for provenance, foreign refs
+                  (escalation/task ids) are recorded but never count toward a
+                  gate arm.  Returns {status: 'written', entity_uuid, grounds,
+                  edge_count_at_decision, expires_at, decided_at} on success,
+                  or a structured error dict: insufficient_evidence
+                  (unmet_arms + hint) when neither arm is satisfied,
+                  invalid_grounds when grounds is outside the enum, or
+                  service_not_configured when the memory service is
+                  unavailable.
+
 Cross-run repair (exceptional, evidence-gated — not part of the normal loop):
-11. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
+12. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
                   replacement_memory_id=None) — re-point (or, with no
                   replacement, drop) a citation that no longer resolves, on a
                   finding owned by a PRIOR, ALREADY-COMPLETED run. The cite_*

@@ -124,12 +124,18 @@ def _stub_factory() -> TrainCallbackFactory:
 def _make_escalation_queue() -> MagicMock:
     """MagicMock escalation queue wired like the harness's dedup pattern.
 
-    ``has_open_l1`` defaults False (no open dedup) so a rejected verdict's
-    escalation always gets through; ``submit``/``make_id`` are plain
-    MagicMocks callers can assert against.
+    ``has_open_l1`` defaults False (no open dedup) and
+    ``find_terminal_by_citation`` defaults None (nothing previously
+    adjudicated) so a rejected verdict's escalation always gets through;
+    ``submit``/``make_id`` are plain MagicMocks callers can assert against.
     """
     eq = MagicMock()
     eq.has_open_l1 = MagicMock(return_value=False)
+    # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+    # record on this citation, so "nothing was previously adjudicated" must be
+    # STATED, not inherited from MagicMock's truthy auto-child — which would
+    # silently suppress every filing callers assert on.
+    eq.find_terminal_by_citation = MagicMock(return_value=None)
     eq.make_id = MagicMock(return_value='esc-coalesce-1')
     return eq
 

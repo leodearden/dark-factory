@@ -14,7 +14,16 @@ record that codebook.validate_coding_record schema-gates.
 Dependency-light library + argparse CLI, a plain-Python scripts/legibility
 sibling of digest.py/codebook.py — deliberately does NOT import the
 heavyweight async ``shared.cli_invoke`` machinery (usage gates, cost
-stores, cap-retry, transcript watchdogs). The real LLM call lives behind
+stores, cap-retry, transcript watchdogs). What it DOES take from ``shared``
+is one pure function: ``cap_markers.looks_like_blocking_banner``, the loose
+OR-substring DEFER GATE — the same matcher ``census.preflight_headroom``
+uses, and explicitly not the strict production cap detector
+(``usage_gate.detect_cap_hit``), whose combined prefix-AND-confirm policy is
+tuned for account failover. This module has nothing to fail over TO: the
+trickle unit runs under an interpreter where the orchestrator config, and
+therefore a multi-account ``UsageGate``, is unreachable. A defer gate is
+exactly the contract it needs, and ``cap_markers``' own docstring argues for
+that split (task 4736). The real LLM call lives behind
 exactly one swappable seam, the module-level ``_invoke_cli``, which every
 public function accepts as an ``invoke`` override. What no test ever does
 is spawn a REAL model — but the seam ITSELF is exercised, so "the LLM is
@@ -52,8 +61,24 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import codebook as codebook_mod
-import yaml
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would scan cap-banner text using
+# the MAIN checkout's marker list rather than its own. Same reasoning and same
+# form as census.py:74-88 (itself citing tasks 2881/2882/3329), with
+# parents[2] because coder.py sits at the same depth as census.py
+# (scripts/legibility/, not scripts/). Unconditional -- deliberately NOT
+# inside a `__main__` guard -- because the `shared.cap_markers` import it
+# enables is module-level, so it must resolve under pytest and package import
+# too.
+_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
+import codebook as codebook_mod  # noqa: E402
+import yaml  # noqa: E402
+from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 
 logger = logging.getLogger("legibility.coder")
 
@@ -67,9 +92,54 @@ class CoderParseError(Exception):
 
 class CoderInvocationError(Exception):
     """Raised when the ``claude -p --model`` subprocess invocation fails —
-    non-zero exit or a timeout. Carries a stderr tail for diagnosis. Never
-    silently swallowed: code_digest turns this into a per-digest failure,
-    never a fabricated record."""
+    non-zero exit or a timeout. Carries a tail of BOTH output streams for
+    diagnosis, each labelled. Never silently swallowed: code_digest turns
+    this into a per-digest failure, never a fabricated record.
+
+    BOTH streams, not just stderr, because of what happened on 2026-08-24:
+    the claude CLI wrote its usage-cap banner to STDOUT and exited 1, and
+    this error embedded only ``(proc.stderr or "")[-2000:]``. With stderr
+    empty, the reason that reached the journal, the epsilon escalation and
+    ``run.failures`` was the bare ``claude CLI exited 1 (model='haiku',
+    ...): `` — nothing after the colon — on 17 of 20 digests. The CLI had
+    stated exactly what was wrong and the coder discarded it, so a night
+    with one plain cause was investigated as twenty causeless failures.
+    A diagnostic the process EMITTED must never be dropped on the floor
+    because it arrived on the less-expected stream.
+    """
+
+
+class CoderCapExhausted(CoderInvocationError):
+    """Raised when the CLI answered with a capacity/auth banner instead of a
+    model turn — i.e. there is no headroom left to code this digest.
+
+    A SUBCLASS, not a sibling, and that is load-bearing: three sites already
+    catch ``CoderInvocationError`` (``code_digest`` here,
+    ``census._build_default_verify_fn`` and ``census.preflight_headroom``)
+    and none of them is touched by this task. A sibling type would escape all
+    three, turning a typed per-digest failure into an uncaught crash that
+    takes down the whole batch.
+
+    **This is a NORMAL operating condition, never a coder defect.** Leo's
+    standing directive (sibling task 4503): an all-accounts-capped night is
+    expected weather, not an incident. Before this existed, 2026-08-24
+    presented as 17 of 20 hard per-digest failures, tripped ``code_digests``'
+    >50% storm threshold, and became ``exit_code=1`` plus an ERROR-level
+    escalation — an infra page for a condition ruled routine.
+
+    ``marker`` names the banner marker that matched, so a deferral reason can
+    quote WHICH signal fired — the difference between an operator reading
+    "deferred: weekly limit" and reading "deferred". Mirrors
+    ``census.preflight_headroom``'s "...carries a banner marker: {marker!r}".
+
+    Never fabricated into a verdict. A capped digest yields no record at all;
+    it is labelled and excluded, exactly as ``evals/runner.py`` excludes a
+    ``cap_exhausted:`` cell from a reported mean rather than scoring it 0.0.
+    """
+
+    def __init__(self, message: str, *, marker: str) -> None:
+        super().__init__(message)
+        self.marker = marker
 
 
 @dataclass
@@ -82,12 +152,24 @@ class CodingResult:
     None and ``reason`` explains why: a CLI invocation error, unparseable
     LLM output, or a schema-invalid assembled record are never partially
     applied and never fabricated into a record.
+
+    ``capped=True`` means the CLI answered with a capacity/auth banner
+    instead of a model turn. It is a strict REFINEMENT of ``ok=False``,
+    never a third success state — ``record`` is still None and the
+    never-fabricate contract is untouched. What it records is a fact about
+    the ACCOUNT, not a judgment about the digest: this digest was never
+    actually coded, so charging it to the coder as a failure of the work is
+    simply wrong. Downstream (``code_digests`` tallies it, ``is_cap_deferral``
+    reads the tally) that distinction is what separates "there was no
+    headroom tonight" from "the coder is broken" — on 2026-08-24 their
+    conflation turned expected weather into an ERROR-level infra page.
     """
 
     ok: bool
     record: dict | None
     reason: str | None = None
     session: str | None = None
+    capped: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +353,16 @@ _CLAUDE_BIN_ENV_VAR = "LEGIBILITY_CLAUDE_BIN"
 """Env var overriding the `claude` binary path; falls back to the bare
 "claude" (PATH-resolved -- /home/leo/.local/bin is on PATH)."""
 
+_ERROR_STREAM_TAIL_CHARS = 2000
+"""How much of EACH captured output stream a CoderInvocationError carries.
+
+One constant for both streams, deliberately: this started as a bare
+``[-2000:]`` on stderr alone, and the asymmetry that grew beside it (stdout
+not bounded because stdout was not carried at all) is exactly the 2026-08-24
+diagnostic loss. Bounded because the text lands verbatim in journal lines,
+``run.failures`` entries and escalation bodies; the TAIL is kept because a
+CLI's last words are its diagnostic ones."""
+
 
 def _invoke_cli(
     prompt: str,
@@ -318,10 +410,20 @@ def _invoke_cli(
 
     Raises CoderInvocationError on a non-zero exit, a timeout, or a
     failure to START the process at all -- never silently swallowed, never
-    a fabricated empty stdout. The error message carries a stderr tail for
-    diagnosis, plus the resolved cwd, so a future sandbox/permission
-    failure NAMES the directory the process was scoped to instead of
-    leaving it to be inferred.
+    a fabricated empty stdout. On a non-zero exit the error message carries
+    a tail of BOTH output streams, each LABELLED, plus the resolved cwd, so
+    a future sandbox/permission failure NAMES the directory the process was
+    scoped to instead of leaving it to be inferred.
+
+    Both streams because the CLI does not reliably diagnose itself on
+    stderr: on 2026-08-24 it wrote a usage-cap banner to STDOUT and exited
+    1, and a stderr-only message reached the journal EMPTY after the colon
+    on 17 of 20 digests (see CoderInvocationError). The exit-0 RETURN
+    contract is untouched by that -- stdout is still returned raw and
+    unbounded there, which census._build_stage_invokes (wiring this
+    function as its mining/verify/synthesis primitive) and
+    census.preflight_headroom (scanning the returned reply itself) both
+    depend on.
 
     That third case is why the ``OSError`` arm below exists. Passing *cwd*
     hands ``subprocess.run`` a second thing that can be missing besides the
@@ -366,11 +468,35 @@ def _invoke_cli(
         ) from exc
 
     if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "")[-2000:]
-        raise CoderInvocationError(
+        # BOTH streams, each labelled. The claude CLI does not reliably put
+        # its own diagnostics on stderr -- on 2026-08-24 it wrote a usage-cap
+        # banner to STDOUT and exited 1 -- so carrying one stream and
+        # labelling neither loses both the text and the fact of WHICH stream
+        # said it. See CoderInvocationError's docstring for the incident.
+        stdout_tail = (proc.stdout or "")[-_ERROR_STREAM_TAIL_CHARS:]
+        stderr_tail = (proc.stderr or "")[-_ERROR_STREAM_TAIL_CHARS:]
+        message = (
             f"claude CLI exited {proc.returncode} (model={model!r}, "
-            f"claude_bin={resolved_bin!r}, cwd={cwd!r}): {stderr_tail}"
+            f"claude_bin={resolved_bin!r}, cwd={cwd!r}): "
+            f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
         )
+        # Scan for a cap/auth banner ONLY here, on an already-FAILED
+        # invocation. This is census's split-on-parse-success rule, adopted
+        # unchanged: a failed invocation is never a verdict, so re-reading it
+        # as a banner can only re-LABEL an already-failed digest. An exit-0
+        # reply is the opposite -- arbitrary model output, whose JSON
+        # `note`/`cause`/`evidence_quote` legitimately QUOTE cap-themed
+        # sessions. census._build_default_verify_fn records what happens when
+        # that distinction is lost: this repo's codebook is dominated by
+        # clusters ABOUT usage and weekly limits, so the loose markers match
+        # ordinary healthy content and the census aborted on cap-themed
+        # clusters. The exit-0 path below is therefore left alone, which also
+        # keeps census.preflight_headroom -- whose whole probe is "call this
+        # function and scan what comes BACK" -- working unchanged.
+        marker = looks_like_blocking_banner(f"{stdout_tail}\n{stderr_tail}")
+        if marker:
+            raise CoderCapExhausted(message, marker=marker)
+        raise CoderInvocationError(message)
 
     return proc.stdout
 
@@ -398,9 +524,12 @@ def code_digest(
     via codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
-    invocation error, unparseable LLM output, or a schema-invalid assembled
-    record all come back as ``ok=False`` with ``record=None`` and
-    ``reason`` set — never partially applied, never fabricated. A
+    invocation error, a usage/auth CAP, unparseable LLM output, or a
+    schema-invalid assembled record all come back as ``ok=False`` with
+    ``record=None`` and ``reason`` set — never partially applied, never
+    fabricated. The cap case additionally sets ``capped=True``: it is the
+    one cause that says nothing about this digest or this coder, only that
+    the account had no headroom left to look (see ``CoderCapExhausted``). A
     legitimately empty judgment (``{"matches": [], "candidates": []}``)
     that passes schema validation is a genuine ``ok=True`` success: "coded
     fine, found nothing" is never conflated with "coding failed" (codebook
@@ -418,12 +547,56 @@ def code_digest(
 
     try:
         raw = invoke_fn(prompt, model)
+    except CoderCapExhausted as exc:
+        # ORDERED ABOVE the generic arm below, and that ordering is
+        # load-bearing: CoderCapExhausted SUBCLASSES CoderInvocationError, so
+        # reversing these two silently routes every cap into the generic arm
+        # and the label is never applied.
+        return CodingResult(
+            ok=False, record=None, reason=str(exc), session=session, capped=True,
+        )
     except CoderInvocationError as exc:
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
     try:
         judgment = parse_coder_output(raw)
     except CoderParseError as exc:
+        # The SECOND cap scan site, and its placement INSIDE this arm is
+        # load-bearing. The CLI does not always exit non-zero when it declines
+        # to answer -- it can print the banner and exit 0, so the "reply"
+        # arrives here as prose that could not be parsed into a verdict.
+        #
+        # Scanning only AFTER the parse has failed is census's
+        # split-on-parse-success rule, adopted unchanged (see
+        # ``census._build_default_verify_fn``'s docstring, which records the
+        # live defect): scanning arbitrary model output with the loose marker
+        # list aborted the census on cap-THEMED clusters, because this repo's
+        # codebook is dominated by clusters ABOUT usage and weekly limits, so
+        # the markers match ordinary HEALTHY content. The coder is exposed
+        # identically -- a judgment's model-authored
+        # ``title``/``cause``/``evidence_quote`` legitimately quote capped
+        # sessions, since "an agent stalled on a usage limit" is a real
+        # confusion worth coding. A pre-parse scan would discard exactly those
+        # findings, quietly, and label the loss a deferral. A reply that
+        # PARSES into a verdict is a verdict.
+        #
+        # ONE deliberate divergence from census: no confirmation probe. Census
+        # needs one because its scan can strike a reply it would otherwise
+        # have ACCEPTED, so a false positive there destroys a good verdict.
+        # Both of the coder's scan sites sit on already-failed paths, where
+        # the alternative disposition is already "per-digest failure" -- so a
+        # false positive can only re-LABEL a digest that was failing anyway,
+        # never launder a genuine verdict into a defer. The hazard the probe
+        # exists to prevent does not exist here.
+        marker = looks_like_blocking_banner(raw)
+        if marker:
+            return CodingResult(
+                ok=False, record=None, session=session, capped=True,
+                reason=(
+                    f"CLI reply is a capacity/auth banner, not a verdict "
+                    f"(marker: {marker!r}); {exc}"
+                ),
+            )
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
     record = {
@@ -460,6 +633,24 @@ class RunResult:
     failed is NOT a storm and stays ``"ok"``. This function never
     escalates and never touches the codebook — that is epsilon/gamma's
     job; it only returns the tallied result.
+
+    ``capped`` counts how many of those failures were a usage/auth CAP
+    rather than a failure of the coding — digests the CLI never actually
+    looked at. It REFINES ``failed`` (a capped digest is counted in both),
+    and it is deliberately a COUNT plus the ``is_cap_deferral`` predicate
+    rather than a third ``status`` value: ``census.py`` computes
+    ``saturated = dup_rate >= config.dup_rate and run_result.status !=
+    "failure"`` and selects storm batches with ``s.status == "failure"``, so
+    a new status value would silently make a capped mining batch count as
+    saturated and stop the census early.
+
+    TAINT-AND-EXCLUDE for a sub-storm capped run: a capped digest is
+    labelled and left out of ``records``, but the batch's genuinely coded
+    records still merge. 2 capped of 20 stays ``status="ok"`` and returns
+    all 18 real records — the same contract ``evals/runner.py`` uses when it
+    excludes a ``cap_exhausted:`` cell from a reported mean instead of
+    scoring it 0.0. Discarding 18 records that cost real tokens because two
+    digests found no headroom would be its own kind of fabrication.
     """
 
     status: str
@@ -468,6 +659,7 @@ class RunResult:
     total: int
     succeeded: int
     failed: int
+    capped: int = 0
 
 
 def code_digests(
@@ -538,6 +730,7 @@ def code_digests(
     """
     records = []
     failures = []
+    capped = 0
 
     for digest_text in digests:
         try:
@@ -545,20 +738,26 @@ def code_digests(
                 digest_text, codebook, project=project, model=model, invoke=invoke,
             )
         except Exception as exc:  # isolate: one crash can't abort the batch
-            failure = (None, str(exc))
+            # An unexpected crash is never a cap: the cap paths are typed and
+            # return a CodingResult, they do not escape as bare exceptions.
+            failure, was_capped = (None, str(exc)), False
         else:
             if result.ok:
                 records.append(result.record)
                 continue
-            failure = (result.session, result.reason)
+            failure, was_capped = (result.session, result.reason), result.capped
 
         # ONE append+log site for BOTH failure paths, so they cannot drift
-        # apart and a later edit cannot silence one of them.
+        # apart and a later edit cannot silence one of them. The cap tally is
+        # threaded THROUGH this funnel rather than counted at a second site,
+        # for the same reason: two sites are two things to forget.
         session, reason = failure
         logger.warning(
             "legibility coder: digest failed (session=%s): %s", session, reason,
         )
         failures.append(failure)
+        if was_capped:
+            capped += 1
 
     total = len(digests)
     failed = len(failures)
@@ -567,8 +766,40 @@ def code_digests(
 
     return RunResult(
         status=status, records=records, failures=failures,
-        total=total, succeeded=succeeded, failed=failed,
+        total=total, succeeded=succeeded, failed=failed, capped=capped,
     )
+
+
+def is_cap_deferral(result: RunResult) -> bool:
+    """True when a run-level FAILURE is really a capped night — a DEFERRAL
+    rather than a coder failure.
+
+    An all-accounts-capped night is a NORMAL operating condition (Leo's
+    standing directive; sibling task 4503), not an incident. The coder must
+    not fabricate a verdict for a digest it never got to look at, and must
+    not present the resulting empty night as an infra failure. Before this
+    existed, 2026-08-24 came back as 17 of 20 hard per-digest failures,
+    tripped the >50% storm threshold, and became ``exit_code=1`` plus an
+    ERROR-level escalation — an operator paged for expected weather.
+
+    The majority rule (``capped * 2 > failed``) deliberately reuses the storm
+    threshold's own strictly-greater-than-half shape. A genuine coder
+    regression that merely COINCIDES with a cap or two still reads as a
+    storm, still exits non-zero, and still gets looked at: the deferral
+    branch must not become a place for real bugs to hide.
+
+    A PREDICATE over ``RunResult``, deliberately NOT a third ``status``
+    value. ``census.py`` computes ``saturated = dup_rate >= config.dup_rate
+    and run_result.status != "failure"`` and selects storm batches with
+    ``s.status == "failure"``; adding a status value would silently make a
+    capped mining batch count as saturated and stop the census early. One
+    policy, one home, two callers (``main`` here and ``nightly.run_nightly``).
+
+    Note the ``status == "failure"`` guard: a sub-storm run with a minority of
+    caps is NOT a deferral. Those runs coded most of their digests and their
+    records still merge (see ``RunResult``'s taint-and-exclude contract).
+    """
+    return result.status == "failure" and result.capped * 2 > result.failed
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +812,7 @@ def _print_summary(result: RunResult, *, matched: int, candidates: int, file) ->
     print(
         f"coder: status={result.status} total={result.total} "
         f"succeeded={result.succeeded} failed={result.failed} "
+        f"capped={result.capped} "
         f"matched={matched} candidates={candidates}",
         file=file,
     )
@@ -600,6 +832,20 @@ def main(argv: list[str] | None = None) -> int:
     and returns 1 (fail-loud), so a driving script (epsilon) can escalate
     and skip the merge. Either way, a one-line status summary is printed
     to stderr.
+
+    THIRD DISPOSITION — the DEFERRAL (task 4736). When that run-level
+    failure is really a capped night (``is_cap_deferral``), the same
+    zero-records/truncate discipline applies but the exit code is 0 and the
+    banner says ``coder: DEFERRED`` rather than ``coder: FAILURE``. An
+    all-accounts-capped night is a normal operating condition, not an
+    incident (Leo's directive; sibling task 4503), and a non-zero exit here
+    made ``check_trickle_liveness.sh`` report a failure for a timer behaving
+    exactly as designed — on 2026-08-24 that became an ERROR-level
+    escalation. The shape deliberately mirrors ``census.main``, which prints
+    ``census: deferred -- stage=... -- <reason>`` and returns 0 for its own
+    headroom defer, so an operator reads the same thing from both legibility
+    CLIs. The one-line summary still reports ``status=failure`` with the
+    true counts: the exit code changes, the tally never lies.
     """
     parser = argparse.ArgumentParser(
         prog="coder",
@@ -659,21 +905,37 @@ def main(argv: list[str] | None = None) -> int:
     candidates = sum(len(r.get("candidates") or []) for r in result.records)
 
     if result.status == "failure":
-        print(
-            f"coder: FAILURE - {result.failed}/{result.total} digests failed "
-            "coding (storm threshold exceeded) -- zero coding records written",
-            file=sys.stderr,
-        )
+        deferred = is_cap_deferral(result)
+        if deferred:
+            print(
+                f"coder: DEFERRED - {result.capped}/{result.total} digests hit "
+                "a usage/auth cap (no headroom) -- zero coding records "
+                "written, nothing fabricated",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"coder: FAILURE - {result.failed}/{result.total} digests failed "
+                "coding (storm threshold exceeded) -- zero coding records written",
+                file=sys.stderr,
+            )
+        # The same per-session loop for BOTH arms, so the cap banner the CLI
+        # actually printed reaches the operator instead of being summarised
+        # away -- the whole point of carrying it this far.
         for session, reason in result.failures:
             print(f"  session={session!r}: {reason}", file=sys.stderr)
         if args.out:
             # Never leave a stale --out from a prior successful run lying
-            # around on a storm: a downstream consumer that reads the file
-            # instead of gating on the exit code must see this run's true
-            # (empty) outcome, not a previous night's records.
+            # around on a storm OR a deferral: a downstream consumer that
+            # reads the file instead of gating on the exit code must see this
+            # run's true (empty) outcome, not a previous night's records.
             Path(args.out).write_text("", encoding="utf-8")
+        # The summary stays honest either way -- status=failure with the true
+        # counts. Exit 0 must not launder the tally: "deferred, nothing coded"
+        # being readable as "coded fine, found nothing" is the never-fabricate
+        # conflation again, at the run level.
         _print_summary(result, matched=matched, candidates=candidates, file=sys.stderr)
-        return 1
+        return 0 if deferred else 1
 
     lines = [json.dumps(record) for record in result.records]
     output = "\n".join(lines)

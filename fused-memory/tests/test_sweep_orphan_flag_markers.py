@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -125,6 +126,54 @@ def _bothmissing(id: str) -> dict:
     but deleted exactly once when run() unions the two by id.
     """
     return _member(id, kind=None, task_id=None)
+
+
+def _mirror(id: str) -> dict:
+    """Member that is a protected cycle_summary ledger MIRROR (task 3041).
+
+    Isolates the first of ``is_protected_mirror_record``'s two independent
+    discriminators: ``kind == 'cycle_summary'``. Everything else about it
+    looks exactly like a sweepable marker (same ``source``, a valid numeric
+    ``task_id``, ``_member``'s default ``created_at``), which is the point —
+    the guard must key on the discriminator, not on the record looking odd.
+
+    Note this shape is ALSO caught by ``find_orphan_markers`` (its ``kind``
+    is not ``stage1_flag_marker``), so without the protected-mirror guard it
+    reaches the delete set through the ordinary orphan predicate.
+    """
+    return _member(id, kind='cycle_summary')
+
+
+def _ledger_stamp(id: str) -> dict:
+    """Member that is a protected ledger STAMP (task 3041).
+
+    Isolates the second discriminator: ``record_type == 'ledger_stamp'``,
+    while carrying a perfectly ordinary ``kind='stage1_flag_marker'`` and a
+    valid numeric ``task_id``. No automatic predicate catches this shape at
+    all — it reaches the delete set only via ``--delete-ids``, which is
+    precisely the case design_decision 2 says the guard must still refuse.
+    """
+    member = _member(id, kind='stage1_flag_marker')
+    member['metadata']['record_type'] = 'ledger_stamp'
+    return member
+
+
+def _svc_with_ledger() -> tuple[AsyncMock, AsyncMock]:
+    """Build ``(memory_service, ledger)`` with a spyable ``recon_ledger``.
+
+    Ported from ``tests/test_mem0_tombstone.py::_svc_with_ledger`` (kept
+    local rather than imported, matching how this suite already keeps its own
+    member builders local). Gives the tombstone tests a direct read on the
+    written ``ReconLedgerRecord`` rows via
+    ``ledger.upsert_many.await_args.args[0]``, so ``deleter`` /
+    ``deleting_run_id`` / ``created_at`` are asserted on the actual row shape
+    an auditor reads rather than on a return count alone.
+    """
+    ledger = AsyncMock()
+    ledger.upsert_many = AsyncMock(return_value=None)
+    memory_service = AsyncMock()
+    memory_service.recon_ledger = ledger
+    return memory_service, ledger
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +694,71 @@ class TestFindTerminalTaskMarkers:
 
 
 # ===========================================================================
+# Tests: find_protected_markers (task 4435)
+# ===========================================================================
+
+class TestFindProtectedMarkers:
+    """Tests for the pure function find_protected_markers(members).
+
+    The script's half of the task-3041 protected-mirror guard: a thin,
+    order-preserving projection over
+    ``mem0_tombstone.is_protected_mirror_record``. A member it returns must
+    NEVER be deleted by this sweep.
+    """
+
+    def test_cycle_summary_mirror_is_returned(self):
+        """The kind=='cycle_summary' discriminator alone suffices."""
+        member = _mirror('m1')
+        result = _mod.find_protected_markers([member])
+        assert result == [member], f'Expected [m1], got: {result!r}'
+
+    def test_ledger_stamp_is_returned(self):
+        """The record_type=='ledger_stamp' discriminator alone suffices —
+        the predicate is an OR over two INDEPENDENT discriminators, not an
+        AND, so a record carrying only the second is protected too."""
+        member = _ledger_stamp('l1')
+        result = _mod.find_protected_markers([member])
+        assert result == [member], f'Expected [l1], got: {result!r}'
+
+    def test_ordinary_marker_shapes_are_never_returned(self):
+        """A well-formed marker, a kind-orphan and a taskless marker are all
+        sweepable — the guard must not over-protect the sweep's own targets."""
+        members = [_member('keep'), _orphan('o1'), _taskless('t1')]
+        result = _mod.find_protected_markers(members)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_preserves_order_and_identity(self):
+        """Returned dicts are the same objects, in input order, and only the
+        protected subset comes back from a mixed input."""
+        mirror = _mirror('m1')
+        stamp = _ledger_stamp('l1')
+        members = [_orphan('o1'), mirror, _member('keep'), stamp]
+        result = _mod.find_protected_markers(members)
+        assert result == [mirror, stamp], f'Expected [m1, l1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        assert _mod.find_protected_markers([]) == []
+
+    @pytest.mark.parametrize('metadata', [None, ['not', 'a', 'dict'], 'string'])
+    def test_non_dict_metadata_is_not_protected_and_does_not_raise(self, metadata):
+        """A weird metadata payload is neither protected nor a crash.
+
+        The sweep runs against whatever Mem0 hands back, so the guard that
+        exists to make it SAFER must never be the thing that kills it.
+        """
+        member = {'id': 'weird', 'created_at': None, 'metadata': metadata}
+        assert _mod.find_protected_markers([member]) == []
+
+    def test_missing_metadata_key_is_not_protected_and_does_not_raise(self):
+        """A member with no 'metadata' key at all is handled, not raised on."""
+        member = {'id': 'nometa', 'created_at': None}
+        assert _mod.find_protected_markers([member]) == []
+
+
+# ===========================================================================
 # Tests: delete_orphan_markers
 # ===========================================================================
 
@@ -709,6 +823,320 @@ class TestDeleteOrphanMarkers:
         memory_service.delete_memory.assert_not_called()
         assert result['deleted'] == 0
         assert result['failed'] == []
+
+
+# ===========================================================================
+# Tests: delete_orphan_markers protected-mirror guard (task 4435)
+# ===========================================================================
+
+class TestDeleteOrphanMarkersProtectedMirrorGuard:
+    """The protected-mirror guard at the DELETE CHOKE POINT (task 3041/4435).
+
+    Exercised through ``delete_orphan_markers`` called DIRECTLY, never via
+    ``run``. That is the whole point: ``run`` pre-partitions the union for
+    REPORTING, but the enforcement has to sit here, where every current and
+    future caller inherits it — including any caller that never consults
+    ``find_protected_markers`` at all. ``delete_orphan_markers`` is a public
+    module-level coroutine with its own direct tests, so a guard that lived
+    only in ``run`` would leave it able to destroy a mirror.
+    """
+
+    @pytest.mark.asyncio
+    async def test_protected_members_are_never_deleted(self):
+        """Only the unprotected members reach delete_memory."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        orphans = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1'), _orphan('o2')]
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', orphans,
+        )
+
+        assert memory_service.delete_memory.await_count == 2, (
+            'Expected exactly two deletes (o1, o2), got: '
+            f'{memory_service.delete_memory.call_args_list!r}'
+        )
+        called_ids = {
+            c.kwargs.get('memory_id')
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert called_ids == {'o1', 'o2'}, f'Unexpected delete set: {called_ids!r}'
+        # Belt and braces: the protected ids appear in NO call at all.
+        assert 'm1' not in repr(memory_service.delete_memory.call_args_list)
+        assert 'l1' not in repr(memory_service.delete_memory.call_args_list)
+
+        assert result['deleted'] == 2
+        assert result['failed'] == []
+        assert result['protected_skipped'] == ['m1', 'l1'], (
+            'protected_skipped must be order-preserving per the input, got: '
+            f"{result['protected_skipped']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_skip_is_logged_at_warning(self, caplog):
+        """A skip is never silent: one WARNING per protected member, naming it.
+
+        Reaching this guard means the caller's delete set was over-broad, so
+        an operator must be able to see WHICH record was refused.
+        """
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        orphans = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.delete_orphan_markers(
+                memory_service, 'dark_factory', orphans,
+            )
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        for protected_id in ('m1', 'l1'):
+            matching = [r for r in warnings if protected_id in r.getMessage()]
+            assert len(matching) == 1, (
+                f'Expected exactly one WARNING naming {protected_id!r}, got: '
+                f'{[r.getMessage() for r in warnings]!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_all_protected_input_performs_zero_deletes(self):
+        """An entirely-protected delete set deletes nothing and does not raise."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_mirror('m1')],
+        )
+
+        memory_service.delete_memory.assert_not_awaited()
+        assert result['deleted'] == 0
+        assert result['failed'] == []
+        assert result['protected_skipped'] == ['m1']
+
+    @pytest.mark.asyncio
+    async def test_protected_skipped_key_is_always_present(self):
+        """Callers must never need a .get fallback — including on the
+        empty-input fast path, which returns before the guard runs."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        empty = await _mod.delete_orphan_markers(memory_service, 'dark_factory', [])
+        assert empty['protected_skipped'] == []
+
+        unprotected = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+        )
+        assert unprotected['protected_skipped'] == []
+
+
+# ===========================================================================
+# Tests: delete_orphan_markers writes task-3041 tombstones (task 4435)
+# ===========================================================================
+
+class TestDeleteOrphanMarkersWritesTombstones:
+    """Every confirmed delete leaves the task-3041 audit trail behind it.
+
+    Without this, an operator chasing a broken memory-id reference cannot
+    distinguish a record this sweep reaped from silent data loss — and
+    ``delete_orphan_markers``' deletes are permanent, so there is no later
+    cycle that would reconstruct the answer.
+    """
+
+    @staticmethod
+    def _rows(ledger: AsyncMock) -> list:
+        """The ReconLedgerRecord rows of the single batch write."""
+        return list(ledger.upsert_many.await_args.args[0])
+
+    @pytest.mark.asyncio
+    async def test_one_batch_carries_every_victim_in_input_order(self):
+        """ONE upsert_many for the whole sweep (not one per victim), whose
+        rows' task_id fields are the victims' Mem0 uuids in input order."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        assert ledger.upsert_many.await_count == 1, (
+            'Expected exactly one ledger transaction for the whole sweep, got '
+            f'{ledger.upsert_many.await_count}'
+        )
+        rows = self._rows(ledger)
+        assert [r.task_id for r in rows] == ['o1', 'o2'], (
+            f'Unexpected tombstone rows: {[r.task_id for r in rows]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_records_this_sweep_as_the_deleter(self):
+        """deleter is the same string delete_memory is passed as _source, and
+        created_at is the VICTIM's own created_at, not the tombstone's."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        victim = _orphan('o1')
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [victim],
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleter'] == 'sweep_orphan_flag_markers'
+        assert payload['created_at'] == victim['created_at']
+
+    @pytest.mark.asyncio
+    async def test_deleting_run_id_is_the_causation_id_when_supplied(self):
+        """The tombstone's run id and the write journal's causation id name
+        the same thing, which is what makes the two cross-referenceable."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+            causation_id='sweep-run-1',
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleting_run_id'] == 'sweep-run-1'
+
+    @pytest.mark.asyncio
+    async def test_deleting_run_id_is_empty_string_without_a_causation_id(self):
+        """A manual/nightly sweep genuinely has no reconciliation run, so ''
+        is the honest value — and matches the ledger row's own run_id default."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleting_run_id'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_failed_delete_is_never_tombstoned(self):
+        """ORDERING CONTRACT: a tombstone must never claim a record that is
+        still alive, so only the SUCCEEDING victim is written."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom'), None]
+        )
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        rows = self._rows(ledger)
+        assert len(rows) == 1, f'Expected only the succeeding victim: {rows!r}'
+        assert rows[0].task_id == 'o2'
+        assert result['deleted'] == 1
+        assert result['failed'] == ['o1']
+        assert result['tombstoned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_tombstoned_count_is_reported(self):
+        """The returned dict reports how many rows were actually written."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        assert result['tombstoned'] == 2
+        assert result['tombstoned'] == len(self._rows(ledger))
+
+    @pytest.mark.asyncio
+    async def test_zero_successful_deletes_writes_no_batch_at_all(self):
+        """An all-failing sweep must not open a ledger transaction it has
+        nothing to put in."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom'), RuntimeError('boom')]
+        )
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        ledger.upsert_many.assert_not_awaited()
+        assert result['deleted'] == 0
+        assert result['tombstoned'] == 0
+
+
+# ===========================================================================
+# Tests: the tombstone write can never break the sweep it accounts for
+# (task 4435)
+# ===========================================================================
+
+class TestTombstoneWriteIsFailSafe:
+    """The tombstone is an audit ADJUNCT to the delete, never a gate on it.
+
+    A deployment with no ``recon_ledger`` wired, a ledger that is down, or a
+    helper someone patched must all degrade to "records deleted, audit trail
+    missing, said out loud" — never to a raise that turns a successful sweep
+    into a fatal error, and never to a ``deleted`` count the caller cannot
+    trust.
+    """
+
+    @staticmethod
+    async def _run_two_deletes(memory_service) -> dict:
+        return await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_still_deletes(self):
+        """recon_ledger=None: no raise, deletes still counted, tombstoned 0."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_raising_ledger_does_not_break_the_sweep(self):
+        """A down ledger exercises record_mem0_deletion_tombstones' OWN
+        internal fail-safe: it absorbs the error and returns 0."""
+        memory_service, ledger = _svc_with_ledger()
+        ledger.upsert_many = AsyncMock(side_effect=RuntimeError('ledger down'))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_raising_helper_is_caught_by_the_second_belt(self, caplog):
+        """SECOND BELT: the helper is internally fail-safe already, so this
+        arm rigs a PATCHED/broken one that raises anyway — the only arm that
+        reaches the sweep's own try/except. It must not raise, must not alter
+        the count, and must say so out loud.
+        """
+        memory_service, _ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError('patched helper exploded')
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod, 'record_mem0_deletion_tombstones', _boom)
+            with caplog.at_level(
+                logging.WARNING, logger='sweep_orphan_flag_markers'
+            ):
+                result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+        # Level and existence only, never message prose (repo norm, task 3799).
+        assert any(
+            r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), f'Expected a WARNING from the sweep logger, got: {caplog.records!r}'
 
 
 # ===========================================================================
@@ -1497,6 +1925,330 @@ class TestTargetedCorrection:
 
 
 # ===========================================================================
+# Tests: run() subtracts protected mirrors from the delete set (task 4435)
+# ===========================================================================
+
+class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
+    """run()'s REPORTING partition, the companion to the choke-point guard.
+
+    ``orphan_count``'s documented contract is "the actual number of records
+    deleted (or that would be deleted)". A DRY RUN never reaches
+    ``delete_orphan_markers`` at all, so without this partition a dry run
+    would print a count the subsequent ``--apply`` silently does not honour —
+    and dry-run-then-apply is exactly the operator workflow this script is
+    built around.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+        delete_ids: list[str] | None = None,
+    ):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _service(members: list[dict], *, apply: bool) -> AsyncMock:
+        memory_service = AsyncMock()
+        counts = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.count_memories_by_metadata = counts
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_dry_run_excludes_protected_members_from_orphan_count(self):
+        """A dry run reports the delete set it would actually take."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['o1'], (
+            f"Protected members leaked into the delete set: {report['orphan_ids']!r}"
+        )
+        assert report['orphan_count'] == 1
+        assert report['protected_skipped_count'] == 2
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_the_same_numbers_as_the_dry_run(self):
+        """A dry run and the --apply it precedes never disagree about the
+        delete set — the whole reason this partition exists in run()."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['o1']
+        assert report['orphan_count'] == 1
+        assert report['protected_skipped_count'] == 2
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'o1'}, f'Unexpected delete set: {deleted_ids!r}'
+
+    @pytest.mark.asyncio
+    async def test_bucket_counts_stay_consistent_with_orphan_count(self):
+        """bucket_counts is documented as a breakdown OF THE FINAL UNION, so
+        the protected members must be absent from it too."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert sum(report['bucket_counts'].values()) == report['orphan_count']
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_cannot_override_the_guard(self):
+        """--delete-ids is refused for a protected member, and the report
+        shows the request was SEEN and refused rather than silently lost."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['m1', 'l1']),
+            memory_service,
+            now=self._NEUTRAL_NOW,
+        )
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert 'm1' not in deleted_ids and 'l1' not in deleted_ids, (
+            f'--delete-ids overrode the guard: {deleted_ids!r}'
+        )
+        assert 'm1' not in report['orphan_ids']
+        assert 'l1' not in report['orphan_ids']
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+        # The operator's request stays visible: targeted_correction_ids
+        # records what --delete-ids MATCHED, which must not vanish just
+        # because the guard then refused it.
+        assert set(report['targeted_correction_ids']) == {'m1', 'l1'}
+
+    @pytest.mark.asyncio
+    async def test_apply_report_accounts_for_every_enumerated_member(self):
+        """The two views of "protected" are pinned against each other.
+
+        run() pre-subtracts, so the choke-point guard has nothing left to
+        catch and its refusal list must come back empty — which is what makes
+        ``deleted + len(failed) == orphan_count`` hold, i.e. the report's
+        delete count is fully accounted for. The guard exists for the case
+        where that stops being true, so the invariant it relies on is pinned
+        mechanically here rather than only asserted in a comment: a future
+        edit that reorders or drops the partition fails this test instead of
+        silently over-reporting the delete set in the nightly JSON.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['enforced_protected_skipped'] == [], (
+            'The choke-point guard fired on a delete set run() had already '
+            'partitioned — the two protected views have diverged: '
+            f"{report['enforced_protected_skipped']!r}"
+        )
+        assert report['deleted'] + len(report['failed']) == report['orphan_count']
+        # And the enumeration-scoped view still reports the full finding.
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_enforced_protected_skipped_is_apply_only(self):
+        """Apply-only, exactly like the sibling deleted/failed/tombstoned
+        keys — a dry run performs no delete, so it refused nothing."""
+        members = [_orphan('o1'), _mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert 'enforced_protected_skipped' not in report
+        assert json.dumps(report)
+
+    @pytest.mark.asyncio
+    async def test_the_subtraction_is_logged_at_warning(self, caplog):
+        """The subtraction is never silent in the journal.
+
+        run() pre-subtracts, so the choke-point guard's own per-member
+        WARNING cannot fire on this path — this is the ONLY journal output
+        the event produces, and the journal is where an operator greps after
+        a nightly run. The JSON key is not a substitute: `undated_kept_count`
+        is the precedent that a "why do this run's numbers look like that"
+        condition warrants both.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        naming_both = [
+            r for r in warnings
+            if 'm1' in r.getMessage() and 'l1' in r.getMessage()
+        ]
+        assert len(naming_both) == 1, (
+            'Expected exactly one WARNING naming both protected ids, got: '
+            f'{[r.getMessage() for r in warnings]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_nothing_is_protected(self, caplog):
+        """A clean run stays quiet — otherwise the warning above is noise an
+        operator learns to filter out."""
+        members = [_orphan('o1'), _member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        protected_warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers'
+            and r.levelno == logging.WARNING
+            and 'protected' in r.getMessage()
+        ]
+        assert protected_warnings == []
+
+    @pytest.mark.asyncio
+    async def test_keys_are_present_when_nothing_is_protected(self):
+        """The two keys are unconditional, so no report consumer needs a
+        .get fallback and a JSON diff across nights stays stable."""
+        members = [_orphan('o1'), _member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['protected_skipped_count'] == 0
+        assert report['protected_skipped_ids'] == []
+
+
+# ===========================================================================
+# Tests: run() surfaces the tombstone count in the report (task 4435)
+# ===========================================================================
+
+class TestRunSurfacesTheTombstoneCount:
+    """An --apply run makes the audit trail's presence — or ABSENCE — readable
+    in the JSON the nightly timer prints.
+
+    The failure this exists to make visible is a deployment with no
+    ``recon_ledger`` wired: records get destroyed permanently and the only
+    trace is a WARNING in the systemd journal. ``deleted: 2, tombstoned: 0``
+    puts that divergence in the report an operator actually reads.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(self, apply: bool = True):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+        )
+
+    @staticmethod
+    def _rig(memory_service: AsyncMock, members: list[dict], *, apply: bool):
+        memory_service.count_memories_by_metadata = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_the_rows_written(self):
+        """A wired ledger: every confirmed delete is accounted for."""
+        memory_service, _ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['deleted'] == 2
+        assert report['tombstoned'] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_missing_ledger_is_visible_as_a_shortfall(self):
+        """No recon_ledger wired: the records are still destroyed, and the
+        report says so — deleted 2, tombstoned 0 — rather than hiding the
+        missing audit trail behind a successful-looking sweep."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['deleted'] == 2
+        assert report['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_dry_run_never_populates_tombstoned(self):
+        """tombstoned is apply-only, exactly like the pre-existing
+        deleted/failed/after keys — a dry run wrote no tombstone, and
+        reporting 0 would read as one that failed."""
+        memory_service, ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1')], apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert 'tombstoned' not in report, (
+            f"tombstoned must be apply-only, got: {report.get('tombstoned')!r}"
+        )
+        ledger.upsert_many.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_report_stays_json_serialisable(self):
+        """main() prints the report, so a non-serialisable value would only
+        blow up in production."""
+        memory_service, _ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        json.dumps(report)
+
+
+# ===========================================================================
 # Tests: the flag_for_stage2 pool is CENSUSED, never deleted (task 3897)
 # ===========================================================================
 
@@ -1504,14 +2256,18 @@ class TestFlagForStage2IsNeverDeleted:
     """The cross-check must never widen the delete set. Guard against a
     future well-meaning edit that turns the census into a deletion.
 
-    The census probe is count-only BY DESIGN: live relay markers in that pool
-    would be caught by this script's own predicates, the script has neither
-    the protected-mirror guard nor the tombstone write the in-cycle
-    _sweep_stale_mem0_pool applies, and task 2966's collector already drains
-    the pool correctly. Full rationale and the dated measurements that back
-    each of those: docs/flag-marker-sweep-recurring.md ("Why the relay pool
-    is censused, never deleted") — deliberately not restated here, so there
-    is one copy to keep current. This class is what stops the design from
+    The census probe is count-only BY DESIGN, on two surviving reasons: live
+    relay markers in that pool would be caught by this script's own
+    predicates (they are live, not dead weight), and task 2966's in-cycle
+    collector already drains the pool, so a second collector here would race
+    a correct one. A third reason — that this script had neither the
+    protected-mirror guard nor the tombstone write the in-cycle
+    _sweep_stale_mem0_pool applies — is retired: task 4435 added both, and
+    the boundary stands unchanged on the other two, each independently
+    sufficient. Full rationale and the dated measurements that back each of
+    those: docs/flag-marker-sweep-recurring.md ("Why the relay pool is
+    censused, never deleted") — deliberately not restated here, so there is
+    one copy to keep current. This class is what stops the design from
     silently regressing.
     """
 

@@ -350,11 +350,31 @@ Every decision must respect this order:
 **Hard constraints — violating these is never acceptable:**
 - Never delete tasks, databases, or anything outside the project directory
 - Never kill processes belonging to other orchestrators, the user, or the system
-- Never directly modify `.taskmaster/tasks/tasks.json` — all task mutations go through fused-memory MCP
+- Never directly modify `.taskmaster/tasks/tasks.db` — all task mutations go through fused-memory MCP
 - If the MCP is down, ask the human for help. MCP task mutations trigger reconciliation that maintains memory quality; bypassing it silently degrades the system.
 
-**tasks.json corruption detection:**
-If tasks.json has shrunk, task IDs are mismatched/duplicated, or tasks have disappeared — this is a **critical infrastructure error**:
+**tasks.db corruption detection:**
+Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db` (the older on-disk
+`tasks.json` was superseded by SQLite and later deleted, so a doc naming it is stale). **Do not use the
+file's size as the signal** — it was a usable proxy for the JSON and is not one for SQLite: the file does
+not shrink when rows are deleted (freed pages go on the freelist), so mass task loss can show *no* size
+change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
+two instead:
+
+- **Task count, cycle over cycle.** `mcp__fused-memory__get_statuses(project_root=<project_root>, page_size=1)`
+  returns the exact count as `pagination['total']` in a response small enough to note every cycle (see
+  "Draining pending escalations" for why full dumps are the context sink to avoid). Compare against the
+  previous cycle's.
+- **`PRAGMA integrity_check`** — SQLite's own structural check. Read the db **read-only** so you never
+  contend with the live orchestrator, per the hard constraint above:
+  `sqlite3.connect('file:<project_root>/.taskmaster/tasks/tasks.db?mode=ro', uri=True)`. Anything other
+  than a single `ok` row is corruption. `SELECT COUNT(*) FROM tasks` on that same connection is the
+  fallback count when the MCP is down — measured 2026-08-30 against the live df store, it agrees exactly
+  with `pagination['total']` (both 4907), and the whole check runs in ~0.2s.
+
+If the count drops with no cause you can name (a `remove_task` you ran, an operator prune), if
+`integrity_check` returns anything but `ok`, or if task IDs are mismatched/duplicated or tasks have
+disappeared — this is a **critical infrastructure error**:
 1. Find the orchestrator process **for this project only** — verify its command-line args reference this project's root before doing anything
 2. Send SIGTERM (not SIGKILL) and let it finish gracefully
 3. Tell the human immediately with full details
@@ -575,7 +595,7 @@ a record is ever hand-edited.
 It is read-only with respect to escalations (it only ever writes the decision's own state field)
 and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
 raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
-the tasks.json-corruption park) is never auto-closed this way and needs explicit human closure.
+the tasks.db-corruption park) is never auto-closed this way and needs explicit human closure.
 Likewise, a decision whose `escalation_id` never resolves to a status — the escalation was purged
 by archive retention pruning, or never existed — also stays `open` forever and needs the same
 explicit human closure; until then, every cycle repeats a full scan of the escalations archive
@@ -602,10 +622,27 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
      task_id=..., branch=..., worktree=..., description=..., wait_secs=100
    )
    ```
+   <!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
    A return within the window yields a terminal outcome shape (`status` ∈
-   `done | conflict | blocked | already_merged | unknown_branch | failed`).
+   `done | conflict | blocked | already_merged | done_wip_recovery | unknown_branch |
+   unmerged_state | stash_failed | wip_halted | wip_recovery_no_advance | error |
+   superseded`).
+   <!-- merge-state-vocab:end -->
+   The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
+   `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
+   `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
+   observed by polling — handle them as `blocked`. (`failed`, which this list named
+   until task 4829, is not a value the server ever returns; the real one is `error`.)
+   <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
    A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
    snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   <!-- merge-state-vocab:end -->
    Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
    intent persists even if the MCP session drops mid-bounded-wait.
    - `status='attached'` on a coalesced submission means the merge is already queued under the
@@ -616,7 +653,16 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    mcp__escalation__merge_status(request_id=...)
    ```
    Back off 15 s → 60 s, using `eta_seconds` as the hint when present. Terminal states:
-   `done | conflict | blocked | already_merged`. After an orchestrator restart,
+   <!-- merge-state-vocab:begin partition=TERMINAL_STATES
+        Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
+   `done | conflict | blocked | abandoned | superseded`.
+   <!-- merge-state-vocab:end -->
+   (`already_merged`, which this list named until task 4829, is a *submit* status the
+   server collapses to `done` when observed by polling — see step 1 and
+   `escalation/src/escalation/server.py::_map_terminal_state`.)
+   After an orchestrator restart,
    `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
 
 3. **To abandon** a queued entry before it is picked up:
@@ -1019,17 +1065,21 @@ pending L2 (also runnable across all queues via `scripts/member-chain-sweep.py`,
 
 When the probe fires, the item's ask changes from "human must decide" to **"human must ratify and
 propagate"** — a much cheaper request. Present it that way, with the recovered ruling attached.
+Unless it clears the carve-out below, in which case the ask changes to NOTHING and you close it
+yourself: ratification is only needed for a ruling that is not already Leo's own, executed, and
+orphaned by a terminated session.
 
-**This check is REPORT-ONLY — it must never close anything on its own.** A record can be a
-deliberately-preserved PIN whose value is its *existence*, not its question: esc-3105-3 scores
-15/15 ruled members on this probe and must NOT be closed (it is the last hold on task 3105 /
-task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk close cascade on
-2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag). From the member chain alone, a
-pin and an answered question are indistinguishable. The machine-readable marker now exists (task
-4377): a record whose **`pin_declared_by`** is non-empty has been declared load-bearing, and
-`resolve_issue` refuses every non-`park` action on it — and on any L2 whose cascade would close it
-— with `{'code': 'declared_pin_refused', 'declared_pins': [...]}`. It rides every compact row, so
-read it on the drain; `pin_declared_reason` (the free-text why) is only on the full record via
+**This check is REPORT-ONLY — with exactly ONE carve-out (below), it must never close anything on
+its own.** A record can be a deliberately-preserved PIN whose value is its *existence*, not its
+question: esc-3105-3 scores 15/15 ruled members on this probe and must NOT be closed (it is the
+last hold on task 3105 / task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk
+close cascade on 2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag as
+`root_cause = veto-pin-do-not-close:3105`). From the member chain alone, a pin and an answered
+question are indistinguishable. The machine-readable marker now exists (task 4377): a record whose
+**`pin_declared_by`** is non-empty has been declared load-bearing, and `resolve_issue` refuses
+every non-`park` action on it — and on any L2 whose cascade would close it — with
+`{'code': 'declared_pin_refused', 'declared_pins': [...]}`. It rides every compact row, so read it
+on the drain; `pin_declared_reason` (the free-text why) is only on the full record via
 `get_escalation`. Read what `pin_declared_by` NAMES and consult it — `acknowledge_declared_pins`
 exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
 check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
@@ -1039,6 +1089,72 @@ marker: `declare_pin` is operator/steward-only today — it is not in the rotati
 (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
 likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
 appears to rely on it, for a human to declare. esc-3105-3 itself is still in that state.
+
+**Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
+permission a second time to do the bookkeeping on a decision he has already made and that has
+already been executed. When a session ruled a record, did the world-facing work, and then
+terminated without closing the record, closing it is **mechanical, not a new decision** — close it
+yourself and report afterwards. This is safe only because the checklist below demands positive
+documentary evidence of a *specific human ruling*, which a pin by construction never has: the
+report-only default exists because a pin and an answered question are indistinguishable FROM THE
+MEMBER CHAIN ALONE, and nothing here takes the member chain as its authority. esc-3105-3 /
+esc-3105-5 fails at item 5 and keeps working exactly as it does today.
+
+**All six gates must hold. Any miss ⇒ report-only, unchanged.**
+
+1. **The ruling is Leo's OWN and EXPLICIT — never inferred.** It must be attributable in writing:
+   a task description, a commit message, a fused-memory ruling record, or another escalation's
+   `resolution` text that names him ruling it. An agent's recommendation, a `triage_note`'s
+   conclusion, a `suggested_action`, or your own read that "this looks settled" does NOT qualify.
+2. **The ruling names THIS record** — by escalation id, or it unambiguously answers this record's
+   specific question. A ruling on an adjacent topic in the same programme does not qualify.
+3. **The ruling was EXECUTED, and that is verifiable NOW.** The world-facing change — task
+   retargeted or rewritten, dependencies wired, commit landed, config flipped — must be observable
+   at close time, not merely promised in the ruling text. Go look; never take the ruling's own word
+   for its own execution.
+4. **The originating session has TERMINATED.** Do not race a live session. Peer sessions are
+   enumerable via the `ListAgents` tool; a session that ran out of context, was closed, or whose
+   work landed hours ago with the record still open is terminated for this purpose. If it may still
+   be running, leave the record and note it.
+5. **The record is NOT a pin.** `pin_declared_by` is empty, `pins_recovery` is empty, `root_cause`
+   is not a `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same
+   task. **This is the protection that must not be weakened** — if any of the four is unclear, treat
+   the record as a pin and stop. (A non-empty `pin_declared_by` is refused by `resolve_issue`
+   regardless; `acknowledge_declared_pins` is never the answer on this path.)
+6. **The sideways check has been run** — `get_pending_escalations(task_id=...)` for the subject
+   task, dispositioning any twin L2 sharing a member in the same sitting (see "At every resolve,
+   look sideways before moving on" under "Resolving Escalations" below).
+
+**When all six hold:**
+
+- Resolve with the appropriate C1 action — usually `resume`; `close_only` when the record is a
+  re-report of an already-ruled class and nothing about the task should change.
+- Write the recovered ruling into the `resolution` verbatim-in-substance, and **name where the
+  ruling lives** (briefing artifact id, commit sha, task id) so the next reader does not re-derive
+  it — and record which residual questions are owned by which tasks, rather than letting the close
+  imply those closed too.
+- **Report the action to Leo afterwards.** No permission needed; the close is never silent.
+
+Worked example — **esc-3881-3** (`design_concern`, `info`, task 3881) asked for sign-off on
+retargeting task 3881 away from a named consumer (`_split_cross_project_task_nodes`) that does not
+exist. Leo ruled it option C on 2026-09-01 via the "The Identity Seam" briefing (artifact
+`b9b4c172-6853-4a12-b242-1a139bd4bb50`) and the ruling was fully executed — task 3881's description
+now opens `RETARGETED 2026-09-01 — option C of esc-3881-3, ruled by Leo via "The Identity Seam"
+briefing`, its scope was rewritten to the safe-A shape, and deps were wired to 3669/3672/4932/4985
+— but that session ran out of context before closing the record, so the L2 sat pending with its
+question already answered. `pin_declared_by` empty, `pins_recovery` empty, `root_cause` the substantive
+`design-concern:3881:…` key rather than a veto-pin key, no DO-NOT-CLOSE companion, sole member
+`esc-3881-2` cascade-closing cleanly: all six hold, so the watcher closes it and reports.
+
+**Expect orphans; they are not anomalies.** That same sitting's docs commit (`3057ffedfd`) recorded
+the esc-3673-1 / esc-3375-1 half of the ruling and never mentioned 3881 at all — which is exactly
+how the record got orphaned. A ruling's propagation is routinely PARTIAL, so a ruled-and-executed
+record left open is the expected residue of a large sitting, not a sign that something went wrong.
+
+**Everything that FAILS the checklist stays report-only**: the ask is still "human must ratify and
+propagate", and if you park it, park with a world-facing predicate naming where the candidate
+ruling lives — never a predicate about the record's own status (see "Reading a triage-ack
+annotation" above).
 
 **If you run a dedup/consolidation pass over pending L2s** (the 2026-08-19 sweep was such a pass,
 done by hand): before designating any survivor, run this check on the shared members. Never keep

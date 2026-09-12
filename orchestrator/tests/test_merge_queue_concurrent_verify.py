@@ -7144,6 +7144,25 @@ class TestLoudWaitMigrationRatchet:
 # ---------------------------------------------------------------------------
 
 
+#: A synthetic per-method wait budget on the GUARDED side of the threshold
+#: `_timeout_mark_offenders` applies -- one second over `PYPROJECT_DEFAULT_TIMEOUT`
+#: -- for the offender-loop unit tests below. Derived rather than written,
+#: mirroring the `PYPROJECT_DEFAULT_TIMEOUT - 1` spelling its sibling
+#: `test_budget_below_threshold_is_skipped_even_with_no_mark` already uses for the
+#: UNGUARDED side, so both sides of the threshold stay pinned to it.
+#:
+#: WHY IT IS NOT A LITERAL: it was `200.0`, chosen when the ini default was 60.
+#: Raising `[tool.pytest.ini_options].timeout` to 300 (2026-09-12) dropped 200
+#: BELOW the threshold, at which point all three failure branches below stopped
+#: being exercised at all -- they would have gone green by being skipped, which
+#: is the vacuity this whole class exists to prevent.
+_SYNTHETIC_HEAVY_BUDGET = float(PYPROJECT_DEFAULT_TIMEOUT + 1)
+
+#: A mark value that comfortably clears :data:`_SYNTHETIC_HEAVY_BUDGET`, for the
+#: happy-path case. Derived for the same reason.
+_SYNTHETIC_ADEQUATE_MARK = _SYNTHETIC_HEAVY_BUDGET + 1
+
+
 class TestTimeoutMarkOffenders:
     """`_timeout_mark_offenders` is the pure offender-accumulation loop
     behind `TestTimeoutMarkCoverage`'s guard. Driven here from synthetic
@@ -7161,28 +7180,32 @@ class TestTimeoutMarkOffenders:
         class _NoMark:
             pass
 
-        offenders = _timeout_mark_offenders({'_NoMark': 200.0}, {'_NoMark': _NoMark}.get)
+        offenders = _timeout_mark_offenders(
+            {'_NoMark': _SYNTHETIC_HEAVY_BUDGET}, {'_NoMark': _NoMark}.get
+        )
 
         assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
         assert '_NoMark' in offenders[0]
         assert 'no @pytest.mark.timeout mark' in offenders[0]
 
     def test_mark_too_tight_for_budget_is_one_offender(self) -> None:
-        """A class carrying `@pytest.mark.timeout(60)` against a 200s
-        computed budget yields exactly one offender naming the too-tight
-        value -- this is the exact failure mode task 3477 hit (a mark
-        present but too tight to clear the real wait profile).
+        """A class whose mark sits just UNDER its computed budget yields
+        exactly one offender naming the too-tight value -- this is the exact
+        failure mode task 3477 hit (a mark present but too tight to clear the
+        real wait profile).
         """
 
-        @pytest.mark.timeout(60)
+        @pytest.mark.timeout(PYPROJECT_DEFAULT_TIMEOUT)
         class _TooTight:
             pass
 
-        offenders = _timeout_mark_offenders({'_TooTight': 200.0}, {'_TooTight': _TooTight}.get)
+        offenders = _timeout_mark_offenders(
+            {'_TooTight': _SYNTHETIC_HEAVY_BUDGET}, {'_TooTight': _TooTight}.get
+        )
 
         assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
         assert '_TooTight' in offenders[0]
-        assert '60' in offenders[0]
+        assert str(PYPROJECT_DEFAULT_TIMEOUT) in offenders[0]
 
     def test_unresolvable_class_name_is_one_offender(self) -> None:
         """A budgeted class name that *resolve* cannot look up (e.g. it was
@@ -7190,7 +7213,7 @@ class TestTimeoutMarkOffenders:
         rather than raising -- the guard degrades to a loud failure, never
         a silent skip.
         """
-        offenders = _timeout_mark_offenders({'DoesNotExist': 200.0}, {}.get)
+        offenders = _timeout_mark_offenders({'DoesNotExist': _SYNTHETIC_HEAVY_BUDGET}, {}.get)
 
         assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
         assert 'DoesNotExist' in offenders[0]
@@ -7199,13 +7222,18 @@ class TestTimeoutMarkOffenders:
     def test_adequate_mark_yields_no_offenders(self) -> None:
         """A class whose mark value clears its computed budget yields no
         offenders -- pins the happy path so it stays non-vacuous too.
+
+        The budget is on the GUARDED side of the threshold, so this really
+        exercises the "mark clears it" branch rather than the skip.
         """
 
-        @pytest.mark.timeout(300)
+        @pytest.mark.timeout(_SYNTHETIC_ADEQUATE_MARK)
         class _Adequate:
             pass
 
-        offenders = _timeout_mark_offenders({'_Adequate': 200.0}, {'_Adequate': _Adequate}.get)
+        offenders = _timeout_mark_offenders(
+            {'_Adequate': _SYNTHETIC_HEAVY_BUDGET}, {'_Adequate': _Adequate}.get
+        )
 
         assert offenders == [], f'Expected no offenders, got {offenders!r}.'
 
@@ -7229,6 +7257,27 @@ class TestTimeoutMarkOffenders:
 # ---------------------------------------------------------------------------
 # task 3492 step-3: enforced coverage invariant over THIS module's own source
 # ---------------------------------------------------------------------------
+#
+# RELATED, BUT ENFORCED ELSEWHERE (task 4246): the SHAPE of a load-bearing wait
+# — a `MergeRequest.result` future or a `gate*.wait()` barrier reached through a
+# bare `asyncio.wait_for(...)`, or carrying a raw numeric `timeout=` literal —
+# is now checked repo-wide by rule `wall-clock-deadline` in
+# fused-memory/scripts/check_bare_magicmock_config.py, run by the seven package
+# lint_commands, dark-factory-orchestrator.yaml and hooks/project-checks. That
+# rule and this class are complements, not overlaps: the rule says a wait must
+# be loop-responsive (`wait_responsive(...)` with a descriptive `label=`, bound
+# derived from MERGE_RESULT_TIMEOUT rather than a written number); this class
+# says whatever budget the resulting waits add up to must be covered by an
+# adequate `@pytest.mark.timeout`. It stays here because it needs runtime marks
+# and imported helper constants, which the stdlib-only checker cannot have —
+# see the policy note above test_merge_speculation.py::TestTimeoutMarkCoverage.
+#
+# THIS FILE CARRIES DEBT under that rule: it is on the shrink-only, opt-out
+# `_WALL_CLOCK_DEADLINE_DEBT` baseline at its measured day-one count (90
+# violations), so its pre-existing sites are grandfathered but the budget is
+# CHECKED — add one more offending wait and the gate reports the overrun. New
+# load-bearing waits added here must therefore use `wait_responsive(...)`, and
+# the recorded number may only be lowered as sites are migrated, never raised.
 
 
 class TestTimeoutMarkCoverage:

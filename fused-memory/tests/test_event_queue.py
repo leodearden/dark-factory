@@ -328,13 +328,38 @@ async def test_overflow_writes_to_dead_letter(tmp_path):
 @pytest.mark.asyncio
 async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
     """Bounded flush drains everything when drainer can keep up."""
+    # shutdown_flush_seconds is deliberately generous, for the reason _wait_for's
+    # docstring gives: the pass/fail line belongs on whether the drainer did its
+    # job, not on how promptly a starved event loop happened to schedule it. This
+    # is the one such bound that cannot be a _wait_for poll, because it lives
+    # inside EventQueue.close() rather than in the test.
+    #
+    # Draining these 50 events costs ~0.075s (measured under esc-3949-7) to ~0.18s
+    # median / 0.28s worst of 10 (re-measured at host load ~362/32 cores), so 5.0s
+    # was already a 27-66x margin — and it still flaked under full-suite xdist
+    # load, dead-lettering 5 of 50 with 'shutdown flush window (5.0s) elapsed'.
+    # 20.0s restores a ~70x margin against that measured cost.
+    #
+    # The window must stay WELL under the suite-wide pytest-timeout cap
+    # (fused-memory/pyproject.toml: timeout = 60, timeout_method = "thread").
+    # EventQueue.close() awaits asyncio.wait_for(queue.join(), shutdown_flush),
+    # so on a genuine drainer stall this test blocks for the whole window; at
+    # 60.0s the setup time ahead of close() pushes the total past the cap, and
+    # the thread handler's os._exit(1) would kill the xdist worker instead of
+    # letting the assertions below report a clean failure. 20.0s keeps the
+    # stall path inside the cap while still being far above any jitter.
+    #
+    # This does NOT weaken the test: both assertions below stay exactly as strong,
+    # so a drainer that genuinely fails to flush still fails here, just not on
+    # scheduling jitter. The sibling test_shutdown_timeout_dumps_remainder keeps
+    # its small window and covers the expiry path.
     q = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
         maxsize=100,
         retry_initial_seconds=0.01,
         retry_max_seconds=0.1,
-        shutdown_flush_seconds=5.0,
+        shutdown_flush_seconds=20.0,
     )
     await q.start()
     for _ in range(50):

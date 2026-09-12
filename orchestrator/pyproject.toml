@@ -42,7 +42,25 @@ orchestrator = "orchestrator.cli:main"
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "tests", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
+#
+# "../scripts" — task 3931 / esc-3805-1 (2026-08-09), esc-3805-6 (2026-08-12),
+# break-glass hotfix 27ac22a6a6. The root pyproject.toml's own extraPaths lists
+# `scripts`, so ROOT-scoped pyright resolves tests/test_run_vllm_eval.py's
+# `import run_vllm_eval` and EvalSummary/PodHandle become real types; without
+# this entry PACKAGE-scoped pyright leaves that import unresolved, everything
+# degrades to Unknown, and the defects go unreported HERE while the root-scoped
+# verify gate reports them. MEASURED at pyright 1.1.408 with the hotfix
+# reverse-applied: `npx pyright orchestrator/tests/test_run_vllm_eval.py` from
+# the worktree ROOT -> 14 reportArgumentType errors (first at :1827);
+# `cd orchestrator && npx pyright tests/test_run_vllm_eval.py` -> 0 errors.
+# verify's FILE_SCOPED fallback runs pyright root-scoped while pre-commit
+# (hooks/project-checks) and the fleet chain run it package-scoped, so this
+# entry is what keeps the two gates in agreement. DO NOT REMOVE — pinned by
+# tests/test_run_vllm_eval.py::TestPyrightScopeParity and by
+# tests/scripts/test_fallback_verify_config.py's chain-independent
+# generalisation. It only widens IMPORT RESOLUTION: scripts/ is still absent
+# from `include` above, so scripts/ files are not themselves type-checked here.
+extraPaths = ["src", "tests", "../scripts", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
@@ -153,21 +171,31 @@ filterwarnings = [
     "error::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
-# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
+# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
+# is 300 rather than the former 60: the cap is WALL-CLOCK, so a healthy test
+# starved of CPU on a loaded 32-core host trips it and — under thread mode
+# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself.
+# 300 is INTERIM and judgement-picked, not measured).
 # Slow tests opt out with @pytest.mark.timeout(N).
 # timeout_method: signal mode was paired with serial execution; once xdist
 # was enabled here (matching fused-memory/pyproject.toml) the worker
 # subprocesses run pytest in a thread, so signal-based interruption is no
 # longer reliable inside the worker — switch to thread mode like fused-memory.
-timeout = 60
+# UNCHANGED by the 60→300 raise, deliberately: the raise attacks the trigger,
+# not the two safety mechanisms.
+# MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants asserts against
+# this value with tomllib at runtime — edit the two together.
+timeout = 300
 timeout_method = "thread"
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /
 # test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
 # ``--max-worker-restart=0`` is the resilience net (task 1907): if any test
-# ever exceeds the 60s timeout, pytest-timeout's thread method os._exit()s the
-# xdist worker. With restarts allowed, xdist spawns a replacement node that
+# ever exceeds the 300s timeout above, pytest-timeout's thread method
+# os._exit()s the xdist worker. With restarts allowed, xdist spawns a
+# replacement node that
 # re-collects the full suite and re-dies → restart/re-collect/re-die loop that
 # hangs the whole suite at ~98%. Disabling restarts degrades a worker death to
 # a single clean per-test failure instead of a suite-wide hang.
@@ -210,10 +238,48 @@ markers = [
 
 [dependency-groups]
 dev = [
+    # complexipy — the cognitive-complexity engine behind
+    # scripts/merge_lane_metrics.py and the merge-lane ratchet
+    # (tests/test_merge_lane_ratchet.py). PRD plans/merge-lane-quality-prd.md
+    # task α. BOTH bounds are load-bearing and were MEASURED in this worktree
+    # on 2026-09-03 against src/orchestrator/merge_queue.py (21,550 lines):
+    #
+    #   version | wall clock | file total | _verifier_loop
+    #   3.0.0   |     4.63s  |      2031  |  186
+    #   4.0.0   |     4.31s  |      2124  |  188
+    #   5.0.0   |     4.81s  |      2092  |  192
+    #   6.0.0   |     5.18s  |      2133  |  245
+    #   6.2.0   |     4.75s  |      2133  |  245
+    #   7.0.1   |   247.00s  |      2133  |  245
+    #
+    # The FLOOR (>=6.2) is correctness: 3/4/5 compute DIFFERENT numbers, so an
+    # older resolve would silently rewrite every baseline figure and turn the
+    # ratchet into noise. 6.x and 7.0.1 agree, and reproduce exactly the
+    # figures the PRD Background table quotes; 6.2.0 is the newest 6.x and the
+    # one every committed baseline number was measured with.
+    #
+    # The CEILING (<7) is not hygiene — it is what keeps the instrument from
+    # becoming a suite-truncating landmine. 7.0.1's cost grows roughly cubically
+    # in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the whole
+    # 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The ratchet
+    # carries @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s and this
+    # file's own `timeout = 300`-equivalent budget; exceeding it does not merely
+    # fail the test — pytest-timeout's thread method os._exit()s the xdist
+    # worker and `--max-worker-restart=0` then truncates the ENTIRE orchestrator
+    # suite, reporting against an innocent test (the esc-3980-1 / esc-3787-1
+    # mode documented at tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
+    # Do not relax to >=6 or drop the <7 ceiling without re-measuring.
+    "complexipy>=6.2,<7",
     "pyright>=1.1.404",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.0",
+    # radon — used ONLY for the reported-not-ratcheted maintainability-index
+    # column of scripts/merge_lane_metrics.py --report (radon.metrics.mi_visit;
+    # measured 0.00 for both merge_queue.py and git_ops.py, reproducing the
+    # PRD's "Maintainability index (radon) | 0" row). It is genuinely exercised
+    # by metrics.maintainability_index() — NOT dead, do not delete as unused.
+    "radon>=6.0,<7",
     "ruff>=0.7.1",
 ]

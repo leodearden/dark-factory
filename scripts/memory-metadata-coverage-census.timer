@@ -1,0 +1,31 @@
+[Unit]
+Description=Nightly timer for the canonical/topic coverage census + retro-stamp rehearsal (task 4006)
+
+[Timer]
+# Nightly at 05:00 local time -- the next free slot in this machine's
+# deliberately-staggered nightly ladder:
+#
+#   03:00  legibility-trickle@
+#   03:30  fused-memory-flag-marker-sweep
+#   04:00  reclaim-orphaned-worktrees  AND  legibility-transcript-check@
+#   04:30  reify-closure-staleness-sweep
+#   05:00  this job
+#
+# The stagger is deliberate: these jobs share a machine and, in several cases,
+# the same backing stores. This one is the heaviest reader of Qdrant in the
+# family -- it scrolls every point in both live collections -- so it sits at
+# the end of the ladder rather than alongside the 04:00 pair. See
+# OPERATIONS.md §12 for the ladder as a whole.
+#
+# Persistent=true catches up a night missed to a sleeping/offline laptop on the
+# next boot or login instead of silently skipping it. That matters more here
+# than for a drain job: this timer's output is a TREND, and a silently skipped
+# night is a hole in the series that no later run can reconstruct. A small
+# randomized delay avoids a thundering herd with other timers firing at the
+# same instant.
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

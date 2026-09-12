@@ -27,6 +27,7 @@ class TestTopLevelImports:
             classify_agent_failure,
             connect_daemon,
             count_transcript_turns,
+            detect_resumable_progress,
             extract_agent_verdict,
             files_to_modules,
             invoke_claude_agent,
@@ -39,6 +40,7 @@ class TestTopLevelImports:
             normalize_lock,
             read_transcript_records,
             require_non_blank_prompt,
+            resumable_progress_for_session,
         )
 
         assert AgentResult is not None
@@ -55,6 +57,12 @@ class TestTopLevelImports:
         assert require_non_blank_prompt is not None
         assert count_transcript_turns is not None
         assert read_transcript_records is not None
+        # task 4274: cap-hit resume eligibility asks TWO questions — can I reach
+        # the transcript, and does it record work to continue?  The second
+        # predicate and its session wrapper are consumed from the blessed
+        # top-level surface, so pin the lazy re-export, not just the submodule.
+        assert detect_resumable_progress is not None
+        assert resumable_progress_for_session is not None
         assert UsageGate is not None
         assert AccountState is not None
         assert AccountPhase is not None
@@ -95,6 +103,7 @@ class TestModuleLevelAll:
             'classify_agent_failure',
             'count_transcript_turns',
             'detect_ended_awaiting_background',
+            'detect_resumable_progress',
             'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
@@ -105,6 +114,7 @@ class TestModuleLevelAll:
             'note_unreadable_transcript',
             'read_transcript_records',
             'require_non_blank_prompt',
+            'resumable_progress_for_session',
             'transcript_exists',
         }
 

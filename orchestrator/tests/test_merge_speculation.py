@@ -41,7 +41,6 @@ _patch_cold_shadow_verify(monkeypatch, return_value) (helper)
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import logging
@@ -1997,9 +1996,11 @@ async def _stop_worker(
 
     The join stays best-effort (``suppress(Exception)``): it asserts nothing,
     and a slow join must not convert a real failure above into a confusing
-    second one. It is also the reason this wait is deliberately exempt from
-    ``TestLateArrivalWaitsAreLoadIndependent`` — see
-    ``_load_bearing_wait_target``.
+    second one. It is also why this wait is exempt from the shared
+    ``wall-clock-deadline`` rule
+    (fused-memory/scripts/check_bare_magicmock_config.py): its target is a bare
+    Name, not a ``.result`` future or a ``gate*.wait()`` barrier, so the
+    exemption is structural rather than a listed name.
     """
     await worker.stop()
     with contextlib.suppress(Exception):
@@ -2086,7 +2087,8 @@ class TestLateArrivalAttaches:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -2318,7 +2320,8 @@ class TestLateArrivalCleanCAS:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -2829,7 +2832,8 @@ class TestLateArrivalGuards:
         # ── A's local verify: passes immediately (no gate) ───────────────────
         async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -2932,7 +2936,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3034,7 +3039,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3149,7 +3155,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3285,7 +3292,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3464,7 +3472,8 @@ class TestLateArrivalSubmissionOrderCAS:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3755,6 +3764,35 @@ class TestFinalizeInflightJournalsLandedRow:
 # ---------------------------------------------------------------------------
 # task 3980: enforced timeout-mark coverage over THIS module's own source
 # ---------------------------------------------------------------------------
+#
+# POLICY (task 4246): this guard deliberately STAYS file-local, and is the one
+# guard in this module that did NOT move into
+# fused-memory/scripts/check_bare_magicmock_config.py alongside
+# `wall-clock-deadline` and `bare-dataclass-double`. Two independent reasons,
+# both hard:
+#
+#   1. It is not an AST-only guard. `_timeout_mark_offenders` resolves each
+#      class through a RUNTIME resolver (`globals().get` below) and reads the
+#      live `cls.pytestmark` marks, and the mark's argument is a Name
+#      (`@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)`), not a literal a
+#      static pass could evaluate. Its budget engine likewise depends on
+#      RESPONSIVE_WAIT_STRETCH / RESPONSIVE_WAIT_WALL_CAP imported from
+#      orchestrator's test helpers. The checker script holds a hard
+#      stdlib-only contract — hooks/project-checks runs it under a bare
+#      `python3` with no uv env resolution — so importing this module's
+#      dependencies there is not an option, and re-deriving the constants
+#      would recreate exactly the drift the imports exist to prevent.
+#
+#   2. It is ALREADY shared, by cross-module import rather than by copy: the
+#      helpers come from test_merge_queue_concurrent_verify (see the imports
+#      at the head of this file), which is why moving it would not remove a
+#      duplicate. It is not the one-copy-per-test-module multiplication that
+#      motivated task 4246; the two guards that WERE that multiplication are
+#      the ones that moved.
+#
+# So the (a)/(b)/(c) choice this task weighed resolved to option (c) — leave it
+# file-local — for this guard alone, and to option (a) — widen the shared
+# checker — for the other two. Do not "finish the job" by moving this one too.
 
 
 class TestTimeoutMarkCoverage:
@@ -3818,363 +3856,66 @@ class TestTimeoutMarkCoverage:
 
 
 # ---------------------------------------------------------------------------
-# task 3980: structural guard — load-bearing waits must be load-independent
+# task 3980's wall-clock guard now lives in the SHARED checker (task 4246)
 # ---------------------------------------------------------------------------
 #
-# SCOPE: the WHOLE module, derived from the call shape alone. An earlier
-# revision scanned a hand-maintained frozenset of the five late-arrival class
-# names; a sixth class added tomorrow with `asyncio.wait_for(req_x.result,
-# timeout=25.0)` would have passed this guard in silence — the same "a policy
-# expressed as a list cannot catch what is outside the list" failure the class
-# docstring below criticises task 2376's sweep for, reintroduced by the guard
-# meant to fix it. Deriving the set from `_worst_per_method_wait_budget`
-# instead does not close it either: a 25.0 literal computes 25s, under
-# PYPROJECT_DEFAULT_TIMEOUT, so the hypothetical offender still would not be
-# scanned. Only the shape is a sound key, so there is no set to maintain.
-
-
-def _load_bearing_wait_target(node: ast.expr) -> str | None:
-    """Describe *node* if it is a load-bearing synchronisation point, else None.
-
-    Exactly two shapes are load-bearing in the late-arrival block, and both
-    gate a hard assertion downstream:
-
-      * ``req_a.result`` — a ``MergeRequest.result`` future. Its resolution IS
-        the event the test is waiting for; a deadline here fails a test whose
-        merge pipeline completed correctly.
-      * ``gate_a_entered.wait()`` — an ``asyncio.Event`` barrier. Already
-        event-driven; only its deadline is wall-clock.
-
-    Deliberately NOT load-bearing, and therefore excluded: the
-    ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
-    ``_stop_worker``. It targets a bare ``Name`` (the worker Task), sits inside
-    ``contextlib.suppress(Exception)``, asserts nothing, and swallows its own
-    TimeoutError — so it cannot manufacture the flake this task fixes, and
-    stretching it would only slow teardown down. The Name-vs-Attribute/Call
-    distinction is what makes that exclusion structural rather than a
-    hand-maintained name list — which matters more now that the scan covers
-    every scope in the module rather than five named classes.
-    """
-    if isinstance(node, ast.Attribute) and node.attr == 'result':
-        return f'{ast.unparse(node)} (MergeRequest.result future)'
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == 'wait'
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id.startswith('gate')
-    ):
-        return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
-    return None
-
-
-def _late_arrival_wait_offenders(source: str) -> list[str]:
-    """Statically scan *source* for load-bearing waits that are still charged
-    in wall clock, returning one formatted offender string per site.
-
-    Two offence kinds, both reported as ``file:line`` plus the enclosing scope
-    so the failure is directly actionable:
-
-      1. a load-bearing wait still routed through a bare
-         ``asyncio.wait_for(..., timeout=...)`` instead of ``wait_responsive``;
-      2. a raw numeric wall-clock literal on a load-bearing wait site (on
-         EITHER call shape) instead of a bound derived from
-         ``MERGE_RESULT_TIMEOUT``.
-
-    Scans EVERY scope in the module — every class, every method, every
-    module-level helper — with no name list and no class filter (see the
-    SCOPE note above the section). Selection is entirely by call shape:
-    ``_load_bearing_wait_target`` decides what counts, so a new late-arrival
-    class, a helper that grows a wait, or a test outside the late-arrival block
-    is covered the moment it is written rather than when someone remembers to
-    add it. Scope tracking mirrors ``_bare_verify_result_double_offenders``
-    below, deliberately: two guards over one file should read the same way.
-
-    Must never raise: a crash here would fail the module over an unrelated
-    edit. Unparseable source returns [].
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    name = Path(__file__).name
-    offenders: list[str] = []
-
-    def _check_call(call: ast.Call, where: str) -> None:
-        if not call.args:
-            return
-        func = call.func
-
-        is_bare_wait_for = (
-            isinstance(func, ast.Attribute)
-            and func.attr == 'wait_for'
-            and isinstance(func.value, ast.Name)
-            and func.value.id == 'asyncio'
-        )
-        is_responsive = isinstance(func, ast.Name) and func.id == 'wait_responsive'
-        if not (is_bare_wait_for or is_responsive):
-            return
-
-        target = _load_bearing_wait_target(call.args[0])
-        if target is None:
-            return
-
-        if is_bare_wait_for:
-            offenders.append(
-                f'{name}:{call.lineno} — {where} — awaits {target} via a '
-                f'bare asyncio.wait_for, so its deadline is charged in '
-                f'WALL CLOCK. Route it through wait_responsive(...) '
-                f'with a descriptive label=.'
-            )
-
-        timeout_kw = next((kw for kw in call.keywords if kw.arg == 'timeout'), None)
-        if (
-            timeout_kw is not None
-            and isinstance(timeout_kw.value, ast.Constant)
-            and isinstance(timeout_kw.value.value, (int, float))
-            and not isinstance(timeout_kw.value.value, bool)
-        ):
-            offenders.append(
-                f'{name}:{call.lineno} — {where} — awaits {target} with a '
-                f'RAW wall-clock literal timeout='
-                f'{timeout_kw.value.value!r}. Derive the bound from '
-                f'MERGE_RESULT_TIMEOUT instead of writing a number.'
-            )
-
-    def _visit(node: ast.AST, scope: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-            ):
-                _visit(child, f'{scope}::{child.name}' if scope else child.name)
-                continue
-            if isinstance(child, ast.Call):
-                _check_call(child, scope or '<module>')
-            _visit(child, scope)
-
-    _visit(tree, '')
-    return offenders
-
-
-class TestLateArrivalWaitsAreLoadIndependent:
-    """Enforced invariant: no load-bearing wait ANYWHERE in this module may
-    carry a wall-clock deadline.
-
-    This is the guard that stops the class recurring in this file a thirteenth
-    time. The measured failures behind task 3980 were all genuine asyncio
-    deadline expiries on tests whose logic had ALREADY completed — the CleanCAS
-    log tail reads ``verify end (passed=True)`` next to a heartbeat of
-    ``oldest age=46s ... state=finalizing``. Widening the numbers would only
-    move the threshold; charging the budget in loop-responsive time removes the
-    dependence, and this guard is what keeps it removed.
-
-    It also closes the specific hole that produced one of the three failures.
-    Task 2376's sweep replaced merge-pipeline wait literals, but its stated
-    policy only covered literals <= 15 — so the lone ``timeout=25.0`` in
-    test_predecessor_fail_cascades_to_late_arrival sat just above the sweep and
-    survived as the file's only bare mid-range deadline. A policy expressed as
-    "literals up to N" cannot catch the one above N; a structural invariant
-    over the call SHAPE can — which is also why the scan carries no class list
-    of its own (see the SCOPE note above ``_load_bearing_wait_target``).
-    """
-
-    def test_no_load_bearing_wait_is_charged_in_wall_clock(self) -> None:
-        offenders = _late_arrival_wait_offenders(Path(__file__).read_text())
-
-        assert not offenders, (
-            'These synchronisation points still carry wall-clock deadlines:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nA MergeRequest.result future wait and an asyncio.Event '
-            'gate barrier are both load-bearing: a deadline expiry there '
-            'fails a test whose merge pipeline completed correctly, purely '
-            'because the xdist worker was descheduled. Use '
-            'wait_responsive(...), which charges its budget in '
-            'loop-responsive time and still reports a genuine hang red. The '
-            "worker run-task join in _stop_worker is deliberately exempt "
-            '(best-effort cleanup inside contextlib.suppress, asserting '
-            'nothing) — and exempt by its Name target, not by a name list.'
-        )
-
-    def test_scan_reaches_a_class_no_name_list_would_have_covered(self) -> None:
-        """Driven with SYNTHETIC source, because the real module is clean.
-
-        Without this, nothing distinguishes "the scan covers the whole module"
-        from "the scan covers the five classes that happen to be clean". The
-        input is the reviewer's own counter-example: a sixth late-arrival class
-        added tomorrow, outside any list, with the exact bare mid-range deadline
-        that produced one of the three measured failures.
-        """
-        synthetic = (
-            'class TestSomeBrandNewLateArrivalCase:\n'
-            '    async def test_new_case(self):\n'
-            '        await asyncio.wait_for(req_x.result, timeout=25.0)\n'
-        )
-
-        offenders = _late_arrival_wait_offenders(synthetic)
-
-        assert len(offenders) == 2, (
-            f'expected BOTH offence kinds (bare asyncio.wait_for on a '
-            f'load-bearing target, and a raw wall-clock literal); got '
-            f'{offenders!r}'
-        )
-        assert all(
-            'TestSomeBrandNewLateArrivalCase::test_new_case' in o for o in offenders
-        ), offenders
-
-    def test_a_name_targeted_join_is_still_exempt_under_the_wider_scope(
-        self,
-    ) -> None:
-        """The widened scope must not start flagging teardown joins.
-
-        ``_stop_worker`` is a module-level helper, so widening the scan from
-        "five classes" to "every scope" newly brings it into range. Its join
-        stays exempt because its target is a bare Name, not because it lives
-        somewhere the scan does not look.
-        """
-        synthetic = (
-            'async def _teardown(worker, worker_task):\n'
-            '    with contextlib.suppress(Exception):\n'
-            '        await asyncio.wait_for(worker_task, timeout=5.0)\n'
-        )
-
-        assert _late_arrival_wait_offenders(synthetic) == []
-
-
-# ===========================================================================
-# Task 3980 step-9: no unspecced VerifyResult-shaped double may survive here
-# ===========================================================================
-
-
-# Exactly ONE deliberate bare-MagicMock site is exempt (task 3980 step-12).
-# TestDispositionDoubleFidelity's NEGATIVE leg re-introduces the pre-step-8
-# defect ON PURPOSE and asserts that the classifier fails open on it — that
-# mutation is what makes the POSITIVE leg's "no fail-open" assertion provably
-# two-sided rather than trivially true. A guard that flagged it would force the
-# proof to be deleted to keep the guard green, which is backwards.
+# `_load_bearing_wait_target`, `_late_arrival_wait_offenders` and
+# `TestLateArrivalWaitsAreLoadIndependent` were deleted here and reimplemented as
+# rule `wall-clock-deadline` in
+# fused-memory/scripts/check_bare_magicmock_config.py. The invariant is unchanged
+# and is now enforced REPO-WIDE by the seven package lint_commands,
+# dark-factory-orchestrator.yaml and hooks/project-checks, rather than only by
+# this module's own test run.
 #
-# The exemption is keyed on the enclosing scope, NOT on a line number (which
-# every edit above it invalidates) and NOT on a comment pragma (which is one
-# copy-paste away from exempting a real offender). Adding an entry here is a
-# design decision, not a cleanup: any NEW entry must, like this one, exist to
-# prove a guard can fail.
-_BARE_DOUBLE_EXEMPT_SCOPES = frozenset({
-    'TestDispositionDoubleFidelity::test_bare_double_makes_classifier_fail_open',
-})
+# WHAT THE RULE STILL KEYS ON, and why it must stay that way: the call SHAPE.
+# A load-bearing target is `X.result` (a MergeRequest.result future) or
+# `gate*.wait()` (an asyncio.Event barrier); the `_stop_worker` teardown join
+# below is exempt because its target is a bare Name, not because anything lists
+# it. No class list and no budget threshold decides which sites are scanned —
+# task 2376's sweep expressed its policy as "literals up to 15" and the lone
+# `timeout=25.0` sat just above it, surviving as one of the three measured
+# failures; task 3980's own amendment pass then deleted a hand-maintained
+# five-class frozenset for the same reason. A list cannot catch what is outside
+# it, and a threshold is just another list.
+#
+# One honest asymmetry, recorded by task 4246's amendment pass rather than
+# glossed: the `.result` leg is pure shape, but the barrier leg also requires a
+# receiver Name starting with `gate` — a naming convention (universal in THIS
+# module, which is why the guard could carry it while it lived here) standing in
+# for "this is an asyncio.Event". Repo-wide it has a measured false-negative
+# surface of 102 `asyncio.wait_for(<expr>.wait(), ...)` sites. The checker's
+# Rule C docstring carries the census and why dropping the prefix was declined.
+#
+# Deleting the local copy was gated on a two-sided proof, not on this module
+# merely passing: fused-memory/tests/test_check_bare_magicmock_config.py::
+# TestRuleCCoversMergeSpeculation asserts this file measures ZERO under the
+# shared rule AND that the reviewer's counter-example flags under this exact
+# filename. This module is deliberately absent from the rule's
+# _WALL_CLOCK_DEADLINE_DEBT baseline, so a regression here fails the gate
+# instead of being grandfathered.
 
 
-def _bare_verify_result_double_offenders(source: str) -> list[str]:
-    """Statically scan *source* for unspecced VerifyResult-shaped MagicMocks.
-
-    The tell is a ``passed=`` keyword: it is VerifyResult's first field and no
-    other double in this file carries it. Keying on ``passed=`` rather than on
-    ``MagicMock`` alone is what lets the many legitimate non-VerifyResult
-    MagicMocks here through untouched.
-
-    Flags a construction regardless of POSITION — ``return MagicMock(...)``, an
-    assignment, or an argument. Position-blindness is the whole point: this
-    repo's dedicated detector, fused-memory/scripts/check_bare_magicmock_config.py,
-    provably cannot catch this shape for three independent reasons, any one of
-    which is fatal — it inspects only ``ast.Assign``/``ast.AnnAssign`` while all
-    ten sites behind task 3980 were ``return MagicMock(...)``; its
-    ``_is_config_name`` matches only config/cfg/*_config/*_cfg targets; and its
-    remedies are pydantic-specific (``pydantic_spec`` reads ``model_fields``)
-    while VerifyResult is a stdlib dataclass. Widening that shared, seven-caller
-    gate is filed as a separate follow-up; this gives the file coverage now.
-
-    A ``spec=``/``spec_set=`` argument exempts a site, because that is precisely
-    what makes an unknown-attribute READ raise AttributeError instead of
-    auto-vivifying a truthy child Mock — the root-cause fix rather than a
-    ``cause_hint=''`` patch for today's one known field.
-
-    Must never raise: a crash here would fail the module over an unrelated
-    edit. Unparseable source returns [].
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    name = Path(__file__).name
-    offenders: list[str] = []
-
-    def _is_magicmock(func: ast.expr) -> bool:
-        # Both the bare `MagicMock(...)` this file imports and a qualified
-        # `mock.MagicMock(...)` / `unittest.mock.MagicMock(...)`.
-        if isinstance(func, ast.Name):
-            return func.id == 'MagicMock'
-        if isinstance(func, ast.Attribute):
-            return func.attr == 'MagicMock'
-        return False
-
-    def _visit(node: ast.AST, scope: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-            ):
-                _visit(child, f'{scope}::{child.name}' if scope else child.name)
-                continue
-            if isinstance(child, ast.Call) and _is_magicmock(child.func):
-                kwargs = {kw.arg for kw in child.keywords}
-                if (
-                    'passed' in kwargs
-                    and not ({'spec', 'spec_set'} & kwargs)
-                    and scope not in _BARE_DOUBLE_EXEMPT_SCOPES
-                ):
-                    offenders.append(
-                        f'{name}:{child.lineno} — {scope or "<module>"} — '
-                        f'MagicMock(passed=...) with no spec=.'
-                    )
-            _visit(child, scope)
-
-    _visit(tree, '')
-    return offenders
-
-
-class TestNoBareVerifyResultDoubles:
-    """Enforced invariant: every VerifyResult-shaped double in this module is
-    built through ``_fake_verify_result``, never as a bare MagicMock.
-
-    Task 3980 measured what a bare one costs. An unconfigured attribute READ on
-    a bare MagicMock auto-vivifies a truthy child Mock rather than returning a
-    real default, so the ten inline doubles here — every one of which omitted
-    ``cause_hint`` — made merge_disposition.py's
-    ``_extract_failing_tests_and_candidate_files`` (:218-221) raise
-    ``TypeError: sequence item 0: expected str instance, MagicMock found`` out
-    of ``str.join``. ``classify_merge_failure_disposition`` (:710-719) swallows
-    that into a silent fail-open (WARNING + INDETERMINATE), which is
-    indistinguishable downstream from a genuine verdict — so the affected
-    assertions only APPEARED to exercise disposition classification.
-
-    Every one of these sites also passed ``verify_skipped=``, which is not a
-    VerifyResult field at all (it lives on MergeOutcome, merge_types.py:945).
-    Nothing objected, because a bare MagicMock accepts any kwarg. That is the
-    same silent-drift failure mode from the other direction, and it is why the
-    remedy is ``spec=VerifyResult`` rather than adding ``cause_hint=''``.
-    """
-
-    def test_no_unspecced_verify_result_double_survives(self) -> None:
-        offenders = _bare_verify_result_double_offenders(Path(__file__).read_text())
-
-        assert not offenders, (
-            'These VerifyResult-shaped doubles are still unspecced MagicMocks:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nRemedy: build them with _fake_verify_result(...) (task 3477, '
-            'imported at the top of this module). It seeds a '
-            'MagicMock(spec=VerifyResult) from dataclasses.fields(VerifyResult), '
-            'so every real field gets its real default (cause_hint becomes a '
-            'real str), an unknown-attribute READ raises AttributeError instead '
-            'of auto-vivifying a truthy Mock, and an unknown override such as '
-            'verify_skipped= is rejected with TypeError instead of silently '
-            'setattr-ing onto the mock. Drop lint_output/type_output/timed_out/'
-            'category unless the test needs a non-default value — restating a '
-            'default inline is how these doubles drifted in the first place.\n'
-            'Exactly one site is exempt, by enclosing scope, in '
-            '_BARE_DOUBLE_EXEMPT_SCOPES: TestDispositionDoubleFidelity\'s '
-            'negative leg re-introduces the defect deliberately to prove the '
-            'positive leg can fail. Do not add an entry to silence a real '
-            'offender.'
-        )
+# ===========================================================================
+# task 3980's bare-double guard now lives in the SHARED checker (task 4016)
+# ===========================================================================
+#
+# `_BARE_DOUBLE_EXEMPT_SCOPES`, `_bare_verify_result_double_offenders` and
+# `TestNoBareVerifyResultDoubles` were deleted here (task 4246) and are covered
+# by rule `bare-dataclass-double` in
+# fused-memory/scripts/check_bare_magicmock_config.py, enforced repo-wide.
+#
+# What the shared rule keys on: an unspecced `MagicMock(...)` in ANY position
+# whose literal kwargs carry the `passed` anchor plus at least two VerifyResult
+# field matches. The deletion accepted a measured, two-directional delta —
+# the shared rule is STRICTER on `spec=None` and positional specs, NARROWER on a
+# lone `MagicMock(passed=True)` — recorded and pinned in
+# fused-memory/tests/test_check_bare_magicmock_config.py::
+# TestRuleBCoversMergeSpeculation, which also holds the two-sided proof that the
+# rule reaches this module. This module is deliberately absent from the rule's
+# _DATACLASS_DOUBLE_DEBT baseline, so a regression here fails the gate.
+#
+# The single deliberate bare double below keeps a per-site
+# `bare-dataclass-double` noqa pragma, which is now its SOLE suppression.
 
 
 # ===========================================================================
@@ -4265,22 +4006,21 @@ class TestDispositionDoubleFidelity:
         ``_extract_failing_tests_and_candidate_files``' ``if part`` filter and
         then breaks ``str.join`` (merge_disposition.py:218).
 
-        Exempt from ``TestNoBareVerifyResultDoubles`` by enclosing scope via
-        ``_BARE_DOUBLE_EXEMPT_SCOPES`` — the one site in this module where a
-        bare double is the point.  TWO independent guards cover this shape and
-        the site is deliberately exempted from BOTH: that file-local scope
-        exemption, and the shared detector's ``# noqa: bare-dataclass-double``
-        pragma below (fused-memory/scripts/check_bare_magicmock_config.py,
-        task 4016).  Both suppressions are paired on purpose — neither is a
-        licence to add another bare double here.
+        This is the one site in this module where a bare double is the point,
+        and it is exempted by exactly ONE suppression: the
+        ``# noqa: bare-dataclass-double`` pragma below
+        (fused-memory/scripts/check_bare_magicmock_config.py, task 4016).  The
+        file-local scope exemption that used to pair with it was deleted in task
+        4246 along with the duplicate guard it belonged to.  That single pragma
+        is not a licence to add another bare double here: every other one in this
+        module is still covered, because the module is deliberately OFF the
+        rule's _DATACLASS_DOUBLE_DEBT baseline.
         """
         for logger_name in _FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        # Paired with the entry in
-        # orchestrator/tests/test_merge_speculation.py::_BARE_DOUBLE_EXEMPT_SCOPES,
-        # which exempts this same scope from task 3980's file-local guard. This module is
-        # deliberately OFF _DATACLASS_DOUBLE_DEBT so every other double here stays covered.
+        # This module is deliberately OFF _DATACLASS_DOUBLE_DEBT, so the pragma
+        # below is a per-SITE suppression and every other double here stays covered.
         # noqa: bare-dataclass-double — permanent mutation leg: this bare double IS the test subject, proving the positive leg can actually fail
         bare = MagicMock(
             passed=False, summary='tests failed', test_output='FAIL',

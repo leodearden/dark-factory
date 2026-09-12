@@ -155,7 +155,8 @@ def apply_promoting_topic_anchor(
 
     ``contested`` is not read — not as an argument, not as a metadata key.
     It is a hand-labelled bake-off FIXTURE field, absent from the live
-    ``RESERVED_VOCABULARY_KEYS`` (``fused_memory/memory_metadata.py``:601)
+    ``RESERVED_VOCABULARY_KEYS``
+    (``fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS``)
     with no writer and no adjudication surface, so an arm that needed it
     would be unimplementable today.  Arm (1) needs it not at all.
 
@@ -212,9 +213,9 @@ class ArmSpec:
         esc-5712 protection ("a contested child is NEVER suppressed") under
         this arm would need a ``contested`` key.  That key does not exist:
         it is absent from ``RESERVED_VOCABULARY_KEYS``
-        (``fused_memory/memory_metadata.py``:601), has no writer and no
-        adjudication surface, so an arm that needs it cannot ship the
-        protection today no matter how good its columns look.
+        (``fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS``), has
+        no writer and no adjudication surface, so an arm that needs it cannot
+        ship the protection today no matter how good its columns look.
       * ``displaces_at_window_edge`` — a third shape again: the transform
         drops nothing, but ``read_path``'s truncation at the reader's
         budget (:3243) evicts the k-th record because the transform put
@@ -1880,7 +1881,8 @@ def render_selection_markdown(report: dict[str, Any]) -> str:
     add('')
     add('The live reserved vocabulary is '
         '`RESERVED_VOCABULARY_KEYS` '
-        '(`fused-memory/src/fused_memory/memory_metadata.py`:601), and it is '
+        '(`fused-memory/src/fused_memory/memory_metadata.py'
+        '::RESERVED_VOCABULARY_KEYS`), and it is '
         f'exactly {{{keys}}} — verified against the imported frozenset, not '
         'transcribed. `contested` is not among them. Any arm that suppresses '
         'records therefore ships without the esc-5712 protection until a '

@@ -16,20 +16,34 @@ longer refuses a leaked write while a guarded one does.
 Boundary/wiring tests for the MCP write tools live in that sibling file;
 ``tests/test_markup_guard_fused_memory.py`` covers the boundary guard itself,
 including the residue emitter this module also hosts.
+
+## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
+
+Every envelope literal quoted below is spelled with the ``\\x3c`` escape for
+``<`` rather than the raw bracket: writing it raw would force an agent editing
+this file to emit that literal inside its own tool-call envelope, reproducing
+the very defect these tests pin. See shared/src/shared/toolcall_markup.py's
+"Sentinel-literal hazard" section — the owner of this rule — for the full
+rationale.
 """
 
 from __future__ import annotations
 
+import ast
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
 from shared.mcp_markup_middleware import OUTCOMES
+from shared.toolcall_markup import ENVELOPE_LITERALS
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
     MARKUP_OVERRIDE_KEY,
     MCP_MARKUP_PATTERNS,
+    _recorded_outcome,
     emit_markup_storm_escalation,
     markup_override_requested,
     strip_markup_override,
@@ -66,7 +80,7 @@ _REPAIRED_STORM = {**_REJECTED_STORM, 'outcome': 'repaired'}
 #
 # Pattern of tests/test_lock_charter_guard.py::_CANONICAL_EXTENSIONS.
 # ---------------------------------------------------------------------------
-_CANONICAL_PATTERNS = ('</content>', '<parameter name=', '</invoke>')
+_CANONICAL_PATTERNS = ('\x3c/content>', '\x3cparameter name=', '\x3c/invoke>')
 
 
 def test_pattern_list_drift_guard():
@@ -74,8 +88,8 @@ def test_pattern_list_drift_guard():
 
     A same-file consistency check — update BOTH together.  The three literals
     are the envelope fragments observed leaking into the corpus (DF 3083
-    vector-1 specimens are ``</content>``/``</invoke>`` tails; vector-2 is the
-    ``<parameter name=`` fragment that mis-parsed task 3210's priority).
+    vector-1 specimens are ``\x3c/content>``/``\x3c/invoke>`` tails; vector-2 is
+    the ``\x3cparameter name=`` fragment that mis-parsed task 3210's priority).
     """
     assert MCP_MARKUP_PATTERNS == _CANONICAL_PATTERNS, (
         f'Write-time pattern list drifted: {MCP_MARKUP_PATTERNS!r} != '
@@ -732,6 +746,147 @@ class TestEmitMarkupStormEscalation:
             f'must still route at the live successor PRD: {payload!r}'
         )
 
+    # -- the record names its own caller (task 4805) ---------------------
+
+    #: A storm carrying the attribution ``_record_storm`` now resolves. The
+    #: ``crossing_*`` axes name the ONE call that crossed the threshold;
+    #: ``callers`` names every distinct caller seen in the window. Two
+    #: different questions, two keys — on a shared server like this one a
+    #: burst can be several agents at once, so a record naming only whoever
+    #: tripped the wire would be confidently misattributed.
+    _ATTRIBUTED_STORM = {
+        **_REJECTED_STORM,
+        'crossing_agent_id': 'claude-task-4805-implementer',
+        'crossing_subject_task_id': '4805',
+        'crossing_subject_agent_role': 'implementer-4805',
+        'callers': ["task_id='4744'", "task_id='4805'"],
+    }
+
+    def test_the_record_names_the_crossing_caller_and_the_window(self, tmp_path):
+        """The defect this task closes, at this filer.
+
+        The record's only route to the caller was its ``suggested_action`` — a
+        grep of the guard's log lines — and four measured
+        ``esc-plan-tools-markup-storm-*`` records were read at 6-7 days old,
+        past this host's ~72h ``journald --user`` retention. So the answer has
+        to be ON the record.
+
+        Anchored as WHOLE LINES, exactly as the ``count=4`` row above is: a
+        bare substring would be satisfied by a digit or a fragment inside the
+        interpolated ``tmp_path``.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        lines = self._filed(tmp_path, self._ATTRIBUTED_STORM)['detail'].splitlines()
+
+        assert "crossing_agent_id='claude-task-4805-implementer'" in lines, lines
+        assert "crossing_subject_task_id='4805'" in lines, lines
+        assert "crossing_subject_agent_role='implementer-4805'" in lines, lines
+        assert 'callers=' + repr(["task_id='4744'", "task_id='4805'"]) in lines, lines
+
+    def test_the_new_keys_tolerate_the_degenerate_shapes(self, tmp_path):
+        """Extends ``test_tolerates_a_storm_dict_missing_keys`` to the new keys.
+
+        The docstring commits this filer to ``{}`` and the legacy
+        ``{'count': 9}``, both of which are live: the first is what that test
+        files, the second is the anchor squatter
+        ``tests/test_markup_guard_fused_memory.py`` files. A new key read
+        without ``.get`` would turn the shape this record is most needed for
+        into a raise.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        for storm in ({}, {'count': 9}):
+            queue_root = tmp_path / f'root-{len(storm)}'
+            queue_root.mkdir()
+
+            lines = self._filed(queue_root, storm)['detail'].splitlines()
+
+            assert 'crossing_agent_id=None' in lines, lines
+            assert 'crossing_subject_task_id=None' in lines, lines
+            assert 'crossing_subject_agent_role=None' in lines, lines
+            assert 'callers=None' in lines, lines
+
+    def test_a_caller_supplied_newline_cannot_spoof_the_outcome_line(self, tmp_path):
+        """The ``!r`` requirement, made checkable.
+
+        ``_recorded_outcome`` scans an already-open record's ``detail`` for the
+        FIRST line starting with ``outcome=`` and ``ast.literal_eval``s the
+        rest. That read is what tells an operator a later burst folded into a
+        record naming a DIFFERENT outcome — the one channel the docstring says
+        must stay honest, because the queue holds a single record. The new
+        fields carry caller-supplied strings, so an unescaped newline could
+        inject a spoofed line and silently disable that warning.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        spoof = 'evil\noutcome=' + repr('repaired')
+        payload = self._filed(
+            tmp_path,
+            {**_REJECTED_STORM, 'crossing_agent_id': spoof, 'callers': [spoof]},
+        )
+
+        assert spoof not in payload['detail'], 'the raw newline landed verbatim'
+        # Read back through the REAL consumer, not by eyeballing the body: what
+        # matters is that the fold-mismatch warning still sees the true outcome.
+        assert _recorded_outcome(
+            SimpleNamespace(detail=payload['detail'])
+        ) == 'rejected'
+
+    def test_the_remedy_leads_with_the_record_and_not_with_a_grep(self, tmp_path):
+        """The instruction has to be dischargeable from the record itself.
+
+        ``suggested_action`` is compact-projected beside ``summary`` (``detail``
+        is dropped BY NAME), so it is where a triager actually reads the remedy
+        — and it told them to grep a journal that on a per-agent stdio server
+        never receives those lines at all, and elsewhere keeps them for ~72h
+        while these records are read days later.
+
+        The grep tokens SURVIVE as corroboration:
+        ``test_the_record_points_at_log_lines_that_actually_exist`` asserts
+        ``markup_guard_storm`` appears across detail+suggested_action, and
+        demoting the instruction must not delete the token.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        payload = self._filed(tmp_path, self._ATTRIBUTED_STORM)
+        action = payload['suggested_action']
+
+        assert 'crossing_' in action, (
+            f'the remedy must point at the attribution the record carries: {action!r}'
+        )
+        assert 'callers' in action, action
+        assert 'identify the leaking caller from the markup guard logs' not in action, (
+            f'the undischargeable instruction is still the headline: {action!r}'
+        )
+        # The routing survives — the grep is demoted, not the destination.
+        assert 'plans/toolcall-markup-containment-prd.md' in action, action
+        assert '3083 is done and closed to appends' in action, action
+
+    def test_the_remedy_is_still_static(self, tmp_path):
+        """Never interpolated with the resolved values, and the reason is old.
+
+        The existing comment records it: an operator-facing hint whose text
+        varies with the data cannot be grepped without already knowing the
+        answer, and ``test_each_outcome_names_itself_and_no_other`` depends on
+        this field naming no outcome of its own. So the remedy names the KEYS
+        to read, never their values — the values live in ``detail``.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        attributed = self._filed(tmp_path, self._ATTRIBUTED_STORM)
+        degenerate_root = tmp_path / 'degenerate'
+        degenerate_root.mkdir()
+        degenerate = self._filed(degenerate_root, {})
+
+        assert attributed['suggested_action'] == degenerate['suggested_action']
+        assert '4805' not in attributed['suggested_action']
+
     # -- the anchor parameter (task 4458) -------------------------------
 
     def test_the_default_anchor_is_unchanged(self, tmp_path):
@@ -831,4 +986,98 @@ class TestSingleSourceOfTruth:
         one assertion a duplicate cannot pass.
         """
         assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
+
+
+# ---------------------------------------------------------------------------
+# Source-hygiene guard (task 4228): both files below predate the ``\x3c``
+# escape convention shared.toolcall_markup's "Sentinel-literal hazard"
+# section establishes. Modelled on
+# scripts/tests/test_sweep_toolcall_markup.py's
+# ``test_the_script_source_spells_no_raw_envelope_literal`` (cross-file) and
+# ``test_this_module_spells_no_raw_envelope_literal`` (self-file).
+#
+# Coverage is per-file opt-in, not repo-wide: this guard covers only
+# markup_tripwire.py and this test module. Sibling files carrying the same
+# defect with no guard of their own — markup_guard.py,
+# test_markup_tripwire_gate.py, test_markup_guard_fused_memory.py — are
+# deliberately left unguarded here; task 4228's plan records them as
+# follow-up scope, not silently covered by this block.
+# ---------------------------------------------------------------------------
+
+#: Needle set shared by both guards below: every ENVELOPE_LITERALS member plus
+#: the two structural prefixes a hand-spelled specimen could use instead of
+#: the enumerated literals — the bare closing-tag prefix (catches any closer,
+#: not just the enumerated ones) and the ``parameter`` opening-tag prefix with
+#: no trailing space (so it also catches an attribute-less opener spelling,
+#: not just the ``name=`` form already covered via ``ENVELOPE_LITERALS``).
+#: Hoisted to module level so the cross-file and self-file guards read the
+#: SAME construction rather than two that could silently drift apart.
+_RAW_SENTINEL_NEEDLES = (*ENVELOPE_LITERALS, chr(60) + '/', chr(60) + 'parameter')
+
+
+def _raw_sentinel_hits(source: str) -> dict[str, list[int]]:
+    """Map each offending needle found in ``source`` to its 1-based lines.
+
+    The scan body shared by both guards below — hoisting only the needle
+    tuple and leaving this comprehension duplicated would still let the two
+    guards drift apart (e.g. a per-line exemption added to one copy and not
+    the other), which is exactly what hoisting the tuple above is meant to
+    prevent.
+    """
+    source_lines = source.splitlines()
+    return {
+        needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
+        for needle in _RAW_SENTINEL_NEEDLES
+        if needle in source
+    }
+
+
+def test_the_tripwire_source_spells_no_raw_envelope_literal():
+    """CROSS-FILE: markup_tripwire.py's own source must carry no raw literal.
+
+    Paired with an anti-vacuity check that the module's docstring still names
+    every canonical pattern after decoding — a bare "no raw literal" scan
+    would be trivially satisfiable by deleting the explanatory lines instead
+    of escaping them.
+    """
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / 'src'
+        / 'fused_memory'
+        / 'server'
+        / 'markup_tripwire.py'
+    )
+    assert source_path.is_file(), f'expected markup_tripwire.py at {source_path}'
+    source = source_path.read_text(encoding='utf-8')
+
+    hits = _raw_sentinel_hits(source)
+    assert not hits, (
+        f'{source_path.name} contains raw envelope sentinel(s) {hits!r}. Spell '
+        "them with the \\x3c escape instead — see this module's docstring for "
+        'why.'
+    )
+
+    doc = ast.get_docstring(ast.parse(source))
+    assert doc is not None, f'{source_path.name} lost its module docstring'
+    for pattern in MCP_MARKUP_PATTERNS:
+        assert pattern in doc, (
+            f'{pattern!r} is missing from the decoded docstring of '
+            f'{source_path.name} — escaping must not delete the specimen it '
+            'explains.'
+        )
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """SELF-FILE (the idiom task 4696 promoted): this test module's own
+    source must never contain a raw envelope literal either — see this
+    module's docstring for why.
+    """
+    source = Path(__file__).read_text(encoding='utf-8')
+
+    hits = _raw_sentinel_hits(source)
+    assert not hits, (
+        'A raw envelope literal was written into this test file. Spell it '
+        "with the \\x3c escape instead — see this module's docstring for "
+        f'why. Offending needle(s): {hits!r}.'
+    )
 

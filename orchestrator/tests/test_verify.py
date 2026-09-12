@@ -9724,3 +9724,179 @@ class TestRunVerificationThreadsEachLegsOwnDuration:
         assert result.summary == 'Failures: lint issues'
         assert result.category != 'infra_kill'
         assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary
+
+
+# ---------------------------------------------------------------------------
+# Version pin survival through verify's scoping pipeline (task 3931)
+# ---------------------------------------------------------------------------
+
+# LOCAL literals, deliberately not derived from the committed YAML: these guards
+# state the scoper contract for a pinned clause independently of whether the
+# fleet chain is pinned. It is NOT — task 4538 pins the version out-of-band via
+# the repo-root package.json + `npm ci`, keeping all seven clauses bare — so a
+# derived fixture would test the unpinned spelling twice. The contract still
+# matters: verify runs against target projects whose own type_check_command may
+# spell `npx pyright@<version>` directly.
+_UNPINNED_TYPE_CHAIN_3931 = (
+    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
+    ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
+    ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
+    ' && cd ../cockpit && npx pyright'
+)
+_PINNED_TYPE_CHAIN_3931 = _UNPINNED_TYPE_CHAIN_3931.replace('npx pyright', 'npx pyright@1.1.408')
+_ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
+
+
+class TestVersionPinSurvivesScoping:
+    """A pinned `npx pyright@<version>` must survive `_scope_to_keyword`.
+
+    Task 3931 / esc-3805-1. Assertions 1 and 2 below are the LOAD-BEARING
+    ones: without them, a version pin in dark-factory-orchestrator.yaml is
+    DECORATIVE on the exact FILE_SCOPED path that generated esc-3805-1 — it
+    reads as pinned in the config and runs unpinned in the gate.
+
+    MEASURED on this branch, before the step-6 change (and after the step-4
+    verify_cmd change, so this is verify.py's own stripping, not the parser's):
+
+        _scope_to_keyword(PINNED,   'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+        _scope_to_keyword(UNPINNED, 'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+
+    Byte-identical. ``retained = head[: idx + len(keyword)]`` (verify.py) is a
+    BYTE-OFFSET slice, so it cuts mid-token at the `@` and drops `@1.1.408`
+    before the string is ever re-parsed. The pin cannot survive a parser fix
+    alone; the truncation itself has to become token-aware.
+
+    A `.py`-touching diff takes exactly this FILE_SCOPED path: the leading
+    `cd` is folded away, leaving `npx pyright <repo-root-relative-file>` to run
+    FROM THE WORKTREE ROOT and then be wrapped by
+    `_scope_fallback_tool_to_subproject`.
+    """
+
+    def test_pinned_chain_keeps_its_version_through_scope_to_keyword(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
+            f'_scope_to_keyword dropped the version pin, returning {scoped!r} '
+            '(task 3931, esc-3805-1). The byte-offset truncation '
+            '`head[: idx + len(keyword)]` slices mid-token at the `@`, so the '
+            'gate advertises a pinned pyright and runs whatever npx last '
+            'cached'
+        )
+
+    def test_pin_survives_the_uv_subproject_rescope(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        rescoped = verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator')
+        assert rescoped == (
+            f'uv run --project orchestrator npx pyright@1.1.408 {_ESC_3805_FILE}'
+        ), (
+            f'the pin did not survive the uv rescope, giving {rescoped!r} '
+            '(task 3931) — this is the command the FILE_SCOPED fallback path '
+            'actually dispatches for the esc-3805-1 diff'
+        )
+
+    def test_unpinned_chain_scopes_exactly_as_today(self):
+        """Regression floor: the bare spelling's scoped shape is unchanged."""
+        scoped = verify._scope_to_keyword(_UNPINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright {_ESC_3805_FILE}'
+        assert verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator') == (
+            f'uv run --project orchestrator npx pyright {_ESC_3805_FILE}'
+        )
+
+    def test_a_longer_unrelated_token_is_not_absorbed_by_the_widening(self):
+        """The boundary rule: widen across an `@<version>` suffix ONLY.
+
+        Pins the chosen rule explicitly so the widening cannot creep into "keep
+        the whole token". `npx pyright-foo` is a DIFFERENT tool whose name
+        merely starts with the keyword; today the byte-offset slice truncates
+        it to `npx pyright` and this must stay byte-identical, because
+        retaining `pyright-foo` whole would reclassify the command (ToolKind.NPX)
+        and make `scope_to` replace the tool name with the touched file — the
+        very failure mode the pinned spelling suffered before step 4.
+
+        This assertion PASSES today and is a floor, not a RED: it is what
+        makes the step-6 widening provably narrow.
+        """
+        assert verify._scope_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE]) == (
+            f'npx pyright {_ESC_3805_FILE}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end capstone: the REAL committed config's FILE_SCOPED dispatch (3931)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT_3931 = Path(__file__).resolve().parents[2]
+_DF_CONFIG_PATH_3931 = _REPO_ROOT_3931 / 'dark-factory-orchestrator.yaml'
+
+
+class TestFleetTypeCheckSurvivesTheRealFallbackPath:
+    """The committed config's type leg must still dispatch a scoped pyright.
+
+    Task 3931 / esc-3805-1. Every other guard in this task is over a LOCAL
+    literal or a single helper; this one runs the whole path end-to-end over
+    the config file the fleet actually loads.
+
+    This is precisely the esc-3805-1 shape: a diff touching one `.py` file
+    under a single subproject. `_build_fallback_config` takes the FILE_SCOPED
+    branch, `_scope_to_keyword` folds away the leading `cd fused-memory &&` and
+    emits `npx pyright <repo-root-relative-file>` to run FROM THE WORKTREE
+    ROOT — which is why that leg saw root-scoped pyright's 14 errors while
+    pre-commit's package-scoped leg saw 0 (closed by this task's extraPaths
+    change to orchestrator/pyproject.toml).
+
+    NOTE ON THE VERSION PIN. This class originally also asserted that the
+    dispatched command carried an inline `pyright@<version>`, because this
+    branch pinned the version by spelling it into all seven clauses of
+    `dark-factory-orchestrator.yaml`'s `type_check_command`. Task 4538 landed
+    on main first and pins the SAME version (1.1.408) a different way — one
+    authored declaration in the repo-root `package.json`, materialised into
+    every cold worktree's `node_modules/.bin` by the `npm ci` step in
+    `verify_cold_preprovision_command`, so the seven clauses stay BARE. Those
+    pin assertions were dropped on rebase rather than merged: they are the
+    exact inverse of the landed
+    `tests/scripts/test_pyright_version_pin.py::test_the_fleet_chain_stays_bare_npx_pyright`.
+    What survives here is the shape floor, which holds under either mechanism —
+    and the scoper's pin-preservation itself is still pinned, mechanism-side,
+    by `TestVersionPinSurvivesScoping` above over a local literal, so a target
+    project that DOES spell `npx pyright@<version>` in its own config is still
+    covered.
+    """
+
+    def _fallback_type_command(self) -> str:
+        from orchestrator.config import load_config
+
+        config = load_config(_DF_CONFIG_PATH_3931)
+        mc = _build_fallback_config([_ESC_3805_FILE], config=config)
+        assert mc is not None, (
+            '_build_fallback_config returned None for a single-.py diff (task '
+            '3931) — it only does that for a zero-.py diff, so the FILE_SCOPED '
+            'path this guard exists to cover was not exercised at all'
+        )
+        type_cmd = mc.type_check_command
+        assert type_cmd is not None, (
+            '_build_fallback_config produced a ModuleConfig with no '
+            'type_check_command for the esc-3805-1 diff (task 3931) — the '
+            'type gate would dispatch nothing at all, so there is no '
+            'pyright invocation left for this guard to inspect'
+        )
+        return type_cmd
+
+    def test_the_scoped_command_still_targets_only_the_touched_file(self):
+        """Regression floor: the FILE_SCOPED shape, whole-string.
+
+        If a version were ever mistaken for a target (the ToolKind.NPX misparse
+        this task's verify_cmd change fixed), `scope_to` would replace
+        `pyright@<version>` with the touched file and the command would lose
+        either its tool or its target. Asserting the exact whole string is what
+        pins that.
+        """
+        cmd = self._fallback_type_command()
+        assert cmd.startswith('npx pyright'), cmd
+        assert cmd.endswith(f' {_ESC_3805_FILE}'), cmd
+        assert cmd.count(_ESC_3805_FILE) == 1, cmd
+        assert 'cd ' not in cmd, (
+            f'{cmd!r} still carries a `cd` clause (task 3931) — the FILE_SCOPED '
+            'path runs from the worktree root, so a surviving cd would '
+            'misresolve the root-relative file path just scoped in'
+        )

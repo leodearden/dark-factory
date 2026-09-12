@@ -40,7 +40,10 @@ from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
 from orchestrator.module_charter import sanitize_files_for_persist
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import (
+    TaskAssignment,
+    _reject_contradictory_metadata_mode,
+)
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import StewardResolved
@@ -236,24 +239,32 @@ class FakeMetadataBackend:
     persists nothing — this fake keeps a real ``blob`` and models BOTH:
 
     - fused-memory's #1827 ``metadata_mode`` contract, with the same precedence
-      ``Scheduler.update_task`` resolves (scheduler.py:3793-3799):
-      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``, and
-      the same per-mode semantics ``_merge_metadata`` implements
-      (sqlite_task_backend.py:3301) — ``'merge'`` shallow last-write-wins
-      (supplied keys overwrite wholesale, omitted keys preserved),
-      ``'replace'`` whole-blob overwrite, ``'additive'`` recursive list
-      union+dedup / dict-recursive / scalar OLD-wins (see
+      ``scheduler.py::Scheduler.update_task`` resolves:
+      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``, with
+      the same ONE carve-out — ``metadata_mode='merge'`` alongside a truthy
+      ``append`` is **rejected** as a contradiction rather than silently
+      letting 'merge' win and shallow-clobber nested keys (task 3890); the other
+      combinations are honored, ``('replace', True)`` -> ``'replace'`` and
+      ``('additive', True)`` -> ``'additive'``.  That carve-out is not restated
+      here — ``update_task`` below calls production's own
+      ``scheduler.py::_reject_contradictory_metadata_mode``, so it cannot drift.
+      It models the same per-mode semantics
+      ``sqlite_task_backend.py::_merge_metadata`` implements — ``'merge'``
+      shallow last-write-wins (supplied keys overwrite wholesale, omitted keys
+      preserved), ``'replace'`` whole-blob overwrite, ``'additive'`` recursive
+      list union+dedup / dict-recursive / scalar OLD-wins (see
       ``_merge_values_additive`` above).  An unrecognised mode raises rather
       than silently degrading to ``'merge'`` — the backend validates against
       ``_METADATA_MODES`` too.
     - the scheduler-side ``metadata.files`` persist that
-      ``handle_blast_radius_expansion(persist_files=...)`` performs via
-      ``Scheduler._persist_files_metadata`` (scheduler.py:6890),
-      ``merged = {**fresh_md, 'files': sanitize_files_for_persist(files)}`` —
-      on BOTH the successful-refinement branch (scheduler.py:6974) and the
-      lock-conflict/requeue branch (scheduler.py:7023, task 2868).  The only
-      non-persist path is the no-op early return when the depth-normalised
-      module set is unchanged, modelled here too.
+      ``scheduler.py::Scheduler.handle_blast_radius_expansion(persist_files=...)``
+      performs via ``scheduler.py::Scheduler._persist_files_metadata``, whose
+      ``merged = {**fresh_md, 'files': honest}`` (where
+      ``honest = sanitize_files_for_persist(files)``) is reached from BOTH the
+      successful-refinement branch and the lock-conflict/requeue branch
+      (task 2868) of ``handle_blast_radius_expansion``.  The only non-persist
+      path is the no-op early return when the depth-normalised module set is
+      unchanged, modelled here too.
 
     NOT modelled: the corrupt-existing-blob guard (``'merge'``/``'additive'``
     raise ``TaskmasterError`` rather than clobber a non-dict blob), the legacy
@@ -294,6 +305,17 @@ class FakeMetadataBackend:
         append: bool = False,
         metadata_mode: str | None = None,
     ) -> bool:
+        # Call PRODUCTION's contradictory-pair guard (task 3890) rather than
+        # restating its condition here: a hand-copied mirror drifts the moment
+        # the production rule is narrowed or widened, leaving this fake silently
+        # over-permissive again — the very
+        # test-infrastructure-lies-about-production failure this whole guard
+        # exists to close.  Delegating makes the fake mirror production BY
+        # CONSTRUCTION.  Called BEFORE recording the call or touching self.blob:
+        # a refused write must leave backend state untouched and must not read
+        # back as "a write happened", matching the production guard, which
+        # refuses before anything reaches the wire.
+        _reject_contradictory_metadata_mode(metadata_mode, append)
         self.update_task_calls.append({
             'task_id': task_id,
             'metadata': metadata,
@@ -301,7 +323,8 @@ class FakeMetadataBackend:
             'metadata_mode': metadata_mode,
         })
         payload = json.loads(metadata) if isinstance(metadata, str) else (metadata or {})
-        # Mirror Scheduler.update_task's precedence exactly.
+        # Mirror Scheduler.update_task's precedence exactly — modulo the
+        # merge + truthy-append cell rejected by the shared guard above.
         if metadata_mode is not None:
             effective = metadata_mode
         elif append:

@@ -19,12 +19,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
 import reclaim_orphaned_worktrees as row
 from reclaim_orphaned_worktrees import parse_parking_dir_name
+
+from df_pytest_isolation import (
+    _GIT_REDIRECT_ENV,
+    _GIT_REDIRECT_ENV_PREFIXES,
+    git_redirect_env,
+)
 
 LOG_PREFIX = "reclaim_orphaned_worktrees:"
 SCRIPT = Path(__file__).parent.parent / "reclaim_orphaned_worktrees.py"
@@ -588,14 +596,21 @@ def test_reclaim_remove_failure_counted_siblings_continue(tmp_path, monkeypatch)
 # step-15: end-to-end CLI via subprocess (JSON on stdout / LOUD logs on stderr)
 # ---------------------------------------------------------------------------
 
-def _run_cli(*args: str) -> subprocess.CompletedProcess:
+def _run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Drive the reclaim CLI as a real subprocess. stdout carries the JSON
-    report; stderr carries the LOUD human log lines."""
+    report; stderr carries the LOUD human log lines.
+
+    ``env`` hands the child a full replacement environment — used by the
+    leaked-GIT_DIR regression below to poison the child WITHOUT mutating this
+    process's ``os.environ`` (which the suite's own git-hermeticity fixtures
+    own). ``None`` inherits, exactly as before.
+    """
     return subprocess.run(
         ["python3", str(SCRIPT), *args],
         capture_output=True,
         text=True,
         timeout=120,
+        env=env,
     )
 
 
@@ -669,3 +684,607 @@ def test_cli_default_parking_root_derived_from_repo(tmp_path):
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     report = json.loads(result.stdout)
     assert report["root"] == str(repo / ".worktrees-orphaned")
+
+
+# ---------------------------------------------------------------------------
+# step-16: ambient GIT_* redirection is fail-closed
+# ---------------------------------------------------------------------------
+
+# An environment poisoned with every name that retargets git away from the path
+# it is given, plus one indexed `git -c` pair. `-C <path>` / `cwd=` only change
+# DIRECTORY; GIT_DIR and its siblings SKIP repository discovery outright, so an
+# ambient GIT_DIR redirects EVERY git call this module makes regardless of
+# --repo / --parking-root / cwd. Measured against the pre-guard script: under
+# `GIT_DIR=<decoy>/.git`, `git worktree remove --force` destroyed a DECOY
+# repository's worktree while the sandbox named by --repo was never touched.
+POISONED_GIT_ENV = {
+    "GIT_DIR": "/decoy/.git",
+    "GIT_WORK_TREE": "/decoy",
+    "GIT_INDEX_FILE": "/decoy/.git/index",
+    "GIT_COMMON_DIR": "/decoy/.git",
+    "GIT_OBJECT_DIRECTORY": "/decoy/.git/objects",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/decoy/.git/objects",
+    "GIT_NAMESPACE": "decoy",
+    "GIT_CONFIG_GLOBAL": "/decoy/gitconfig",
+    "GIT_CONFIG_SYSTEM": "/decoy/gitconfig",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.hooksPath",
+    "GIT_CONFIG_VALUE_0": "/decoy/hooks",
+}
+
+# Names the scrub must LEAVE ALONE. The ceiling is a DIFFERENT defence's own
+# mechanism (df_pytest_isolation._df_git_ceiling_at_basetemp, incident
+# esc-3072-3), so scrubbing it here would disarm a sibling guard whenever this
+# script runs under the suite; the identity vars change what a commit SAYS,
+# never where it lands.
+PRESERVED_GIT_ENV = {
+    "GIT_CEILING_DIRECTORIES": "/tmp/pytest-basetemp",
+    "GIT_AUTHOR_NAME": "Reclaim Test",
+    "GIT_COMMITTER_EMAIL": "test@example.com",
+}
+
+
+def test_scrubbed_git_env_drops_every_redirecting_name():
+    """No redirecting name — exact or indexed-prefix — survives the scrub."""
+    scrubbed = row.scrubbed_git_env(dict(POISONED_GIT_ENV))
+
+    for name in POISONED_GIT_ENV:
+        assert name not in scrubbed, f"{name} survived the scrub"
+
+
+def test_scrubbed_git_env_forces_lc_all_c_over_ambient_locale():
+    """LC_ALL=C is FORCED (porcelain stability), overriding an ambient locale —
+    the one behaviour carried over verbatim from the pre-guard env build."""
+    scrubbed = row.scrubbed_git_env({"LC_ALL": "en_US.UTF-8", "GIT_DIR": "/decoy/.git"})
+
+    assert scrubbed["LC_ALL"] == "C"
+
+
+def test_scrubbed_git_env_preserves_unrelated_vars():
+    """Everything that is not a git-redirecting name passes through verbatim —
+    the scrub is a targeted removal, not a hermetic env rebuild (the systemd
+    unit's PATH/HOME must survive)."""
+    scrubbed = row.scrubbed_git_env(
+        {"PATH": "/usr/bin:/bin", "HOME": "/home/leo", "GIT_DIR": "/decoy/.git"}
+    )
+
+    assert scrubbed["PATH"] == "/usr/bin:/bin"
+    assert scrubbed["HOME"] == "/home/leo"
+
+
+def test_scrubbed_git_env_preserves_ceiling_and_identity_vars():
+    """GIT_CEILING_DIRECTORIES and the identity vars are DELIBERATELY kept."""
+    scrubbed = row.scrubbed_git_env({**POISONED_GIT_ENV, **PRESERVED_GIT_ENV})
+
+    for name, value in PRESERVED_GIT_ENV.items():
+        assert scrubbed[name] == value, f"{name} must survive the scrub"
+
+
+def test_scrubbed_git_env_does_not_mutate_input():
+    """Pure: the caller's mapping (in production, ``os.environ``) is untouched."""
+    environ = dict(POISONED_GIT_ENV)
+    before = dict(environ)
+
+    row.scrubbed_git_env(environ)
+
+    assert environ == before
+
+
+def test_scrubbed_git_env_matches_shared_redirect_classifier():
+    """DRIFT PIN. This module is STDLIB-ONLY by design (the systemd wrapper runs
+    plain `python3`, and df_pytest_isolation imports pytest), so the redirecting
+    names are DUPLICATED into the script rather than imported. This test is the
+    only legal place to import the shared definition, and it pins the copy
+    against it in BOTH directions: a name added to df_pytest_isolation's list
+    that the script does not scrub, or a name the script scrubs that the shared
+    classifier does not consider redirecting, fails here."""
+    assert row._GIT_REDIRECT_ENV == _GIT_REDIRECT_ENV
+    assert row._GIT_REDIRECT_ENV_PREFIXES == _GIT_REDIRECT_ENV_PREFIXES
+
+    # ...and behaviourally, over a mapping derived from the SHARED list (so a
+    # widening there poisons this mapping too): every name the shared classifier
+    # calls redirecting is absent from the scrub's output.
+    derived = {name: "/decoy" for name in _GIT_REDIRECT_ENV}
+    derived.update({f"{prefix}0": "/decoy" for prefix in _GIT_REDIRECT_ENV_PREFIXES})
+    redirecting = git_redirect_env(derived)
+    assert redirecting, "the shared classifier must classify the derived mapping"
+
+    scrubbed = row.scrubbed_git_env(derived)
+    assert [name for name in redirecting if name in scrubbed] == []
+
+
+def test_run_git_chokepoint_scrubs_ambient_redirection(tmp_path, monkeypatch):
+    """The scrub is reached at the SINGLE chokepoint: the env handed to
+    ``subprocess.run`` carries no redirecting name, whatever the ambient one
+    holds. Asserted at ``_run_git`` (not per call site) because the defect class
+    is "a call site that forgets the guard" — fixing today's seven leaves the
+    hole open for the eighth."""
+    recorded: dict[str, dict[str, str]] = {}
+
+    class _Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(*_args, **kwargs):
+        recorded["env"] = kwargs["env"]
+        return _Completed()
+
+    for name, value in {**POISONED_GIT_ENV, **PRESERVED_GIT_ENV}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    monkeypatch.setattr(row.subprocess, "run", fake_run)
+
+    row._run_git(["status", "--porcelain"], cwd=tmp_path)
+
+    env = recorded["env"]
+    for name in POISONED_GIT_ENV:
+        assert name not in env, f"{name} reached git through the chokepoint"
+    for name, value in PRESERVED_GIT_ENV.items():
+        assert env[name] == value, f"{name} must survive to git"
+    assert env["LC_ALL"] == "C"
+
+
+def _decoy_and_sandbox(tmp_path):
+    """A DECOY repo owning a DIRTY worktree registered under the SANDBOX's
+    parking root, plus the sandbox's own eligible parking.
+
+    Reproduces the measured incident layout: ``git worktree list`` under a
+    leaked ``GIT_DIR`` enumerates the DECOY's worktrees, and the parking-root
+    band guard passes the decoy-owned one because it physically sits under the
+    sandbox's quarantine base.
+    """
+    decoy_base = tmp_path / "decoy"
+    decoy_base.mkdir()
+    decoy = _init_repo(decoy_base)
+
+    sandbox_base = tmp_path / "sandbox"
+    sandbox_base.mkdir()
+    sandbox = _init_repo(sandbox_base)
+
+    own = _add_parking(sandbox, f"2920-{TS_OLD}")
+
+    decoy_parking = _parking_root(sandbox) / f"d1-{TS_OLD}"
+    _git(decoy, "worktree", "add", "-q", "-b", f"task/d1-{TS_OLD}", str(decoy_parking))
+    (decoy_parking / "wip.txt").write_text("decoy work\n")
+
+    return decoy, sandbox, own, decoy_parking
+
+
+def _ref_snapshot(repo: Path) -> str:
+    """Every ref and its sha — a whole-repo mutation detector."""
+    return _git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout
+
+
+def test_cli_leaked_git_dir_never_touches_the_decoy_repository(tmp_path):
+    """END-TO-END REGRESSION (incident 2026-08-31). Under an ambient
+    ``GIT_DIR`` naming a DECOY repository, the sweep must act ONLY on the repo
+    ``--repo`` names.
+
+    Measured on the pre-guard script, BOTH halves failed: the decoy's registered
+    worktree was park-committed into the decoy and then destroyed by
+    ``git worktree remove --force``, while the sandbox's own eligible parking
+    was never swept — the JSON report nonetheless claiming ``reclaimed=1``.
+    """
+    decoy, sandbox, own, decoy_parking = _decoy_and_sandbox(tmp_path)
+    decoy_refs_before = _ref_snapshot(decoy)
+
+    result = _run_cli(
+        "--repo", str(sandbox),
+        "--now", str(CLI_NOW),
+        "--min-age-hours", "48",
+        env=dict(os.environ, GIT_DIR=str(decoy / ".git")),
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    # THE DECOY IS UNTOUCHED: no redirected commit landed, nothing was removed.
+    assert _ref_snapshot(decoy) == decoy_refs_before
+    assert decoy_parking.exists()
+    assert decoy_parking.resolve() in _worktree_paths(decoy)
+
+    # POSITIVE CONTROL: the repository --repo actually named WAS swept, so the
+    # guard refuses the wrong target rather than refusing everything.
+    assert not own.exists()
+    assert _branch_resolves(sandbox, f"task/2920-{TS_OLD}")
+    report = json.loads(result.stdout)
+    assert report["reclaimed"] == 1
+    assert report["reclaimed_paths"] == [str(own.resolve())]
+
+
+# ---------------------------------------------------------------------------
+# step-17: residual fail-closed target verify — is_git_toplevel(path)
+# ---------------------------------------------------------------------------
+
+def test_is_git_toplevel_true_for_repo_root(tmp_path):
+    repo = _init_repo(tmp_path)
+    assert row.is_git_toplevel(repo) is True
+
+
+def test_is_git_toplevel_true_for_registered_parking(tmp_path):
+    """A LINKED worktree resolves its OWN path as toplevel (measured), so a
+    per-parking verify is sound — park_commit can self-guard the worktree it is
+    about to `add -A` from."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+
+    assert row.is_git_toplevel(parking) is True
+
+
+def test_is_git_toplevel_true_through_a_symlink(tmp_path):
+    """A repo reached via a SYMLINK passes. ``--show-toplevel`` reports the REAL
+    path, so BOTH sides must be realpath-resolved before comparison — comparing
+    the literal strings would false-refuse a legitimately symlinked checkout,
+    turning the guard into an outage."""
+    repo = _init_repo(tmp_path)
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo)
+
+    assert row.is_git_toplevel(link) is True
+
+
+def test_is_git_toplevel_false_for_subdirectory_of_repo(tmp_path):
+    """The misconfiguration this guard exists to catch: git happily discovers
+    the ENCLOSING repo from a subdirectory, so the sweep would act on a
+    repository the caller only half-named."""
+    repo = _init_repo(tmp_path)
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    assert row.is_git_toplevel(subdir) is False
+
+
+def test_is_git_toplevel_false_for_subdirectory_inside_parking(tmp_path):
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+    subdir = parking / "sub"
+    subdir.mkdir()
+
+    assert row.is_git_toplevel(subdir) is False
+
+
+def test_is_git_toplevel_false_for_non_repository(tmp_path):
+    """``rev-parse`` exits 128 outside a repository — fail CLOSED."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+
+    assert row.is_git_toplevel(plain) is False
+
+
+def test_is_git_toplevel_false_for_missing_path_without_raising(tmp_path):
+    """A vanished target reaches ``_run_git``'s OSError path, which the module's
+    never-raise contract maps to a non-zero rc. The predicate must inherit that
+    fail-closed and NOT propagate — the sweep never raises."""
+    assert row.is_git_toplevel(tmp_path / "does-not-exist") is False
+
+
+# ---------------------------------------------------------------------------
+# step-18: reclaim_worktrees refuses an unverified target
+# ---------------------------------------------------------------------------
+
+def _repo_with_clean_and_dirty_parkings(tmp_path):
+    """A repo with one CLEAN-old and one DIRTY-old parking, plus its records."""
+    repo = _init_repo(tmp_path)
+    clean = _add_parking(repo, f"2920-{TS_OLD}")
+    dirty = _add_parking(repo, f"_lane-0-{TS_LANE}", dirty=True)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+    assert len(records) == 2
+    return repo, clean, dirty, records
+
+
+def test_reclaim_refuses_whole_sweep_when_repo_is_not_toplevel(tmp_path, caplog):
+    """A ``repo`` that is not the ROOT of the repository git resolves for it
+    refuses the ENTIRE sweep before any branch check, park-commit or removal.
+
+    git discovers the enclosing repo from a subdirectory, so without this gate
+    the sweep would happily act on a repository the caller only half-named."""
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo, clean, dirty, records = _repo_with_clean_and_dirty_parkings(tmp_path)
+    head_before = _git(dirty, "rev-parse", "HEAD").stdout.strip()
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    outcome = row.reclaim_worktrees(subdir, records, dry_run=False)  # must not raise
+
+    assert outcome.refused is True
+    assert _resolved(outcome.skipped) == [r.path.resolve() for r in records]
+    assert outcome.reclaimed == []
+    assert outcome.park_committed == []
+    assert outcome.failed == []
+    # Nothing removed, nothing committed.
+    assert clean.exists() and dirty.exists()
+    assert {clean.resolve(), dirty.resolve()} <= _worktree_paths(repo)
+    assert _git(dirty, "rev-parse", "HEAD").stdout.strip() == head_before
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING" in m and str(subdir) in m for m in warn)
+
+
+def test_reclaim_refusal_also_applies_in_dry_run(tmp_path, caplog):
+    """--check exists so an operator can see what the real run WOULD do. A dry
+    run that printed 'would reclaim' while the real run would refuse is an
+    actively misleading answer — and this misconfiguration is exactly the one a
+    dry run most needs to surface."""
+    # INFO, not WARNING: the "would reclaim" line this test asserts is ABSENT is
+    # logged at INFO, so a WARNING floor would make that half vacuously true.
+    caplog.set_level(logging.INFO, logger="reclaim_orphaned_worktrees")
+    repo, clean, dirty, records = _repo_with_clean_and_dirty_parkings(tmp_path)
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    outcome = row.reclaim_worktrees(subdir, records, dry_run=True)
+
+    assert outcome.refused is True
+    assert _resolved(outcome.skipped) == [r.path.resolve() for r in records]
+    assert outcome.reclaimed == []
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING" in m for m in warn)
+    assert not any("would reclaim" in r.getMessage() for r in caplog.records)
+
+
+def test_reclaim_proceeds_normally_through_a_symlinked_repo(tmp_path):
+    """NON-REGRESSION: a repo reached via a SYMLINK is a legitimate target and
+    must still be swept — the guard compares realpaths, not literal strings."""
+    repo, clean, dirty, _records = _repo_with_clean_and_dirty_parkings(tmp_path)
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo)
+    records = row.list_parked_worktrees(link, _parking_root(link))
+
+    outcome = row.reclaim_worktrees(link, records, dry_run=False)
+
+    assert outcome.refused is False
+    assert set(_resolved(outcome.reclaimed)) == {clean.resolve(), dirty.resolve()}
+    assert not clean.exists()
+    assert not dirty.exists()
+    assert _branch_resolves(repo, f"task/_lane-0-{TS_LANE}")
+
+
+# ---------------------------------------------------------------------------
+# step-19: park_commit self-guards its own destructive verbs
+# ---------------------------------------------------------------------------
+
+def test_park_commit_refuses_a_worktree_it_cannot_verify(tmp_path, caplog):
+    """``git add -A`` stages from the WORKTREE ROOT regardless of cwd, so an
+    unverified target does not merely mis-scope the snapshot — it commits the
+    whole tree of whatever repository git resolved. park_commit self-guards
+    rather than trusting its caller to have checked."""
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    subdir = parking / "sub"
+    subdir.mkdir()
+    (subdir / "more-wip.txt").write_text("nested uncommitted work\n")
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+
+    assert row.park_commit(subdir, "reclaim") is None  # must not raise
+
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert _git(parking, "status", "--porcelain").stdout.strip()  # still dirty
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING" in m and str(subdir) in m for m in warn)
+
+
+def test_park_commit_still_commits_a_verified_dirty_parking(tmp_path):
+    """NON-REGRESSION: the guard must not disarm the ordinary happy path."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+
+    sha = row.park_commit(parking, "reclaim")
+
+    assert sha and sha != head_before
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == sha
+    assert not _git(parking, "status", "--porcelain").stdout.strip()
+
+
+def test_reclaim_skips_a_parking_whose_park_commit_refuses(tmp_path, caplog, monkeypatch):
+    """THE COMPOSITION THAT MUST NOT BE DESTRUCTIVE: a park-commit refusal must
+    NOT cascade into a removal.
+
+    ``park_commit``'s guard returns ``None``, deliberately reusing the failure
+    channel :func:`reclaim_worktrees` already treats as "SKIP, never removed
+    (data-loss guard)". The two are tested in isolation elsewhere — step-19
+    proves the refusal, step-18 the sweep-level one — but nothing drove the two
+    TOGETHER, and this is the one composition where a mistake destroys content:
+    a parking whose dirty state was never snapshotted, removed anyway.
+
+    It is also the only guard whose reachability depends on a RACE rather than
+    on a misconfigured ``repo`` — the sweep's own gate passed, so a parking that
+    stops verifying between the sweep entry and its own park-commit (replaced,
+    unmounted, its admin file rewritten) is the live path. Simulated by making
+    the target verify answer truthfully for ``repo`` and False for the parking.
+    """
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+    assert len(records) == 1
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+    truthful = row.is_git_toplevel
+
+    def refuses_the_parking(path):
+        if Path(path).resolve() == parking.resolve():
+            return False
+        return truthful(path)
+
+    monkeypatch.setattr(row, "is_git_toplevel", refuses_the_parking)
+
+    outcome = row.reclaim_worktrees(repo, records, dry_run=False)  # must not raise
+
+    # The refusal landed in the data-loss-guard channel, not the removal one.
+    assert outcome.refused is False  # the SWEEP was not refused — this parking was
+    assert _resolved(outcome.skipped) == [parking.resolve()]
+    assert outcome.reclaimed == []
+    assert outcome.park_committed == []
+    assert outcome.failed == []
+    # ...and nothing was destroyed: still on disk, still registered, still dirty,
+    # still on the same commit (no snapshot was taken, so none may be lost).
+    assert parking.exists()
+    assert parking.resolve() in _worktree_paths(repo)
+    assert _git(parking, "status", "--porcelain").stdout.strip()
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == head_before
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING to park-commit" in m for m in warn)
+    assert any(LOG_PREFIX in m and "SKIP" in m and "NOT removing" in m for m in warn)
+
+
+def test_park_commit_still_commits_through_a_symlinked_parking(tmp_path):
+    """NON-REGRESSION: a parking reached via a SYMLINK is a legitimate target —
+    the guard realpath-compares, so it must not false-refuse here."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    link = tmp_path / "parking-link"
+    link.symlink_to(parking)
+
+    sha = row.park_commit(link, "reclaim")
+
+    assert sha
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == sha
+
+
+# ---------------------------------------------------------------------------
+# step-20: end-to-end CLI refusal — refused_target in the JSON report, no prune
+# ---------------------------------------------------------------------------
+
+def _cli_repo_with_live_and_prunable_parkings(tmp_path):
+    """A repo with one LIVE old parking, one whose directory was deleted (so
+    ``git worktree list --porcelain`` reports a ``prunable`` admin entry), and
+    one YOUNG parking held back by the age floor.
+
+    The prunable entry is the observable for the FINAL ``git worktree prune``:
+    it is the only phase whose effect survives after the sweep, so "did the
+    prune run against this repo?" is answerable from the porcelain alone.
+
+    The YOUNG parking is what makes ``scanned`` exceed ``kept + skipped``'s
+    degenerate case: the age floor is applied UPSTREAM of the sweep, so a young
+    parking is counted in ``kept`` and never reaches ``skipped`` even under a
+    refusal. Without one, ``skipped == scanned`` holds by accident and a test
+    asserting it would pin a coincidence rather than the real invariant.
+    """
+    repo = _init_repo(tmp_path)
+    live = _add_parking(repo, f"2920-{TS_OLD}")
+    stale = _add_parking(repo, f"_lane-0-{TS_LANE}")
+    shutil.rmtree(stale)
+    young = _add_parking(repo, f"3050-{TS_YOUNG}")
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
+    return repo, live, stale, young
+
+
+def test_cli_refuses_unverified_repo_target_and_skips_the_prune(tmp_path):
+    """A ``--repo`` that is not the repository root refuses every phase — the
+    sweep AND the final prune — while still exiting 0 so the nightly timer is
+    never wedged. The refusal is carried by the JSON report's ``refused_target``
+    key, because the always-0 exit code cannot carry it and ``skipped`` alone
+    cannot distinguish 'detached branch' from 'refused target' (INV-4)."""
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    result = _run_cli(
+        "--repo", str(subdir),
+        "--parking-root", str(_parking_root(repo)),
+        "--now", str(CLI_NOW),
+        "--min-age-hours", "48",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert live.exists()
+    assert live.resolve() in _worktree_paths(repo)
+
+    report = json.loads(result.stdout)
+    assert report["refused_target"] is True
+    assert report["reclaimed"] == 0
+    assert report["park_committed"] == 0
+    assert report["scanned"] > 0
+    # A refusal skips every ELIGIBLE parking — NOT every scanned one. The age
+    # floor runs upstream of the sweep, so the young parking is counted in
+    # `kept` and never reaches `skipped`. The fixture carries one precisely so
+    # this asserts the invariant rather than the `kept == 0` coincidence.
+    assert report["kept"] > 0
+    assert report["skipped"] == report["scanned"] - report["kept"]
+    assert young.exists()  # the age floor still protects it under a refusal
+    assert LOG_PREFIX in result.stderr
+    assert "REFUSING" in result.stderr
+
+    # The final prune did NOT run against the unverified target.
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
+
+
+def test_prune_gate_reuses_the_sweep_verdict_instead_of_re_probing(tmp_path, capsys, monkeypatch):
+    """The report and the prune read ONE verdict, so they can never disagree.
+
+    ``_run_git`` never raises — a 120s timeout or a transient ``OSError`` is
+    mapped to rc=1 — so a SECOND ``is_git_toplevel(repo)`` probe in ``main``
+    could answer differently from the one ``reclaim_worktrees`` already recorded.
+    Simulated here with a probe that answers False once and truthfully after:
+    against a re-probing prune gate the report would claim ``refused_target:
+    true`` while the prune actually RAN (clearing the prunable entry) — exactly
+    the report/behaviour ambiguity ``refused_target`` exists to remove.
+
+    Driven in-process (not via ``_run_cli``) because monkeypatching cannot cross
+    the subprocess boundary.
+    """
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    truthful = row.is_git_toplevel
+    repo_probes: list[Path] = []
+
+    def flaky(path):
+        if Path(path).resolve() == repo.resolve():
+            repo_probes.append(Path(path))
+            return len(repo_probes) > 1  # first answer False, then truthful
+        return truthful(path)
+
+    monkeypatch.setattr(row, "is_git_toplevel", flaky)
+
+    rc = row.main(
+        ["--repo", str(repo), "--now", str(CLI_NOW), "--min-age-hours", "48"]
+    )
+
+    assert rc == 0  # a refusal is a missed sweep, never a wedged timer
+    report = json.loads(capsys.readouterr().out)
+    assert report["refused_target"] is True
+    # ...and the prune AGREES with that report: the stale entry survives.
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
+    assert live.exists()
+    assert young.exists()
+    # One decision, one probe — the second source of truth is gone.
+    assert len(repo_probes) == 1
+
+
+def test_cli_verified_run_reports_not_refused_and_still_prunes(tmp_path):
+    """NON-REGRESSION: an ordinary run reports ``refused_target`` false, still
+    reclaims, and still clears the stale admin entry."""
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+
+    result = _run_cli(
+        "--repo", str(repo), "--now", str(CLI_NOW), "--min-age-hours", "48"
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    report = json.loads(result.stdout)
+    assert report["refused_target"] is False
+    assert report["reclaimed"] == 1
+    assert not live.exists()
+    assert young.exists()  # held back by the age floor, not by the guard
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain").stdout
+
+
+def test_cli_symlinked_repo_behaves_exactly_like_the_direct_path_run(tmp_path):
+    """NON-REGRESSION: a ``--repo`` that is a SYMLINK to the repo root is a
+    legitimate target — reclaims, prunes, ``refused_target`` false. A guard that
+    compared literal paths would turn every symlinked deployment into a silently
+    skipped nightly."""
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo)
+
+    result = _run_cli(
+        "--repo", str(link), "--now", str(CLI_NOW), "--min-age-hours", "48"
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    report = json.loads(result.stdout)
+    assert report["refused_target"] is False
+    assert report["reclaimed"] == 1
+    assert not live.exists()
+    assert young.exists()  # held back by the age floor, not by the guard
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain").stdout

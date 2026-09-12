@@ -940,11 +940,24 @@ a defense is active when it isn't:
   today, not an enforced OS boundary. (Separately, fused-memory's
   reconciliation confinement *is* enabled and fail-closed — a different
   subsystem, not covered by this caveat.)
-- **Worktrees share the main checkout's virtualenv.** A task's worktree
-  under `.worktrees/<id>/` is a separate git working directory, but not a
-  separate Python environment — dependency installs in one worktree are
-  visible everywhere, and a broken environment change can affect
-  concurrently-running tasks.
+- **An agent's shell in a worktree can import first-party code from main,
+  not the worktree.** Each worktree gets its own independent root `.venv`,
+  never a shared one, once cold-verified. A project can set
+  `verify_cold_preprovision_command` to build it explicitly (this repo's
+  value is `uv sync --all-packages && npm ci …`); the knob defaults to
+  empty, in which case the `.venv` is instead materialized as a side
+  effect of the verify test leg's `cd <module> && uv run pytest`
+  (`orchestrator/src/orchestrator/verify.py::_preprovision_shared_venv`).
+  Either way, there's no `.venv` at all before that first cold verify.
+  The real edge: an agent's Bash subprocess inherits a copy of the
+  orchestrator's environment, including main's `VIRTUAL_ENV`
+  (`orchestrator/src/orchestrator/agents/invoke.py`), so a first-party
+  `import` there can resolve main's editable source instead of the
+  worktree's edits. Verify is unaffected —
+  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` strips
+  `VIRTUAL_ENV` so the target always resolves its own `.venv`. See
+  `### Locating installed code` in `CLAUDE.md` for the one-line
+  provenance check.
 - **Verify commands default to repo-wide scope in places**, not always
   scoped strictly to the modules a task touched — `merge_verify_breadth`
   defaults to `scoped`, but individual verify command derivation can still

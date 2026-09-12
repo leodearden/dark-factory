@@ -42,6 +42,72 @@ from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
+# Tasks per get_tasks response for the snapshot read.  See the SOURCE comment
+# in collect_snapshot for WHY the read is paginated at all; this comment is
+# only about the NUMBER.
+#
+# DERIVED FROM MEASURED FULL-ROW DENSITY, not by analogy with any other cap.
+# Measured read-only against this repo's own backend (.taskmaster/tasks/
+# tasks.db, 4,941 tasks, each row serialised as get_tasks delivers it):
+#
+#     mean 5,234 chars/task   median 3,999   p95 13,917   p99 25,197
+#     max 95,838
+#
+# The transport wall sits between the ~62,000-char documented-safe envelope
+# and the ~80-85 KB observed rejection point (fused-memory server/tools.py and
+# fused-memory/tests/test_get_statuses_pagination.py record both numbers from
+# the reify incident).  62,000 / 5,234 => ~11.8 rows, so 10 is the
+# conservative side of a TYPICAL page: 10 x 5,234 ~= 52 KB.
+#
+# THIS BOUNDS THE TYPICAL PAGE, NOT EVERY PAGE.  The tail is not bounded by
+# any page size: a single p99 row is 25 KB and the largest real row is 95,838
+# chars, already over the envelope on its own.  So a page of 10 dense rows can
+# still be rejected, and NO choice of _SNAPSHOT_PAGE_SIZE makes the read
+# unconditionally safe.  It is a large reduction in the probability of a
+# rejected cycle, not a proof against one.  When a page IS rejected the read
+# fails loud and all-or-nothing (fetch_tasks discards partial rows and returns
+# the offline marker) rather than writing an undercount as fact.
+#
+# COST -- MEASURED, and NOT affordable enough to pay unconditionally.  The
+# fused-memory server materialises the whole task list and slices it in memory
+# per request (tools.py get_tasks), so an N-task project costs ceil(N/10)
+# SEQUENTIAL round trips and O(N^2/10) server-side row builds per cycle --
+# ~496 requests for this repo's 4,956 tasks.  Timed read-only against this
+# repo's own backend: ~0.33-0.35 s per paginated request, so ~209 s of
+# continuous work for ONE root.  An earlier revision of this comment called
+# that "affordable because the collector runs once per 600 s"; that was wrong
+# by the measurement.  collect_snapshot fans out over EVERY discovered root
+# concurrently against a single server where the requests serialise
+# server-side, so at 3+ roots an unconditionally-paginated cycle approaches or
+# exceeds _SAMPLE_INTERVAL_SECONDS (600 s) -- ~35% of the interval per root,
+# on the same httpx client the 2 s render polls share (a live
+# httpx.PoolTimeout risk for request-path handlers), plus ~500 _log_read audit
+# writes per root per cycle.
+#
+# That measurement is why the paginated read is now GATED behind a size probe
+# rather than issued unconditionally -- see _fetch_snapshot_tasks.  Small roots
+# cost one request again; only a tree that genuinely exceeds the envelope pays
+# the ceil(N/10) walk.
+#
+# The residual per-root cost is the strongest argument that get_tasks
+# pagination is the wrong long-term lever: the loop reads exactly four keys per
+# task and a field-limited or statuses-filtered read would cost a fraction of
+# this.  No such read exists at any layer today (see collect_snapshot's SOURCE
+# comment); task 4390 is the open follow-up that would add get_tasks field
+# projection at the source, at which point this constant and the pagination it
+# drives should be revisited rather than tuned.
+#
+# THIS BLOCK IS THE SINGLE SOURCE for the density measurement and the cost
+# model above: _fetch_snapshot_tasks, collect_snapshot's inline block, the
+# fetch_tasks docstring and the test class all point HERE rather than restating
+# the numbers, so a re-measurement is a one-place edit.
+#
+# Pinned by TestSnapshotPageSizeIsSizedFromMeasuredDensity::
+# test_a_typical_page_fits_the_documented_safe_envelope in
+# dashboard/tests/test_burndown_data.py so a future bump cannot silently
+# re-cross the wall.
+_SNAPSHOT_PAGE_SIZE = 10
+
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +253,64 @@ def _count_zones(tasks: Sequence[Mapping[str, Any]], now: datetime) -> dict[str,
     return counts
 
 
+async def _fetch_snapshot_tasks(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    root: str,
+) -> list[dict] | dict:
+    """Read one project's full task tree for a snapshot, unpaginated FIRST.
+
+    SIZE PROBE, not an optimisation of the paginated path.  The paginated read
+    costs ``ceil(N/P)`` SEQUENTIAL round trips — MEASURED at ~209 s for ONE
+    root of this repo's size — and ``collect_snapshot`` fans out over every
+    discovered root concurrently against a SINGLE server where the requests
+    serialise, on the same httpx client the 2 s render polls use.  Paying that
+    unconditionally is a live ``httpx.PoolTimeout`` risk for request-path
+    handlers, not a ten-minute rounding error.  The measurement, its
+    derivation, and the cost model behind it live in ONE place:
+    ``_SNAPSHOT_PAGE_SIZE``.
+
+    So pagination is now the EXCEPTION: issue one ordinary unpaginated read
+    (exactly what this collector did before pagination existed) and fall back
+    to the paginated path only when it comes back as the offline marker.  A
+    project whose tree fits the transport envelope — every small root, which
+    is most of the fan-out — costs ONE request per cycle again.
+
+    This does NOT make the big-root case cheap: a tree that genuinely exceeds
+    the envelope pays one rejected probe and then the full walk, so for a
+    project the size of this repo that path is still the steady state.  The
+    probe bounds the FAN-OUT amplification (R roots x ceil(N/P) -> 1 root x
+    ceil(N/P) + 1 + (R-1) x 1), not the per-root cost.  Only a field-limited
+    read fixes that; task 4390 is the open follow-up.
+
+    The probe cannot mask a real outage: a genuinely offline server fails the
+    probe AND the fallback's first request, so the offline marker is still what
+    reaches ``collect_snapshot``'s triage.  A successful probe is cached by
+    ``fetch_tasks`` exactly as any other successful read.
+
+    Returns whatever ``fetch_tasks`` returns — a ``list[dict]`` on success or
+    the ``{'offline': True, 'error': str}`` marker — so the caller's existing
+    triage is unchanged.
+    """
+    probe = await fetch_tasks(client, config, root)
+    if isinstance(probe, list):
+        return probe
+    logger.debug(
+        'Unpaginated snapshot read rejected for %s (%s); retrying paginated at page_size=%d',
+        root,
+        probe.get('error') if isinstance(probe, dict) else probe,
+        _SNAPSHOT_PAGE_SIZE,
+    )
+    return await fetch_tasks(
+        client, config, root,
+        page_size=_SNAPSHOT_PAGE_SIZE,
+        # paginate=True is what turns *page_size* from "one page" into
+        # "walk every page and assemble".  Without it this would silently
+        # snapshot the first _SNAPSHOT_PAGE_SIZE tasks as the whole tree.
+        paginate=True,
+    )
+
+
 async def collect_snapshot(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
@@ -297,8 +421,37 @@ async def collect_snapshot(
         # per _SAMPLE_INTERVAL_SECONDS (600s), so the larger payload is a
         # ten-minute cost, not a per-render one — and it collapses the
         # collector onto ONE source instead of two that can disagree.
+        #
+        # PAGINATED-ON-DEMAND because `snapshots` is an APPEND-ONLY historical
+        # record.  A single whole-tree response that exceeds the MCP transport
+        # limit is rejected wholesale; fetch_tasks then reports offline and the
+        # triage below skips the project, so that cycle's row is never written
+        # and no later cycle backfills it — a permanent, unexplained hole in
+        # the chart.  _fetch_snapshot_tasks probes unpaginated first and falls
+        # back to the paginated walk only on rejection; why the walk is the
+        # exception rather than the steady state is on that helper, and why no
+        # page size is unconditionally safe is on _SNAPSHOT_PAGE_SIZE.
+        #
+        # Pagination is the only lever available, not the ideal one, and this
+        # is the loop that shows why: it reads exactly four keys per task —
+        # status, claimant_run_id, heartbeat_at, and metadata['infra_hold'] —
+        # so a field-limited read would be strictly better.  None exists at any
+        # layer: MCP get_tasks accepts only project_root/tag/page_size/offset/
+        # statuses (fused-memory server/tools.py) and the backend query is
+        # `SELECT *` (sqlite_task_backend.py:1534).  Pagination therefore
+        # bounds delivery, not work.
+        #
+        # A fetch_statuses fallback on oversize was considered and REJECTED:
+        # in_progress_live/in_progress_stranded are INTEGER NOT NULL DEFAULT 0
+        # (BURNDOWN_SCHEMA), so a statuses-only row cannot express "split
+        # unknown" — it would have to write stranded=0, manufacturing a
+        # confident zero out of a degraded read.  Trading a visible hole for an
+        # invisible lie in a permanent record is the wrong direction.
+        #
+        # Request-path callers are unaffected: page_size is opt-in and
+        # active_tasks still calls fetch_tasks with no page_size at all.
         all_results = await asyncio.gather(
-            *(fetch_tasks(client, config, root) for root in roots_to_snapshot),
+            *(_fetch_snapshot_tasks(client, config, root) for root in roots_to_snapshot),
             return_exceptions=True,
         )
 

@@ -187,14 +187,35 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 and (f) the cold fall-through. Do not infer a measurement floor
 #                 here that does not exist.
 #
-# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE. The concurrent arm of the sweep
-# was a 6-WAY wave (the six modules this task closed). Production's
-# ``verify.run_full_verification`` gathers over EVERY registered module config —
-# nine today, including the dominant `orchestrator` segment — so the measured
-# wave is a LOWER BOUND on the fully-concurrent cost, not a reproduction of it.
-# See the same note in each yaml's provenance block for what bounds the gap.
+#   shared        W was RE-MEASURED by task 5131 under a real NINE-WAY gather
+#                 at base 1b3c50e98f, so unlike the other five entries here it
+#                 is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
+#                 4802 (+48%) over that epoch, but the worst-run wall clock
+#                 grew only ~35.5% (219.08s -> 296.88s) — LESS than the count
+#                 ratio predicts. Do NOT scale this figure by a test-count
+#                 ratio next time it goes stale — RE-MEASURE instead. That
+#                 same +48% growth also makes
+#                 MEASURED_FLEET_SEGMENT_SECS['shared'] = 120.21 in
+#                 test_fallback_verify_config.py (n=1, 2026-07-31, task 3062)
+#                 known-stale by the same evidence — a DIFFERENT command
+#                 feeding a DIFFERENT floor (task 4902 precedent keeps the
+#                 two tables separate homes), so it is not corrected here;
+#                 filed as a follow-up re-measure (tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R)
+#                 instead.
+#
+# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE, save one entry. The concurrent
+# arm of the sweep was a 6-WAY wave (the six modules this task closed) for
+# every entry EXCEPT `shared`, whose W was RE-MEASURED under a real NINE-WAY
+# gather (task 5131, see its entry above) — production's own gather width.
+# Production's ``verify.run_full_verification`` gathers over EVERY registered
+# module config — nine today, including the dominant `orchestrator` segment —
+# so for the five 6-way entries the measured wave remains a LOWER BOUND on the
+# fully-concurrent cost, not a reproduction of it. See the same note in each
+# of those five yamls' provenance blocks for what bounds the gap; shared's own
+# provenance block records the nine-way gather directly, so no such note
+# applies there.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
-    'shared': 219.08,
+    'shared': 296.88,
     'escalation': 354.56,
     'fused-memory': 439.80,
     'dashboard': 653.54,
@@ -458,12 +479,29 @@ MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
         'Owned by task 3353, which is still pending. Deliberately not fixed by '
         'task 3473 to avoid scope creep onto files 3473 does not lock. The '
         'exclusion is TECHNICALLY correct, not merely deferential: orchestrator '
-        'is the dominant fleet segment (measured 1366.23s and 1157.62s on one '
-        'day, ~18% apart, in task 3062 attempt-2 / esc-3062-3), and task 3353 '
+        'is the dominant fleet segment — the largest entry by far in '
+        'MEASURED_FLEET_SEGMENT_SECS — and task 3353 '
         "has since been rewritten to \"split or shard the orchestrator test "
-        'suite\" — so a budget declared now against an unsharded 1366s figure '
+        'suite\" — so a budget declared now against an unsharded figure '
         "would be invalidated by 3353's own change rather than merely refined "
-        'by it. DELETION CONDITION: once orchestrator/orchestrator.yaml declares '
+        'by it. TASK 4902 RE-MEASURED that segment on 2026-08-28 and it had '
+        'risen materially above the single task-3062 run this entry used to '
+        'quote. NO FIGURE IS RESTATED HERE, deliberately: the value, its date, '
+        'its sample and its percentile spread live ONCE — in '
+        'MEASURED_FLEET_SEGMENT_SECS, MEASURED_FLEET_SEGMENT_PROVENANCE and '
+        'POST_CAP_ORCHESTRATOR_GREEN_SECS in '
+        'tests/scripts/test_fallback_verify_config.py. Read them there. A number '
+        'copied into this justification would be one more copy to raise in '
+        'lockstep, and the one that used to sit here went stale exactly that '
+        'way. The re-measurement makes the deferral MORE justified, not less: '
+        'the segment rose sharply in 28 days and its run-to-run spread is now '
+        'far wider than the ~18%-apart same-day pair task 3062 recorded '
+        '(attempt-2 / esc-3062-3), so a budget sized against the unsharded '
+        'suite is chasing a moving target — one whose observed green maximum '
+        'has already consumed the full warm ceiling as a false infra_timeout. '
+        'DELETION CONDITION (unchanged, and NOT satisfied by 4902, which '
+        're-measured only and declared no budget): once '
+        'orchestrator/orchestrator.yaml declares '
         'its own verify_command_timeout_secs, delete this entry — the coverage '
         'guard then covers it automatically with no further edit.'
     ),

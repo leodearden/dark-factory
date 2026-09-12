@@ -1,0 +1,28 @@
+[Unit]
+Description=Nightly canonical/topic stamping COVERAGE census + retro-stamp rehearsal (task 4006)
+# The NORMATIVE definitions of every figure this job produces are the census
+# script itself -- its coverage/cross-tab docstrings and the schema_version it
+# stamps into the JSON -- and the PRD section that owns the obligation. Read
+# those, not any paraphrase, before changing what is measured. The report is
+# also the standing instrument for gate 3626's re-measurement recipe items 3
+# and 4 (slug conformance over all topics, and over canonical records alone).
+Documentation=file:///home/leo/src/dark-factory/fused-memory/scripts/census_memory_metadata.py
+Documentation=file:///home/leo/src/dark-factory/docs/prds/memory-metadata-vocabulary.md
+Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
+
+[Service]
+Type=oneshot
+# All logic lives in the committed wrapper script -- the unit itself is a thin
+# systemd shell around it (mirrors
+# scripts/reify-closure-staleness-sweep.service). The wrapper runs the census
+# and then a DRY-RUN of 3201's retro stamp, in sequence, and always exits 0: a
+# recurring `oneshot` that can fail enters systemd `failed` state and STAYS
+# there, silently stopping the whole nightly job. The census exits 1 by design
+# whenever coverage.complete is false, which is routine on a live corpus.
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/src/dark-factory/scripts/memory-metadata-coverage-census.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target

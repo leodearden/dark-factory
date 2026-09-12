@@ -93,6 +93,8 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     evaluate_closure,
+    handrolled_member_enumeration,
+    resolve_unstamped_live_ids,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
@@ -525,6 +527,11 @@ class TaskInterceptor:
         # through. Wired by set_consolidation_scroll (see its docstring).
         self._consolidation_scroll: Any | None = None
         self._consolidation_count: Any | None = None
+        # Task 4808: the per-candidate existence probe that makes
+        # `unstamped_cluster_member` reachable. DORMANT on the same terms as
+        # the scroll above — unwired, the derivation returns () and the gate
+        # behaves exactly as it did before.
+        self._consolidation_exists: Any | None = None
 
     def set_write_journal(self, journal: 'WriteJournal') -> None:
         """Wire the write journal for durable auditing of task writes.
@@ -590,7 +597,9 @@ class TaskInterceptor:
         """
         self._lifecycle_reset_filer = filer
 
-    def set_consolidation_scroll(self, scroll: Any, count: Any = None) -> None:
+    def set_consolidation_scroll(
+        self, scroll: Any, count: Any = None, exists: Any = None
+    ) -> None:
         """Wire the consolidation-gate closure scroll (task 3112).
 
         *scroll* is an async ``(filters, *, limit, project_id) -> list[payload]``
@@ -606,6 +615,24 @@ class TaskInterceptor:
         ``TaskInterceptor`` construction site, where ``memory_service`` is
         already in scope.
 
+        *exists* (task 4808) is an async ``(memory_id, *, project_id) -> bool``
+        — in production a wrapper over ``MemoryService.get_memory_by_id``,
+        built by ``consolidation_gate.py::closure_exists_probe`` (the shared
+        factory ``server/main.py::_wire_closure_collaborators`` and
+        ``scripts/check_consolidation_closure.py`` both bind). It is what lets
+        the seam derive ``unstamped_live_ids`` from the gate block's inert
+        provenance, and it is scoped for the same non-optional reason the
+        scroll is. Like *count* it falls back to ``scroll.exists`` when
+        omitted, so one bound collaborator object still carries all three.
+        When it is not wired the unstamped-member derivation is DORMANT and
+        the gate behaves exactly as it did before: without a probe an observed
+        id missing from the scroll cannot be told apart from one that was
+        absorbed and deleted, and guessing would make every correctly executed
+        delete-arm consolidation permanently uncloseable.
+
+        *scroll* stays positional and *count* keeps its position, so existing
+        positional callers are untouched.
+
         Before the call — and in every test that does not configure one — the
         consolidation-closure gate is DORMANT and status transitions proceed
         exactly as before: zero behaviour change, mirroring
@@ -613,6 +640,9 @@ class TaskInterceptor:
         """
         self._consolidation_scroll = scroll
         self._consolidation_count = count if count is not None else getattr(scroll, 'count', None)
+        self._consolidation_exists = (
+            exists if exists is not None else getattr(scroll, 'exists', None)
+        )
 
     #: Per-check cap on the consolidation-closure scroll. Mirrors the
     #: `consolidate_memories` topic-members listing: a single Qdrant scroll,
@@ -637,6 +667,17 @@ class TaskInterceptor:
         COST ORDERING copies the landed op: count first, scroll only on a
         non-zero count, and disclose truncation — so the common path is cheap
         and a capped scroll never reads as complete.
+
+        UNSTAMPED MEMBERS (task 4808). The seam also derives
+        ``unstamped_live_ids`` from the gate block's inert provenance, via
+        ``consolidation_gate.py::resolve_unstamped_live_ids``. This is the ONE
+        thing provenance may contribute, and it can only ever ADD a refusal —
+        never grant a pass — which is the design statement
+        ``consolidation_gate.py::build_consolidation_gate_task`` already makes
+        about the enumeration it writes. The derivation sits INSIDE the
+        fail-closed ``try`` below on purpose: a probe timeout then becomes the
+        same refusal an unreadable scroll already produces, with no new policy
+        and no second decision to keep in sync.
         """
         scroll = self._consolidation_scroll
         if scroll is None:
@@ -646,6 +687,29 @@ class TaskInterceptor:
             return None
         block = meta.get(GATE_METADATA_KEY)
         if not isinstance(block, dict):
+            # Task 4808, the SECOND gap. `operational_mode == 'gate'` is a
+            # GENERIC human-gate marker, so a block-less gate cannot be
+            # refused — that would brick the 123 measured gates that
+            # legitimately carry no block. But a gate that hand-rolled its own
+            # member list under `memory_ids`/`related_memory_ids` is very
+            # likely a consolidation gate the seam simply cannot see, so it is
+            # FLAGGED rather than silently skipped. See
+            # `consolidation_gate.py::handrolled_member_enumeration` for the
+            # measured basis and the flag-don't-refuse decision.
+            handrolled = handrolled_member_enumeration(meta)
+            if handrolled is not None:
+                key, ids = handrolled
+                logger.warning(
+                    'task=%s enumerates cluster members under `metadata.%s` '
+                    '(%s) but carries no `%s` block, so the consolidation '
+                    'gate is DORMANT for it and this `done` transition '
+                    'closes it unchecked. File it through '
+                    '`build_consolidation_gate_task` to arm the gate.',
+                    task_id,
+                    key,
+                    ', '.join(str(i) for i in ids),
+                    GATE_METADATA_KEY,
+                )
             return None
         topic = block.get('topic')
         if not isinstance(topic, str) or not topic:
@@ -668,6 +732,12 @@ class TaskInterceptor:
 
         filters = {'topic': topic}
         limit = self._CONSOLIDATION_SCROLL_LIMIT
+        # Initialised BEFORE the try so the except path cannot raise
+        # UnboundLocalError — a handler that itself raises would convert a
+        # fail-closed refusal into a 500. That path forces available=False
+        # anyway, which makes evaluate_closure return `scroll_unavailable`
+        # and ignore everything else.
+        unstamped: tuple[str, ...] = ()
         try:
             total: int | None = None
             if self._consolidation_count is not None:
@@ -683,10 +753,16 @@ class TaskInterceptor:
             )
             if total is None:
                 total = len(members)
+            unstamped = await resolve_unstamped_live_ids(
+                block,
+                members=members,
+                exists=self._consolidation_exists,
+                project_id=project_id,
+            )
         except Exception as exc:  # noqa: BLE001 — every failure is a refusal
             logger.warning(
-                'consolidation closure scroll failed for task=%s topic=%s: %s; '
-                'REFUSING the done transition (fail-closed)',
+                'consolidation closure scroll or probe failed for task=%s '
+                'topic=%s: %s; REFUSING the done transition (fail-closed)',
                 task_id,
                 topic,
                 exc,
@@ -699,6 +775,7 @@ class TaskInterceptor:
             scroll_total=total,
             scroll_truncated=truncated,
             scroll_available=available,
+            unstamped_live_ids=unstamped,
         )
         if verdict.closed:
             return None
@@ -2216,6 +2293,41 @@ class TaskInterceptor:
         )
         return None
 
+    def _escalation_suggested_root(self, suggested_project: str | None) -> str | None:
+        """Resolve the filesystem root of *suggested_project*, or ``None``.
+
+        Shared by both scope_violation emit helpers so the resolution — and in
+        particular the defensive ``registry is not None`` guard — exists once.
+        That guard is belt-and-suspenders (see :meth:`_files_scope_check`): the
+        constructor has guaranteed a non-None :attr:`_prefix_registry` since
+        task 2208, but ``root_for_project`` must never be reached on a None
+        registry from an escalation path, where an AttributeError would
+        convert a reporting side-effect into a guard exception.
+        """
+        registry = self._prefix_registry
+        if not suggested_project or registry is None:
+            return None
+        return registry.root_for_project(suggested_project)
+
+    @staticmethod
+    def _escalation_candidate_title(
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+    ) -> str:
+        """Best available human label for an escalation record, length-bounded.
+
+        Shared by both scope_violation emit helpers.  Note where the ``[:200]``
+        binds: it applies to the WHOLE expression, so a candidate-supplied
+        title is bounded too.  Binding it to the fallback branch alone (the
+        earlier shape) left the common case — a real ``CandidateTask`` whose
+        title came from caller-supplied text — unbounded in a field that is
+        rendered verbatim into agent briefings.
+        """
+        return (
+            (candidate.title if candidate else '')
+            or str(kwargs.get('title') or kwargs.get('prompt') or '<unknown>')
+        )[:200]
+
     def _emit_scope_violation_escalation(
         self,
         verdict: PathGuardVerdict,
@@ -2262,16 +2374,8 @@ class TaskInterceptor:
         """
         if self._scope_violation_escalator is None:
             return
-        registry = self._prefix_registry
-        suggested_root: str | None = None
-        # `registry is not None` is defensive belt-and-suspenders here too
-        # (see :meth:`_files_scope_check`): the constructor guarantees a
-        # non-None :attr:`_prefix_registry` since task 2208.
-        if verdict.suggested_project and registry is not None:
-            suggested_root = registry.root_for_project(verdict.suggested_project)
-        candidate_title = (candidate.title if candidate else '') or str(
-            kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
-        )[:200]
+        suggested_root = self._escalation_suggested_root(verdict.suggested_project)
+        candidate_title = self._escalation_candidate_title(candidate, kwargs)
         try:
             self._scope_violation_escalator.report_rejection(
                 project_root=project_root,
@@ -2290,6 +2394,95 @@ class TaskInterceptor:
             logger.exception(
                 'task_interceptor: scope_violation_escalator raised; '
                 'continuing with rejection error',
+            )
+
+    @staticmethod
+    def _override_matched_paths(
+        files_verdict: PathGuardVerdict,
+        prose_verdict: PathGuardVerdict,
+    ) -> tuple[str, ...]:
+        """Union the two REPORTING-ONLY verdicts' paths for the audit record.
+
+        Files-certain paths first (they are exact owner lookups), then any
+        prose prefixes not already present.  Order-stable and deduplicated so
+        the recorded list is reproducible — the record's whole value is that
+        it can be checked against the guard's behaviour after the fact.
+        """
+        paths: list[str] = []
+        for verdict in (files_verdict, prose_verdict):
+            for path in verdict.matched_paths:
+                if path not in paths:
+                    paths.append(path)
+        return tuple(paths)
+
+    def _emit_routing_override_escalation(
+        self,
+        *,
+        reason: str,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_root: str,
+        project_id: str,
+        files_verdict: PathGuardVerdict,
+        prose_verdict: PathGuardVerdict,
+    ) -> None:
+        """File the AUDIT record for a routing-override bypass.
+
+        Pure side-effect helper modelled on
+        :meth:`_emit_scope_violation_escalation`, with the same never-raise
+        contract — and here it matters MORE, not less: the submission this
+        describes has already been allowed, so a queue failure must not
+        convert an allowed submission into an exception.  No-ops when no
+        escalator is configured.
+
+        *files_verdict* / *prose_verdict* are computed for REPORTING ONLY by
+        the caller; nothing is enforced from them.  ``suggested_project`` is
+        the files verdict's suggestion when it rejected AND named one, else
+        the prose verdict's, else ``None``.
+        """
+        if self._scope_violation_escalator is None:
+            return
+        # UNCONDITIONAL — deliberately NOT gated on `matched_paths` being
+        # non-empty.  The defect being fixed is "a bypass leaves no
+        # operator-visible record", not "a bypass that MATTERED leaves no
+        # record".  An override whose verdicts both came back clean is the
+        # single most useful data point available: direct evidence that the
+        # parameter was reached for unnecessarily, which is what any later
+        # tightening of it has to be measured against.  Gating on "the guard
+        # would have fired" would reproduce the original defect for exactly
+        # the over-cautious caller, and would make the census under-count.
+        # Flood risk is handled by the escalator's content-fingerprint fold,
+        # not by suppressing the signal.
+        matched_paths = self._override_matched_paths(files_verdict, prose_verdict)
+        # The files verdict wins when it rejected — it is the CERTAIN signal
+        # (an exact metadata.files owner mismatch) against the prose scan's
+        # heuristic.  But it can reject and STILL yield no suggestion: with
+        # two distinct foreign owners in metadata.files, check_files_for_scope
+        # cannot pick one and returns None.  Falling through to the prose
+        # suggestion there rather than reporting None keeps the degradation
+        # symmetric with :meth:`_override_matched_paths`, which unions both
+        # signals for exactly this multi-signal case.  Nothing enforces on
+        # this field — it is the audit record's best-available hint.
+        suggested_project = (
+            (files_verdict.suggested_project if files_verdict.is_rejection else None)
+            or prose_verdict.suggested_project
+        )
+        suggested_root = self._escalation_suggested_root(suggested_project)
+        candidate_title = self._escalation_candidate_title(candidate, kwargs)
+        try:
+            self._scope_violation_escalator.report_routing_override(
+                project_root=project_root,
+                project_id=project_id,
+                candidate_title=candidate_title,
+                reason=reason,
+                matched_paths=matched_paths,
+                suggested_project=suggested_project,
+                suggested_root=suggested_root,
+            )
+        except Exception:  # pragma: no cover — defensive only
+            logger.exception(
+                'task_interceptor: scope_violation_escalator raised on the '
+                'routing-override audit path; the submission stays allowed',
             )
 
     async def _path_guard_or_skip(
@@ -2312,6 +2505,21 @@ class TaskInterceptor:
         describes — read it there rather than re-deriving it here; only the
         facts specific to this seam are recorded below.
 
+        * Outcome (0), AUDITED BYPASS — a non-blank *routing_override_reason*.
+          Checked FIRST, and deliberately so: it makes "no enforcement
+          side-effect fires on the override path" a STRUCTURAL property of
+          this method rather than one every future branch would have to
+          re-establish.  Since task 3123 the verdicts ARE computed inside
+          this branch, purely to populate an audit record — they are pure
+          functions returning frozen verdicts, and NONE of the enforcement
+          side-effects (the reject dict, the ``possible_scope_mismatch``
+          stamp, the ``cross_repo`` tag, ``report_rejection``) is reachable
+          from it.  That computation is itself guarded, so a defect anywhere
+          in the guard machinery degrades the audit record's path list rather
+          than breaking a submission that explicitly asked to bypass it.
+          A ``scope_violation`` override record is filed via
+          :meth:`_emit_routing_override_escalation` so the bypass is visible
+          in the operator queue and not only in a ``logger.warning``.
         * Outcome (1), FILES-CERTAIN reject — :meth:`_files_scope_check`.  No
           LLM adjudication: the file's owner is either known and different,
           or it isn't, so there is nothing to adjudicate.
@@ -2365,15 +2573,64 @@ class TaskInterceptor:
         Call-site pattern:
             ``if err := await self._path_guard_or_skip(kwargs, project_root, project_id): return err``
         """
-        # Routing override: deliberate bypass of BOTH the FILES-certain
-        # reject and the PROSE-advisory.  Must be the FIRST action so no
-        # verdict computation or escalation fires.
+        # Routing override, outcome (0) — AUDITED BYPASS.  Deliberate bypass
+        # of BOTH the FILES-certain reject and the PROSE-advisory.  Stays the
+        # FIRST action so that "no enforcement side-effect fires here" is
+        # STRUCTURAL rather than a property every future branch would have to
+        # re-establish independently.
+        #
+        # Since task 3123 the verdicts ARE computed inside this branch — for
+        # REPORTING ONLY.  check_files_for_scope / check_text_for_scope are
+        # pure and return frozen PathGuardVerdicts, so this cannot leak an
+        # enforcement action: no reject dict, no possible_scope_mismatch
+        # stamp, no cross_repo tag and no report_rejection is reachable from
+        # here.  It buys the audit record its paths.
         if is_routing_override(routing_override_reason):
+            # NEVER-RAISE, and the reason is stronger here than for the
+            # escalation emit below.  Before task 3123 this branch did
+            # literally nothing, which made an override caller STRUCTURALLY
+            # immune to any defect in the guard machinery; buying the audit
+            # record its paths must not hand that immunity back.  A raise out
+            # of candidate-building or either verdict — a future extractor
+            # meeting a malformed metadata shape, a registry/regex change, a
+            # path string that trips normpath/expanduser — would turn a
+            # submission the caller EXPLICITLY asked to bypass into an
+            # exception out of submit_task, which is the precise failure the
+            # reporting-only design exists to be immune to.  Degrade to empty
+            # verdicts instead: the audit record is still filed (with no
+            # paths, which is honest — the guard genuinely produced none), and
+            # the bypass still bypasses.
+            try:
+                if candidate is None:
+                    candidate = self._build_candidate(kwargs)
+                files_verdict = self._files_scope_check(candidate, kwargs, project_id)
+                prose_verdict = self._path_guard_check(candidate, kwargs, project_id)
+            except Exception:
+                logger.exception(
+                    'task_interceptor: path-guard verdict computation raised on '
+                    'the ROUTING-OVERRIDE reporting path for project_id=%s; '
+                    'filing the audit record with no paths and leaving the '
+                    'submission allowed',
+                    project_id,
+                )
+                files_verdict = PathGuardVerdict(outcome='ok', project_id=project_id)
+                prose_verdict = PathGuardVerdict(outcome='ok', project_id=project_id)
+            override_paths = self._override_matched_paths(files_verdict, prose_verdict)
             logger.warning(
                 'path-guard ROUTING OVERRIDE: skipping path guards for '
-                'project_id=%s reason=%r',
+                'project_id=%s reason=%r would_have_matched=%s',
                 project_id,
                 routing_override_reason.strip(),
+                list(override_paths),
+            )
+            self._emit_routing_override_escalation(
+                reason=routing_override_reason,
+                candidate=candidate,
+                kwargs=kwargs,
+                project_root=project_root,
+                project_id=project_id,
+                files_verdict=files_verdict,
+                prose_verdict=prose_verdict,
             )
             return None
 

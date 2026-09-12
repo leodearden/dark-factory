@@ -5828,7 +5828,11 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         # (d) metadata_mode=None + append=None -> 'merge' (new default)
         (None, None,  'merge'),
         # (f) explicit metadata_mode wins over conflicting append (distinct combos)
-        ('merge',    True,  'merge'),
+        # NOTE: ('merge', True) is intentionally ABSENT — that pair used to
+        # resolve to 'merge' and SHALLOW-clobber nested metadata (the task-3581 /
+        # DF-3260 memory_hints clobber); it now RAISES. See
+        # test_resolve_metadata_mode_merge_plus_append_true_raises.
+        ('additive', True,  'additive'),
         ('additive', False, 'additive'),
         ('replace',  True,  'replace'),
     ],
@@ -5871,6 +5875,39 @@ def test_resolve_metadata_mode_bare_append_false_raises():
     # 'replace' escape hatch (asserted above). Incident traceability lives in the
     # source error message and the _resolve_metadata_mode docstring, not here, so
     # a future reword that keeps the guidance but drops the tag won't break this.
+
+
+def test_resolve_metadata_mode_merge_plus_append_true_raises():
+    """metadata_mode='merge' alongside append=True is a CONTRADICTION and is
+    REJECTED (task 3581). ``append=True`` means exactly one thing — 'additive',
+    the recursive union merge — while 'merge' is shallow last-write-wins, so the
+    pair asks for two incompatible resolutions of the same write. It used to
+    resolve silently to 'merge', shallow-clobbering nested metadata: the whole
+    ``memory_hints`` key (with its authored ``entities``/``queries``) was
+    overwritten wholesale by the incoming stub — the DF-3260 clobber."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode('merge', True)  # metadata_present defaults True
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    msg = exc.value.message
+    assert 'additive' in msg, (
+        f"message must point the caller at the 'additive' escape hatch; got: {msg!r}"
+    )
+    # NB: as with the task-2180 guard above, deliberately do NOT assert on the
+    # incident number or the full prose. The load-bearing contract is that the
+    # caller is told about the actionable 'additive' resolution; traceability
+    # lives in the source message and the _resolve_metadata_mode docstring.
+
+
+def test_resolve_metadata_mode_merge_plus_append_true_no_metadata_ok():
+    """metadata_mode='merge' + append=True with metadata_present=False (a
+    details-only write, no metadata) is NOT rejected — the task-3581 guard is
+    scoped to metadata-present writes exactly like the task-2180 one. With no
+    metadata there is nothing to clobber and ``append`` is independently driving
+    the details-append path, so the pair is not contradictory. Returns 'merge'
+    (unused by the caller since no metadata is written)."""
+    assert _resolve_metadata_mode('merge', True, metadata_present=False) == 'merge'
 
 
 def test_resolve_metadata_mode_append_false_cosignal_replace():
@@ -6105,6 +6142,196 @@ async def test_update_task_details_only_append_false_ok(backend, project_root):
     task = await backend.get_task('1', project_root=project_root)
     assert task['details'] == 'new', (
         f'details-only append=False should replace: {task["details"]!r}'
+    )
+
+
+# ── update_task end-to-end: merge+append=True clobber guard (task 3581) ──────
+#
+# These reproduce the exact live call shape observed from the Stage-2
+# reconciliation LLM against DF task 3857:
+#   update_task(id=3857, metadata={...}, metadata_mode='merge', append=True)
+# issued against a row that already carried authored memory_hints. The pair
+# used to resolve silently to 'merge' and overwrite the whole memory_hints key.
+
+_DF3857_SEED_METADATA = {
+    'memory_hints': {
+        'entities': [],
+        'queries': [
+            'resolution for: dashboard: stop leaking CLOSE-WAIT sockets '
+            'on the escalation poller',
+        ],
+    },
+    'files': ['dashboard/src/poller.py'],
+    '_causation_id': 'caus-df3857',
+}
+
+_DF3857_INCOMING_HINTS = {
+    'memory_hints': {
+        'queries': [
+            'CLOSE_WAIT socket leak httpx client lifecycle',
+            'dashboard escalation poller connection reuse',
+        ],
+    },
+}
+
+
+async def _raw_metadata_bytes(backend, project_root, task_id: int = 1) -> str:
+    """Read the stored metadata blob verbatim, bypassing get_task's parsing."""
+    conn = await backend._get_connection(project_root)
+    cursor = await conn.execute(
+        'SELECT metadata FROM tasks WHERE id = ?', (task_id,),
+    )
+    row = await cursor.fetchone()
+    return row['metadata']
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_plus_append_true_rejected_and_blob_untouched(
+    backend, project_root,
+):
+    """The contradictory metadata_mode='merge' + append=True pair is REJECTED
+    and the stored blob is left byte-for-byte intact (task 3581).
+
+    The load-bearing assertion is the second one: _resolve_metadata_mode is
+    called before ensure_connected() and before the write _txn, so a rejection
+    can never leave a half-applied write. Rejecting is therefore strictly safer
+    than the old silent 'merge', which clobbered memory_hints wholesale."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    before = await _raw_metadata_bytes(backend, project_root)
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps(_DF3857_INCOMING_HINTS),
+            metadata_mode='merge', append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+
+    after = await _raw_metadata_bytes(backend, project_root)
+    assert after == before, (
+        f'rejected write must leave stored bytes untouched.\n'
+        f'before={before!r}\nafter={after!r}'
+    )
+
+    # Belt and braces on the parsed view: the authored query survives, the
+    # siblings survive, and neither incoming query was written.
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+    assert hints['queries'] == _DF3857_SEED_METADATA['memory_hints']['queries'], (
+        f'authored memory_hints.queries must be untouched: {meta}'
+    )
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+    for q in _DF3857_INCOMING_HINTS['memory_hints']['queries']:
+        assert q not in hints['queries'], f'rejected write must not land: {meta}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        pytest.param({'append': True}, id='append-true-alone'),
+        pytest.param({'metadata_mode': 'additive'}, id='metadata_mode-additive'),
+    ],
+)
+async def test_update_task_append_true_unions_nested_memory_hints(
+    backend, project_root, kwargs,
+):
+    """The positive control: the CORRECT spellings of the same intent union the
+    nested memory_hints lists instead of replacing them (task 3581).
+
+    Both ``append=True`` alone and the explicit ``metadata_mode='additive'``
+    resolve to 'additive', which recursively unions list/dict values — so the
+    pre-existing authored query survives alongside both incoming ones and the
+    top-level siblings are preserved."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        **kwargs,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+
+    expected_queries = (
+        _DF3857_SEED_METADATA['memory_hints']['queries']
+        + _DF3857_INCOMING_HINTS['memory_hints']['queries']
+    )
+    assert set(hints['queries']) == set(expected_queries), (
+        f'memory_hints.queries must UNION, not replace: {meta}'
+    )
+    assert len(hints['queries']) == len(expected_queries), (
+        f'union must dedup-preserve exactly one copy of each query: {meta}'
+    )
+    # The sub-field the incoming payload omitted is preserved, not dropped.
+    assert hints.get('entities') == [], f'memory_hints.entities lost: {meta}'
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_explicit_merge_without_append_still_shallow(
+    backend, project_root,
+):
+    """The guard did NOT broaden: a bare metadata_mode='merge' (no append) still
+    resolves and performs the documented shallow last-write-wins.
+
+    Many production callers legitimately use this spelling (task_interceptor,
+    citation_verifier), so the task-3581 guard must fire only on the
+    contradictory PAIR — never on 'merge' on its own."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        metadata_mode='merge',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    # Shallow: the whole memory_hints key was overwritten wholesale...
+    assert meta['memory_hints'] == _DF3857_INCOMING_HINTS['memory_hints'], (
+        f"bare metadata_mode='merge' must stay shallow last-write-wins: {meta}"
+    )
+    # ...while untouched top-level siblings survive (that is what 'merge' means).
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_details_only_merge_plus_append_true_ok(backend, project_root):
+    """A details-only merge+append=True write (NO metadata) is NOT rejected —
+    the task-3581 guard is scoped to metadata-present writes, so the
+    details-append path stays green even when an inert metadata_mode='merge'
+    rides along. append=True appends to details rather than replacing it."""
+    await backend.add_task(
+        project_root=project_root, title='t', details='old',
+        metadata=json.dumps({'_causation_id': 'keep'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='new', metadata_mode='merge', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'new' in task['details'], (
+        f'details-only append=True should append: {task["details"]!r}'
+    )
+    assert 'old' in task['details'], (
+        f'details-only append=True must not replace: {task["details"]!r}'
+    )
+    assert task['metadata'].get('_causation_id') == 'keep', (
+        f'a details-only write must not disturb metadata: {task["metadata"]}'
     )
 
 

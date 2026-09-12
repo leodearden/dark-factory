@@ -16,6 +16,7 @@ import click
 from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, load_config
+from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -441,16 +442,38 @@ def check_config(config_path: Path | None):
     \b
       * name it with the reserved ``x_``/``x-`` prefix (works at any depth, no
         config ceremony) — the preferred form for a NEW knob;
-      * add its dotted path to ``config_key_census.ignore`` in the same YAML
-        (fnmatch globs, so ``cpu_governance.*`` opts out a whole namespace) —
-        for existing names other tooling already greps for.
+      * add it to ``config_key_census.ignore`` in the same YAML (fnmatch globs,
+        so ``cpu_governance.*`` opts out a whole namespace) — for existing
+        names other tooling already greps for.
 
-    Exits 1 if any GENUINELY-unknown key is found, or if the file could not be
-    read or parsed at all (a census of nothing is not a clean census); else 0.
-    An EMPTY project YAML is a legitimate clean result — it means "use all
-    defaults" — and still exits 0.
+    An ignore entry is an ASSERTION that some non-orchestrator consumer reads
+    the key, so it should carry a justification:
+
+    \b
+      config_key_census:
+        ignore:
+          - path: cpu_governance.weights
+            reason: read verbatim by scripts/cpu-governed-exec.sh
+          - path: warm_lane_pool
+            reason: temporary — pending #5908, which deletes this entry
+
+    A bare string still works but reports as un-reasoned DEBT.  If the consumer
+    has NOT landed yet, the reason must cite its tracking task as ``#NNNN``:
+    an uncited "pending" claim has no expiry, so nothing will ever re-check it.
+
+    \b
+    Exit codes:
+      0 — no unknown keys and no HARD ignore-entry findings (advisory findings
+          are reported but stay exit-neutral).  An EMPTY project YAML is a
+          legitimate clean result — it means "use all defaults" — and exits 0;
+      1 — at least one GENUINELY-unknown key, OR the file could not be read or
+          parsed at all (a census of nothing is not a clean census, task 4124);
+          dominates 2;
+      2 — no unknown keys, but at least one HARD ignore-entry finding
+          (self-refuting / missing-cite / orphaned).
     """
     from orchestrator.config import census_config_keys
+    from orchestrator.config_census_ignore import HARD_KINDS
 
     # Resolve the config path (arg wins, then ORCH_CONFIG_PATH) without
     # constructing a validated config — census only needs the raw YAML path.
@@ -473,7 +496,8 @@ def check_config(config_path: Path | None):
     # `unknown` empty for an unreadable/unparseable file, so printing the
     # affirmative OK below would tell an operator a config is safe precisely
     # when it could not be inspected at all.  The ignored/OK sections are both
-    # vacuous in this case, so return before either.
+    # vacuous in this case, so return before either — and so is the
+    # ignore-entry audit below, which re-reads the same unparseable file.
     if census.parse_error:
         click.echo(f'Error: {census.parse_error}', err=True)
         click.echo(
@@ -482,6 +506,15 @@ def check_config(config_path: Path | None):
             err=True,
         )
         sys.exit(1)
+
+    # A broken lint must never turn a working gate into a crash, so the audit
+    # (which reaches the filesystem and a sqlite store) degrades to "no
+    # findings" rather than taking check-config down with it.
+    try:
+        findings = audit_census_ignore_entries(config_path)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        click.echo(f'WARNING: ignore-entry audit failed ({exc}) — skipped.', err=True)
+        findings = []
 
     # Informational FIRST, and explicitly marked as such: these keys were
     # deliberately excused, so listing them keeps an over-broad glob auditable
@@ -496,10 +529,37 @@ def check_config(config_path: Path | None):
             '(informational — does not affect the exit code):'
         )
         for ik in census.ignored:
-            click.echo(f'  {ik.path}  ({_REASONS.get(ik.reason, f"ignored: {ik.reason}")})')
+            label = _REASONS.get(ik.reason, f'ignored: {ik.reason}')
+            # An allowlisted key with no operator justification is DEBT, and
+            # saying so is the whole point: an unexplained entry is an
+            # unfalsifiable assertion about a consumer nobody can check.
+            if ik.note:
+                suffix = f'  — {ik.note}'
+            elif ik.reason == 'allowlist':
+                suffix = '  — no reason given (undocumented debt)'
+            else:
+                suffix = ''
+            click.echo(f'  {ik.path}  ({label}){suffix}')
+        click.echo('')
+
+    hard = [f for f in findings if f.kind in HARD_KINDS]
+    if findings:
+        advisory = [f for f in findings if f.kind not in HARD_KINDS]
+        click.echo(f'{len(findings)} finding(s) in config_key_census.ignore entries:')
+        for f in hard + advisory:
+            click.echo(f'  [{f.severity}] {f.kind}: {f.detail}')
+        click.echo(
+            f'  ({len(advisory)} advisory finding(s) do not affect the exit code.)'
+        )
         click.echo('')
 
     if not census.unknown:
+        if hard:
+            click.echo(
+                f'FAIL: {config_path} has {len(hard)} hard ignore-entry '
+                'finding(s) (no unknown config keys).'
+            )
+            sys.exit(2)
         click.echo(f'OK: {config_path} has no unknown config keys.')
         sys.exit(0)
 

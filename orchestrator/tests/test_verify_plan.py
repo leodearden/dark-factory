@@ -1870,6 +1870,54 @@ class TestDeriveVerifyPlanFallbackPath:
         assert run.cmd is not None
         assert run.cmd.targets == ('.',)
 
+    def test_collectable_tests_with_configured_suite_run_verbatim_unscoped(self):
+        """Fidelity fix (task γ review, correctness finding): configured suite runs VERBATIM.
+
+        Distinct from every other test in this class: the diff here is
+        collectable test file(s) ONLY — no conftest, no test-data module, no
+        structural file — so this exercises the ``elif collectable_tests:``
+        arm with ``has_real_suite`` True. ``_build_fallback_config`` never
+        file-scopes a real configured suite; it always runs it verbatim
+        (unscoped) or skips it entirely. Recording FILE_SCOPED here — as the
+        bare-default else-branch below it does — would misrepresent what
+        actually executes.
+
+        The touched path is root-owning (``tests/`` carries no
+        ``pyproject.toml`` of its own), so ``_build_fallback_config`` would
+        reach this same config-verbatim branch for it too —
+        ``_single_subproject_prefix`` disqualifies ``tests/`` for lacking an
+        owning ``pyproject.toml``, so neither of its pure-/mixed-subproject
+        branches (which DO file/subproject-scope a real configured suite,
+        ahead of the verbatim branch in that function) intercepts it. A
+        subproject-owned path like ``shared/tests/...`` would NOT reach the
+        verbatim branch there, even though ``derive_verify_plan`` — pure and
+        worktree-blind — treats both identically; picking a path where the
+        two agree keeps this docstring's claim honest about what actually
+        executes.
+
+        The parametrized sweep
+        (``test_fallback_path_scoped_targets_nonempty_exactly_for_file_scoped_runs``,
+        ids ``fallback/real-suite`` x ``collectable-test``) DOES execute this
+        same branch, but its body (``_assert_scoped_targets_invariant``)
+        pins only ``bool(scoped_targets) == (scope_kind is FILE_SCOPED)`` — a
+        regression to the pre-fix FILE_SCOPED-with-populated-scoped_targets
+        shape satisfies that invariant too, so the sweep would stay green
+        through it. Assertion 4 below (exact command equality against the
+        unmodified parsed configured suite) is the fidelity pin the sweep
+        does not provide: a FILE_SCOPED regression necessarily scopes the
+        command to the touched file and so cannot satisfy it.
+        """
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command=ROOT_TEST_COMMAND)
+        plan = derive_verify_plan(
+            ['tests/test_widget.py'], [], config, fake_worktree_reader,
+        )
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scoped_targets == ()
+        assert run.cmd == parse_config_command(config.test_command)
+        assert 'verbatim' in run.reason
+
 
 # ---------------------------------------------------------------------------
 # Plan-level flags: needs_pipeline_guard_check / TRIVIAL (step-11: RED)
@@ -2480,6 +2528,12 @@ class TestPlanRecordScopedTargets:
         never a ModuleConfig, so the module-config axis is deliberately
         absent rather than inert: crossing it in would re-run each case five
         times under ids naming a dimension nothing reads.
+
+        Fidelity pin for the ``fallback/real-suite`` x ``collectable-test``
+        case (this sweep executes that branch but pins only the
+        scope-consistency invariant above) lives in
+        ``TestDeriveVerifyPlanFallbackPath
+        .test_collectable_tests_with_configured_suite_run_verbatim_unscoped``.
         """
         plan = derive_verify_plan(files, [], config, fake_worktree_reader, role=role)
         _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{diff_name}')
@@ -2666,3 +2720,73 @@ class TestEffectiveMergeModuleConfigs:
         monkeypatch.setattr(verify_plan_module, '_merge_breadth_is_full', lambda _cfg: False)
 
         assert effective_merge_module_configs(config, [mc_a]) == [mc_a]
+
+
+# ---------------------------------------------------------------------------
+# Version pin survival through the VerifyCmd-layer scoper (task 3931)
+# ---------------------------------------------------------------------------
+
+# The committed fleet chain is deliberately BARE — task 4538 pins the pyright
+# version out-of-band, in the repo-root package.json that
+# verify_cold_preprovision_command's `npm ci` materialises — so the pinned
+# fixture is DERIVED from it here. The non-vacuity assert in
+# ``test_unpinned_chain_scopes_exactly_as_today`` below is what keeps the two
+# fixtures from collapsing into one string if that ever changes.
+_PINNED_TYPE_CHAIN_3931 = ROOT_TYPE_CHECK_COMMAND.replace('npx pyright', 'npx pyright@1.1.408')
+_ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
+
+
+class TestVersionPinSurvivesPrefixScoping:
+    """``_scope_prefix_to_keyword`` must keep a pinned npx package version.
+
+    Task 3931 / esc-3805-1 — the LOCKSTEP counterpart of
+    ``test_verify.py::TestVersionPinSurvivesScoping``.
+
+    This function is the ``VerifyCmd``-layer twin of
+    ``verify._scope_to_keyword`` and carries the IDENTICAL byte-offset
+    truncation (``retained = head[: idx + len(keyword)]``); its own docstring
+    states that *raw* "is ALWAYS truncated to everything up to and including
+    the first occurrence of *keyword* before being (re-)parsed". So it strips a
+    version pin exactly the same way, and the two layers must be fixed in the
+    SAME commit or they silently diverge — the trap task 3830 fell into, where
+    a plan named only verify.py while verify_plan.py needed the identical
+    change.
+
+    MEASURED on this branch before the step-6 change (and after step-4, so this
+    is verify_plan.py's own stripping, not the parser's):
+
+        _scope_prefix_to_keyword(PINNED, 'pyright', [file])
+            -> ToolKind.PYRIGHT, renders 'npx pyright <file>'   <-- pin GONE
+    """
+
+    def test_pinned_chain_keeps_its_version(self):
+        cmd = _scope_prefix_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert render(cmd) == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
+            f'_scope_prefix_to_keyword dropped the version pin, rendering '
+            f'{render(cmd)!r} (task 3931, esc-3805-1). This is the '
+            'VerifyCmd-layer twin of verify._scope_to_keyword and must be '
+            'fixed in lockstep with it — the pair routes through one shared '
+            'split_chain_tail gate and its STRUCTURAL lockstep is a documented '
+            'property'
+        )
+
+    def test_unpinned_chain_scopes_exactly_as_today(self):
+        """Regression floor: the bare spelling is unchanged."""
+        assert _PINNED_TYPE_CHAIN_3931 != ROOT_TYPE_CHECK_COMMAND, (
+            'the committed fleet chain already carries an inline `@<version>` '
+            '(task 3931 / 4538) — the pinned fixture above would then be the '
+            'same string as this one and neither guard would mean anything'
+        )
+        cmd = _scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
+
+    def test_a_longer_unrelated_token_is_not_absorbed(self):
+        """Same boundary rule as verify.py's: widen across `@<version>` ONLY.
+
+        Passes today; it is the floor that makes the step-6 widening provably
+        narrow rather than a general "keep the whole token" change.
+        """
+        cmd = _scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
+        assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'

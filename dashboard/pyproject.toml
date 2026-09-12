@@ -61,13 +61,18 @@ asyncio_mode = "auto"
 # stall is unconfirmed (task 3431 flags it as an unverified hypothesis, not
 # established fact). Without this cap, a wedge like that hangs the whole
 # suite with no output instead of failing loud with a traceback.
-# 60s matches shared/escalation/orchestrator/fused-memory's default, so slow
+# 300s matches shared/escalation/orchestrator/fused-memory's default, so slow
 # tests can opt up individually with @pytest.mark.timeout(N) as those
 # configs document. Per-module merge/root verify test_commands already pass
 # --timeout=300 on the CLI (which overrides this ini value), so this default
 # instead governs bare local/agent invocations (`cd dashboard && uv run
 # pytest tests/`, the form CONTRIBUTING.md and the 3216 incident used).
-timeout = 60
+# Raised 60→300 on 2026-09-12; see shared/pyproject.toml for the full
+# rationale (the cap is WALL-CLOCK, so a healthy test starved of CPU on a
+# loaded 32-core host trips it, and in the xdist packages that reds a
+# SHIFTING VICTIM rather than the starved test). 300 is INTERIM and
+# judgement-picked, not measured.
+timeout = 300
 # dashboard runs no pytest-xdist, so signal is safe and is the only method
 # that interrupts a blocking main-thread wait (thread mode can't — mirrors
 # escalation/pyproject.toml). Residual risk: signal only raises in the main

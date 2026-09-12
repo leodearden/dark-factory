@@ -44,8 +44,8 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
     test tweak just the field(s) it cares about. Includes the C1 schema
     extensions (parent_session_id/spawn_mode/display/question) and the
-    task-4193 hook-owner binding (claude_session_id) alongside the original
-    rail fields.
+    task-4193 hook-owner binding (claude_session_id, claude_owner_pid)
+    alongside the original rail fields.
     """
     # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
     # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
@@ -74,6 +74,7 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         ),
         'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
         'claude_session_id': 'uuid-claude-abc123',
+        'claude_owner_pid': 424242,
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -247,6 +248,77 @@ def test_session_record_round_trip_includes_claude_session_id() -> None:
 def test_session_record_defaults_claude_session_id_to_none() -> None:
     record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
     assert record.claude_session_id is None
+
+
+def test_session_record_round_trip_includes_claude_owner_pid() -> None:
+    # esc-4193-11 suggestion 3: to_dict/from_dict must actually carry
+    # claude_owner_pid -- without a non-None value in _make_record's fields,
+    # the round-trip pin above is vacuous (both sides default to None even
+    # if to_dict silently dropped the key).
+    r = _make_record()
+    assert r.claude_owner_pid == 424242
+    assert r.to_dict()['claude_owner_pid'] == 424242
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),  # bool is an int subclass; must be rejected before the int check
+        ('x', None),
+        (3.0, None),
+        (0, None),
+        (-1, None),
+        (None, None),
+        (4242, 4242),
+    ],
+)
+def test_coerce_owner_pid(raw: object, expected: int | None) -> None:
+    assert sr._coerce_owner_pid(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),
+        (123, None),
+        (3.0, None),
+        (None, None),
+        ('', None),
+        ('   ', None),
+        ('uuid-claude-abc123', 'uuid-claude-abc123'),
+        ('  uuid-claude-abc123  ', 'uuid-claude-abc123'),
+    ],
+)
+def test_coerce_session_id(raw: object, expected: str | None) -> None:
+    assert sr._coerce_session_id(raw) == expected
+
+
+def test_session_record_from_dict_coerces_non_str_claude_session_id() -> None:
+    # esc-4193-11 suggestion 2: a hand-edited or future-writer record body
+    # carrying a non-string claude_session_id must not survive into the
+    # SessionRecord -- session_hooks does `(record.claude_session_id or
+    # '').strip()` outside a try/except, so a raw int here would raise
+    # AttributeError and lose the whole hook event.
+    data = _make_record().to_dict()
+    data['claude_session_id'] = 123
+    record = sr.SessionRecord.from_dict(data)
+    assert record.claude_session_id is None
+
+
+def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
+    # Sibling to the claude_session_id regression test above (task 4660
+    # review follow-up): pins the from_dict call site for claude_owner_pid
+    # too, so replacing `_coerce_owner_pid(data.get(...))` with a bare
+    # `data.get(...)` cannot go unnoticed. True is an int subclass and would
+    # otherwise survive as a real-looking pid, which could silently compare
+    # equal to a real pid in session_hooks._env_slug_ownership
+    # (session_hooks.py:329).
+    data = _make_record().to_dict()
+    data['claude_owner_pid'] = True
+    record = sr.SessionRecord.from_dict(data)
+    assert record.claude_owner_pid is None
 
 
 def test_spawn_mode_enum_values() -> None:
@@ -779,6 +851,128 @@ def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -
     reread = sr.read_record(r.session_slug, root=tmp_path)
     assert reread.status == sr.Status.RUNNING
     assert sr.record_path_for_slug(r.session_slug, root=tmp_path) == path_before
+
+
+# ---------------------------------------------------------------------------
+# apply_refresh -- the PURE (no-I/O) half of refresh_record (task 4662)
+#
+# session_hooks performs three reads of one record.json per hook event; the
+# third is refresh_record's own internal read. Splitting the upsert body out
+# as a pure function lets a caller that ALREADY holds the record produce the
+# refreshed body without a second read, so one event can settle on ONE
+# snapshot and ONE write. These tests pin that the split half is genuinely
+# I/O-free and that refresh_record, re-expressed on top of it, is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _no_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ANY registry filesystem access explode.
+
+    apply_refresh is the seam session_hooks needs precisely because it
+    touches no disk; asserting "we passed no root" would not catch an
+    implementation that reached for the default root, so the read/write
+    entry points are booby-trapped instead.
+    """
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError('apply_refresh must perform no filesystem access')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+    monkeypatch.setattr(sr, 'write_record', _boom)
+
+
+def test_apply_refresh_updates_prior_in_place_and_does_no_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior = _make_record(status=sr.Status.LAUNCHING)
+    before = prior.to_dict()
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=sr.Status.IDLE)
+
+    # In-place read-modify, exactly like refresh_record/update_status today.
+    assert result is prior
+    assert result.status is sr.Status.IDLE
+    # Every other field survives byte-identical.
+    after = result.to_dict()
+    del before['status'], after['status']
+    assert after == before
+
+
+def test_apply_refresh_with_no_status_is_a_pure_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status=None must leave the prior status alone.
+
+    This is the case the launch-window withhold path relies on: it wants the
+    mtime heartbeat bumped without promoting a still-LAUNCHING record.
+    """
+    prior = _make_record(status=sr.Status.LAUNCHING)
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=None)
+
+    assert result is prior
+    assert result.status is sr.Status.LAUNCHING
+
+
+def test_apply_refresh_synthesizes_a_well_formed_record_when_prior_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('hand-launched-slug', None, status=sr.Status.RUNNING)
+
+    assert result.session_slug == 'hand-launched-slug'
+    assert result.status is sr.Status.RUNNING
+    assert result.schema_version == sr.SCHEMA_VERSION
+    # A parseable ISO-8601 start_ts, not merely a non-empty string.
+    assert result.start_ts
+    assert datetime.fromisoformat(result.start_ts)
+
+
+def test_apply_refresh_synthesis_defaults_to_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LAUNCHING is refresh_record's documented default for a new record."""
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('hand-launched-slug', None, status=None)
+
+    assert result.status is sr.Status.LAUNCHING
+
+
+@pytest.mark.parametrize('status', [sr.Status.RUNNING, None])
+def test_refresh_record_equals_read_apply_write(
+    tmp_path: Path, status: sr.Status | None
+) -> None:
+    """refresh_record(...) == write_record(apply_refresh(read_record(...))).
+
+    The equivalence is the whole point of the split: session_hooks composes
+    the second spelling from a snapshot it already holds, so it must produce
+    a byte-identical body to the one refresh_record writes today.
+    """
+    seed = _make_record(status=sr.Status.LAUNCHING)
+    sr.write_record(seed, root=tmp_path)
+    via_refresh = sr.refresh_record(seed.session_slug, root=tmp_path, status=status)
+    refreshed_bytes = sr.record_path_for_slug(
+        seed.session_slug, root=tmp_path
+    ).read_text(encoding='utf-8')
+
+    # Re-seed and take the composed route over the same starting body.
+    sr.write_record(_make_record(status=sr.Status.LAUNCHING), root=tmp_path)
+    composed = sr.apply_refresh(
+        seed.session_slug,
+        sr.read_record(seed.session_slug, root=tmp_path),
+        status=status,
+    )
+    sr.write_record(composed, root=tmp_path)
+    composed_bytes = sr.record_path_for_slug(
+        seed.session_slug, root=tmp_path
+    ).read_text(encoding='utf-8')
+
+    assert composed_bytes == refreshed_bytes
+    assert composed.to_dict() == via_refresh.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -7361,7 +7555,7 @@ class TestAtomicWriteSemantics:
     ``shared.safe_io.atomic_write_text``, but this module is the deliberate
     exception: it is stdlib-only so ``skills/spawn/spawn-claude.sh`` can run it
     with no venv (see ``TestStdlibOnlySelfContainment`` below and
-    ``_ALLOWED_RENAMERS`` in ``shared/tests/test_safe_io.py``).
+    ``_ALLOWED_RENAMERS`` in ``tests/scripts/test_atomic_write_regrowth.py``).
 
     So these assert the OBSERVABLE result on disk rather than that a particular
     helper was called. That is the more durable pin anyway: it holds whether

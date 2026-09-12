@@ -25,6 +25,7 @@ construction, no real graph. The LLM path is exercised through the extracted
 """
 
 import json
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -75,12 +76,26 @@ def no_ambient_openai_env(monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY', 'env-key-must-not-be-used')
 
 
-def _config(llm_url: str, embedder_url: str) -> FusedMemoryConfig:
+def _config(
+    llm_url: str,
+    embedder_url: str,
+    *,
+    client_class: Literal['openai', 'openai_generic'] = 'openai_generic',
+    structured_output_mode: Literal['auto', 'json_object'] = 'json_object',
+) -> FusedMemoryConfig:
+    """One config builder for every arm.
+
+    ``client_class``/``structured_output_mode`` default to the local-endpoint
+    arm this file was written for. The default (shipped) ``'openai'`` arm passes
+    ``client_class='openai'`` with ``structured_output_mode='auto'`` — LLMConfig
+    rejects ``'json_object'`` on that arm at construction, so the combination
+    stays honest rather than being silently derived here.
+    """
     return FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',
-            client_class='openai_generic',
-            structured_output_mode='json_object',
+            client_class=client_class,
+            structured_output_mode=structured_output_mode,
             model='mock-model',
             providers=LLMProvidersConfig(
                 openai=OpenAIProviderConfig(api_key='test-key', api_url=llm_url),
@@ -166,6 +181,47 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
             await client.generate_response(
                 [Message(role='user', content='Alice knows Bob.')],
                 response_model=_Extraction,
+            )
+
+            body = server.requests_to('/chat/completions')[0]['json_body']
+            assert body['max_tokens'] == 2048
+
+    @pytest.mark.asyncio
+    async def test_configured_max_tokens_reaches_the_wire_on_the_default_arm(
+        self, no_ambient_openai_env,
+    ):
+        """Same proof for the SHIPPED default arm (task 3864).
+
+        ``BaseOpenAIClient.__init__`` (openai_base_client.py:51-67) — the base
+        of graphiti's ``OpenAIClient`` — re-assigns ``self.max_tokens`` from its
+        own parameter (upstream's ``DEFAULT_MAX_TOKENS``) right after
+        ``super().__init__`` took the configured value off the config object,
+        and ``_generate_response`` then sends ``max_tokens or self.max_tokens``
+        (:176,187). A construction-kwarg assertion structurally cannot catch a
+        value that is accepted and then dropped — the same reason this whole
+        file exists for base_url — so this pins the recorded request body.
+
+        No ``response_model`` is passed, deliberately: that routes through
+        ``_create_completion`` → ``chat.completions``, which the mock server
+        serves, whereas the structured path calls ``client.responses.parse``
+        against ``/v1/responses``, which it does not. The same ``self.max_tokens``
+        feeds both paths, so the served path is a sound proof for both. The
+        mock's default ``chat_content`` (``{"ok": true}``) is a valid reply here
+        — with no response_model there is no envelope to violate.
+        """
+        with mock_openai_server() as server:
+            cfg = _config(
+                server.base_url,
+                server.base_url,
+                client_class='openai',
+                structured_output_mode='auto',
+            )
+            cfg.llm.max_tokens = 2048  # distinct from schema default 4096 and upstream's
+            client = build_llm_client(cfg)
+            assert client is not None
+
+            await client.generate_response(
+                [Message(role='user', content='Alice knows Bob.')],
             )
 
             body = server.requests_to('/chat/completions')[0]['json_body']

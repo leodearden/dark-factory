@@ -31,7 +31,10 @@ constructing ``Harness(real_config)`` — a full real-config harness would
 resolve ``project_root``/``overrides_db_path`` under the real repo and write
 to ``data/`` (test-hygiene risk). Grafting the model-parsed committed values
 ties the deployment config to the code path (a field rename/typo would show
-up as a reverted-to-default value) while keeping the test hermetic.
+up as a reverted-to-default value) while keeping the test hermetic. The one
+exception is ``orchestrator_restart_on_merge_enabled`` itself, which is
+forced on locally rather than grafted from the committed value — see
+``_graft_committed_restart_config``'s docstring for why.
 """
 
 from __future__ import annotations
@@ -75,10 +78,25 @@ def _load_committed_orchestrator_config(monkeypatch: pytest.MonkeyPatch) -> Orch
 
 
 def _graft_committed_restart_config(harness: Harness, committed: OrchestratorConfig) -> None:
-    """Copy the committed config's orchestrator_restart_* fields onto harness.config."""
-    harness.config.orchestrator_restart_on_merge_enabled = (
-        committed.orchestrator_restart_on_merge_enabled
-    )
+    """Copy the committed config's orchestrator_restart_* fields onto harness.config
+    -- except orchestrator_restart_on_merge_enabled, which is forced on locally.
+
+    These three tests (scenarios 9-10) cover coordinator COMPOSITION (script
+    path, watch prefixes, ``_require_idle``, the I3 merge-drain precondition)
+    and burst coalescing. The restart *fire path* is the vehicle for that
+    coverage, not the subject under test.
+
+    ``orchestrator_restart_on_merge_enabled`` is an OPS lever, not a code
+    contract: it was flipped ``true -> false`` on 2026-09-03 by the fleet
+    deploy pause. Grafting it here (as the other four fields are grafted)
+    would silently delete all three guards' fire-path coverage for the whole
+    duration of the pause. Deploy policy for this flag is deliberately
+    pinned by NO test — it is an operator lever.
+
+    Task 5020 is the gate that restores the committed value once the pause
+    lifts; once it does, this override is a no-op.
+    """
+    harness.config.orchestrator_restart_on_merge_enabled = True
     harness.config.orchestrator_restart_script = committed.orchestrator_restart_script
     harness.config.orchestrator_restart_watch_prefixes = (
         committed.orchestrator_restart_watch_prefixes
@@ -155,6 +173,13 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         coord = harness._build_orchestrator_restart_coordinator()
 
         assert isinstance(coord, StaleServiceRestartCoordinator)
+        # Not a tautology: _graft_committed_restart_config forces the harness
+        # config's flag to True, so this pins that
+        # harness._build_orchestrator_restart_coordinator plumbs
+        # config.orchestrator_restart_on_merge_enabled through to
+        # StaleServiceRestartCoordinator(enabled=...) -- a builder that
+        # hardcoded enabled=False, or wired the wrong config field, still
+        # fails here.
         assert coord.enabled is True
         assert coord._script_path == 'scripts/restart-all-orchestrators.sh'
         # Asserted against the parsed committed config's own field (not a

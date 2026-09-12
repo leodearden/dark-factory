@@ -697,6 +697,618 @@ class TestInertProvenance:
 
 
 # --------------------------------------------------------------------------- #
+# Task 4808 — the BRIDGE: deriving `unstamped_live_ids` from inert provenance.
+#
+# `evaluate_closure` has always ACCEPTED `unstamped_live_ids`, and
+# `build_consolidation_gate_task` has always WRITTEN
+# `provenance.observed_members`, but nothing computed one from the other, so
+# `unstamped_cluster_member` was unreachable outside these tests.
+# --------------------------------------------------------------------------- #
+
+
+def _prov(observed):
+    """A gate block whose inert kappa-shaped provenance names *observed*."""
+    return {
+        'topic': _TOPIC,
+        'provenance': {
+            'report_run': 'run-abc',
+            'observed_members': list(observed),
+            'detector': 'topic-cluster-scan',
+            'authoritative': False,
+        },
+    }
+
+
+class TestUnstampedCandidates:
+    """The PURE half of the bridge: which observed ids must be PROBED.
+
+    `unstamped_candidates` is `observed_members` MINUS the live topic scroll
+    MINUS the canonical\'s `supersedes` claim.  It answers "which ids are
+    ambiguous", not "which ids are unstamped" — an id absent from the scroll
+    is either absorbed-and-deleted or live-but-unstamped, and only a probe
+    can tell those apart.
+    """
+
+    def test_a_stamped_observed_member_is_not_a_candidate(self):
+        """The measured 2026-08-27 corpus shape: every observed member is in
+        the scroll, so all four known-good gates derive ZERO candidates."""
+        members = _well_formed_cluster(3)
+        observed = [_uuid(1), _uuid(2), _uuid(3)]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov(observed), members=members
+            )
+            == ()
+        )
+
+    def test_an_observed_member_absent_from_the_scroll_is_a_candidate(self):
+        stray = _uuid(42)
+        assert consolidation_gate.unstamped_candidates(
+            _prov([_uuid(1), stray]), members=_well_formed_cluster(2)
+        ) == (stray,)
+
+    def test_the_canonicals_supersedes_claim_suppresses_a_candidate(self):
+        """The DELETE arm.  Subtracting the cluster\'s own absorption claim is
+        what keeps a correctly executed delete-arm consolidation closeable."""
+        absorbed = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
+            _member(_uuid(2)),
+        ]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([_uuid(1), absorbed]), members=members
+            )
+            == ()
+        )
+
+    def test_the_legacy_bare_scalar_supersedes_spelling_also_suppresses(self):
+        """81 live records predate 3196\'s list migration; `normalize_supersedes`
+        accepts both spellings and this derivation must not disagree with it."""
+        absorbed = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=absorbed),
+            _member(_uuid(2)),
+        ]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([absorbed]), members=members
+            )
+            == ()
+        )
+
+    def test_a_non_canonical_peers_supersedes_does_not_suppress(self):
+        """Only the CANONICAL\'s claim is the cluster\'s claim — the same rule
+        `consolidation_gate.py::_classify_supersedes` already states."""
+        stray = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True),
+            _member(_uuid(2), supersedes=[stray]),
+        ]
+        assert consolidation_gate.unstamped_candidates(
+            _prov([stray]), members=members
+        ) == (stray,)
+
+    def test_supersedes_is_only_read_when_exactly_one_canonical_exists(self):
+        """With two canonicals there is no single cluster claim to trust; the
+        gate is refusing on `multiple_canonicals` anyway."""
+        absorbed = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
+            _member(_uuid(2), canonical=True),
+        ]
+        assert consolidation_gate.unstamped_candidates(
+            _prov([absorbed]), members=members
+        ) == (absorbed,)
+
+    def test_a_non_uuid_observed_id_is_dropped(self):
+        """It cannot be probed, so it can never be substantiated."""
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov(['not-a-uuid', '', 'deadbeef', None]),
+                members=_well_formed_cluster(2),
+            )
+            == ()
+        )
+
+    def test_scroll_matching_is_case_insensitive(self):
+        """Mirrors `evaluate_closure`\'s own case-folded `live_ids`, so the two
+        cannot disagree about what the scroll saw."""
+        members = [_member(_uuid(1).upper(), canonical=True)]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([_uuid(1)]), members=members
+            )
+            == ()
+        )
+
+    def test_supersedes_matching_is_case_insensitive(self):
+        absorbed = _uuid(42)
+        members = [_member(_uuid(1), canonical=True, supersedes=[absorbed.upper()])]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([absorbed]), members=members
+            )
+            == ()
+        )
+
+    def test_the_result_is_deduped_and_first_seen_ordered(self):
+        """Deterministic, so refusal messages and tests are stable."""
+        a, b = _uuid(42), _uuid(43)
+        assert consolidation_gate.unstamped_candidates(
+            _prov([b, a, b, a]), members=_well_formed_cluster(2)
+        ) == (b, a)
+
+    def test_the_original_id_spelling_is_returned_not_the_folded_one(self):
+        """A refusal must name the id exactly as the gate recorded it."""
+        stray = _uuid(42).upper()
+        assert consolidation_gate.unstamped_candidates(
+            _prov([stray]), members=_well_formed_cluster(2)
+        ) == (stray,)
+
+    @pytest.mark.parametrize(
+        'block',
+        [
+            None,
+            'not-a-mapping',
+            42,
+            {},
+            {'topic': _TOPIC},
+            {'topic': _TOPIC, 'provenance': None},
+            {'topic': _TOPIC, 'provenance': 'not-a-mapping'},
+            {'topic': _TOPIC, 'provenance': {}},
+            {'topic': _TOPIC, 'provenance': {'observed_members': None}},
+            {'topic': _TOPIC, 'provenance': {'observed_members': 42}},
+            # A bare string is a Sequence but is NOT a member list; iterating
+            # it would yield 36 single characters, none of them a uuid.
+            {'topic': _TOPIC, 'provenance': {'observed_members': _uuid(42)}},
+            {'topic': _TOPIC, 'provenance': {'observed_members': b'bytes'}},
+        ],
+    )
+    def test_defensive_shapes_return_empty_rather_than_raising(self, block):
+        """This predicate\'s job is to REPORT malformedness; one that dies on
+        bad input blocks the very gates it exists to adjudicate."""
+        assert (
+            consolidation_gate.unstamped_candidates(
+                block, members=_well_formed_cluster(2)
+            )
+            == ()
+        )
+
+    def test_malformed_scroll_rows_do_not_raise(self):
+        assert consolidation_gate.unstamped_candidates(
+            _prov([_uuid(42)]), members=['not-a-mapping', None, {}, {'id': None}]
+        ) == (_uuid(42),)
+
+    def test_it_is_exported(self):
+        assert 'unstamped_candidates' in consolidation_gate.__all__
+
+class _RecordingProbe:
+    """An ``exists`` collaborator that records every call it is given.
+
+    Hand-rolled rather than an ``AsyncMock`` so the recorded shape is the
+    exact ``(memory_id, *, project_id)`` contract under test — an AsyncMock
+    would accept any signature and pass a scoping slip silently.
+    """
+
+    def __init__(self, live=(), raises=None):
+        self.live = {str(i).lower() for i in live}
+        self.raises = raises
+        self.calls = []
+
+    async def __call__(self, memory_id, *, project_id):
+        self.calls.append((memory_id, project_id))
+        if self.raises is not None:
+            raise self.raises
+        return str(memory_id).lower() in self.live
+
+
+class TestResolveUnstampedLiveIds:
+    """The PROBE half of the bridge: which candidates are genuinely live.
+
+    A candidate absent from the scroll is either absorbed-and-deleted or
+    live-but-unstamped.  One point read per candidate settles it — and the
+    candidate list is empty on every well-formed gate, so the common path
+    issues no reads at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_live_candidate_is_returned(self):
+        """THE defect: live, but never stamped into the topic, therefore
+        invisible to the topic scroll."""
+        stray = _uuid(42)
+        probe = _RecordingProbe(live=[stray])
+        assert await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([stray]),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        ) == (stray,)
+
+    @pytest.mark.asyncio
+    async def test_an_absent_candidate_is_not_returned(self):
+        """Deleted without being claimed in `supersedes` is still an ABSORBED
+        id, not a stray — so the delete arm still closes."""
+        gone = _uuid(42)
+        probe = _RecordingProbe(live=[])
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([gone]),
+                members=_well_formed_cluster(2),
+                exists=probe,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+        assert len(probe.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_each_candidate_is_probed_exactly_once_and_scoped(self):
+        """A cross-project probe would judge one project\'s gate against
+        another project\'s memories — the same scoping argument
+        `TaskInterceptor.set_consolidation_scroll` makes for the scroll."""
+        a, b = _uuid(42), _uuid(43)
+        probe = _RecordingProbe(live=[a, b])
+        await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([a, b, a]),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        )
+        assert probe.calls == [(a, 'dark_factory'), (b, 'dark_factory')]
+
+    @pytest.mark.asyncio
+    async def test_suppressed_ids_are_never_probed(self):
+        """The cheap subtraction runs FIRST: stamped, claimed and non-uuid ids
+        cost nothing."""
+        stamped, absorbed = _uuid(1), _uuid(42)
+        members = [
+            _member(stamped, canonical=True, supersedes=[absorbed]),
+            _member(_uuid(2)),
+        ]
+        probe = _RecordingProbe(live=[stamped, absorbed])
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([stamped, absorbed, 'not-a-uuid']),
+                members=members,
+                exists=probe,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+        assert probe.calls == []
+
+    @pytest.mark.asyncio
+    async def test_zero_candidates_never_awaits_the_probe(self):
+        """The measured 2026-08-27 corpus shape: every observed member is
+        already stamped, so all four known-good gates cost zero reads."""
+        probe = _RecordingProbe()
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([_uuid(1), _uuid(2)]),
+                members=_well_formed_cluster(2),
+                exists=probe,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+        assert probe.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_unwired_probe_is_dormant(self):
+        """Without a probe we cannot tell absorbed from unstamped, and guessing
+        \'unstamped\' would make every delete-arm consolidation uncloseable."""
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([_uuid(42)]),
+                members=_well_formed_cluster(2),
+                exists=None,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_propagates(self):
+        """Both callers own the fail-closed policy; swallowing here would let
+        an unreadable store read as \'no strays\'."""
+        probe = _RecordingProbe(raises=TimeoutError('qdrant timed out'))
+        with pytest.raises(TimeoutError):
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([_uuid(42)]),
+                members=_well_formed_cluster(2),
+                exists=probe,
+                project_id='dark_factory',
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_result_preserves_candidate_order(self):
+        a, b, c = _uuid(42), _uuid(43), _uuid(44)
+        probe = _RecordingProbe(live=[a, c])
+        assert await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([c, b, a]),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        ) == (c, a)
+
+    def test_it_is_exported(self):
+        assert 'resolve_unstamped_live_ids' in consolidation_gate.__all__
+
+
+class TestUnstampedProbeBudget:
+    """The probe loop is CAPPED, and the cap is disclosed rather than silent.
+
+    This loop runs on the `done` transition itself, inside
+    `TaskInterceptor._consolidation_closure_error`, while
+    `provenance.observed_members` is written verbatim with no cap of its own —
+    so an uncapped loop is unbounded work on the write path.  The cap mirrors
+    the scroll's, which is the sibling collaborator reading the same store for
+    the same cluster.
+    """
+
+    @staticmethod
+    def _strays(n):
+        return [_uuid(1000 + i) for i in range(n)]
+
+    def test_the_cap_matches_the_scroll_cap(self):
+        """A cap on one store collaborator and none (or a different one) on
+        the other is an asymmetry with no justification."""
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+
+        assert (
+            consolidation_gate._UNSTAMPED_PROBE_LIMIT
+            == TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT
+        )
+
+    @pytest.mark.asyncio
+    async def test_at_the_cap_every_candidate_is_still_probed(self):
+        limit = consolidation_gate._UNSTAMPED_PROBE_LIMIT
+        strays = self._strays(limit)
+        probe = _RecordingProbe(live=[])
+        await consolidation_gate.resolve_unstamped_live_ids(
+            _prov(strays),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        )
+        assert len(probe.calls) == limit
+
+    @pytest.mark.asyncio
+    async def test_past_the_cap_the_loop_stops_at_the_limit(self):
+        """Bounded work on the write path — not `len(observed_members)`."""
+        limit = consolidation_gate._UNSTAMPED_PROBE_LIMIT
+        strays = self._strays(limit + 5)
+        probe = _RecordingProbe(live=strays)
+        live = await consolidation_gate.resolve_unstamped_live_ids(
+            _prov(strays),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        )
+        assert len(probe.calls) == limit
+        assert [c[0] for c in probe.calls] == strays[:limit]
+        assert live == tuple(strays[:limit])
+
+    @pytest.mark.asyncio
+    async def test_overflow_is_DISCLOSED_not_silent(self, caplog):
+        """A partial probe that said nothing would read as \'no strays\'.  The
+        WARNING is the disclosure, and it is emitted HERE — in the one shared
+        derivation — so the CLI and the seam cannot disclose differently."""
+        import logging  # noqa: PLC0415
+
+        limit = consolidation_gate._UNSTAMPED_PROBE_LIMIT
+        strays = self._strays(limit + 1)
+        with caplog.at_level(logging.WARNING, logger=consolidation_gate.__name__):
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov(strays),
+                members=_well_formed_cluster(2),
+                exists=_RecordingProbe(live=[]),
+                project_id='dark_factory',
+            )
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'probe budget' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert str(limit + 1) in message and str(limit) in message
+        # The first id it did NOT look at, so the log names what is unchecked.
+        assert strays[limit] in message
+
+    @pytest.mark.asyncio
+    async def test_under_the_cap_says_nothing(self, caplog):
+        """The measured corpus is 2-6 observed members: the common path must
+        not emit an operational warning."""
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger=consolidation_gate.__name__):
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov(self._strays(3)),
+                members=_well_formed_cluster(2),
+                exists=_RecordingProbe(live=[]),
+                project_id='dark_factory',
+            )
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+class _StubMemoryService:
+    """Just ``get_memory_by_id`` — no store, no config, no MemoryService.
+
+    Duck-typed on purpose: :func:`closure_exists_probe` must not need a real
+    ``MemoryService``, which is what keeps this module a stdlib-only import
+    leaf and lets both callers bind it without importing the service layer.
+    """
+
+    def __init__(self, *, result=None, raises=None):
+        self.result = result
+        self.raises = raises
+        self.calls = []
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        self.calls.append((project_id, memory_id))
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+class TestClosureExistsProbe:
+    """The ONE home of the probe binding, for both production callers.
+
+    ``server/main.py::_wire_closure_collaborators`` and
+    ``scripts/check_consolidation_closure.py::scroll_cluster`` each used to
+    close over their own copy of this adaptation, with a private test apiece.
+    Both copies spelled the same ``project_id``-first argument order, which is
+    precisely the slip that would probe the wrong scope and report every
+    candidate absent — so it is tested ONCE, here, against the shared factory.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_payload_dict_reads_as_live(self):
+        stub = _StubMemoryService(
+            result={'id': _uuid(42), 'content': 'x', 'metadata': {}}
+        )
+        probe = consolidation_gate.closure_exists_probe(stub)
+        assert await probe(_uuid(42), project_id='dark_factory') is True
+
+    @pytest.mark.asyncio
+    async def test_none_reads_as_absent(self):
+        """The two outcomes that distinguish live-but-unstamped from
+        absorbed-and-deleted."""
+        probe = consolidation_gate.closure_exists_probe(
+            _StubMemoryService(result=None)
+        )
+        assert await probe(_uuid(42), project_id='dark_factory') is False
+
+    @pytest.mark.asyncio
+    async def test_project_id_is_the_first_positional_argument(self):
+        """``MemoryService.get_memory_by_id(self, project_id, memory_id)``.
+        An argument-order slip here would probe the wrong scope and silently
+        report every candidate as absent."""
+        stub = _StubMemoryService(result=None)
+        await consolidation_gate.closure_exists_probe(stub)(
+            _uuid(42), project_id='dark_factory'
+        )
+        assert stub.calls == [('dark_factory', _uuid(42))]
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_propagates_rather_than_collapsing_to_false(self):
+        """``get_memory_by_id``\'s docstring makes this contract explicit: the
+        timeout is PROPAGATED, not collapsed into None, precisely so a caller
+        can tell "genuinely absent" from "backend timed out".  Collapsing it
+        here would let an unreadable store read as "no strays"."""
+        probe = consolidation_gate.closure_exists_probe(
+            _StubMemoryService(raises=TimeoutError('qdrant point read'))
+        )
+        with pytest.raises(TimeoutError):
+            await probe(_uuid(42), project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_it_plugs_straight_into_the_derivation(self):
+        """The factory and its one consumer agree on the collaborator shape —
+        the property two separately-maintained copies could not guarantee."""
+        stray = _uuid(42)
+        stub = _StubMemoryService(result={'id': stray, 'content': 'x'})
+        assert await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([stray]),
+            members=_well_formed_cluster(2),
+            exists=consolidation_gate.closure_exists_probe(stub),
+            project_id='dark_factory',
+        ) == (stray,)
+        assert stub.calls == [('dark_factory', stray)]
+
+    def test_it_is_exported(self):
+        assert 'closure_exists_probe' in consolidation_gate.__all__
+
+
+class TestHandrolledMemberEnumeration:
+    """The SECOND gap: a gate filed with no `x_recon_consolidation_gate` block
+    at all, for which the seam is fully dormant and `set_task_status(done)`
+    closes it untouched (task 4747 was filed exactly that way).
+
+    A refusal is NOT available here — `operational_mode == 'gate'` is a
+    GENERIC human-gate marker — so the detector exists to FLAG, and its
+    precision only has to be good enough for a log line.
+    """
+
+    @staticmethod
+    def _meta(**extra):
+        meta = {'execution_class': 'operational', 'operational_mode': 'gate'}
+        meta.update(extra)
+        return meta
+
+    def test_fires_for_the_memory_ids_spelling(self):
+        """Gate 3036 — the very gate this module\'s docstring already indicts
+        for inventing `metadata.memory_ids`."""
+        ids = [_uuid(1), _uuid(2)]
+        assert consolidation_gate.handrolled_member_enumeration(
+            self._meta(memory_ids=ids)
+        ) == ('memory_ids', ids)
+
+    def test_fires_for_the_related_memory_ids_spelling(self):
+        """Gate 4747, before it was retro-fitted with a real block."""
+        ids = [_uuid(1)]
+        assert consolidation_gate.handrolled_member_enumeration(
+            self._meta(related_memory_ids=ids)
+        ) == ('related_memory_ids', ids)
+
+    def test_silent_for_an_ordinary_gate_with_neither_key(self):
+        """The 118-task majority. A false positive here would spam the log for
+        every gate close in the fleet."""
+        assert consolidation_gate.handrolled_member_enumeration(self._meta()) is None
+
+    def test_silent_when_a_proper_block_is_present(self):
+        """4747\'s post-retrofit shape: a real block WINS, even alongside a
+        leftover hand-rolled key."""
+        assert (
+            consolidation_gate.handrolled_member_enumeration(
+                self._meta(
+                    memory_ids=[_uuid(1)],
+                    **{GATE_METADATA_KEY: {'topic': _TOPIC}},
+                )
+            )
+            is None
+        )
+
+    def test_silent_for_a_non_gate_carrying_the_key(self):
+        assert (
+            consolidation_gate.handrolled_member_enumeration(
+                {'execution_class': 'operational',
+                 'operational_mode': 'llm',
+                 'memory_ids': [_uuid(1)]}
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize('metadata', [None, 'not-a-mapping', 42, [], {}])
+    def test_silent_for_non_dict_or_absent_metadata(self, metadata):
+        assert consolidation_gate.handrolled_member_enumeration(metadata) is None
+
+    def test_key_selection_is_deterministic_when_both_are_present(self):
+        """Sorted-first, so the warning text is stable across runs."""
+        hit = consolidation_gate.handrolled_member_enumeration(
+            self._meta(memory_ids=[_uuid(1)], related_memory_ids=[_uuid(2)])
+        )
+        assert hit is not None
+        key, _ = hit
+        assert key == sorted(consolidation_gate.HANDROLLED_MEMBER_KEYS)[0]
+
+    def test_an_empty_enumeration_is_not_a_hit(self):
+        """An empty list enumerates nothing, so there is nothing to flag."""
+        assert (
+            consolidation_gate.handrolled_member_enumeration(self._meta(memory_ids=[]))
+            is None
+        )
+
+    def test_the_measured_key_set_is_exported(self):
+        assert set(consolidation_gate.HANDROLLED_MEMBER_KEYS) == {
+            'memory_ids',
+            'related_memory_ids',
+        }
+        assert 'HANDROLLED_MEMBER_KEYS' in consolidation_gate.__all__
+        assert 'handrolled_member_enumeration' in consolidation_gate.__all__
+
+# --------------------------------------------------------------------------- #
 # Guard: the seam's import weight, and INV-5's single homes (step-15a)
 # --------------------------------------------------------------------------- #
 

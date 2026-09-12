@@ -14,7 +14,17 @@ two retrospective blind spots this script sweeps for:
       being reopened.
   (b) misattribution — the cited commit is real and on the ref, but its
       message cites a *different* task, so it was never actually this
-      task's deliverable.
+      task's deliverable. For a MERGE commit, the subject alone is not
+      sufficient evidence of this: this repo's merge worker routinely
+      coalesces several tasks' branches under one ``Merge task/<N> into
+      main`` subject naming only one of them, so the classifier also
+      scans the commit messages the merge brought in under its second
+      parent (see :func:`_second_parent_self_citation`) and only declares
+      misattribution when the audited task cites itself NOWHERE in that
+      lineage. Measured at task 4706's filing (main HEAD 72286f53b9): 359
+      of 505 (71%) task-subject merges on main's first-parent chain since
+      2026-07-25 carry commits citing other task ids under their second
+      parent.
 
 For every found_on_main task this script:
   1. Parses ``metadata.done_provenance`` (commit/note) and ``metadata.files``
@@ -168,6 +178,16 @@ _FLAGGED_VERDICTS = frozenset({
     'commit_not_on_main', 'misattributed', 'reverted', 'deliverable_absent',
 })
 
+# Bound on the second-parent walk in _git_second_parent_commits, passed as
+# `-n` to `git log`. Largest real second parent measured on main at HEAD
+# 72286f53b9 is c7dcc4f9d4 with 104 commits, so 500 is ~5x headroom for
+# this corpus. `git log`'s default order is newest-first, so a cap
+# truncates the OLDEST commits; a self-citation lost to truncation leaves
+# the task flagged for human review rather than silently cleared — the
+# conservative direction (mirrors the `[]`-default policy on the wrapper
+# itself, see _git_second_parent_commits below).
+_SECOND_PARENT_WALK_CAP = 500
+
 
 @dataclass
 class TaskProvenanceAudit:
@@ -176,8 +196,11 @@ class TaskProvenanceAudit:
     Task facts (``task_id``/``title``/``commit``/``note``/``declared_files``)
     are populated by :func:`select_found_on_main_tasks`. The git-fact fields
     default to benign placeholders until :func:`build_audit_report` fills
-    them in from an injected git-facts dependency. ``verdict``/``reasons``
-    are set by :func:`classify`.
+    them in from an injected git-facts dependency — including
+    ``second_parent_commits``: ``(sha, message)`` pairs for the commits a
+    CITED MERGE brought in under its second parent; empty for a non-merge, a
+    git failure, or a commit whose facts were never gathered. ``verdict``/
+    ``reasons`` are set by :func:`classify`.
     """
 
     task_id: str
@@ -189,6 +212,7 @@ class TaskProvenanceAudit:
     commit_subject: str = ''
     commit_message: str = ''
     commit_files: list[str] = field(default_factory=list)
+    second_parent_commits: list[tuple[str, str]] = field(default_factory=list)
     revert_commit: str | None = None
     declared_files_missing_on_main: list[str] = field(default_factory=list)
     declared_files_inconclusive: list[str] = field(default_factory=list)
@@ -265,6 +289,85 @@ def extract_cited_task_ids(message: str) -> set[str]:
     return ids
 
 
+# WHY THIS IS SAFE: the second-parent walk tightens on CONTENT LINEAGE (did
+# this task's own commits ride in under the cited merge?), not on FILE
+# OVERLAP. Both of the PRD's proven fabrications stay flagged after this
+# walk is added: task 2394 / commit b045a72de2 has 12 commits under its
+# cited merge's second parent with 0 citing 2394; task 2531 / commit
+# b929f4441d has 16 commits under ^2 with 0 citing 2531 (re-measured in
+# this worktree at task 4706's filing). Demoting `misattributed` below
+# `deliverable_absent` in the precedence ladder was considered and
+# REJECTED for this reason: the `deliverable_absent` arm below uses
+# `any()`, not `all()`, over declared files, and would have let both
+# fabrications through. This walk leaves the ladder's precedence
+# unchanged.
+#
+# THE MEASURED LIMIT: the walk clears only what extract_cited_task_ids
+# above already accepts as a citation, so of the four found_on_main
+# records task 4706's filing named, it clears exactly ONE — task 3103,
+# commit c7dcc4f9d4, via 20 commits under its cited merge's second parent
+# carrying the `task/3103` slash form. Tasks 2724, 2949 and 3610 are NOT
+# cleared: their cited merges' second parents mention the audited id only
+# as `(task 2724 step-8)` (the `\(task (\d+)\)` alternative in
+# CITATION_PATTERN above needs the closing paren immediately after the
+# digits, so the trailing ` step-8` blocks the match), or as body prose
+# (`Addresses the review pass on task 2949.`, `pre-3610`). Re-measuring
+# with the pre-task-4705 bare-paren pattern restored gives identical
+# counts, so sibling task 4705's citation-pattern narrowing is not the
+# cause and reverting it would not help. Filed as escalation esc-4706-1.
+# Widening CITATION_PATTERN to accept prose is NOT the fix for this limit
+# — it would widen the SUBJECT scan too and reintroduce exactly the
+# misattribution false positives task 4705 removed.
+#
+# WHY NOT task 4647's patch-id primitive:
+# orchestrator/src/orchestrator/landing_evidence.py's patch-id attribution
+# is the stronger tool for this and would clear the SHA-lineage cases
+# prose matching cannot, but a fused-memory -> orchestrator runtime import
+# is architecturally backwards and pulls in the whole GitOps stack — the
+# same reasoning this module's header already records above
+# CITATION_PATTERN for not importing
+# orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN (task 2645
+# design decisions). Not hand-rolled a second time, not imported;
+# recorded here so the next reader sees the choice was made deliberately,
+# not overlooked — patch-id lineage is precisely what WOULD clear the
+# three records message-matching cannot.
+def _second_parent_self_citation(audit: TaskProvenanceAudit) -> str | None:
+    """Return the sha of the first commit the cited merge brought in whose
+    SUBJECT LINE cites ``audit.task_id``, or None.
+
+    Deliberately reuses :func:`extract_cited_task_ids` — the same pattern
+    the subject scan uses — rather than a second, independent pattern, so
+    the subject scan and this lineage scan can never drift apart (a future
+    citation-pattern change, e.g. task 4705's bare-paren narrowing, moves
+    both together automatically).
+
+    Scans ``message.splitlines()[0]`` only, never the full body. The
+    module header above (the "Residual, un-addressed false-positive
+    source" paragraph before ``CITATION_PATTERN``) already documents that
+    the ``task/{id}`` alternative matches anywhere in a message — scanning
+    full second-parent commit bodies would let body prose like "rebased on
+    top of task/50" manufacture a false CLEARANCE, which is fail-open in a
+    way the subject scan's false positives are not (those are surfaced for
+    a human to filter; a clearance is silent — see
+    ``check_found_on_main_spurious_rate.py`` and
+    ``correct_found_on_main_backlog.py::plan_corrections``, both of which
+    treat a cleared verdict as final). Restricting to the subject line
+    still clears the load-bearing real case: task 3103 / c7dcc4f9d4's
+    `task/3103` citations are themselves subject-line forms (see "THE
+    MEASURED LIMIT" above).
+
+    Walk order is ``audit.second_parent_commits``' own order, which is
+    ``git log``'s default newest-first (see :func:`_git_second_parent_commits`);
+    this returns the FIRST match in that order — first-match-wins, mirroring
+    the rest of the module's deterministic-first-match conventions.
+    """
+    for sha, message in audit.second_parent_commits:
+        subject = message.splitlines()[0] if message else ''
+        if audit.task_id in extract_cited_task_ids(subject):
+            return sha
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Classifier (pure)
 # ---------------------------------------------------------------------------
@@ -281,6 +384,13 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
     reviewer can tell "some declared file's presence on the ref couldn't be
     confirmed (transient git failure)" apart from a verdict actually earned
     by confirmed facts.
+
+    A coalesce clearance (see :func:`_second_parent_self_citation`) never
+    changes which verdict wins the ladder either — it only ever suppresses
+    ``misattributed``/``unverifiable`` on positive evidence that this
+    task's own work rode in under a cited merge's second parent, and
+    contributes an extra leading reason (the clearing commit's sha) so a
+    human can see why, whichever verdict finally wins.
     """
     verdict, reasons = _classify_core(audit)
     if audit.declared_files_inconclusive:
@@ -301,7 +411,32 @@ def _classify_core(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
         ]
 
     cited = extract_cited_task_ids(audit.commit_message)
-    if cited and audit.task_id not in cited:
+    self_cited = audit.task_id in cited
+    # A cited MERGE's subject can name only the task that "owns" it while
+    # this task's own work rode in under the second parent — this repo's
+    # merge worker routinely coalesces several tasks' branches under one
+    # subject (see plan.json's "THE DEFECT" for task 4706). So before
+    # declaring misattribution, look for a self-citation in what the merge
+    # actually brought in, using the same citation semantics as the
+    # subject scan.
+    coalesced_sha = None if self_cited else _second_parent_self_citation(audit)
+    extra: list[str] = []
+    if coalesced_sha is not None:
+        if cited:
+            extra.append(
+                f"cited merge's second parent carries commit {coalesced_sha} citing "
+                f'task {audit.task_id} — this task\'s work was coalesced into a merge '
+                f'whose own subject names another task, so the subject citation is '
+                f'not proof of misattribution'
+            )
+        else:
+            extra.append(
+                f"cited merge's second parent carries commit {coalesced_sha} citing "
+                f"task {audit.task_id} — this task's work rode in under the merge's "
+                f"second parent (the cited merge's own subject names no task at all)"
+            )
+
+    if cited and not self_cited and coalesced_sha is None:
         others = ', '.join(sorted(cited))
         return 'misattributed', [
             f'commit message cites task(s) {others}, not task {audit.task_id} — '
@@ -318,21 +453,23 @@ def _classify_core(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
         if audit.declared_files_missing_on_main:
             missing = ', '.join(audit.declared_files_missing_on_main)
             reasons.append(f'declared file(s) missing from the ref HEAD: {missing}')
-        return 'reverted', reasons
+        return 'reverted', [*extra, *reasons]
 
     if audit.declared_files and not any(f in audit.commit_files for f in audit.declared_files):
         return 'deliverable_absent', [
+            *extra,
             f'none of the declared file(s) {sorted(audit.declared_files)} appear in the '
             f'cited commit\'s diff',
         ]
 
-    if not audit.declared_files and audit.task_id not in cited:
+    if not audit.declared_files and not self_cited and coalesced_sha is None:
         return 'unverifiable', [
+            *extra,
             'no declared files and the commit message does not cite this task — '
             'nothing to verify the found_on_main claim against',
         ]
 
-    return 'ok', []
+    return 'ok', extra
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +635,61 @@ async def _git_commit_message(project_root: str, commit: str) -> str:
     return stdout.decode('utf-8', errors='replace').strip()
 
 
+async def _git_second_parent_commits(
+    project_root: str, commit: str,
+) -> list[tuple[str, str]]:
+    """Return ``(sha, message)`` pairs for the commits *commit*'s second
+    parent brought in, or ``[]`` on any failure.
+
+    Walks ``<commit>^1..<commit>^2`` — commits reachable from the SECOND
+    parent but not the first, i.e. exactly what a no-ff merge commit
+    brought in from the branch it merged. On an ordinary single-parent
+    commit that range is unresolvable (git exits 128 with `fatal:
+    ambiguous argument`; verified empirically), so this single subprocess
+    call degrades to ``[]`` for a non-merge with no separate parent-count
+    probe needed.
+
+    ``[]`` is deliberately indistinguishable-by-design between "not a
+    merge", "git failed" (timeout, missing binary, non-zero exit) and "cap
+    exceeded" — every one of those collapses to the same safe default, so a
+    caller consulting this fact for a self-citation can never have a git
+    failure manufacture a false clearance; the absence of evidence lands on
+    the loud, already-reviewed outcome instead.
+
+    Capped at :data:`_SECOND_PARENT_WALK_CAP` commits via ``-n``; `git
+    log`'s default order is newest-first, so a cap truncates the OLDEST
+    commits — a self-citation lost to truncation leaves the task flagged
+    for human review rather than silently cleared, the conservative
+    direction.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'log', '-z', '--format=%H%n%B',
+            '-n', str(_SECOND_PARENT_WALK_CAP), f'{commit}^1..{commit}^2',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            return []
+    except FileNotFoundError:
+        return []
+    if proc.returncode != 0:
+        return []
+    payload = stdout.decode('utf-8', errors='replace')
+    pairs: list[tuple[str, str]] = []
+    for record in payload.split('\0'):
+        if not record.strip():
+            continue
+        sha, _sep, message = record.partition('\n')
+        if not sha:
+            continue
+        pairs.append((sha, message))
+    return pairs
+
+
 class GitFacts:
     """Live git-inspection facade over a project's working tree.
 
@@ -515,12 +707,37 @@ class GitFacts:
     ) -> dict[str, Any]:
         """Gather every git fact :func:`classify` needs about *commit* vs *ref*.
 
-        Checks ``is_ancestor`` first and short-circuits the remaining four
-        subprocess calls (commit message/diff, revert-log search, and the
-        batched declared-files existence check) when it is False:
-        ``classify()`` resolves to ``commit_not_on_main`` at its very first
-        precedence check in that case and never consults any of the other
-        facts, so gathering them would be pure wasted subprocess work.
+        Checks ``is_ancestor`` first and short-circuits the remaining five
+        subprocess calls (commit message/diff, revert-log search, the
+        batched declared-files existence check, and the second-parent walk)
+        when it is False: ``classify()`` resolves to ``commit_not_on_main``
+        at its very first precedence check in that case and never consults
+        any of the other facts, so gathering them would be pure wasted
+        subprocess work.
+
+        The second-parent walk (``second_parent_commits``) is issued
+        unconditionally on the ancestor path rather than being gated on
+        merge-ness: this method's injected-facts contract is ``(commit,
+        ref, declared_files)`` and deliberately carries no ``task_id``, so
+        it has no way to know whether the subject already self-cites. The
+        walk itself is a single ``git log`` call that exits 128 immediately
+        for an ordinary non-merge commit (see
+        :func:`_git_second_parent_commits`), so gating it would cost a
+        separate parent-count probe just to save a call that is already
+        cheap to fail.
+
+        That "cheap to fail" framing covers non-merges only. For a genuine
+        merge — even one whose subject already self-cites, so
+        ``_classify_core`` never ends up consulting the fact at all (it
+        only calls :func:`_second_parent_self_citation` when ``not
+        self_cited``) — this runs a full ``git log`` over up to
+        :data:`_SECOND_PARENT_WALK_CAP` commits (measured up to ~104 on
+        this repo) whose result is then discarded. Accepted as-is because
+        the found_on_main corpus this audit runs over is small; revisit
+        (thread ``task_id`` into this contract so the walk can be skipped
+        when the subject already self-cites, or make
+        ``second_parent_commits`` lazily populated) if that stops being
+        true.
         """
         is_ancestor = await _git_is_ancestor(self.project_root, commit, ref)
         if not is_ancestor:
@@ -529,6 +746,7 @@ class GitFacts:
                 'commit_subject': '',
                 'commit_message': '',
                 'commit_files': [],
+                'second_parent_commits': [],
                 'revert_commit': None,
                 'declared_files_missing_on_main': [],
                 'declared_files_inconclusive': [],
@@ -542,6 +760,7 @@ class GitFacts:
             'commit_subject': message.splitlines()[0] if message else '',
             'commit_message': message,
             'commit_files': await _git_show_files(self.project_root, commit),
+            'second_parent_commits': await _git_second_parent_commits(self.project_root, commit),
             'revert_commit': await _git_find_revert(self.project_root, commit, ref),
             'declared_files_missing_on_main': missing,
             'declared_files_inconclusive': inconclusive,
@@ -591,6 +810,11 @@ async def build_audit_report(
         audit.commit_subject = facts.get('commit_subject', '')
         audit.commit_message = facts.get('commit_message', '')
         audit.commit_files = facts.get('commit_files') or []
+        # Conservative default, same reasoning as commit_files/is_ancestor
+        # above: an alternate facts provider that omits this key must
+        # reproduce the pre-change verdict (still misattributed), never
+        # silently clear a task.
+        audit.second_parent_commits = facts.get('second_parent_commits') or []
         audit.revert_commit = facts.get('revert_commit')
         audit.declared_files_missing_on_main = facts.get('declared_files_missing_on_main') or []
         audit.declared_files_inconclusive = facts.get('declared_files_inconclusive') or []

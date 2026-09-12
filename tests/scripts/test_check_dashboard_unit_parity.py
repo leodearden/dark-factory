@@ -32,6 +32,7 @@ import types
 import pytest
 from setup_host_sections import (
     checker_repo,
+    enabled_units,
     run_section,
     setup_host_text,
     slice_section,
@@ -2352,11 +2353,20 @@ def test_checker_subprocess_unit_flag_narrows_the_run(tmp_path: pathlib.Path):
 
 # Anchored on the block's hoisted `_dash_parity_script=` assignment — CODE, and
 # unique to this site — so a reworded section comment cannot turn CI red for no
-# behavioural change. The end anchor is the install's own `ok` line, because
-# this slice must cover the render/cp/enable that FOLLOWS the gate: whether the
-# units still land is half of what these tests assert.
+# behavioural change. The slice must cover the render/cp/enable that FOLLOWS the
+# gate: whether the units still land is half of what these tests assert.
+#
+# THE END IS TWO ANCHORS, not one. The install's own `ok` line no longer ends
+# the section — it is now one branch of an `if [ "$_dash_rendered" = "1" ]`,
+# because a closing line that prints unconditionally asserted the install had
+# happened even on the paths that had just FAILED to render. Ending the slice at
+# that `ok` would therefore cut the section off inside the construct, and bash
+# would refuse the fragment for a missing `fi`. So the `ok` becomes `end_after`
+# — the "run THROUGH this" anchor slice_section already has for exactly this
+# shape — and the slice ends at the column-0 `fi` that closes it.
 _SECTION_8_START = "_dash_parity_script="
-_SECTION_8_END = 'ok "Dashboard units installed'
+_SECTION_8_END_AFTER = 'ok "Dashboard units installed'
+_SECTION_8_END = "\nfi\n"
 
 # The argparse-shaped stub: exit 2, usage-shaped stderr, and no
 # [dashboard_unit_parity] report — what renaming a flag would actually produce.
@@ -2377,7 +2387,8 @@ def _gate_repo(
     """_fake_repo plus the scripts/ files the installer slice reads.
 
     The real checker is copied in (with its sibling systemd_unit_parity import)
-    so the gate drives the real one; only the TREE is fake.
+    so the gate drives the real one; only the TREE is fake. The RENDERER the
+    install half now runs is copied in the same way, for the same reason.
     """
     repo = _fake_repo(tmp_path, mod)
     (repo / "scripts").mkdir(parents=True, exist_ok=True)
@@ -2387,6 +2398,29 @@ def _gate_repo(
         ),
         encoding="utf-8",
     )
+    # The renderer and its shared parsing dependency, copied UNCONDITIONALLY and
+    # BEFORE write_checker. BOTH halves of that are load-bearing:
+    #
+    #   UNCONDITIONALLY, because the install half of this slice runs the
+    #   renderer on EVERY path through the gate — including with_checker=False
+    #   and the usage-error stub, whose whole point is that the units still land
+    #   when the gate did not run. Materializing the renderer only alongside the
+    #   real checker would make those two tests fail on a missing renderer
+    #   rather than on what they assert.
+    #
+    #   BEFORE write_checker, because write_checker(body=...) writes a STUB at
+    #   scripts/<checker>.py and skips its siblings entirely. Copying these
+    #   afterwards would be fine; copying them THROUGH that call would not, and
+    #   ordering them first makes it structural that a stub checker body can
+    #   never shadow the renderer's dependencies.
+    #
+    # This is also why render_dashboard_unit.py must not import the checker: see
+    # its module docstring, which names this harness as the concrete obstacle.
+    for _name in ("render_dashboard_unit.py", "systemd_unit_parity.py"):
+        (repo / "scripts" / _name).write_text(
+            (REPO_ROOT / "scripts" / _name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     if with_checker:
         write_checker(
             repo,
@@ -2403,7 +2437,9 @@ def _run_section_8(
     """Run the section-8 slice. UV_PATH is set upstream in the real script."""
     return run_section(
         tmp_path,
-        slice_section(_SECTION_8_START, _SECTION_8_END),
+        slice_section(
+            _SECTION_8_START, _SECTION_8_END, end_after=_SECTION_8_END_AFTER
+        ),
         repo_root=repo,
         unit_dir=unit_dir,
         env_extra={"UV_PATH": "/usr/bin/uv"},
@@ -2576,6 +2612,342 @@ def test_section_8_reports_not_yet_installed_on_a_bare_host(tmp_path: pathlib.Pa
         f"A genuine 'not yet installed' is a real verdict.\n{result.stdout}"
     )
     _assert_units_installed(repo, unit_dir)
+
+
+# ---------------------------------------------------------------------------
+# The section-8 INSTALL preserves this host's local Environment= values
+# ---------------------------------------------------------------------------
+#
+# The gate above is only half of section 8. The other half is the RENDER, and
+# until task 4793 it was a plain truncating redirect:
+#
+#     sed -e "s|__REPO_ROOT__|$REPO_ROOT|g" ... > "$UNIT_DIR/<unit>"
+#
+# scripts/dashboard.service.template declares
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`, so that render
+# collapsed this host's nine measured aggregation roots to one on every re-run
+# — and INVISIBLY, because that variable is on DIVERGENCE_ALLOWLIST (compared by
+# NAME, value blessed), so the post-install check at section 12 reported parity
+# afterwards. The gate's own remediation line is what sends the operator into it.
+#
+# These two tests are the acceptance criteria for that fix, made at the
+# SANCTIONED INSTALL PATH rather than at the renderer's unit boundary: the real
+# section-8 slice, run over a tmp repo and a tmp unit dir.
+
+# The host-local value these two tests turn on is `_NINE_ROOTS` above — the same
+# measured nine-vs-one divergence the allowlist tests use, deliberately reused
+# rather than re-spelled here, so the value the gate blesses and the value the
+# install must preserve can never drift apart inside this file.
+
+
+def _installed_env(mod: types.ModuleType, unit_dir: pathlib.Path) -> dict[str, str]:
+    """The installed dashboard unit's [Service] Environment= map.
+
+    Read through the checker's own parser rather than a regex, so a value
+    written with any of systemd's accepted Environment= spellings is read here
+    exactly as the gate one section later would read it.
+    """
+    text = (unit_dir / _DASHBOARD_SERVICE).read_text(encoding="utf-8")
+    return mod._environment_map(mod.parse_unit_directives(text), "Service")
+
+
+def _installed_directive(
+    mod: types.ModuleType, unit_dir: pathlib.Path, key: str
+) -> str:
+    """The single value of *key* in the installed dashboard unit's [Service]."""
+    text = (unit_dir / _DASHBOARD_SERVICE).read_text(encoding="utf-8")
+    values = mod.parse_unit_directives(text)["Service"][key]
+    assert len(values) == 1, f"expected one {key}= in the installed unit, got {values}"
+    return values[0]
+
+
+def test_section_8_preserves_a_host_local_known_project_roots_value(
+    tmp_path: pathlib.Path,
+):
+    """ACCEPTANCE 1 + 2: re-running the sanctioned install path keeps this host's roots.
+
+    The fixture is the exact real-world starting state: a host whose installed
+    units MATCH the committed ones except for the one allowlisted, host-local
+    value it is supposed to carry. So the gate reports "already at parity"
+    first — which is the whole reason the old clobber was invisible — and then
+    the install runs anyway, because section 8's install is unconditional by
+    design (see test_section_8_installs_even_when_the_gate_did_not_run).
+
+    Three assertions, and the third is what keeps the first two from being
+    satisfiable by simply not rendering:
+
+      1. All nine roots survive the re-render, asserted by COUNT as well as by
+         equality — a one-root result cannot pass by looking like a prefix.
+      2. The install still TOOK: both watchdog units copied, placeholders
+         substituted (_assert_units_installed).
+      3. DASHBOARD_PROJECT_ROOT was RE-DERIVED to this run's repo root and still
+         equals the same copy's WorkingDirectory=. That variable is on the same
+         DIVERGENCE_ALLOWLIST, and preserving it too would have pinned the data
+         root at the PREVIOUS checkout while WorkingDirectory= moved —
+         manufacturing precisely the intra-copy drift
+         UnitSpec.env_matches_directive exists to report. The allowlist is not
+         the preserve set; the host-local SUBSET of it is.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={
+            _DASHBOARD_SERVICE: (
+                "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory",
+                f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS={_NINE_ROOTS}",
+            )
+        },
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "already at parity" in result.stdout, (
+        "The pre-install gate should see a correctly-configured host — the "
+        "host-local value is allowlisted. That green verdict is exactly why "
+        f"the clobber below went unnoticed.\n{result.stdout}"
+    )
+
+    env = _installed_env(mod, unit_dir)
+    assert env["DASHBOARD_KNOWN_PROJECT_ROOTS"] == _NINE_ROOTS, (
+        "The re-render overwrote this host's local aggregation roots. That is "
+        "the defect: the operator followed the parity gate's own remediation "
+        f"advice and lost eight project roots.\n{result.stdout}"
+    )
+    roots = env["DASHBOARD_KNOWN_PROJECT_ROOTS"]
+    assert roots.count(",") == 8, f"expected nine roots, got {roots!r}"
+
+    _assert_units_installed(repo, unit_dir)
+
+    assert env["DASHBOARD_PROJECT_ROOT"] == str(repo), (
+        "DASHBOARD_PROJECT_ROOT must be RE-DERIVED from this run's repo root, "
+        "not preserved from the installed copy — it is allowlisted for the "
+        f"opposite reason.\n{env['DASHBOARD_PROJECT_ROOT']!r} != {str(repo)!r}"
+    )
+    assert env["DASHBOARD_PROJECT_ROOT"] == _installed_directive(
+        mod, unit_dir, "WorkingDirectory"
+    ), "the rendered unit contradicts itself: data root != WorkingDirectory="
+
+
+def test_section_8_greenfield_installs_the_single_root_default(
+    tmp_path: pathlib.Path,
+):
+    """A bare host has nothing to preserve, so it gets the rendered default.
+
+    The failure mode this closes is the mirror of the one above: a preservation
+    step that treats "no installed unit" as an error, or that writes an EMPTY
+    value it read from nowhere, would break provisioning on exactly the hosts
+    the installer exists to serve. Absent is not a failure — it is the
+    greenfield case, and the template's single-root default is the right answer.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "FAIL " not in result.stdout, (
+        f"A greenfield install has nothing to preserve and nothing to warn "
+        f"about.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert _installed_env(mod, unit_dir)["DASHBOARD_KNOWN_PROJECT_ROOTS"] == str(repo), (
+        "With no installed unit to read, the rendered single-root default is "
+        "what must land."
+    )
+
+
+# The renderer's OWN failure shape, in stub form: a tagged error line on stderr,
+# a non-zero exit, and nothing written to --output. Same manoeuvre as
+# `usage_error_checker` above — a real script whose only behaviour is the
+# failure being simulated — because the property under test is what the
+# INSTALLER does with a non-zero renderer, not how the renderer got there.
+_FAILING_RENDERER = (
+    "import sys\n"
+    "sys.stderr.write('[dashboard_unit_render] FAILED: cannot read template\\n')\n"
+    "sys.exit(1)\n"
+)
+
+
+def _seeded_with_nine_roots(
+    tmp_path: pathlib.Path, mod: types.ModuleType, repo: pathlib.Path
+) -> pathlib.Path:
+    """An installed dir at parity except for this host's nine aggregation roots."""
+    return _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={
+            _DASHBOARD_SERVICE: (
+                "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory",
+                f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS={_NINE_ROOTS}",
+            )
+        },
+    )
+
+
+def _assert_render_degraded_loudly(
+    tmp_path: pathlib.Path,
+    repo: pathlib.Path,
+    unit_dir: pathlib.Path,
+    before: bytes,
+    result: subprocess.CompletedProcess,
+) -> None:
+    """The whole loud-degradation contract, asserted in one place for both branches.
+
+    Both ways the render can fail — the script missing, and the script running
+    and returning non-zero — must land on the SAME operator-visible outcome, so
+    they are asserted through one helper rather than two drifting copies.
+    """
+    # 1. The installer does not abort. `fail` is a printf, not an exit: one
+    #    un-renderable service unit must not take the rest of section 8 with it.
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+    # 2. It says so, loudly.
+    assert "FAIL " in result.stdout, (
+        f"A render that did not happen must be reported.\n{result.stdout}"
+    )
+
+    # 3. And it does NOT claim otherwise. A green line about the render, next to
+    #    a FAIL about the render, is the reports-green-because-it-never-ran
+    #    failure this whole gate family exists to remove.
+    ok_lines = [line for line in result.stdout.splitlines() if line.startswith("OK ")]
+    assert not any("render" in line.lower() for line in ok_lines), (
+        f"An OK line claims the render succeeded.\n{result.stdout}"
+    )
+
+    # 4. The host's unit is BYTE-UNCHANGED — not truncated, not half-written,
+    #    not silently re-rendered by a fallback that would have stripped the
+    #    very values this preserves. Stale-but-intact is the recoverable
+    #    direction, and section 12's gate reports the staleness next run.
+    after = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
+    assert after == before, (
+        "The installed dashboard unit was modified by a render that failed."
+    )
+    assert _NINE_ROOTS.encode() in after, "this host's nine roots did not survive"
+
+    # 5. The REST of section 8 still ran. One un-renderable service unit must
+    #    not take the watchdog supervision with it — the same reasoning
+    #    setup_host_parsing.INSTALL_LOOP_CP records for the orchestrator copy
+    #    loop.
+    for name in (_WATCHDOG_SERVICE, _WATCHDOG_TIMER):
+        assert (unit_dir / name).read_text(encoding="utf-8") == (
+            repo / "dashboard" / name
+        ).read_text(encoding="utf-8"), f"{name} was not copied"
+    assert enabled_units(tmp_path) == [
+        "dark-factory-dashboard",
+        "dark-factory-dashboard-watchdog.timer",
+    ], enabled_units(tmp_path)
+
+    # 6. And the section's CLOSING line does not contradict all of the above.
+    #    It used to print `OK Dashboard units installed` unconditionally — the
+    #    one green line an operator scanning section 8 actually looks for,
+    #    asserting the install that the FAIL lines directly above it had just
+    #    said did not happen. Reaching the end of the section is still asserted;
+    #    what changed is that the line now reports which end it reached.
+    assert "OK Dashboard units installed" not in result.stdout, (
+        "The closing line still claims the units were installed after a render "
+        f"that did not happen.\n{result.stdout}"
+    )
+    assert "WARN Dashboard watchdog units installed" in result.stdout, (
+        f"section 8 did not reach its closing line.\n{result.stdout}"
+    )
+
+
+def test_section_8_render_failure_leaves_the_installed_unit_intact(
+    tmp_path: pathlib.Path,
+):
+    """A renderer that RAN and returned non-zero must not pass for a success.
+
+    This is the `elif ...; then ok` construct's blind spot: with no else branch,
+    a failing render falls out of the if-chain with status 0 and the operator is
+    told nothing at all about the unit that did not get written — while the
+    section's closing line, which used to print unconditionally, read as
+    confirmation that it did. Both halves are asserted by the helper: the
+    failure is reported, and the closing line no longer claims otherwise.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+        _FAILING_RENDERER, encoding="utf-8"
+    )
+    unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
+    before = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    _assert_render_degraded_loudly(tmp_path, repo, unit_dir, before, result)
+
+
+def test_section_8_missing_renderer_does_not_clobber_host_local_values(
+    tmp_path: pathlib.Path,
+):
+    """The `[ ! -f ]` branch: a renamed or missing renderer is not a licence to sed.
+
+    Deleting the file AFTER _gate_repo, rather than adding a `with_renderer=`
+    flag to it, is deliberate: the unconditional copy in that helper is itself
+    an invariant (a stub checker body must never shadow the renderer), and a
+    flag would give a future reader two reasons a renderer might be absent.
+    Here it is absent because this test removed it, on the line that says so.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    (repo / "scripts" / "render_dashboard_unit.py").unlink()
+    unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
+    before = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    _assert_render_degraded_loudly(tmp_path, repo, unit_dir, before, result)
+
+
+def test_section_8_bare_host_with_a_failed_render_still_installs_the_watchdog(
+    tmp_path: pathlib.Path,
+):
+    """GREENFIELD plus a failed render — the case both other degradation tests miss.
+
+    They each SEED an existing dashboard unit, so `systemctl --user enable
+    dark-factory-dashboard` always had a unit to name. On a BARE host with no
+    render there is none, and the real `systemctl` exits non-zero for a unit
+    that does not exist — which, under setup-host.sh's `set -euo pipefail`,
+    aborts the whole installer before the watchdog TIMER is enabled and before
+    every later section. That is the opposite of what both failure branches
+    promise ("The watchdog units below still install"), and it was reachable
+    only after the render stopped being a `sed >` that always produced a file.
+
+    The harness `systemctl` stub exits 0 for everything, so this cannot assert
+    the abort directly — it asserts the GUARD, which is the part that is ours:
+    the installer does not ask systemd to enable a unit that is not there, and
+    the timer is enabled regardless. Both are visible in the recorded argv.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+        _FAILING_RENDERER, encoding="utf-8"
+    )
+    unit_dir = tmp_path / "bare-unit-dir"
+    unit_dir.mkdir()
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert not (unit_dir / _DASHBOARD_SERVICE).exists(), (
+        "a failed render must not leave a dashboard unit behind"
+    )
+    # The watchdog supervision lands, which is the whole promise.
+    for name in (_WATCHDOG_SERVICE, _WATCHDOG_TIMER):
+        assert (unit_dir / name).is_file(), f"{name} was not copied"
+    assert enabled_units(tmp_path) == ["dark-factory-dashboard-watchdog.timer"], (
+        enabled_units(tmp_path)
+    )
+    assert "FAIL dark-factory-dashboard NOT enabled" in result.stdout, (
+        f"the skipped enable must be reported, not silent.\n{result.stdout}"
+    )
+    assert "OK Dashboard units installed" not in result.stdout, result.stdout
 
 
 # ---------------------------------------------------------------------------

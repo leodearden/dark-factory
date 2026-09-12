@@ -9,7 +9,6 @@ import logging
 import os
 import time
 import traceback
-from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
 from fused_memory.backends.falkor_indices import (
@@ -152,6 +152,12 @@ _RECON_DEDUP_CONFIG = (
             # _record_placeholder_finding_drop).  Same fold rationale as
             # recon_watchdog_kill_storm above.
             'recon_remediation_placeholder_storm',
+            # Task 4781: aggregate storm alarm for actionable findings dropped
+            # from remediation after phantom-citation verification stripped
+            # every citation (see _PHANTOM_CITATION_DROP_STORM_FINDING /
+            # _record_phantom_citation_finding_drop).  Same fold rationale as
+            # the two storm categories above it.
+            'recon_remediation_phantom_citation_storm',
             # Task 2278: stable per-project finding identity (build_stale_snapshot_finding)
             # so a sustained task_count_snapshot cadence gap folds into a single pending
             # escalation per project instead of firing once per cycle.
@@ -241,8 +247,13 @@ _MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
 _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 
 # Task 1970 amendment (reviewer_comprehensive): coarse safety net for a
-# runaway Stage 3 that stops citing anything.  Each individual referenceless-
-# finding drop in _maybe_remediate is only logged
+# runaway Stage 3 that stops citing anything — i.e. a finding that was NEVER
+# cited at all.  Task 4781 gave the other referenceless cause (a finding that
+# WAS cited but had every citation phantom-stripped by
+# citation_verifier.py::verify_cited_memories) its own sibling counter,
+# _PHANTOM_CITATION_DROP_STORM_THRESHOLD below, so this one now covers only
+# never-cited drops.  Each individual never-cited-finding drop in
+# _maybe_remediate is only logged
 # (reconciliation.remediation_dropped_placeholder_finding) and, being noise
 # rather than a human-actionable integrity issue, is deliberately never
 # escalated on its own — see _maybe_remediate.  That means a systemic Stage 3
@@ -251,10 +262,11 @@ _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD above, since a dropped placeholder
 # never enters a remediation run.  This rolling-window counter closes that
 # gap by firing ONE coarse escalation once drops recur this often for the
-# same project within the window.  Mirrors the dead_owner_shielded
-# suppression-storm counter (_record_dead_owner_suppression /
-# dead_owner_suppression_storm_threshold+window_seconds below) but as plain
-# module constants rather than ReconciliationConfig fields, since this
+# same project within the window.  The window mechanics are the shared
+# StormCounter's (see _record_placeholder_finding_drop); these knobs are
+# plain module constants rather than ReconciliationConfig fields — unlike
+# the dead_owner_shielded suppression-storm counter's
+# dead_owner_suppression_storm_threshold+window_seconds below — since this
 # predicate and its guard are private to this module.
 _PLACEHOLDER_DROP_STORM_THRESHOLD = 5
 _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
@@ -276,6 +288,26 @@ _PLACEHOLDER_DROP_STORM_FINDING: dict[str, Any] = {
     'description': (
         'Stage 3 is repeatedly filing actionable findings with no '
         'task/entity/edge/memory citation'
+    ),
+}
+
+# Task 4781: sibling rolling-window counter for actionable findings dropped
+# from remediation because phantom-citation verification
+# (citation_verifier.py::verify_cited_memories) stripped every citation —
+# NOT because the stage never cited anything (that is the counter above).
+# Same knob values and the same stable-identity/fold rationale as the
+# placeholder pair, deliberately kept parallel so an operator reads the two
+# alarms side by side; all variable data (count, window, projects) lives
+# only in summary/detail, never in these constants, so submit_or_dedupe
+# folds repeat windows into one pending escalation.
+_PHANTOM_CITATION_DROP_STORM_THRESHOLD = 5
+_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
+_PHANTOM_CITATION_DROP_STORM_FINDING: dict[str, Any] = {
+    'category': 'recon_remediation_phantom_citation_storm',
+    'affected_ids': ['remediation_phantom_citation_drop_storm'],
+    'description': (
+        'actionable findings dropped from remediation after phantom-citation '
+        'verification stripped every citation'
     ),
 }
 
@@ -334,8 +366,45 @@ def _finding_has_reference(finding: dict) -> bool:
 
     Task 1970: used by ``_maybe_remediate`` to drop referenceless actionable
     findings before they reach the production remediation batch.
+
+    Task 4781: "never followed up with a cite_* call" is not the only way a
+    finding ends up referenceless.  Since task 2979 hoisted
+    ``citation_verifier.py::verify_cited_memories`` into
+    ``stages/base.py::BaseStage.run``, a finding that WAS cited can also land
+    here if every citation was later phantom-stripped — which is why
+    ``_maybe_remediate`` consults ``_finding_has_citation_failures`` before
+    attributing a drop to either cause.
     """
     return bool(_derive_affected_ids(finding))
+
+
+def _finding_has_citation_failures(finding: dict) -> bool:
+    """Return True iff *finding* carries a ``citation_failures`` marker.
+
+    ``fused_memory/reconciliation/citation_verifier.py::verify_cited_memories``
+    is the sole writer of ``citation_failures`` (called from every stage via
+    ``stages/base.py::BaseStage.run``), and it only ever inspects a finding
+    that ALREADY had a ``cited_memories`` entry to check. So a truthy
+    ``citation_failures`` is positive evidence that the stage DID call a
+    ``cite_*`` follow-up — the opposite of what ``_finding_has_reference``
+    screens for, which is a finding that never cited anything at all.
+
+    Both marker reasons route here: ``memory_not_found`` (the citation is
+    DROPPED from ``cited_memories``) and ``verification_error`` (the citation
+    is KEPT, verification just couldn't confirm it). Neither reason changes
+    what a marker proves — verification touched this finding's citations —
+    so this predicate does not filter on ``reason``.
+
+    Plain truthiness is deliberate: a malformed non-list value (or any other
+    truthy junk) fails SAFE by routing to the phantom-cited branch, i.e. AWAY
+    from the never-cited-placeholder storm alarm, rather than being
+    mis-counted as evidence of a stage that stopped citing.
+
+    Task 4781: used by ``_maybe_remediate`` alongside ``_finding_has_reference``
+    to tell a phantom-cited drop (evidence evaporated after citing) apart from
+    a never-cited placeholder drop (never cited in the first place).
+    """
+    return bool(finding.get('citation_failures'))
 
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -650,11 +719,12 @@ class ReconciliationHarness:
 
         # Task 1755 / PRD β, amended by task 2039: rolling-window counter of
         # DISTINCT dead-owner instance UUIDs among dead_owner_shielded
-        # recon_stale_run suppressions.  Each entry is
-        # (timestamp, project_id, instance_id); pruned on each call to
-        # _record_dead_owner_suppression().  The count that matters is the
-        # number of distinct non-None instance_id values in the window, NOT
-        # the number of suppression events.
+        # recon_stale_run suppressions.  The count that matters is the number
+        # of distinct non-None instance_id values in the window, NOT the number
+        # of suppression events — hence count_distinct=True, with instance_id
+        # passed as the counter's `key` and project_id as its `label` (task
+        # 3259).  Those two dimensions are orthogonal by construction: the
+        # threshold follows the keys, the reported `projects` follow the labels.
         #
         # ⚠ In-process lifetime limitation: these counters are reset on every
         # harness restart.  A single restart recovers one dead_owner_shielded
@@ -674,29 +744,34 @@ class ReconciliationHarness:
         # Single-restart churn is instead observable via the per-event INFO
         # log emitted at harness.py:741.  If single-owner restart churn must
         # also alarm, count recent dead_owner_shielded _error records from
-        # the journal over the window instead of the in-memory deque.
-        self._dead_owner_suppressions: deque[tuple[datetime, str, str | None]] = deque()
-        # Timestamp of the last storm escalation — None means never fired.
-        self._last_suppression_storm_escalation_at: datetime | None = None
+        # the journal over the window instead of this in-memory counter.
+        self._dead_owner_storm = StormCounter(count_distinct=True)
 
         # Task 1970 amendment: rolling-window counter for dropped
         # referenceless actionable findings (see
         # _record_placeholder_finding_drop / _maybe_remediate).  Same
-        # (timestamp, project_id) shape, in-process-lifetime caveat, and
-        # rate-limited single-fire semantics as _dead_owner_suppressions above.
-        self._placeholder_finding_drops: deque[tuple[datetime, str]] = deque()
-        self._last_placeholder_drop_storm_escalation_at: datetime | None = None
+        # in-process-lifetime caveat and rate-limited single-fire semantics as
+        # the dead-owner suppression counter above.
+        self._placeholder_drop_storm = StormCounter()
+
+        # Task 4781: sibling rolling-window counter for actionable findings
+        # dropped from remediation because phantom-citation verification
+        # stripped every citation (see _record_phantom_citation_finding_drop /
+        # _maybe_remediate).  Deliberately a SEPARATE StormCounter instance
+        # from _placeholder_drop_storm above — the two drop causes must never
+        # share a window, or a phantom-citation outage could push the
+        # never-cited-placeholder alarm over threshold (or vice versa) and
+        # misattribute the cause.  Same in-process-lifetime caveat and
+        # rate-limited single-fire semantics.
+        self._phantom_citation_drop_storm = StormCounter()
 
         # Task σ / 2717: rolling-window per-event counter of unresumable/failed
         # interrupted-run resume attempts (config-driven
-        # resume_failure_storm_threshold / _window_seconds).  Same
-        # (timestamp, project_id) shape, in-process-lifetime caveat, and
-        # rate-limited single-fire semantics as _placeholder_finding_drops above.
-        # Fed from _resume_interrupted_runs' failed+restore fallback arm so a
-        # persistent resume failure (prompt/tool drift, stale transcripts) surfaces
-        # ONE loud recon_resume_failure_storm escalation instead of silent churn.
-        self._resume_failures: deque[tuple[datetime, str]] = deque()
-        self._last_resume_failure_storm_escalation_at: datetime | None = None
+        # resume_failure_storm_threshold / _window_seconds).  Fed from
+        # _resume_interrupted_runs' failed+restore fallback arm so a persistent
+        # resume failure (prompt/tool drift, stale transcripts) surfaces ONE loud
+        # recon_resume_failure_storm escalation instead of silent churn.
+        self._resume_failure_storm = StormCounter()
 
         # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
         # inline remediation tail was deferred because the project was still in
@@ -2220,58 +2295,110 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one dead_owner_shielded suppression and check for a storm.
 
-        Appends (effective_now, project_id, instance_id) to the rolling deque,
-        prunes entries older than the configured window, then:
-        - Returns None if the number of DISTINCT non-None instance_id values
-          (dead-owner instances) in the window is below the threshold.
-        - Returns None if the alarm already fired within this window
-          (rate limit: <=1 per window).
-        - Otherwise sets _last_suppression_storm_escalation_at = effective_now
-          and returns a storm summary dict with 'count' (the distinct
-          dead-owner-instance count), 'window_seconds', and 'projects'
-          (sorted distinct project labels seen in the window).
+        The rolling-window mechanics — append, prune to the window, count,
+        compare to the threshold, rate-limit to one fire per window, and report
+        the distinct project labels seen — live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None while the count is below the
+        threshold and None when the alarm already fired within this window,
+        otherwise a storm summary dict with 'count' (the distinct
+        dead-owner-instance count), 'window_seconds', and 'projects' (sorted
+        distinct project labels seen in the window).
 
         Task 2039: the count is keyed on DISTINCT dead-owner instance_id
-        values, not on the number of suppression events. All orphans
-        recovered by one restart share that ONE dead owner's instance_id, so
-        a single multi-project restart contributes only 1 to the count no
-        matter how many projects it touches; only genuinely-independent
-        watchdog kills (distinct instance_id values) accumulate toward the
-        threshold. instance_id=None entries (should not occur for
-        dead_owner_shielded, which requires a matching non-None instance_id)
-        are excluded from the distinct set defensively.
+        values, not on the number of suppression events — which is why the
+        counter runs in ``count_distinct`` mode with instance_id as its ``key``
+        and project_id as its independent ``label``. All orphans recovered by
+        one restart share that ONE dead owner's instance_id, so a single
+        multi-project restart contributes only 1 to the count no matter how
+        many projects it touches; only genuinely-independent watchdog kills
+        (distinct instance_id values) accumulate toward the threshold.
+        instance_id=None entries (should not occur for dead_owner_shielded,
+        which requires a matching non-None instance_id) are excluded from the
+        distinct set defensively — StormCounter drops ``key=None`` from it.
+
+        Threshold and window are read LIVE off ``self.config`` on every call
+        rather than captured, so promoting either dead_owner_suppression_storm_*
+        leaf into ``RELOADABLE_FIELDS`` would work without further edits.
 
         The now= parameter follows the ``_finding_recently_resolved(..., now=None)``
         time-injection convention (harness.py:1592) for deterministic unit tests.
-        Task 1755 / PRD β; distinct-instance counting added by task 2039.
+        Task 1755 / PRD β; distinct-instance counting added by task 2039;
+        migrated onto the shared counter by task 3259.
+        """
+        return self._storm_summary(
+            self._dead_owner_storm,
+            threshold=self.config.dead_owner_suppression_storm_threshold,
+            window_seconds=self.config.dead_owner_suppression_storm_window_seconds,
+            project_id=project_id,
+            now=now,
+            key=instance_id,
+        )
+
+    # ── Shared storm-counter adapter (task 3259 / INV-5) ───────────────
+
+    @staticmethod
+    def _storm_summary(
+        counter: StormCounter,
+        *,
+        threshold: int,
+        window_seconds: float,
+        project_id: str,
+        now: datetime | None,
+        key: str | None = None,
+    ) -> dict | None:
+        """Record one event on *counter*; return this module's storm summary.
+
+        The single bridge between the harness's three storm recorders and
+        ``shared.storm_counter.StormCounter``, which owns the one
+        append-prune-count-ratelimit body in the codebase (INV-5).  It reconciles
+        the two contract differences, and nothing else:
+
+        CLOCK.  The harness injects time PER CALL (``now: datetime | None``, the
+        :meth:`_finding_recently_resolved` convention) while StormCounter's
+        ``time_provider`` binds at construction, so *now* is resolved here in
+        that idiom and forwarded as an epoch float.  The conversion is exact for
+        this use: the counter only ever subtracts and compares timestamps, and
+        ``.timestamp()`` on a tz-aware UTC datetime preserves both ordering and
+        differences.
+
+        SHAPE.  StormCounter returns ``count``/``threshold``/``window_seconds``/
+        ``labels``; this module's contract — read at the three call sites that
+        fold a summary into an escalation payload — is exactly
+        ``count``/``window_seconds``/``projects``.  Remapping here keeps that
+        shape byte-identical rather than leaking a renamed or extra key into an
+        operator-facing payload.  Same adapter shape MarkupStormCounter already
+        established: store/forward the knobs, rename ``labels`` on the way out.
+
+        *threshold* and *window_seconds* are passed PER CALL, never captured, so
+        a caller reading them live off ``self.config`` keeps observing in-place
+        reloads (``config/reload.py``'s reload-safety rule).
+
+        *key* is the distinct-count dimension, used only by
+        :meth:`_record_dead_owner_suppression` and only meaningful against a
+        counter built with ``count_distinct=True``.  This adapter deliberately
+        does NOT screen it: ``StormCounter.record`` raises ``ValueError`` on a
+        non-``None`` key handed to a default-mode counter, so a future recorder
+        wired to the wrong counter fails loudly on its first call instead of
+        silently reverting to raw-event thresholding — the pre-2039
+        (esc-recon-50da2482-1) behaviour.  Screening here would only re-hide it
+        for this one caller.  ``key=None`` stays valid in either mode, which is
+        what lets the two per-event recorders share this bridge unchanged.
         """
         effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._dead_owner_suppressions.append((effective_now, project_id, instance_id))
-        window = timedelta(seconds=self.config.dead_owner_suppression_storm_window_seconds)
-        cutoff_ts = effective_now - window
-        while self._dead_owner_suppressions and self._dead_owner_suppressions[0][0] < cutoff_ts:
-            self._dead_owner_suppressions.popleft()
-
-        count = len({iid for _, _, iid in self._dead_owner_suppressions if iid is not None})
-        if count < self.config.dead_owner_suppression_storm_threshold:
+        summary = counter.record(
+            threshold=threshold,
+            window_seconds=window_seconds,
+            label=project_id,
+            key=key,
+            now=effective_now.timestamp(),
+        )
+        if summary is None:
             return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_suppression_storm_escalation_at is not None
-            and (effective_now - self._last_suppression_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_suppression_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid, _ in self._dead_owner_suppressions})
         return {
-            'count': count,
-            'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
-            'projects': projects,
+            'count': summary['count'],
+            'window_seconds': window_seconds,
+            'projects': summary['labels'],
         }
 
     # ── Placeholder-finding drop storm counter (task 1970 amendment) ───
@@ -2279,60 +2406,81 @@ class ReconciliationHarness:
     def _record_placeholder_finding_drop(
         self, project_id: str, *, now: datetime | None = None
     ) -> dict | None:
-        """Record one dropped referenceless-finding event and check for a storm.
+        """Record one dropped never-cited-finding event and check for a storm.
 
-        Same rolling-window-counter + rate-limited-single-fire shape as
-        _record_dead_owner_suppression above, applied to
-        reconciliation.remediation_dropped_placeholder_finding events instead
-        of dead_owner_shielded suppressions.  Thresholds are the plain module
-        constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
+        Applied to reconciliation.remediation_dropped_placeholder_finding events
+        instead of the dead_owner_shielded suppressions
+        :meth:`_record_dead_owner_suppression` watches.  Thresholds are the plain
+        module constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
         _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS rather than ReconciliationConfig
         fields, since this counter is private to this module.
 
-        Appends (effective_now, project_id) to the rolling deque, prunes
-        entries older than the configured window, then:
-        - Returns None if the count is below the threshold.
-        - Returns None if the alarm already fired within this window
-          (rate limit: <=1 per window).
-        - Otherwise sets _last_placeholder_drop_storm_escalation_at =
-          effective_now and returns a storm summary dict with 'count',
-          'window_seconds', and 'projects' (sorted distinct project labels
-          seen in the window).
+        Task 4781: covers only findings _maybe_remediate classified as never
+        cited at all (``_finding_has_citation_failures`` is False).  A finding
+        that WAS cited but had every citation phantom-stripped by
+        ``citation_verifier.py::verify_cited_memories`` (a truthy
+        ``citation_failures`` marker) is routed to
+        :meth:`_record_phantom_citation_finding_drop` instead — a marker
+        proves the stage DID call cite_*, so counting it here would
+        misattribute an evidence-loss event as "Stage 3 stopped citing".
+
+        The rolling-window mechanics — append, prune to the window, count,
+        compare to the threshold, rate-limit to one fire per window, and report
+        the distinct project labels seen — live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None below the threshold and None when
+        the alarm already fired within this window, otherwise a storm summary
+        dict with 'count', 'window_seconds', and 'projects' (sorted distinct
+        project labels seen in the window).
 
         The now= parameter follows the same time-injection convention as
         _record_dead_owner_suppression, for deterministic unit tests.
         """
-        effective_now = now if now is not None else datetime.now(UTC)
+        return self._storm_summary(
+            self._placeholder_drop_storm,
+            threshold=_PLACEHOLDER_DROP_STORM_THRESHOLD,
+            window_seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+            project_id=project_id,
+            now=now,
+        )
 
-        # Append and prune the rolling window.
-        self._placeholder_finding_drops.append((effective_now, project_id))
-        window = timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS)
-        cutoff_ts = effective_now - window
-        while (
-            self._placeholder_finding_drops
-            and self._placeholder_finding_drops[0][0] < cutoff_ts
-        ):
-            self._placeholder_finding_drops.popleft()
+    # ── Phantom-citation drop storm counter (task 4781) ─────────────────
 
-        count = len(self._placeholder_finding_drops)
-        if count < _PLACEHOLDER_DROP_STORM_THRESHOLD:
-            return None
+    def _record_phantom_citation_finding_drop(
+        self, project_id: str, *, now: datetime | None = None
+    ) -> dict | None:
+        """Record one dropped phantom-cited-finding event and check for a storm.
 
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_placeholder_drop_storm_escalation_at is not None
-            and (effective_now - self._last_placeholder_drop_storm_escalation_at) < window
-        ):
-            return None
+        The complement of :meth:`_record_placeholder_finding_drop`: applied to
+        ``reconciliation.remediation_dropped_phantom_cited_finding`` events —
+        actionable findings dropped because
+        ``citation_verifier.py::verify_cited_memories`` stripped every citation
+        (the cited mem0 id(s) no longer resolve), NOT because the stage never
+        cited anything.  Thresholds are the plain module constants
+        _PHANTOM_CITATION_DROP_STORM_THRESHOLD /
+        _PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS, for the same
+        private-to-this-module reason as the placeholder counter's.
 
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_placeholder_drop_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._placeholder_finding_drops})
-        return {
-            'count': count,
-            'window_seconds': _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
-            'projects': projects,
-        }
+        The rolling-window mechanics live in ``shared.storm_counter.StormCounter``
+        (INV-5); this method only supplies the knobs and the event, via the same
+        :meth:`_storm_summary` adapter the placeholder counter uses — but against
+        its OWN counter instance (``self._phantom_citation_drop_storm``), so a
+        phantom-citation outage and a never-cited-placeholder regression are
+        counted, thresholded, and alarmed independently.  Returns None below
+        the threshold and None when the alarm already fired within this
+        window, otherwise a storm summary dict with 'count', 'window_seconds',
+        and 'projects' (sorted distinct project labels seen in the window).
+
+        The now= parameter follows the same time-injection convention as
+        _record_placeholder_finding_drop, for deterministic unit tests.
+        """
+        return self._storm_summary(
+            self._phantom_citation_drop_storm,
+            threshold=_PHANTOM_CITATION_DROP_STORM_THRESHOLD,
+            window_seconds=_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS,
+            project_id=project_id,
+            now=now,
+        )
 
     # ── Resume-failure storm counter (task σ / 2717) ───────────────────
 
@@ -2341,55 +2489,32 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one unresumable/failed interrupted-run resume and check for a storm.
 
-        Same rolling-window per-event counter + rate-limited single-fire shape as
-        :meth:`_record_placeholder_finding_drop`, applied to the failed+restore
-        fallback arm of :meth:`_resume_interrupted_runs`.  Thresholds are the
-        config fields ``resume_failure_storm_threshold`` /
+        Applied to the failed+restore fallback arm of
+        :meth:`_resume_interrupted_runs`.  Thresholds are the config fields
+        ``resume_failure_storm_threshold`` /
         ``resume_failure_storm_window_seconds`` (mirroring
         :meth:`_record_dead_owner_suppression`, which likewise reads config)
-        rather than module constants, so an operator can retune the alarm.
+        rather than module constants, so an operator can retune the alarm.  Both
+        are read LIVE on every call rather than captured, so promoting either
+        into ``RELOADABLE_FIELDS`` would work without further edits.
 
-        Appends ``(effective_now, project_id)`` to the rolling deque, prunes
-        entries older than the configured window, then:
-        - Returns None if the count is below the threshold.
-        - Returns None if the alarm already fired within this window (rate limit:
-          <=1 per window).
-        - Otherwise sets ``_last_resume_failure_storm_escalation_at =
-          effective_now`` and returns a storm summary dict with ``count``,
-          ``window_seconds``, and ``projects`` (sorted distinct project labels
-          seen in the window).
+        The rolling-window mechanics live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None below the threshold and None when
+        the alarm already fired within this window, otherwise a storm summary
+        dict with ``count``, ``window_seconds``, and ``projects`` (sorted
+        distinct project labels seen in the window).
 
         The now= parameter follows the same time-injection convention as the
         sibling storm counters, for deterministic unit tests.
         """
-        effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._resume_failures.append((effective_now, project_id))
-        window = timedelta(seconds=self.config.resume_failure_storm_window_seconds)
-        cutoff_ts = effective_now - window
-        while self._resume_failures and self._resume_failures[0][0] < cutoff_ts:
-            self._resume_failures.popleft()
-
-        count = len(self._resume_failures)
-        if count < self.config.resume_failure_storm_threshold:
-            return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_resume_failure_storm_escalation_at is not None
-            and (effective_now - self._last_resume_failure_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_resume_failure_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._resume_failures})
-        return {
-            'count': count,
-            'window_seconds': self.config.resume_failure_storm_window_seconds,
-            'projects': projects,
-        }
+        return self._storm_summary(
+            self._resume_failure_storm,
+            threshold=self.config.resume_failure_storm_threshold,
+            window_seconds=self.config.resume_failure_storm_window_seconds,
+            project_id=project_id,
+            now=now,
+        )
 
     # ── Deferred write replay ─────────────────────────────────────────
 
@@ -3549,7 +3674,39 @@ class ReconciliationHarness:
                 await self._flush_cycle_summaries(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
-                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                # Shielded against a second cancellation arriving mid-write;
+                # the write keeps running to completion in its own Task.
+                # asyncio.shield only protects work once its coroutine exists
+                # as its own Task — on the already-being-cancelled path this
+                # whole finally exists to serve, an unshielded await here
+                # would re-raise the very CancelledError the backstop arms
+                # above just survived, discarding the stage_reports copy
+                # (including the markers _flush_cycle_summaries just
+                # stamped) before it ever reaches the DB (task 4431).
+                # Materialized explicitly (rather than handed to
+                # asyncio.shield as a bare coroutine) so a done-callback can
+                # log a failure that survives a second cancellation instead
+                # of vanishing silently (task 4431).
+                stage_reports_write = asyncio.ensure_future(
+                    self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                )
+                stage_reports_write.add_done_callback(
+                    lambda t: self._log_stage_reports_write_failure(run_id, t)
+                )
+                await asyncio.shield(stage_reports_write)
+                # Known residual (task 4431): asyncio.shield protects the
+                # WRITE, not this awaiting frame — a second cancellation
+                # still raises CancelledError HERE, so the gc_run_config_dir
+                # block below remains unreachable on that path, exactly as
+                # before this fix (not a regression). A try/finally around
+                # this await (finally: run the gc block) would make it
+                # reachable WITHOUT swallowing the CancelledError —
+                # gc_run_config_dir is synchronous filesystem work with no
+                # awaits, so it cannot itself be re-interrupted. Left
+                # unaddressed here by scope, not necessity: this task's
+                # remit is the shield alone (design decision 3), so the
+                # reachability fix is deferred to a follow-up task rather
+                # than folded in here.
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
                 # exit path (success/failure) EXCEPT an interrupted (resumable) run —
                 # its transcript must survive on disk for the startup --resume pass.
@@ -3821,6 +3978,31 @@ class ReconciliationHarness:
             run, run_id, project_id, anchor,
         )
 
+    def _log_stage_reports_write_failure(
+        self, run_id: str, task: asyncio.Task,
+    ) -> None:
+        """Done-callback for the ``update_run_stage_reports`` write once
+        ``asyncio.shield`` has detached it into its own Task, in
+        :meth:`run_full_cycle`'s and :meth:`_run_remediation_pass`'s
+        ``finally`` blocks (task 4431). Once detached, a second
+        cancellation leaves nothing else awaiting that Task again.
+        ``asyncio.shield`` itself retrieves the inner Task's exception once
+        it is done (to suppress the generic "exception was never
+        retrieved" GC warning) but discards it without logging anything —
+        so today a real exception raised inside this write (e.g. a DB
+        error, not a cancellation) leaves no trace at all. Calling
+        ``task.exception()`` here first gives it a normal, structured log
+        line instead.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                'update_run_stage_reports failed for run %s (second-'
+                'cancellation write path): %r', run_id, exc,
+            )
+
     async def _ensure_stage1_cycle_summary(
         self,
         run: ReconciliationRun,
@@ -3920,7 +4102,10 @@ class ReconciliationHarness:
         whatever exception is already propagating and skip that persistence
         call, so the body swallows ``BaseException`` and each write itself
         runs under ``asyncio.shield`` to survive a second cancellation
-        arriving mid-write.
+        arriving mid-write. ``update_run_stage_reports`` itself is now also
+        shielded (task 4431), so the persisted copy this guarantee protects
+        actually reaches the DB instead of being discarded by a second
+        cancellation landing at that next, previously-unshielded await.
         """
         s1_key = StageId.memory_consolidator.value
         s1_report = run.stage_reports.get(s1_key)
@@ -3970,7 +4155,8 @@ class ReconciliationHarness:
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
             # narrow, bounded best-effort upsert, and letting any of those
             # interrupt the finally risks skipping the update_run_stage_reports
-            # call that follows (see docstring).
+            # call that follows — itself now shielded against a second
+            # cancellation too (task 4431; see docstring).
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_failed',
                 exc_info=True,
@@ -4099,7 +4285,10 @@ class ReconciliationHarness:
         exception is already propagating and skip that persistence call, so
         the body swallows ``BaseException`` and each write itself runs under
         ``asyncio.shield`` to survive a second cancellation arriving
-        mid-write.
+        mid-write. ``update_run_stage_reports`` itself is now also shielded
+        (task 4431), so the persisted copy this guarantee protects actually
+        reaches the DB instead of being discarded by a second cancellation
+        landing at that next, previously-unshielded await.
         """
         s2_key = StageId.task_knowledge_sync.value
         s2_report = run.stage_reports.get(s2_key)
@@ -4158,7 +4347,8 @@ class ReconciliationHarness:
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
             # narrow, bounded best-effort upsert, and letting any of those
             # interrupt the finally risks skipping the update_run_stage_reports
-            # call that follows (see docstring).
+            # call that follows — itself now shielded against a second
+            # cancellation too (task 4431; see docstring).
             logger.warning(
                 'reconciliation.stage2_cycle_summary_backstop_failed',
                 exc_info=True,
@@ -4292,12 +4482,12 @@ class ReconciliationHarness:
         (``task_count_snapshot_mem0_written``, already computed by
         ``TaskKnowledgeSync.run()``'s post-flight check); only a CONFIRMED
         current miss (``False`` — not a fresh write and not an
-        inconclusive/unknown check) is eligible to escalate.  Journal rows
-        persisted before the task-3045 rename carry the old
-        ``task_count_snapshot_written`` spelling and are still honored, via
-        ``extract_snapshot_written``'s legacy-key fallback — without it the
-        streak below would stop dead at the first pre-rename row.  The prior
-        consecutive-miss streak is recomputed each call from
+        inconclusive/unknown check) is eligible to escalate.  A read-only
+        alias for the pre-task-3045 stat spelling was retired in task 3488,
+        once measurement confirmed no journal row inside the lookback window
+        below could still change the computed streak; a pre-rename row now
+        reads as unknown, which stops the streak rather than extending it.
+        The prior consecutive-miss streak is recomputed each call from
         ``journal.get_recent_runs`` — mirroring ``_finding_persistence_count``'s
         journal-recompute pattern — rather than a stored counter, so it
         naturally resets on any successful write and survives a harness
@@ -4621,13 +4811,101 @@ class ReconciliationHarness:
             # the leak.  Fail-open: _finding_has_reference only drops a
             # finding when _derive_affected_ids is clearly empty; anything
             # ambiguous (legacy affected_ids or any typed citation) passes.
+            # Task 4781: split the drop bucket a second way.  Precedence is
+            # deliberate — _finding_has_citation_failures is checked BEFORE
+            # falling back to "never cited", because a citation_failures
+            # marker can only exist on a finding that DID have a citation to
+            # verify (see _finding_has_citation_failures's docstring). A
+            # phantom-cited finding must never be miscounted as evidence that
+            # Stage 3 stopped citing.
             referenceable: list[dict] = []
+            dropped_phantom_cited: list[dict] = []
             dropped_placeholders: list[dict] = []
             for finding in actionable:
                 if _finding_has_reference(finding):
                     referenceable.append(finding)
+                elif _finding_has_citation_failures(finding):
+                    dropped_phantom_cited.append(finding)
                 else:
                     dropped_placeholders.append(finding)
+
+            # Task 4781: a phantom-cited finding is a REAL finding whose
+            # evidence evaporated after Stage 3 cited it (its cited mem0 id(s)
+            # no longer resolve — see citation_verifier.py::verify_cited_memories).
+            # It is still dropped here, same as a never-cited placeholder:
+            # _derive_affected_ids(finding) is empty either way, so a
+            # remediation agent would have no task/entity/edge/memory identity
+            # to investigate, and _escalate's fingerprint would fall back to a
+            # description-only hash that folds unrelated findings together —
+            # exactly the leak _finding_has_reference exists to close. What
+            # changes is attribution: this drop is logged and (step-6) alarmed
+            # under its own name, so it is never misfiled as "Stage 3 stopped
+            # citing findings".
+            #
+            # COVERAGE TRADE-OFF (reviewer_comprehensive, task 4781 amendment):
+            # splitting one counter into two independently-thresholded counters
+            # is NOT coverage-neutral for a MIXED burst. Before this split, both
+            # causes fed one counter at threshold 5, so e.g. 3 never-cited drops
+            # + 3 phantom-cited drops in a window summed to 6 and fired (under
+            # the wrong label) the placeholder storm. Now each cause has its own
+            # threshold-5 counter, so that same 3+3 burst trips NEITHER alarm —
+            # six actionable findings can vanish from remediation in one window
+            # with no escalation at all. Accepted deliberately: correct
+            # attribution was judged more valuable than aggregate-sum
+            # sensitivity to a mixed burst (see this task's plan
+            # design_decisions), and a genuinely sustained single-cause outage
+            # still fires its own alarm at the same threshold as before the
+            # split. test_maybe_remediate_mixed_drop_causes_below_threshold_neither_storm_escalates
+            # (test_harness.py) pins the current, reduced-coverage-on-mixed-
+            # bursts behaviour so a future reader sees it as a decision, not a
+            # bug. If mixed-cause bursts under each per-cause threshold prove to
+            # matter operationally, the fix is a THIRD StormCounter fed by BOTH
+            # loops below, whose escalation names both per-cause counts — not
+            # raising these two thresholds, which would blunt each alarm's own
+            # single-cause sensitivity instead of restoring aggregate coverage.
+            for finding in dropped_phantom_cited:
+                logger.warning(
+                    'reconciliation.remediation_dropped_phantom_cited_finding',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'description': finding.get('description', ''),
+                        'citation_failures': finding.get('citation_failures') or [],
+                    },
+                )
+                # Task 4781: coarse aggregate alarm for a sustained
+                # phantom-citation-verification outage (e.g. mem0/Qdrant
+                # health, a bad bulk-delete) — the sibling of the
+                # placeholder-storm alarm below, but for the OTHER drop
+                # cause. Without this, a real evidence-loss event would push
+                # findings out of every remediation batch with no alarm at
+                # all: an individual drop is logged-only, and a dropped
+                # finding never enters a remediation run, so it can no longer
+                # accumulate toward _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+                # either (same gap the module comment above
+                # _PLACEHOLDER_DROP_STORM_THRESHOLD documents for the other
+                # cause).
+                storm = self._record_phantom_citation_finding_drop(project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or project_id
+                    storm_summary = (
+                        f"phantom-cited finding drop storm: {storm['count']} in "
+                        f'{window_min:.0f} min (projects: {proj_label}) — actionable '
+                        f'findings are reaching remediation with every citation stripped '
+                        f'by phantom-citation verification (cited mem0 ids no longer '
+                        f'resolve); their evidence evaporated — check mem0/Qdrant health '
+                        f'and recent memory deletions'
+                    )
+                    storm_detail = f'project={project_id} parent_run={parent_run_id}'
+                    self._escalate(
+                        'recon_remediation_phantom_citation_storm',
+                        parent_run_id,
+                        storm_summary,
+                        storm_detail,
+                        finding=_PHANTOM_CITATION_DROP_STORM_FINDING,
+                    )
 
             for finding in dropped_placeholders:
                 logger.warning(
@@ -5462,11 +5740,38 @@ class ReconciliationHarness:
             # by explicit design, so a lost row here is a genuine gap. Anchored
             # at run.started_at (this driver has no separate cycle_start_time
             # local), and placed strictly before update_run_stage_reports so the
-            # persisted copy captures whatever markers either arm stamped.
+            # persisted copy captures whatever markers either arm stamped —
+            # and that call is itself shielded against a second cancellation
+            # arriving mid-write, the identical mirror-site fix applied to
+            # run_full_cycle's finally: asyncio.shield only protects work
+            # once its coroutine exists as its own Task, so this driver needs
+            # the same guard for the same reason (task 4431).
             await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
             )
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            # Materialized explicitly (rather than handed to asyncio.shield
+            # as a bare coroutine) so a done-callback can log a failure that
+            # survives a second cancellation instead of vanishing silently
+            # (task 4431).
+            stage_reports_write = asyncio.ensure_future(
+                self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            )
+            stage_reports_write.add_done_callback(
+                lambda t: self._log_stage_reports_write_failure(run_id, t)
+            )
+            await asyncio.shield(stage_reports_write)
+            # Known residual (task 4431): asyncio.shield protects the WRITE,
+            # not this awaiting frame — a second cancellation still raises
+            # CancelledError HERE, so the gc_run_config_dir block below
+            # remains unreachable on that path, exactly as before this fix
+            # (not a regression). A try/finally around this await (finally:
+            # run the gc block) would make it reachable WITHOUT swallowing
+            # the CancelledError — gc_run_config_dir is synchronous
+            # filesystem work with no awaits, so it cannot itself be
+            # re-interrupted. Left unaddressed here by scope, not necessity:
+            # this task's remit is the shield alone (design decision 3), so
+            # the reachability fix is deferred to a follow-up task rather
+            # than folded in here.
             # Task 2744: GC this remediation run's per-run recon CLI config dir on
             # every exit path. Defensive — never mask the run's terminal outcome.
             try:
