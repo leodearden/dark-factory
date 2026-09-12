@@ -880,11 +880,16 @@ class TestAFalsificationIsNeverMaskedByABenignChange:
     it writes provenance-free bodies to BOTH clocks, so both are ``falsified``
     and reporting the first IS correct there. That contract still holds and that
     test stays green — first-offender-wins applies among EQUALS.
+
+    CROSS-clock only, deliberately. Two writes to the SAME clock leave only the
+    surviving body to attribute, and nothing here pins that case because nothing
+    can: it is residual gap (2) in ``df_pytest_isolation``'s SECOND DEFENCE
+    section, accepted there with its reasoning.
     """
 
     def _report(
         self, tmp_path: Path, before: dict[str, tuple[bytes, int] | None],
-    ) -> tuple[str, str] | None:
+    ) -> tuple[ClockVerdict, str] | None:
         return deploy_clock_change_report(
             before, deploy_clock_snapshot(tmp_path),
             session_token=_THIS_SESSION, root=tmp_path,

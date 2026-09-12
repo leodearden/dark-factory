@@ -93,15 +93,31 @@ defence whose whole point is that a silently-disarmed 8h backstop is invisible,
 and it is what makes the change safe to land with no coordinated writer rollout:
 a stamp from any writer not yet taught provenance reads as unattributable.
 
-THE RESIDUAL GAP, stated plainly rather than left to be rediscovered: a test
-that spawns a clock writer through an env-SCRUBBING seam — a fake
-``systemd-run`` transient unit, say — loses the token, so its write would carry
-an empty ``pytest_session`` and read as external.  Accepted, on two grounds.
-3797's actual defect class is a spawner that copies ``dict(os.environ)`` and
-merely forgets the clock var, which is covered in full; and the measured cost of
-the old behaviour was four innocent branches blocked.  If a scrubbing spawner is
-ever added, the fix is to thread the token through it, not to retire the
-downgrade.
+THE RESIDUAL GAPS, stated plainly rather than left to be rediscovered.  There
+are exactly TWO, both accepted, and both narrower than the cost they replace —
+four innocent branches blocked, measured.
+
+(1) A LOST TOKEN.  A test that spawns a clock writer through an env-SCRUBBING
+seam — a fake ``systemd-run`` transient unit, say — loses the token, so its
+write carries an empty ``pytest_session`` and reads as external.  3797's actual
+defect class is a spawner that copies ``dict(os.environ)`` and merely forgets
+the clock var, which is covered in full.  If a scrubbing spawner is ever added,
+the fix is to thread the token through it, not to retire the downgrade.
+
+(2) AN OVERWRITTEN FALSIFICATION.  Attribution reads the surviving body, so a
+test stamp that a GENUINE redeploy later overwrites on the SAME clock inside one
+run is attributed to that redeploy and the run stays green.  The pre-4823 guard
+caught this, because it keyed on "the bytes moved" alone; this is the one place
+the defence genuinely narrows.  Narrow: it needs both writes, to one clock,
+inside the same 26-41 minute run, against an 8h redeploy cadence.
+
+Closing (2) means observing the INTERMEDIATE states, which the session-scoped
+snapshot pair cannot do — and the obvious cheap patch does not work: the
+``before`` entry is read before any test runs, so it can never carry this run's
+own token, and parsing its provenance would buy nothing.  The real fix is
+continuous observation (a per-test guard, or a watch on the file), which is
+exactly the cost :func:`_df_deploy_clocks_unwritten` documents rejecting when it
+chose SESSION scope.  Revisit that trade before adding a check here.
 
 THIRD DEFENCE — a test's spawn timeout can never leak a process group.
 
