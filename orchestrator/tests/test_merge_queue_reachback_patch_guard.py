@@ -304,9 +304,6 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     # test's `len(head_calls) == 1` assertion would pass vacuously.
     ('test_merge_queue_deep_landing.py', '_maybe_schedule_shadow_compare'),
     ('test_merge_queue_equivalence.py', '_check_post_merge_pyright'),
-    ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_equivalence'),
-    ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_pyright'),
-    ('test_merge_queue_invariant_integration_gate.py', '_reverify_rebased_tree'),
     ('test_merge_queue_lifecycle_registry.py', '_finalize_advanced_merge'),
     ('test_merge_queue_lifecycle_registry.py', '_reverify_rebased_tree'),
     ('test_merge_queue_multihost_wiring.py', '_maybe_run_drift_check'),
