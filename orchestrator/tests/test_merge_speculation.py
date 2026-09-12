@@ -781,7 +781,7 @@ async def _run_spec_scenario(
     git_ops: GitOps,
     config: OrchestratorConfig,
     *,
-    verifier: FakeVerifier,
+    verifier: _SequencedVerifier,
     gate_a: asyncio.Event,
     escalation_queue: Any = None,
     after_b_verify_entered: Callable[[MergeLane, MergeRequest], Awaitable[None]] | None = None,
@@ -990,10 +990,11 @@ class TestSpecLaneAbortReleasesLane:
             # rather than waiting ten seconds for the next tick.
             lane.VERIFY_ABANDON_POLL_SECS = 0.01
             req_b.result.cancel()
+            pool = git_ops.spec_warm_lane_pool
+            assert pool is not None
+            lane0 = git_ops.worktree_base / '_spec-0'
             await _until(
-                lambda: git_ops.spec_warm_lane_pool.state(
-                    git_ops.worktree_base / '_spec-0'
-                ) == LaneState.FREE,
+                lambda: pool.state(lane0) == LaneState.FREE,
                 what='the dropped verify to release its warm spec lane',
             )
 
@@ -1021,10 +1022,11 @@ class TestSpecLaneAbortReleasesLane:
         async def _halt(lane: MergeLane, req_b: MergeRequest) -> None:
             lane.VERIFY_ABANDON_POLL_SECS = 0.01
             lane.operator_halt('spec-lane abort scenario')
+            pool = git_ops.spec_warm_lane_pool
+            assert pool is not None
+            lane0 = git_ops.worktree_base / '_spec-0'
             await _until(
-                lambda: git_ops.spec_warm_lane_pool.state(
-                    git_ops.worktree_base / '_spec-0'
-                ) == LaneState.FREE,
+                lambda: pool.state(lane0) == LaneState.FREE,
                 what='the halted verify to release its warm spec lane',
             )
             assert not req_b.result.done(), (

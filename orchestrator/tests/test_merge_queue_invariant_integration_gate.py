@@ -485,7 +485,7 @@ class TestScenario234VerifierLifecycleFaults:
         tests; what this gate adds is that the burst still reaches quiescence
         with the request landed rather than stuck or chain-failed.
         """
-        attempts: list[str] = []
+        attempts: list[str | None] = []
 
         class _UnavailableOnce(FakeVerifier):
             async def run_scoped(self, *args: Any, **options: Any):
