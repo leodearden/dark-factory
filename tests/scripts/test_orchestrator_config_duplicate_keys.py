@@ -396,9 +396,25 @@ def test_a_second_top_level_verify_env_block_silently_drops_the_earlier_keys(
     is the whole point — ``OrchestratorConfig.settings_customise_sources`` reads
     that env var at construction time, so a config built earlier would still be
     describing the tracked file.
+
+    KEYS ``defaults.yaml`` ALSO DECLARES ARE EXCLUDED, because shadowing the
+    project block does not unset the default: the effective config is
+    ``_deep_merge(_load_defaults(), project_config)`` and that merge RECURSES
+    into ``verify_env``, so a key declared in both layers legitimately survives
+    the mutation. Intersecting without the subtraction would couple this
+    reproduction to ``defaults.yaml`` currently declaring ``verify_env: {}`` —
+    and a later harmless edit there would go red pointing at the duplicate-key
+    guard rather than at the edit that caused it.
     """
-    declared = _declared_verify_env(ROOT_CONFIG_PATH)
-    assert declared, f'{ROOT_CONFIG_PATH} declares an empty verify_env; nothing to lose'
+    droppable = set(_declared_verify_env(ROOT_CONFIG_PATH)) - set(
+        _declared_verify_env(DEFAULTS_PATH)
+    )
+    assert droppable, (
+        f'{ROOT_CONFIG_PATH.name} declares no verify_env key that '
+        f'{DEFAULTS_PATH.name} does not also declare, so the mutation below has '
+        'nothing it could drop and this reproduction would pass while reproducing '
+        'nothing'
+    )
 
     mutant = tmp_path / ROOT_CONFIG_PATH.name
     mutant.write_text(_with_second_verify_env_block(ROOT_CONFIG_PATH.read_text()))
@@ -413,11 +429,14 @@ def test_a_second_top_level_verify_env_block_silently_drops_the_earlier_keys(
         'which is the reports-green-while-checking-something-else failure this '
         'whole directory exists to prevent'
     )
-    survivors = sorted(set(declared) & set(effective))
+    survivors = sorted(droppable & set(effective))
     assert not survivors, (
-        f'expected the second `verify_env:` block to shadow the first entirely, '
-        f'but {survivors!r} survived — the reproduction no longer reproduces, so '
-        'the guard above may be passing for a reason other than the one claimed'
+        f'expected the second `verify_env:` block to shadow the first entirely, but '
+        f'{survivors!r} survived. Keys {DEFAULTS_PATH.name} also declares are already '
+        'excluded — _deep_merge layers the project mapping over the defaults, so those '
+        'survive legitimately. Anything else means the reproduction no longer '
+        'reproduces, and the guard above may be passing for a reason other than the '
+        'one claimed'
     )
     assert [f.key for f in duplicate_keys(mutant)] == ['verify_env'], (
         'the detector must flag the very shape the production loader just '
