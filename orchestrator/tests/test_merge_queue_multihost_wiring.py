@@ -209,29 +209,35 @@ class TestBuildRemoteRunnersDfCheckout:
         result = self._call(config)
         assert result[0]._df_remote_checkout is None
 
-    def test_df_local_checkout_resolved_once_and_threaded_to_every_runner(self):
-        """df_local_checkout == resolve_local_df_checkout(), resolved once, shared."""
+    def test_df_local_checkout_is_the_dispatcher_root_resolved_once(self):
+        """df_local_checkout == the dispatcher's own checkout root, shared.
+
+        The REAL resolver runs.  It walks up from the orchestrator source file
+        to the ``.git`` marker, so in a test process it returns the checkout
+        this suite is running from — a value the test can recognise without
+        substituting the resolver.  The identity check is what "resolved ONCE
+        for the whole build, not re-walked per runner" is observable as: one
+        object threaded into every runner.
+        """
         from pathlib import Path
 
-        sentinel = Path('/dispatcher/dark-factory')
         config = _make_config(verify_runners=[
             _make_runner_cfg('r1', df_checkout_path='/remote/df1'),
             _make_runner_cfg('r2', df_checkout_path='/remote/df2'),
         ])
-        # NO create=True: resolve_local_df_checkout is genuinely imported into
-        # merge_queue by _build_remote_runners, so the patch MUST bind to a real
-        # module attribute.  Dropping create=True makes this test fail loudly if a
-        # future refactor drops that import (the wiring guarantee it pins).
-        with patch(
-            'orchestrator.merge_queue.resolve_local_df_checkout',
-            return_value=sentinel,
-        ) as mock_resolve:
-            result = self._call(config)
+        result = self._call(config)
 
-        assert all(r._df_local_checkout == sentinel for r in result)
-        # Resolved ONCE for the whole build (dispatcher root is call-invariant),
-        # not re-walked per runner.
-        assert mock_resolve.call_count == 1
+        roots = [r._df_local_checkout for r in result]
+        assert len({id(root) for root in roots}) == 1, (
+            'the dispatcher root must be resolved once and shared, not '
+            're-walked per runner'
+        )
+        root = roots[0]
+        assert root is not None, 'the running checkout must resolve'
+        assert (root / '.git').exists(), f'{root} is not a checkout root'
+        assert Path(__file__).resolve().is_relative_to(root), (
+            f'{root} is not the checkout this test is running from'
+        )
 
 
 # ---------------------------------------------------------------------------
