@@ -151,6 +151,7 @@ from orchestrator.task_ground_truth import (
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_pins_recovery,
 )
 from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
 from orchestrator.task_status import (
@@ -5781,7 +5782,15 @@ class Harness:
         recovery write — caller handles failure counting + escalation.
 
         Early-return guards (return None without touching the worktree):
-          - open L1 escalation veto (~line 1598): human handoff in progress
+          - the escalation-pin veto in the guard tail: a handoff is in
+            progress.  Since task 3541 that veto is the RESOLVER'S OWN answer
+            (``report_pins_recovery`` -> ``escalation.pins.classify_pins``),
+            not a local ``bool(report.open_escalations)`` re-derivation, so
+            this applier and ``_shape`` cannot disagree about what pins
+            (E7/INV-5).  The two ``deploy_phase`` / ``is_actively_held``
+            guards beside it are NOT policy: they carry facts the
+            ``_RECOVERY`` table structurally cannot express, and are labelled
+            as such in-code.
           - merge-deferred guard (below): task is train-parked (PRD § 9.8);
             the worktree must survive intact for the train-merge worker.
             Mirrors the open-L1 veto pattern — explicit early-return as
@@ -6401,9 +6410,17 @@ class Harness:
                 )
             return None
 
-        # Deploy-phase-tracked in-progress tasks are never auto-recovered by
-        # this generic reaper (review amendment, task 2243 W10-θ2
-        # reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
+        # THE GUARD TAIL.  Task 3541 (eta) separated the two kinds of check
+        # that used to sit here indistinguishably.  What was removed is the
+        # POLICY RE-DERIVATION (the `bool(report.open_escalations)` copy below,
+        # now the resolver's own shared answer — E7/INV-5).  What stays, and
+        # why, is stated on each survivor: both are facts the `_RECOVERY` table
+        # structurally CANNOT express, not second opinions about its output.
+        #
+        # BELT AND BRACES #1 — a deploy phase the table deliberately leaves
+        # unmapped.  Deploy-phase-tracked in-progress tasks are never
+        # auto-recovered by this generic reaper (review amendment, task 2243
+        # W10-θ2 reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
         # requires deploy_phase is None for EVERY MARK_DONE_WITH_PROVENANCE /
         # REVERT_TO_PENDING row (a/b/c/d) — so an in-progress task carrying a
         # deploy_phase can only reach this point via the LEAVE default
@@ -6425,21 +6442,32 @@ class Harness:
         if report.deploy_phase is not None:
             return None
 
-        # task 2243, W10-θ2 step-12: is_actively_held is the scheduler's own
-        # in-memory dispatch bookkeeping (dispatched / module-lock held /
-        # recent workflow-cancel stamp) — unambiguous, and not something the
-        # applier below independently re-derives (that was the now-deleted
-        # driver-level guard's job). Trust it directly rather than falling
-        # through.
+        # BELT AND BRACES #2 — the scheduler's IN-MEMORY dispatch bookkeeping,
+        # which no `TruthReport` field carries.  task 2243, W10-θ2 step-12:
+        # is_actively_held folds dispatched / module-lock held / recent
+        # workflow-cancel — unambiguous, and not something the applier below
+        # independently re-derives (that was the now-deleted driver-level
+        # guard's job). Trust it directly rather than falling through.
         if self.scheduler.is_actively_held(tid):
             return None
 
-        # An open escalation at ANY level (not just L1 — the resolver's row
-        # (f) folds every level) is the deliberate human/automation-handoff
-        # signal: don't reap it. Replaces the old has_open_l1(tid) veto
-        # (L1-only), which missed an L2-only open escalation and fell
-        # through to an incorrect revert.
-        if report.open_escalations:
+        # THE VETO — and no longer a local re-derivation of it (task 3541,
+        # E7/INV-5).  `report_pins_recovery` is the resolver's OWN
+        # `escalation.pins.classify_pins(...).pins` answer, so this applier and
+        # `_shape` can no longer disagree about whether a record pins: before
+        # the rewiring this read `bool(report.open_escalations)`, which held a
+        # strand on an info-severity ANNOTATION the resolver had already
+        # stopped counting (PRD boundary #8).
+        #
+        # `downgraded_reason is not None` is folded in and is NOT redundant.
+        # Task 3539's log mode (and its merge-remediable scoping clause) turn a
+        # CONVERT row into a LEAVE that must still HOLD, and both reach here.
+        # Without this disjunct a log-mode pinned strand — including a dead-L0
+        # one, which `pins` deliberately calls unpinned — would fall straight
+        # through to `_revert_in_progress_if_no_live_claimant` and be reverted
+        # underneath its responder: the precise demand-1 violation conversion
+        # exists to prevent.
+        if downgraded_reason is not None or report_pins_recovery(report):
             # Task 3535: the SAME hold the chokepoint above already described.
             # Emitting unguarded here would DOUBLE every boundary-#9 row — this
             # early-return and that chokepoint both see an on-main pinned
@@ -6461,6 +6489,10 @@ class Harness:
                 )
             return None
 
+        # BELT AND BRACES #3 — R3, the applier-side fact `_shape` cannot
+        # carry.  `_shape` sees only `live_claimant is not None`; it cannot see
+        # that a PLAN_LOCK-sourced claimant proves nothing mid-run.
+        #
         # A live claimant is a deliberate leave-alone (task 2243, W10-θ2
         # step-16 — this blanket check replaces the applier's own owner_pid
         # re-derivation, now retired), EXCEPT the R3 mid-run exception: a
