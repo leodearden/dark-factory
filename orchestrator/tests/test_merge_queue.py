@@ -28,7 +28,14 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, VerifyScript, passes, raises
+from _merge_lane_fakes import (
+    FakeClock,
+    FakeVerifier,
+    VerifyScript,
+    hangs_until,
+    passes,
+    raises,
+)
 from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec
 from _serial_merge_worker import MergeWorker
@@ -22788,6 +22795,21 @@ class TestSpeculationPermitLeakOnMergerError:
             await worker_task
 
 
+async def _wait_for_scoped_verify(verifier: FakeVerifier, *, timeout: float = 30.0) -> None:
+    """Wait until *verifier* has been asked to run a scoped verify.
+
+    ``FakeVerifier.run_scoped`` records the task id BEFORE it waits on a
+    ``hangs_until`` gate, so a non-empty ``verified`` is exactly the
+    "verify has started" edge these tests used to build by hand out of an
+    ``asyncio.Event`` set inside a patched stub.
+    """
+    async def _poll() -> None:
+        while not verifier.verified:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
+
+
 def _ledger_paths(worker: SpeculativeMergeWorker) -> set[Path]:
     """The owned-merge-worktree ledger, read from the worker's public snapshot.
 
@@ -23050,7 +23072,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         clock = FakeClock(time=time.time())
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, clock=clock)
         worker._heartbeat_interval_s = 9999.0  # suppress rate-limited log
 
         # Build a real _merge-* worktree
@@ -23082,13 +23104,16 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             )
         finally:
             worker._running = False
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            # Deliberately NO task.cancel(): with the clock injected the loop
+            # is never parked in a real sleep, so it must exit on the stop flag
+            # ALONE. Cancelling would mask a loop that ignores the flag — and
+            # measured, it does: with `while self._running` mutated to
+            # `while True` the cancel-then-await version still passed.
+            await asyncio.wait_for(task, timeout=5)
 
-        # Confirm the task is truly done before sampling, so a final in-flight
-        # tick cannot fire inside the observation window.
-        assert task.done(), 'Heartbeat task must be done after cancel+await'
+        # The task is done before sampling, so a final in-flight tick cannot
+        # fire inside the observation window.
+        assert task.done(), 'Heartbeat task must be done once _running is cleared'
         frozen_mtime = merge_wt.stat().st_mtime
         ticks_at_stop = len(clock.sleeps)
         for _ in range(50):
@@ -23118,50 +23143,41 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             git_ops, 'reg-test', 'reg.py', 'x = 1\n',
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
-
-        # Event that lets the test hold the verify open, and a separate
-        # event that fires when verify starts so we can sample the ledger.
-        verify_started = asyncio.Event()
+        # The injected verifier holds the verify open on `verify_gate`, and
+        # records the task id before it starts waiting — which is the
+        # "verify has started" edge this test needs.
         verify_gate = asyncio.Event()
-
-        async def _blocking_verify(merge_wt, cfg, module_configs, **kwargs):
-            verify_started.set()
-            await verify_gate.wait()
-            return MagicMock(passed=True, summary='')
+        verifier = FakeVerifier(default=hangs_until(verify_gate))
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
 
         worker_task = asyncio.create_task(worker.run())
         try:
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                side_effect=_blocking_verify,
-            ):
-                req = _make_request('reg-test', 'reg-test', wt, config)
-                await queue.put(req)
+            req = _make_request('reg-test', 'reg-test', wt, config)
+            await queue.put(req)
 
-                # Wait until verify has started (worktree is merged + in-verify)
-                await asyncio.wait_for(verify_started.wait(), timeout=30)
+            # Wait until verify has started (worktree is merged + in-verify)
+            await _wait_for_scoped_verify(verifier)
 
-                # --- THE ASSERTION ---
-                # At this point the merger has succeeded and put a SpeculativeItem
-                # on the verifier queue.  The worktree must be registered.
-                ledger = _ledger_paths(worker)
-                assert len(ledger) >= 1, (
-                    '_owned_merge_worktrees must be non-empty while verify is running; '
-                    'got empty set'
-                )
-                wt_path = next(iter(ledger))
-                assert wt_path.name.startswith('_merge-'), (
-                    f'Ledger entry must be a _merge-* path; got {wt_path.name!r}'
-                )
-                assert wt_path.parent == git_ops.worktree_base, (
-                    f'Ledger entry must live under worktree_base; got {wt_path}'
-                )
+            # --- THE ASSERTION ---
+            # At this point the merger has succeeded and put a SpeculativeItem
+            # on the verifier queue.  The worktree must be registered.
+            ledger = _ledger_paths(worker)
+            assert len(ledger) >= 1, (
+                '_owned_merge_worktrees must be non-empty while verify is running; '
+                'got empty set'
+            )
+            wt_path = next(iter(ledger))
+            assert wt_path.name.startswith('_merge-'), (
+                f'Ledger entry must be a _merge-* path; got {wt_path.name!r}'
+            )
+            assert wt_path.parent == git_ops.worktree_base, (
+                f'Ledger entry must live under worktree_base; got {wt_path}'
+            )
 
-                # Unblock verify
-                verify_gate.set()
-                outcome = await asyncio.wait_for(req.result, timeout=30)
-                assert outcome.status == 'done', f'Expected done; got {outcome}'
+            # Unblock verify
+            verify_gate.set()
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+            assert outcome.status == 'done', f'Expected done; got {outcome}'
 
         finally:
             await worker.stop()
@@ -23250,17 +23266,14 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             git_ops, 'done-clear', 'done.py', 'd = 1\n',
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        verifier = FakeVerifier()
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
 
         worker_task = asyncio.create_task(worker.run())
         try:
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                _mock_verify_pass(),
-            ):
-                req = _make_request('done-clear', 'done-clear', wt, config)
-                await queue.put(req)
-                outcome = await asyncio.wait_for(req.result, timeout=30)
+            req = _make_request('done-clear', 'done-clear', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
             assert outcome.status == 'done', (
                 f'Expected done landing; got {outcome}'
             )
@@ -23316,7 +23329,9 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
         wt = await _make_branch_with_file(git_ops, 'warm-swap', 'ws.py', 'x = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        verify_gate = asyncio.Event()
+        verifier = FakeVerifier(default=hangs_until(verify_gate))
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
 
         # Capture the ephemeral path at registration time (before the swap removes it)
         captured_ephemeral: list[Path] = []
@@ -23329,47 +23344,35 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
         worker._register_owned_merge_worktree = _capturing_register  # type: ignore[method-assign]
 
-        verify_started = asyncio.Event()
-        verify_gate = asyncio.Event()
-
-        async def _blocking_verify(merge_wt, cfg, module_configs, **kwargs):
-            verify_started.set()
-            await verify_gate.wait()
-            return MagicMock(passed=True, summary='')
-
         worker_task = asyncio.create_task(worker.run())
         try:
-            with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                side_effect=_blocking_verify,
-            ):
-                req = _make_request('warm-swap', 'warm-swap', wt, warm_config)
-                await queue.put(req)
+            req = _make_request('warm-swap', 'warm-swap', wt, warm_config)
+            await queue.put(req)
 
-                # Wait until verify has started — the warm swap has already
-                # happened at this point (swap is done before run_scoped_verification
-                # is called in _verify_and_advance).
-                await asyncio.wait_for(verify_started.wait(), timeout=30)
+            # Wait until verify has started — the warm swap has already
+            # happened at this point (swap is done before the scoped verify
+            # is dispatched in _verify_and_advance).
+            await _wait_for_scoped_verify(verifier)
 
-                # --- KEY ASSERTION ---
-                # The warm swap branch must have deregistered the ephemeral.
-                assert len(captured_ephemeral) == 1, (
-                    f'Expected exactly one ephemeral registered; '
-                    f'got {captured_ephemeral!r}'
-                )
-                ephemeral = captured_ephemeral[0]
-                assert ephemeral not in _ledger_paths(worker), (
-                    f'Ephemeral {ephemeral.name!r} must be deregistered at warm-swap '
-                    'time (before verify), not left as a ghost in the liveness ledger'
-                )
-                # Persistent path must never have been registered
-                persistent_path = git_ops.worktree_base / _PMN
-                assert persistent_path not in _ledger_paths(worker), (
-                    f'Persistent {_PMN!r} path must never enter the liveness ledger'
-                )
+            # --- KEY ASSERTION ---
+            # The warm swap branch must have deregistered the ephemeral.
+            assert len(captured_ephemeral) == 1, (
+                f'Expected exactly one ephemeral registered; '
+                f'got {captured_ephemeral!r}'
+            )
+            ephemeral = captured_ephemeral[0]
+            assert ephemeral not in _ledger_paths(worker), (
+                f'Ephemeral {ephemeral.name!r} must be deregistered at warm-swap '
+                'time (before verify), not left as a ghost in the liveness ledger'
+            )
+            # Persistent path must never have been registered
+            persistent_path = git_ops.worktree_base / _PMN
+            assert persistent_path not in _ledger_paths(worker), (
+                f'Persistent {_PMN!r} path must never enter the liveness ledger'
+            )
 
-                verify_gate.set()
-                outcome = await asyncio.wait_for(req.result, timeout=30)
+            verify_gate.set()
+            outcome = await asyncio.wait_for(req.result, timeout=30)
             assert outcome.status == 'done', f'Expected done; got {outcome}'
         finally:
             await worker.stop()
