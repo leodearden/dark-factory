@@ -2310,6 +2310,24 @@ class _StubRemoteAllocator:
         self._held = False
         return True
 
+    # -- the read side `snapshot()` goes through --------------------------------
+    # `_queued_in_lane` and `_owns_merge_worktree` read placement off
+    # `snapshot()`, which reads `host_names` UNCONDITIONALLY for
+    # `occupancy.hosts_total` (merge_queue.py::SpeculativeMergeWorker.snapshot)
+    # whenever an allocator is installed.  Without it, the first scene to pair
+    # this stub with one of those readers fails with an AttributeError from
+    # inside snapshot() instead of with a placement mismatch.
+    #
+    # `host_states()` is deliberately NOT provided, for the same reason its
+    # twin in test_merge_queue_deep_integration_gate.py dropped it: the `hosts`
+    # block comes from `_host_states_block`, whose first statement is
+    # `if not isinstance(self._host_allocator, HostAllocator): return []`, so
+    # it stays `[]` for any duck-typed double however much it offers.
+
+    @property
+    def host_names(self) -> list[str]:
+        return [self._lease.name]
+
 
 class _DeepScene:
     """One repo + worker + queue, driven round after round by :meth:`round_`."""

@@ -2073,23 +2073,25 @@ class _StubRemoteAllocator:
         self._held = False
         return True
 
-    # -- the read side `snapshot()` goes through (verify_runner.py:3376) ------
+    # -- the read side `snapshot()` goes through --------------------------------
     # Minimal, but not optional: `SpeculativeMergeWorker.snapshot()` reads
-    # `host_names` for `occupancy.hosts_total` and `host_states()` for the
-    # `hosts` block, so a stub without them makes the worker's own public
-    # observation surface unreadable on a remote scene.
+    # `host_names` UNCONDITIONALLY for `occupancy.hosts_total`
+    # (merge_queue.py::SpeculativeMergeWorker.snapshot), so a stub without it
+    # makes the worker's own public observation surface unreadable on a remote
+    # scene -- an AttributeError from inside snapshot(), not a failed claim.
+    #
+    # `host_states()` is deliberately NOT provided: the `hosts` block is built
+    # by `_host_states_block`, whose first statement is
+    # `if not isinstance(self._host_allocator, HostAllocator): return []`.
+    # That gate is a TYPE check by design (its docstring: the doubles "answer
+    # every attribute, so hasattr/duck-typing would let them crash or inject
+    # garbage"), so for THIS duck-typed stub the block is `[]` whatever the
+    # stub offers -- and an assertion written against `hosts` here would be
+    # permanently vacuous.
 
     @property
     def host_names(self) -> list[str]:
         return [self._lease.name]
-
-    def host_states(self) -> list[dict]:
-        return [{
-            'name': self._lease.name,
-            'is_local': self._lease.is_local,
-            'slot_state': 'busy' if self._held else 'free',
-            'quarantined': False,
-        }]
 
 
 def _verify_rows(db_path: Path) -> list[dict]:
