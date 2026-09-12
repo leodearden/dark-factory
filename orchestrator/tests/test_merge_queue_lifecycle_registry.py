@@ -34,6 +34,13 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import (
+    FakeVerifier,
+    RecordingEscalations,
+    hangs_until,
+    make_lane,
+    raises,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -86,40 +93,9 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=git_repo, git=git_config)
 
 
-class _FakeEscalationQueue:
-    """Minimal fake escalation queue (copied from
-    test_merge_queue_request_liveness.py:119 — per-file duplication
-    convention).
-    """
-
-    def __init__(self, *, open_l1: bool = False):
-        self._open_l1 = open_l1
-        self._seq = 0
-        self.submitted: list = []
-
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
-        return self._open_l1
-
-    def make_id(self, task_id: str) -> str:
-        self._seq += 1
-        return f'esc-{self._seq}'
-
-    def submit(self, esc) -> None:
-        self.submitted.append(esc)
-
-    def open_it(self):
-        """Simulate a prior open L1 (for dedup tests)."""
-        self._open_l1 = True
-
-
 def _make_worker(git_ops: GitOps, *, escalation_queue: Any = None):
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring).
-
-    Mirrors test_merge_queue_invariant_integration_gate.py:212's _make_worker.
-    """
-    from orchestrator.merge_queue import SpeculativeMergeWorker
-
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue(), escalation_queue=escalation_queue)
+    """Build a lane on the fakes for unit tests (no harness wiring)."""
+    return make_lane(git_ops, escalation_queue=escalation_queue)
 
 
 def _make_request(
@@ -160,14 +136,6 @@ async def _make_branch_with_file(
     (worktree / filename).write_text(content)
     await git_ops.commit(worktree, f'Add {filename}')
     return worktree
-
-
-def _mock_verify_pass() -> AsyncMock:
-    """Return a mock that makes run_scoped_verification always pass.
-
-    Duplicated from test_merge_queue.py (per-file duplication convention).
-    """
-    return AsyncMock(return_value=MagicMock(passed=True, summary=''))
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +180,7 @@ class TestNoteTransitionBestEffort:
     ) -> None:
         from orchestrator.merge_queue import ItemLifecycleState
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
@@ -223,7 +191,7 @@ class TestNoteTransitionBestEffort:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
         assert 'mr-unregistered0' in warnings[0].message
-        assert len(fake_eq.submitted) == 1
+        assert len(fake_eq.filed) == 1
 
     def test_illegal_edge_does_not_raise_and_leaves_state_unchanged(
         self,
@@ -232,7 +200,7 @@ class TestNoteTransitionBestEffort:
     ) -> None:
         from orchestrator.merge_queue import ItemLifecycleState
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
         rid = 'mr-aaaaaaaa'
         worker._lifecycle.register(rid)
@@ -248,7 +216,7 @@ class TestNoteTransitionBestEffort:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
         assert rid in warnings[0].message
-        assert len(fake_eq.submitted) == 1
+        assert len(fake_eq.filed) == 1
         # The underlying registry state is untouched by the rejected move —
         # matches ItemLifecycle.transition()'s own "leaves state UNCHANGED"
         # contract (test_item_lifecycle.py::test_skip_stage_move_raises).
@@ -320,13 +288,13 @@ class TestMergerDrainRegistersAndTransitions:
     async def test_request_progresses_queued_lane_buffered_merging(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-seq', 'file_kappa_seq.py', 'x = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-seq', 'kappa-seq', wt, config)
 
         # Producer-boundary asymmetry (see test above): unseen by the
@@ -345,18 +313,17 @@ class TestMergerDrainRegistersAndTransitions:
 
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            await queue.put(req)
+        await queue.put(req)
 
-            # worker.run() has been scheduled but the loop has not yet
-            # switched to it: asyncio.Queue.put() on a non-full unbounded
-            # queue never actually suspends (mirrors test_merge_queue.py's
-            # test_speculative_basic_throughput "Submit ... before the
-            # worker processes them" comment) — still pre-registry.
-            assert worker._lifecycle.current(req.request_id) is None
+        # worker.run() has been scheduled but the loop has not yet
+        # switched to it: asyncio.Queue.put() on a non-full unbounded
+        # queue never actually suspends (mirrors test_merge_queue.py's
+        # test_speculative_basic_throughput "Submit ... before the
+        # worker processes them" comment) — still pre-registry.
+        assert worker._lifecycle.current(req.request_id) is None
 
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
+        outcome = await asyncio.wait_for(req.result, timeout=60)
+        assert outcome.status == 'done', f'{outcome}'
 
         assert observed[:2] == [
             (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
@@ -375,13 +342,13 @@ class TestMergerDrainRegistersAndTransitions:
         agreement check now that the transient ``_inflight_req`` field is
         gone — the registry is the sole source of truth).
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-merging', 'file_kappa_merging.py', 'y = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-merging', 'kappa-merging', wt, config)
 
         captured: list[tuple[Any, Any]] = []
@@ -411,7 +378,6 @@ class TestMergerDrainRegistersAndTransitions:
 
         with (
             patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=60)
@@ -450,14 +416,13 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
         from orchestrator.merge_queue import (
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-awaiting-verify', 'file_kappa_av.py', 'z = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-awaiting-verify', 'kappa-awaiting-verify', wt, config)
 
         observed: list[tuple[Any, Any]] = []
@@ -484,10 +449,9 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
 
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
+        assert outcome.status == 'done', f'{outcome}'
 
         # NOTE: this test awaits FULL pipeline completion (`req.result`), which
         # for a successful RealMergeItem only resolves once verify+finalize
@@ -532,11 +496,10 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
         from orchestrator.merge_queue import (
             DecidedItem,
             ItemLifecycleState,
-            SpeculativeMergeWorker,
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request(
             'kappa-loop-breaker', 'kappa-loop-breaker', tmp_path / 'no-such-wt', config,
         )
@@ -599,12 +562,11 @@ class TestRequeueToQueuedSites:
             InflightStatus,
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+        worker = make_lane(git_ops, queue, escalation_queue=fake_eq)
 
         req = _make_request(
             'kappa-predispatch-halt', 'kappa-predispatch-halt', tmp_path, config,
@@ -625,8 +587,8 @@ class TestRequeueToQueuedSites:
         assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.QUEUED
         assert worker._live_items[req.request_id] is req
         assert not queue.empty(), 'req must be put back on _queue by the halt branch'
-        assert len(fake_eq.submitted) == 0, (
-            f'requeue must not escalate: {fake_eq.submitted!r}'
+        assert len(fake_eq.filed) == 0, (
+            f'requeue must not escalate: {fake_eq.filed!r}'
         )
 
         # Re-arm and re-drain: the SAME request_id flows back through the
@@ -636,8 +598,8 @@ class TestRequeueToQueuedSites:
 
         assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.LANE_BUFFERED
         assert worker._live_items[req.request_id] is drained
-        assert len(fake_eq.submitted) == 0, (
-            f're-drain must not escalate either: {fake_eq.submitted!r}'
+        assert len(fake_eq.filed) == 0, (
+            f're-drain must not escalate either: {fake_eq.filed!r}'
         )
 
     async def test_predispatch_operator_halt_on_unregistered_item_stays_silent(
@@ -654,12 +616,11 @@ class TestRequeueToQueuedSites:
         from orchestrator.merge_queue import (
             InflightStatus,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+        worker = make_lane(git_ops, queue, escalation_queue=fake_eq)
 
         req = _make_request(
             'kappa-predispatch-halt-bare', 'kappa-predispatch-halt-bare', tmp_path, config,
@@ -677,8 +638,8 @@ class TestRequeueToQueuedSites:
 
         assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert worker._lifecycle.current(req.request_id) is None
-        assert len(fake_eq.submitted) == 0, (
-            f'unregistered requeue must stay silent: {fake_eq.submitted!r}'
+        assert len(fake_eq.filed) == 0, (
+            f'unregistered requeue must stay silent: {fake_eq.filed!r}'
         )
 
 
@@ -729,16 +690,6 @@ async def _make_merged_item(
         speculative=False,
     )
     return req, item
-
-
-async def _dead_gate_never_returns(*args: object, **kwargs: object) -> MagicMock:
-    """Simulates a dead/hung LOCAL verify: never returns, never writes.
-
-    Duplicated from test_merge_queue_request_liveness.py:1090 (per-file
-    duplication convention).
-    """
-    await asyncio.Event().wait()
-    raise AssertionError('unreachable — this Event is never set')  # pragma: no cover
 
 
 def _attr_calls(node: ast.AST, attr: str) -> list[ast.Call]:
@@ -793,16 +744,31 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         """
         from orchestrator.git_ops import MergeVerifyLeaseContended
         from orchestrator.merge_queue import (
+            PRODUCTION_CLOCK,
             InflightStatus,
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
         from orchestrator.verify_runner import HostLease
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+        # One verifier scripts BOTH drives below: the contended-lease defer
+        # raises out of the scoped verify, and the dead-verify abort hangs on
+        # an Event nothing ever sets.
+        verifier = FakeVerifier(scripts={
+            'df3082-pair-contended': raises(
+                MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0),
+            ),
+            'df3082-pair-deadverify': hangs_until(asyncio.Event()),
+        })
+        # The real clock, deliberately: the no-progress budget below is read
+        # off the clock port while the abandon poll's cadence is real asyncio
+        # time, so a hand-advanced clock would never reach the budget.
+        worker = make_lane(
+            git_ops, queue, verifier=verifier, clock=PRODUCTION_CLOCK,
+            escalation_queue=fake_eq,
+        )
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
         worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
         worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
@@ -828,19 +794,15 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         fake_local.is_local = True
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        async def _lease_contended(*_a: object, **_k: object) -> object:
-            raise MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
-
         # ── CONTROL 1: contended-lease defer (merge_queue.py :13839/:13840) ──
         req_cl, item_cl = await _make_merged_item(
             git_ops, config, 'df3082-pair-contended', 'pc.py', 'c=1\n',
         )
         worker._register_owned_merge_worktree(item_cl.merge_wt)
         worker._register_item(item_cl, initial=ItemLifecycleState.VERIFYING)
-        with patch('orchestrator.merge_queue._run_post_merge_verify', _lease_contended):
-            vr_cl = await asyncio.wait_for(
-                worker._run_inflight_verify(item_cl, lease), timeout=15.0,
-            )
+        vr_cl = await asyncio.wait_for(
+            worker._run_inflight_verify(item_cl, lease), timeout=15.0,
+        )
         assert vr_cl.status == InflightStatus.REQUEUED, f'{vr_cl!r}'
 
         # ── THE DEFECT: dead-verify no-progress abort (:13775/:13776) ────────
@@ -849,12 +811,9 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         )
         worker._register_owned_merge_worktree(item_dv.merge_wt)
         worker._register_item(item_dv, initial=ItemLifecycleState.VERIFYING)
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns,
-        ):
-            vr_dv = await asyncio.wait_for(
-                worker._run_inflight_verify(item_dv, lease), timeout=15.0,
-            )
+        vr_dv = await asyncio.wait_for(
+            worker._run_inflight_verify(item_dv, lease), timeout=15.0,
+        )
         assert vr_dv.status == InflightStatus.REQUEUED, f'{vr_dv!r}'
 
         # ── CONTROL 2: pre-dispatch operator halt (:14727/:14730) ────────────
@@ -1280,13 +1239,13 @@ class TestVerifierDispatchFillRegistersDispatching:
         test awaits FULL pipeline completion (`req.result`), so (since
         step-10) the tail also covers the FINALIZING/TERMINAL transitions.
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-dispatching-verifying', 'file_kappa_dv.py', 'v = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request(
             'kappa-dispatching-verifying', 'kappa-dispatching-verifying', wt, config,
         )
@@ -1303,10 +1262,9 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
+        assert outcome.status == 'done', f'{outcome}'
 
         assert observed == [
             (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
@@ -1333,14 +1291,13 @@ class TestVerifierDispatchFillRegistersDispatching:
         from orchestrator.merge_queue import (
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-dispatching-window', 'file_kappa_dw.py', 'd = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request(
             'kappa-dispatching-window', 'kappa-dispatching-window', wt, config,
         )
@@ -1368,7 +1325,6 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         with (
             patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=60)
@@ -1396,11 +1352,10 @@ class TestVerifierDispatchFillRegistersDispatching:
         from orchestrator.merge_queue import (
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
 
         fake_allocator = MagicMock()
         fake_allocator.free_host_count.return_value = 0
@@ -1454,11 +1409,10 @@ class TestVerifierDispatchFillRegistersDispatching:
         from orchestrator.merge_queue import (
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
 
         fake_allocator = MagicMock()
         fake_allocator.free_host_count.return_value = 0
@@ -1516,13 +1470,13 @@ class TestVerifierDispatchFillRegistersDispatching:
         test_verify_pickup_rebases_when_main_advanced's OOB-advance
         interposition to force the ``main_advanced`` remerge deterministically.
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-stale-remerge', 'file_kappa_stale.py', 's = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-stale-remerge', 'kappa-stale-remerge', wt, config)
 
         original_dispatch = worker._dispatch_item
@@ -1562,10 +1516,9 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
+        assert outcome.status == 'done', f'{outcome}'
 
         assert captured == [ItemLifecycleState.MERGING], (
             f'expected the registry to read MERGING while _remerge() ran: {captured!r}'
@@ -1614,13 +1567,13 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         VERIFYING -> FINALIZING -> TERMINAL as the tail of the transition
         sequence, and the rid must be retired once the request lands.
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-finalize-land', 'file_kappa_fl.py', 'f = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-finalize-land', 'kappa-finalize-land', wt, config)
 
         observed: list[tuple[Any, Any]] = []
@@ -1635,10 +1588,9 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
+        assert outcome.status == 'done', f'{outcome}'
 
         assert observed == [
             (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
@@ -1673,7 +1625,6 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             InflightEntry,
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
         from orchestrator.verify_runner import HostLease
 
@@ -1691,7 +1642,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         mock_allocator = MagicMock()
         mock_allocator.release = AsyncMock()
         mock_allocator.cancel_and_release = AsyncMock()
@@ -1717,8 +1668,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         git_ops.advance_main = _capturing_advance  # type: ignore[method-assign]
         try:
-            with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-                advanced = await worker._finalize_inflight(entry)
+            advanced = await worker._finalize_inflight(entry)
         finally:
             git_ops.advance_main = original_advance  # type: ignore[method-assign]
 
@@ -1747,11 +1697,10 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             InflightEntry,
             ItemLifecycleState,
             MergeOutcome,
-            SpeculativeMergeWorker,
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
 
         req = _make_request('kappa-passthrough', 'kappa-passthrough', tmp_path, config)
         outcome = MergeOutcome('conflict', reason='merge conflict')
@@ -1800,12 +1749,11 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             ItemLifecycleState,
             RealMergeItem,
             SpeculativeItem,
-            SpeculativeMergeWorker,
         )
         from orchestrator.verify_runner import HostLease
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         fake_allocator = MagicMock()
         fake_allocator.quarantine_and_release = AsyncMock()
         worker._host_allocator = fake_allocator
@@ -1876,13 +1824,13 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         side_effect technique to force the branch deterministically.
         """
         from orchestrator.git_ops import AdvanceOutcome
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-gate-reverify', 'file_kappa_gr.py', 'g = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-gate-reverify', 'kappa-gate-reverify', wt, config)
 
         advance_calls: list[Any] = []
@@ -1898,9 +1846,6 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             # success-path gate machinery, which is not this test's concern.
             return AdvanceOutcome('not_descendant')
 
-        async def _fake_reverify_rebased_tree(*args: Any, **kwargs: Any) -> Any:
-            return None  # gate clears — disjoint/green re-verify
-
         observed: list[tuple[Any, Any]] = []
         original_note_transition = worker._note_transition
 
@@ -1913,14 +1858,10 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_advance_side_effect),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
-            patch(
-                'orchestrator.merge_queue._reverify_rebased_tree',
-                new=_fake_reverify_rebased_tree,
-            ),
-        ):
+        # No re-verify double: the fabricated rebase shas make the real
+        # overlap probe fail CLOSED, so _reverify_rebased_tree runs its real
+        # overlapping-delta arm through _run_post_merge_verify and clears.
+        with patch.object(git_ops, 'advance_main', side_effect=_advance_side_effect):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
 
@@ -1991,7 +1932,6 @@ async def _make_verifying_entry_with_sentinel(
         InflightVerifyResult,
         ItemLifecycleState,
         RealMergeItem,
-        SpeculativeMergeWorker,
     )
     from orchestrator.verify_runner import HostLease
 
@@ -2009,7 +1949,7 @@ async def _make_verifying_entry_with_sentinel(
         speculative=False,
     )
 
-    worker = SpeculativeMergeWorker(
+    worker = make_lane(
         git_ops, asyncio.Queue(), escalation_queue=escalation_queue,
     )
     mock_allocator = MagicMock()
@@ -2032,14 +1972,14 @@ async def _make_verifying_entry_with_sentinel(
     return worker, req, entry
 
 
-def _rejected_transition_escalations(fake_eq: _FakeEscalationQueue) -> list:
+def _rejected_transition_escalations(fake_eq: RecordingEscalations) -> list:
     """The ``merge_lifecycle_transition_rejected`` subset of *fake_eq*.
 
     Category-specific assertion idiom, copied from
     test_merge_queue_duplicate_submission.py:316/:341 (per-file duplication
     convention).
     """
-    return [e for e in fake_eq.submitted if e.category == 'merge_lifecycle_transition_rejected']
+    return [e for e in fake_eq.filed if e.category == 'merge_lifecycle_transition_rejected']
 
 
 @pytest.mark.asyncio
@@ -2064,7 +2004,7 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
         """
         from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         worker, req, entry = await _make_verifying_entry_with_sentinel(
             git_ops, config, 'df3082-requeued-verifying', 'df3082_rv.py', 'x = 1\n',
             escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
@@ -2087,7 +2027,7 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
             'a requeued request must be left PENDING for its re-dispatch, not resolved'
         )
         assert _rejected_transition_escalations(fake_eq) == [], (
-            f'a requeue must not escalate: {fake_eq.submitted!r}'
+            f'a requeue must not escalate: {fake_eq.filed!r}'
         )
 
     async def test_note_requeued_shaped_requeue_fires_no_rejected_transition_escalation(
@@ -2100,7 +2040,7 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
         """
         from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         worker, req, entry = await _make_verifying_entry_with_sentinel(
             git_ops, config, 'df3082-requeued-queued', 'df3082_rq.py', 'y = 2\n',
             escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
@@ -2116,7 +2056,7 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
         assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
         assert _rejected_transition_escalations(fake_eq) == [], (
             f'a properly-requeued item must not fire a rejected-transition L1 on '
-            f'every dead-verify abort: {fake_eq.submitted!r}'
+            f'every dead-verify abort: {fake_eq.filed!r}'
         )
         current = worker._lifecycle.current(rid)
         assert current == ItemLifecycleState.QUEUED, (
@@ -2183,7 +2123,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         """
         from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         worker, req, entry = await _make_verifying_entry_with_sentinel(
             git_ops, config, 'df3082-dropped', 'df3082_dr.py', 'd = 1\n',
             escalation_queue=fake_eq, status=InflightStatus.DROPPED,
@@ -2208,7 +2148,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
             f'{_accretion_warnings(caplog)!r}'
         )
         assert _rejected_transition_escalations(fake_eq) == [], (
-            f'retiring a dropped request must not escalate: {fake_eq.submitted!r}'
+            f'retiring a dropped request must not escalate: {fake_eq.filed!r}'
         )
 
     async def test_requeued_sentinel_leaves_no_inflight_entry_residue(
@@ -2223,7 +2163,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         """
         from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         worker, req, entry = await _make_verifying_entry_with_sentinel(
             git_ops, config, 'df3082-requeued-residue', 'df3082_rr.py', 'r = 1\n',
             escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
@@ -2250,7 +2190,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
             f'{_accretion_warnings(caplog)!r}'
         )
         assert _rejected_transition_escalations(fake_eq) == [], (
-            f'the chokepoint repair must not escalate: {fake_eq.submitted!r}'
+            f'the chokepoint repair must not escalate: {fake_eq.filed!r}'
         )
         assert not req.result.done(), (
             'a requeued request must be left PENDING for its re-dispatch, not resolved'
@@ -2275,7 +2215,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         """
         from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
 
-        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_eq = RecordingEscalations()
         worker, req, entry = await _make_verifying_entry_with_sentinel(
             git_ops, config, 'df3082-requeue-raced', 'df3082_rq.py', 'q = 1\n',
             escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
@@ -2299,7 +2239,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
         assert _rejected_transition_escalations(fake_eq) == [], (
             f'a correctly-wired requeue raced past QUEUED by the drain must not '
-            f'fire a rejected-transition escalation: {fake_eq.submitted!r}'
+            f'fire a rejected-transition escalation: {fake_eq.filed!r}'
         )
         current = worker._lifecycle.current(rid)
         assert current == ItemLifecycleState.LANE_BUFFERED, (
@@ -2357,11 +2297,10 @@ class TestStopMidFlightRetiresEveryContainer:
             InflightEntry,
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
 
         # 1. Lane-buffered request.
         req_lb = _make_request('kappa-stop-lb', 'kappa-stop-lb', tmp_path, config)
@@ -2463,13 +2402,13 @@ class TestAbandonPredispatchRetiresRegistry:
         before the merger reached it — is currently MERGING and is silently
         dropped (`continue`) without ever resolving a Future.
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-merger-abandon', 'file_kappa_ma.py', 'a = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-merger-abandon', 'kappa-merger-abandon', wt, config)
         req.result.cancel()
 
@@ -2506,11 +2445,10 @@ class TestAbandonPredispatchRetiresRegistry:
             InflightStatus,
             ItemLifecycleState,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
 
         req = _make_request(
             'kappa-dispatch-abandon', 'kappa-dispatch-abandon', tmp_path, config,
@@ -2567,7 +2505,6 @@ class TestCoalesceSupersededRetiresRegistry:
         from orchestrator.merge_queue import (
             GroupMergeRequest,
             ItemLifecycleState,
-            SpeculativeMergeWorker,
         )
 
         coalesce_cfg = OrchestratorConfig(
@@ -2579,7 +2516,7 @@ class TestCoalesceSupersededRetiresRegistry:
         wt3 = await _make_branch_with_file(git_ops, 'kc3', 'file_kc3.py', 'c = 1\n')
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(
+        worker = make_lane(
             git_ops, queue, train_callback_factory=_stub_train_callback_factory,
         )
 
@@ -2645,7 +2582,6 @@ class TestAutoChainParentSupersededRetiresRegistry:
             ItemLifecycleState,
             MergeOutcome,
             RealMergeItem,
-            SpeculativeMergeWorker,
         )
         from orchestrator.verify_runner import HostLease
 
@@ -2663,7 +2599,7 @@ class TestAutoChainParentSupersededRetiresRegistry:
         )
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         mock_allocator = MagicMock()
         mock_allocator.release = AsyncMock()
         mock_allocator.cancel_and_release = AsyncMock()
@@ -2682,7 +2618,6 @@ class TestAutoChainParentSupersededRetiresRegistry:
 
         with (
             patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             advanced = await worker._finalize_inflight(entry)
 
@@ -2731,13 +2666,13 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
     async def test_agreement_at_merging_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-sample-merging', 'file_ksm.py', 'm = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request('kappa-sample-merging', 'kappa-sample-merging', wt, config)
 
         captured: list[tuple[set, set]] = []
@@ -2765,7 +2700,6 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
 
         with (
             patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=60)
@@ -2793,13 +2727,13 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
         ``test_agreement_at_merging_window``/``test_agreement_at_finalizing_window``
         above.
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-sample-dispatching', 'file_ksd.py', 'd = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request(
             'kappa-sample-dispatching', 'kappa-sample-dispatching', wt, config,
         )
@@ -2829,7 +2763,6 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
 
         with (
             patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=60)
@@ -2849,13 +2782,13 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
     async def test_agreement_at_finalizing_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wt = await _make_branch_with_file(
             git_ops, 'kappa-sample-finalizing', 'file_ksf.py', 'f = 1\n',
         )
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         req = _make_request(
             'kappa-sample-finalizing', 'kappa-sample-finalizing', wt, config,
         )
@@ -2876,7 +2809,6 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
 
         with (
             patch.object(git_ops, 'advance_main', new=_capturing_advance),
-            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
         ):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=60)
@@ -2910,7 +2842,7 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
     async def test_three_items_all_reach_terminal_no_leaks(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState
 
         wts = [
             await _make_branch_with_file(
@@ -2919,7 +2851,7 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
             for i in range(3)
         ]
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue)
         reqs = [
             _make_request(f'kappa-quiesce-{i}', f'kappa-quiesce-{i}', wts[i], config)
             for i in range(3)
@@ -2927,12 +2859,11 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
 
         worker_task = asyncio.create_task(worker.run())
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-            for req in reqs:
-                await queue.put(req)
-            outcomes = await asyncio.gather(
-                *(asyncio.wait_for(req.result, timeout=60) for req in reqs)
-            )
+        for req in reqs:
+            await queue.put(req)
+        outcomes = await asyncio.gather(
+            *(asyncio.wait_for(req.result, timeout=60) for req in reqs)
+        )
 
         assert all(o.status == 'done' for o in outcomes), f'{outcomes}'
 
