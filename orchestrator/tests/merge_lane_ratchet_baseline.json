@@ -1384,7 +1384,7 @@
     "orchestrator/tests/test_harness_train_callbacks.py": {"patch_targets": ["SpeculativeMergeWorker", "enforce_merge_liveness_margin", "enforce_persistent_worktree_serial_lane"], "private_reads": 6},
     "orchestrator/tests/test_harness_warm_lane_wiring.py": {"patch_targets": [], "private_reads": 123},
     "orchestrator/tests/test_harness_wip_step_detection.py": {"patch_targets": [], "private_reads": 14},
-    "orchestrator/tests/test_inflight_verify_merge_lease.py": {"patch_targets": ["VerifyRunnerPool.dispatch"], "private_reads": 4},
+    "orchestrator/tests/test_inflight_verify_merge_lease.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_interactive_warm_worktree_integration_gate.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/test_interactive_worktree.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_interactive_worktree_reaper.py": {"patch_targets": [], "private_reads": 9},

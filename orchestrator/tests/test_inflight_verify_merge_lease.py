@@ -29,6 +29,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, _run_post_merge_verify
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cancel import read_lock_holder_pgid
 
 # ---------------------------------------------------------------------------
 # Real-git fixtures (mirroring test_merge_queue_persistent_worktree.py /
@@ -139,11 +140,13 @@ class TestInflightVerifyMergeLease:
         dispatch_observed_lease: list[bool] = []
 
         async def _side(*args, **kwargs):
-            dispatch_observed_lease.append(git_ops._merge_verify_lease_active())
+            dispatch_observed_lease.append(
+                read_lock_holder_pgid(git_ops.worktree_base) is not None
+            )
             return _mock_verify_result(True)
 
         with patch(
-            'orchestrator.merge_queue.VerifyRunnerPool.dispatch',
+            'orchestrator.verify_runner.VerifyRunnerPool.dispatch',
             new=AsyncMock(side_effect=_side),
         ):
             outcome = await _run_post_merge_verify(
@@ -158,7 +161,7 @@ class TestInflightVerifyMergeLease:
             'the merge-verify lease must be held at dispatch time for the '
             'local in-process verify on the persistent warm lane'
         )
-        assert git_ops._merge_verify_lease_active() is False, (
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
             'the lease must be released once the verify span completes'
         )
 
@@ -174,11 +177,13 @@ class TestInflightVerifyMergeLease:
         dispatch_observed_lease: list[bool] = []
 
         async def _side(*args, **kwargs):
-            dispatch_observed_lease.append(git_ops._merge_verify_lease_active())
+            dispatch_observed_lease.append(
+                read_lock_holder_pgid(git_ops.worktree_base) is not None
+            )
             return _mock_verify_result(True)
 
         with patch(
-            'orchestrator.merge_queue.VerifyRunnerPool.dispatch',
+            'orchestrator.verify_runner.VerifyRunnerPool.dispatch',
             new=AsyncMock(side_effect=_side),
         ):
             outcome = await _run_post_merge_verify(
@@ -206,11 +211,13 @@ class TestInflightVerifyMergeLease:
         dispatch_observed_lease: list[bool] = []
 
         async def _side(*args, **kwargs):
-            dispatch_observed_lease.append(git_ops._merge_verify_lease_active())
+            dispatch_observed_lease.append(
+                read_lock_holder_pgid(git_ops.worktree_base) is not None
+            )
             return _mock_verify_result(True)
 
         with patch(
-            'orchestrator.merge_queue.VerifyRunnerPool.dispatch',
+            'orchestrator.verify_runner.VerifyRunnerPool.dispatch',
             new=AsyncMock(side_effect=_side),
         ):
             outcome = await _run_post_merge_verify(
