@@ -2668,6 +2668,21 @@ class TestBuildParser:
         # (which passes neither spelling) parse cleanly instead of being
         # rejected with exit 2 by an armed default it never asked for.
         assert args.fail_on_blind_spot is None
+        # task 2917 EDIT 1: the per-project resolution seam the nightly
+        # wrapper uses. Defaults off so every pre-existing invocation still
+        # sweeps rather than printing a list and returning.
+        assert args.list_known_projects is False
+
+    def test_list_known_projects_flag(self):
+        """--list-known-projects is the seam
+        scripts/fused-memory-flag-marker-sweep.sh uses to per-projectize the
+        nightly drain (task 2917 EDIT 1). Resolution lives HERE, in Python,
+        rather than inline in the bash wrapper, so it is unit-testable and
+        so the wrapper's fake-recorder harness can distinguish a resolution
+        call from a sweep call by argv alone."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--list-known-projects'])
+        assert args.list_known_projects is True
 
     def test_fail_on_blind_spot_opt_in(self):
         """--fail-on-blind-spot is a store_true opt-in (task 3897)."""
@@ -2775,6 +2790,50 @@ class TestParseArgs:
             _mod._parse_args(['--apply', '--fail-on-blind-spot'])
         assert exc_info.value.code == 2
         assert '--fail-on-blind-spot requires --check' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ('argv', 'offender'),
+        [
+            (['--apply', '--list-known-projects'], '--apply'),
+            (['--check', '--list-known-projects'], '--check'),
+            (['--terminal-drain', '--list-known-projects'], '--terminal-drain'),
+            (['--delete-ids', 'abc', '--list-known-projects'], '--delete-ids'),
+        ],
+    )
+    def test_list_known_projects_with_a_sweeping_flag_is_rejected(
+        self, argv, offender, capsys,
+    ):
+        """task 2917 EDIT 1. --list-known-projects returns BEFORE the sweep
+        runs, so pairing it with any sweep-performing or verdict-rendering
+        flag would print the list and SILENTLY NOT SWEEP -- the same
+        cannot-fail/no-op defect class this function already rejects for
+        --fail-on-blind-spot. An operator who wired
+        `--apply --terminal-drain --list-known-projects` into the nightly
+        service would get a green run that drained nothing."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(argv)
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        assert '--list-known-projects' in stderr and offender in stderr, (
+            f'Expected an actionable error naming both flags, got: {stderr!r}'
+        )
+
+    def test_list_known_projects_alone_parses(self):
+        """The supported shape -- resolution only, no sweep flags."""
+        args = _mod._parse_args(['--list-known-projects'])
+        assert args.list_known_projects is True
+
+    def test_nightly_argv_still_parses_alongside_the_new_guard(self):
+        """The load-bearing ordering guard, re-asserted for task 2917: the
+        nightly `--apply --terminal-drain` argv must keep parsing cleanly.
+        The new validation sits alongside the --fail-on-blind-spot check and
+        BEFORE the tri-state resolution, so it cannot reject a run that
+        passes neither spelling."""
+        args = _mod._parse_args(['--apply', '--terminal-drain'])
+        assert args.apply is True
+        assert args.terminal_drain is True
+        assert args.list_known_projects is False
+        assert args.fail_on_blind_spot is True
 
     def test_opt_in_with_check_parses(self):
         """The supported wiring — and the one
@@ -2994,9 +3053,14 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids()
+            result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
+        assert mode == 'unconfigured', (
+            f'An unconfigured taskmaster must be reported as its OWN mode, not '
+            f'as a bare empty set: the journal line renders it differently from '
+            f'a backend that failed and from a genuine zero; got {mode!r}'
+        )
         assert not any(
             record.name == 'sweep_orphan_flag_markers' for record in caplog.records
         ), f'Expected no WARNING logs, got: {[r.message for r in caplog.records]}'
@@ -3017,7 +3081,16 @@ class TestResolveTerminalTaskIds:
 
         monkeypatch.setattr(
             'fused_memory.config.schema.FusedMemoryConfig',
-            lambda: types.SimpleNamespace(taskmaster=object()),
+            # project_root is present so the primary-project guard (task 2917)
+            # resolves and MATCHES, letting the run reach the backend -- this
+            # test is about backend wiring, not about the guard.
+            lambda: types.SimpleNamespace(
+                taskmaster=types.SimpleNamespace(project_root='/srv/dark-factory'),
+            ),
+        )
+        monkeypatch.setattr(
+            'fused_memory.models.scope.resolve_project_id_for_root',
+            lambda _root: 'dark_factory',
         )
         monkeypatch.setattr(
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
@@ -3025,9 +3098,14 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids()
+            result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
+        assert mode == 'resolution-failed', (
+            f'A raising backend must be distinguishable from a narrowed sweep '
+            f'and from a genuine zero, or a nightly whose task store failed to '
+            f'open reads like a healthy one; got {mode!r}'
+        )
         matching = [
             record for record in caplog.records
             if record.name == 'sweep_orphan_flag_markers' and record.levelno == logging.WARNING
@@ -3300,3 +3378,547 @@ class TestRunApplyStoreMutationPreflight:
             f'got: {[r.getMessage() for r in caplog.records]}'
         )
         memory_service.delete_memory.assert_not_awaited()
+
+
+class TestKnownProjectsCoverageIssue:
+    """_known_projects_coverage_issue() — the degradation predicate behind
+    --list-known-projects (task 2917 EDIT 1, esc-2917-3 ruling).
+
+    EMPTINESS IS THE WRONG KEY. ``build_known_projects_map`` seeds its
+    candidates with the primary root BEFORE extending with the env roots, so
+    an unset DASHBOARD_KNOWN_PROJECT_ROOTS yields a ONE-entry map, never an
+    empty one: the ``if not known_projects`` guard is unreachable in exactly
+    the degradation it was written to catch, and the nightly drain narrows to
+    a single project at exit 0, silently.
+
+    DRIVEN END-TO-END, ON PURPOSE (task 2917 amendment,
+    reviewer_comprehensive #2). Every test here sets the real env var against
+    real tmp_path roots and feeds the real ``_known_projects_map()`` output
+    into the predicate. The previous version stubbed BOTH sides —
+    monkeypatching ``resolve_project_id_for_root`` AND hand-passing the
+    resolved id list — so it asserted on a (root_named, id_absent) state the
+    real pipeline provably cannot produce, and stayed green no matter what
+    the registry builder did.
+
+    Three cases must be told apart:
+      (i)   a named root that IS NOT A DIRECTORY (typo, moved/unmounted
+            checkout). ``Path.resolve()`` is non-strict, so the builder
+            ADMITS it under a basename-derived id — the sweep runs a phantom
+            project that enumerates 0, deletes 0 and exits 0;
+      (ii)  a named root whose resolved path is ABSENT from the map, i.e. its
+            project_id was claimed first by another root (first-wins). That
+            checkout is never swept;
+      (iii) the env var is UNSET — primary-only coverage. Reported, but NOT
+            as a hard failure: a legitimately single-project install would
+            otherwise warn-as-error forever.
+    """
+
+    @staticmethod
+    def _resolve_pair(monkeypatch, primary_root, named_roots=None):
+        """Run the REAL resolution pair: build the registry exactly as
+        ``--list-known-projects`` does, then judge coverage on THAT map.
+
+        Returns ``(known_map, issue)`` so a test can assert on both what the
+        builder actually produced and what the predicate said about it.
+        """
+        monkeypatch.setenv('PROJECT_ROOT', str(primary_root))
+        if named_roots is None:
+            monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
+        else:
+            monkeypatch.setenv(
+                'DASHBOARD_KNOWN_PROJECT_ROOTS',
+                ','.join(str(root) for root in named_roots),
+            )
+        known = _mod._known_projects_map()
+        return known, _mod._known_projects_coverage_issue(known)
+
+    @staticmethod
+    def _mkroot(parent, name):
+        root = parent / name
+        root.mkdir(parents=True)
+        return root
+
+    def test_unset_env_reports_single_project_coverage(self, monkeypatch, tmp_path):
+        """Case (iii): primary-only is legible, not silent."""
+        primary = self._mkroot(tmp_path, 'dark-factory')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, named_roots=None)
+
+        assert list(known) == ['dark_factory'], (
+            f'The primary root is always seeded, so an unset env var yields a '
+            f'ONE-entry map -- the exact state an emptiness check cannot see; '
+            f'got {known!r}'
+        )
+        assert issue is not None, (
+            'A primary-only map must be REPORTED: it is the exact degradation '
+            'an empty-map check can never see, since the primary root is '
+            'always seeded into the map.'
+        )
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in issue, issue
+        assert 'dark_factory' in issue, issue
+
+    def test_named_root_that_is_not_a_directory_is_reported_root_by_root(
+        self, monkeypatch, tmp_path,
+    ):
+        """Case (i), and the reason id-membership was the wrong test.
+
+        A nonexistent root is NOT skipped by build_known_projects_map --
+        ``Path(raw).resolve()`` is non-strict, so the root is admitted under a
+        basename-derived project_id. Its id IS therefore in the map, an
+        id-membership predicate reports clean, and the wrapper goes on to
+        sweep a phantom project that counts 0 and exits 0. Asserted here on
+        the REAL map so the dead branch cannot come back.
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        present = self._mkroot(tmp_path, 'reify')
+        gone = tmp_path / 'gone-project'  # deliberately never created
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [present, gone])
+
+        assert 'gone_project' in known, (
+            f'Premise of this test: the builder ADMITS a nonexistent root '
+            f'(resolve() is non-strict), which is why membership-by-id cannot '
+            f'detect it; got {known!r}'
+        )
+        assert issue is not None, (
+            'A named root that is not a directory is a genuine degradation -- '
+            'it becomes a phantom project the sweep runs for nothing -- and '
+            'must not pass quietly.'
+        )
+        assert str(gone) in issue, (
+            f'Expected the BROKEN root to be named so the warning is '
+            f'actionable; got {issue!r}'
+        )
+        assert str(present) not in issue, (
+            f'Expected only the broken root to be named, not the healthy '
+            f'ones; got {issue!r}'
+        )
+
+    def test_first_wins_collision_is_reported(self, monkeypatch, tmp_path):
+        """Case (ii): two real roots claiming ONE project_id.
+
+        build_known_projects_map keeps the first and drops the second, so the
+        dropped checkout is never swept. Its id is still in the map (the
+        winner's), which is the second reason an id-membership test was
+        structurally blind here -- coverage must be judged by resolved PATH.
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        winner = self._mkroot(tmp_path / 'a', 'reify')
+        loser = self._mkroot(tmp_path / 'b', 'reify')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [winner, loser])
+
+        assert known.get('reify') == str(winner), (
+            f'Premise: first-wins keeps the earlier root; got {known!r}'
+        )
+        assert issue is not None, (
+            'A root whose project_id was already claimed is silently dropped '
+            'by the builder and never swept -- that must be reported.'
+        )
+        assert str(loser) in issue, (
+            f'Expected the DROPPED root to be named; got {issue!r}'
+        )
+        assert str(winner) not in issue, (
+            f'Expected the surviving root not to be named; got {issue!r}'
+        )
+
+    def test_fully_resolved_multi_project_map_is_quiet(self, monkeypatch, tmp_path):
+        """No degradation, no noise — otherwise the warning stops being read."""
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        reify = self._mkroot(tmp_path, 'reify')
+        autotrade = self._mkroot(tmp_path, 'autotrade')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [reify, autotrade])
+
+        assert sorted(known) == ['autotrade', 'dark_factory', 'reify'], known
+        assert issue is None, issue
+
+    def test_primary_root_repeated_in_the_env_var_is_not_a_degradation(
+        self, monkeypatch, tmp_path,
+    ):
+        """MEASURED on the live registry: DASHBOARD_KNOWN_PROJECT_ROOTS lists
+        the primary root too, and build_known_projects_map drops it as a
+        duplicate project_id (logged at INFO). A naive count comparison
+        (len(map) < 1 + len(named)) would therefore cry degradation on every
+        healthy nightly run, and so would a path check that ignored the
+        first-wins dedup. Built for real here -- the env var names the primary
+        root itself -- rather than re-running the previous test's fixture
+        (task 2917 amendment, reviewer_comprehensive #3).
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        reify = self._mkroot(tmp_path, 'reify')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [primary, reify])
+
+        assert sorted(known) == ['dark_factory', 'reify'], (
+            f'The repeated primary root must be DEDUPED, not duplicated; '
+            f'got {known!r}'
+        )
+        assert issue is None, (
+            f'The repeated primary root resolves to a path that IS in the map, '
+            f'so it is not a degradation; got {issue!r}'
+        )
+
+
+class TestTerminalDrainIsPrimaryProjectOnly:
+    """--terminal-drain must never arm deletions in a project whose task
+    store this process does not own (task 2917, esc-2917-3 ruling).
+
+    The defect: `_resolve_terminal_task_ids` took no project argument and
+    resolved terminal ids from `config.taskmaster.project_root` -- ONE
+    project's task DB. `main` computed that set once and handed it to `run`,
+    which matched markers by PLAIN STRING MEMBERSHIP against whatever
+    `--project-id` it was sweeping. Once the wrapper began looping over the
+    registered fleet, a sibling project's marker whose task_id merely
+    COLLIDES with a terminal dark_factory id (ids are small integers; the
+    measured collision rate was ~96%) would be deleted -- unrecoverably,
+    since mem0 removes the Qdrant point BEFORE writing its SQLite history.
+
+    The ruling: terminal-drain stays scoped to the PRIMARY project (the one
+    whose taskmaster root this process is configured with); every other
+    registered project is swept AGE-ONLY. The guard lives here rather than in
+    the bash wrapper because this is the single chokepoint every caller --
+    including a direct CLI invocation -- passes through.
+    """
+
+    @staticmethod
+    def _rig(monkeypatch, *, primary_id='dark_factory'):
+        """Wire a config whose taskmaster root resolves to `primary_id`, plus a
+        stub backend that WOULD yield terminal ids if it were ever reached."""
+        seen: dict[str, Any] = {'constructed': 0, 'get_statuses_roots': []}
+
+        class _StubBackend:
+            def __init__(self, _cfg):
+                seen['constructed'] += 1
+
+            async def start(self):
+                return None
+
+            async def get_statuses(self, project_root):
+                seen['get_statuses_roots'].append(project_root)
+                return {'11': 'done', '12': 'pending', '13': 'cancelled'}
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            lambda: types.SimpleNamespace(
+                taskmaster=types.SimpleNamespace(project_root='/srv/dark-factory'),
+            ),
+        )
+        monkeypatch.setattr(
+            'fused_memory.models.scope.resolve_project_id_for_root',
+            lambda _root: primary_id,
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
+            _StubBackend,
+        )
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_non_primary_project_gets_no_terminal_ids(self, monkeypatch, caplog):
+        """The escalation's own ask: sweeping `reify` must NOT receive
+        dark_factory's terminal task ids. Returning set() degrades that
+        project to an age-only sweep -- today's status quo, which self-drains
+        -- instead of arming a cross-project delete."""
+        seen = self._rig(monkeypatch, primary_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            result, mode = await _mod._resolve_terminal_task_ids('reify')
+
+        assert mode == 'narrowed-non-primary', (
+            f'The narrowing is the whole point of the guard, so it must be '
+            f'reported as a mode and not inferred from an empty set; got '
+            f'{mode!r}'
+        )
+        assert result == set(), (
+            f"Expected NO terminal ids for a non-primary project (they would be "
+            f"matched against reify's markers by plain string membership); "
+            f"got {result!r}"
+        )
+        assert seen['constructed'] == 0, (
+            'Expected the guard to short-circuit BEFORE the task backend is '
+            'even constructed, so no other project pays for a resolution it '
+            'must not use.'
+        )
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        assert messages, (
+            'A narrowed sweep must be LOUD: expected a WARNING, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        joined = ' '.join(messages)
+        assert 'reify' in joined and 'dark_factory' in joined, (
+            f'Expected the WARNING to name BOTH the swept project and the '
+            f'primary project so the journal explains the narrowing; got {joined!r}'
+        )
+        # Case-insensitive: the message emphasises the downgrade as AGE-ONLY,
+        # and the contract is that it SAYS so, not how it capitalises it.
+        assert 'age-only' in joined.lower(), (
+            f'Expected the WARNING to state the sweep proceeds age-only; '
+            f'got {joined!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_primary_project_still_gets_its_terminal_ids(self, monkeypatch):
+        """The guard must not disarm the working case: the primary project's
+        sweep still resolves terminal ids exactly as before."""
+        seen = self._rig(monkeypatch, primary_id='dark_factory')
+
+        result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
+
+        assert mode == 'terminal-drain', (
+            f'The working case must report the mode that actually ran; got '
+            f'{mode!r}'
+        )
+        assert result == {'11', '13'}, (
+            f'Expected the primary project to keep its terminal-drain set; '
+            f'got {result!r}'
+        )
+        assert seen['constructed'] == 1
+        assert seen['get_statuses_roots'] == ['/srv/dark-factory']
+
+
+class TestEffectiveModeLabel:
+    """_effective_mode_label() — the per-project coverage line in the journal
+    (task 2917 amendment, reviewer_comprehensive #4).
+
+    The line previously read `'terminal-drain (N)' if terminal_task_ids else
+    'age-only'`, keying on the TRUTHINESS of the resolved set. That collapses
+    four operational states into one word, and the state an operator most
+    needs to tell apart -- the PRIMARY project resolving zero terminal ids
+    because its task store failed to open -- then reads identically to a
+    correctly narrowed sibling project. The stated goal of the line is to
+    report coverage rather than intent; these tests pin that it does.
+    """
+
+    def test_terminal_drain_reports_the_count_including_zero(self):
+        """Zero terminal ids on the primary project is a REAL terminal-drain
+        run, not an age-only one: the set is authoritative and empty."""
+        assert _mod._effective_mode_label('terminal-drain', set()) == (
+            'terminal-drain (0 terminal task ids)'
+        )
+        assert _mod._effective_mode_label('terminal-drain', {'1', '2'}) == (
+            'terminal-drain (2 terminal task ids)'
+        )
+
+    @pytest.mark.parametrize(
+        'mode,expected_marker',
+        [
+            ('narrowed-non-primary', 'NARROWED'),
+            ('unconfigured', 'NO '),
+            ('resolution-failed', 'FAILED'),
+            ('not-requested', 'not requested'),
+        ],
+    )
+    def test_every_empty_set_reason_renders_distinctly(self, mode, expected_marker):
+        label = _mod._effective_mode_label(mode, set())
+        assert label.startswith('age-only ('), label
+        assert expected_marker in label, (
+            f'Mode {mode!r} must say WHY the sweep was age-only; got {label!r}'
+        )
+
+    def test_the_four_age_only_reasons_are_not_the_same_string(self):
+        """A regression that mapped two reasons to one label would defeat the
+        whole point, and would pass every test above."""
+        labels = {
+            _mod._effective_mode_label(mode, set())
+            for mode in (
+                'narrowed-non-primary', 'unconfigured',
+                'resolution-failed', 'not-requested',
+            )
+        }
+        assert len(labels) == 4, f'Expected four distinct labels, got {labels!r}'
+
+    def test_an_unlabelled_mode_is_loud_rather_than_mislabelled_age_only(self):
+        """Fail-visible: a mode added to the resolver without a label must not
+        silently print `age-only` for something that may not be age-only."""
+        label = _mod._effective_mode_label('brand-new-mode', set())
+        assert 'brand-new-mode' in label and 'UNKNOWN' in label, label
+
+
+class TestListKnownProjects:
+    """_known_projects_map() — the registry-backed resolution behind
+    --list-known-projects (task 2917 EDIT 1).
+
+    The nightly wrapper previously swept exactly ONE project (the sweep's
+    own `--project-id` default, dark_factory) while its per-project census
+    output read as if the fleet were covered. This helper is what lets the
+    wrapper ask the SAME {project_id: project_root} registry the
+    fused-memory server itself is configured from, rather than duplicating a
+    host-specific root list into a committed unit file.
+
+    Fail-safe posture mirrors _resolve_terminal_task_ids: any failure
+    degrades to {} (logged at WARNING) rather than propagating.
+
+    It returns the MAP, not just the ids: --list-known-projects prints
+    sorted(map) while _known_projects_coverage_issue judges coverage against
+    map.values(), so both consumers read ONE derivation of each root (task
+    2917 amendment, reviewer_comprehensive #6).
+    """
+
+    def test_returns_the_registry_map_verbatim(self, monkeypatch):
+        import fused_memory.models.scope as scope
+
+        monkeypatch.setattr(
+            scope, 'build_known_projects_map',
+            lambda *_a, **_kw: {'reify': '/b', 'dark_factory': '/a'},
+        )
+        assert _mod._known_projects_map() == {'reify': '/b', 'dark_factory': '/a'}, (
+            'The roots must survive the call: the coverage predicate compares '
+            'env-named roots against these VALUES, and re-deriving them is '
+            'what made it fragile.'
+        )
+
+    def test_passes_project_root_env_through_as_primary_root(self, monkeypatch):
+        """PROJECT_ROOT is the seam the wrapper already exports, so the
+        primary root the registry is built around must come from it."""
+        import fused_memory.models.scope as scope
+
+        seen: dict[str, Any] = {}
+
+        def _capture(primary_root, extra_roots=None):
+            seen['primary_root'] = primary_root
+            seen['extra_roots'] = extra_roots
+            return {'dark_factory': primary_root}
+
+        monkeypatch.setattr(scope, 'build_known_projects_map', _capture)
+        monkeypatch.setenv('PROJECT_ROOT', '/srv/some-checkout')
+
+        assert _mod._known_projects_map() == {'dark_factory': '/srv/some-checkout'}
+        assert seen['primary_root'] == '/srv/some-checkout'
+        # extra_roots left None so the registry defaults it from
+        # known_project_roots_from_env() (DASHBOARD_KNOWN_PROJECT_ROOTS) --
+        # the wrapper must not re-derive that list itself.
+        assert seen['extra_roots'] is None
+
+    def test_degrades_to_empty_map_when_registry_raises(self, monkeypatch, caplog):
+        """Fail-safe, not fail-open: a broken registry must not take down the
+        nightly drain, but it must be visible in the journal."""
+        import fused_memory.models.scope as scope
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError('registry exploded')
+
+        monkeypatch.setattr(scope, 'build_known_projects_map', _boom)
+
+        with caplog.at_level(logging.WARNING):
+            assert _mod._known_projects_map() == {}
+        assert any(
+            'registry exploded' in r.getMessage()
+            or '_known_projects_map' in r.getMessage()
+            for r in caplog.records
+        ), f'Expected a WARNING naming the failure; got {[r.getMessage() for r in caplog.records]}'
+
+
+class TestMainListKnownProjects:
+    """main() --list-known-projects — the branch the nightly wrapper consumes
+    with `$( ... )` word-splitting (task 2917 amendment,
+    reviewer_comprehensive #5).
+
+    Every contract here is read by BASH, not by Python, and the wrapper-side
+    tests substitute a fake recorder for this script — so without these, a
+    regression in any of the three silently changes what the nightly sweeps:
+
+      * stdout is EXACTLY one project_id per line and nothing else. Any stray
+        stdout write is word-split into an extra `--project-id` the wrapper
+        then sweeps;
+      * exit 1 when the registry resolves empty. That non-zero is what trips
+        the wrapper's narrow-and-warn fallback; `_known_projects_map` returning
+        `{}` is tested on its own, but the exit code that turns it into a
+        caller-visible signal is what the wrapper actually keys on;
+      * NO MemoryService and NO FusedMemoryConfig are constructed on this path.
+        That is why the wrapper can resolve the project list before the stores
+        are known reachable.
+    """
+
+    @staticmethod
+    def _no_store(monkeypatch):
+        """Make ANY live-store construction an immediate, loud failure."""
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError(
+                'the --list-known-projects path must not touch the live stores'
+            )
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig', _forbidden,
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', _forbidden,
+        )
+        monkeypatch.setattr(_mod.asyncio, 'run', _forbidden)
+
+    def _run(self, monkeypatch, resolved):
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--list-known-projects'],
+        )
+        monkeypatch.setattr(_mod, '_known_projects_map', lambda: resolved)
+        self._no_store(monkeypatch)
+        return _mod.main()
+
+    def test_prints_one_sorted_project_id_per_line_and_nothing_else(
+        self, monkeypatch, capsys,
+    ):
+        exit_code = self._run(
+            monkeypatch, {'reify': '/b', 'dark_factory': '/a', 'autotrade': '/c'},
+        )
+        out = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert out == 'autotrade\ndark_factory\nreify\n', (
+            f'The wrapper word-splits this stdout straight into --project-id '
+            f'arguments, so it must carry the ids and NOTHING else (sorted, so '
+            f'the journal order is stable); got {out!r}'
+        )
+
+    def test_json_report_is_not_printed_on_this_path(self, monkeypatch, capsys):
+        """The sweeping path ends with `print(json.dumps(report))`. If that
+        ever leaked into this branch every JSON token would become a swept
+        project_id."""
+        self._run(monkeypatch, {'dark_factory': '/a'})
+        out = capsys.readouterr().out
+
+        assert out.split() == ['dark_factory'], (
+            f'Expected exactly the id list; got {out!r}'
+        )
+
+    def test_empty_registry_exits_1_with_no_stdout(self, monkeypatch, capsys):
+        """The wrapper's narrow-and-warn fallback triggers on the EXIT CODE.
+        A 0 here would leave PROJECT_IDS empty-but-successful and the drain
+        would silently sweep nothing."""
+        exit_code = self._run(monkeypatch, {})
+        out = capsys.readouterr().out
+
+        assert exit_code == 1, (
+            f'An unresolvable registry must be a caller-visible signal, not a '
+            f'quiet success; got exit {exit_code}'
+        )
+        assert out == '', (
+            f'Nothing may reach stdout when there is no list to emit -- the '
+            f'wrapper only checks emptiness of what it captured; got {out!r}'
+        )
+
+    def test_reports_the_coverage_degradation_without_polluting_stdout(
+        self, monkeypatch, capsys, caplog,
+    ):
+        """A primary-only map is warned about (it is the degradation an
+        emptiness check can never see) — but on the LOG, never on stdout."""
+        monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            exit_code = self._run(monkeypatch, {'dark_factory': '/a'})
+        out = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert out == 'dark_factory\n', out
+        assert any(
+            'DASHBOARD_KNOWN_PROJECT_ROOTS' in r.getMessage()
+            for r in caplog.records
+        ), (
+            'A primary-only map must still be REPORTED at WARNING; got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
