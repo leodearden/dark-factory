@@ -151,6 +151,7 @@ from orchestrator.task_ground_truth import (
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_pins_blocked_recovery,
     report_pins_recovery,
 )
 from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
@@ -5868,19 +5869,31 @@ class Harness:
         # (_branch_is_degenerate below) — rather than a change to θ1's
         # reviewed table (design decision, task 2243; esc-2243-4).
         #
-        # The open-escalation clause is _only_merge_remediable, not the former
-        # `not report.open_escalations` (PRD leaf δ): a task whose branch landed
-        # while it was still blocked is often held by the reaper's OWN
-        # stranded_blocked — the escalation that ASKED for this landing — and
-        # letting it veto the self-heal pins the task blocked forever after its
-        # work is already on main.  Any non-remediable (human-concern)
-        # escalation still yields False and leaves the task alone, and an empty
-        # list is still True, so every other task classifies exactly as before.
+        # The open-escalation clause is the SHARED blocked-recovery predicate
+        # (task 3541), not the former `not report.open_escalations`: a task
+        # whose branch landed while it was still blocked is often held by the
+        # reaper's OWN stranded_blocked — the escalation that ASKED for this
+        # landing — and letting it veto the self-heal pins the task blocked
+        # forever after its work is already on main (PRD leaf δ).
+        #
+        # `report_pins_blocked_recovery` composes TWO relaxations that used to
+        # be one: `escalation.pins`' pin CLASS (an info annotation never pins;
+        # a dead-filer L0 has no consumer left — and `report.live_claimant is
+        # None` above is exactly what makes link 4 conclusive here) with this
+        # package's CATEGORY policy (`recovery_pins.only_merge_remediable`).
+        # `Scheduler._phase_redispatch_stranded_blocked` consumes the IDENTICAL
+        # function, which is what unifies the drift E7 catalogued — before
+        # 3541 the relaxation was a private Harness staticmethod the scheduler
+        # could not reach, so it kept its own bare `bool(rows)`.
+        #
+        # Any non-remediable (human-concern) handoff still pins and leaves the
+        # task alone, and an empty list still relaxes, so every other task
+        # classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and self._only_merge_remediable(report.open_escalations)
+            and not report_pins_blocked_recovery(report)
             and report.branch_state.kind in (
                 BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
             )
@@ -5897,20 +5910,20 @@ class Harness:
         # MARK_DONE upgrade above — rather than a change to θ1's reviewed
         # table (design decision, task 2243; esc-2243-5).
         #
-        # The open-escalation clause is _only_merge_remediable, not the former
-        # `not report.open_escalations` (PRD leaf δ): this is the branch shape a
-        # verified-green-but-never-merged task is in, and the escalation
-        # holding it is usually the reaper's OWN stranded_blocked — filed to
-        # REQUEST exactly the merge the verified-green gate below performs.
-        # Letting that request veto its own remediation was the anti-synergy δ
-        # closes.  Any non-remediable (human-concern) escalation still yields
-        # False here and leaves the task alone, and an empty list is still
-        # True, so every other task classifies exactly as before.
+        # Same SHARED predicate as the clause above (task 3541), for the same
+        # reason and with the same two composed relaxations: this is the branch
+        # shape a verified-green-but-never-merged task is in, and the
+        # escalation holding it is usually the reaper's OWN stranded_blocked —
+        # filed to REQUEST exactly the merge the verified-green gate below
+        # performs.  Letting that request veto its own remediation was the
+        # anti-synergy PRD leaf δ closes.  Any non-remediable (human-concern)
+        # handoff still pins here and leaves the task alone, and an empty list
+        # still relaxes, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and self._only_merge_remediable(report.open_escalations)
+            and not report_pins_blocked_recovery(report)
             and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN
         ):
             action = RecoveryAction.RE_FILE_ESCALATION
@@ -5948,26 +5961,39 @@ class Harness:
         # A PIN THAT `blocked` ACTUALLY HOLDS.
         #
         # The table cannot make this distinction and must not try: `_RECOVERY`
-        # keys on a BOOLEAN `has_open_escalation` and the module is
+        # keys on the CONSERVATIVE `vetoes_done_flip` answer and the module is
         # deliberately pure and config-free, while "which pin categories does
-        # the blocked arm treat as merge-remediable" is THIS class's policy
-        # (`MERGE_REMEDIABLE_ESC_CATEGORIES`).  So the scoping lives here, with
-        # the other two sweep-side adjustments.
+        # the blocked arm treat as merge-remediable" is orchestrator policy
+        # (`recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES`).  So the scoping
+        # lives here, with the other two sweep-side adjustments.
         #
         # WHY IT IS NEEDED.  `CONVERT_TO_BLOCKED`'s whole justification is that
         # `blocked` is a RESTING state for a pinned row: not dispatchable, and
         # `_RECOVERY`'s only BLOCKED row keys `has_open_escalation=False`, so a
         # converted row can never be recovered out of it by the table.  That
         # holds for a `task_failure` pin (the measured 3717 population) — but
-        # NOT for a pin the two clauses ABOVE deliberately relax on.  For a row
-        # pinned solely by `stranded_blocked`, `_only_merge_remediable` is
-        # True, so the very next sweep would see status='blocked', classify
-        # LEAVE, and be upgraded to MARK_DONE_WITH_PROVENANCE (or, off main, to
+        # NOT for a pin the two clauses ABOVE deliberately relax on.  For such
+        # a row the very next sweep would see status='blocked', classify LEAVE,
+        # and be upgraded to MARK_DONE_WITH_PROVENANCE (or, off main, to
         # RE_FILE_ESCALATION over an escalation that is already open).  That
         # would turn row (f)'s "never second-guess an open escalation, even
         # with on-main landing evidence" veto into a two-sweep auto-done, and
         # (j) into a possible duplicate filing — the exact hazards the rows
         # exist to avoid, arrived at by a route no one reviewed.
+        #
+        # This clause therefore asks the blocked arm's OWN question — "would
+        # those clauses move this row next sweep?" — by calling the SAME
+        # predicate they call (task 3541).  Before eta it asked with
+        # `_only_merge_remediable`, which WAS that predicate at the time;
+        # keeping the old spelling once the arm moved on would let the two
+        # drift, which is precisely how this hazard reopens.
+        #
+        # Consequence, deliberate: a CONVERT row pinned SOLELY by a dead-filer
+        # L0 in a non-remediable category now lands here instead of converting,
+        # because the blocked arm no longer vetoes on that record either.  Spec
+        # S6 assigns that row's visibility to the ORPHAN-L0 REAPER, which
+        # promotes the aged-out L0 to L1 — after which it is a genuine
+        # QUEUE_HANDOFF and converts on the next sweep.
         #
         # A merge-remediable-pinned strand therefore keeps EXACTLY its
         # pre-3539 disposition: a silent LEAVE, byte-identical emission
@@ -5980,7 +6006,7 @@ class Harness:
         # holds is not in it.
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
-            and self._only_merge_remediable(report.open_escalations)
+            and not report_pins_blocked_recovery(report)
         ):
             logger.info(
                 'Reconcile: task %s matches a convert_to_blocked row but is '
