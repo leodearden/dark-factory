@@ -511,6 +511,7 @@ class TestRecoverPendingMergesRegistryDedup:
         full_branch: str,
         branch_sha: str = 'sha-live',
         ancestor_pairs: set[tuple[str, str]] | None = None,
+        project_root: Path | None = None,
     ) -> MagicMock:
         """Fake git_ops for the dedup tests.
 
@@ -520,6 +521,10 @@ class TestRecoverPendingMergesRegistryDedup:
           survival check ``is_ancestor(full_branch, 'main')`` is therefore False
           (branch not yet landed) unless that pair is explicitly supplied, and
           the Phase-2 tip classification is driven by the snapshot-tip pairs.
+        * ``project_root`` is the cwd the REAL
+          ``merge_queue.patch_content_contained`` runs ``git cherry`` in.  Point
+          it at a NON-git directory to exercise that helper's documented
+          fail-open clause (``rc != 0`` → False) without patching it.
         """
         pairs = ancestor_pairs if ancestor_pairs is not None else set()
 
@@ -532,6 +537,8 @@ class TestRecoverPendingMergesRegistryDedup:
         git_ops = MagicMock()
         git_ops.resolve_branch_sha = fake_resolve
         git_ops.is_ancestor = fake_is_ancestor
+        if project_root is not None:
+            git_ops.project_root = project_root
         return git_ops
 
     async def test_same_sha_coalesces_to_one_with_peer_mirror(
@@ -658,7 +665,7 @@ class TestRecoverPendingMergesRegistryDedup:
         )
 
     async def test_divergence_replaces_and_warns(
-        self, tmp_path: Path, caplog, monkeypatch
+        self, tmp_path: Path, caplog
     ) -> None:
         """Divergent pair (is_ancestor False both ways) + patch NOT contained →
         resolve_divergent SUPERSET → REPLACE to the later record + a D2 WARNING
@@ -673,15 +680,17 @@ class TestRecoverPendingMergesRegistryDedup:
         store.record(req_x)
         store.record(req_y)
 
-        async def _pcc(head: str, upstream: str, git_ops: object) -> bool:
-            return False
-
-        monkeypatch.setattr(
-            'orchestrator.merge_queue.patch_content_contained', _pcc,
-        )
+        # No patch of patch_content_contained: a non-git project_root makes the
+        # REAL helper take its documented fail-open branch (``git cherry``
+        # rc != 0 → False), which is exactly the "patch NOT contained" input
+        # this test needs.
+        not_a_repo = tmp_path / 'not-a-git-repo'
+        not_a_repo.mkdir()
 
         registry = InFlightMergeRegistry()
-        git_ops = self._make_git_ops(full_branch='task/5326')  # DIVERGENT
+        git_ops = self._make_git_ops(  # DIVERGENT
+            full_branch='task/5326', project_root=not_a_repo,
+        )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
 
         with caplog.at_level(logging.WARNING):
@@ -1378,6 +1387,18 @@ class TestDelegatesToSharedAtomicWriter:
     """
 
     @staticmethod
+    def _a_request(tmp_path: Path) -> MergeRequest:
+        """Any journalable request — the PUBLIC entry point to ``_save_raw``.
+
+        ``record`` is the only public writer (``merge_queue_store.py::
+        MergeQueueStore.record``); its payload is irrelevant here, the
+        delegation contract is what this class pins.
+        """
+        wt = tmp_path / 'wt'
+        wt.mkdir(exist_ok=True)
+        return _make_req('t1', 't1', wt, _real_config(tmp_path))
+
+    @staticmethod
     def _recorder(monkeypatch):
         import shared.safe_io as _safe_io
 
@@ -1403,8 +1424,8 @@ class TestDelegatesToSharedAtomicWriter:
     def test_delegates_with_preserved_semantics(self, tmp_path: Path, monkeypatch) -> None:
         calls = self._recorder(monkeypatch)
         store = MergeQueueStore(tmp_path / 'data' / 'merge_queue.json')
-        store.remove('nope')  # no-op; drive _save_raw directly instead
-        store._save_raw({})
+        store.remove('nope')  # genuinely a no-op: absent id never reaches the writer
+        store.record(self._a_request(tmp_path))
 
         assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
         self._assert_common(calls[0][2])
@@ -1413,7 +1434,7 @@ class TestDelegatesToSharedAtomicWriter:
         reference = tmp_path / 'reference.json'
         reference.write_text('ref', encoding='utf-8')
         path = tmp_path / 'merge_queue.json'
-        MergeQueueStore(path)._save_raw({})
+        MergeQueueStore(path).record(self._a_request(tmp_path))
         assert path.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
 
     def test_oserror_still_swallowed_with_warning(self, tmp_path: Path, monkeypatch, caplog) -> None:
@@ -1429,7 +1450,7 @@ class TestDelegatesToSharedAtomicWriter:
         store = MergeQueueStore(tmp_path / 'merge_queue.json')
 
         with caplog.at_level(logging.WARNING):
-            store._save_raw({})  # must NOT raise
+            store.record(self._a_request(tmp_path))  # must NOT raise
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected one WARNING, got {caplog.records}'
