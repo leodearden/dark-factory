@@ -72,8 +72,10 @@ lock_depth: 12
 # fan-out for non-prefixed source, this command rarely fires; when it does
 # (root conftest.py changes), the fan-out keeps it safe.
 # task 2361: worker-kill de-flake + coverage. Every segment appends
-# --timeout=300 (CLI overrides each subproject's pyproject.toml timeout=60):
-# orchestrator/fused-memory run pytest-xdist with a 60s per-test timeout, and
+# --timeout=300 (a CLI --timeout overrides each subproject's pyproject.toml
+# `[tool.pytest.ini_options].timeout`, which was 60 when this was written and
+# is now itself 300 — see shared/pyproject.toml, 2026-09-12):
+# orchestrator/fused-memory run pytest-xdist, and
 # under host CPU oversubscription a starved xdist worker crosses that ceiling,
 # gets os._exit()'d by pytest-timeout's thread method, and
 # --max-worker-restart=0 turns that into a false-failing per-test "node down"

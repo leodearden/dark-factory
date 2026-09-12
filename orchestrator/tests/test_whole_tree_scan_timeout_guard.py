@@ -9,7 +9,13 @@ suite however runs under ``-n auto`` (``[tool.pytest.ini_options].addopts`` in
 concurrently with everything else and the same call has been MEASURED at
 17.85 / 21.32 / 30.75s at loadavg 120-176 -- a ~4.8x load inflation.  Worker
 deaths were then observed at loadavg 250-423, one further inflation step past
-the 60s ``[tool.pytest.ini_options].timeout`` default.
+the 60s ``[tool.pytest.ini_options].timeout`` default THEN IN FORCE (that
+default was raised to 300 on 2026-09-12 for an unrelated reason -- CPU
+starvation on a loaded host false-redding a shifting victim; see
+shared/pyproject.toml.  The family ceiling stayed at its own
+measurement-anchored 300s rather than following, so the marks this module
+demands are now equal to, not above, the global default: they still guarantee
+the family never drops BELOW it, which is what a floor is for).
 
 What makes the breach so expensive is the two settings around it:
 
@@ -33,15 +39,19 @@ uses, and (from step-5 on) recomputes the census of scanners from source on
 every run so the Nth new scanner is caught at commit time rather than by another
 truncated verify.
 
-NOT widening the global ``timeout``: that would blunt the 60s ceiling for the
-other ~16000 tests, which is exactly the ceiling that catches real hangs.
+NOT widening the global ``timeout`` *as the remedy for THIS hazard*: doing it
+for that reason would blunt the hang-catching ceiling for the other ~16000
+tests to buy headroom only ~13 modules need.  (The global default did later
+move 60 -> 300, but for a different hazard -- wall-clock CPU starvation
+false-redding a shifting victim -- and the per-module marks stayed, because a
+sweep's cost and a host's contention are separate things to size against.)
 
 WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
 module a failing run points at, but the CANONICAL home -- the derivation of the
 ceiling, the full measurement record, and the escalation references -- is the
 ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in ``_orch_helpers.py``.  The ~13
 modules that carry the mark point THERE rather than repeating it, so retuning
-the multiple or switching ``timeout_method`` is one edit plus this file, not
+the ceiling or switching ``timeout_method`` is one edit plus this file, not
 fourteen.
 """
 from __future__ import annotations
@@ -103,14 +113,21 @@ _MEASURED_UNDER_LOAD_WORST_CASE = 30.75
 _REQUIRED_HEADROOM_FACTOR = 8
 
 # ABSOLUTE floor in seconds, deliberately independent of
-# PYPROJECT_DEFAULT_TIMEOUT.  WHOLE_TREE_SCAN_TEST_TIMEOUT is DERIVED
-# (`5 * PYPROJECT_DEFAULT_TIMEOUT`), which is right for tracking the hazard
-# UPWARD but would also track the ini default DOWNWARD in silence: tightening
-# `[tool.pytest.ini_options].timeout` to 20s shrinks the family ceiling to
+# PYPROJECT_DEFAULT_TIMEOUT -- and, since 2026-09-12, the PRIMARY anchor for
+# the family ceiling rather than a backstop under a derivation.
+#
+# WHOLE_TREE_SCAN_TEST_TIMEOUT used to be DERIVED (`5 *
+# PYPROJECT_DEFAULT_TIMEOUT`), which tracked the hazard UPWARD but also tracked
+# the ini default DOWNWARD in silence: tightening
+# `[tool.pytest.ini_options].timeout` to 20s would shrink the family ceiling to
 # 100s -- inside ~3x of the measured-under-load worst case, and well inside the
 # further inflation seen at loadavg 250-423 -- while a ratio-only assertion
-# (`>= 5 * PYPROJECT_DEFAULT_TIMEOUT`) stays green because it is an identity.
-# This floor is what makes that scenario fail loudly.  Never-narrow.
+# (`>= 5 * PYPROJECT_DEFAULT_TIMEOUT`) stayed green because it was an identity.
+# This floor was written to make that scenario fail loudly, and it is what the
+# constant is now pinned AT: the derivation was dropped when the ini default
+# was raised 60 -> 300 (for host-contention reasons of its own), because
+# carrying the multiple forward would have set the family ceiling to 1500s on
+# no measurement at all.  Never-narrow.
 _ABSOLUTE_FLOOR_SECONDS = 300
 
 # Resolved from _orch_helpers' shared anchor, which is itself resolved from
@@ -179,22 +196,29 @@ class TestTimeoutConstants:
         * 17.85 / 21.32 / 30.75s per call for test_serial_merge_worker_import_guard
           at loadavg 120-176 (task 4215's record) -- ~4.8x its unloaded figure;
         * xdist worker deaths observed at loadavg 250-423 (esc-3980-1,
-          esc-3787-1), i.e. past the 60s default.
+          esc-3787-1), i.e. past the 60s default then in force.
 
-        A 5x multiple leaves ~36x headroom over the unloaded worst case and ~10x
-        over the measured-under-load worst case.  Asserted as ``>=`` rather than
-        ``==`` so raising the constant later is never blocked by this test --
-        the never-narrow polarity the neighbouring shared timeouts use.
+        300s leaves ~36x headroom over the unloaded worst case and ~10x over the
+        measured-under-load worst case.  Asserted as ``>=`` rather than ``==`` so
+        raising the constant later is never blocked by this test -- the
+        never-narrow polarity the neighbouring shared timeouts use.
 
-        TWO INDEPENDENT ASSERTIONS, because the ratio alone pins nothing.
-        ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` is *defined* as
-        ``5 * PYPROJECT_DEFAULT_TIMEOUT``, so a ratio-only check is an identity
-        that cannot fail -- and worse, the derivation tracks the ini default
-        DOWNWARD in silence: tightening ``[tool.pytest.ini_options].timeout`` to
-        20s would auto-shrink this ceiling to 100s with both this test and
-        :meth:`test_pyproject_default_timeout_mirrors_pyproject` still green.
-        The ABSOLUTE floor is therefore asserted first, and the floor itself is
-        justified against the MEASUREMENT rather than written as a bare literal.
+        THREE ASSERTIONS, each pinning something the others do not:
+
+        1. the ABSOLUTE floor still clears the MEASUREMENT with the demanded
+           headroom -- the arithmetic that justifies the literal 300 rather
+           than leaving it a bare number;
+        2. the constant clears that floor -- the substantive check;
+        3. the constant has not fallen below the ini default, which would turn
+           the module-level marks from a floor into a tightening.
+
+        Assertion 3 REPLACED a ``>= 5 * PYPROJECT_DEFAULT_TIMEOUT`` check on
+        2026-09-12.  While the constant was *defined* as
+        ``5 * PYPROJECT_DEFAULT_TIMEOUT`` that check was an identity that could
+        not fail; the derivation was then dropped (the ini default rose 60 ->
+        300 for host-contention reasons, and carrying the multiple would have
+        set this ceiling to 1500s on no measurement), so the relationship worth
+        pinning is the never-narrow one, which has teeth in both directions.
         """
         assert (
             _ABSOLUTE_FLOOR_SECONDS
@@ -219,12 +243,13 @@ class TestTimeoutConstants:
             'the setting it exists to clear -- pin it explicitly rather than '
             'lowering this floor.'
         )
-        assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= 5 * PYPROJECT_DEFAULT_TIMEOUT, (
-            f'WHOLE_TREE_SCAN_TEST_TIMEOUT ({WHOLE_TREE_SCAN_TEST_TIMEOUT}) must '
-            f'clear 5x the pyproject default ({5 * PYPROJECT_DEFAULT_TIMEOUT}s). '
-            'A whole-tree AST sweep measured 30.75s at loadavg 120-176 and the '
-            'xdist worker deaths this guard exists to prevent were seen at '
-            'loadavg 250-423; anything tighter re-arms that cliff.'
+        assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (
+            f'WHOLE_TREE_SCAN_TEST_TIMEOUT ({WHOLE_TREE_SCAN_TEST_TIMEOUT}) has '
+            f'fallen BELOW the pyproject default ({PYPROJECT_DEFAULT_TIMEOUT}s). '
+            'The module-level marks this guard demands are meant to be a FLOOR '
+            'that narrows nothing; below the default they would instead TIGHTEN '
+            'every test in ~13 modules, which is the opposite of the intent. '
+            'Raise the constant, or lower the ini default to match.'
         )
 
 
@@ -332,7 +357,7 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
     helper answers "is the marker NAME present", which is the wrong question on
     its own.  A new scanner added with ``pytestmark = pytest.mark.timeout(30)``
     carries the name and would sail through a name-only check while sitting
-    BELOW the very 60s cliff this module exists to clear -- the guard's own
+    BELOW the family ceiling this module exists to enforce -- the guard's own
     remediation text says to use ``WHOLE_TREE_SCAN_TEST_TIMEOUT``, and until
     this function existed nothing enforced it.
 
@@ -579,7 +604,7 @@ def test_ceiling_reads_a_bare_numeric_literal() -> None:
     """``pytest.mark.timeout(30)`` -- the hole this function closes.
 
     A name-only check reads this module as "has a timeout mark" and passes it
-    green while it sits BELOW the 60s default the family exists to clear.
+    green while it sits BELOW the family ceiling.
     """
     source = 'import pytest\npytestmark = pytest.mark.timeout(30)\n'
     assert _module_level_timeout_ceiling(source) == 30.0
@@ -691,7 +716,7 @@ def test_a_synthetic_new_scanner_marked_too_tight_is_an_offender() -> None:
 
     The 13th family member added with ``pytest.mark.timeout(30)`` is the
     scenario this pair of checks exists for -- it satisfies a name-only check
-    while sitting below even the 60s default. Proven synthetically because the
+    while sitting below even the global ini default. Proven synthetically because the
     real tree is green by construction and cannot demonstrate it.
     """
     synthetic_source = (
@@ -736,7 +761,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     (:func:`module_level_marker_names`) catches a scanner with no mark; the
     VALUE half (:func:`_module_level_timeout_ceiling`) catches one marked
     ``pytest.mark.timeout(30)``, which carries the name yet sits BELOW even the
-    60s default -- so a name-only check would pass it green while it re-arms the
+    global ini default -- so a name-only check would pass it green while it re-arms the
     exact cliff this module exists to clear. Only a value the grammar can
     actually resolve can offend: an unresolvable expression is skipped, keeping
     the guard a floor rather than a proof.
@@ -748,7 +773,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     IMPORTED here rather than re-derived. A decorator-aware sweep (e.g.
     test_marker_registration_drift.py's ``_applied_marker_names``) is an
     explicit UPPER bound: a file with three tests where only one is decorated
-    would read as "has timeout" while the other two sit at the 60s cliff, which
+    would read as "has timeout" while the other two sit at the bare ini default, which
     is precisely the defect this guard exists to stop. An existing tighter
     per-test decorator still WINS where present -- verified empirically: with
     ``pytestmark = pytest.mark.timeout(300)`` plus ``@pytest.mark.timeout(7)``
@@ -797,7 +822,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
             offenders.append(f'{py_file.name}: no module-level pytestmark timeout')
             continue
         # NAME present, but at what value? A mark of `timeout(30)` satisfies the
-        # check above while sitting BELOW even the 60s default -- see
+        # check above while sitting BELOW even the global ini default -- see
         # _module_level_timeout_ceiling. None means unresolvable, which is NOT
         # an offence (fail-soft; the guard stays a floor).
         ceiling = _module_level_timeout_ceiling(source)
@@ -832,8 +857,9 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
             '    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n\n'
             'at module level in each. These modules rglob() every *.py in the '
             'repo and ast.parse() each one; under `-n auto` that has been '
-            'MEASURED at 30.75s per call at loadavg 120-176, against the 60s '
-            f'default in {ORCH_PYPROJECT.name}. Exceeding it does NOT fail the '
+            'MEASURED at 30.75s per call at loadavg 120-176, against the '
+            f'per-test default in {ORCH_PYPROJECT.name}. Exceeding it does NOT fail '
+            'the '
             "test: pytest-timeout's thread method os._exit()s the whole xdist "
             'worker, and --max-worker-restart=0 then truncates the ENTIRE suite '
             'run and reports the failure against some innocent guard that '

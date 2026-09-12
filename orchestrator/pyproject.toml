@@ -171,21 +171,31 @@ filterwarnings = [
     "error::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
-# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
+# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
+# is 300 rather than the former 60: the cap is WALL-CLOCK, so a healthy test
+# starved of CPU on a loaded 32-core host trips it and — under thread mode
+# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself.
+# 300 is INTERIM and judgement-picked, not measured).
 # Slow tests opt out with @pytest.mark.timeout(N).
 # timeout_method: signal mode was paired with serial execution; once xdist
 # was enabled here (matching fused-memory/pyproject.toml) the worker
 # subprocesses run pytest in a thread, so signal-based interruption is no
 # longer reliable inside the worker — switch to thread mode like fused-memory.
-timeout = 60
+# UNCHANGED by the 60→300 raise, deliberately: the raise attacks the trigger,
+# not the two safety mechanisms.
+# MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants asserts against
+# this value with tomllib at runtime — edit the two together.
+timeout = 300
 timeout_method = "thread"
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /
 # test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
 # ``--max-worker-restart=0`` is the resilience net (task 1907): if any test
-# ever exceeds the 60s timeout, pytest-timeout's thread method os._exit()s the
-# xdist worker. With restarts allowed, xdist spawns a replacement node that
+# ever exceeds the 300s timeout above, pytest-timeout's thread method
+# os._exit()s the xdist worker. With restarts allowed, xdist spawns a
+# replacement node that
 # re-collects the full suite and re-dies → restart/re-collect/re-die loop that
 # hangs the whole suite at ~98%. Disabling restarts degrades a worker death to
 # a single clean per-test failure instead of a suite-wide hang.

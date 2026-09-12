@@ -99,7 +99,9 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
-# (currently 60).  It was a bare literal in
+# (currently 300, raised from 60 on 2026-09-12 -- see that setting's comment,
+# and shared/pyproject.toml for the canonical rationale).  It was a bare
+# literal in
 # test_merge_queue_concurrent_verify.py, whose own comment admitted the
 # defect -- "it is still a literal and CAN drift if that setting changes
 # without a matching edit here; there is no automated link between the two."
@@ -107,14 +109,14 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
 # pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
 # add a second copy -- import this one.
-PYPROJECT_DEFAULT_TIMEOUT = 60
+PYPROJECT_DEFAULT_TIMEOUT = 300
 
 # task 4215: per-test ceiling for the family of guard tests that sweep the
 # WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
 # cannot be sized by the ordinary 60s default.  This comment is the SINGLE
 # home of that rationale: the ~13 modules that carry the mark point HERE
 # instead of repeating it, so switching `timeout_method`, retuning the
-# multiple, or revising the measurements is one edit rather than fourteen.
+# ceiling, or revising the measurements is one edit rather than fourteen.
 #
 # It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
 # with `@pytest.mark.timeout(N)`", the comment on
@@ -137,7 +139,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 #     guard that merely shared the dead worker.
 #   So one slow tree-scan costs a whole verify run AND misattributes the blame.
 #
-# MEASURED basis for 5x rather than a tuned literal:
+# MEASURED basis for 300 rather than a tuned literal:
 #   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
 #     (test_merge_queue_reachback_patch_guard), 6.70s
 #     (test_event_loop_antipattern_guard), 6.46s
@@ -145,8 +147,8 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 #   * the SAME serial_merge_worker guard measured 17.85 / 21.32 / 30.75s per
 #     call at loadavg 120-176 under `-n auto` -- ~4.8x load inflation;
 #   * xdist worker deaths were then observed at loadavg 250-423, one further
-#     inflation step past the 60s default (esc-3980-1 on branch task/3980,
-#     esc-3787-1 on branch task/3787).
+#     inflation step past the 60s default THEN IN FORCE (esc-3980-1 on branch
+#     task/3980, esc-3787-1 on branch task/3787).
 #   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
 #   test_merge_queue_reachback_patch_guard.py and
 #   test_serial_merge_worker_import_guard.py -- which is what makes this a
@@ -154,13 +156,31 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 #   preemptively: a marked-but-fast test costs nothing, while an
 #   unmarked-and-slow one costs a whole session.
 # 300s is ~36x the unloaded worst case and ~10x the measured-under-load worst
-# case.  DERIVED from PYPROJECT_DEFAULT_TIMEOUT because that ini default IS the
-# hazard being cleared -- deliberately NOT from HEAVY_BARRIER_TEST_TIMEOUT,
-# which happens to equal 300 but is merge-wait arithmetic
-# (`5 * MERGE_RESULT_TIMEOUT + 75`); an AST sweep performs zero merge waits, so
-# borrowing it would let a future merge-timing retune silently move this
-# ceiling.  Never-narrow.
-WHOLE_TREE_SCAN_TEST_TIMEOUT = 5 * PYPROJECT_DEFAULT_TIMEOUT  # 300s
+# case, and that MEASUREMENT is what the value is anchored to.
+#
+# WAS `5 * PYPROJECT_DEFAULT_TIMEOUT` until 2026-09-12, when that ini default
+# was raised 60 -> 300 to stop CPU starvation on a loaded host false-redding a
+# shifting victim (shared/pyproject.toml carries the rationale).  The multiple
+# existed to TRACK the hazard: when the default was 60 it was the binding
+# constraint on this family, so deriving from it kept the ceiling clear of it
+# automatically.  The default has now overtaken the family's own measured
+# requirement, and carrying the multiple forward would have set this to 1500s
+# -- a 5x widening of the ceiling for the ~13 marked modules that no
+# measurement asks for, and one that would silently let a genuinely hung tree
+# scan burn 25 minutes.  So the two knobs are now what they always were
+# SEMANTICALLY -- orthogonal, one sized by host contention and one by the cost
+# of an AST sweep -- and this one is pinned at the figure its own measurements
+# justify.  test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
+# already encoded exactly that independence and is unchanged.
+#
+# Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT, which happens to
+# equal 300 but is merge-wait arithmetic (`5 * MERGE_RESULT_TIMEOUT + 75`); an
+# AST sweep performs zero merge waits, so borrowing it would let a future
+# merge-timing retune silently move this ceiling.  Never-narrow: it must also
+# never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
+# a FLOOR would start narrowing its module below the global default (pinned by
+# test_whole_tree_scan_timeout_guard.py).
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 300
 
 
 # task 3540: the claimant-liveness TTL the row builder below derives its

@@ -65,13 +65,39 @@ dev = [
 markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
-# Default per-test timeout. Catches accidental asyncio-sleep hangs (e.g. a
-# misconfigured UsageGate mock whose slot.detect_cap_hit returns a truthy
-# MagicMock, sending invoke_with_cap_retry through 19 real exponential-
-# backoff sleeps). Slow tests can opt out with @pytest.mark.timeout(N).
-# signal method is load-bearing: thread method prints a stack trace but
+# Default per-test timeout. THE CANONICAL RATIONALE for this setting across
+# the workspace — orchestrator/, fused-memory/, escalation/ and dashboard/
+# pyproject.toml cite this block rather than restating it.
+#
+# WHAT IT CATCHES: accidental asyncio-sleep hangs (e.g. a misconfigured
+# UsageGate mock whose slot.detect_cap_hit returns a truthy MagicMock, sending
+# invoke_with_cap_retry through 19 real exponential-backoff sleeps), and
+# deadlocked lock implementations. Slow tests can opt out with
+# @pytest.mark.timeout(N).
+#
+# WHY 300 AND NOT THE FORMER 60 (2026-09-12). The cap is WALL-CLOCK, not CPU
+# time. On this 32-core host under sustained load (~180 at the time of the
+# change) a perfectly healthy test can exceed 60s from CPU STARVATION alone,
+# without being hung at all. The cost of that is not one honest red: under
+# timeout_method = "thread" pytest-timeout answers a breach by os._exit()ing
+# the xdist worker, and --max-worker-restart=0 degrades that into a clean
+# per-test FAILURE whose victim is whatever test happened to be on the dead
+# worker — NOT the starved one. That is the "shifting victim" false-red
+# mechanism from the CPU-contention RCA (memory:
+# project_cpu_contention_test_flakiness_rootcause_2026_07_18).
+#
+# So 300 attacks the TRIGGER and deliberately leaves both safety mechanisms
+# intact: timeout_method and --max-worker-restart=0 are UNCHANGED, each having
+# been chosen against a measured worse failure (task 1907).
+#
+# 300 IS INTERIM AND JUDGEMENT-PICKED, NOT MEASURED. Nobody has yet measured
+# the real test-duration distribution under load; a follow-up task owns that
+# measurement and owns replacing this with a data-driven value. The cost of
+# the interim: a genuinely hung test now takes 5 minutes to surface, not 1.
+#
+# signal method is load-bearing HERE: thread method prints a stack trace but
 # can't actually interrupt a blocking asyncio.sleep in the main thread.
-timeout = 60
+timeout = 300
 timeout_method = "signal"
 
 [tool.pyright]
