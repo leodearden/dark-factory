@@ -305,6 +305,17 @@ class MemoryConsolidator(BaseStage):
         report.stats['curator_gate_resolution_flags_emitted'] = 0
         report.stats['curator_gate_resolution_errors'] = 0
 
+        # Always present (task 2896 γ): count of recon flags suppressed this cycle
+        # by an ACTIVE entity_standing_decision (Hook A).  Overwritten below to the
+        # actual sum on a full cycle with items_flagged; stays 0 when nothing was
+        # flagged and on a remediation pass, which returns just below.  Pre-inited
+        # HERE, above that early return, rather than beside the filter it belongs to
+        # (reviewer finding correctness, amendment pass): a key set below the return
+        # is simply ABSENT from a remediation report, which is the .get(..., 0)
+        # fallback the always-present convention exists to spare consumers — and
+        # Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt.
+        report.stats['entity_standing_decision_suppressed'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
@@ -403,12 +414,6 @@ class MemoryConsolidator(BaseStage):
         # below when there is anything to acknowledge; stays 0 when items_flagged is
         # empty/falsy.
         report.stats['stage1_flag_markers_acknowledged'] = 0
-        # Always present (task 2896 γ, mirrors the symmetric-stat convention above):
-        # count of recon flags suppressed this cycle by an ACTIVE
-        # entity_standing_decision (Hook A). Overwritten below to the actual sum on a
-        # full cycle with items_flagged; stays 0 when nothing was flagged. Kept
-        # symmetric so downstream consumers never need a .get(..., 0) fallback.
-        report.stats['entity_standing_decision_suppressed'] = 0
         if report.items_flagged:
             # Snapshot before the filter chain (task-2029): used below to compute
             # which flags the chain dropped for a MOOT reason — terminal task,

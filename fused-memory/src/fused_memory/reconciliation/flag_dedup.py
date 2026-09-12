@@ -356,6 +356,7 @@ from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.reconciliation.standing_decision_constants import (
+    CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_TOKEN_FAMILIES,
     STATE_ACTIVE,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
@@ -366,11 +367,27 @@ from fused_memory.utils.async_utils import gather_collect
 # reconciliation package must import cleanly even where the escalation package
 # is not installed. maybe_escalate_suppression_storm no-ops when Escalation is
 # None.
+#
+# ONE combined block, deliberately (same reasoning as stage1_stall_detector's):
+# all four names bind or fail together, so any ONE identity check suffices at
+# RUNTIME. Every name is still listed in that guard because only an identity
+# check on the name itself narrows an optionally-imported symbol for the type
+# checker.
 try:
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        content_fingerprint_key,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped]
     _HAS_ESCALATION = True
 except ImportError:
     Escalation = None  # type: ignore[assignment,misc]
+    DedupeConfig = None  # type: ignore[assignment,misc]
+    compute_content_fingerprint = None  # type: ignore[assignment]
+    content_fingerprint_key = None  # type: ignore[assignment]
+    submit_or_dedupe = None  # type: ignore[assignment]
     _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
@@ -809,10 +826,22 @@ def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
     family bound to *grounds* in
     :data:`~fused_memory.reconciliation.standing_decision_constants.GROUNDS_TOKEN_FAMILIES`;
     an unknown/empty grounds (no bound family) → ``False``. Otherwise returns
-    True when any family stem is a casefolded substring of *flag_type* — a
-    conservative gate reusing the token-normalization spirit of
-    :func:`canonical_flag_type_family` so only size/conflation-class flag_types
-    are fallback-suppressed. Pure, sync, no I/O.
+    True when any family stem is a casefolded SUBSTRING of the whole
+    *flag_type*.
+
+    Substring, NOT ``_``-split token equality (unlike
+    :func:`canonical_flag_type_family`, whose splitter this deliberately does
+    not reuse): the family is a list of stems precisely so ``'conflat'`` can
+    match ``topic_conflation`` and ``'size'`` can match ``oversized_entity``,
+    neither of which is a whole ``_``-delimited token. Splitting first would
+    silently narrow the gate to the stems that happen to be complete words.
+
+    The safety of a substring test therefore rests entirely on the family
+    holding stems that appear in NO unrelated flag_type — the property
+    ``GROUNDS_TOKEN_FAMILIES``' own comment makes a precondition of adding one.
+    A stem that is a common word (``count``, ``scope``) matches unrelated
+    findings and, for an entity under an active decision, DROPS them. Pure,
+    sync, no I/O.
     """
     if not isinstance(flag_type, str) or not flag_type:
         return False
@@ -886,10 +915,89 @@ def _match_entity_standing_decision(
     return None
 
 
+def _index_active_standing_decisions(
+    rows: list[ReconLedgerRecord], project_id: str, now: str
+) -> dict[str, ReconLedgerRecord]:
+    """Index the ACTIVE standing-decision *rows* by lowercased ``entity_uuid``.
+
+    Two classes of row are dropped rather than indexed, each logged, because
+    suppressing on either would hide a finding on information this function
+    can see is unsound:
+
+    **TTL already lapsed** (``expires_at`` non-None and before *now*) — logged
+    INFO. ``state`` alone is not sufficient evidence that a decision is still
+    in force: the active→expired flip lives ONLY in ``ReconLedgerStore.gc()``,
+    whose sole caller is Stage 2's ``stages.task_knowledge_sync._gc_recon_markers``
+    — a different stage, running AFTER this one, which a deployment may skip
+    and whose gc pass may error. Trusting ``state`` alone would let a decision
+    past its 90-day TTL keep suppressing for at least one more cycle, and
+    indefinitely wherever that pass never runs, turning a deliberately
+    time-bounded hold into an unbounded one. The comparison is a plain string
+    ``<``, matching ``gc()``'s own semantics: both sides are the canonical
+    zero-padded UTC ISO-8601 form ``ReconLedgerRecord`` documents, so
+    lexicographic order is chronological order.
+
+    **Ambiguous entity** (more than one active row for one ``entity_uuid``) —
+    logged WARNING naming both grounds, and that entity suppresses NOTHING this
+    cycle. An entity can carry one row per grounds, so once ``GROUNDS_ENUM``
+    grows past its single seed value several can be ACTIVE at once. The shared
+    by-uuid lookup ``ReconLedgerStore.get_active_entity_standing_decision``
+    raises ``ValueError`` on exactly this state rather than picking one under an
+    unstated ordering; a plain ``{row.entity_uuid: row}`` comprehension here
+    would instead collapse them silently, last-row-wins in SELECT order — the
+    non-determinism that guard exists to prevent. Skipping is the fail-open
+    analogue of its raise: loud, deterministic, and under-suppressing.
+
+    Why γ indexes at all instead of calling that shared lookup per flag: Hook A
+    is a whole-batch filter, and one indexed read per cycle is what gives it the
+    same clean batch fail-open as :func:`filter_suppressed` (N per-flag queries
+    cannot fail as a unit mid-batch). INV-5's single source is α's ledger rows
+    and grounds constants, which both hooks read — not one Python call site.
+    """
+    by_uuid: dict[str, list[ReconLedgerRecord]] = {}
+    for row in rows:
+        if not row.entity_uuid:
+            continue
+        if row.expires_at is not None and row.expires_at < now:
+            logger.info(
+                'filter_entity_standing_decisions: skipping standing decision '
+                'entity_uuid=%s grounds=%s in project %s — still state=active but '
+                'expires_at=%s has lapsed (now=%s); the Stage-2 gc() TTL flip has '
+                'not run. Not suppressing on a lapsed decision.',
+                row.entity_uuid,
+                row.flag_type,
+                project_id,
+                row.expires_at,
+                now,
+            )
+            continue
+        by_uuid.setdefault(row.entity_uuid.lower(), []).append(row)
+
+    indexed: dict[str, ReconLedgerRecord] = {}
+    for entity_uuid, matches in by_uuid.items():
+        if len(matches) > 1:
+            logger.warning(
+                'filter_entity_standing_decisions: found more than one ACTIVE '
+                'entity_standing_decision for entity_uuid=%s in project %s '
+                '(grounds=%s) — suppressing nothing for that entity this cycle. '
+                'This lookup assumes at most one active grounds per entity; add an '
+                'explicit grounds argument before growing GROUNDS_ENUM past one '
+                'value (see ReconLedgerStore.get_active_entity_standing_decision).',
+                entity_uuid,
+                project_id,
+                sorted(match.flag_type for match in matches),
+            )
+            continue
+        indexed[entity_uuid] = matches[0]
+    return indexed
+
+
 async def filter_entity_standing_decisions(
     memory_service: Any,
     project_id: str,
     flags: list[dict[str, Any]],
+    *,
+    now: str | None = None,
 ) -> EntityStandingSuppressionResult:
     """Drop recon flags already adjudicated by an ACTIVE ``entity_standing_decision``.
 
@@ -903,6 +1011,14 @@ async def filter_entity_standing_decisions(
     the ledger read raises, NO suppression is applied this cycle (all flags
     kept) — a ledger read failure must never hide a finding. The ledger-None
     path logs DEBUG; the read-exception path logs WARNING.
+
+    A read row is not automatically a licence to suppress: rows whose TTL has
+    lapsed and entities carrying more than one active row are dropped from the
+    index (see :func:`_index_active_standing_decisions`). *now* — the
+    lapsed-TTL reference, a canonical UTC ISO-8601 string — defaults to
+    ``datetime.now(UTC).isoformat()``, the same spelling the β writer uses for
+    ``expires_at``, so the two are string-comparable; tests inject a fixed
+    value.
 
     Returns an :class:`EntityStandingSuppressionResult`; the caller assigns
     ``kept_flags`` back to ``items_flagged`` and reads ``suppressed_by_decision``
@@ -944,9 +1060,9 @@ async def filter_entity_standing_decisions(
             kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
         )
 
-    active_by_uuid: dict[str, ReconLedgerRecord] = {
-        row.entity_uuid.lower(): row for row in rows if row.entity_uuid
-    }
+    active_by_uuid = _index_active_standing_decisions(
+        rows, project_id, now if now is not None else datetime.now(UTC).isoformat()
+    )
     if not active_by_uuid:
         return EntityStandingSuppressionResult(
             kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
@@ -979,6 +1095,12 @@ async def filter_entity_standing_decisions(
     )
 
 
+#: Finding-category component of the storm escalation's dedupe fingerprint —
+#: the second axis of ``compute_content_fingerprint``, distinguishing this
+#: finding from any other that might one day share the storm category.
+_STORM_FINDING_CATEGORY: str = 'entity_standing_decision_suppression_storm'
+
+
 async def maybe_escalate_suppression_storm(
     escalation_queue: Any,
     project_id: str,
@@ -987,45 +1109,65 @@ async def maybe_escalate_suppression_storm(
     *,
     threshold: int = SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 ) -> list[str]:
-    """File a per-cycle "storm escape" L1 escalation per over-active standing decision.
+    """File (or fold) a "storm escape" L1 escalation per over-active standing decision.
 
     For each ``(entity_uuid, count)`` in ``result.suppressed_by_decision`` whose
-    *count* exceeds *threshold* (strict ``>``): skip if the queue already has an
-    open L1 for that entity in the storm category (dedup via
-    ``has_open_l1(entity_uuid, category=...)``), else submit one
+    *count* exceeds *threshold* (strict ``>``), submit one
     ``Escalation(level=1, severity='blocking',
-    category='reconciliation_standing_decision_storm',
+    category=CATEGORY_STANDING_DECISION_STORM,
     agent_role='reconciliation-stage1', ...)`` naming the entity, its grounds,
     and the per-cycle count. An active decision hiding a flood of flags in one
     cycle is a signal it may be over-broad or the entity's situation changed —
     worth a human look.
 
-    Best-effort, mirroring :func:`~fused_memory.reconciliation.stage1_stall_detector.maybe_escalate_stalled_tasks`:
-    returns ``[]`` immediately when the ``escalation`` package is unavailable
-    (``Escalation is None``); any per-decision id-gen/construction/submit failure
-    logs WARNING and excludes that entity from the returned list. Returns the
-    list of entity_uuids that actually received a new escalation this cycle.
+    **Filed through** :func:`escalation.dedupe.submit_or_dedupe`, NOT gated on
+    ``has_open_l1`` (task 3522). Stage 1 re-evaluates every cycle, so a decision
+    that storms once tends to storm every cycle — exactly the recurring-detector
+    shape for which the sibling gate-backlog path retired the ``has_open_l1``
+    skip: that skip suppressed every cycle after the first, so ``dedupe_count``
+    stayed pinned at 0 and the operator saw no difference between one storm and
+    forty. Folding instead keeps ONE pending record per entity and increments
+    ``dedupe_count`` on it, which is the steward's recurrence / triage-order
+    signal. The fold key is the ``(category, finding_category, project:entity)``
+    content fingerprint stamped below — deliberately NOT the count or run_id,
+    which drift every cycle and would mint a fresh record per breach. The window
+    is UNBOUNDED so a decision storming for days still folds into its original
+    parent. Accepted cost, as on the gate-backlog path: a folded record keeps the
+    PARENT's summary, so the count named there is the FIRST breach's, while
+    ``dedupe_count`` carries how often it has recurred since.
+
+    Best-effort throughout: returns ``[]`` immediately when the ``escalation``
+    package is unavailable; any per-decision fingerprint/id-gen/construction/
+    submit/fold failure logs WARNING and excludes that entity from the returned
+    list. Returns the entity_uuids that received a NEW record this cycle — folds
+    are excluded, so the list means "new filings", with recurrence carried by
+    ``dedupe_count`` and the fold INFO log.
 
     (The PRD's parenthetical cross-cycle-streak variant needs persistent
     per-decision state and is deferred; this is the self-contained per-cycle N.)
     """
-    if Escalation is None:
+    # Any ONE identity check suffices at runtime (all five names bind or fail
+    # together in the module's single import block); each is named so the type
+    # checker narrows it at the use sites below.
+    if (
+        Escalation is None
+        or DedupeConfig is None
+        or compute_content_fingerprint is None
+        or content_fingerprint_key is None
+        or submit_or_dedupe is None
+    ):
         return []
+
+    config = DedupeConfig(
+        infra_dedupe_enabled=True,
+        infra_dedupe_window_secs=float('inf'),
+        infra_dedupe_categories=(CATEGORY_STANDING_DECISION_STORM,),
+        key_fn=content_fingerprint_key,
+    )
 
     escalated: list[str] = []
     for entity_uuid, count in result.suppressed_by_decision.items():
         if count <= threshold:
-            continue
-        if escalation_queue.has_open_l1(
-            entity_uuid, category='reconciliation_standing_decision_storm'
-        ):
-            logger.info(
-                'maybe_escalate_suppression_storm: entity_uuid=%s already has an '
-                'open level-1 storm escalation; skipping (project %s)',
-                entity_uuid,
-                project_id,
-                extra={'project_id': project_id},
-            )
             continue
 
         grounds = result.grounds_by_decision.get(entity_uuid, 'unknown')
@@ -1043,31 +1185,58 @@ async def maybe_escalate_suppression_storm(
         ])
 
         try:
-            # make_id()/Escalation() inside the try so id-gen or constructor
-            # failures are caught and logged rather than escaping.
+            # Everything that can fail is inside the try, so a fingerprint,
+            # id-gen, constructor, submit or fold failure is logged rather than
+            # aborting the remaining decisions.
+            fingerprint = compute_content_fingerprint(
+                CATEGORY_STANDING_DECISION_STORM,
+                _STORM_FINDING_CATEGORY,
+                [f'{project_id}:{entity_uuid}'],
+            )
+            # Fail closed rather than file with a falsy key: find_dedupe_parent
+            # short-circuits on one, so the record would silently become a second
+            # visible pending record for this entity every cycle. Unreachable via
+            # today's sha256 callee — this guards a future change to it.
+            if not fingerprint:
+                raise ValueError(
+                    f'empty dedupe_fingerprint for storm entity_uuid={entity_uuid}'
+                )
             esc = Escalation(
                 id=escalation_queue.make_id(entity_uuid),
-                # INVARIANT: task_id carries the entity_uuid because it IS the
-                # dedup key — has_open_l1(entity_uuid, category=...) above reads
-                # it back via get_by_task's exact esc.task_id match.  Writing ''
-                # here (as an earlier revision did) makes the dedup guard a
-                # silent no-op: the lookup never matches, so an over-active
-                # decision re-files a duplicate storm escalation every cycle.
-                # Write key and read key must stay the same field.
+                # The entity is the subject, so it occupies task_id: that is the
+                # key get_by_task/has_open_l1 read a storm record back by, and it
+                # is what makes the record greppable per entity. It is NOT the
+                # fold key — dedupe_fingerprint below is — so the two cannot
+                # drift apart the way a task_id-keyed guard once did.
                 task_id=entity_uuid,
                 agent_role='reconciliation-stage1',
                 severity='blocking',
-                category='reconciliation_standing_decision_storm',
+                category=CATEGORY_STANDING_DECISION_STORM,
                 summary=summary,
                 detail=detail,
                 level=1,
+                dedupe_fingerprint=fingerprint,
             )
-            escalation_queue.submit(esc)
-            escalated.append(entity_uuid)
+            outcome = submit_or_dedupe(escalation_queue, esc, config)
+            if outcome.get('status') == 'dedup_skipped':
+                # Loud-over-silent: the recurrence is visible in the log stream,
+                # not only as a counter on disk.
+                logger.info(
+                    'maybe_escalate_suppression_storm: entity_uuid=%s folded into '
+                    'parent_id=%s (child_id=%s) — the storm is recurring',
+                    entity_uuid,
+                    outcome.get('parent_id'),
+                    outcome.get('child_id'),
+                    extra={'project_id': project_id},
+                )
+            else:
+                # Tested with != rather than == 'queued' so observed_submit_response's
+                # auto-resolved/dismissed branch (a record WAS minted) still counts.
+                escalated.append(entity_uuid)
         except Exception as exc:
             logger.warning(
                 'maybe_escalate_suppression_storm: failed to escalate entity_uuid=%s '
-                '(id-gen, construction, or submit): %s',
+                '(fingerprint, id-gen, construction, submit, or fold): %s',
                 entity_uuid,
                 exc,
                 extra={'project_id': project_id},

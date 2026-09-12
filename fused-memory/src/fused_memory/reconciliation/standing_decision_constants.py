@@ -13,7 +13,9 @@ state/expiry_reason vocabularies, and the 90-day TTL. Consumers:
   to ``decided_at`` and consumes ``MEM0_KIND_INVESTIGATION_OUTCOME`` /
   ``GROUNDS_ENUM``.
 * **γ/δ** (Hook A filter / Hook B annotation) — consume ``GROUNDS_ENUM`` and
-  ``GROUNDS_TOKEN_FAMILIES`` for the fallback token-family match.
+  ``GROUNDS_TOKEN_FAMILIES`` for the fallback token-family match; γ also
+  consumes ``SUPPRESSION_STORM_THRESHOLD_PER_CYCLE`` and
+  ``CATEGORY_STANDING_DECISION_STORM`` for its storm escape.
 * **ε** (prompt/self-model renderer) — consumes the grounds enum and
   ``MEM0_KIND_INVESTIGATION_OUTCOME``.
 * **ζ** (growth/merge sweeps) — consume ``STATE_*`` and the growth/merge
@@ -60,16 +62,29 @@ GROUNDS_ENUM: frozenset[str] = frozenset({GROUNDS_STRUCTURAL_SIZE_CONFLATION})
 # bias (PRD decision 10): a fallback miss costs one cycle of noise, never a
 # hidden finding. Preserves α's structure invariant (keys == GROUNDS_ENUM; each
 # family a tuple of str), so test_standing_decision_constants.py stays green.
+#
+# DISTINCTIVE means "does not occur in a flag_type outside this class", and that
+# is a checkable property, not a slogan (reviewer finding correctness, amendment
+# pass).  The first cut also carried ``'count'``, ``'topic'``, ``'scope'`` and
+# ``'broad'``; each matches live flag_types that have nothing to do with entity
+# size — ``'count'`` hits ``recon_stale_task_count_snapshot`` and every other
+# ``*_count_*`` flag, ``'scope'`` hits ``scope_violation`` and
+# ``consolidated_scope_correction``.  A stem that fires there does not merely
+# add noise: it silently DROPS that finding for any entity under an active
+# standing decision, which is the exact failure the under-suppression bias
+# forbids.  They are dropped rather than made exact-token matches because
+# splitting on ``_`` would not save them (``scope_violation`` and
+# ``recon_stale_task_count_snapshot`` both contain the bare token) while it
+# WOULD break the stems that carry this family (``'conflat'`` inside
+# ``conflation``, ``'size'`` inside ``oversized``).  The surviving eight cover
+# the class; ``topic_conflation`` still matches via ``'conflat'``.  Add a stem
+# only after checking it against the live flag_type vocabulary.
 GROUNDS_TOKEN_FAMILIES: dict[str, tuple[str, ...]] = {
     GROUNDS_STRUCTURAL_SIZE_CONFLATION: (
         'size',
         'large',
-        'count',
         'magnitude',
         'conflat',
-        'topic',
-        'scope',
-        'broad',
         'sprawl',
         'bloat',
         'monolith',
@@ -86,6 +101,18 @@ GROUNDS_TOKEN_FAMILIES: dict[str, tuple[str, ...]] = {
 # ("across a streak of cycles") requires persistent per-decision cross-cycle
 # state and is deferred; γ implements the self-contained per-cycle N.
 SUPPRESSION_STORM_THRESHOLD_PER_CYCLE = 5
+
+# Escalation category of that storm escape, single-sourced HERE rather than
+# spelled as a literal at each use site (reviewer finding architecture-coherence,
+# amendment pass).  ``Escalation.category`` is free-form prose validated by
+# nothing at submit time (see the REFACTOR TRIGGER comment on
+# ``escalation.models.Escalation``), and the correctness of a categorized
+# detector rests entirely on its filer and its reader spelling the category
+# identically: γ's filer stamps it on the record while the fold gate
+# (``DedupeConfig.infra_dedupe_categories``) and any operator query read it back.
+# A shared constant makes that agreement structural instead of a discipline
+# every future reader has to re-verify.
+CATEGORY_STANDING_DECISION_STORM = 'reconciliation_standing_decision_storm'
 
 # --- Evidence mem0 kind (Arm 2 of the β authorization gate) -----------------
 # The ledger kind is the sole machine-consulted standing-decision form; the

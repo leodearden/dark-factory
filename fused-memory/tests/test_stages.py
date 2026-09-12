@@ -54,6 +54,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _suppress_same_run_human_operator_dups,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
+    CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
@@ -16221,17 +16222,21 @@ class TestMemoryConsolidatorEntityStandingDecision:
         self, mock_deps, tmp_path
     ):
         """(c) When one active decision suppresses more than the per-cycle threshold,
-        a reconciliation_standing_decision_storm L1 escalation is filed for its entity."""
+        a reconciliation_standing_decision_storm L1 escalation is filed for its entity.
+
+        Driven against a REAL EscalationQueue: the filing folds through
+        submit_or_dedupe, and a MagicMock cannot witness what was persisted or
+        under which key.
+        """
+        from escalation.queue import EscalationQueue
+
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.scope = _scope('p', '/proj')
         stage.episode_limit = 10
         stage.memory_limit = 10
 
-        fake_queue = MagicMock()
-        fake_queue.make_id.return_value = 'esc-storm-id'
-        fake_queue.has_open_l1.return_value = False
-        fake_queue.submit.return_value = None
-        stage._escalation_queue = fake_queue
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
 
         ledger = await self._ledger_with_active_decision(tmp_path)
         stage.memory.recon_ledger = ledger
@@ -16267,10 +16272,53 @@ class TestMemoryConsolidatorEntityStandingDecision:
 
         # All N flags matched U → all suppressed.
         assert report.stats['entity_standing_decision_suppressed'] == n
-        # Exactly one storm escalation filed for U in the storm category.
-        fake_queue.submit.assert_called_once()
-        esc = fake_queue.submit.call_args.args[0]
-        assert esc.category == 'reconciliation_standing_decision_storm'
+        # Exactly one storm escalation filed for U in the storm category, findable
+        # by the entity: task_id is the read key, so a filing that left it ''
+        # would be a record no per-entity lookup can reach.
+        pending = queue.get_by_task(self._U, status='pending', level=1)
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.task_id == self._U
+        assert esc.category == CATEGORY_STANDING_DECISION_STORM
         assert esc.level == 1
         assert esc.agent_role == 'reconciliation-stage1'
+        assert esc.dedupe_fingerprint, 'the fold key must be stamped on the record'
         assert self._U in f'{esc.summary}\n{esc.detail}'
+
+    @pytest.mark.asyncio
+    async def test_stat_is_present_on_a_remediation_pass(self, mock_deps):
+        """The suppression stat is present (0) even on a remediation pass.
+
+        A remediation pass returns before the filter chain, so the stat can only
+        be there if it is pre-inited above that early return.  Stage 1's whole
+        stats blob is serialized verbatim into Stage 2's prompt, and the
+        always-present convention is exactly the promise that a consumer never
+        has to distinguish "0" from "absent" (reviewer finding correctness,
+        amendment pass).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.remediation_findings = [{'description': 'fix me'}]
+
+        base_report = self._make_base_report([self._strong_flag('oversized_entity')])
+        esd_mock = AsyncMock()
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'filter_entity_standing_decisions',
+                new=esd_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-esd-remediation',
+            )
+
+        assert report.stats['entity_standing_decision_suppressed'] == 0
+        assert esd_mock.await_count == 0, 'a remediation pass must not run the filter'
