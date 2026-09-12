@@ -346,7 +346,9 @@ class TestSnapshotHostsBlock:
         worker, alloc, _ = _real_worker(git_ops)
         _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=555.0,
                  reason='ssh: connection reset')
-        assert not alloc.is_quarantined('laptop')
+        assert not any(alloc.is_quarantined(h) for h in alloc.host_names), (
+            'nothing quarantined yet, on ANY managed host'
+        )
 
         laptop = _by_name(worker.snapshot())['laptop']
 
@@ -508,11 +510,22 @@ class TestSnapshotHostsBlock:
         worker, alloc, _ = _real_worker(git_ops)
         _seed_ru(worker, 'departed-host', streak=7, first_unavailable_at=500.0,
                  reason='host removed from pool')
-        # A departed host has no slot left to acquire, so the same public
-        # writer takes a synthesised lease: the name joins the shared set and
-        # the slot release no-ops.
+        # A departed host has NO slot, so acquire_remote() cannot issue a lease
+        # for it and the quarantine write goes in with a SYNTHESISED one —
+        # unlike _quarantine_remote() above, which uses the acquire/quarantine
+        # pair production runs.  HostAllocator has no public quarantine(name)
+        # writer (VerifyRunnerPool does) that would retire the synthesis; that
+        # seam belongs to task 5446.  Until then the two assertions below pin
+        # what the synthesis relies on rather than leaving it assumed.
         await alloc.quarantine_and_release(
             HostLease(name='departed-host', runner=MagicMock(), is_local=False)
+        )
+        assert alloc.is_quarantined('departed-host'), (
+            'the synthesised lease must still join the shared quarantine set'
+        )
+        assert 'departed-host' not in alloc.host_names, (
+            'and must not conjure a slot: release() is a no-op for a name the '
+            'allocator never issued'
         )
 
         snap = worker.snapshot()
@@ -809,7 +822,9 @@ class TestHeartbeatDegradation:
         """Regression guard: nothing quarantined → no DEGRADED substring at all."""
         worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg4')
         self._add_local_inflight(worker, config, git_repo)
-        assert not alloc.is_quarantined('laptop')
+        assert not any(alloc.is_quarantined(h) for h in alloc.host_names), (
+            'nothing quarantined yet, on ANY managed host'
+        )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
