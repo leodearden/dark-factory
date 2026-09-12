@@ -196,12 +196,16 @@ class QueueItem:
 
 _ID_PLACEHOLDER = '(none)'
 
-# Some terminals silently DROP an over-long OSC 52 clipboard write rather
-# than truncating it (App.copy_to_clipboard's caller in app.py), so an
-# unbounded question could otherwise land on the clipboard as nothing at
-# all with no operator-visible feedback (task 2517 amendment). Sized
-# generously above any realistic question length and comfortably under the
-# payload limits reported by common terminals.
+# Guards the OSC 52 FALLBACK leg specifically. The primary clipboard path is
+# a local helper (cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard,
+# task 5448), which has no payload limit; OSC 52 is what
+# cockpit/src/cockpit/app.py::CockpitApp.action_copy falls back to when no
+# local helper succeeded -- the over-SSH case. Some terminals silently DROP
+# an over-long OSC 52 write rather than truncating it, so an unbounded
+# question could land on the clipboard as nothing at all (task 2517
+# amendment). Still justified: the fallback runs whenever the local path
+# didn't. Sized generously above any realistic question length and
+# comfortably under the payload limits reported by common terminals.
 _COPY_QUESTION_MAX_CHARS = 4000
 
 
@@ -230,8 +234,10 @@ def format_copy_payload(item: QueueItem) -> str:
     'decision_id: <id>' for a decision, or 'session: <slug>' for a
     session (slug = item.key after its 'session:' prefix). The question
     line is defensively capped (_cap_for_clipboard) so a pathologically
-    long question can't silently vanish from the clipboard on a terminal
-    that drops rather than truncates an over-long OSC 52 payload.
+    long question can't silently vanish on a terminal that drops rather
+    than truncates an over-long OSC 52 payload -- that cap guards the OSC
+    52 FALLBACK leg; the primary path is
+    cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard.
     """
     if item.kind == 'session':
         slug = item.key.split(':', 1)[1] if ':' in item.key else item.key

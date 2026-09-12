@@ -339,7 +339,10 @@ class TestFormatCopyPayload:
         over-long OSC 52 clipboard write, so an unbounded question could
         otherwise land on the clipboard as nothing at all with no
         operator-visible feedback (task 2517 amendment: reviewer_comprehensive
-        robustness suggestion)."""
+        robustness suggestion). The cap guards the OSC 52 FALLBACK leg
+        specifically; the primary path is
+        cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard (task
+        5448)."""
         from cockpit.panes.decision_queue import _COPY_QUESTION_MAX_CHARS, format_copy_payload
 
         long_question = 'x' * (_COPY_QUESTION_MAX_CHARS + 500)
