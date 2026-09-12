@@ -97,7 +97,12 @@ class _Resp:
         return self._payload
 
 
-def _completion(content: str | None, finish_reason: str = 'stop') -> dict:
+_UNSET = object()
+
+
+def _completion(
+    content: str | None, finish_reason: str = 'stop', usage=_UNSET
+) -> dict:
     """An OpenAI chat-completions response body carrying *content*.
 
     `None` is a REAL shape, not a test convenience: vLLM returns
@@ -105,8 +110,14 @@ def _completion(content: str | None, finish_reason: str = 'stop') -> dict:
     where llama.cpp returns `''`. Typing this `str` would make the null case
     unexpressible — and that case is exactly what made COMPLETION_TRUNCATED
     unreachable on the vLLM stack.
+
+    `usage` is likewise absent-by-default rather than defaulting to `None`,
+    because "no usage block at all" and "a usage block whose
+    prompt_tokens_details is null" are two distinct real shapes (task 3781):
+    the first is what a minimal server returns, the second is what vLLM
+    returns, and only the second proves the reader tolerates a null.
     """
-    return {
+    body: dict = {
         'id': 'cmpl-1',
         'object': 'chat.completion',
         'choices': [
@@ -117,6 +128,9 @@ def _completion(content: str | None, finish_reason: str = 'stop') -> dict:
             }
         ],
     }
+    if usage is not _UNSET:
+        body['usage'] = usage
+    return body
 
 
 def _models_payload(*names: str) -> dict:
@@ -244,6 +258,101 @@ def test_building_an_llm_probe_for_an_embedding_arm_is_a_typed_error():
 
     with pytest.raises(lms_healthcheck.HealthcheckError):
         lms_healthcheck.build_llm_probe_request(embedding_arm)
+
+
+# ---------------------------------------------------------------------------
+# The warm-up request (task 3781)
+#
+# The measured probe is meant to be ENGINE-warm and PREFIX-COLD -- the state a
+# production request actually arrives in.  That is only achievable if the
+# discarded warm-up carries a DIFFERENT prompt: warming with the same text
+# populates the very prefix cache the measured probe must find cold.  Measured
+# 2026-08-06 on moe-stretch, llama.cpp served the warm run with 338 of its 343
+# prompt tokens from cache, so a same-prompt warm-up does not merely blunt the
+# measurement, it inverts what the number means.
+# ---------------------------------------------------------------------------
+
+
+def _user_content(body: dict) -> str:
+    """The user message's text, which is where the probe passage lives."""
+    return next(m['content'] for m in body['messages'] if m['role'] == 'user')
+
+
+def test_the_llm_warmup_request_does_not_reuse_the_measured_probe_text():
+    warm = lms_healthcheck.build_llm_probe_request(_arm(), warmup=True)
+    measured = lms_healthcheck.build_llm_probe_request(_arm(), warmup=False)
+
+    warm_sent = json.dumps(warm['messages'])
+    measured_sent = json.dumps(measured['messages'])
+
+    assert lms_healthcheck.PROBE_TEXT not in warm_sent
+    assert lms_healthcheck.WARMUP_PROBE_TEXT in warm_sent
+    assert lms_healthcheck.PROBE_TEXT in measured_sent
+    assert lms_healthcheck.WARMUP_PROBE_TEXT not in measured_sent
+
+
+def test_the_warmup_text_diverges_at_the_first_user_token():
+    """The load-bearing property, not a cosmetic one.
+
+    A prefix cache is a PREFIX cache: it is the shared LEADING tokens that get
+    reused, so a warm-up sharing a long opening with the measured probe warms
+    exactly the thing the measured probe is supposed to find cold.  The probe
+    text is placed first in the user message precisely so a different passage
+    diverges at the very first user token, leaving only the short system
+    message cacheable.
+    """
+    warm = _user_content(lms_healthcheck.build_llm_probe_request(_arm(), warmup=True))
+    measured = _user_content(lms_healthcheck.build_llm_probe_request(_arm()))
+
+    shared = 0
+    # strict=False deliberately: the two passages are different lengths, and
+    # the shorter one running out IS the end of any shared prefix.
+    for warm_char, measured_char in zip(warm, measured, strict=False):
+        if warm_char != measured_char:
+            break
+        shared += 1
+
+    assert shared < 8, (
+        f'the warm-up and measured user messages share a {shared}-character '
+        'leading prefix; that prefix is exactly what a prefix cache reuses'
+    )
+
+
+@pytest.mark.parametrize('make_arm', [_arm, _moe_arm], ids=['vllm', 'llamacpp'])
+def test_the_warmup_request_is_otherwise_shape_identical(make_arm):
+    """Same code path, different text.
+
+    The warm-up's whole job is to warm what the measured probe will exercise --
+    grammar compilation, sampler setup, CUDA graph capture.  A warm-up that
+    differed in `response_format` or `chat_template_kwargs` would warm a
+    DIFFERENT path and leave the measured probe paying the cold cost anyway.
+    """
+    warm = lms_healthcheck.build_llm_probe_request(make_arm(), warmup=True)
+    measured = lms_healthcheck.build_llm_probe_request(make_arm())
+
+    for key in ('model', 'temperature', 'max_tokens', 'response_format'):
+        assert warm[key] == measured[key], key
+    assert warm.get('chat_template_kwargs') == measured.get('chat_template_kwargs')
+    assert set(warm) == set(measured)
+    assert [m['role'] for m in warm['messages']] == [
+        m['role'] for m in measured['messages']
+    ]
+    # The system message is the one part that may legitimately stay cached.
+    warm_system = next(m['content'] for m in warm['messages'] if m['role'] == 'system')
+    measured_system = next(
+        m['content'] for m in measured['messages'] if m['role'] == 'system'
+    )
+    assert warm_system == measured_system
+
+
+def test_warmup_defaults_to_false_so_the_measured_probe_is_the_default():
+    """Every existing caller asks for the measured probe by asking for nothing."""
+    assert lms_healthcheck.build_llm_probe_request(
+        _arm()
+    ) == lms_healthcheck.build_llm_probe_request(_arm(), warmup=False)
+    assert lms_healthcheck.build_embedding_probe_request(
+        _embedding_arm()
+    ) == lms_healthcheck.build_embedding_probe_request(_embedding_arm(), warmup=False)
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +721,183 @@ def test_a_placeholder_arm_is_refused_before_any_request(install_fake_httpx):
     assert result.reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
 
 
+# ---------------------------------------------------------------------------
+# The cached-prompt-token diagnostic (task 3781)
+#
+# This is the only DIRECT evidence in the artifact that the measured probe
+# found the prefix cache COLD -- the claim the whole cold/warm split rests on.
+# Without it, "engine-warm, prefix-cold" is an assertion about the instrument
+# that the instrument's own output cannot support.
+#
+# The two stacks answer differently and the asymmetry is not hidden: llama.cpp
+# fills `usage.prompt_tokens_details.cached_tokens`, so a near-zero count there
+# proves it; vLLM returns `prompt_tokens_details: null`, so on that stack the
+# claim rests on latency alone.  REPORTED and NON-GATING, exactly like
+# `top_level_entities_named` -- it must never decide a verdict.
+# ---------------------------------------------------------------------------
+
+
+def _healthy_llm_wire(install_fake_httpx, body, model='qwen3.5-9b'):
+    """Install a fake httpx serving *body* from a correctly-identified arm."""
+    install_fake_httpx(
+        get=lambda url, **kw: _Resp(200, _models_payload(model)),
+        post=lambda url, **kw: _Resp(200, body),
+    )
+
+
+def test_a_llamacpp_shaped_response_records_its_cached_prompt_tokens(
+    install_fake_httpx,
+):
+    """The llama.cpp shape.  5 of 343 cached is what a genuinely cold prefix
+    looks like; 338 of 343 is the poisoned same-prompt warm-up this task's
+    design exists to avoid."""
+    _healthy_llm_wire(
+        install_fake_httpx,
+        _completion(
+            _valid_probe_json(),
+            usage={'prompt_tokens': 343, 'prompt_tokens_details': {'cached_tokens': 5}},
+        ),
+    )
+
+    result = lms_healthcheck.probe_llm_arm(_arm())
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens == 5
+
+
+def test_a_vllm_shaped_null_prompt_tokens_details_still_produces_both_latencies(
+    install_fake_httpx,
+):
+    """The measured vLLM shape.  On that stack the cold/warm split has to be
+    visible through LATENCY ALONE, so a null here must never degrade a field,
+    move a verdict, or raise."""
+    _healthy_llm_wire(
+        install_fake_httpx,
+        _completion(
+            _valid_probe_json(),
+            usage={'prompt_tokens': 343, 'prompt_tokens_details': None},
+        ),
+    )
+
+    report = lms_healthcheck.run_healthcheck(
+        [_arm()], gpu_probe=lambda: _snapshot(), baseline=_baseline(),
+    )
+    row = report.arms[0]
+
+    assert row.verdict == 'PASS'
+    assert row.first_probe_ms > 0
+    assert row.latency_ms > 0
+    assert row.measured_cached_prompt_tokens is None
+
+
+def test_a_response_with_no_usage_block_at_all_records_no_cached_count(
+    install_fake_httpx,
+):
+    _healthy_llm_wire(install_fake_httpx, _completion(_valid_probe_json()))
+
+    result = lms_healthcheck.probe_llm_arm(_arm())
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens is None
+
+
+@pytest.mark.parametrize(
+    'usage',
+    [
+        'nope',
+        {'prompt_tokens_details': []},
+        {'prompt_tokens_details': {'cached_tokens': 'many'}},
+        {'prompt_tokens_details': {'cached_tokens': True}},
+        {'prompt_tokens_details': {}},
+        None,
+    ],
+    ids=['string', 'list-details', 'string-count', 'bool-count', 'empty', 'null'],
+)
+def test_a_malformed_usage_block_is_tolerated_not_raised(install_fake_httpx, usage):
+    """Read defensively, exactly as `_extract_content` and `_was_truncated`
+    already read bodies: an unreadable diagnostic must never abort a sweep or
+    change a verdict.  `True` is rejected on its own account -- Python's
+    `isinstance(True, int)` hole, closed here as `verify_embedding_response`
+    already closes it for vector values."""
+    _healthy_llm_wire(
+        install_fake_httpx, _completion(_valid_probe_json(), usage=usage)
+    )
+
+    result = lms_healthcheck.probe_llm_arm(_arm())
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens is None
+
+
+def _healthy_embedding_wire(install_fake_httpx, arm, body=None):
+    """Install a fake httpx serving a valid vector from a correctly-identified
+    embedding arm.  *body* overrides the whole response, for the shapes that
+    need a `usage` block the default payload does not carry."""
+    dims = arm.dims
+    assert dims is not None
+    payload = body if body is not None else _embedding_payload(
+        [0.01 * i for i in range(dims)], model=arm.served_model_name
+    )
+    install_fake_httpx(
+        get=lambda url, **kw: _Resp(200, _models_payload(arm.served_model_name)),
+        post=lambda url, **kw: _Resp(200, payload),
+    )
+
+
+def test_an_embedding_row_records_no_cached_prompt_tokens(install_fake_httpx):
+    """A vLLM embedding arm answers with no `usage` block, so the honest answer
+    is None rather than a 0 that reads like a measured cold cache.  All four
+    embedding arms on the committed slate are vLLM, which is why they all read
+    `null` there.
+
+    Driven through the REAL probe path (`run_healthcheck` with no injected
+    prober) on purpose.  The version of this test that ran through the
+    `_passing_probe` stub asserted a property of the STUB -- whose
+    `cached_prompt_tokens` was simply left at its `None` default -- and would
+    have stayed green no matter what `_probe` did to a real response body.
+    """
+    arm = _unprefixed_arm()
+    _healthy_embedding_wire(install_fake_httpx, arm)
+
+    row = lms_healthcheck.run_healthcheck(
+        [arm], gpu_probe=lambda: _snapshot(), baseline=_baseline(),
+    ).arms[0]
+
+    assert row.verdict == 'PASS'
+    assert row.measured_cached_prompt_tokens is None
+
+
+def test_an_embedding_server_that_answers_the_cache_question_is_recorded(
+    install_fake_httpx,
+):
+    """The diagnostic is gated on the STACK's silence, not on the axis.
+
+    No embedding arm on this slate answers it — but one that did would be
+    reporting on the same prefix cache the LLM axis reports on, and suppressing
+    that answer by axis would delete the only DIRECT evidence for that row's
+    cold/warm split, leaving it resting on latency alone for no reason.
+    Reported and non-gating either way, exactly like the LLM axis.
+    """
+    arm = _unprefixed_arm()
+    _healthy_embedding_wire(
+        install_fake_httpx,
+        arm,
+        body={
+            **_embedding_payload(
+                [0.01 * i for i in range(R2_DIMS)], model=arm.served_model_name
+            ),
+            'usage': {'prompt_tokens': 11, 'prompt_tokens_details': {
+                'cached_tokens': 7
+            }},
+        },
+    )
+
+    result = lms_healthcheck.probe_embedding_arm(arm)
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens == 7
+
+
 # ===========================================================================
 # Part 2 (step 13) -- the embedding axis.
 #
@@ -702,6 +988,27 @@ def test_an_arm_without_a_declared_prefix_gets_none_invented():
     body = lms_healthcheck.build_embedding_probe_request(_unprefixed_arm())
 
     assert 'Instruct:' not in body['input'][0]
+
+
+def test_the_embedding_warmup_query_differs_from_the_measured_one():
+    """The embedding axis needs its own distinct warm-up text, for the same
+    reason the LLM axis does -- and the declared `query_prefix` must be applied
+    to BOTH.  An unprefixed warm-up would warm the document-side path of an
+    asymmetric model, which is not the path the measured probe takes.
+    """
+    arm = _embedding_arm()
+    prefix = arm.query_prefix
+    assert prefix is not None
+
+    warm = lms_healthcheck.build_embedding_probe_request(arm, warmup=True)
+    measured = lms_healthcheck.build_embedding_probe_request(arm)
+
+    assert warm['input'][0] != measured['input'][0]
+    assert lms_healthcheck.EMBEDDING_PROBE_QUERY not in warm['input'][0]
+    assert warm['input'] == [prefix + lms_healthcheck.WARMUP_EMBEDDING_QUERY]
+    assert warm['input'][0].startswith('Instruct:')
+    assert warm['model'] == measured['model']
+    assert warm['encoding_format'] == measured['encoding_format']
 
 
 def test_building_an_embedding_probe_for_an_llm_arm_is_a_typed_error():
@@ -1033,13 +1340,17 @@ def _over_budget_snapshot() -> lms_vram.GpuSnapshot:
     return _snapshot(used_mib=24400, free_mib=MEASURED_TOTAL_MIB - 24400)
 
 
-def _passing_probe(arm):
+#: Both fakes ACCEPT `warmup` rather than ignoring it (task 3781).  A fake with
+#: a bare `(arm)` signature could not be called with the kwarg at all, so it
+#: would turn "the warm-up was never fired" into a TypeError somewhere else
+#: instead of a legible assertion here.
+def _passing_probe(arm, *, warmup: bool = False):
     return lms_healthcheck.ProbeResult(
         verdict='PASS', reason=lms_healthcheck.Reason.OK, detail='ok', latency_ms=12.5,
     )
 
 
-def _failing_probe(arm):
+def _failing_probe(arm, *, warmup: bool = False):
     return lms_healthcheck.ProbeResult(
         verdict='FAIL',
         reason=lms_healthcheck.Reason.IDENTITY_MISMATCH,
@@ -1048,13 +1359,210 @@ def _failing_probe(arm):
     )
 
 
-def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None):
+def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None, **kwargs):
     return lms_healthcheck.run_healthcheck(
         arms if arms is not None else [_arm()],
         gpu_probe=lambda: snapshot if snapshot is not None else _snapshot(),
         probe=probe,
         baseline=baseline if baseline is not None else _baseline(),
+        **kwargs,
     )
+
+
+def _recording_probe(result=None):
+    """A prober that logs `(arm_id, warmup)` per call.  Returns (fn, calls)."""
+    calls: list[tuple[str, bool]] = []
+
+    def probe(arm, *, warmup: bool = False):
+        calls.append((arm.arm_id, warmup))
+        return (result or _passing_probe)(arm, warmup=warmup)
+
+    return probe, calls
+
+
+# ---------------------------------------------------------------------------
+# The discarded warm-up (task 3781)
+#
+# `run_healthcheck` fires TWO probes per arm and keeps one.  The first is
+# thrown away entirely -- it exists only to warm CUDA graphs, the allocator,
+# kernel autotune and grammar compilation, so the SECOND one measures a warm
+# engine hitting a cold prefix cache, which is the state production is in.
+#
+# "Discarded" has to be load-bearing in both directions, and the two tests
+# below pin both: a failing warm-up must not fail a healthy arm, and a passing
+# warm-up must not launder a broken one.
+# ---------------------------------------------------------------------------
+
+
+def test_the_warmup_probe_is_fired_before_the_measured_one():
+    probe, calls = _recording_probe()
+
+    _report(probe=probe)
+
+    assert calls == [('qwen3.5-9b', True), ('qwen3.5-9b', False)]
+
+
+def test_a_failing_warmup_never_reaches_the_row():
+    """The first request after an arm reaches ready is the one most likely to
+    look bad for reasons that are not the arm's fault.  Its verdict is thrown
+    away, not merged in."""
+    def probe(arm, *, warmup: bool = False):
+        return _failing_probe(arm) if warmup else _passing_probe(arm)
+
+    report = _report(probe=probe)
+
+    assert report.arms[0].verdict == 'PASS'
+    assert report.arms[0].reason == lms_healthcheck.Reason.OK
+    assert report.overall == 'PASS'
+
+
+def test_a_passing_warmup_never_launders_a_failing_measured_probe():
+    """The inverse, and the one that matters more: without it, "discard the
+    first result" is a hole a broken arm could walk through."""
+    def probe(arm, *, warmup: bool = False):
+        return _passing_probe(arm) if warmup else _failing_probe(arm)
+
+    report = _report(probe=probe)
+
+    assert report.arms[0].verdict == 'FAIL'
+    assert report.arms[0].reason == lms_healthcheck.Reason.IDENTITY_MISMATCH
+    assert report.overall == 'FAIL'
+    assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+def test_the_warmup_is_fired_once_per_arm_not_once_per_sweep():
+    """A per-sweep warm-up warms NOTHING for arms two onward: each arm is a
+    separate server process with its own CUDA context, so being warmed by a
+    different arm's process is the same as not being warmed at all."""
+    probe, calls = _recording_probe()
+
+    _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
+
+    assert calls == [
+        ('qwen3.5-9b', True),
+        ('qwen3.5-9b', False),
+        ('granite-embedding-english-r2', True),
+        ('granite-embedding-english-r2', False),
+    ]
+
+
+def test_a_placeholder_arm_still_issues_no_request_at_all(install_fake_httpx,
+                                                          monkeypatch, tmp_path):
+    """The warm-up must not re-open the refusal path.
+
+    A TBD arm has nothing to probe, and issuing the request anyway would report
+    a 404 on a literal `TBD-Q3` model id as an arm failure -- burying an
+    unresolved PRD Open Question under a transport error like every other one.
+    Doubling the requests per arm is exactly the change that could reintroduce
+    it, so this drives the REAL prober through the sweep.
+    """
+    def _boom(url, **kwargs):
+        raise AssertionError('no request may be issued for a placeholder arm')
+
+    install_fake_httpx(post=_boom, get=_boom)
+    placeholder = _moe_arm(
+        model_ref='TBD-Q3-pick-a-gguf', image='TBD-Q3', quant='TBD-Q3'
+    )
+    assert placeholder.is_placeholder is True
+
+    report = lms_healthcheck.run_healthcheck(
+        [placeholder],
+        gpu_probe=lambda: _snapshot(),
+        baseline=_baseline(),
+    )
+
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.arms[0].verdict == 'FAIL'
+
+
+# ---------------------------------------------------------------------------
+# Both numbers, unambiguously named (task 3781)
+#
+# Before this task the row carried ONE latency under a name that did not say
+# which of the two very different things it was.  It was in fact the cold one:
+# the first request after the arm reached ready.  Both are now on the row under
+# names that mean what they say.
+#
+# Every latency below is INJECTED.  Nothing here asserts cold > warm -- see
+# test_a_row_carries_both_the_cold_and_the_warm_latency for why that ordering
+# is deliberately not a property of this instrument.
+# ---------------------------------------------------------------------------
+
+
+def _latency_probe(cold: float, warm: float):
+    def probe(arm, *, warmup: bool = False):
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            detail='ok',
+            latency_ms=cold if warmup else warm,
+        )
+
+    return probe
+
+
+def test_a_row_carries_both_the_cold_and_the_warm_latency():
+    """A ~12x gap between the two, the shape a load-dominated arm shows.  The
+    injected figures below are from a `reasoning: off` dev run and are NOT in
+    the committed artifact; the comparable committed pair is
+    qwen3-embedding-0.6b at 604.7 ms cold against 44.7 ms warm.
+
+    Deliberately NOT asserted here, or anywhere: that cold > warm in general.
+    phi-4-14b measured 1893.3 ms cold against 2241.2 ms warm in the committed
+    2026-08-16 slate -- a generation-dominated arm where load cost is a rounding
+    error against the generation itself and the ordering sits inside the noise.
+    A gate on it would fail an arm that is serving correctly.
+    """
+    report = _report(probe=_latency_probe(cold=4249.7, warm=359.1))
+    row = report.arms[0]
+
+    assert row.first_probe_ms == 4249.7
+    assert row.latency_ms == 359.1
+    assert row.first_probe_ms != row.latency_ms
+    assert row.first_probe_ms > 0 and row.latency_ms > 0
+
+
+def test_latency_ms_is_the_measured_probe_not_the_first_one():
+    """The anti-regression assertion.
+
+    Before this task `latency_ms` WAS the first probe after ready.  Pinning
+    which call it comes from means a later refactor that swaps the two turns
+    this red instead of silently restoring a cold number under a warm name.
+    """
+    report = _report(probe=_latency_probe(cold=4249.7, warm=359.1))
+
+    assert report.arms[0].latency_ms == 359.1
+    assert report.arms[0].latency_ms != 4249.7
+
+
+def test_the_two_latency_fields_are_named_for_what_they_measure():
+    """Both present on the dumped row, so the artifact never carries one number
+    whose meaning depends on knowing the run order that produced it."""
+    dumped = _report().arms[0].model_dump(mode='json')
+
+    assert 'first_probe_ms' in dumped
+    assert 'latency_ms' in dumped
+
+
+def test_a_placeholder_row_reports_both_fields_without_inventing_a_measurement():
+    """A refused arm measured nothing.  Both fields are 0.0 rather than either
+    being omitted -- an absent field reads as an older schema, and a nonzero
+    one would be a measurement nobody took."""
+    placeholder = _moe_arm(
+        model_ref='TBD-Q3-pick-a-gguf', image='TBD-Q3', quant='TBD-Q3'
+    )
+
+    def probe(arm, *, warmup: bool = False):
+        return lms_healthcheck.ProbeResult(
+            verdict='FAIL',
+            reason=lms_healthcheck.Reason.PLACEHOLDER_ARM,
+            detail='nothing to probe',
+        )
+
+    row = _report(arms=[placeholder], probe=probe).arms[0]
+
+    assert row.first_probe_ms == 0.0
+    assert row.latency_ms == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1157,8 +1665,11 @@ def test_overall_is_pass_only_when_every_row_and_the_vram_block_pass():
 
 
 def test_overall_is_fail_when_a_single_arm_fails():
-    def probe(arm):
-        return _failing_probe(arm) if arm.arm_id == 'qwen3.5-9b' else _passing_probe(arm)
+    def probe(arm, *, warmup: bool = False):
+        return (
+            _failing_probe(arm, warmup=warmup) if arm.arm_id == 'qwen3.5-9b'
+            else _passing_probe(arm, warmup=warmup)
+        )
 
     report = _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
 
@@ -1340,8 +1851,11 @@ def test_the_table_takes_only_the_report_so_text_and_json_cannot_disagree():
 
 
 def test_the_table_shows_every_row_with_its_verdict_and_reason():
-    def probe(arm):
-        return _failing_probe(arm) if arm.arm_id == 'qwen3.5-9b' else _passing_probe(arm)
+    def probe(arm, *, warmup: bool = False):
+        return (
+            _failing_probe(arm, warmup=warmup) if arm.arm_id == 'qwen3.5-9b'
+            else _passing_probe(arm, warmup=warmup)
+        )
 
     report = _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
 
@@ -1485,11 +1999,16 @@ def cli_env(monkeypatch, tmp_path):
     `lms_ctl.start` would: the CLI has no baseline parameter on purpose, so the
     only way a report gets one is that something actually started the arm.
     """
-    calls = {'probed': []}
+    calls = {'probed': [], 'calls': []}
 
-    def probe(arm):
-        calls['probed'].append(arm.arm_id)
-        return _passing_probe(arm)
+    def probe(arm, *, warmup: bool = False):
+        # `probed` stays the MEASURED sweep, so every pre-3781 assertion about
+        # which arms were covered keeps meaning what it said.  `calls` is the
+        # full wire sequence, warm-ups included, for the tests that care.
+        calls['calls'].append((arm.arm_id, warmup))
+        if not warmup:
+            calls['probed'].append(arm.arm_id)
+        return _passing_probe(arm, warmup=warmup)
 
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
     for arm_id in lms_manifest.load_arms().arm_ids():
@@ -1582,8 +2101,181 @@ def test_cli_output_writes_the_json_artifact_step_21_validates(cli_env, tmp_path
     ):
         assert key in written['vram']
     for key in ('arm_id', 'axis', 'stack', 'endpoint', 'served_model_name',
-                'verdict', 'reason', 'latency_ms'):
+                'verdict', 'reason', 'latency_ms', 'first_probe_ms'):
         assert key in written['arms'][0]
+
+
+# ---------------------------------------------------------------------------
+# --repeat N (task 3781)
+#
+# A pure OBSERVABILITY knob.  It shows an operator a spread and must never move
+# a verdict -- an operator who could turn a row green by running it again would
+# have the cheapest possible way to fake this artifact, which `merge_reports`
+# already refuses for exactly the same reason.
+#
+# Samples after the FIRST are prefix-cache WARM: the first measured probe
+# populates the cache the rest are served from.  Measured 2026-08-06 on
+# moe-stretch, 338 of 343 prompt tokens came from cache on a repeat, and the
+# cache state even changed the OUTPUT at temperature 0 (276 completion tokens
+# cold-cache vs 236 warm).  Repeated identical probes are NOT independent
+# samples, which is why latency_ms stays pinned to the only prefix-cold one.
+# ---------------------------------------------------------------------------
+
+
+def test_repeat_fires_the_measured_probe_n_times_and_the_warmup_once(cli_env):
+    """Exactly ONE warm-up regardless of N.  The engine is warm after the first
+    request; re-warming would only spend GPU time to learn nothing."""
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--repeat', '3'])
+
+    assert code == 0
+    assert cli_env['calls'] == [
+        ('qwen3.5-9b', True),
+        ('qwen3.5-9b', False),
+        ('qwen3.5-9b', False),
+        ('qwen3.5-9b', False),
+    ]
+
+
+def test_repeat_records_every_measured_sample():
+    seen = {'n': 0}
+
+    def probe(arm, *, warmup: bool = False):
+        if warmup:
+            return lms_healthcheck.ProbeResult(
+                verdict='PASS', reason=lms_healthcheck.Reason.OK, latency_ms=4249.7,
+            )
+        seen['n'] += 1
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            latency_ms=float(350 + seen['n']),
+        )
+
+    row = _report(probe=probe, repeat=3).arms[0]
+
+    assert row.repeat_latencies_ms is not None
+    assert row.repeat_latencies_ms == [351.0, 352.0, 353.0]
+    assert 4249.7 not in row.repeat_latencies_ms
+    assert row.first_probe_ms == 4249.7
+
+
+def test_latency_ms_is_the_first_measured_sample():
+    """Not a mean.  Only the FIRST measured probe is prefix-cold; samples 2..N
+    are served from the cache it populated, so averaging them would quietly
+    redefine the artifact's headline number into a mean of incomparable
+    things."""
+    seen = {'n': 0}
+
+    def probe(arm, *, warmup: bool = False):
+        if warmup:
+            return _passing_probe(arm, warmup=True)
+        seen['n'] += 1
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            latency_ms=float(1000 // seen['n']),
+        )
+
+    row = _report(probe=probe, repeat=3).arms[0]
+
+    assert row.repeat_latencies_ms is not None
+    assert row.latency_ms == row.repeat_latencies_ms[0]
+    assert row.latency_ms == 1000.0
+
+
+def test_repeat_never_changes_a_verdict():
+    """Observability, never adjudication.  The FIRST measured probe alone
+    supplies the verdict, so a later sample cannot move it in either
+    direction."""
+    seen = {'n': 0}
+
+    def probe(arm, *, warmup: bool = False):
+        if warmup:
+            return _passing_probe(arm, warmup=True)
+        seen['n'] += 1
+        return _failing_probe(arm) if seen['n'] == 3 else _passing_probe(arm)
+
+    report = _report(probe=probe, repeat=3)
+
+    assert report.arms[0].verdict == 'PASS'
+    assert report.arms[0].reason == lms_healthcheck.Reason.OK
+    assert report.overall == 'PASS'
+    assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_OK
+
+
+def test_without_repeat_the_spread_field_is_absent():
+    """None, not a one-element list.  "The question was not asked" and "a
+    spread of one" are different statements, the same distinction
+    top_level_entities_named already draws."""
+    assert _report().arms[0].repeat_latencies_ms is None
+
+
+@pytest.mark.parametrize('count', ['0', '-1'])
+def test_repeat_rejects_a_non_positive_count(cli_env, count):
+    """Silently probing zero times would write a report with no measurement in
+    it that still reads as a completed run."""
+    with pytest.raises(SystemExit) as excinfo:
+        lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--repeat', count])
+
+    assert excinfo.value.code != 0
+
+
+def test_run_healthcheck_rejects_a_non_positive_repeat_as_a_caller_error():
+    """A HealthcheckError, never a FAIL row: this is the harness being asked
+    something incoherent, and blaming the arm for it is this module's stated
+    contract violation."""
+    with pytest.raises(lms_healthcheck.HealthcheckError):
+        _report(repeat=0)
+
+
+@pytest.mark.parametrize('selector', [['--arm', 'qwen3.5-9b'], ['--all'], ['--active']])
+def test_repeat_is_not_part_of_the_selector_group(cli_env, selector):
+    """A plain option, not a member of the required mutually-exclusive group,
+    so it composes with every MEASUREMENT way of choosing arms.  `--merge` is
+    the one selector it does not compose with — see the test below."""
+    code = lms_healthcheck.main([*selector, '--repeat', '2'])
+
+    # --active finds nothing under cli_env, which is its own non-zero code.
+    assert code in (0, lms_healthcheck.EXIT_NO_ACTIVE_ARMS)
+
+
+def test_repeat_with_merge_is_refused_rather_than_silently_ignored(
+    cli_env, tmp_path, capsys
+):
+    """`--merge` assembles parts that were already measured, so there is nothing
+    for `--repeat` to fire.  Accepting the pair would exit 0 having done none of
+    what was asked, and the operator's next move is to trust a spread that was
+    never measured -- the silent-degradation shape this package refuses
+    everywhere else.
+    """
+    path = tmp_path / 'one.json'
+    assert lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(path)]) == 0
+    out = tmp_path / 'merged.json'
+
+    with pytest.raises(SystemExit) as excinfo:
+        lms_healthcheck.main(
+            ['--merge', str(path), '--repeat', '5', '--output', str(out)]
+        )
+
+    # argparse's own usage-error code, and NOT a merge error: the assembly was
+    # never attempted, so reporting one would name the wrong fix.
+    assert excinfo.value.code == 2
+    assert '--repeat measures' in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_merge_without_repeat_is_still_accepted(cli_env, tmp_path):
+    """The refusal above is keyed on `--repeat` being ASKED FOR, not on its
+    default: a plain `--merge` must stay unaffected."""
+    parts = []
+    for arm_id in lms_healthcheck.load_arms().arm_ids():
+        part = tmp_path / f'{arm_id}.json'
+        assert lms_healthcheck.main(['--arm', arm_id, '--output', str(part)]) == 0
+        parts.append(str(part))
+    out = tmp_path / 'merged.json'
+
+    assert lms_healthcheck.main(['--merge', *parts, '--output', str(out)]) == 0
+    assert out.exists()
 
 
 def test_cli_written_artifact_is_pure_json_with_no_enum_repr(cli_env, tmp_path):
@@ -1929,11 +2621,19 @@ def test_this_producer_never_emits_the_unmeasured_sentinel():
 
 
 def test_the_report_schema_version_records_the_added_evidence():
-    """v5.  A v4 file read by a v5-aware consumer would show a `pollution` it
-    never measured, which is precisely the misreading this constant exists to
-    prevent."""
-    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 5
-    assert _report().schema_version == 5
+    """v6, and the constant is pinned HERE and nowhere else in this suite.
+
+    Two shape changes rode on it.  v5 (task 3755): a v4 file read by a
+    v5-aware consumer would show a `pollution` it never measured.  v6 (task
+    3781): `latency_ms` CHANGED MEANING at the same field name, from the
+    engine-cold first request to the engine-warm, prefix-cold measured one, so
+    a v5-or-older file reinterpreted as current restates an old number under a
+    caveat no producer ever made.  Both are misreadings this constant exists
+    to prevent, and both are silent -- which is why the producer stamping it is
+    asserted here too, not just the literal.
+    """
+    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 6
+    assert _report().schema_version == 6
 
 
 def test_a_polluted_recorded_baseline_produces_no_report_at_all():
@@ -2693,3 +3393,152 @@ def test_top_level_count_is_none_when_the_question_does_not_apply():
 
     assert result.reason == lms_healthcheck.Reason.NOT_JSON
     assert result.top_level_entities_named is None
+
+
+# ---------------------------------------------------------------------------
+# Schema v5 and the not-comparable caveat (task 3781)
+#
+# Two things moved at once, and the version exists to stop a consumer papering
+# over either.  The ROW SHAPE gained `first_probe_ms`, `repeat_latencies_ms`
+# and `measured_cached_prompt_tokens` -- but more importantly `latency_ms`
+# CHANGED MEANING: up to v4 it was the first request after the arm reached
+# ready (engine-cold AND prefix-cold), and from v5 it is the engine-warm,
+# prefix-COLD measured run.  A consumer that read a v4 `latency_ms` as the same
+# quantity would be wrong, which is precisely what a version bump prevents.
+#
+# The CAVEAT is the load-bearing other half.  A corrected number without the
+# sentence saying what it is not re-creates the same false comparability the
+# corrected number was supposed to retire -- and eta (3720) and theta (3721)
+# read the JSON artifact, not the README, so the sentence has to live in a real
+# FIELD.  `prd_marker` already exists for exactly this reason.
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_carries_the_not_comparable_caveat_in_a_field():
+    """The FIELD is wired: a non-empty `LATENCY_CAVEAT` reaches
+    `HealthReport.latency_caveat` verbatim, exactly as `prd_marker` does.
+
+    That is the whole contract here.  The caveat's WORDING is reviewed by a
+    human, not pinned by a test -- the sentence is spelled ONCE as a module
+    constant precisely so every consumer of it agrees by identity, and so it
+    can be reworded in one place without turning the suite red.
+    """
+    caveat = lms_healthcheck.LATENCY_CAVEAT
+
+    assert isinstance(caveat, str)
+    assert caveat.strip()
+    assert _report().latency_caveat == caveat
+
+
+def test_the_written_artifact_carries_the_caveat_and_both_latencies(cli_env, tmp_path):
+    """JSON carries no comments, which is exactly why this has to be a field --
+    the same reason `prd_marker` is one."""
+    out_path = tmp_path / 'health-report.json'
+
+    assert lms_healthcheck.main(['--all', '--output', str(out_path)]) == 0
+    written = json.loads(out_path.read_text())
+
+    assert written['latency_caveat'] == lms_healthcheck.LATENCY_CAVEAT
+    assert written['arms']
+    for row in written['arms']:
+        assert 'first_probe_ms' in row
+        assert 'latency_ms' in row
+
+
+def test_the_table_states_the_caveat_and_shows_both_numbers():
+    """An operator reading ONE ms column would re-create the same false
+    comparability the JSON just fixed, so the table splits it too."""
+    def probe(arm, *, warmup: bool = False):
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            detail='ok',
+            latency_ms=4249.7 if warmup else 359.1,
+        )
+
+    table = lms_healthcheck.render_table(_report(probe=probe))
+
+    assert 'COLD-MS' in table
+    row_line = next(
+        line for line in table.splitlines() if line.startswith('qwen3.5-9b')
+    )
+    assert '4250' in row_line
+    assert '359' in row_line
+    assert lms_healthcheck.LATENCY_CAVEAT in table
+
+
+def test_merging_preserves_the_caveat_and_both_latencies():
+    """The caveat travels from the BINDING input -- the same report the
+    surviving vram block comes from -- so the merged artifact cannot state a
+    caveat no input ever made."""
+    small = _single(_arm())
+    big = _single(
+        _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+        snapshot=_snapshot(used_mib=20000, free_mib=4576),
+    )
+
+    merged = lms_healthcheck.merge_reports([small, big])
+
+    assert merged.latency_caveat == lms_healthcheck.LATENCY_CAVEAT
+    assert all(row.first_probe_ms > 0 for row in merged.arms)
+
+    stamped = big.model_copy(update={'latency_caveat': 'from the binding run'})
+    assert lms_healthcheck.merge_reports(
+        [small, stamped]
+    ).latency_caveat == 'from the binding run'
+
+
+def test_a_v4_artifact_no_longer_reads_as_current():
+    """`latency_ms` changed meaning at v5, so a stale v4 part must be REFUSED
+    rather than reinterpreted alongside v5 rows."""
+    stale = _single(_arm()).model_copy(update={'schema_version': 4})
+    current = _single(
+        _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412)
+    )
+
+    with pytest.raises(
+        lms_healthcheck.ReportMergeError, match='mixed schema versions'
+    ):
+        lms_healthcheck.merge_reports([stale, current])
+
+
+def test_uniformly_stale_parts_do_not_merge_into_a_current_looking_artifact():
+    """Agreeing with each other is not the same as being current.
+
+    Refusing only DISAGREEMENT left the worse case open: a set of parts that are
+    all v4 agrees with itself, merges cleanly, and emits `schema_version=4` --
+    while pydantic silently fills in this producer's defaults for
+    `first_probe_ms` (0.0) and `latency_caveat`.  The result asserts its
+    latencies were taken "with the engine warm and the prefix cache COLD" over
+    numbers that are pre-3781 cold single samples: precisely the
+    reinterpretation `REPORT_SCHEMA_VERSION`'s own contract tells a consumer to
+    refuse, and it makes the caveat carried from the binding input vacuous for
+    exactly the case that comment names.
+    """
+    parts = [
+        _single(_arm()).model_copy(update={'schema_version': 4}),
+        _single(
+            _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412)
+        ).model_copy(update={'schema_version': 4}),
+    ]
+
+    with pytest.raises(
+        lms_healthcheck.ReportMergeError, match='stale schema versions'
+    ) as excinfo:
+        lms_healthcheck.merge_reports(parts)
+
+    # The message must name what is stale AND what this producer writes, so an
+    # operator holding old parts knows a re-measure is the fix.
+    assert '[4]' in str(excinfo.value)
+    assert f'v{lms_healthcheck.REPORT_SCHEMA_VERSION}' in str(excinfo.value)
+
+
+def test_a_current_slate_still_merges():
+    """The refusal above must not have closed the door on the normal path."""
+    merged = lms_healthcheck.merge_reports([
+        _single(_arm()),
+        _single(_arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412)),
+    ])
+
+    assert merged.schema_version == lms_healthcheck.REPORT_SCHEMA_VERSION
+    assert [row.arm_id for row in merged.arms] == ['qwen3.5-9b', 'phi-4-14b']

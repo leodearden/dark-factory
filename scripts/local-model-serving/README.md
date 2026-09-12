@@ -116,6 +116,16 @@ Useful variants: `lms_ctl active` / `stop-all`; `lms_fetch_weights --all`
 (non-placeholder arms) or `--images-only`; `lms_healthcheck --active`,
 `--all`, and `--output <path>` to write the JSON artifact.
 
+`lms_healthcheck --repeat N` is the operator's spread knob: it fires the
+measured probe N times behind the same single warm-up and records every sample
+in `repeat_latencies_ms`. Samples after the **first** are prefix-cache **warm**
+— the first measured probe populates the cache the rest are served from — so
+they are not independent samples, `latency_ms` stays pinned to the first, and
+`--repeat` can never change a verdict. It composes with the measurement
+selectors (`--all` / `--arm` / `--active`) and is **refused** alongside
+`--merge`, which measures nothing: pairing them would exit 0 having done none
+of what was asked.
+
 Logs are the journal: `journalctl --user -u lms-arm@qwen3.5-9b.service -f`.
 
 ### The whole slate: `lms_slate_run.py`
@@ -579,9 +589,14 @@ lms_ctl stop granite-embedding-english-r2
 | — weight load | 1.6 s (0.29 GiB) |
 | — profile, KV cache, warmup | 22.0 s (16.6 s of it `torch.compile`) |
 | **resident VRAM while serving** | **796 MiB** (7309 → 8105 MiB used) |
-| embeddings probe latency | 192 ms |
+| embeddings probe latency | 192 ms (COLD single sample — see the caveat below) |
 | VRAM after `stop` | 7309 MiB — **exactly** the pre-start baseline |
 | whisper-writer throughout | 4050 MiB, undisturbed |
+
+That 192 ms was measured by the pre-3781 single-probe instrument, so it is the
+**cold** first request — the same arm in the committed 2026-09-12 slate served
+the warm probe in **36.2 ms**. It is a single sample, not ζ's p95-under-load envelope
+metric (task **3719**), and it must not be used to rank arms.
 
 What this establishes that step 19 could not: the unit template instantiates
 against a real `arms.yaml` arm, the pre-flight admits an arm that fits, the
@@ -686,25 +701,55 @@ the card — which is how `0.6b` (2.0 -> 3.0) and `4b` (9.0 -> 10.0) were caught
 
 ---
 
-## Live slate run (measured, step 23 — 2026-08-06, COMPLETE)
+## Live slate run (measured, step 23 — re-measured 2026-09-12, COMPLETE)
 
-Every arm run through the committed chain, one at a time, 30 m 22 s of live host
-time on a card confirmed clean at 7205 MiB idle beforehand (whisper-writer the
-only compute app at 4050 MiB, no ollama model resident). **7 of 7 PASS.**
+Every arm run through the committed chain, one at a time, ~24 min of live host
+time on a card confirmed clean at 6073 MiB idle beforehand. **7 of 7 PASS.**
 
-| arm | ready | resident (footprint) | budget | probe | entities | verdict |
-|---|---|---|---|---|---|---|
-| `granite-embedding-english-r2` | 101 s | 789 MiB | 16922 MiB | 129 ms | — | **PASS** |
-| `gte-modernbert-base` | 111 s | 788 MiB | 16922 MiB | 115 ms | — | **PASS** |
-| `qwen3-embedding-0.6b` | 116 s | 3584 MiB | 16921 MiB | 507 ms | — | **PASS** |
-| `qwen3-embedding-4b` | 157 s | 10114 MiB | 16911 MiB | 630 ms | — | **PASS** |
-| `qwen3.5-9b` | 438 s | 14507 MiB | 16910 MiB | 43501 ms | 4/4 (4 top-level) | **PASS** |
-| `phi-4-14b` | 171 s | 15519 MiB | 16918 MiB | 2854 ms | 3/4 (2 top-level) | **PASS** |
-| `moe-stretch` | 20 s | 14604 MiB | 16915 MiB | 2465 ms | 4/4 (4 top-level) | **PASS** |
+**This is the run the committed artifact carries** (`schema_version: 6`,
+`measured_at: 2026-09-12T12:31:52Z`). It was driven by `lms_slate_run.py`
+rather than by hand, and it is the first slate taken on a producer holding BOTH
+task 3755's consumer inventory and task 3781's cold/warm split — which is why
+task 4229 required one run rather than two. Every figure below is in the
+artifact; none of them is prose.
 
-Every arm released **every** byte on stop (card back to 7198–7217 MiB within the
-first 3 s poll), whisper-writer held 4050 MiB undisturbed throughout, and no two
-arms were ever co-resident.
+| arm | ready | resident (footprint) | budget | COLD ms | WARM ms | cached prompt tok | entities | verdict |
+|---|---|---|---|---|---|---|---|---|
+| `granite-embedding-english-r2` | 107 s | 787 MiB | 18019 MiB | 53.4 | **36.2** | — | — | **PASS** |
+| `gte-modernbert-base` | 106 s | 787 MiB | 18017 MiB | 37.9 | **27.5** | — | — | **PASS** |
+| `qwen3-embedding-0.6b` | 162 s | 3581 MiB | 18018 MiB | 571.3 | **38.8** | — | — | **PASS** |
+| `qwen3-embedding-4b` | 162 s | 10123 MiB | 18019 MiB | 616.4 | **40.8** | — | — | **PASS** |
+| `qwen3.5-9b` (`reasoning: on`) | 473 s | 15569 MiB | 18003 MiB | 41594.4 | **33794.8** | null (vLLM) | 4/4 (4 top-level) | **PASS** |
+| `phi-4-14b` | 223 s | 16637 MiB | 18019 MiB | 2224.9 | **2263.4** | null (vLLM) | 3/4 (2 top-level) | **PASS** |
+| `moe-stretch` | 97 s | 14611 MiB | 18019 MiB | 3737.5 | **2931.7** | **26** of ~343 | 4/4 (4 top-level) | **PASS** |
+
+**These latencies are NOT comparable across arms — do not rank on them.** Each
+is a SINGLE SAMPLE from a health probe, taken with the engine warm and the
+prefix cache **cold** (a discarded warm-up on a different prompt precedes it).
+They are **not** ζ's p95-under-load envelope metric (task **3719**, PRD
+`episode-latency-p50/p95` under concurrent load), and the arms differ in axis,
+stack, reasoning mode and prompt shape, so a column ordering carries no meaning.
+The same sentence lives in the artifact's `latency_caveat` field, because JSON
+carries no comments and η/θ read the JSON, not this file.
+
+`moe-stretch`'s **26** cached prompt tokens of ~343 is the direct evidence that
+the measured probe found the prefix cache cold — the same 26 the 2026-08-16
+instrument shakedown saw, against the **338** of 343 a same-prompt warm-up
+produced. vLLM reports
+`prompt_tokens_details: null`, so on those six arms the cold/warm split rests on
+latency alone — hence the two columns rather than one.
+
+`phi-4-14b` measured **cold LESS THAN warm** (2224.9 vs 2263.4), as it did on
+2026-08-16 (1893.3 vs 2241.2). That ordering is not a fault and nothing gates
+on it: for a generation-dominated arm the first-request penalty is a rounding
+error against sampling variance. A cold > warm check would fail an arm that is
+serving correctly — and it has now reproduced across two runs on different
+days, so it is the arm's shape, not one unlucky sample.
+
+Every arm released **every** byte on stop (card back to 6075 MiB, whisper-writer
+alone), and no two arms were ever co-resident. `vram.pollution` is `CLEAN`:
+nothing but whisper-writer held the card at either reading of any arm, which is
+the claim the v5 inventory exists to let the artifact make.
 
 `phi-4-14b` is the row the extraction floor was ruled on: `FalkorDB` appears
 **only as an attribute value** and `Leo` **only in the free-text summary**, which
@@ -712,14 +757,60 @@ the floor does not scan. So it captures 3 of 4 and promotes 2 — both numbers a
 in the row, the floor passes it, and `top_level_entities_named` records the
 representation difference for η without α judging it.
 
-### Latency here is a COLD single sample — do not rank arms on it
+### How the instrument separates cold from warm (task 3781)
 
-`qwen3.5-9b` measured 2849 ms cold and ~350 ms warm at `reasoning: off` — a 12×
-gap. These numbers are one measurement each, taken on the first request after
-load, and they are **not** ζ's p95-under-load envelope metric. Task **3781**
-fixes the instrument (warm the engine, not the prefix cache; report cold and warm
-separately). The one exception is `qwen3.5-9b` at `reasoning: on`: 43.5 s cold vs
-41.0 s warm, because that cost is genuine generation rather than load.
+Up to 2026-08-16 this section carried a warning that the latency column was a
+cold single sample. Task **3781** fixed the instrument, so what follows is what
+it now does.
+
+`run_healthcheck` probes each arm **twice**. The first run is **discarded** —
+its verdict is thrown away entirely, and only its latency is kept, as
+`first_probe_ms`. It exists to warm CUDA graphs, the allocator, kernel autotune
+and grammar compilation. The second run is the one measured, and its latency is
+`latency_ms`. So the reported number is **engine-warm and prefix-cold**, which
+is the state a production request actually arrives in.
+
+The warm-up deliberately uses a **different prompt** (`WARMUP_PROBE_TEXT`,
+`WARMUP_EMBEDDING_QUERY`), diverging from the measured one at the very first
+user token. Warming with the *same* prompt is the measured trap: llama.cpp then
+serves the "measured" run from the prefix cache the warm-up just populated —
+**338 of 343** prompt tokens, observed on `moe-stretch`. Everything else about
+the warm-up request is byte-identical, so it exercises the same server path it
+is meant to warm.
+
+Two measured findings justify the shape, and both are why repeated identical
+probes are **not** independent samples:
+
+- prompt-cache state changed the **output** at temperature 0 — 276 completion
+  tokens on a cold cache vs 236 on a warm one;
+- samples 2..N of a `--repeat` run measure generation with prompt processing
+  nearly free. `latency_ms` therefore stays pinned to `repeat_latencies_ms[0]`,
+  the only prefix-cold sample, and `--repeat` can never move a verdict.
+
+On llama.cpp, `measured_cached_prompt_tokens` proves the cold prefix directly
+(26 of ~343, on both the 2026-08-16 shakedown and the committed 2026-09-12
+run). vLLM returns `prompt_tokens_details: null`, so on those arms the claim
+rests on latency alone — which the artifact records
+honestly as `null` rather than a misleading `0`. The diagnostic is suppressed
+only by the STACK's silence, never by axis: an embedding server that answered
+the question would be reporting on the same prefix cache, and dropping that
+answer would delete the only direct evidence for that row's split.
+
+**Where the probe clock starts.** It starts *after* the `GET /v1/models`
+identity gate, so a measured figure is the model's own request and nothing
+else. It used to start before, which put one loopback GET into every number —
+a few ms, but a double-digit percentage of a 28 ms warm embedding reading, and
+the 2026-08-16 shakedown figures carry that offset. The table above does not:
+it was taken on the corrected clock, which is part of why its fast arms read
+lower than that shakedown's. The FAIL path still times from before the gate,
+where the elapsed time *is* the gate.
+
+Naming the mode each figure belongs to, since two numbers for `qwen3.5-9b` have
+read as contradictory: at **`reasoning: off`** it measured 2849 ms cold against
+~350 ms warm (a 12× load penalty); at **`reasoning: on`** — the mode `arms.yaml`
+declares and the mode the slate table above was measured in — the committed
+run has it at 41.6 s cold against 33.8 s warm, because that cost is genuine
+generation rather than load.
 
 ### The dropped arm
 
@@ -776,30 +867,65 @@ distance metric, and say which in its report.
 
 ## Verification artifact
 
-`verification/health-report.json` is written by a live run
-(`lms_healthcheck --all --output ...`) and committed. It carries
-`schema_version`, an aware-UTC `measured_at`, the GPU identity (which card,
-which driver — every verdict is relative to specific hardware), one row per arm,
-and the VRAM block. `scripts/tests/test_lms_verification_artifact.py` requires a
-`PASS` row for every arm in `arms.yaml` plus a passing VRAM block, so the test
-can only be greened by the run having actually happened.
+`verification/health-report.json` is written by a live run and committed. It
+carries `schema_version`, an aware-UTC `measured_at`, the GPU identity (which
+card, which driver — every verdict is relative to specific hardware), one row
+per arm with both latencies, the VRAM block, and `latency_caveat`.
+`scripts/tests/test_lms_verification_artifact.py` requires a `PASS` row for
+every arm in `arms.yaml`, a positive **cold and warm** latency on each, a
+passing VRAM block and the caveat field — so the test can only be greened by the
+run having actually happened.
 
-**The committed file is `schema_version: 4`; the producer is at 5.** It is
-evidence of a real ~39-minute 7-arm run and every other property of the gate
-still holds against it — what it predates is the v5 consumer inventory, so it
-cannot say who else held the card while those arms were measured. Re-deriving
-it needs docker, systemd and the shared 3090, and may itself be *refused* by the
-v5 guard if ollama is resident, which is the whole point of the guard. So the
-gate's version check is `ACCEPTED_ARTIFACT_SCHEMA_VERSIONS = {4, 5}` — a narrow,
-self-expiring grandfather clause, and a *widening* of the equality it replaced
-rather than a strengthening of it. What still runs live against today's v4 file
-is: the v4 block must carry **none** of the five consumer keys (so it cannot be
-hand-edited to fake an inventory), the set may grandfather exactly one named
-older version, and the set expires at the next schema bump. The *additional*
-strictness — a v5 artifact must carry a measured inventory and a `CLEAN`
-pollution state — begins the moment the artifact is re-derived at v5, and is not
-in force today. That re-run is filed as task **4229**; do not close it by editing
-the artifact.
+**Regenerating it.** `--all` cannot produce this file: it would need all seven
+arms up simultaneously, which this card cannot hold and which `lms_ctl start`
+refuses (exclusive by default), plus seven live VRAM baselines. The real chain
+is per arm, one at a time, then a merge:
+
+```bash
+# for each arm in arms.yaml:
+uv run --project shared python scripts/local-model-serving/lms_ctl.py start <arm>
+uv run --project shared python scripts/local-model-serving/lms_ctl.py wait-ready <arm>
+uv run --project shared python scripts/local-model-serving/lms_healthcheck.py \
+    --arm <arm> --output /tmp/parts/<arm>.json
+uv run --project shared python scripts/local-model-serving/lms_ctl.py stop <arm>
+
+# then, once every arm has a part:
+uv run --project shared python scripts/local-model-serving/lms_healthcheck.py \
+    --merge /tmp/parts/*.json \
+    --output scripts/local-model-serving/verification/health-report.json
+```
+
+`lms_ctl start` is the **only** writer of the VRAM baseline, which is what makes
+the artifact unfakeable — without it `run_healthcheck` raises `VramProbeError`
+and writes no report at all. `merge_reports` enforces manifest coverage, so a
+missing arm refuses the merge rather than yielding a short artifact that reads
+as complete. Long runs belong in a transient `systemd --user` unit (PRD
+decision 11), never a bare background shell.
+
+**The committed file is `schema_version: 6`, and every assertion in the gate
+runs live against it.** It was taken on 2026-09-12 by `lms_slate_run.py` — the
+whole slate, one arm at a time, 7/7 PASS, on a card holding nothing but
+whisper-writer — and it carries task 3755's consumer inventory *and* task
+3781's cold/warm latency split, because both were in the producer before the
+run.
+
+The gate's version check is `ACCEPTED_ARTIFACT_SCHEMA_VERSIONS = {6}`: the
+producer's version and nothing older. It was briefly a grandfather clause,
+because the committed artifact sat at v4 while the producer moved to v5 and
+then v6, and re-deriving it needs docker, systemd and exclusive use of the
+shared 3090 — it can even be *refused* by the v5 guard itself if ollama is
+resident, which is the whole point of that guard. Task **4229** took the run,
+so the clause is retired rather than left to become permanent. What that turns
+back on is the strictness the widening had suspended: the artifact must carry a
+measured, non-empty consumer inventory, a `CLEAN` pollution state with no
+contradicting reason, and a cold *and* warm latency on every passing row.
+
+Two pins hold the set from both sides — it may not slide forward past the
+producer's version, and it may not quietly grow an older one. Re-introducing a
+grandfather clause therefore takes two lines in one reviewable diff: the
+version in the set, and a loosened `test_the_accepted_set_grandfathers_nothing`
+naming why that version is still acceptable evidence. Do not close a gap here
+by editing the artifact.
 
 ---
 
@@ -819,17 +945,28 @@ Every arm was started through the committed chain and probed with the committed
 health check. All four loaded under the vLLM pooling runner and returned a valid
 vector of their declared length:
 
-| arm | load | probe | resident VRAM | probe verdict |
-|---|---|---|---|---|
-| `granite-embedding-english-r2` | 123 s | 192 ms | 796 MiB | PASS |
-| `gte-modernbert-base` | 122 s | 286 ms | 788 MiB | PASS |
-| `qwen3-embedding-0.6b` | 143 s | 700 ms | ~~16603 MiB~~ **3584 MiB** | PASS |
-| `qwen3-embedding-4b` | 142 s | 580 ms | ~~16078 MiB~~ **10114 MiB** | PASS |
+| arm | load | probe (COLD, step 22) | probe (WARM, 2026-09-12) | resident VRAM | probe verdict |
+|---|---|---|---|---|---|
+| `granite-embedding-english-r2` | 123 s | 192 ms | **36.2 ms** | 796 MiB | PASS |
+| `gte-modernbert-base` | 122 s | 286 ms | **27.5 ms** | 788 MiB | PASS |
+| `qwen3-embedding-0.6b` | 143 s | 700 ms | **38.8 ms** | ~~16603 MiB~~ **3581 MiB** | PASS |
+| `qwen3-embedding-4b` | 142 s | 580 ms | **40.8 ms** | ~~16078 MiB~~ **10123 MiB** | PASS |
+
+The WARM column is read off the committed artifact, not off prose, so it moves
+only when a live slate re-measures it.
 
 Uniformity was the preferred outcome and measurement allowed it: one stack across
-all four removes a serving-stack confound from ι's query-latency comparison, so
-the latency column above is comparable as it stands. `fallback_stack: tei` stays
-in the manifest as the recorded fallback, unused.
+all four removes a serving-stack confound from ι's query-latency comparison.
+`fallback_stack: tei` stays in the manifest as the recorded fallback, unused.
+
+**Correction (task 3781).** This section previously concluded that "the latency
+column above is comparable as it stands". It was not. Removing the stack
+confound is necessary but nowhere near sufficient: the step-22 column was seven
+COLD single samples, and re-measuring warm collapsed a 192–700 ms spread to
+28–41 ms. Almost the entire apparent ranking was first-request load cost, not
+serving cost. Even the warm column is a **single sample per arm** and is **not**
+ζ's p95-under-load envelope metric (task **3719**) — ι must measure query
+latency under its own load, not inherit either column here.
 
 #### The resident-VRAM split is architectural, and it matters
 

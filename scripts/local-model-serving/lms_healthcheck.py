@@ -48,7 +48,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import lms_ctl
 import lms_vram
@@ -109,10 +109,38 @@ PROBE_TEXT = (
 #: entity keeps a defensible naming difference from failing an arm that worked.
 PROBE_KNOWN_ENTITIES = ('Leo', 'Dark Factory', 'Graphiti', 'FalkorDB')
 PROBE_MIN_ENTITIES = 3
+
+#: The passage sent on the DISCARDED warm-up run, and it must never be
+#: PROBE_TEXT (task 3781).
+#:
+#: The warm-up exists to make the measured probe ENGINE-warm — CUDA graphs
+#: captured, allocator settled, kernels autotuned, grammar compiled — while
+#: leaving it PREFIX-COLD, which is the state a production request actually
+#: arrives in.  Warming with the SAME text destroys the second half of that:
+#: a prefix cache reuses shared LEADING tokens, so an identical warm-up
+#: pre-populates precisely the cache the measured probe is supposed to miss.
+#: Measured 2026-08-06 on moe-stretch, llama.cpp served the warm run with 338
+#: of its 343 prompt tokens from cache — the measurement did not merely get
+#: blunted, it changed subject.
+#:
+#: PROBE_TEXT is placed FIRST in the user message, so a different passage
+#: diverges at the very first user token and only the ~25-token system message
+#: can stay cached.  Do not "simplify" this back to PROBE_TEXT.
+#:
+#: It carries no known-entity contract because its verdict is thrown away; all
+#: it owes is genuine novelty and a comparable shape and length.
+WARMUP_PROBE_TEXT = (
+    'Ada maintains Tidewater Press, a small publishing house whose catalogue '
+    'is indexed by Solstice, a full-text search engine running on SQLite.'
+)
+
 #: Embedding arms are probed with a QUERY, not a passage: the Qwen3-Embedding
 #: family's `query_prefix` is a query-side instruct prefix, so probing with a
 #: document would exercise the wrong half of an asymmetric model.
 EMBEDDING_PROBE_QUERY = 'Which graph database backs the memory layer?'
+#: The embedding axis's own warm-up text — distinct from EMBEDDING_PROBE_QUERY
+#: for exactly the reason WARMUP_PROBE_TEXT is distinct from PROBE_TEXT.
+WARMUP_EMBEDDING_QUERY = 'Which search engine indexes the printed catalogue?'
 EMBEDDING_TIMEOUT_S = 60.0
 #: Below this L2 norm a vector carries no direction, so cosine similarity
 #: against it is undefined and every retrieval score computed from it is noise.
@@ -225,12 +253,21 @@ class ProbeResult(BaseModel):
     #: to judge.  `None` where the question does not apply: an embedding arm, or
     #: an LLM response that never parsed.
     top_level_entities_named: int | None = None
+    #: How many of this request's prompt tokens the server served from its
+    #: prefix cache.  REPORTED, NON-GATING, and `None` wherever the question
+    #: does not apply or cannot be answered -- an embedding arm, a stack that
+    #: does not report it (vLLM sends `prompt_tokens_details: null`), or a body
+    #: this code cannot read.  See `_cached_prompt_tokens`.
+    cached_prompt_tokens: int | None = None
 
     def with_latency(self, latency_ms: float) -> ProbeResult:
         return self.model_copy(update={'latency_ms': round(latency_ms, 1)})
 
     def with_top_level(self, count: int) -> ProbeResult:
         return self.model_copy(update={'top_level_entities_named': count})
+
+    def with_cached_tokens(self, count: int | None) -> ProbeResult:
+        return self.model_copy(update={'cached_prompt_tokens': count})
 
 
 def _ok(detail: str = '') -> ProbeResult:
@@ -255,13 +292,19 @@ def _exc_detail(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_llm_probe_request(arm: ArmEntry) -> dict[str, Any]:
+def build_llm_probe_request(arm: ArmEntry, *, warmup: bool = False) -> dict[str, Any]:
     """The chat-completions body for *arm*.
 
     The schema is described IN THE PROMPT for every arm, not only the
     unconstrained one.  Keeping the prompt identical across arms means the
     only difference under measurement is the enforcement mechanism, which is
     the thing the eval is actually comparing.
+
+    `warmup=True` swaps in WARMUP_PROBE_TEXT and changes NOTHING else: same
+    system message, same schema-in-prompt, same temperature, max_tokens,
+    response_format and chat_template_kwargs.  The warm-up's job is to warm
+    the exact server path the measured probe will take, so any other
+    difference would warm the wrong one.  Defaults to the measured probe.
     """
     if arm.axis != 'llm':
         raise HealthcheckError(
@@ -275,6 +318,7 @@ def build_llm_probe_request(arm: ArmEntry) -> dict[str, Any]:
         )
 
     schema = ProbeExtraction.model_json_schema()
+    text = WARMUP_PROBE_TEXT if warmup else PROBE_TEXT
     body: dict[str, Any] = {
         'model': arm.served_model_name,
         'messages': [
@@ -288,7 +332,7 @@ def build_llm_probe_request(arm: ArmEntry) -> dict[str, Any]:
             {
                 'role': 'user',
                 'content': (
-                    f'{PROBE_TEXT}\n\nExtract the entities. Reply with one JSON '
+                    f'{text}\n\nExtract the entities. Reply with one JSON '
                     f'object conforming to this schema:\n{json.dumps(schema)}'
                 ),
             },
@@ -413,6 +457,36 @@ def _known_entities_found(
         known for known in PROBE_KNOWN_ENTITIES
         if any(candidate and _norm(known) in candidate for candidate in haystack)
     ]
+
+
+def _cached_prompt_tokens(body: Any) -> int | None:
+    """How many prompt tokens the server says it served from its prefix cache.
+
+    The only DIRECT evidence in the artifact that the measured probe found the
+    prefix cache cold -- the claim the cold/warm split rests on.  On llama.cpp
+    a near-zero count proves it (measured 2026-08-06, a same-prompt warm run on
+    moe-stretch showed 338 of 343 cached).  vLLM sends
+    `prompt_tokens_details: null`, so on that stack the claim rests on latency
+    alone, and this returns None rather than pretending otherwise.
+
+    Read with the same defensive isinstance ladder `_extract_content` and
+    `_was_truncated` use: anything unreadable is None, never an exception.  A
+    diagnostic that could abort a sweep would be worse than no diagnostic.
+    `bool` is rejected explicitly -- `isinstance(True, int)` is True in Python,
+    the same hole `verify_embedding_response` closes for vector values.
+    """
+    if not isinstance(body, dict):
+        return None
+    usage = body.get('usage')
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get('prompt_tokens_details')
+    if not isinstance(details, dict):
+        return None
+    cached = details.get('cached_tokens')
+    if isinstance(cached, bool) or not isinstance(cached, int):
+        return None
+    return cached
 
 
 def _was_truncated(body: Any) -> bool:
@@ -590,7 +664,9 @@ def check_model_identity(arm: ArmEntry, models_body: Any) -> ProbeResult:
 # ---------------------------------------------------------------------------
 
 
-def build_embedding_probe_request(arm: ArmEntry) -> dict[str, Any]:
+def build_embedding_probe_request(
+    arm: ArmEntry, *, warmup: bool = False
+) -> dict[str, Any]:
     """The `/v1/embeddings` body for *arm*, with its declared prefix applied.
 
     The prefix lives in the manifest precisely so it cannot be forgotten at a
@@ -599,6 +675,11 @@ def build_embedding_probe_request(arm: ArmEntry) -> dict[str, Any]:
     vector that is simply worse.  That degradation is invisible to every check
     except a side-by-side retrieval comparison — which is exactly what iota
     runs, and exactly what it would then mis-attribute to the model.
+
+    `warmup=True` swaps in WARMUP_EMBEDDING_QUERY and changes nothing else —
+    the declared prefix is applied EITHER way, because an unprefixed warm-up
+    would warm the document side of an asymmetric model rather than the query
+    side the measured probe takes.
     """
     if arm.axis != 'embedding':
         raise HealthcheckError(
@@ -606,7 +687,8 @@ def build_embedding_probe_request(arm: ArmEntry) -> dict[str, Any]:
             'not apply. Use build_llm_probe_request for the LLM axis.'
         )
 
-    text = f'{arm.query_prefix or ""}{EMBEDDING_PROBE_QUERY}'
+    query = WARMUP_EMBEDDING_QUERY if warmup else EMBEDDING_PROBE_QUERY
+    text = f'{arm.query_prefix or ""}{query}'
     return {
         'model': arm.served_model_name,
         'input': [text],
@@ -740,17 +822,27 @@ def _probe(
     A traceback out of here would abort the whole sweep on the first dead arm
     and lose the verdicts already measured for the others — the report would
     then be both incomplete AND silent about being incomplete.
+
+    The MEASURED clock starts after the identity gate, so `latency_ms` times the
+    model's own request and nothing else.  Up to task 3781's amendment pass it
+    started before the gate and silently included a `GET /v1/models` round trip:
+    tolerable while the column was an undifferentiated cold number, wrong now
+    that the warm embedding truth is 41-56 ms and a loopback GET is a
+    double-digit percentage of it.  The FAIL path below keeps the pre-gate
+    clock, because there the elapsed time IS the gate.
     """
     import httpx  # lazy: keeps import cost off every consumer of this module
+
+    gate_started = time.monotonic()
+
+    identity = _identity_gate(arm, httpx)
+    if identity.verdict == 'FAIL':
+        return identity.with_latency((time.monotonic() - gate_started) * 1000.0)
 
     started = time.monotonic()
 
     def elapsed_ms() -> float:
         return (time.monotonic() - started) * 1000.0
-
-    identity = _identity_gate(arm, httpx)
-    if identity.verdict == 'FAIL':
-        return identity.with_latency(elapsed_ms())
 
     try:
         response = httpx.post(f'{arm.base_url}{path}', json=request, timeout=timeout_s)
@@ -771,7 +863,11 @@ def _probe(
             Reason.MALFORMED_RESPONSE, f'POST {path}: {_exc_detail(exc)}'
         ).with_latency(elapsed_ms())
 
-    return verify(arm, body).with_latency(elapsed_ms())
+    # The success path is the only place the parsed body is in hand, so the
+    # cache diagnostic is attached here.  It never touches the verdict.
+    return verify(arm, body).with_latency(elapsed_ms()).with_cached_tokens(
+        _cached_prompt_tokens(body)
+    )
 
 
 def _placeholder_refusal(arm: ArmEntry) -> ProbeResult | None:
@@ -792,8 +888,15 @@ def _placeholder_refusal(arm: ArmEntry) -> ProbeResult | None:
     )
 
 
-def probe_llm_arm(arm: ArmEntry) -> ProbeResult:
-    """Probe one LLM arm end to end: identity, then a constrained completion."""
+def probe_llm_arm(arm: ArmEntry, *, warmup: bool = False) -> ProbeResult:
+    """Probe one LLM arm end to end: identity, then a constrained completion.
+
+    Still exactly ONE request either way.  The cold/warm PAIRING lives in
+    `run_healthcheck`, which is the only layer that owns it; `warmup` here just
+    carries the different prompt to the wire.
+    """
+    # BEFORE any request, warm-up included: probing a literal `TBD-Q3` model id
+    # would 404 and record an unresolved PRD Open Question as a transport error.
     refusal = _placeholder_refusal(arm)
     if refusal is not None:
         return refusal
@@ -801,13 +904,13 @@ def probe_llm_arm(arm: ArmEntry) -> ProbeResult:
     return _probe(
         arm,
         path='/v1/chat/completions',
-        request=build_llm_probe_request(arm),
+        request=build_llm_probe_request(arm, warmup=warmup),
         timeout_s=COMPLETION_TIMEOUT_S,
         verify=verify_llm_response,
     )
 
 
-def probe_embedding_arm(arm: ArmEntry) -> ProbeResult:
+def probe_embedding_arm(arm: ArmEntry, *, warmup: bool = False) -> ProbeResult:
     """Probe one embedding arm end to end: identity, then a real vector."""
     refusal = _placeholder_refusal(arm)
     if refusal is not None:
@@ -816,17 +919,31 @@ def probe_embedding_arm(arm: ArmEntry) -> ProbeResult:
     return _probe(
         arm,
         path='/v1/embeddings',
-        request=build_embedding_probe_request(arm),
+        request=build_embedding_probe_request(arm, warmup=warmup),
         timeout_s=EMBEDDING_TIMEOUT_S,
         verify=verify_embedding_response,
     )
 
 
-def probe_arm(arm: ArmEntry) -> ProbeResult:
+def probe_arm(arm: ArmEntry, *, warmup: bool = False) -> ProbeResult:
     """Dispatch one arm to its axis's probe."""
     if arm.axis == 'embedding':
-        return probe_embedding_arm(arm)
-    return probe_llm_arm(arm)
+        return probe_embedding_arm(arm, warmup=warmup)
+    return probe_llm_arm(arm, warmup=warmup)
+
+
+class ArmProber(Protocol):
+    """What `run_healthcheck`'s injectable `probe` must accept.
+
+    A named Protocol rather than a bare `Callable[..., ProbeResult]`: `...`
+    accepts literally any callable, so a prober missing the keyword-only
+    `warmup` would type-check and then blow up at the first call.
+    `run_healthcheck` invokes it BOTH ways -- `probe_one(arm, warmup=True)` for
+    the discarded warm-up and `probe_one(arm)` for the measured run -- so that
+    is exactly the contract worth keeping checkable.
+    """
+
+    def __call__(self, arm: ArmEntry, *, warmup: bool = False) -> ProbeResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -858,7 +975,26 @@ def probe_arm(arm: ArmEntry) -> ProbeResult:
 #: the two readings; up to v4 nothing recorded whether that held, so a slate run
 #: with ollama resident (measured 2026-08-06: 10314 MiB on keep_alive) produced
 #: an artifact indistinguishable from a clean one.
-REPORT_SCHEMA_VERSION = 5
+#: v6 (2026-09-12, task 3781, renumbered under task 4229): the latency column
+#: split.  Rows gained `first_probe_ms` (the DISCARDED engine-cold warm-up),
+#: the optional `repeat_latencies_ms` spread behind `--repeat N`, and the
+#: `measured_cached_prompt_tokens` diagnostic; the report gained
+#: `latency_caveat`.  Most of all, `latency_ms` CHANGED MEANING: up to v5 it
+#: was the first request after the arm reached ready — engine-cold AND
+#: prefix-cold — and from v6 it is the engine-warm, PREFIX-COLD measured run,
+#: which is the state a production request arrives in.  A consumer holding a
+#: v5-or-older file must REFUSE it rather than reinterpret the same field name
+#: as the same quantity; that refusal is the whole reason this number exists.
+#:
+#: WHY 6 AND NOT 5.  This change was authored as v5 on branch task/3781 while
+#: task 3755 was independently landing its OWN v5 on main — two meanings for
+#: one integer, which git auto-merges with no conflict marker because the
+#: literal is textually identical.  Leo ruled the renumber on 2026-08-25
+#: (esc-4730-1, carried in task 4229): bump to 6 and take ONE live 7-arm slate
+#: run against the merged producer, so the artifact carries 3755's consumer
+#: inventory and 3781's cold/warm split together rather than paying for two
+#: exclusive-GPU runs.
+REPORT_SCHEMA_VERSION = 6
 
 #: Appended to a POLLUTED block's reason.  The observation alone is not enough:
 #: `arm_footprint_mib` is the headline number of this very block, and a reader
@@ -886,6 +1022,22 @@ POLLUTED_BANNER_BODY = (
 #: The delivered-check literal for task 3713.  Spelled once, here, and carried
 #: into the JSON artifact as a field.
 PRD_MARKER = 'PRD-MARKER:local-memory-models-eval serving'
+
+#: What these latencies are NOT.  Spelled ONCE and carried into the artifact,
+#: the rendered table and the README, so those three cannot drift into three
+#: different caveats.
+#:
+#: This sentence is the load-bearing half of task 3781: a corrected number
+#: without it re-creates exactly the false comparability the correction was for
+#: — seven single samples in one column read as a ranking whether or not they
+#: are one.
+LATENCY_CAVEAT = (
+    'Latency here is a SINGLE-SAMPLE health-probe measurement taken with the '
+    'engine warm and the prefix cache COLD (one discarded warm-up on a '
+    'different prompt precedes it). It is NOT the p95-under-load envelope '
+    'metric (task 3719 zeta; PRD episode-latency-p50/p95 under concurrent '
+    'load), and it must not be used to rank arms against one another.'
+)
 
 EXIT_OK = 0
 #: At least one arm answered wrongly, or not at all.
@@ -946,7 +1098,27 @@ class ArmRow(BaseModel):
     verdict: Verdict
     reason: Reason
     detail: str
+    #: The MEASURED probe: engine-warm and prefix-COLD, which is the state a
+    #: production request arrives in.  It CHANGED MEANING in schema v5 -- up to
+    #: v4 this was the first request after the arm reached ready, i.e. the cold
+    #: number now carried in `first_probe_ms`.
     latency_ms: float
+    #: The DISCARDED engine-cold warm-up run, kept rather than thrown away
+    #: because discarding the number would hide the very penalty this
+    #: instrument exists to expose.  In the committed 2026-08-16 slate the
+    #: embedding axis carries it plainly: qwen3-embedding-0.6b 604.7 ms cold
+    #: against 44.7 ms warm (~14x), gte-modernbert 156.9 against 41.4.
+    #:
+    #: Cold is NOT reliably greater than warm and no check asserts it is.  The
+    #: live counter-example is in that same artifact: phi-4-14b measured
+    #: 1893.3 ms cold against 2241.2 ms warm (2026-08-16), a generation-dominated
+    #: arm where the load cost is a rounding error against the generation itself
+    #: and the ordering sits inside the noise.
+    #:
+    #: The DEFAULT is load-bearing, not incidental -- it is what lets a report
+    #: written by an older producer still validate through this model, the same
+    #: role `top_level_entities_named`'s default plays.
+    first_probe_ms: float = 0.0
     #: When THIS row was measured.  The merged artifact spans one run per arm,
     #: so a single top-level `measured_at` cannot say when any given arm was up.
     measured_at: str
@@ -962,6 +1134,37 @@ class ArmRow(BaseModel):
     #: Known entities promoted to TOP-LEVEL entities.  Reported, non-gating —
     #: see ProbeResult.  `None` for an embedding arm or an unparseable response.
     top_level_entities_named: int | None = None
+    #: Prompt tokens the MEASURED probe was served from the prefix cache.  The
+    #: warm-up's own count is not recorded and would be meaningless: the warm-up
+    #: is the run that DIRTIES the cache, not the one being judged.
+    #:
+    #: The artifact's only direct evidence that the measured probe found the
+    #: prefix COLD, which is the claim the whole cold/warm split rests on.
+    #: Reported, non-gating -- exactly like `top_level_entities_named`, it must
+    #: never decide a verdict.
+    #:
+    #: `None` means THE STACK DECLINED TO ANSWER, on either axis: vLLM sends
+    #: `prompt_tokens_details: null`, so on that stack the split rests on
+    #: latency alone.  It is deliberately NOT suppressed by axis -- an embedding
+    #: server that does report `usage.prompt_tokens_details.cached_tokens` is
+    #: answering the same question about the same prefix cache, and dropping
+    #: that answer would delete the only direct evidence for that row's split.
+    #: Every embedding arm on the committed slate is vLLM, which is why they all
+    #: read `null` there.
+    measured_cached_prompt_tokens: int | None = None
+    #: Every measured sample when `--repeat N` was asked for, `None` otherwise
+    #: -- "the question was not asked" and "a spread of one" are different
+    #: statements, the same distinction `top_level_entities_named` draws.
+    #:
+    #: Samples after the FIRST are PREFIX-CACHE WARM and therefore measure
+    #: generation with prompt processing largely free: the first measured probe
+    #: populates the cache the rest are served from.  Measured 2026-08-06 on
+    #: moe-stretch, a repeat was served 338 of its 343 prompt tokens from cache,
+    #: and the cache state even changed the OUTPUT at temperature 0 (276
+    #: completion tokens cold-cache against 236 warm).  Repeated identical
+    #: probes are NOT independent samples -- which is why `latency_ms` stays
+    #: pinned to `repeat_latencies_ms[0]`, the only prefix-cold one.
+    repeat_latencies_ms: list[float] | None = None
 
 
 class VramBlock(BaseModel):
@@ -1046,6 +1249,11 @@ class HealthReport(BaseModel):
     #: comments.  `test_lms_marker_contract.py` enumerates committed files; this
     #: is how the artifact satisfies the same grep the source files do.
     prd_marker: str = PRD_MARKER
+    #: What the latency columns are NOT — a real FIELD for the very same reason
+    #: `prd_marker` is one: JSON carries no comments, and the consumers that
+    #: would be misled by these numbers (eta 3720, theta 3721) read this
+    #: artifact, not the README the caveat would otherwise live in alone.
+    latency_caveat: str = LATENCY_CAVEAT
 
 
 def _now_iso() -> str:
@@ -1058,8 +1266,9 @@ def _now_iso() -> str:
 def run_healthcheck(
     arms: Sequence[ArmEntry],
     gpu_probe: Callable[[], lms_vram.GpuSnapshot] | None = None,
-    probe: Callable[[ArmEntry], ProbeResult] | None = None,
+    probe: ArmProber | None = None,
     baseline: lms_vram.GpuBaseline | None = None,
+    repeat: int = 1,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
 
@@ -1083,7 +1292,26 @@ def run_healthcheck(
     Individual arm failures, by contrast, are recorded and the sweep continues:
     aborting on the first dead arm would drop verdicts already measured for the
     others and leave the report silently short of rows.
+
+    Each arm is probed TWICE (task 3781): a discarded warm-up, then the run
+    that is actually measured.  See the per-arm loop for why the pairing lives
+    here rather than inside `probe_arm`.
+
+    `repeat > 1` fires the MEASURED probe that many times and records every
+    latency, still behind exactly one warm-up.  It is observability only: the
+    first measured result alone supplies the verdict, so no number of repeats
+    can turn a row green.
     """
+    if repeat < 1:
+        # A caller error, never an arm failure -- recording it as a FAIL would
+        # blame the model for the harness, which this module's exception
+        # contract exists to prevent.
+        raise HealthcheckError(
+            f'repeat={repeat} would probe each arm zero times, producing a '
+            'report with no measurement in it that still reads as a completed '
+            'run'
+        )
+
     read_gpu = gpu_probe if gpu_probe is not None else lms_vram.probe_gpu_snapshot
     probe_one = probe if probe is not None else probe_arm
 
@@ -1144,7 +1372,31 @@ def run_healthcheck(
     measured_at = _now_iso()
     rows: list[ArmRow] = []
     for arm in arms:
-        result = probe_one(arm)
+        # The PAIRING lives here, not in `probe_arm`, because `run_healthcheck`
+        # is the only layer that owns it: it is what assembles the ArmRow where
+        # both numbers land.  Keeping `probe_llm_arm`/`probe_embedding_arm`
+        # single-request also keeps every direct-probe test in this suite
+        # measuring exactly one thing.
+        #
+        # The warm-up's VERDICT is discarded outright -- see the two tests that
+        # pin it in both directions.  A failing warm-up must not fail a healthy
+        # arm, and a passing one must not launder a broken one.
+        #
+        # COST, ACCEPTED DELIBERATELY: a hung arm now burns up to
+        # (1 + repeat) x COMPLETION_TIMEOUT_S -- 360 s at the default repeat=1,
+        # rather than 180 s, and 33 min at `--repeat 10`, since `--repeat` is
+        # the knob that actually scales this ceiling.  A genuinely dead arm
+        # still refuses fast at `_identity_gate`, so the raised ceiling is paid
+        # only by a pathologically slow one -- which is cheaper than a latency
+        # column that lies about every healthy arm.
+        warmup = probe_one(arm, warmup=True)
+        # ONE warm-up regardless of `repeat`: the engine is warm after the
+        # first request, so re-warming would spend GPU time to learn nothing.
+        samples = [probe_one(arm) for _ in range(repeat)]
+        # The FIRST measured sample alone adjudicates.  It is also the only
+        # prefix-cold one, so it is the only sample comparable with a
+        # single-shot run.
+        result = samples[0]
         rows.append(
             ArmRow(
                 arm_id=arm.arm_id,
@@ -1156,10 +1408,17 @@ def run_healthcheck(
                 reason=result.reason,
                 detail=result.detail,
                 latency_ms=result.latency_ms,
+                # The warm-up's LATENCY is kept even though its verdict is not:
+                # the number is the whole point of firing it in the open.
+                first_probe_ms=warmup.latency_ms,
                 measured_at=measured_at,
                 arm_footprint_mib=budget.arm_footprint_mib,
                 reasoning=arm.reasoning,
                 top_level_entities_named=result.top_level_entities_named,
+                measured_cached_prompt_tokens=result.cached_prompt_tokens,
+                repeat_latencies_ms=(
+                    [s.latency_ms for s in samples] if repeat > 1 else None
+                ),
             )
         )
 
@@ -1297,6 +1556,25 @@ def merge_reports(
             'describe different report shapes and cannot be combined'
         )
 
+    stale = sorted(v for v in versions if v != REPORT_SCHEMA_VERSION)
+    if stale:
+        # Refusing DISAGREEMENT alone was not enough: a set of uniformly-stale
+        # parts agreed with itself and merged cleanly, emitting
+        # `schema_version=4` while pydantic silently synthesised this producer's
+        # defaults for `first_probe_ms` (0.0) and `latency_caveat`.  The result
+        # asserted its latencies were taken "with the engine warm and the prefix
+        # cache COLD" over numbers that were in fact pre-3781 cold single
+        # samples -- the exact reinterpretation REPORT_SCHEMA_VERSION's contract
+        # tells a consumer to refuse, and it made the `latency_caveat` carried
+        # from the binding input vacuous for precisely the case it names.
+        raise ReportMergeError(
+            f'reports carry stale schema versions {stale}; this producer writes '
+            f'v{REPORT_SCHEMA_VERSION}, and `latency_ms` changed meaning at v5 '
+            '(cold first probe -> engine-warm, prefix-cold measured run). '
+            'Merging them would restate old numbers under the current shape '
+            'and under a caveat no input ever made. Re-measure the arms'
+        )
+
     gpus = {(r.gpu.name, r.gpu.driver_version, r.gpu.total_mib) for r in reports}
     if len(gpus) > 1:
         raise ReportMergeError(
@@ -1389,6 +1667,10 @@ def merge_reports(
             'pollution_reason': merged_reason,
         }),
         overall='PASS' if everything_passed else 'FAIL',
+        # Carried from the BINDING input rather than re-defaulted, for the same
+        # reason the vram block is: a merged artifact must not state a caveat
+        # that no input it was assembled from ever made.
+        latency_caveat=binding.latency_caveat,
     )
 
 
@@ -1449,6 +1731,18 @@ def _consumer_lines(label: str, consumers: Sequence[lms_vram.GpuConsumer]) -> li
     ]
 
 
+def _ms_cell(row: ArmRow) -> str:
+    """The measured latency, with the `--repeat` spread appended when asked
+    for.  The spread is shown BESIDE the headline number, never instead of it:
+    only the first sample is prefix-cold, so the range is context, not a
+    better estimate."""
+    head = f'{row.latency_ms:.0f}'
+    spread = row.repeat_latencies_ms
+    if not spread:
+        return head
+    return f'{head} [{min(spread):.0f}-{max(spread):.0f}]'
+
+
 def render_table(report: HealthReport) -> str:
     """Render the report for a human.
 
@@ -1458,7 +1752,12 @@ def render_table(report: HealthReport) -> str:
     the block's own `pollution` field, never re-derived from the consumer lists
     printed beside it, so the two cannot drift apart.
     """
-    headers = ('ARM', 'AXIS', 'STACK', 'ENDPOINT', 'VERDICT', 'REASON', 'MS')
+    # COLD-MS and MS are separate columns on purpose.  An operator reading ONE
+    # millisecond column re-creates in the terminal exactly the false
+    # comparability the artifact was just corrected to avoid.
+    headers = (
+        'ARM', 'AXIS', 'STACK', 'ENDPOINT', 'VERDICT', 'REASON', 'COLD-MS', 'MS',
+    )
     rows = [
         (
             row.arm_id,
@@ -1467,7 +1766,8 @@ def render_table(report: HealthReport) -> str:
             row.endpoint,
             row.verdict,
             str(row.reason),
-            f'{row.latency_ms:.0f}',
+            f'{row.first_probe_ms:.0f}',
+            _ms_cell(row),
         )
         for row in report.arms
     ]
@@ -1515,7 +1815,17 @@ def render_table(report: HealthReport) -> str:
     if report.vram.consumer_inventory_note:
         out.extend(_wrapped(report.vram.consumer_inventory_note))
 
-    out.extend(['', f'OVERALL: {report.overall}'])
+    out.extend(
+        [
+            '',
+            # One line, never wrapped: the table's readers are the ones most
+            # likely to line these numbers up against each other.
+            f'COLD-MS is the DISCARDED warm-up, MS the measured run. '
+            f'{LATENCY_CAVEAT}',
+            '',
+            f'OVERALL: {report.overall}',
+        ]
+    )
     for row in report.arms:
         if row.verdict == 'FAIL':
             out.append(f'  {row.arm_id}: {row.reason} — {row.detail}')
@@ -1547,6 +1857,21 @@ def _write_report(report: HealthReport, output: str | None) -> None:
     print(f'\nwrote {out_path}')
 
 
+def _positive_int(raw: str) -> int:
+    """argparse `type` for --repeat.  Rejected at PARSE time, not later, so
+    `--repeat 0` never reaches a sweep that would write a measurement-free
+    report reading as a completed run."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{raw!r} is not an integer') from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f'{value} would probe each arm zero times; N must be at least 1'
+        )
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog='lms_healthcheck',
@@ -1564,7 +1889,31 @@ def main(argv: list[str] | None = None) -> int:
         help='combine per-arm JSON reports into one slate artifact',
     )
     parser.add_argument('--output', help='write the JSON report to this path')
+    # Deliberately OUTSIDE the selector group: it is not a way of choosing arms
+    # and must compose with every MEASUREMENT selector (--all/--arm/--active).
+    # It does NOT compose with --merge, which measures nothing; that pairing is
+    # rejected below rather than silently ignored.
+    parser.add_argument(
+        '--repeat', type=_positive_int, default=1, metavar='N',
+        help=(
+            'fire the measured probe N times per arm (one warm-up regardless) '
+            'and record every latency. Observability only — the first sample '
+            'alone decides the verdict, and samples after it are '
+            'prefix-cache WARM, so they are not independent measurements. '
+            'Applies to the measurement selectors (--all/--arm/--active) only, '
+            'not to --merge'
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.merge and args.repeat != 1:
+        # An explicit refusal, not a silently-dropped flag: `--repeat 5 --merge`
+        # otherwise exits 0 having done nothing of what was asked, and the
+        # operator's next move is to trust a spread that was never measured.
+        parser.error(
+            '--repeat measures; --merge assembles already-measured parts. '
+            'Re-run the arms with --repeat, then merge the parts it wrote'
+        )
 
     if args.merge:
         try:
@@ -1607,7 +1956,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_NO_ACTIVE_ARMS
 
     try:
-        report = run_healthcheck(arms)
+        report = run_healthcheck(arms, repeat=args.repeat)
     except (lms_vram.PollutedBaselineError, lms_vram.PollutedMeasurementError) as exc:
         # BEFORE the VramProbeError branch below, which they subclass.  In the
         # other order this refusal would be reported as "the GPU probe failed"
