@@ -21,7 +21,7 @@ from typing import TypeGuard, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, raises
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore
@@ -339,6 +339,31 @@ class _RecordingEventStore(EventStore):
         return [e['data'][name] for e in self.emitted if name in e['data']]
 
 
+async def _init_merge_wt_with_change(merge_wt, filename='src/x.py'):
+    """A real checkout whose HEAD is one commit of *filename* ahead of main.
+
+    ``_derive_task_files_from_git`` shells out to ``git diff main...HEAD`` in
+    the merge worktree it is handed, so the real derivation runs against a
+    real checkout — nothing has to stand in for it.
+    """
+    from orchestrator.git_ops import _run
+
+    merge_wt.mkdir(parents=True, exist_ok=True)
+    await _run(['git', 'init', '-b', 'main'], cwd=merge_wt)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=merge_wt)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=merge_wt)
+    (merge_wt / 'README.md').write_text('# test\n')
+    await _run(['git', 'add', '-A'], cwd=merge_wt)
+    await _run(['git', 'commit', '-m', 'initial'], cwd=merge_wt)
+    await _run(['git', 'checkout', '-b', 'task/42'], cwd=merge_wt)
+    changed = merge_wt / filename
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text('x = 1\n')
+    await _run(['git', 'add', '-A'], cwd=merge_wt)
+    await _run(['git', 'commit', '-m', f'add {filename}'], cwd=merge_wt)
+    return merge_wt
+
+
 def _runner_double(name, *, is_local, result=None, error=None):
     """A verify host that reports *result*, or raises *error* when dispatched.
 
@@ -356,6 +381,22 @@ def _runner_double(name, *, is_local, result=None, error=None):
     else:
         runner.run_merge_verify = AsyncMock(return_value=result or _make_pass_result())
     return runner
+
+
+class _BodyVerifier(FakeVerifier):
+    """``FakeVerifier`` whose scoped verify runs an arbitrary async *body*.
+
+    The LOCAL lease path verifies through the port (the pool wraps
+    ``verifier.run_scoped`` in its LocalRunner), so this is the local-lease
+    counterpart of a runner double with a hand-written dispatch.
+    """
+
+    def __init__(self, body):
+        super().__init__()
+        self.body = body
+
+    async def run_scoped(self, worktree, config, module_configs, task_files=None, **options):
+        return await self.body(worktree, config, module_configs, task_files, **options)
 
 
 class _TwoHostAllocator:
@@ -402,37 +443,22 @@ class TestRunPostMergeVerifyPoolWiring:
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_git_ops_mock()
+        es = _RecordingEventStore()
 
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
-
-        emitted = []
-        from orchestrator.event_store import EventStore
-
-        class FakeEventStore(EventStore):
-            def __init__(self):
-                object.__init__(self)
-
-            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
-                emitted.append({'event_type': event_type, 'data': data or {}})
-
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=FakeEventStore(),
-                merge_sha='abc123',
-                verifier=FakeVerifier(),
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,
+            merge_sha='abc123',
+            verifier=FakeVerifier(),
+        )
 
         assert outcome is None  # verify passed
-        merge_verify_events = [e for e in emitted if hasattr(e['event_type'], 'value') and e['event_type'].value == 'merge_verify']
-        assert len(merge_verify_events) >= 1
-        # β decision 6: local-only pool — remote never dispatched directly
-        assert merge_verify_events[0]['data']['runner'] == 'local'
+        assert 'merge_verify' in es.types()
+        # β decision 6: local-only pool — a configured remote is never in it,
+        # and the pool would have PREFERRED it if it were.
+        assert es.field('runner') == ['local']
 
     async def test_dispatching_host_derives_task_files_when_enabled_runners(self, tmp_path):
         """With enabled runner + task_files=None, derivation runs on dispatching host."""
@@ -441,27 +467,22 @@ class TestRunPostMergeVerifyPoolWiring:
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=None, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
-
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+        # A real merge worktree, one commit of src/x.py ahead of main: the
+        # REAL derivation runs `git diff main...HEAD` here and finds it.
+        merge_wt = await _init_merge_wt_with_change(tmp_path / 'merge-wt')
 
         # The derived scope is observed where it LANDS -- the scope the verify
         # was actually asked to run -- rather than on the spec builder that
         # computes it.
         verifier = _RecordingVerifier()
 
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
-             patch('orchestrator.merge_queue._derive_task_files_from_git',
-                   new=AsyncMock(return_value=['src/x.py'])):
-            await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                merge_sha='abc123',
-                verifier=verifier,
-            )
+        await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            verifier=verifier,
+        )
 
         assert len(verifier.scoped_calls) >= 1
         # The tuple is what the spec carried, unchanged -- the assertion the
@@ -477,28 +498,25 @@ class TestRunPostMergeVerifyPoolWiring:
         req = _make_merge_request(config, task_files=None, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
 
-        # Track proactive calls to _derive_task_files_from_git from _run_post_merge_verify.
-        # We patch run_scoped_verification so the local runner doesn't actually run verify
-        # (which would also call _derive internally), isolating the upstream derivation.
-        derive_mock = AsyncMock(return_value=['src/x.py'])
+        # A real merge worktree one commit ahead of main: the derivation WOULD
+        # find src/x.py here, so an unscoped verify is only explicable by the
+        # Lever C gate holding.
+        merge_wt = await _init_merge_wt_with_change(tmp_path / 'merge-wt')
 
         verifier = _RecordingVerifier()
 
-        with patch('orchestrator.merge_queue._derive_task_files_from_git',
-                   new=derive_mock):
-            await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                merge_sha='abc123',
-                verifier=verifier,
-            )
+        await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            verifier=verifier,
+        )
 
-        # The proactive derivation must NOT have been called when Lever C is off
-        derive_mock.assert_not_called()
         # The verify must have been asked for the UNSCOPED run (task_files=None
         # -- the byte-identical local-only path), which is the observable the
-        # spec's task_files argument existed to prove.
+        # spec's task_files argument existed to prove, and which a proactive
+        # derivation on this checkout would have replaced with ('src/x.py',).
         assert verifier.scoped_calls[0]['task_files'] is None
 
 
@@ -628,42 +646,23 @@ class TestRunPostMergeVerifyLocalOnly:
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_git_ops_mock()
+        es = _RecordingEventStore()
 
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
-
-        emitted = []
-        from orchestrator.event_store import EventStore
-
-        class FakeEventStore(EventStore):
-            def __init__(self):
-                object.__init__(self)
-
-            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
-                emitted.append({'event_type': event_type, 'data': data or {}})
-
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, tmp_path,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                event_store=FakeEventStore(),
-                merge_sha='abc123',
-                verifier=FakeVerifier(),
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=es,
+            merge_sha='abc123',
+            verifier=FakeVerifier(),
+        )
 
         assert outcome is None  # verify passed
-        merge_verify_events = [
-            e for e in emitted
-            if hasattr(e['event_type'], 'value') and e['event_type'].value == 'merge_verify'
-        ]
-        assert len(merge_verify_events) >= 1
+        assert 'merge_verify' in es.types()
         # β decision 6: must be 'local', NOT 'laptop'
-        assert merge_verify_events[0]['data']['runner'] == 'local', (
+        assert es.field('runner') == ['local'], (
             "β: _run_post_merge_verify must dispatch to 'local' even when verify_runners is set "
-            f"(got: {merge_verify_events[0]['data']['runner']!r})"
+            f"(got: {es.field('runner')!r})"
         )
 
 
@@ -1456,7 +1455,9 @@ class TestRunInflightVerifyRunnerUnavailableReason:
 
         git_ops = _make_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=q, verifier=FakeVerifier(),
+        )
 
         # Minimal RealMergeItem: only the fields asserted in _run_inflight_verify
         merge_wt_path = tmp_path / 'merge-wt'
@@ -1474,18 +1475,16 @@ class TestRunInflightVerifyRunnerUnavailableReason:
             speculative=False,
         )
 
-        # REMOTE lease — bypasses local warm-swap path
-        fake_runner = MagicMock()
-        fake_runner.name = 'leo-laptop'
-        fake_runner.is_local = False
+        # REMOTE lease whose host is genuinely unreachable: a remote-lease
+        # dispatch builds a single-runner pool, so the RunnerUnavailable the
+        # runner raises propagates through the real verify path exactly as a
+        # dead laptop does in production — no module attribute substituted.
+        fake_runner = _runner_double(
+            'leo-laptop', is_local=False, error=RunnerUnavailable(error_msg),
+        )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
 
-        # Patch _run_post_merge_verify to raise RunnerUnavailable immediately
-        async def _raise_unavailable(*args, **kwargs):
-            raise RunnerUnavailable(error_msg)
-
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
-            result = await worker._run_inflight_verify(item, lease)
+        result = await worker._run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         # RED: reason is None until step-4 adds `except RunnerUnavailable as exc:` + reason=str(exc)
@@ -1559,7 +1558,16 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         # seeded lane.  Everything downstream of it is the real code path.
         git_ops.acquire_spec_lane = AsyncMock(return_value=(lane, True))
         q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        # A LOCAL lease verifies through the injected port (the pool wraps
+        # verifier.run_scoped in its LocalRunner), so scripting the port to
+        # raise is how a local-lease RU is reached without substituting
+        # _run_post_merge_verify.
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=q,
+            verifier=FakeVerifier(default=raises(
+                RunnerUnavailable('INV-2 contract-currency sync failed')
+            )),
+        )
 
         config = OrchestratorConfig(
             git=GitConfig(main_branch='main', merge_spec_warm_lane_pool=True),
@@ -1569,16 +1577,10 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         assert config.git.persistent_merge_worktree_safety_valve_every_n == 0
         item = self._make_item(tmp_path, cold_wt, config=config, speculative=True)
 
-        fake_local = MagicMock()
-        fake_local.name = 'local'
-        fake_local.is_local = True
+        fake_local = _runner_double('local', is_local=True)
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        async def _raise_unavailable(*args, **kwargs):
-            raise RunnerUnavailable('INV-2 contract-currency sync failed')
-
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
-            result = await worker._run_inflight_verify(item, lease)
+        result = await worker._run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.merge_wt == lane, 'the warm lane is the worktree handed to the chokepoint'
@@ -1600,22 +1602,20 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
 
         git_ops = _make_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=q, verifier=FakeVerifier(),
+        )
 
         cold_wt = tmp_path / '_merge-cold'
         cold_wt.mkdir()
         item = self._make_item(tmp_path, cold_wt)
 
-        fake_runner = MagicMock()
-        fake_runner.name = 'leo-laptop'
-        fake_runner.is_local = False
+        fake_runner = _runner_double(
+            'leo-laptop', is_local=False, error=RunnerUnavailable('ssh spawn failed'),
+        )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
 
-        async def _raise_unavailable(*args, **kwargs):
-            raise RunnerUnavailable('ssh spawn failed')
-
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
-            result = await worker._run_inflight_verify(item, lease)
+        result = await worker._run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.merge_wt == cold_wt
@@ -1631,22 +1631,25 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
 
 @pytest.mark.asyncio
 class TestRunInflightVerifyThreadsEscalationQueue:
-    """_run_inflight_verify passes self._escalation_queue into
-    _run_post_merge_verify (task 2307 step-7).
+    """The worker's escalation queue reaches the post-merge verify (task 2307 step-7).
 
-    RED until step-8 GREEN adds escalation_queue=self._escalation_queue to
-    the _run_post_merge_verify call site inside _run_inflight_verify.
+    Observed end to end rather than on the call's kwargs: a laptop-side
+    flock-contention VerifyResult can only reach the born-at-L2 alarm if
+    _run_inflight_verify threaded the queue down, so the escalation landing in
+    the worker's OWN injected queue is the wiring.
     """
 
-    async def test_escalation_queue_threaded_into_post_merge_verify(self, tmp_path):
+    async def test_laptop_contention_alarm_reaches_the_workers_queue(self, tmp_path):
         from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
-        from orchestrator.verify_runner import HostLease
+        from orchestrator.verify_runner import HostLease, make_flock_contention_result
 
         git_ops = _make_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-        sentinel_eq = MagicMock()
-        worker._escalation_queue = sentinel_eq
+        worker_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=q, escalation_queue=worker_eq,
+            verifier=FakeVerifier(),
+        )
 
         merge_wt_path = tmp_path / 'merge-wt'
         merge_result = MagicMock()
@@ -1664,21 +1667,23 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         )
 
         # REMOTE lease — bypasses local warm-swap path (mirrors 1795/step-3's builder)
-        fake_runner = MagicMock()
-        fake_runner.name = 'leo-laptop'
-        fake_runner.is_local = False
+        fake_runner = _runner_double(
+            'leo-laptop', is_local=False,
+            result=make_flock_contention_result(
+                host='leo-laptop', holder_pgid=4242, waiter_pgid=4343,
+            ),
+        )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
 
-        spy = AsyncMock(return_value=None)
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
-            await worker._run_inflight_verify(item, lease)
+        await worker._run_inflight_verify(item, lease)
 
-        assert spy.await_args is not None, '_run_post_merge_verify was not called'
-        # RED: escalation_queue is not yet threaded through by _run_inflight_verify
-        assert spy.await_args.kwargs.get('escalation_queue') is sentinel_eq, (
+        assert len(worker_eq.submitted) == 1, (
             '_run_inflight_verify must pass escalation_queue=self._escalation_queue '
-            "into _run_post_merge_verify — the worker's queue was not threaded through"
+            "into the post-merge verify — the worker's queue was not threaded through"
         )
+        esc = worker_eq.submitted[0]
+        assert esc.category == 'verify_worktree_contention'
+        assert 'leo-laptop' in esc.summary
 
 
 # ---------------------------------------------------------------------------
@@ -4391,12 +4396,15 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
     RED until 3043/step-8 wraps the verify_task lifetime in a try/finally.
     """
 
-    def _make_worker_and_item(self, tmp_path):
+    def _make_worker_and_item(self, tmp_path, *, verifier=None):
         from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
 
         git_ops = _make_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=q,
+            verifier=verifier if verifier is not None else FakeVerifier(),
+        )
         worker.VERIFY_ABANDON_POLL_SECS = 0.01
 
         merge_result = MagicMock()
@@ -4412,26 +4420,44 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         )
         return worker, item
 
-    def _remote_lease(self, name='leo-laptop'):
+    def _remote_lease(self, name='leo-laptop', *, on_verify=None):
+        """A remote lease whose host behaves as *on_verify* says when dispatched.
+
+        The verify BODY is the seam here: a remote lease dispatches
+        ``runner=<this runner>``, which builds a single-runner pool with no
+        local anchor to fall back on — so whatever *on_verify* does happens
+        inside the REAL inner ``_run_post_merge_verify`` task, which is the
+        task the orphan guard is about.  ``runner.entered`` collects that
+        inner task, so a caller can wait for the dispatch instead of scanning
+        the loop for a stand-in coroutine's name.
+        """
         from orchestrator.verify_runner import HostLease
 
-        runner = MagicMock()
-        runner.name = name
-        runner.is_local = False
+        runner = _runner_double(name, is_local=False)
+        entered: list = []
+
+        async def _dispatch(*args, **kwargs):
+            entered.append(asyncio.current_task())
+            if on_verify is None:
+                return _make_pass_result()
+            return await on_verify(*args, **kwargs)
+
+        runner.run_merge_verify = AsyncMock(side_effect=_dispatch)
+        runner.entered = entered
         return HostLease(name=name, runner=runner, is_local=False)
 
-    def _pending_fake_verifies(self, fn_name: str) -> list:
-        """Pending tasks still running the patched _run_post_merge_verify stand-in."""
+    def _pending_inner_verifies(self) -> list:
+        """Pending tasks still running the inner _run_post_merge_verify."""
         out = []
         for t in asyncio.all_tasks():
             if t.done() or t is asyncio.current_task():
                 continue
             coro = getattr(t, 'get_coro', lambda: None)()
-            if fn_name in getattr(coro, '__qualname__', ''):
+            if '_run_post_merge_verify' in getattr(coro, '__qualname__', ''):
                 out.append(t)
         return out
 
-    async def _cancel_midflight(self, worker, item, lease, fake_verify):
+    async def _cancel_midflight(self, worker, item, lease, dispatched=None):
         """Start the outer verify, let it reach the poll loop, then cancel it.
 
         Returns the OUTER task, and asserts up front that it actually ended
@@ -4447,20 +4473,19 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         """
         import contextlib
 
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=fake_verify):
-            outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-            for _ in range(50):
-                await asyncio.sleep(0.01)
-                if worker._runner_quarantine or self._pending_fake_verifies(
-                    fake_verify.__qualname__
-                ):
-                    break
-            outer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await outer
-            # Let any cancellation the finally-guard issued settle.
-            for _ in range(10):
-                await asyncio.sleep(0)
+        if dispatched is None:
+            dispatched = getattr(lease.runner, 'entered', [])
+        outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if dispatched or worker._runner_quarantine:
+                break
+        outer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await outer
+        # Let any cancellation the finally-guard issued settle.
+        for _ in range(10):
+            await asyncio.sleep(0)
         assert outer.cancelled() is True, (
             'the outer _run_inflight_verify must end CANCELLED — the orphan '
             'guard in its `finally` must never swallow the in-flight '
@@ -4475,22 +4500,21 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         """Cancelling the outer task must not leave the inner verify running."""
         from orchestrator.verify_runner import RunnerUnavailable
 
-        captured: list = []
-
-        async def _fake_verify(*args, **kwargs):
-            captured.append(asyncio.current_task())
+        async def _hang_then_fail(*args, **kwargs):
             await asyncio.sleep(30)
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+        lease = self._remote_lease(on_verify=_hang_then_fail)
+        await self._cancel_midflight(worker, item, lease)
 
-        assert captured, 'the patched verify never started'
-        assert captured[0].done(), (
+        inner = lease.runner.entered
+        assert inner, 'the verify never reached the host'
+        assert inner[0].done(), (
             'inner _run_post_merge_verify task outlived the cancelled outer '
             'coroutine — this is the Task-350 orphan'
         )
-        assert self._pending_fake_verifies('_fake_verify') == []
+        assert self._pending_inner_verifies() == []
 
     # -- (b) the inner exception is always RETRIEVED ----------------------------
 
@@ -4500,13 +4524,10 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
 
         from orchestrator.verify_runner import RunnerUnavailable
 
-        captured: list = []
-
-        async def _fake_verify(*args, **kwargs):
+        async def _fail_shortly(*args, **kwargs):
             # Raises on its OWN timeline, shortly after the outer is cancelled —
             # the incident's shape: the orphan keeps talking to the down host
             # and surfaces the transport failure with nobody left listening.
-            captured.append(asyncio.current_task())
             await asyncio.sleep(0.05)
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
@@ -4516,14 +4537,15 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         loop.set_exception_handler(lambda _loop, ctx: unhandled.append(ctx))
         try:
             worker, item = self._make_worker_and_item(tmp_path)
-            await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+            lease = self._remote_lease(on_verify=_fail_shortly)
+            await self._cancel_midflight(worker, item, lease)
 
             # Give an ORPHANED inner task time to reach its raise — that is the
             # moment the unretrieved-exception warning becomes possible.  With
             # the guard in place the inner is already cancelled by now, so this
             # window simply passes quietly.
             await asyncio.sleep(0.2)
-            captured.clear()          # drop our own reference to the task
+            lease.runner.entered.clear()   # drop our own reference to the task
             gc.collect()
             await asyncio.sleep(0)
             gc.collect()
@@ -4552,14 +4574,16 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         """
         from orchestrator.verify_runner import RunnerUnavailable
 
-        async def _fake_verify(*args, **kwargs):
+        async def _fail_on_cancel(*args, **kwargs):
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 raise RunnerUnavailable(_INCIDENT_RU_MSG) from None
 
         worker, item = self._make_worker_and_item(tmp_path)
-        await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+        await self._cancel_midflight(
+            worker, item, self._remote_lease(on_verify=_fail_on_cancel),
+        )
 
         assert 'leo-laptop' in worker._runner_unavailable, (
             'stranded host has no tracker entry — reprobe cannot re-adopt it'
@@ -4572,11 +4596,11 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
     async def test_cleanly_cancelled_inner_records_nothing(self, tmp_path):
         """An inner task that ends CANCELLED (not RunnerUnavailable) is not a strand."""
 
-        async def _fake_verify(*args, **kwargs):
+        async def _hang(*args, **kwargs):
             await asyncio.sleep(30)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+        await self._cancel_midflight(worker, item, self._remote_lease(on_verify=_hang))
 
         assert worker._runner_unavailable == {}
         assert worker._runner_quarantine == set()
@@ -4585,19 +4609,23 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         """A LOCAL lease is never quarantined — local is the trust anchor."""
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
-        async def _fake_verify(*args, **kwargs):
+        dispatched: list = []
+
+        async def _fail_on_cancel(*args, **kwargs):
+            dispatched.append(asyncio.current_task())
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 raise RunnerUnavailable('local verify blew up') from None
 
-        worker, item = self._make_worker_and_item(tmp_path)
-        local_runner = MagicMock()
-        local_runner.name = 'local'
-        local_runner.is_local = True
+        # A LOCAL lease verifies through the port, so the body goes in there.
+        worker, item = self._make_worker_and_item(
+            tmp_path, verifier=_BodyVerifier(_fail_on_cancel),
+        )
+        local_runner = _runner_double('local', is_local=True)
         lease = HostLease(name='local', runner=local_runner, is_local=True)
 
-        await self._cancel_midflight(worker, item, lease, _fake_verify)
+        await self._cancel_midflight(worker, item, lease, dispatched)
 
         assert worker._runner_unavailable == {}
         assert worker._runner_quarantine == set()
@@ -4608,12 +4636,13 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         """Uncancelled remote RU still converts to the RUNNER_UNAVAILABLE result."""
         from orchestrator.verify_runner import RunnerUnavailable
 
-        async def _fake_verify(*args, **kwargs):
+        async def _unavailable(*args, **kwargs):
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_fake_verify):
-            result = await worker._run_inflight_verify(item, self._remote_lease())
+        result = await worker._run_inflight_verify(
+            item, self._remote_lease(on_verify=_unavailable),
+        )
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.reason is not None and 'Connection timed out' in result.reason
@@ -4629,12 +4658,13 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         """
         from orchestrator.verify_runner import RunnerUnavailable
 
-        async def _fake_verify(*args, **kwargs):
+        async def _unavailable(*args, **kwargs):
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_fake_verify):
-            await worker._run_inflight_verify(item, self._remote_lease())
+        await worker._run_inflight_verify(
+            item, self._remote_lease(on_verify=_unavailable),
+        )
 
         assert worker._runner_unavailable == {}, (
             'the finally-guard recorded a failure the RU handler already owns'
@@ -4673,7 +4703,7 @@ class TestOrphanGuardPreservesCancellation:
 
     _make_worker_and_item = TestRunInflightVerifyNeverOrphansVerifyTask._make_worker_and_item
     _remote_lease = TestRunInflightVerifyNeverOrphansVerifyTask._remote_lease
-    _pending_fake_verifies = TestRunInflightVerifyNeverOrphansVerifyTask._pending_fake_verifies
+    _pending_inner_verifies = TestRunInflightVerifyNeverOrphansVerifyTask._pending_inner_verifies
     _cancel_midflight = TestRunInflightVerifyNeverOrphansVerifyTask._cancel_midflight
 
     # ── (a) the outer task ends CANCELLED, not RESULT ───────────────────────
@@ -4682,7 +4712,7 @@ class TestOrphanGuardPreservesCancellation:
         """outer.cancelled() is True — not merely done()."""
         from orchestrator.verify_runner import RunnerUnavailable
 
-        async def _fake_verify(*args, **kwargs):
+        async def _fail_on_cancel(*args, **kwargs):
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -4690,7 +4720,7 @@ class TestOrphanGuardPreservesCancellation:
 
         worker, item = self._make_worker_and_item(tmp_path)
         outer = await self._cancel_midflight(
-            worker, item, self._remote_lease(), _fake_verify,
+            worker, item, self._remote_lease(on_verify=_fail_on_cancel),
         )
 
         assert outer.done() is True
@@ -4701,12 +4731,12 @@ class TestOrphanGuardPreservesCancellation:
     async def test_guard_never_converts_cancellation_into_a_result(self, tmp_path):
         """A `return` in the guard would surface here as a non-cancelled result."""
 
-        async def _fake_verify(*args, **kwargs):
+        async def _hang(*args, **kwargs):
             await asyncio.sleep(30)
 
         worker, item = self._make_worker_and_item(tmp_path)
         outer = await self._cancel_midflight(
-            worker, item, self._remote_lease(), _fake_verify,
+            worker, item, self._remote_lease(on_verify=_hang),
         )
 
         assert outer.cancelled() is True, (
@@ -4728,15 +4758,15 @@ class TestOrphanGuardPreservesCancellation:
         from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import RunnerUnavailable
 
-        async def _fake_verify(*args, **kwargs):
+        async def _fail_on_cancel(*args, **kwargs):
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 raise RunnerUnavailable(_INCIDENT_RU_MSG) from None
 
         worker, item = self._make_worker_and_item(tmp_path)
-        lease = self._remote_lease()
-        outer = await self._cancel_midflight(worker, item, lease, _fake_verify)
+        lease = self._remote_lease(on_verify=_fail_on_cancel)
+        outer = await self._cancel_midflight(worker, item, lease)
 
         entry = InflightEntry(
             item=item, lease=lease, verify_task=outer,
@@ -4758,16 +4788,14 @@ class TestOrphanGuardPreservesCancellation:
         the head-failure cascade) await the OUTER task, so an unbounded reap
         turns a slow unwind into a stalled shutdown.
         """
-        started: list = []
         released = asyncio.Event()
 
-        async def _fake_verify(*args, **kwargs):
-            started.append(asyncio.current_task())
+        async def _unkillable(*args, **kwargs):
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 # Refuses to die promptly, and survives REPEATED cancellation —
-                # the wedge shape.  A fake that dies on the second cancel would
+                # the wedge shape.  A host that dies on the second cancel would
                 # pass without any bound at all, because wait_for's timeout
                 # cancel chains down into this task.
                 while not released.is_set():
@@ -4777,20 +4805,21 @@ class TestOrphanGuardPreservesCancellation:
 
         worker, item = self._make_worker_and_item(tmp_path)
         worker.ORPHAN_REAP_TIMEOUT_SECS = 0.05
+        lease = self._remote_lease(on_verify=_unkillable)
+        started = lease.runner.entered
 
         try:
-            with patch('orchestrator.merge_queue._run_post_merge_verify', new=_fake_verify):
-                outer = asyncio.ensure_future(worker._run_inflight_verify(item, self._remote_lease()))
-                for _ in range(200):
-                    await asyncio.sleep(0.01)
-                    if started:
-                        break
-                assert started, 'the patched verify never started'
-                outer.cancel()
-                # The bound is what makes this await return at all.
-                await asyncio.wait_for(
-                    asyncio.gather(outer, return_exceptions=True), timeout=5.0,
-                )
+            outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if started:
+                    break
+            assert started, 'the verify never reached the host'
+            outer.cancel()
+            # The bound is what makes this await return at all.
+            await asyncio.wait_for(
+                asyncio.gather(outer, return_exceptions=True), timeout=5.0,
+            )
             assert outer.done() is True, 'the canceller was wedged by the reap'
             assert outer.cancelled() is True, (
                 'abandoning the reap must not change the outer task outcome'
@@ -4805,16 +4834,14 @@ class TestOrphanGuardPreservesCancellation:
 
     async def test_abandoned_reap_warns_naming_the_task_and_host(self, tmp_path, caplog):
         """Re-orphaning is a deliberate trade — it must be VISIBLE, not silent."""
-        started: list = []
         released = asyncio.Event()
 
-        async def _fake_verify(*args, **kwargs):
-            started.append(asyncio.current_task())
+        async def _unkillable(*args, **kwargs):
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 # Refuses to die promptly, and survives REPEATED cancellation —
-                # the wedge shape.  A fake that dies on the second cancel would
+                # the wedge shape.  A host that dies on the second cancel would
                 # pass without any bound at all, because wait_for's timeout
                 # cancel chains down into this task.
                 while not released.is_set():
@@ -4824,14 +4851,13 @@ class TestOrphanGuardPreservesCancellation:
 
         worker, item = self._make_worker_and_item(tmp_path)
         worker.ORPHAN_REAP_TIMEOUT_SECS = 0.05
+        lease = self._remote_lease(on_verify=_unkillable)
+        started = lease.runner.entered
 
         try:
-            with (
-                caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
-                patch('orchestrator.merge_queue._run_post_merge_verify', new=_fake_verify),
-            ):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
                 outer = asyncio.ensure_future(
-                    worker._run_inflight_verify(item, self._remote_lease())
+                    worker._run_inflight_verify(item, lease)
                 )
                 for _ in range(200):
                     await asyncio.sleep(0.01)
@@ -4873,7 +4899,7 @@ class TestOrphanGuardPreservesCancellation:
         """
         from orchestrator.verify_runner import RunnerUnavailable
 
-        async def _fake_verify(*args, **kwargs):
+        async def _fail_on_cancel(*args, **kwargs):
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -4907,7 +4933,7 @@ class TestOrphanGuardPreservesCancellation:
         mq_logger.addFilter(wedge)
         try:
             outer = await self._cancel_midflight(
-                worker, item, self._remote_lease(), _fake_verify,
+                worker, item, self._remote_lease(on_verify=_fail_on_cancel),
             )
         finally:
             mq_logger.removeFilter(wedge)
