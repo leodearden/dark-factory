@@ -56,6 +56,7 @@
       "orchestrator/tests/_serial_merge_worker.py",
       "orchestrator/tests/_merge_queue_harness.py",
       "orchestrator/tests/conftest.py",
+      "orchestrator/tests/_fill_drive_harness.py",
       "orchestrator/tests/_merge_lane_census.py",
       "orchestrator/tests/_merge_lane_fakes.py",
       "orchestrator/tests/_merge_queue_harness.py",
@@ -313,6 +314,7 @@
       "orchestrator/tests/_serial_merge_worker.py",
       "orchestrator/tests/_merge_queue_harness.py",
       "orchestrator/tests/conftest.py",
+      "orchestrator/tests/_fill_drive_harness.py",
       "orchestrator/tests/_merge_lane_census.py",
       "orchestrator/tests/_merge_lane_fakes.py",
       "orchestrator/tests/_merge_queue_harness.py",
@@ -1338,6 +1340,7 @@
     "orchestrator/tests/conftest.py::repo_root": 3
   },
   "tests": {
+    "orchestrator/tests/_fill_drive_harness.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/_merge_lane_census.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/_merge_lane_fakes.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/_merge_queue_harness.py": {"patch_targets": [], "private_reads": 4},

@@ -49,6 +49,18 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# COMPAT RE-EXPORT, task 5030. The white-box drive harness these tests used to
+# run on now lives in _fill_drive_harness.py, but
+# test_merge_queue_verifier_raw_cancel.py (a different γ group, not editable
+# from here) still imports it FROM THIS MODULE. Re-exported so that import
+# keeps resolving; delete both this block and _fill_drive_harness.py when that
+# file's group migrates or retires it.
+from _fill_drive_harness import (  # noqa: F401,E402
+    _drive_fill,
+    _make_real_item,
+    _teardown_fill_drive,
+)
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, hangs_until, passes
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_concurrent_verify import (
