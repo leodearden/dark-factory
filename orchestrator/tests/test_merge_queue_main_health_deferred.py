@@ -301,7 +301,7 @@ class TestSpawnForwardsOriginIsLocal:
     """
 
     @staticmethod
-    def _red_signals(tmp_path: Path, **spawn_kwargs: object) -> list[dict]:
+    def _red_signals(tmp_path: Path, **spawn_kwargs: bool) -> list[dict]:
         """Drive the real spawn to completion; return its main_health_red data.
 
         The probe verdict is forced positive so the signal is emitted at all;
