@@ -1461,7 +1461,7 @@
     "orchestrator/tests/test_merge_queue_verifier_raw_cancel.py": {"patch_targets": [], "private_reads": 21},
     "orchestrator/tests/test_merge_queue_verify_base_invariant.py": {"patch_targets": [], "private_reads": 59},
     "orchestrator/tests/test_merge_queue_verify_retry.py": {"patch_targets": ["VerifyRunnerPool", "_kill_probe_process_tree", "_probe_nextest_planned", "_run_probe_cmd"], "private_reads": 23},
-    "orchestrator/tests/test_merge_queue_warm_cold_shadow.py": {"patch_targets": ["SpeculativeMergeWorker", "VerifyRunnerPool", "_ensure_verify_disk_space", "_maybe_schedule_shadow_compare", "_run_coarse_shadow_compare", "_run_cold_shadow_verify", "_run_post_merge_verify", "_run_shadow_compare"], "private_reads": 37},
+    "orchestrator/tests/test_merge_queue_warm_cold_shadow.py": {"patch_targets": ["SpeculativeMergeWorker", "_maybe_schedule_shadow_compare", "_run_cold_shadow_verify", "_run_shadow_compare"], "private_reads": 22},
     "orchestrator/tests/test_merge_request_ledger.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_merge_serial_lane_tripwire.py": {"patch_targets": ["_MERGE_AHEAD_BOUND"], "private_reads": 19},
     "orchestrator/tests/test_merge_shadow.py": {"patch_targets": ["_run_coarse_shadow_compare", "_run_cold_shadow_verify", "_run_cold_shadow_verify_suite", "_run_shadow_compare", "_run_unscoped_typechecks", "run_scoped_verification"], "private_reads": 12},

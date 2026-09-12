@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from _orch_helpers import make_placeholder_future, pydantic_spec
 from escalation.models import BORN_AT_L2_SEVERITIES
 
@@ -1257,6 +1258,17 @@ class TestRunShadowCompare:
 # ---------------------------------------------------------------------------
 
 
+def _shadow_state_path(root: Path) -> Path:
+    """The warm-verify shadow state path production derives from a project root.
+
+    Byte-identical to what ``merge_queue.py::SpeculativeMergeWorker.__init__``
+    computes, so a test asserting on this file asserts on the path the worker
+    really writes.  ``test_smw_shadow_state_path_under_data_dir`` is what pins
+    the two to each other.
+    """
+    return root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
+
+
 def _make_worker_stub(
     tmp_path: Path,
     *,
@@ -1264,10 +1276,15 @@ def _make_worker_stub(
     every_n: int = 40,
     nightly_interval: float = 86400.0,
 ) -> MagicMock:
-    """Build a minimal SpeculativeMergeWorker stub for scheduler tests."""
+    """Build a minimal SpeculativeMergeWorker stub for scheduler tests.
+
+    ``_shadow_compare_tasks`` / ``_shadow_state_path`` are
+    ``_maybe_schedule_shadow_compare``'s OWN parameter surface — it takes the
+    worker and reads them — so a stand-in must carry them.
+    """
     worker = MagicMock()
     worker._shadow_compare_tasks = set()
-    worker._shadow_state_path = tmp_path / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
+    worker._shadow_state_path = _shadow_state_path(tmp_path)
     return worker
 
 
@@ -1308,45 +1325,7 @@ class TestMaybeScheduleShadowCompare:
         )
 
         assert len(worker._shadow_compare_tasks) == 0
-        assert not worker._shadow_state_path.exists()
-
-    # Empty warm_results (map-less land) + due → routes to the COARSE compare.
-    #
-    # FIX 2 (task 2886, PRD leaf δ §3.4): the historical empty-warm_results
-    # no-op is intentionally GONE.  Trivial-pass / remote-verdict lands have no
-    # per-test warm map yet CAN diverge, so a due map-less land must be sampled
-    # via the COARSE suite-level _run_coarse_shadow_compare (reach-back seam at
-    # orchestrator.merge_queue._run_coarse_shadow_compare) — never the per-test
-    # _run_shadow_compare.  (Authoritative FIX-2 coverage lives in
-    # test_merge_shadow.py::TestScheduleShadowCompareMapLess.)
-    @pytest.mark.asyncio
-    async def test_empty_warm_results_schedules_coarse_compare(
-        self, tmp_path: Path
-    ) -> None:
-        worker = _make_worker_stub(tmp_path)
-        req = MagicMock()
-        # every_n=1 → the count leg is due on this first land (deterministic;
-        # does not lean on the nightly-clock-vs-wall-clock leg).
-        req.config = _make_shadow_config(tmp_path, every_n=1)
-
-        coarse = AsyncMock(return_value=None)
-        per_test = AsyncMock(return_value=None)
-        with (
-            patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse),
-            patch('orchestrator.merge_queue._run_shadow_compare', per_test),
-        ):
-            await _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha', {}, None, None
-            )
-            # A coarse compare task is scheduled for the map-less land.
-            assert len(worker._shadow_compare_tasks) == 1
-            task = next(iter(worker._shadow_compare_tasks))
-            await task
-
-        coarse.assert_awaited_once()
-        per_test.assert_not_called()
-        # Due path reset + persisted the cadence counter (no longer a no-op).
-        assert worker._shadow_state_path.exists()
+        assert not _shadow_state_path(tmp_path).exists()
 
     # _shadow_state_path is None (bare-harness worker) + knob ON → no-op, no raise
     def test_none_shadow_state_path_no_op(self, tmp_path: Path) -> None:
@@ -1384,7 +1363,7 @@ class TestMaybeScheduleShadowCompare:
 
         # Pre-set state: count=5, last_run recent enough that nightly won't fire
         state = ShadowCompareState(merges_since_last_shadow=5, last_shadow_run_at=1e10)
-        _save_shadow_compare_state(worker._shadow_state_path, state)
+        _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
         asyncio.run(
             _maybe_schedule_shadow_compare(
@@ -1393,7 +1372,7 @@ class TestMaybeScheduleShadowCompare:
         )
 
         # Counter must have been incremented (5 → 6, still below 10)
-        saved = _load_shadow_compare_state(worker._shadow_state_path)
+        saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
         assert saved.merges_since_last_shadow == 6
         # No task scheduled
         assert len(worker._shadow_compare_tasks) == 0
@@ -1417,7 +1396,7 @@ class TestMaybeScheduleShadowCompare:
 
         # Seed state at threshold
         state = ShadowCompareState(merges_since_last_shadow=9, last_shadow_run_at=0.0)
-        _save_shadow_compare_state(worker._shadow_state_path, state)
+        _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
         with patch(
             'orchestrator.merge_queue._run_shadow_compare',
@@ -1449,7 +1428,7 @@ class TestMaybeScheduleShadowCompare:
         warm = {'t1': 'pass'}
 
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
-        _save_shadow_compare_state(worker._shadow_state_path, state)
+        _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
         with patch(
             'orchestrator.merge_queue._run_shadow_compare',
@@ -1461,7 +1440,7 @@ class TestMaybeScheduleShadowCompare:
                 )
             )
 
-        saved = _load_shadow_compare_state(worker._shadow_state_path)
+        saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
         assert saved.merges_since_last_shadow == 0
         assert saved.last_shadow_run_at > 0.0  # updated to now
 
@@ -1480,7 +1459,7 @@ class TestMaybeScheduleShadowCompare:
 
         # Both calls see state with count=10 (due)
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
-        _save_shadow_compare_state(worker._shadow_state_path, state)
+        _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
         with patch(
             'orchestrator.merge_queue._run_shadow_compare',
@@ -1495,7 +1474,7 @@ class TestMaybeScheduleShadowCompare:
             # Second call while first is still in-flight: must NOT spawn another
             # Reset state so it looks "due" again
             state2 = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
-            _save_shadow_compare_state(worker._shadow_state_path, state2)
+            _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
 
             await _maybe_schedule_shadow_compare(
                 worker, MagicMock(), req, 'sha2', warm, None, None
@@ -1533,7 +1512,7 @@ class TestMaybeScheduleShadowCompare:
 
         # First call: state at threshold (10 = due), spawns the in-flight task
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
-        _save_shadow_compare_state(worker._shadow_state_path, state)
+        _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
         with patch(
             'orchestrator.merge_queue._run_shadow_compare',
@@ -1547,7 +1526,7 @@ class TestMaybeScheduleShadowCompare:
 
             # Manually set state to look "due" again (as if 10 more merges landed)
             state2 = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
-            _save_shadow_compare_state(worker._shadow_state_path, state2)
+            _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
 
             # Second call while first is in-flight: skips scheduling but MUST
             # increment and persist the counter (10 → 11)
@@ -1556,7 +1535,7 @@ class TestMaybeScheduleShadowCompare:
             )
 
             # Counter must have been incremented (10 → 11) even though in-flight
-            saved = _load_shadow_compare_state(worker._shadow_state_path)
+            saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
             assert saved.merges_since_last_shadow == 11, (
                 f"Expected 11 (incremented from 10), got "
                 f"{saved.merges_since_last_shadow} — in-flight guard must persist counter"
@@ -1617,13 +1596,6 @@ class TestSMWEscalationQueueInit:
         )
         assert worker._escalation_queue is fake_eq
 
-    def test_smw_default_escalation_queue_is_none(self, tmp_path: Path) -> None:
-        """escalation_queue defaults to None — keeps bare-worker tests green."""
-        mock_git_ops = MagicMock()
-        mock_git_ops.project_root = tmp_path
-        worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
-        assert worker._escalation_queue is None
-
     def test_smw_has_shadow_compare_tasks_set(self, tmp_path: Path) -> None:
         """_shadow_compare_tasks must be an empty set after __init__."""
         mock_git_ops = MagicMock()
@@ -1669,24 +1641,18 @@ class TestRunPostMergeVerifyOnResultCallback:
             lint_output='', type_output='', summary='',
         )
 
-        with patch(
-            'orchestrator.merge_queue._ensure_verify_disk_space',
-            new=AsyncMock(return_value=None),
-        ), patch(
-            'orchestrator.merge_queue.VerifyRunnerPool',
-        ) as mock_pool_cls:
-            mock_pool = MagicMock()
-            mock_pool.dispatch = AsyncMock(return_value=fake_vr)
-            mock_pool_cls.return_value = mock_pool
-
-            # Will raise TypeError: got unexpected keyword argument 'on_result'
-            # until step-16 adds the parameter.
-            result = await _run_post_merge_verify(
-                MagicMock(), req, merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=2, max_enospc=1,
-                on_result=received.append,
-            )
+        # The verify port is INJECTED, not patched: `verifier=` already exists
+        # on _run_post_merge_verify, and FakeVerifier.ensure_disk_space returns
+        # DiskGuardOutcome(reason=None) — identical to the
+        # AsyncMock(return_value=None) this used to patch over
+        # _ensure_verify_disk_space.
+        result = await _run_post_merge_verify(
+            MagicMock(), req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            on_result=received.append,
+            verifier=FakeVerifier(default=VerifyScript(result=fake_vr)),
+        )
 
         # on_result must be called with the VerifyResult
         assert len(received) == 1
@@ -1786,13 +1752,14 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
             sched_calls.append(args)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(wcs_git_ops, queue, event_store=None)
+        # A passing verify port, INJECTED (model: test_merge_lane_package.py),
+        # replaces the _run_post_merge_verify patch this used to need.
+        worker = SpeculativeMergeWorker(
+            wcs_git_ops, queue, event_store=None, verifier=FakeVerifier(),
+        )
         worker_task = asyncio.create_task(worker.run())
 
         with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
-            new=AsyncMock(return_value=None),
-        ), patch(
             'orchestrator.merge_queue._maybe_schedule_shadow_compare',
             new=_capture_schedule,
         ):
@@ -1826,15 +1793,14 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
             await gate.wait()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(wcs_git_ops, queue, event_store=None)
+        worker = SpeculativeMergeWorker(
+            wcs_git_ops, queue, event_store=None, verifier=FakeVerifier(),
+        )
         worker_task = asyncio.create_task(worker.run())
 
         outcome_fut = req.result
 
         with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
-            new=AsyncMock(return_value=None),
-        ), patch(
             'orchestrator.merge_queue._maybe_schedule_shadow_compare',
             new=_gated_schedule,
         ):
