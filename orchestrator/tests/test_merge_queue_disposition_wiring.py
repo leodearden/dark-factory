@@ -22,17 +22,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_disposition import (
-    ClassificationResult,
     MergeFailureDisposition,
     SkewEvidence,
 )
@@ -41,6 +42,7 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
     _classify_main_health_red,
+    _resolve_dispatch_time_merge_base,
     _run_post_merge_verify,
 )
 from orchestrator.merge_types import OutcomeKind, QueuedBranch
@@ -95,15 +97,53 @@ def _make_git_ops(tmp_path: Path) -> GitOps:
     return git_ops
 
 
+def _seed_main_health_probe(
+    verify: VerifyResult, main_sha: str, *, preexisting: bool,
+) -> None:
+    """Pick the main-health probe verdict for *verify* without stubbing the probe.
+
+    The REAL ``verify_failure_is_preexisting_on_main`` consults verify.py's
+    process-wide probe cache before it pays the probe-worktree cost, and
+    production writes exactly these entries itself — so seeding one is how a
+    test chooses the verdict while still running the real function. The key is
+    composed with the same normaliser production uses, so the two cannot drift
+    apart. ``reset_probe_cache`` clears the cache around every test.
+
+    A seed that MISSED would fall through to a real probe, which a MagicMock
+    git_ops degrades to the fail-safe ``(False, '')`` — silently right for the
+    negative case. Every caller therefore also asserts
+    ``git_ops.ephemeral_worktree`` was never reached, which is what keeps the
+    seeding honest.
+    """
+    from orchestrator.verify import _PROBE_CACHE
+    from orchestrator.workflow import _normalize_cause_hint
+
+    key = (main_sha, verify.category or '', _normalize_cause_hint(verify.cause_hint))
+    _PROBE_CACHE[key] = (time.monotonic(), preexisting)
+
+
+def _exploding_branch() -> QueuedBranch:
+    """A QueuedBranch stand-in whose bare_id raises — the I3 fail-open's fault seam.
+
+    Delivered through ``MergeRequest(branch=...)``, a public constructor
+    argument, so no lane module name has to be patched to reach the guard.
+    """
+    branch = MagicMock(spec=QueuedBranch)
+    type(branch).bare_id = PropertyMock(side_effect=RuntimeError('injected fault'))
+    return branch
+
+
 def _make_req(
     task_id: str,
     worktree: Path,
     config: OrchestratorConfig,
+    *,
+    branch: QueuedBranch | None = None,
 ) -> MergeRequest:
     future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+        branch=branch or QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -131,14 +171,12 @@ class TestClassifyMainHealthRedSetsDisposition:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        async def _run() -> MergeOutcome | None:
-            with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                new=AsyncMock(return_value=(True, MAIN_SHA)),
-            ):
-                return await _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+        _seed_main_health_probe(COMPILE_ERROR_RESULT, MAIN_SHA, preexisting=True)
+        outcome = asyncio.run(
+            _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+        )
 
-        outcome = asyncio.run(_run())
+        git_ops.ephemeral_worktree.assert_not_called()
         assert outcome is not None
         assert outcome.disposition == MergeFailureDisposition.MAIN_RED, (
             f'Expected disposition=MAIN_RED; got {outcome.disposition!r}'
@@ -163,14 +201,12 @@ class TestClassifyMainHealthRedSetsDisposition:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        async def _run() -> MergeOutcome | None:
-            with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                new=AsyncMock(return_value=(False, '')),
-            ):
-                return await _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+        _seed_main_health_probe(COMPILE_ERROR_RESULT, MAIN_SHA, preexisting=False)
+        outcome = asyncio.run(
+            _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+        )
 
-        outcome = asyncio.run(_run())
+        git_ops.ephemeral_worktree.assert_not_called()
         assert outcome is None
 
 
@@ -379,9 +415,21 @@ class TestClassifyDispositionForOutcome:
         # payload byte-identical under step-10's widened emit guard.
         assert observed is None
 
-    def test_row4_classifier_fault_fails_open(
+    def test_row4_fault_while_classifying_fails_open(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """I3 belt-and-suspenders: ANY exception raised while classifying
+        degrades to INDETERMINATE.
+
+        The fault is injected through the *request* — the wrapper reads
+        ``req.branch.bare_id`` to build the classifier call — rather than by
+        replacing ``classify_merge_failure_disposition``, because the
+        classifier wraps its whole body in its own fail-open and therefore
+        cannot itself raise. A fault in the surrounding marshalling is exactly
+        the class this outer guard exists for, and a MergeRequest carrying an
+        exploding branch is that fault delivered through a public constructor
+        argument.
+        """
         from orchestrator.merge_queue import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
@@ -391,18 +439,12 @@ class TestClassifyDispositionForOutcome:
         landing_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
 
         config = _make_config(repo)
-        req = _make_req('2381', repo, config)
+        req = _make_req('2381', repo, config, branch=_exploding_branch())
 
         async def _run() -> tuple[
             MergeFailureDisposition, dict[str, str] | None, str, SkewEvidence | None,
         ]:
-            with (
-                patch(
-                    'orchestrator.merge_queue.classify_merge_failure_disposition',
-                    new=AsyncMock(side_effect=RuntimeError('injected fault')),
-                ),
-                caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
-            ):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
                 return await _classify_disposition_for_outcome(
                     _XPY_FAILURE, req=req, merge_base_sha=merge_base_sha,
                     main_sha=landing_sha, event_store=None,
@@ -413,8 +455,8 @@ class TestClassifyDispositionForOutcome:
         assert diag is None
         assert reason_suffix == ''
         # Task 3178, the I3 guarantee step-10's widened guard relies on: a
-        # classifier fault gathered NOTHING and must not fabricate a bundle, so
-        # no merge_attempt row is emitted for the fail-open path.
+        # fault gathered NOTHING and must not fabricate a bundle, so no
+        # merge_attempt row is emitted for the fail-open path.
         assert observed is None
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_texts, 'Expected a WARNING to be logged on classifier fault'
@@ -430,13 +472,22 @@ async def _drive_verify_with_base_facts(
     merge_wt: Path,
     git_ops: GitOps,
     *,
+    verify: VerifyResult,
     event_store: EventStore | None = None,
     merge_base_sha: str | None = None,
     main_sha: str | None = None,
 ) -> MergeOutcome | None:
     """Call _run_post_merge_verify with standard test parameters, threading
-    the optional merge_base_sha/main_sha kw-params under test."""
-    return await _run_post_merge_verify(
+    the optional merge_base_sha/main_sha kw-params under test.
+
+    *verify* is the scoped-verify verdict, supplied through the injected
+    VerifyPort rather than by stubbing the module-level verify functions, and
+    is also what the seeded main-health probe verdict is keyed on: every test
+    here is about the NON-preexisting (task-fault) bucket, so the probe is
+    seeded False and the generic classification path runs.
+    """
+    _seed_main_health_probe(verify, await git_ops.get_main_sha(), preexisting=False)
+    outcome = await _run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts={},
         enospc_retries={},
@@ -445,7 +496,10 @@ async def _drive_verify_with_base_facts(
         event_store=event_store,
         merge_base_sha=merge_base_sha,
         main_sha=main_sha,
+        verifier=FakeVerifier(default=VerifyScript(result=verify)),
     )
+    git_ops.ephemeral_worktree.assert_not_called()  # type: ignore[attr-defined]
+    return outcome
 
 
 class TestRunPostMergeVerifyDispositionWiring:
@@ -478,25 +532,12 @@ class TestRunPostMergeVerifyDispositionWiring:
             data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
         )
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=_XPY_FAILURE),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _drive_verify_with_base_facts(
-                    req, merge_wt, git_ops,
-                    event_store=store,
-                    merge_base_sha=merge_base_sha,
-                    main_sha=landing_sha,
-                )
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_drive_verify_with_base_facts(
+            req, merge_wt, git_ops, verify=_XPY_FAILURE,
+            event_store=store,
+            merge_base_sha=merge_base_sha,
+            main_sha=landing_sha,
+        ))
         assert outcome is not None
         assert outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW, (
             f'Expected INTEGRATION_SKEW; got {outcome.disposition!r}'
@@ -535,25 +576,12 @@ class TestRunPostMergeVerifyDispositionWiring:
             data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
         )
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=_XPY_FAILURE),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _drive_verify_with_base_facts(
-                    req, merge_wt, git_ops,
-                    event_store=store,
-                    merge_base_sha=merge_base_sha,
-                    main_sha=main_sha,
-                )
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_drive_verify_with_base_facts(
+            req, merge_wt, git_ops, verify=_XPY_FAILURE,
+            event_store=store,
+            merge_base_sha=merge_base_sha,
+            main_sha=main_sha,
+        ))
         assert outcome is not None
         assert outcome.disposition == MergeFailureDisposition.BRANCH_BUG, (
             f'Expected BRANCH_BUG; got {outcome.disposition!r}'
@@ -581,24 +609,11 @@ class TestRunPostMergeVerifyDispositionWiring:
         task_wt.mkdir()
         req = _make_req('2381', task_wt, config)
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=_TIMED_OUT_FAILURE),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _drive_verify_with_base_facts(
-                    req, merge_wt, git_ops,
-                    merge_base_sha='deadbeef',
-                    main_sha='beadfeed',
-                )
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_drive_verify_with_base_facts(
+            req, merge_wt, git_ops, verify=_TIMED_OUT_FAILURE,
+            merge_base_sha='deadbeef',
+            main_sha='beadfeed',
+        ))
         assert outcome is not None
         assert outcome.disposition == MergeFailureDisposition.INDETERMINATE, (
             f'Expected INDETERMINATE for a timed-out verify with no '
@@ -622,20 +637,9 @@ class TestRunPostMergeVerifyDispositionWiring:
         task_wt.mkdir()
         req = _make_req('2381', task_wt, config)
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=_XPY_FAILURE),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _drive_verify_with_base_facts(req, merge_wt, git_ops)
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(
+            _drive_verify_with_base_facts(req, merge_wt, git_ops, verify=_XPY_FAILURE)
+        )
         assert outcome is not None
         assert outcome.disposition == MergeFailureDisposition.INDETERMINATE, (
             f'Expected INDETERMINATE (default, classification skipped); '
@@ -651,134 +655,56 @@ class TestRunPostMergeVerifyDispositionWiring:
 # ---------------------------------------------------------------------------
 
 
-class TestRunInflightVerifyBaseFactsWiring:
-    """_run_inflight_verify computes dispatch-time base facts — main_sha from
-    item.base_sha (the frozen value captured at merge-dispatch time, NEVER a
-    fresh get_main_sha() re-read) and merge_base_sha via git merge-base of
-    that base and the item's frozen merged_branch_tip — and threads both
-    into _run_post_merge_verify (task 2383 β, 2357)."""
+class TestDispatchTimeMergeBaseResolution:
+    """_resolve_dispatch_time_merge_base is what turns an item's two FROZEN
+    dispatch-time facts — base_sha and merged_branch_tip — into the
+    merge_base_sha threaded into _run_post_merge_verify (task 2383 beta, 2357).
 
-    def test_base_facts_forwarded_from_item_not_fresh_main_read(
+    Asserted against git itself rather than against a kwarg captured from a
+    stubbed _run_post_merge_verify, so what is pinned is the computed value
+    and its fail-safe degradation, not the call shape."""
+
+    def test_merge_base_of_the_frozen_base_and_branch_tip(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
-        from orchestrator.verify_runner import HostLease
-
         repo = tmp_path / 'repo'
         repo.mkdir()
         _init_git_repo(repo)
-        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        fork_point = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
         subprocess.run(
             ['git', 'checkout', '-q', '-b', 'task/2381'], cwd=repo, check=True,
         )
         branch_tip = _commit_file(repo, 'src/branch_only.py', 'v1', 'task work')
         subprocess.run(['git', 'checkout', '-q', 'main'], cwd=repo, check=True)
-        # item.base_sha: the FROZEN dispatch-time main SHA — deliberately
-        # DIFFERENT from whatever a fresh get_main_sha() call would return
-        # (git_ops.get_main_sha is stubbed to a distinguishing sentinel below
-        # so any accidental fresh re-read would leak into the assertion).
-        main_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
+        # main advances past the fork point, so the merge base is deliberately
+        # NOT the frozen base itself — a naive "return base_sha" would pass an
+        # assertion made against a repo where they coincide.
+        base_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
 
-        config = _make_config(repo)
-        merge_wt = tmp_path / 'merge-wt'
-        merge_wt.mkdir()
-        req = _make_req('2381', repo, config)
-
-        git_ops = MagicMock()
-        git_ops.get_main_sha = AsyncMock(return_value='should-not-be-used-sha')
-
-        item = RealMergeItem(
-            request=req,
-            merge_result=MergeResult(
-                success=True, merge_commit='deadbeef', merge_worktree=merge_wt,
-            ),
-            merge_wt=merge_wt,
-            base_sha=main_sha,
-            speculative=False,
-            merged_branch_tip=branch_tip,
+        resolved = asyncio.run(
+            _resolve_dispatch_time_merge_base(repo, base_sha, branch_tip)
         )
-        lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
 
-        captured: dict = {}
-
-        async def _fake_run_post_merge_verify(*_args, **kwargs):
-            captured.update(kwargs)
-            return MergeOutcome(
-                'blocked', reason='Post-merge verification failed: boom',
-                disposition=MergeFailureDisposition.INTEGRATION_SKEW,
-            )
-
-        async def _run():
-            worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
-            with patch(
-                'orchestrator.merge_queue._run_post_merge_verify',
-                _fake_run_post_merge_verify,
-            ):
-                return await worker._run_inflight_verify(item, lease)
-
-        result = asyncio.run(_run())
-
-        git_ops.get_main_sha.assert_not_called()
-        assert captured.get('main_sha') == main_sha, captured
-        assert captured.get('merge_base_sha') == merge_base_sha, captured
-        assert result.outcome is not None
-        assert result.outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW
+        assert resolved == fork_point, (
+            f'Expected git merge-base({base_sha}, {branch_tip}) == {fork_point}; '
+            f'got {resolved!r}'
+        )
 
     def test_missing_branch_tip_degrades_merge_base_to_none(
         self, tmp_path: Path,
     ) -> None:
-        """merged_branch_tip=None (best-effort unavailable) -> merge_base_sha
-        is passed as None rather than raising; classification degrades to
-        INDETERMINATE inside _run_post_merge_verify (I3, fail-open)."""
-        from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
-        from orchestrator.verify_runner import HostLease
-
+        """merged_branch_tip=None (best-effort unavailable) -> None rather than
+        raising. _run_post_merge_verify then skips classification entirely,
+        which is pinned by TestRunPostMergeVerifyDispositionWiring::
+        test_base_facts_absent_skips_classification_byte_identical (I3)."""
         repo = tmp_path / 'repo'
         repo.mkdir()
         _init_git_repo(repo)
-        main_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x')
+        base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x')
 
-        config = _make_config(repo)
-        merge_wt = tmp_path / 'merge-wt'
-        merge_wt.mkdir()
-        req = _make_req('2381', repo, config)
-        git_ops = MagicMock()
-        git_ops.get_main_sha = AsyncMock(return_value='should-not-be-used-sha')
-
-        item = RealMergeItem(
-            request=req,
-            merge_result=MergeResult(
-                success=True, merge_commit='deadbeef', merge_worktree=merge_wt,
-            ),
-            merge_wt=merge_wt,
-            base_sha=main_sha,
-            speculative=False,
-            merged_branch_tip=None,
-        )
-        lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
-
-        captured: dict = {}
-
-        async def _fake_run_post_merge_verify(*_args, **kwargs):
-            captured.update(kwargs)
-            return MergeOutcome(
-                'blocked', reason='Post-merge verification failed: boom',
-            )
-
-        async def _run():
-            worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
-            with patch(
-                'orchestrator.merge_queue._run_post_merge_verify',
-                _fake_run_post_merge_verify,
-            ):
-                return await worker._run_inflight_verify(item, lease)
-
-        asyncio.run(_run())
-
-        assert captured.get('main_sha') == main_sha, captured
-        assert captured.get('merge_base_sha') is None, captured
+        assert asyncio.run(
+            _resolve_dispatch_time_merge_base(repo, base_sha, None)
+        ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -836,25 +762,12 @@ class TestRunPostMergeVerifyRealMainHeadFilter:
             data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
         )
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=_XPY_FAILURE),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _drive_verify_with_base_facts(
-                    req, merge_wt, git_ops,
-                    event_store=store,
-                    merge_base_sha=merge_base_sha,
-                    main_sha=orphan_tip,  # the frozen orphaned speculative base
-                )
-
-        outcome = asyncio.run(_run())
+        outcome = asyncio.run(_drive_verify_with_base_facts(
+            req, merge_wt, git_ops, verify=_XPY_FAILURE,
+            event_store=store,
+            merge_base_sha=merge_base_sha,
+            main_sha=orphan_tip,  # the frozen orphaned speculative base
+        ))
         assert outcome is not None
         assert outcome.disposition == MergeFailureDisposition.BRANCH_BUG, (
             f'Expected BRANCH_BUG (orphan pruned by real-main ancestor filter); '
@@ -864,47 +777,6 @@ class TestRunPostMergeVerifyRealMainHeadFilter:
         assert 'port landed commit' not in outcome.reason, outcome.reason
         assert 'do not hunt your own diff' not in outcome.reason, outcome.reason
         assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
-
-    def test_classify_disposition_for_outcome_forwards_real_main_head_sha(
-        self, tmp_path: Path,
-    ) -> None:
-        """_classify_disposition_for_outcome forwards a supplied
-        real_main_head_sha into classify_merge_failure_disposition (RED today:
-        the wrapper does not accept the kwarg)."""
-        from orchestrator.merge_queue import _classify_disposition_for_outcome
-
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_git_repo(repo)
-        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x')
-        config = _make_config(repo)
-        req = _make_req('2381', repo, config)
-
-        captured: dict = {}
-
-        async def _fake_classify(**kwargs):
-            captured.update(kwargs)
-            # Return the REAL type, not a bare 3-tuple: the wrapper reads the
-            # evidence slots by name, and a stub whose shape has drifted from
-            # the function it stands in for is how a false premise survives.
-            return ClassificationResult(MergeFailureDisposition.BRANCH_BUG, None, None)
-
-        async def _run() -> tuple[
-            MergeFailureDisposition, dict[str, str] | None, str, SkewEvidence | None,
-        ]:
-            with patch(
-                'orchestrator.merge_queue.classify_merge_failure_disposition',
-                new=_fake_classify,
-            ):
-                return await _classify_disposition_for_outcome(
-                    _XPY_FAILURE, req=req, merge_base_sha=merge_base_sha,
-                    main_sha='beadfeed', event_store=None,
-                    real_main_head_sha='realmainheadsha',
-                )
-
-        disposition, _diag, _reason_suffix, _observed = asyncio.run(_run())
-        assert captured.get('real_main_head_sha') == 'realmainheadsha', captured
-        assert disposition == MergeFailureDisposition.BRANCH_BUG
 
 
 # ---------------------------------------------------------------------------
@@ -1140,23 +1012,10 @@ class TestRunPostMergeVerifySkewEvidenceWiring:
             data={'passed': True, 'base_sha': merge_base_sha, 'branch': f'task/{task_id}'},
         )
 
-        async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=verify),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-            ):
-                return await _drive_verify_with_base_facts(
-                    req, merge_wt, git_ops, event_store=store,
-                    merge_base_sha=merge_base_sha, main_sha=main_sha,
-                )
-
-        return asyncio.run(_run())
+        return asyncio.run(_drive_verify_with_base_facts(
+            req, merge_wt, git_ops, verify=verify, event_store=store,
+            merge_base_sha=merge_base_sha, main_sha=main_sha,
+        ))
 
     def test_integration_skew_outcome_carries_the_bundle(self, tmp_path: Path) -> None:
         repo = tmp_path / 'repo'
