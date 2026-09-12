@@ -838,12 +838,19 @@ class TestRunDeterministicReconSweep:
         h.scheduler.get_tasks = AsyncMock(return_value=[task])
         h._escalation_queue.get_by_task = MagicMock(return_value=[esc])  # type: ignore[union-attr]
         h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
-        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        # Returns False = "I deduped, I filed nothing" — the real method's
+        # answer for this fixture.  Since task 3541 Source A always CALLS the
+        # method (its self-dedup is the only copy of that guard) and gates
+        # `recovered_this_pass` on the return value, which is what preserves
+        # this test's actual contract: a deduped task is still Source B's.
+        h._recover_stranded_deterministic_task = AsyncMock(  # type: ignore[method-assign]
+            return_value=False,
+        )
         h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
 
         await h._run_deterministic_recon_sweep()
 
-        h._recover_stranded_deterministic_task.assert_not_awaited()
+        h._recover_stranded_deterministic_task.assert_awaited_once()
         h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
             esc, task, metadata
         )
@@ -1383,7 +1390,16 @@ def _pinned_deploy_strand(tid: str = 'tid-pinned') -> dict:
 
 
 class TestDeterministicReconSweepSiteEmits:
-    """The sweep's Source-A deploy dedup skip — the SILENT half of the pair."""
+    """One sweep pass over a deduped deploy strand: the row it writes.
+
+    Was "the SILENT half of the pair" — the Source-A deploy branch's own copy
+    of the dedup read and veto.  Task 3541 deleted that copy, so a pass now
+    reaches the SAME hold through `_recover_stranded_deterministic_task` and
+    the row carries that method's site label.  Everything else about the row —
+    the reason, the ids, the ages, the shape, the RE-FILE-NEVER-FLIP
+    disposition, the bounded repeat — is unchanged, which is what makes the
+    collapse a de-duplication rather than a behaviour change.
+    """
 
     @pytest.mark.asyncio
     async def test_dedup_skip_emits_recovery_vetoed(self, tmp_path: Path) -> None:
@@ -1400,7 +1416,10 @@ class TestDeterministicReconSweepSiteEmits:
         assert rows[0]['event_type'] == EventType.recovery_vetoed.value
         assert rows[0]['task_id'] == 'tid-pinned'
         data = rows[0]['data']
-        assert data['site'] == 'deterministic_recon_sweep'
+        assert data['site'] == 'deterministic_recon_deploy', (
+            'the surviving guard is the one inside '
+            '_recover_stranded_deterministic_task, so its label is what charges'
+        )
         assert data['reason'] == 'escalation_pinned'
         assert data['store_unavailable'] is False
 
@@ -1540,16 +1559,19 @@ class TestDeterministicReconDeploySiteEmits:
         h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
 
-class TestDeterministicReconPairIsMeasurable:
-    """The point of the two labels: the duplication becomes a FACT."""
+class TestDeterministicReconPairIsCollapsed:
+    """The duplication measured under two labels is GONE (task 3541).
+
+    This class is the deliberate inversion of the one it replaces, which
+    asserted that both halves spoke under distinct site labels precisely so
+    task eta could measure the duplication rather than assume it.  Eta is that
+    collapse, so the assertion flips: one hold, one label.
+    """
 
     @pytest.mark.asyncio
-    async def test_the_pair_speaks_under_two_distinct_site_labels(
+    async def test_a_sweep_pass_and_a_direct_call_use_the_same_site(
         self, tmp_path: Path,
     ) -> None:
-        """Deliberately NOT asserting that only one fires — de-duplicating
-        the predicate is task eta's (3541), and a shared label would hide
-        exactly the duplication eta needs to measure."""
         h = _emitting_recon_harness(tmp_path)
         task = _pinned_deploy_strand()
         h.scheduler.get_tasks = AsyncMock(return_value=[task])
@@ -1562,9 +1584,11 @@ class TestDeterministicReconPairIsMeasurable:
         )
 
         sites = [r['data']['site'] for r in _recon_recovery_rows(h)]
-        assert sites == ['deterministic_recon_sweep', 'deterministic_recon_deploy'], (
-            'both halves of the duplicated predicate must be independently '
-            'attributable in the event store'
+        assert sites == ['deterministic_recon_deploy'], (
+            'ONE hold, ONE row.  The sweep now reaches this hold THROUGH the '
+            'method, so both observations are the same site speaking and the '
+            'emitter\'s transition guard collapses them — where the two labels '
+            'each carried their own transition state and so both spoke'
         )
 
 
@@ -1905,7 +1929,7 @@ class TestDeterministicReconStreakRelease:
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
         await _recon_passes(h, clock, 3)
-        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_deploy'}
 
         h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
         clock.advance(_RECON_INTERVAL)
@@ -2032,7 +2056,7 @@ class TestDeterministicReconStreakReleaseIsSiteScoped:
         # A reconcile pass that swept nothing: its own entry is stale.
         h._release_recovery_veto_streaks(RecoverySweepTally())
 
-        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_deploy'}
         assert len(_sentinel_alarms(h)) == 1, (
             'the deterministic sweep still holds this task — its shared alarm '
             'must not be stood down by the other sweep'

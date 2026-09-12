@@ -111,6 +111,7 @@ from orchestrator.recovery_emission import (
     should_emit_event,
     veto_signature,
 )
+from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -14131,8 +14132,14 @@ class Harness:
     async def _recover_stranded_deterministic_task(
         self, tid: str, task: dict, metadata: dict,
         *, tally: RecoverySweepTally | None = None,
-    ) -> None:
+    ) -> bool:
         """Recover a task-2059-shaped stranded deterministic task (Source A).
+
+        Returns True iff an escalation was actually FILED.  The caller uses
+        that to gate its ``recovered_this_pass`` bookkeeping (task 3541): a
+        dedup skip must NOT mark the task recovered, or Source B would stop
+        re-validating its open record for a whole pass — which is exactly what
+        the deleted outer copy's ``continue`` used to achieve by not adding it.
 
         ``tally`` is the calling sweep's per-pass recovery accumulator, OPTIONAL
         and defaulted so every direct caller keeps working untouched (the same
@@ -14140,12 +14147,15 @@ class Harness:
         one gets this site's holds folded in, which is what lets the sweep
         release the streak alarms of tasks it no longer holds.
 
-        Dedup-guarded: skips when a pending escalation already exists for
+        Dedup-guarded: skips when a PINNING escalation is already open for
         *tid* — self-dedupes across sweep passes once filed.  That skip logs
         (unchanged) AND emits a structured ``recovery_vetoed`` naming the
-        pinning records (task 3535); the sweep's Source-A deploy branch
-        implements the same predicate and emits under its own site label, so
-        the duplication is measurable until task eta (3541) collapses it.
+        pinning records (task 3535).  This is now the SOLE copy of that guard:
+        task 3541 deleted the twin in ``_run_deterministic_recon_sweep``'s
+        Source-A deploy branch, which read the same queue and emitted the same
+        veto one line earlier.  THIS copy is the one that survived because the
+        method has direct callers that rely on it — deleting it would make the
+        method unsafe to call standalone.
         Re-validates live systemd health for the deploy's target unit and
         RE-FILES a single L1 escalation — this method NEVER calls
         ``set_task_status`` (RE-FILE-NEVER-FLIP discipline, mirroring the
@@ -14166,24 +14176,36 @@ class Harness:
                 shape=render_shape(None, None, None, None, None),
                 store_unavailable=True,
             )
-            return
+            return False
         # The queue is present: re-arm this site's one-shot notice, exactly as
         # Scheduler._phase_redispatch_stranded_blocked re-arms its own latch.
         self._rearm_recovery_process_notice(RecoverySite.deterministic_recon_deploy)
         _dedup_rows = self._escalation_queue.get_by_task(tid, status='pending')
-        if _dedup_rows:
+        # The SHARED pin predicate (task 3541, INV-5), not a bare
+        # `bool(_dedup_rows)`.  `live_claimant=False` is honest here: the only
+        # production caller enumerates `blocked` tasks in the
+        # stranded-deterministic shape, so no incarnation holds them, and a
+        # direct caller invoking this method is by construction acting on a
+        # task nothing is running.  Under `classify_pins` link 4 that makes a
+        # plain L0 read DEAD_L0.
+        #
+        # Consequence, accepted and correct under spec S6: an info-severity
+        # record and a dead-filer L0 no longer suppress the re-file.  An
+        # annotation is not a handoff, and a dead L0 has no consumer left — in
+        # neither case is there an open handoff for this re-file to duplicate,
+        # which is the only thing this guard exists to prevent.
+        if records_pin_recovery(tid, _dedup_rows, live_claimant=False):
             logger.info(
                 'Deterministic-recon-sweep: task %s already has a pending '
                 'escalation — skipping strand recovery (dedup)',
                 tid,
             )
             # The log line above stays the HUMAN record and the event below is
-            # the machine-readable one; neither replaces the other.  This
-            # predicate is duplicated verbatim in _run_deterministic_recon_
-            # sweep's Source-A deploy branch, which emits under its own
-            # RecoverySite.deterministic_recon_sweep label — task eta (3541)
-            # owns collapsing the pair, and until then BOTH deliberately speak
-            # so the duplication is measurable rather than assumed.
+            # the machine-readable one; neither replaces the other.  Since task
+            # 3541 this is the ONLY emission for this hold: the twin under
+            # RecoverySite.deterministic_recon_sweep is gone, so one pass over
+            # one held task now produces exactly one row under exactly one
+            # site label.
             self._emit_recovery_disposition(
                 tid,
                 site=RecoverySite.deterministic_recon_deploy,
@@ -14195,7 +14217,7 @@ class Harness:
                 records=_dedup_rows,
                 tally=tally,
             )
-            return
+            return False
 
         verdict = await self._revalidate_deterministic_deploy_health(metadata)
         before_done = metadata.get('before_done') or {}
@@ -14265,6 +14287,7 @@ class Harness:
             'L1 %s (category=%s, suggested_action=%s, no status change)',
             tid, verdict, esc.id, category, suggested_action,
         )
+        return True
 
     async def _recover_stranded_deterministic_gate(
         self, tid: str, task: dict, metadata: dict,
@@ -14564,10 +14587,11 @@ class Harness:
         tasks = await self.scheduler.get_tasks(statuses=['blocked'])
         task_by_id: dict[str, dict] = {}
         recovered_this_pass: set[str] = set()
-        # ONE tally across BOTH deterministic sites, deliberately: they are two
-        # halves of one duplicated predicate (task eta / 3541 collapses them)
-        # and the streak alarm they can file is keyed on task_id alone, so
-        # "held ANYWHERE in this pass" is exactly the right release granularity.
+        # ONE tally across BOTH deterministic sites, deliberately: the streak
+        # alarm they can file is keyed on task_id alone, so "held ANYWHERE in
+        # this pass" is exactly the right release granularity.  Since task 3541
+        # collapsed the duplicated predicate only the deploy site can still
+        # CHARGE, but the release below still names both — see there.
         # Bookkeeping only — this sweep has its own logging and does NOT log a
         # second summary line; part (2)'s unconditional summary belongs to the
         # reconcile sweep.
@@ -14598,33 +14622,28 @@ class Harness:
                 if _is_deploy:
                     # Deploy strand: dedup on the pending queue, then re-file an
                     # L1 whose category depends on live systemd unit health.
-                    _deploy_rows = self._escalation_queue.get_by_task(
-                        tid, status='pending',
-                    )
-                    if _deploy_rows:
-                        # Was a completely SILENT `continue`.  Twin of the
-                        # identical predicate at the head of
-                        # _recover_stranded_deterministic_task, which emits
-                        # under RecoverySite.deterministic_recon_deploy; task
-                        # eta (3541) owns collapsing the pair, and until then
-                        # BOTH deliberately emit so the duplication is
-                        # measurable rather than assumed.
-                        self._emit_recovery_disposition(
-                            tid,
-                            site=RecoverySite.deterministic_recon_sweep,
-                            reason=LeaveReason.escalation_pinned,
-                            shape=render_shape(
-                                'blocked', None, None, True,
-                                (metadata.get('deploy_state') or {}).get('phase'),
-                            ),
-                            records=_deploy_rows,
-                            tally=recovery_tally,
-                        )
-                        continue
-                    await self._recover_stranded_deterministic_task(
+                    #
+                    # BOTH of those live in _recover_stranded_deterministic_task
+                    # (task 3541).  This branch used to perform the SAME
+                    # `get_by_task(tid, status='pending')` read and the SAME
+                    # veto one line before calling it, emitting under a second
+                    # site label — so a recovered strand paid for two identical
+                    # reads per pass and a held one produced two rows for one
+                    # hold.  The inner copy is the one that survived because
+                    # the method has direct callers that rely on its own guard.
+                    #
+                    # The return value is what keeps this collapse
+                    # behaviour-preserving.  The deleted `continue` marked a
+                    # dedup-skipped task as NOT recovered_this_pass, so Source
+                    # B still re-validated its open record in the same pass;
+                    # calling through unconditionally and always adding the tid
+                    # would silently skip that re-validation for a whole pass.
+                    # Gating on "did it actually FILE?" reproduces the old
+                    # membership exactly.
+                    if await self._recover_stranded_deterministic_task(
                         tid, task, metadata, tally=recovery_tally,
-                    )
-                    recovered_this_pass.add(tid)
+                    ):
+                        recovered_this_pass.add(tid)
                 elif _is_gate:
                     # Gate strand: the discriminator is an archive-INCLUSIVE,
                     # role-scoped emptiness check (status=None scans queue root +
@@ -14656,8 +14675,13 @@ class Harness:
 
         # Source A is the only part of this pass that can CHARGE a veto streak,
         # so its end is this sweep's release point.  Both deterministic sites
-        # are named because this pass drives both; releasing only the one that
-        # happened to fire would leave the other's entry to grow forever.
+        # are still named even though task 3541 left only
+        # `deterministic_recon_deploy` able to charge: a pre-collapse
+        # orchestrator charged `deterministic_recon_sweep` too, and a streak
+        # entry under that label survives in the registry across the deploy
+        # that lands this change.  Releasing only the site that can still fire
+        # would leave those entries to grow forever, so the member and the
+        # two-site release both stay.
         # Deliberately after the loop rather than at method exit: the alarm it
         # may resolve is itself a pending record, and standing it down here
         # keeps Source B's re-globbed get_pending() from re-observing an
