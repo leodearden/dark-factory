@@ -38,8 +38,9 @@ def _caller_param_names() -> list[str]:
     module-level symbol to import — `_tool_manager.get_tool(...).fn` is the
     established accessor spelling in this suite.
     """
-    fn = create_mcp_server(AsyncMock())._tool_manager.get_tool('search').fn
-    return [n for n in inspect.signature(fn).parameters if n.startswith('caller_')]
+    tool = create_mcp_server(AsyncMock())._tool_manager.get_tool('search')
+    assert tool is not None, 'the search tool is not registered on the MCP server'
+    return [n for n in inspect.signature(tool.fn).parameters if n.startswith('caller_')]
 
 
 def test_memory_instructions_name_every_caller_param():
