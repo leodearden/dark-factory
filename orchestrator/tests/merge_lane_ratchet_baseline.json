@@ -1426,7 +1426,7 @@
     "orchestrator/tests/test_merge_queue_disposition_wiring.py": {"patch_targets": ["_run_post_merge_verify", "classify_merge_failure_disposition", "run_scoped_verification", "verify_failure_is_preexisting_on_main"], "private_reads": 2},
     "orchestrator/tests/test_merge_queue_dry_run_unblock.py": {"patch_targets": ["SpeculativeMergeWorker", "_ensure_verify_disk_space", "_run_post_merge_verify", "enforce_merge_liveness_margin", "enforce_persistent_worktree_serial_lane", "run_dry_run_unblock", "run_scoped_verification", "verify_failure_is_preexisting_on_main"], "private_reads": 23},
     "orchestrator/tests/test_merge_queue_duplicate_submission.py": {"patch_targets": [], "private_reads": 39},
-    "orchestrator/tests/test_merge_queue_equivalence.py": {"patch_targets": ["_check_post_merge_pyright", "_run_unscoped_typechecks", "run_scoped_verification", "run_verification"], "private_reads": 5},
+    "orchestrator/tests/test_merge_queue_equivalence.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_finalize_head_visibility.py": {"patch_targets": [], "private_reads": 18},
     "orchestrator/tests/test_merge_queue_flake_recorder.py": {"patch_targets": [], "private_reads": 11},
     "orchestrator/tests/test_merge_queue_frozen_prefix.py": {"patch_targets": [], "private_reads": 69},
