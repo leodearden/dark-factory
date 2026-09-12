@@ -14,9 +14,10 @@ import contextlib
 import logging
 import sqlite3
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, make_lane
 from _serial_merge_worker import MergeWorker
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -27,8 +28,8 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
     PostMergePyrightResult,
-    SpeculativeMergeWorker,
     _check_post_merge_pyright,
+    _run_unscoped_typechecks,
 )
 from orchestrator.merge_types import QueuedBranch
 
@@ -255,284 +256,228 @@ class TestCheckPostMergePyrightBehavioral:
 
 
 # ---------------------------------------------------------------------------
-# _check_post_merge_pyright — classification / fail-open edge cases (mocked)
+# Stand-in type_check_commands and config shims for the real-condition rows
+# ---------------------------------------------------------------------------
+
+# Outlives any test-sized verify budget; paired with _impatient() below to
+# produce a genuine timeout rather than a mocked one.
+_TYPE_CMD_HANGS = 'python3 -c "import time; time.sleep(60)"'
+
+
+def _type_cmd_green_then_red(counter: Path) -> str:
+    """A type_check_command green on its first run and red on every later one.
+
+    Models what the POST-advance gate exists to catch: a type-check that
+    passed in the merge worktree and fails once main carries the merge.  The
+    pre-advance gate consumes the green run, the post-advance check sees the
+    red one.  The counter lives outside the worktree so the fresh worktree
+    created at the advanced SHA still sees it.
+    """
+    return (
+        'python3 -c "'
+        'import sys, pathlib; '
+        f"c = pathlib.Path('{counter}'); "
+        'first = not c.exists(); '
+        "c.write_text('ran'); "
+        'sys.exit(0) if first else '
+        "(sys.stderr.write('synthetic type error\\n'), sys.exit(1))"
+        '"'
+    )
+
+
+def _impatient(config: OrchestratorConfig, secs: float = 1.0) -> OrchestratorConfig:
+    """*config* with a per-command verify budget short enough to trip in a test."""
+    return config.model_copy(update={
+        'verify_command_timeout_secs': secs,
+        'verify_cold_command_timeout_secs': secs,
+        'merge_verify_cold_command_timeout_secs': secs,
+    })
+
+
+def _merge_worktrees(git_ops: GitOps) -> list[Path]:
+    """The merge worktrees on disk — the public trace of create/cleanup."""
+    return sorted(git_ops.worktree_base.glob('_merge-*'))
+
+
+async def _land(git_ops: GitOps, worktree: Path, branch: str) -> str:
+    """Merge *branch* and advance main, returning the advanced SHA.
+
+    Leaves no merge worktree behind, so a later ``_merge_worktrees`` reading
+    reports only what the code under test created.
+    """
+    merge_result = await git_ops.merge_to_main(worktree, branch)
+    assert merge_result.success
+    assert merge_result.merge_commit is not None
+    assert merge_result.merge_worktree is not None
+    try:
+        outcome = await git_ops.advance_main(
+            merge_result.merge_commit, merge_result.merge_worktree,
+            branch=branch, max_attempts=1,
+        )
+        return outcome.advanced_sha or merge_result.merge_commit
+    finally:
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+
+# ---------------------------------------------------------------------------
+# _check_post_merge_pyright — fail-open edge cases, over real git
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestCheckPostMergePyrightClassification:
-    """Classification / fail-open edge cases — mock run_verification and git_ops."""
+class TestCheckPostMergePyrightFailOpen:
+    """The gate never blocks a landed merge on a hang or an infra error.
 
-    def _make_git_ops(self, *, raise_on_create: Exception | None = None):
-        git_ops = MagicMock()
-        if raise_on_create is not None:
-            git_ops._create_merge_worktree = AsyncMock(side_effect=raise_on_create)
-        else:
-            git_ops._create_merge_worktree = AsyncMock(
-                return_value=(Path('/tmp/fake-wt'), 'deadbeef')
-            )
-        git_ops.cleanup_merge_worktree = AsyncMock()
-        return git_ops
+    Each row produces the condition for real — a type-check that outruns its
+    budget, a SHA no worktree can be created at, a type-check that exits
+    non-zero — and observes the worktree bookkeeping as the merge worktrees
+    left on disk.
+    """
 
-    def _make_verify_result(
-        self, *, passed: bool, timed_out: bool = False,
-        type_output: str = 'type error output',
-    ) -> MagicMock:
-        v = MagicMock()
-        v.passed = passed
-        v.timed_out = timed_out
-        v.type_output = type_output
-        v.failure_report = MagicMock(return_value='failure report text' if not passed else '')
-        return v
-
-    @pytest.fixture
-    def config(self, tmp_path: Path) -> OrchestratorConfig:
-        """Minimal config for mocked tests."""
-        from orchestrator.config import GitConfig
-        return OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-                push_after_advance=False,
-            ),
-        )
-
-    async def test_timeout_treated_as_fail_open(
-        self, config: OrchestratorConfig, caplog,
+    async def test_a_hanging_type_check_fails_open(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
     ):
-        """verify.timed_out=True + passed=False → fail open (not broken), warning logged."""
-        git_ops = self._make_git_ops()
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-        verify_result = self._make_verify_result(passed=False, timed_out=True)
+        """A type-check that outruns its budget → not broken, warning logged."""
+        advanced_sha = await git_ops.get_main_sha()
+        mc = _make_module_config(prefix='pkg', type_check_command=_TYPE_CMD_HANGS)
 
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(return_value=verify_result),
-        ), caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING):
             result = await _check_post_merge_pyright(
-                'abc123', git_ops, config, [mc], task_id='timeout-test',
+                advanced_sha, git_ops, _impatient(config), [mc], task_id='timeout-test',
             )
 
         assert result.broken is False
         assert result.failing_subprojects == []
+        assert result.timed_out_subprojects == ['pkg']
         assert any('timed out' in r.message.lower() for r in caplog.records)
+        assert _merge_worktrees(git_ops) == []
 
-    async def test_genuine_failure_not_timed_out_is_broken(
-        self, config: OrchestratorConfig,
+    async def test_a_sha_no_worktree_can_be_created_at_fails_open(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
     ):
-        """verify.passed=False AND timed_out=False → genuine failure → broken=True."""
-        git_ops = self._make_git_ops()
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-        verify_result = self._make_verify_result(
-            passed=False, timed_out=False, type_output='error: foo.py:10',
-        )
+        """An unresolvable SHA makes worktree creation raise → not broken."""
+        mc = _make_module_config(prefix='pkg')
 
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(return_value=verify_result),
-        ):
+        with caplog.at_level(logging.WARNING):
             result = await _check_post_merge_pyright(
-                'abc123', git_ops, config, [mc], task_id='fail-test',
-            )
-
-        assert result.broken is True
-        assert 'pkg' in result.failing_subprojects
-        assert result.detail != ''
-
-    async def test_create_merge_worktree_exception_fails_open(
-        self, config: OrchestratorConfig, caplog,
-    ):
-        """_create_merge_worktree raising RuntimeError → fail open (not broken), WARNING logged."""
-        git_ops = self._make_git_ops(raise_on_create=RuntimeError('git error'))
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = await _check_post_merge_pyright(
-                'abc123', git_ops, config, [mc], task_id='infra-error-test',
+                'f' * 40, git_ops, config, [mc], task_id='infra-error-test',
             )
 
         assert result.broken is False
         assert result.failing_subprojects == []
         assert any('infra error' in r.message.lower() for r in caplog.records)
-        # cleanup must NOT be called since worktree was never created
-        git_ops.cleanup_merge_worktree.assert_not_awaited()
+        # Nothing was created, so nothing is left to clean up.
+        assert _merge_worktrees(git_ops) == []
 
-    async def test_cleanup_called_even_when_verify_fails(
-        self, config: OrchestratorConfig,
+    async def test_the_merge_worktree_is_removed_even_when_the_check_fails(
+        self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Worktree cleanup is awaited in finally even when verify reports a failure."""
-        fake_wt = Path('/tmp/fake-wt')
-        git_ops = self._make_git_ops()
-        git_ops._create_merge_worktree = AsyncMock(
-            return_value=(fake_wt, 'deadbeef')
-        )
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-        verify_result = self._make_verify_result(passed=False, timed_out=False)
+        """Cleanup runs in ``finally``, so the failing path leaks no worktree."""
+        wt = (await git_ops.create_worktree('pyright-cleanup')).path
+        (wt / '.BROKEN_UNION').write_text('broken\n')
+        await git_ops.commit(wt, 'Add .BROKEN_UNION marker')
+        advanced_sha = await _land(git_ops, wt, 'pyright-cleanup')
 
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(return_value=verify_result),
-        ):
-            result = await _check_post_merge_pyright(
-                'abc123', git_ops, config, [mc], task_id='cleanup-test',
-            )
+        result = await _check_post_merge_pyright(
+            advanced_sha, git_ops, config, [_make_module_config(prefix='pkg')],
+            task_id='cleanup-test',
+        )
 
         assert result.broken is True
-        git_ops.cleanup_merge_worktree.assert_awaited_once_with(fake_wt)
+        assert _merge_worktrees(git_ops) == []
 
 
 # ---------------------------------------------------------------------------
-# _run_unscoped_typechecks — classification tests (step-3)
+# _run_unscoped_typechecks — classification, over real type-check commands
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestRunUnscopedTypechecks:
-    """Tests for the _run_unscoped_typechecks helper.
+    """The per-module classification loop, over real commands.
 
-    Uses a caller-supplied fake worktree Path to confirm the helper does NOT
-    create or clean up a worktree — it operates on what the caller provides.
+    Every row runs the real ``type_check_command`` in a caller-supplied
+    worktree.  That the helper creates and cleans up no worktree of its own
+    is observed as the merge-worktree set staying empty across the call.
     """
 
-    def _make_git_ops(self) -> MagicMock:
-        git_ops = MagicMock()
-        git_ops._create_merge_worktree = AsyncMock()
-        git_ops.cleanup_merge_worktree = AsyncMock()
-        return git_ops
+    async def test_a_failing_type_check_is_broken(
+        self, git_ops: GitOps, git_repo: Path, config: OrchestratorConfig,
+    ):
+        """Exits non-zero without timing out → genuine failure, detail captured."""
+        (git_repo / '.BROKEN_UNION').write_text('broken\n')
 
-    def _make_verify_result(
-        self, *, passed: bool, timed_out: bool = False,
-        type_output: str = 'type error output',
-    ) -> MagicMock:
-        v = MagicMock()
-        v.passed = passed
-        v.timed_out = timed_out
-        v.type_output = type_output
-        v.failure_report = MagicMock(return_value='failure report text' if not passed else '')
-        return v
-
-    @pytest.fixture
-    def config(self, tmp_path: Path) -> OrchestratorConfig:
-        from orchestrator.config import GitConfig
-        return OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-                push_after_advance=False,
-            ),
+        result = await _run_unscoped_typechecks(
+            git_repo, config, [_make_module_config(prefix='pkg')],
+            block_on_timeout=False, task_id='fail-test',
         )
 
-    async def test_genuine_failure_is_broken(self, config: OrchestratorConfig):
-        """passed=False, timed_out=False → prefix in failing_subprojects, broken=True."""
-        from orchestrator.merge_queue import _run_unscoped_typechecks
-        fake_wt = Path('/tmp/fake-wt')
-        git_ops = self._make_git_ops()
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-        verify_result = self._make_verify_result(passed=False, timed_out=False)
-
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(return_value=verify_result),
-        ):
-            result = await _run_unscoped_typechecks(
-                fake_wt, config, [mc],
-                block_on_timeout=False, task_id='fail-test',
-            )
-
         assert result.broken is True
-        assert 'pkg' in result.failing_subprojects
-        # No worktree creation/cleanup by the helper itself
-        git_ops._create_merge_worktree.assert_not_awaited()
-        git_ops.cleanup_merge_worktree.assert_not_awaited()
+        assert result.failing_subprojects == ['pkg']
+        assert 'synthetic type error' in result.detail
+        # The helper operates on the worktree it is given; it creates none.
+        assert _merge_worktrees(git_ops) == []
 
-    async def test_timeout_with_block_on_timeout_false_fails_open(
-        self, config: OrchestratorConfig,
+    async def test_a_hanging_type_check_fails_open_when_timeouts_do_not_block(
+        self, git_repo: Path, config: OrchestratorConfig,
     ):
-        """timed_out=True, block_on_timeout=False → fail-open: NOT in failing, IS in timed_out."""
-        from orchestrator.merge_queue import _run_unscoped_typechecks
-        fake_wt = Path('/tmp/fake-wt')
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-        verify_result = self._make_verify_result(passed=False, timed_out=True)
+        """block_on_timeout=False → timed out but NOT failing (post-advance shape)."""
+        mc = _make_module_config(prefix='pkg', type_check_command=_TYPE_CMD_HANGS)
 
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(return_value=verify_result),
-        ):
-            result = await _run_unscoped_typechecks(
-                fake_wt, config, [mc],
-                block_on_timeout=False, task_id='timeout-open-test',
-            )
+        result = await _run_unscoped_typechecks(
+            git_repo, _impatient(config), [mc],
+            block_on_timeout=False, task_id='timeout-open-test',
+        )
 
         assert result.broken is False
-        assert 'pkg' not in result.failing_subprojects
-        assert 'pkg' in result.timed_out_subprojects
+        assert result.failing_subprojects == []
+        assert result.timed_out_subprojects == ['pkg']
 
-    async def test_timeout_with_block_on_timeout_true_is_broken(
-        self, config: OrchestratorConfig,
+    async def test_a_hanging_type_check_is_broken_when_timeouts_block(
+        self, git_repo: Path, config: OrchestratorConfig,
     ):
-        """timed_out=True, block_on_timeout=True → fail-closed: in BOTH failing AND timed_out."""
-        from orchestrator.merge_queue import _run_unscoped_typechecks
-        fake_wt = Path('/tmp/fake-wt')
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-        verify_result = self._make_verify_result(passed=False, timed_out=True)
+        """block_on_timeout=True → timed out AND failing (pre-advance shape)."""
+        mc = _make_module_config(prefix='pkg', type_check_command=_TYPE_CMD_HANGS)
 
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(return_value=verify_result),
-        ):
-            result = await _run_unscoped_typechecks(
-                fake_wt, config, [mc],
-                block_on_timeout=True, task_id='timeout-closed-test',
-            )
+        result = await _run_unscoped_typechecks(
+            git_repo, _impatient(config), [mc],
+            block_on_timeout=True, task_id='timeout-closed-test',
+        )
 
         assert result.broken is True
-        assert 'pkg' in result.failing_subprojects
-        assert 'pkg' in result.timed_out_subprojects
+        assert result.failing_subprojects == ['pkg']
+        assert result.timed_out_subprojects == ['pkg']
 
-    async def test_clean_result_is_empty(self, config: OrchestratorConfig):
-        """passed=True → both lists empty, broken=False, timed_out=False."""
-        from orchestrator.merge_queue import _run_unscoped_typechecks
-        fake_wt = Path('/tmp/fake-wt')
-        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
-        verify_result = self._make_verify_result(passed=True, timed_out=False)
-
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(return_value=verify_result),
-        ):
-            result = await _run_unscoped_typechecks(
-                fake_wt, config, [mc],
-                block_on_timeout=True, task_id='clean-test',
-            )
+    async def test_a_passing_type_check_is_clean(
+        self, git_repo: Path, config: OrchestratorConfig,
+    ):
+        """Exits zero → both lists empty, neither broken nor timed out."""
+        result = await _run_unscoped_typechecks(
+            git_repo, config, [_make_module_config(prefix='pkg')],
+            block_on_timeout=True, task_id='clean-test',
+        )
 
         assert result.broken is False
         assert result.timed_out is False
         assert result.failing_subprojects == []
         assert result.timed_out_subprojects == []
 
-    async def test_no_type_check_command_skips_module(self, config: OrchestratorConfig):
-        """Modules with type_check_command=None are skipped; returns clean result."""
-        from orchestrator.merge_queue import _run_unscoped_typechecks
-        fake_wt = Path('/tmp/fake-wt')
-        mc = _make_module_config(prefix='pkg', type_check_command=None)
+    async def test_a_module_without_a_type_check_command_is_skipped(
+        self, git_repo: Path, config: OrchestratorConfig,
+    ):
+        """The command-less module is not run: on a red tree, only the other fails."""
+        (git_repo / '.BROKEN_UNION').write_text('broken\n')
 
-        with patch(
-            'orchestrator.merge_queue.run_verification',
-            AsyncMock(),
-        ) as mock_run:
-            result = await _run_unscoped_typechecks(
-                fake_wt, config, [mc],
-                block_on_timeout=True, task_id='no-cmd-test',
-            )
+        result = await _run_unscoped_typechecks(
+            git_repo, config,
+            [
+                _make_module_config(prefix='no-cmd', type_check_command=None),
+                _make_module_config(prefix='pkg'),
+            ],
+            block_on_timeout=True, task_id='no-cmd-test',
+        )
 
-        mock_run.assert_not_awaited()
-        assert result.broken is False
+        assert result.failing_subprojects == ['pkg']
 
 
 # ---------------------------------------------------------------------------
@@ -560,37 +505,24 @@ def _make_merge_request(
     )
 
 
-def _mock_scoped_verify_pass():
-    """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=MagicMock(passed=True, summary=''))
-
-
-def _mock_pyright_clean():
-    """Return a mock that makes _check_post_merge_pyright return clean (not broken)."""
-    return AsyncMock(return_value=PostMergePyrightResult())
-
-
-def _mock_pyright_broken(prefix: str = 'subpkg'):
-    """Return a mock that makes _check_post_merge_pyright return broken."""
-    return AsyncMock(return_value=PostMergePyrightResult(
-        failing_subprojects=[prefix],
-        detail='error: src/foo.py:10: Missing method bar',
-    ))
-
-
-def _mock_unscoped_gate_pass():
-    """Return a mock that makes _run_unscoped_typechecks (the pre-advance gate) always pass.
-
-    Tests for the post-advance _check_post_merge_pyright call-site patch this
-    to ensure the new pre-advance gate does not block the merge before the
-    post-advance check is reached.
-    """
-    return AsyncMock(return_value=PostMergePyrightResult())
+async def _drain(worker, worker_task: asyncio.Task) -> None:
+    """Stop *worker* and let its run loop finish."""
+    await worker.stop()
+    worker_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker_task
 
 
 @pytest.mark.asyncio
 class TestMergeWorkerPyrightCallSite:
-    """Integration: MergeWorker._do_merge calls _check_post_merge_pyright after equiv check."""
+    """MergeWorker._do_merge runs the post-advance type-check gate.
+
+    The serial worker takes no ``VerifyPort``, so BOTH the pre-advance gate
+    and the post-advance check run the real ``type_check_command``.  The
+    broken rows therefore use the green-then-red stand-in: the pre-advance
+    gate consumes the green run and the post-advance check sees the red one,
+    which is exactly the condition this gate exists for.
+    """
 
     async def test_broken_pyright_blocks_merge_without_push(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -600,30 +532,16 @@ class TestMergeWorkerPyrightCallSite:
         (worktree / 'mod.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add mod.py')
 
-        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
+        mc = _make_module_config(
+            prefix='subpkg',
+            type_check_command=_type_cmd_green_then_red(tmp_path / 'mw-broken.count'),
+        )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
         push_mock = AsyncMock(return_value='pushed')
-        with (
-            patch.object(git_ops, 'push_main', push_mock),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                _mock_scoped_verify_pass(),
-            ),
-            # Pre-advance gate must pass so the merge reaches advance_main and
-            # the post-advance _check_post_merge_pyright call (what this test
-            # actually exercises).
-            patch(
-                'orchestrator.merge_queue._run_unscoped_typechecks',
-                _mock_unscoped_gate_pass(),
-            ),
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                _mock_pyright_broken('subpkg'),
-            ),
-        ):
+        with patch.object(git_ops, 'push_main', push_mock):
             req = _make_merge_request(
                 'mw-pyright-broken', 'mw-pyright-broken', worktree, config,
                 module_configs=[mc],
@@ -631,10 +549,7 @@ class TestMergeWorkerPyrightCallSite:
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
 
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        await _drain(worker, worker_task)
 
         assert outcome.status == 'blocked'
         assert outcome.reason is not None
@@ -651,39 +566,19 @@ class TestMergeWorkerPyrightCallSite:
         (worktree / 'mod.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add mod.py')
 
-        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
+        mc = _make_module_config(prefix='subpkg')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                _mock_scoped_verify_pass(),
-            ),
-            # Pre-advance gate must pass so the merge reaches advance_main and
-            # the post-advance _check_post_merge_pyright call (what this test
-            # actually exercises).
-            patch(
-                'orchestrator.merge_queue._run_unscoped_typechecks',
-                _mock_unscoped_gate_pass(),
-            ),
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                _mock_pyright_clean(),
-            ),
-        ):
-            req = _make_merge_request(
-                'mw-pyright-clean', 'mw-pyright-clean', worktree, config,
-                module_configs=[mc],
-            )
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+        req = _make_merge_request(
+            'mw-pyright-clean', 'mw-pyright-clean', worktree, config,
+            module_configs=[mc],
+        )
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=30)
 
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        await _drain(worker, worker_task)
 
         assert outcome.status == 'done'
 
@@ -698,39 +593,22 @@ class TestMergeWorkerPyrightCallSite:
         (worktree / 'mod.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add mod.py')
 
-        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
+        mc = _make_module_config(
+            prefix='subpkg',
+            type_check_command=_type_cmd_green_then_red(tmp_path / 'mw-event.count'),
+        )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue, event_store=event_store)
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                _mock_scoped_verify_pass(),
-            ),
-            # Pre-advance gate must pass so the merge reaches advance_main and
-            # the post-advance _check_post_merge_pyright call (what this test
-            # actually exercises).
-            patch(
-                'orchestrator.merge_queue._run_unscoped_typechecks',
-                _mock_unscoped_gate_pass(),
-            ),
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                _mock_pyright_broken('subpkg'),
-            ),
-        ):
-            req = _make_merge_request(
-                'mw-pyright-event', 'mw-pyright-event', worktree, config,
-                module_configs=[mc],
-            )
-            await queue.put(req)
-            await asyncio.wait_for(req.result, timeout=30)
+        req = _make_merge_request(
+            'mw-pyright-event', 'mw-pyright-event', worktree, config,
+            module_configs=[mc],
+        )
+        await queue.put(req)
+        await asyncio.wait_for(req.result, timeout=30)
 
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        await _drain(worker, worker_task)
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -745,57 +623,43 @@ class TestMergeWorkerPyrightCallSite:
 
 
 # ---------------------------------------------------------------------------
-# SpeculativeMergeWorker._verifier_loop call-site integration tests  (step-7)
+# MergeLane._verifier_loop call-site integration tests  (step-7)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestSpeculativeMergeWorkerPyrightCallSite:
-    """Integration: SpeculativeMergeWorker._verifier_loop calls _check_post_merge_pyright."""
+class TestMergeLanePyrightCallSite:
+    """The lane's verifier loop runs the post-advance type-check gate.
 
-    async def test_broken_pyright_blocks_speculative_merge_without_push(
+    The lane threads its injected ``VerifyPort`` into post-merge verify, so
+    ``FakeVerifier`` supplies a passing scoped verify and a clean PRE-advance
+    unscoped gate.  The POST-advance check reaches back to the module
+    function and is not a port call, so it runs the real command against the
+    landed tree — which is what these rows exercise.
+    """
+
+    async def test_broken_pyright_blocks_lane_merge_without_push(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Broken pyright in speculative path → blocked outcome, reason starts with prefix, push NOT called."""
+        """Broken pyright in the lane → blocked outcome, prefix in reason, no push."""
         worktree = (await git_ops.create_worktree('smw-pyright-broken')).path
-        (worktree / 'mod.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add mod.py')
+        (worktree / '.BROKEN_UNION').write_text('broken\n')
+        await git_ops.commit(worktree, 'Add .BROKEN_UNION marker')
 
-        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
         push_mock = AsyncMock(return_value='pushed')
-        with (
-            patch.object(git_ops, 'push_main', push_mock),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                _mock_scoped_verify_pass(),
-            ),
-            # Pre-advance gate must pass so the merge reaches advance_main and
-            # the post-advance _check_post_merge_pyright call (what this test
-            # actually exercises).
-            patch(
-                'orchestrator.merge_queue._run_unscoped_typechecks',
-                _mock_unscoped_gate_pass(),
-            ),
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                _mock_pyright_broken('subpkg'),
-            ),
-        ):
+        with patch.object(git_ops, 'push_main', push_mock):
             req = _make_merge_request(
                 'smw-pyright-broken', 'smw-pyright-broken', worktree, config,
-                module_configs=[mc],
+                module_configs=[_make_module_config(prefix='subpkg')],
             )
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
 
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        await _drain(worker, worker_task)
 
         assert outcome.status == 'blocked'
         assert outcome.reason is not None
@@ -803,95 +667,49 @@ class TestSpeculativeMergeWorkerPyrightCallSite:
         assert 'subpkg' in outcome.reason
         push_mock.assert_not_awaited()
 
-    async def test_clean_pyright_allows_speculative_merge(
+    async def test_clean_pyright_allows_lane_merge(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Clean pyright in speculative path → 'done' outcome."""
+        """Clean pyright in the lane → 'done' outcome."""
         worktree = (await git_ops.create_worktree('smw-pyright-clean')).path
         (worktree / 'mod.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add mod.py')
 
-        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                _mock_scoped_verify_pass(),
-            ),
-            # Pre-advance gate must pass so the merge reaches advance_main and
-            # the post-advance _check_post_merge_pyright call (what this test
-            # actually exercises).
-            patch(
-                'orchestrator.merge_queue._run_unscoped_typechecks',
-                _mock_unscoped_gate_pass(),
-            ),
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                _mock_pyright_clean(),
-            ),
-        ):
-            req = _make_merge_request(
-                'smw-pyright-clean', 'smw-pyright-clean', worktree, config,
-                module_configs=[mc],
-            )
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+        req = _make_merge_request(
+            'smw-pyright-clean', 'smw-pyright-clean', worktree, config,
+            module_configs=[_make_module_config(prefix='subpkg')],
+        )
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=30)
 
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        await _drain(worker, worker_task)
 
         assert outcome.status == 'done'
 
-    async def test_broken_pyright_cleans_up_merge_worktree(
+    async def test_broken_pyright_leaves_no_merge_worktree_behind(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Broken pyright → merge_wt is cleaned up (cleanup_merge_worktree awaited)."""
+        """Broken pyright → every merge worktree the attempt created is gone."""
         worktree = (await git_ops.create_worktree('smw-pyright-cleanup')).path
-        (worktree / 'mod.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add mod.py')
+        (worktree / '.BROKEN_UNION').write_text('broken\n')
+        await git_ops.commit(worktree, 'Add .BROKEN_UNION marker')
 
-        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = make_lane(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
-        original_cleanup = git_ops.cleanup_merge_worktree
-        cleanup_spy = AsyncMock(wraps=original_cleanup)
-        with (
-            patch.object(git_ops, 'cleanup_merge_worktree', cleanup_spy),
-            patch(
-                'orchestrator.merge_queue.run_scoped_verification',
-                _mock_scoped_verify_pass(),
-            ),
-            # Pre-advance gate must pass so the merge reaches advance_main and
-            # the post-advance _check_post_merge_pyright call (what this test
-            # actually exercises).
-            patch(
-                'orchestrator.merge_queue._run_unscoped_typechecks',
-                _mock_unscoped_gate_pass(),
-            ),
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                _mock_pyright_broken('subpkg'),
-            ),
-        ):
-            req = _make_merge_request(
-                'smw-pyright-cleanup', 'smw-pyright-cleanup', worktree, config,
-                module_configs=[mc],
-            )
-            await queue.put(req)
-            await asyncio.wait_for(req.result, timeout=30)
-
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-        assert cleanup_spy.await_count >= 1, (
-            'cleanup_merge_worktree must be awaited on the broken pyright path'
+        req = _make_merge_request(
+            'smw-pyright-cleanup', 'smw-pyright-cleanup', worktree, config,
+            module_configs=[_make_module_config(prefix='subpkg')],
         )
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        await _drain(worker, worker_task)
+
+        assert outcome.status == 'blocked'
+        assert _merge_worktrees(git_ops) == []
