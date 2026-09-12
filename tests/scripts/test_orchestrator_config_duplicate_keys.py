@@ -237,6 +237,36 @@ def test_a_second_verify_env_block_is_silently_last_wins_and_is_reported(tmp_pat
     assert (finding.first_line, finding.duplicate_line) == (1, 4)
 
 
+_MUTANT_MARKER_KEY = 'DF_DUPLICATE_KEY_GUARD_MARKER'
+
+
+def _declared_verify_env(path: Path) -> dict[str, str]:
+    """The ``verify_env`` mapping as the file DECLARES it, read through the strict loader.
+
+    Through ``_NoDuplicateKeysLoader`` rather than ``yaml.safe_load``, and that
+    is redundant enforcement of the same invariant at a second site rather than
+    an accident: if the root config ever regains a duplicate key, this helper
+    RAISES instead of quietly handing back the surviving block — which would
+    otherwise leave the survival test comparing the survivor against itself and
+    agreeing.
+    """
+    document = yaml.load(path.read_text(), _NoDuplicateKeysLoader) or {}
+    return document.get('verify_env') or {}
+
+
+def _with_second_verify_env_block(text: str) -> str:
+    """Append a SECOND top-level ``verify_env:`` block, reproducing task 4635's shape.
+
+    A TEXT transform, never a yaml round trip: this is applied to a copy of
+    ``dark-factory-orchestrator.yaml``, ~1400 lines of load-bearing comments a
+    parse-and-dump would erase — the same reason
+    ``scripts/merge-pytest-n-ab-switch.sh`` edits that file by line. Appending
+    below the existing block is also precisely how the real defect arrived:
+    it conflicts with nothing.
+    """
+    return text.rstrip('\n') + f'\n\nverify_env:\n  {_MUTANT_MARKER_KEY}: "1"\n'
+
+
 def test_every_verify_env_key_declared_in_the_root_config_survives_into_the_effective_config(
     root_config: OrchestratorConfig,
 ) -> None:
