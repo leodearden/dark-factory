@@ -3228,9 +3228,7 @@ class TestSpeculativeMergeWorker:
                 return (1, '', 'fatal: not a git repository')
             return await original_run(cmd, cwd=cwd, **kwargs)
 
-        with (
-            patch('orchestrator.merge_queue._run', new=mock_run),
-        ):
+        with patch('orchestrator.merge_queue._run', new=mock_run):
             req_n = _make_request('rp-n', 'rp-n', wt_n, config)
             req_ok = _make_request('rp-ok', 'rp-ok', wt_ok, config)
             await queue.put(req_n)
@@ -3312,9 +3310,7 @@ class TestSpeculativeMergeWorker:
                 raise RuntimeError('Simulated get_main_sha failure')
             return await original_get_main_sha()
 
-        with (
-            patch.object(git_ops, 'get_main_sha', new=failing_get_main_sha),
-        ):
+        with patch.object(git_ops, 'get_main_sha', new=failing_get_main_sha):
             req_n = _make_request('mef-n', 'mef-n', wt_n, config)
             req_ok = _make_request('mef-ok', 'mef-ok', wt_ok, config)
             await queue.put(req_n)
@@ -3437,9 +3433,7 @@ class TestSpeculativeMergeWorker:
 
         req = _make_request('race-1', 'race-1', wt, config)
 
-        with (
-            patch.object(git_ops, 'merge_to_main', new=blocking_merge),
-        ):
+        with patch.object(git_ops, 'merge_to_main', new=blocking_merge):
             await queue.put(req)
             # Wait until the merger is definitely blocked inside merge_to_main.
             await asyncio.wait_for(merge_started.wait(), timeout=10)
@@ -3584,9 +3578,7 @@ class TestSpeculativeMergeWorker:
                 return AdvanceOutcome('cas_failed')
             return await original_advance(*args, **kwargs)
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_fail_twice_then_succeed),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_fail_twice_then_succeed):
             req = _make_request('scas-ok', 'scas-ok', wt, config)
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
@@ -3627,9 +3619,7 @@ class TestSpeculativeMergeWorker:
         async def _always_cas_fail(*args: Any, **kwargs: Any):
             return AdvanceOutcome('cas_failed')
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_always_cas_fail),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_always_cas_fail):
             req = _make_request('scas-lim', 'scas-lim', wt, config)
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
@@ -3728,9 +3718,7 @@ class TestSpeculativeMergeWorker:
             git_ops._last_stash_dirty_files = ['write_queue.db']
             return AdvanceOutcome('stash_failed')
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_stash_failed),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_stash_failed):
             req = _make_request('stashf-sw-1', 'stashf-sw-1', wt, config)
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
@@ -5893,9 +5881,7 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch.object(git_ops, 'merge_to_main', new=tracking_merge),
-        ):
+        with patch.object(git_ops, 'merge_to_main', new=tracking_merge):
             req_n = _make_request('ab-n', 'ab-n', wt_n, config)
             req_n1 = _make_request('ab-n1', 'ab-n1', wt_n1, config)
 
@@ -7004,9 +6990,7 @@ class TestWipHaltSpeculativeMergeWorker:
                 return AdvanceOutcome('wip_overlap')
             return await original_advance(*args, **kwargs)
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_wip_overlap_then_normal),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_wip_overlap_then_normal):
             # Submit req1 alone — no req2 in queue, so no speculative look-ahead
             req1 = _make_request('shalt-1', 'shalt-1', wt1, config)
             await queue.put(req1)
@@ -7047,9 +7031,7 @@ class TestWipHaltSpeculativeMergeWorker:
             git_ops._last_recovery_branch = 'wip/recovery-srecov-1-20260407T120000'
             return AdvanceOutcome('pop_conflict')
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_pop_conflict):
             req = _make_request('srecov-1', 'srecov-1', wt, config)
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
@@ -7082,9 +7064,7 @@ class TestWipHaltSpeculativeMergeWorker:
             # 1997), not the git_ops._last_advanced_sha side channel.
             return AdvanceOutcome('pop_conflict', advanced_sha='cafebabe' * 5)
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_pop_conflict):
             req = _make_request('srecov-sha', 'srecov-sha', wt, config)
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
@@ -7110,9 +7090,7 @@ class TestWipHaltSpeculativeMergeWorker:
         async def _unmerged_state(*args: Any, **kwargs: Any):
             return AdvanceOutcome('unmerged_state')
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_unmerged_state),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_unmerged_state):
             req = _make_request('uu-sw-1', 'uu-sw-1', wt, config)
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
@@ -7140,9 +7118,7 @@ class TestWipHaltSpeculativeMergeWorker:
             git_ops._last_recovery_branch = 'wip/recovery-x-y'
             return AdvanceOutcome('pop_conflict_no_advance')
 
-        with (
-            patch.object(git_ops, 'advance_main', side_effect=_pop_conflict_no_advance),
-        ):
+        with patch.object(git_ops, 'advance_main', side_effect=_pop_conflict_no_advance):
             req = _make_request('pcna-sw-1', 'pcna-sw-1', wt, config)
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
@@ -8831,9 +8807,7 @@ class TestPushHook:
         worker_task = asyncio.create_task(worker.run())
 
         push_mock = AsyncMock(return_value='pushed')
-        with (
-            patch.object(git_ops, 'push_main', push_mock),
-        ):
+        with patch.object(git_ops, 'push_main', push_mock):
             req = _make_request('spec-push', 'spec-push', worktree, config)
             await queue.put(req)
             result = await asyncio.wait_for(req.result, timeout=30)
@@ -11346,11 +11320,9 @@ class TestGroupMergeRequestSpeculativeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch.object(
-                git_ops, 'push_main',
-                AsyncMock(return_value='pushed'),
-            ),
+        with patch.object(
+            git_ops, 'push_main',
+            AsyncMock(return_value='pushed'),
         ):
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=60)
@@ -13256,9 +13228,7 @@ class TestSpeculationRaceRetry:
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
         actual_main = await git_ops.get_main_sha()
 
-        with (
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
-        ):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             item = await worker._remerge(req, None)
 
         # merge_to_main must have been called exactly twice
@@ -14478,9 +14448,7 @@ class TestRunPostMergeVerify:
         merge_wt = MagicMock()
 
         verifier = _ScriptedVerifier(answers=[raises(RuntimeError('boom'))])
-        with (
-            pytest.raises(RuntimeError, match='boom'),
-        ):
+        with pytest.raises(RuntimeError, match='boom'):
             await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -14665,9 +14633,7 @@ class TestRunPostMergeVerify:
         timed_out_result.type_output = ''
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
-        with (
-            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
-        ):
+        with patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -14708,9 +14674,7 @@ class TestRunPostMergeVerify:
         test_fail_result.type_output = ''
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_fail_result)])
-        with (
-            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
-        ):
+        with patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -20714,9 +20678,7 @@ class TestSoftCancelMidVerify:
         registry = InFlightMergeRegistry()
         retention = TerminalOutcomeRetention()
 
-        with (
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
-        ):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
             worker_task = asyncio.create_task(worker.run())
             await register_and_enqueue_merge_request(
                 queue, req, None, registry, retention=retention,
@@ -21966,9 +21928,7 @@ class TestRunPostMergeVerifyRouting:
         )
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
-        with (
-            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)) as mock_mh,
-        ):
+        with patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -22006,9 +21966,7 @@ class TestRunPostMergeVerifyRouting:
             answers=[VerifyScript(result=passed_scoped)],
             gates=[broken_gate],
         )
-        with (
-            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock()) as mock_mh,
-        ):
+        with patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock()) as mock_mh:
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -22527,9 +22485,7 @@ class TestSpeculationPermitLeakOnMergerError:
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge),
-        ):
+        with patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge):
             req_n = _make_request('leak-wm-n', 'leak-wm-n', wt_n, config)
             req_n1 = _make_request('leak-wm-n1', 'leak-wm-n1', wt_n1, config)
             await queue.put(req_n)
@@ -22600,9 +22556,7 @@ class TestSpeculationPermitLeakOnMergerError:
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=FakeVerifier())
         worker_task = asyncio.create_task(worker.run())
 
-        with (
-            patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge),
-        ):
+        with patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge):
             req_n = _make_request('leak-ex-n', 'leak-ex-n', wt_n, config)
             req_n1 = _make_request('leak-ex-n1', 'leak-ex-n1', wt_n1, config)
             await queue.put(req_n)
