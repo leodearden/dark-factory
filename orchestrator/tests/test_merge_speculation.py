@@ -158,6 +158,22 @@ async def _init_repo(repo: Path) -> None:
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
+async def _registered_worktrees(repo: Path) -> set[Path]:
+    """Every worktree git itself reports for *repo*, canonicalised.
+
+    Reads git's own state (``git worktree list --porcelain``) — the same
+    command GitOps runs internally — so lane registration is asserted against
+    git rather than against the lane's internals.  Both sides are resolved so
+    a registration recorded under a symlinked path still matches.
+    """
+    _, output, _ = await _run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
+    return {
+        Path(line[len('worktree '):]).resolve()
+        for line in output.splitlines()
+        if line.startswith('worktree ')
+    }
+
+
 @pytest.fixture
 def spec_git_repo(tmp_path: Path) -> Path:
     """Real git repository at ``tmp_path/repo`` ready for worktree operations.
@@ -304,7 +320,7 @@ class TestAcquireSpecLane:
         lane_path, _ = await git_ops.acquire_spec_lane(merge_commit)
 
         assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool._lanes[lane_path] == LaneState.ASSIGNED
+        assert git_ops.spec_warm_lane_pool.state(lane_path) == LaneState.ASSIGNED
 
     async def test_acquire_spec_lane_invokes_seed_reset_in_place(
         self, spec_git_repo: Path,
@@ -348,7 +364,7 @@ class TestAcquireSpecLane:
 
         lane_path, _ = await git_ops.acquire_spec_lane(merge_commit)
 
-        assert await git_ops._is_registered_worktree(lane_path), (
+        assert lane_path.resolve() in await _registered_worktrees(spec_git_repo), (
             f'Lane {lane_path} is not a registered git worktree'
         )
 
@@ -388,12 +404,12 @@ class TestAcquireSpecLaneFallback:
             f'Cold fallback path {lane2} must differ from warm lane {lane1}'
         )
         # Cold fallback is a registered worktree (ephemeral _merge-<uuid>)
-        assert await git_ops._is_registered_worktree(lane2), (
+        assert lane2.resolve() in await _registered_worktrees(spec_git_repo), (
             f'Cold fallback {lane2} is not a registered git worktree'
         )
         # The warm lane is still ASSIGNED (not released)
         assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool._lanes[lane1] == LaneState.ASSIGNED
+        assert git_ops.spec_warm_lane_pool.state(lane1) == LaneState.ASSIGNED
 
     async def test_seed_failure_returns_cold_false(self, spec_git_repo: Path):
         """When seed fails (no seed script), falls back to cold — lane released to FREE."""
@@ -427,7 +443,7 @@ class TestAcquireSpecLaneFallback:
         # After seed-failure fallback the pool's only lane should be FREE again
         assert git_ops.spec_warm_lane_pool is not None
         lane0 = git_ops.worktree_base / '_spec-0'
-        assert git_ops.spec_warm_lane_pool._lanes[lane0] == LaneState.FREE, (
+        assert git_ops.spec_warm_lane_pool.state(lane0) == LaneState.FREE, (
             'Lane must be released back to FREE after seed failure'
         )
 
@@ -482,7 +498,7 @@ class TestReleaseSpecLane:
         await git_ops.release_spec_lane(lane_path, warm=warm)
 
         assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool._lanes[lane_path] == LaneState.FREE
+        assert git_ops.spec_warm_lane_pool.state(lane_path) == LaneState.FREE
 
     async def test_release_warm_lane_retains_worktree(self, spec_git_repo: Path):
         """release_spec_lane does NOT remove the worktree (target/ warmth retained)."""
@@ -504,7 +520,7 @@ class TestReleaseSpecLane:
             f'release_spec_lane deleted the warm lane directory {lane_path}'
         )
         # And still registered as a git worktree
-        assert await git_ops._is_registered_worktree(lane_path), (
+        assert lane_path.resolve() in await _registered_worktrees(spec_git_repo), (
             f'release_spec_lane un-registered the warm lane {lane_path}'
         )
 
