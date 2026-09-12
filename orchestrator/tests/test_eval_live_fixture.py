@@ -124,13 +124,6 @@ def live_plan() -> dict:
     }
 
 
-DF_VERIFY = {
-    'test': 'cd orchestrator && uv run pytest tests/ -x',
-    'lint': 'cd orchestrator && uv run ruff check src/',
-    'typecheck': 'cd orchestrator && uv run pyright src/',
-}
-
-
 class TestBuildLiveFixtureKeySurface:
     """Exactly the eight emitted keys, key by key — and the omissions."""
 
@@ -229,12 +222,23 @@ class TestBuildLiveFixtureKeySurface:
 class TestBuildLiveFixtureRefuses:
     """The guard block: every bad input is a ValueError naming what was wrong.
 
-    Refusing at BUILD time is the point. `runner.py`'s own plan check fires at
-    :529, AFTER `create_eval_worktree` has already run at :495 — so a plan-less
+    Refusing at BUILD time is the point, and the inputs split into two kinds
+    by what happens if the refusal is skipped.
+
+    Some fail LATE and loudly: `runner.py::run_eval`'s own plan check fires
+    only after `create_eval_worktree` has already run, so a plan-less
     implementer fixture leaks an eval worktree before it fails, and a bad
-    base_sha dies as a late HEAD-mismatch RuntimeError with a worktree already
-    on disk. Refusing here keeps a data-plumbing bug from becoming a leaked
-    worktree and a scored candidate decline (INV-11, no-silent-fail-soft).
+    base_sha dies as a late HEAD-mismatch RuntimeError with a worktree
+    already on disk.
+
+    The three guarded below `task_id` are worse: they do not fail at all. A
+    partial `verify_commands`, a relative-or-empty `project_root` and a
+    malformed `metadata.modules` each let the cell RUN and be SCORED — against
+    the base config's gates, against whatever checkout the fixture JSON was
+    written under, or with module scoping exploded into single characters —
+    with nothing in the record to show the substitution. Refusing here is what
+    keeps a caller's data-plumbing bug from becoming a misattributed
+    measurement (INV-11, no-silent-fail-soft).
     """
 
     def _build(self, tmp_path, **overrides):
