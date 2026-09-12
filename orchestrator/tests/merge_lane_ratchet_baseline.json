@@ -1427,7 +1427,7 @@
     "orchestrator/tests/test_merge_queue_finalize_head_visibility.py": {"patch_targets": [], "private_reads": 18},
     "orchestrator/tests/test_merge_queue_flake_recorder.py": {"patch_targets": ["_run_unscoped_typechecks", "run_scoped_verification"], "private_reads": 11},
     "orchestrator/tests/test_merge_queue_frozen_prefix.py": {"patch_targets": [], "private_reads": 69},
-    "orchestrator/tests/test_merge_queue_host_observability.py": {"patch_targets": [], "private_reads": 48},
+    "orchestrator/tests/test_merge_queue_host_observability.py": {"patch_targets": [], "private_reads": 32},
     "orchestrator/tests/test_merge_queue_invariant_integration_gate.py": {"patch_targets": ["_check_post_merge_equivalence", "_check_post_merge_pyright", "_reverify_rebased_tree", "_run_post_merge_verify", "run_scoped_verification"], "private_reads": 53},
     "orchestrator/tests/test_merge_queue_landed_dispatch_gate.py": {"patch_targets": ["gate_mark_done_on_delivered_checks"], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_landed_reconciler.py": {"patch_targets": ["reconcile_landed_row"], "private_reads": 7},
