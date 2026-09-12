@@ -22,6 +22,10 @@ test_backends_base.py conventions).
 
 from __future__ import annotations
 
+import time
+
+import pytest
+
 
 def _which_all(name):
     """A `shutil.which` double for which every clipboard helper resolves."""
@@ -104,3 +108,76 @@ class TestAvailableCopyCommands:
         )
 
         assert commands == (_WL_COPY, _XCLIP, _XSEL)
+
+
+# Multi-line and non-ASCII on purpose: a real payload is a labeled block
+# (format_copy_payload) and a real question can carry any unicode. No
+# trailing newline, so a runner that helpfully appends one fails the
+# byte-exactness assertion.
+_UNICODE_PAYLOAD = 'question: Wie heißt der Port?\nproject: df — fleet\ntask_id: 5448'
+
+
+class TestRunClipboardCommand:
+    """The DEFAULT runner, against REAL subprocesses.
+
+    Deliberately no monkeypatching of subprocess: the process boundary IS
+    the thing under test, and faking it here would rebuild exactly the
+    self-referential green this task exists to delete.
+    """
+
+    @pytest.mark.timeout(10)
+    def test_text_is_delivered_on_the_helper_stdin_byte_exact(self, tmp_path):
+        """The payload reaches the child's stdin verbatim — nothing added, nothing stripped."""
+        from cockpit.clipboard import run_clipboard_command
+
+        target = tmp_path / 'copied.txt'
+
+        code = run_clipboard_command(['sh', '-c', 'cat > "$1"', 'sh', str(target)], _UNICODE_PAYLOAD)
+
+        assert code == 0
+        assert target.read_text(encoding='utf-8') == _UNICODE_PAYLOAD
+
+    @pytest.mark.timeout(10)
+    def test_missing_binary_returns_nonzero_instead_of_raising(self):
+        """Fail-soft (PRD §2): subprocess.run raises FileNotFoundError here; the cockpit must not."""
+        from cockpit.clipboard import run_clipboard_command
+
+        code = run_clipboard_command(['df-no-such-binary-5448'], 'payload')
+
+        assert code != 0
+
+    @pytest.mark.timeout(10)
+    def test_a_helper_that_forks_a_child_does_not_block_the_caller(self, tmp_path):
+        """The no-pipe contract: stdout/stderr are NOT piped, so a forked child can't stall us.
+
+        Regression guard for a real UI freeze. A clipboard helper owns the
+        X/Wayland selection by forking a background child that lives until
+        the clipboard is replaced, and that child inherits the parent's
+        stdout/stderr. Measured in this worktree: the identical call under
+        capture_output=True blocks for the CHILD's whole lifetime (5.01s
+        against a 5s sleeper) versus 0.19s with DEVNULL — so on every 'y'
+        press the cockpit's UI thread would freeze for as long as the
+        operator keeps the clipboard.
+        """
+        from cockpit.clipboard import run_clipboard_command
+
+        target = tmp_path / 'copied.txt'
+
+        started = time.monotonic()
+        code = run_clipboard_command(
+            ['sh', '-c', 'cat > "$1"; sleep 30 &', 'sh', str(target)], 'payload'
+        )
+        elapsed = time.monotonic() - started
+
+        assert code == 0
+        assert target.read_text(encoding='utf-8') == 'payload'
+        assert elapsed < 5.0
+
+    @pytest.mark.timeout(10)
+    def test_a_helper_that_never_exits_times_out_to_nonzero(self):
+        """A wedged helper degrades to a return code, never a TimeoutExpired out of action_copy."""
+        from cockpit.clipboard import run_clipboard_command
+
+        code = run_clipboard_command(['sh', '-c', 'sleep 30'], 'payload', timeout=0.2)
+
+        assert code != 0
