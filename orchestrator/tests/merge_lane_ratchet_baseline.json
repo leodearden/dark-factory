@@ -1349,7 +1349,7 @@
     "orchestrator/tests/test_branch_work_landed.py": {"patch_targets": ["patch_content_contained"], "private_reads": 1},
     "orchestrator/tests/test_citation_gate_positive_arm.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_cli.py": {"patch_targets": [], "private_reads": 6},
-    "orchestrator/tests/test_coalesce_integration_gate.py": {"patch_targets": [], "private_reads": 6},
+    "orchestrator/tests/test_coalesce_integration_gate.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 7},
     "orchestrator/tests/test_concurrent_verify_boundary.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 25},
     "orchestrator/tests/test_config_reload_integration_gate.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/test_convert_to_blocked.py": {"patch_targets": ["_check_plan_files_touched_in_branch", "_emit_merge_attempt", "register_and_enqueue_merge_request"], "private_reads": 63},
