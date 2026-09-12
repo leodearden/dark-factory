@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -371,7 +372,11 @@ def caplog_at_warning():
         log.setLevel(previous)
 
 
-def _stranded_flag(task_id='3105', flag_type='task_stranded_no_claimant', **extra):
+def _stranded_flag(
+    task_id: Any = '3105',
+    flag_type: Any = 'task_stranded_no_claimant',
+    **extra,
+):
     """A Stage-1 stranded finding, shaped like the ones actually emitted."""
     flag = {
         'task_id': task_id,
