@@ -742,8 +742,10 @@ async def test_probe_nextest_planned_nonzero_exit_warning_carries_stderr(
     hit = [m for m in _mq_warnings(caplog) if 'exited 101' in m]
     assert hit, _mq_warnings(caplog)
     assert 'no such command' in hit[0], hit[0]
-    assert len(hit[0]) < len(stderr), (
-        'the stderr tail must be bounded, not the whole log'
+    assert len(hit[0]) < 2500, (
+        'the stderr tail must be bounded, not the whole log: this pins the same '
+        'order of magnitude the tail constant is set to, so raising it to the '
+        f'5000-char noise prefix fails here.  Warning was {len(hit[0])} chars.'
     )
 
 

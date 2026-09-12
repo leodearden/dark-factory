@@ -1070,6 +1070,13 @@ class TestPostRebaseVerifyFailure:
 
         outcome = (await workflow.run()).outcome
 
+        assert verify_call == 2, (
+            'expected exactly the in-worktree + post-rebase verifies through '
+            f'orchestrator.workflow.run_scoped_verification; got {verify_call}. '
+            'A third call means the merge queue no longer runs its own verify '
+            'through conftest, and this stub is now failing a verify it never '
+            'meant to judge.'
+        )
         # Post-rebase verify failure is non-blocking; merge queue handles it
         assert outcome == WorkflowOutcome.DONE
 
