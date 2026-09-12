@@ -2621,11 +2621,19 @@ def test_this_producer_never_emits_the_unmeasured_sentinel():
 
 
 def test_the_report_schema_version_records_the_added_evidence():
-    """v5.  A v4 file read by a v5-aware consumer would show a `pollution` it
-    never measured, which is precisely the misreading this constant exists to
-    prevent."""
-    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 5
-    assert _report().schema_version == 5
+    """v6, and the constant is pinned HERE and nowhere else in this suite.
+
+    Two shape changes rode on it.  v5 (task 3755): a v4 file read by a
+    v5-aware consumer would show a `pollution` it never measured.  v6 (task
+    3781): `latency_ms` CHANGED MEANING at the same field name, from the
+    engine-cold first request to the engine-warm, prefix-cold measured one, so
+    a v5-or-older file reinterpreted as current restates an old number under a
+    caveat no producer ever made.  Both are misreadings this constant exists
+    to prevent, and both are silent -- which is why the producer stamping it is
+    asserted here too, not just the literal.
+    """
+    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 6
+    assert _report().schema_version == 6
 
 
 def test_a_polluted_recorded_baseline_produces_no_report_at_all():
@@ -3404,11 +3412,6 @@ def test_top_level_count_is_none_when_the_question_does_not_apply():
 # read the JSON artifact, not the README, so the sentence has to live in a real
 # FIELD.  `prd_marker` already exists for exactly this reason.
 # ---------------------------------------------------------------------------
-
-
-def test_the_report_schema_version_is_five():
-    """The shape moved AND `latency_ms` changed meaning between v4 and v5."""
-    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 5
 
 
 def test_the_report_carries_the_not_comparable_caveat_in_a_field():

@@ -82,7 +82,7 @@ MANIFEST_PATH = _LMS_DIR / 'arms.yaml'
 #: keep the widening from rotting into a permanent hole:
 #:
 #: 1. `test_the_accepted_set_expires_at_the_next_schema_bump` pins
-#:    `max(...) == REPORT_SCHEMA_VERSION`, so v6 turns this file RED and forces
+#:    `max(...) == REPORT_SCHEMA_VERSION`, so v7 turns this file RED and forces
 #:    a conscious decision here instead of the clause silently sliding forward.
 #: 2. `test_the_accepted_set_grandfathers_exactly_one_older_version` pins the
 #:    remainder to exactly `_GRANDFATHERED_ARTIFACT_SCHEMA_VERSION`, so a
@@ -97,11 +97,11 @@ MANIFEST_PATH = _LMS_DIR / 'arms.yaml'
 #: checks are exactly (2), (3) and the expiry pin -- that is a real guard, but
 #: it is NOT the strictly-stronger check the widening once claimed to be.  The
 #: ADDITIONAL strictness -- a measured non-empty inventory and a CLEAN
-#: pollution state -- begins the moment the artifact is re-derived at v5, and
+#: pollution state -- begins the moment the artifact is re-derived at v6, and
 #: is not in force today.
 #:
 #: The owed live re-run is FILED, not implicit: see _OWED_LIVE_RERUN_TASK_ID.
-ACCEPTED_ARTIFACT_SCHEMA_VERSIONS = frozenset({4, 5})
+ACCEPTED_ARTIFACT_SCHEMA_VERSIONS = frozenset({4, 6})
 
 #: The first version whose reports carry the consumer inventory (task 3755).
 _CONSUMER_EVIDENCE_SCHEMA_VERSION = 5
@@ -112,10 +112,9 @@ _CONSUMER_EVIDENCE_SCHEMA_VERSION = 5
 _GRANDFATHERED_ARTIFACT_SCHEMA_VERSION = 4
 
 #: The filed, closeable work item that ends the grandfather clause: task 4229,
-#: "lms: re-run the live 7-arm slate to regenerate health-report.json at schema
-#: v5" (pending; sibling filing 4202 covers the same gap, so the pin survives a
-#: dedupe of either).  A temporary exemption pointing at a real task can be
-#: closed; one pointing at nobody becomes permanent.
+#: "lms: ONE live 7-arm slate re-run to regenerate health-report.json at schema
+#: v6 (discharges 3781 too)".  A temporary exemption pointing at a real task
+#: can be closed; one pointing at nobody becomes permanent.
 _OWED_LIVE_RERUN_TASK_ID = '4229'
 
 #: The v5 vram keys.  Named once so both directions of the check use the same
