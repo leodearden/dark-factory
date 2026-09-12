@@ -146,18 +146,27 @@ def _make_worker(
     config: OrchestratorConfig,
     git_ops: GitOps | None = None,
     factory=None,
+    clock=None,
 ) -> SpeculativeMergeWorker:
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    """Build a bare MergeLane for these tests.
+
+    *clock* is for the one test whose SUBJECT is a wait: a FakeClock makes the
+    worker's deadline arithmetic run to completion without a wall-clock wait.
+    Everywhere else the wait is incidental and the production clock is what
+    keeps the test honest about real concurrency, so it is left alone.
+    """
+    from orchestrator.merge_lane import MergeLane
     if git_ops is None:
         # stub git_ops — not used in no-op guard tests
         git_ops = MagicMock()
         git_ops.config = config
-    worker = SpeculativeMergeWorker(
+    kwargs = {} if clock is None else {'clock': clock}
+    return MergeLane(
         git_ops,
         queue,
         train_callback_factory=factory,
+        **kwargs,
     )
-    return worker
 
 
 # ─── Step 3 ─────────────────────────────────────────────────────────────────
@@ -2932,18 +2941,14 @@ class TestAwaitUnadvancedPredecessor:
         that the wait really ran to its deadline rather than falling out early
         is the clock's own record of what it was asked to sleep.
         """
-        config = _make_config(tmp_path).model_copy(
-            update={'verify_command_timeout_secs': 0.05})
+        config = _make_config(tmp_path)
         queue: asyncio.Queue = asyncio.Queue()
         clock = FakeClock()
-        worker = _make_worker(queue, config)
+        worker = _make_worker(queue, config, clock=clock)
         pred = _make_single_req('pred', config=config)
         worker._last_merged_request = pred
 
-        with patch(
-            'orchestrator.merge_queue._TRAIN_PREDECESSOR_SETTLE_SLACK_SECS', 0.1,
-        ):
-            assert await worker._await_unadvanced_predecessor('train-x') is True
+        assert await worker._await_unadvanced_predecessor('train-x') is True
 
         assert sum(clock.sleeps) >= config.verify_command_timeout_secs, (
             'the interlock must poll all the way to its deadline before '
