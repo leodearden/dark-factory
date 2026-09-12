@@ -35,6 +35,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from _merge_lane_fakes import FakeClock, FakeVerifier
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -92,14 +93,17 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
 
 
 def _make_worker(git_ops: GitOps):
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring).
+    """Build a bare MergeLane for unit tests (no harness wiring).
 
-    Mirrors test_merge_queue_lifecycle_registry.py's / test_merge_queue_
-    invariant_integration_gate.py:212's ``_make_worker``.
+    The verify and clock ports are the fakes from ``_merge_lane_fakes``, so
+    every observation this file makes through ``snapshot()`` is deterministic
+    — in particular the ages, which the worker reads off its own clock.
     """
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane import MergeLane
 
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    return MergeLane(
+        git_ops, asyncio.Queue(), verifier=FakeVerifier(), clock=FakeClock(time=NOW),
+    )
 
 
 def _make_request(
