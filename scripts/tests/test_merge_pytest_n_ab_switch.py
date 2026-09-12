@@ -19,6 +19,8 @@ one the test itself owns, bound to an ephemeral port.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -246,12 +248,17 @@ def _make_repo(tmp_path, verify_env_value, *, marker=False):
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run(server, config_path, value):
-    """Run the real script for *value* against *config_path*, pointing its
-    reload at *server*'s real ephemeral port."""
+def _run(server, config_path, value, *, script=SCRIPT, env=None):
+    """Run the script for *value* against *config_path*, pointing its reload
+    at *server*'s real ephemeral port.
+
+    *script* and *env* are the seams the interpreter-resolution tests need: a
+    COPY of the script in a checkout with no venv, and a PATH whose `python3`
+    cannot import the transport.
+    """
     return subprocess.run(
-        ["bash", str(SCRIPT), value, str(config_path), str(server.port)],
-        capture_output=True, text=True, timeout=60,
+        ["bash", str(script), value, str(config_path), str(server.port)],
+        env=env, capture_output=True, text=True, timeout=60,
     )
 
 
@@ -615,3 +622,110 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
     ).stdout.strip()
     assert sha in proc.stderr, f"stderr={proc.stderr}"
     assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Which interpreter runs the reload
+#
+# The transport is not stdlib: it needs httpx, plus pydantic via
+# census_trigger's module-level `legibility.config` import. Measured here on
+# 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3) has neither
+# (it does have yaml), while every venv in this tree has all three. So a
+# reload step that inherits whatever `python3` the caller's shell offers is a
+# deploy gate an operator cannot reach from a login shell -- the same
+# unreachable-gate outcome as the transport defect above, with a different
+# cause.
+# ---------------------------------------------------------------------------
+
+SYSTEM_PYTHON = "/usr/bin/python3"
+CHECKOUT_VENV_PYTHON = SCRIPT.parent.parent / ".venv" / "bin" / "python3"
+
+
+def _system_python_without_the_transport():
+    """The system interpreter, or a skip reason if it cannot play the part.
+
+    An interpreter that CAN import the transport would make both tests below
+    pass while proving nothing, so the premise is checked rather than assumed.
+    """
+    if not os.path.exists(SYSTEM_PYTHON):
+        return None, f"{SYSTEM_PYTHON} is absent"
+    probe = subprocess.run(
+        [SYSTEM_PYTHON, "-c", "import httpx, pydantic"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode == 0:
+        return None, f"{SYSTEM_PYTHON} can import the transport, so it proves nothing"
+    return SYSTEM_PYTHON, ""
+
+
+def _path_python3_shimmed_to(tmp_path, interpreter):
+    """An env whose PATH `python3` is *interpreter*."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nexec {interpreter} "$@"\n')
+    shim.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    return env
+
+
+def test_the_reload_ignores_a_path_python3_that_cannot_import_the_transport(tmp_path):
+    """PATH's `python3` cannot import the transport; the flip still lands.
+
+    That can only happen if the reload step resolved the SCRIPT's own
+    checkout venv rather than inheriting PATH. Step 1's YAML editor is
+    stdlib-only and keeps working under the shim, so this isolates the reload
+    interpreter specifically.
+    """
+    system_python, why = _system_python_without_the_transport()
+    if system_python is None:
+        pytest.skip(why)
+    if not CHECKOUT_VENV_PYTHON.exists():
+        pytest.skip(f"{CHECKOUT_VENV_PYTHON} is absent (an un-synced worktree)")
+
+    config = _make_repo(tmp_path, "16")
+    env = _path_python3_shimmed_to(tmp_path, system_python)
+
+    with _FakeEscalationMcp(_report(
+        config_path=str(config),
+        applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
+    )) as server:
+        proc = _run(server, config, "8", env=env)
+
+    assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
+    assert _verdict(proc)["outcome"] == "applied"
+
+
+def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path):
+    """No venv to fall back on: fail naming the interpreter and the remedy.
+
+    The script is copied into a checkout carrying the real `scripts/legibility`
+    but NO `.venv`, so the bare-`python3` fallback leg is taken and the
+    interpreter is the only thing that differs from the passing case above. A
+    raw ImportError traceback would leave an operator with no next step.
+    """
+    system_python, why = _system_python_without_the_transport()
+    if system_python is None:
+        pytest.skip(why)
+
+    scripts_dir = tmp_path / "checkout" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy2(SCRIPT, scripts_dir / SCRIPT.name)
+    (scripts_dir / "legibility").symlink_to(SCRIPT.parent / "legibility")
+
+    config = _make_repo(tmp_path, "8", marker=True)
+    env = _path_python3_shimmed_to(tmp_path, system_python)
+    tried = subprocess.run(
+        [system_python, "-c", "import sys; print(sys.executable)"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    with _FakeEscalationMcp(_report(config_path=str(config))) as server:
+        proc = _run(server, config, "8",
+                    script=scripts_dir / SCRIPT.name, env=env)
+
+    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert not _converged_verdict_lines(proc)
+    assert tried in proc.stderr, f"stderr={proc.stderr}"
+    assert "uv run --project shared" in proc.stderr, f"stderr={proc.stderr}"
