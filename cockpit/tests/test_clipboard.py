@@ -22,8 +22,6 @@ test_backends_base.py conventions).
 
 from __future__ import annotations
 
-import pytest
-
 
 def _which_all(name):
     """A `shutil.which` double for which every clipboard helper resolves."""
