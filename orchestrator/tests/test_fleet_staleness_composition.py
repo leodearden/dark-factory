@@ -201,14 +201,17 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         """End-to-end: note_merge arms the real (list-index-2) coordinator on a
         watched-path diff; once the merge pipeline is drained, the systemd-run
         argv targets the FLEET script (restart-all-orchestrators.sh) — not
-        restart-orchestrator.sh — with the resulting on_active_secs. Note:
-        dark-factory-orchestrator.yaml does not set orchestrator_restart_on_active_secs,
-        so the asserted value (10) comes from config.py's pydantic default, not
-        a value pinned in the committed YAML.
+        restart-orchestrator.sh — with the resulting on_active_secs.
 
-        ``on_active_override`` perturbs that undeclared leaf on the parsed
-        ``committed`` object before the graft, reproducing task 4481's
-        adversarial-config sweep for this one field.
+        The ``--on-active=`` expectation is derived from the parsed committed
+        config rather than hardcoded, precisely so an operator retune or task
+        4481's adversarial-config sweep cannot redden it:
+        orchestrator_restart_on_active_secs is declared nowhere in
+        dark-factory-orchestrator.yaml, so its value is config.py's pydantic
+        default and a perturbation of that undeclared leaf must not break this
+        test. ``on_active_override`` parametrizes exactly that perturbation.
+        Not a tautology — this still pins that the parsed value reaches the
+        systemd-run argv, which is the I3 composition contract.
         """
         committed = _load_committed_orchestrator_config(monkeypatch)
         if on_active_override is not None:
@@ -252,7 +255,9 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         mock_exec.assert_awaited_once()
         pos_args = mock_exec.call_args.args
         assert pos_args[0] == 'systemd-run'
-        assert '--on-active=10' in pos_args
+        # Asserted against the parsed committed config's own field (not a
+        # hardcoded literal), matching the watch-prefixes assertion above.
+        assert f'--on-active={committed.orchestrator_restart_on_active_secs}' in pos_args
         assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
         assert expected_script in pos_args
         assert orch_coord.is_pending is False
