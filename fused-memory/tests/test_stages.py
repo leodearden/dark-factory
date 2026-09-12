@@ -16328,3 +16328,329 @@ class TestMemoryConsolidatorEntityStandingDecision:
 
         assert report.stats['entity_standing_decision_suppressed'] == 0
         assert esd_mock.await_count == 0, 'a remediation pass must not run the filter'
+
+
+# ---------------------------------------------------------------------------
+# Task 4223 — MemoryConsolidator wires filter_preservation_specimen_flags +
+# maybe_escalate_preservation_suppression_storm ABOVE the remediation
+# early-return:
+#   • a stranded flag for a corroborated preservation specimen is dropped on a
+#     FULL cycle AND on a REMEDIATION pass (the load-bearing regression — the
+#     two post-widening recurrences of this false positive, runs f16954ae and
+#     720ebf37, were both remediation runs, and anything wired beside Hook A at
+#     the filter chain is unreachable from there);
+#   • preservation_specimen_suppressed / _unresolved are always-present stats,
+#     explicit 0 on a cycle that suppressed nothing, remediation included;
+#   • a suppressed flag is EXCLUDED from acknowledge_resolved_flags (suppression
+#     is not resolution — the invariant Hook A maintains);
+#   • a guard failure never aborts the stage or half-mutates items_flagged.
+#
+# RED until step-14 wires the guard into memory_consolidator.py.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorPreservationSpecimenGuard:
+    """MemoryConsolidator.run() declines stranded flags for preserved specimens."""
+
+    _GUARD = (
+        'fused_memory.reconciliation.stages.memory_consolidator.'
+        'filter_preservation_specimen_flags'
+    )
+    _CITATION = 'a8fd36a8-46db-4ca8-a21c-554c38a918ee'
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    def _make_stage(self, mock_deps):
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        # Hook A is not under test here; leave it nothing to read.
+        stage.memory.recon_ledger = None
+        return stage
+
+    def _make_base_report(self, items_flagged):
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items_flagged,
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+    @staticmethod
+    def _stranded_flag(task_id='3105', flag_type='task_stranded_no_claimant'):
+        return {
+            'task_id': task_id,
+            'flag_type': flag_type,
+            'category': 'task_memory_mismatch',
+            'severity': 'moderate',
+            'actionable': True,
+            'description': f'Task {task_id} is in-progress with no claimant and no heartbeat.',
+            'suggested_action': f'File an operator gate task to reset task {task_id}.',
+        }
+
+    def _corroborating_memory(self, stage):
+        """Point the stage's Mem0 channel at task 3105's real preservation row."""
+        row = {
+            'id': self._CITATION,
+            'metadata': {
+                'kind': 'investigation_outcome',
+                'task_id': '3105',
+                'actionable': False,
+                'data': 'Task 3105 is the sole preserved live validation specimen '
+                        'for gate task 3546.',
+            },
+        }
+        stage.memory.get_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: (
+                [row] if str(filters.get('task_id')) == '3105' else []
+            ),
+        )
+        stage.memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+
+    @staticmethod
+    def _full_cycle_patches(**extra):
+        """The filter-chain stubs a full cycle needs, plus any *extra* patches."""
+        patches = {
+            'dedup_flags': AsyncMock(side_effect=lambda **kw: kw.get('flags', [])),
+            'filter_false_absence_flags': AsyncMock(
+                side_effect=lambda taskmaster, project_root, flags: flags,
+            ),
+            'acknowledge_resolved_flags': AsyncMock(return_value=0),
+        }
+        patches.update(extra)
+        return [
+            patch(f'fused_memory.reconciliation.stages.memory_consolidator.{name}', new=mock)
+            for name, mock in patches.items()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_full_cycle_suppresses_corroborated_stranded_flag(self, mock_deps):
+        """(a) The finding that twice became a destructive gate task is dropped."""
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+
+        specimen = self._stranded_flag()
+        unrelated = {'task_id': '4102', 'flag_type': 'missing_deliverable'}
+        base_report = self._make_base_report([specimen, unrelated])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            *self._full_cycle_patches(),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-full',
+            )
+
+        assert specimen not in (report.items_flagged or [])
+        assert unrelated in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 1
+        assert report.stats['preservation_specimen_unresolved'] == 0
+
+    @pytest.mark.asyncio
+    async def test_remediation_pass_suppresses_too(self, mock_deps):
+        """(b) THE regression this task exists for.
+
+        memory_consolidator's remediation early-return sits ABOVE the whole
+        filter chain, so a guard wired beside Hook A would be unreachable here —
+        and the two recurrences that continued AFTER the blanket
+        stage1_flag_suppression for task 3105 was widened (run f16954ae
+        2026-08-26, run 720ebf37 2026-09-11) were both remediation runs.
+        """
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+        stage.remediation_findings = [{'description': 'fix me'}]
+
+        specimen = self._stranded_flag(flag_type='stranded_merge_phase_liveness')
+        base_report = self._make_base_report([specimen])
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-remediation',
+            )
+
+        assert specimen not in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 1
+
+    @pytest.mark.asyncio
+    async def test_stats_are_present_and_zero_on_a_quiet_full_cycle(self, mock_deps):
+        """(c) Always-present, explicit 0 — never absent.
+
+        Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt,
+        and the always-present convention is the promise that a consumer never
+        has to tell "0" from "absent".
+        """
+        stage = self._make_stage(mock_deps)
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+
+        base_report = self._make_base_report([{'task_id': '9', 'flag_type': 'task_absent'}])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            *self._full_cycle_patches(),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-quiet',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 0
+
+    @pytest.mark.asyncio
+    async def test_stats_are_present_and_zero_on_a_quiet_remediation_pass(self, mock_deps):
+        """(c) Same promise on the path that returns before the filter chain."""
+        stage = self._make_stage(mock_deps)
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+        stage.remediation_findings = [{'description': 'fix me'}]
+
+        base_report = self._make_base_report([{'task_id': '9', 'flag_type': 'task_absent'}])
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-quiet-remediation',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 0
+
+    @pytest.mark.asyncio
+    async def test_unresolved_corroboration_is_counted_and_keeps_the_flag(self, mock_deps):
+        """A degraded read keeps the flag AND shows up in the stats (INV-11)."""
+        stage = self._make_stage(mock_deps)
+        stage.memory.get_memories_by_metadata = AsyncMock(side_effect=TimeoutError('down'))
+        stage.memory.get_entity = AsyncMock(side_effect=RuntimeError('also down'))
+
+        specimen = self._stranded_flag()
+        base_report = self._make_base_report([specimen])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            *self._full_cycle_patches(),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-degraded',
+            )
+
+        assert specimen in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 1
+
+    @pytest.mark.asyncio
+    async def test_suppressed_flag_is_excluded_from_acknowledgment(self, mock_deps):
+        """(d) Suppression is NOT resolution.
+
+        The dropped flag's stage1_flag_marker must survive, so recurrence
+        history is intact for when the preservation citation is retired.
+        """
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+
+        specimen = self._stranded_flag()
+        base_report = self._make_base_report([specimen])
+        ack_mock = AsyncMock(return_value=0)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            *self._full_cycle_patches(acknowledge_resolved_flags=ack_mock),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-ack',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == 1
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        resolved = ack_mock.await_args.kwargs.get('resolved_flags', [])
+        assert specimen not in resolved
+
+    @pytest.mark.asyncio
+    async def test_guard_failure_never_aborts_the_stage(self, mock_deps):
+        """(e) Best-effort: the cycle completes with items_flagged untouched."""
+        stage = self._make_stage(mock_deps)
+        specimen = self._stranded_flag()
+        base_report = self._make_base_report([specimen])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(self._GUARD, new=AsyncMock(side_effect=RuntimeError('guard exploded'))),
+            *self._full_cycle_patches(),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-boom',
+            )
+
+        assert specimen in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 0
+
+    @pytest.mark.asyncio
+    async def test_guard_failure_on_a_remediation_pass_is_also_swallowed(self, mock_deps):
+        """(e) Both paths call the guard, so both must survive its failure."""
+        stage = self._make_stage(mock_deps)
+        stage.remediation_findings = [{'description': 'fix me'}]
+        specimen = self._stranded_flag()
+        base_report = self._make_base_report([specimen])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(self._GUARD, new=AsyncMock(side_effect=RuntimeError('guard exploded'))),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-boom-remediation',
+            )
+
+        assert specimen in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 0
+
+    @pytest.mark.asyncio
+    async def test_storm_escalation_filed_on_a_full_cycle(self, mock_deps, tmp_path):
+        """The INV-4 escape is wired, and only where an escalation queue exists."""
+        from escalation.queue import EscalationQueue
+        from fused_memory.reconciliation.preservation_specimen_guard import (
+            PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+        )
+
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
+
+        n = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1
+        storm_flags = [self._stranded_flag(flag_type=f'task_stranded_v{i}') for i in range(n)]
+        base_report = self._make_base_report(storm_flags)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            *self._full_cycle_patches(),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-storm',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == n
+        pending = queue.get_by_task('3105', status='pending', level=1)
+        assert len(pending) == 1
+        assert pending[0].category == 'reconciliation_preservation_specimen_storm'
