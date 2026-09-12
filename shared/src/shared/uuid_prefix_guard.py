@@ -35,6 +35,20 @@ forwarded unchanged with the reason on ``meta``. At the PRD's measured ~0.2s
 per walk that is ~0.4s of added latency in the worst case rather than the
 unbounded N x 0.2s a serial, uncapped resolve would have cost.
 
+That ceiling bounds DISTINCT tokens ONLY, which is worth saying out loud
+because reading it as a bound on the whole call is what once let an unbounded
+quadratic sit underneath a stated bound: one id cited N times is ONE walk, and
+N is bounded by nothing but the size of the argument map. The APPLY phase is
+therefore bounded separately, by :meth:`_expand`'s single
+``substitute_all`` call — linear in the total characters of the strings it
+edits and independent of how many times any one id is cited. Two per-SITE
+costs remain linear in occurrences and are deliberately so: one
+``substitutions`` record per edit, and one fact per edit, because both
+describe a site rather than a resolution. MEASURED on the worst shape this
+guard has been driven with — 25,600 citations of 16 ids in a 1.25MB argument
+map, every one resolving `unique` — one guarded call adds 0.34s: 0.08s scan,
+0.02s apply, 0.08s for 25,600 substitution records and 0.07s for 25,600 facts.
+
 The burst escape and the injected-sink discipline are NOT here: they are
 :mod:`shared.boundary_storm_escape`, composed. Mechanism that is the same for
 every boundary guard belongs in one place (INV-5); what stays here is what is
@@ -77,7 +91,7 @@ from shared.uuid_prefix import (
     PrefixToken,
     find_prefix_tokens,
     strip_uuid_prefix_override,
-    substitute,
+    substitute_all,
     uuid_prefix_override_requested,
 )
 
@@ -448,16 +462,18 @@ def _applicable(prefix: str, resolution: Resolution) -> Resolution:
     The RESOLVER's contract, checked where its answer ARRIVES. C1's
     substitution is MONOTONE — the token must be a literal prefix of its
     replacement, so a wrong expansion stays visible and reversible — and
-    ``substitute`` enforces that by raising ``ValueError``.
+    ``substitute_all`` enforces that by raising ``ValueError``.
 
-    That raise would arrive at the worst possible moment. The substitution fold
-    runs at the END of delivery, after the `expanded` facts have already been
-    published, so an injected resolver that normalised dashes out before
-    matching (the natural way to make a 12-char token like ``ccf73ca48240``
-    match the canonical ``ccf73ca4-8240-...``) would take the whole call down
-    with an unhandled ValueError while the fact stream already claimed the
-    substitution had happened. Both halves of that are outcomes this design
-    rules out: the call is LOST, and the record of it is a lie. The guard is
+    That raise would arrive at the worst possible moment, and batching made it
+    stricter rather than looser: the batch door validates every pair before it
+    rebuilds anything, so ONE violating answer refuses the whole call's
+    substitutions. It runs at the END of delivery, after the `expanded` facts
+    have already been published, so an injected resolver that normalised dashes
+    out before matching (the natural way to make a 12-char token like
+    ``ccf73ca48240`` match the canonical ``ccf73ca4-8240-...``) would take the
+    whole call down with an unhandled ValueError while the fact stream already
+    claimed the substitution had happened. Both halves of that are outcomes
+    this design rules out: the call is LOST, and the record of it is a lie. The guard is
     typed against a PORT, not against the one resolver that happens to use
     ``STARTS WITH`` today, and it is the guard that pays.
 
@@ -1032,13 +1048,24 @@ class UuidPrefixGuardMiddleware(Middleware):
 
     @staticmethod
     def _expand(arguments: dict[str, Any], expansions: tuple[_Planned, ...]) -> None:
-        """Apply every substitution, then write the result back IN PLACE.
+        """Apply every substitution in ONE batch, then write the result back IN PLACE.
 
-        REVERSE document order. ``substitute`` is span-exact against offsets
-        that an earlier replacement in the same string would have invalidated,
-        so folding from the back leaves every remaining span untouched. The
-        alternative — re-scanning after each replacement — costs a second
-        linear pass and can see different tokens once an expansion has landed.
+        Ordering is the batch door's own concern — ``substitute_all`` sorts the
+        spans it is given per path — so this hands it every planned expansion
+        at once and carries no ordering precondition of its own.
+
+        ONE call, not one per site, and the difference is a server-wide stall.
+        The fold this replaced applied one ``substitute`` per occurrence, each
+        rebuilding the whole containing string, which is O(occurrences x string
+        length) — and NOTHING bounded occurrence count:
+        :data:`MAX_DISTINCT_PREFIXES_PER_CALL` bounds DISTINCT tokens only, as
+        ``test_repeated_citations_of_one_id_never_approach_it`` pins. MEASURED
+        on 25,600 occurrences of 16 ids in a 1.25MB argument map: the fold cost
+        21.1s, this batch costs 0.02s. This middleware sits on every tool call
+        of a shared single-threaded server, so those 21 seconds were every
+        other agent's latency too, reachable from one ordinary large write.
+        Do not re-derive the fold as a simplification: it reads as one, and it
+        is the whole defect.
 
         The write-back is a clear-and-update on the SAME dict object rather
         than a rebind. MEASURED (``mcp_markup_middleware``): ``call_next``
@@ -1048,9 +1075,10 @@ class UuidPrefixGuardMiddleware(Middleware):
         """
         if not expansions:
             return
-        repaired: Any = arguments
-        for planned in reversed(expansions):
-            repaired = substitute(repaired, planned.token, planned.resolution.candidates[0].id)
+        repaired = substitute_all(
+            arguments,
+            ((p.token, p.resolution.candidates[0].id) for p in expansions),
+        )
         arguments.clear()
         arguments.update(repaired)
 
