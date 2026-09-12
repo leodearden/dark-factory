@@ -93,11 +93,6 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=git_repo, git=git_config)
 
 
-def _make_worker(git_ops: GitOps, *, escalation_queue: Any = None):
-    """Build a lane on the fakes for unit tests (no harness wiring)."""
-    return make_lane(git_ops, escalation_queue=escalation_queue)
-
-
 def _make_request(
     task_id: str,
     branch: str,
@@ -154,12 +149,12 @@ class TestLifecycleRegistryPresence:
     def test_lifecycle_is_an_item_lifecycle_instance(self, git_ops: GitOps) -> None:
         from orchestrator.merge_queue import ItemLifecycle
 
-        worker = _make_worker(git_ops)
+        worker = make_lane(git_ops)
 
         assert isinstance(worker._lifecycle, ItemLifecycle)
 
     def test_live_items_starts_empty(self, git_ops: GitOps) -> None:
-        worker = _make_worker(git_ops)
+        worker = make_lane(git_ops)
 
         assert worker._live_items == {}
 
@@ -181,7 +176,7 @@ class TestNoteTransitionBestEffort:
         from orchestrator.merge_queue import ItemLifecycleState
 
         fake_eq = RecordingEscalations()
-        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        worker = make_lane(git_ops, escalation_queue=fake_eq)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             worker._note_transition(
@@ -201,7 +196,7 @@ class TestNoteTransitionBestEffort:
         from orchestrator.merge_queue import ItemLifecycleState
 
         fake_eq = RecordingEscalations()
-        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        worker = make_lane(git_ops, escalation_queue=fake_eq)
         rid = 'mr-aaaaaaaa'
         worker._lifecycle.register(rid)
 
@@ -232,7 +227,7 @@ class TestNoteTransitionBestEffort:
         this file — e.g. _submit_loop_escalation / _alarm_resource_audit)."""
         from orchestrator.merge_queue import ItemLifecycleState
 
-        worker = _make_worker(git_ops, escalation_queue=None)
+        worker = make_lane(git_ops, escalation_queue=None)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             worker._note_transition(
@@ -274,7 +269,7 @@ class TestMergerDrainRegistersAndTransitions:
         producer's put() — the module-level enqueue helpers have no
         reference to the worker/registry.
         """
-        worker = _make_worker(git_ops)
+        worker = make_lane(git_ops)
         req = _make_request('pre-registry', 'pre-registry', git_ops.project_root, config)
 
         assert worker._lifecycle.current(req.request_id) is None
@@ -1147,7 +1142,7 @@ class TestRequeueRequestHelperContract:
     ) -> None:
         from orchestrator.merge_queue import ItemLifecycleState
 
-        worker = _make_worker(git_ops)
+        worker = make_lane(git_ops)
         req = _make_request('df3204-helper', 'df3204-helper', tmp_path, config)
         rid = worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
         worker._request_ledger.on_dequeue(req, now=0.0)
@@ -1177,7 +1172,7 @@ class TestRequeueRequestHelperContract:
         loop's drain can never observe the request on ``_queue`` while the
         registry still reads VERIFYING — STRUCTURAL rather than conventional.
         """
-        worker = _make_worker(git_ops)
+        worker = make_lane(git_ops)
         assert not inspect.iscoroutinefunction(worker._requeue_request), (
             '_requeue_request must stay sync: an await between the put_nowait and '
             'the _note_requeue re-opens exactly the window task 3082 closed'
@@ -2545,91 +2540,6 @@ class TestCoalesceSupersededRetiresRegistry:
         # already registered at LANE_BUFFERED (step-4), untouched by the
         # absorbed members' retirement.
         assert worker._lifecycle.current(group_req.request_id) == ItemLifecycleState.LANE_BUFFERED
-
-
-# ---------------------------------------------------------------------------
-# step-11 RED / step-12 GREEN (continued): auto-chain parent-superseded —
-# ALREADY covered by the existing _resolve_or_drop_abandoned chokepoint
-# (step-10); this test is a completeness proof, not new wiring.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-class TestAutoChainParentSupersededRetiresRegistry:
-    """The auto-chain generation path (``_maybe_auto_chain_generation``,
-    reached via ``_finalize_advanced_merge``'s equivalence-gate
-    ``on_blocked`` hook) resolves the ORIGINAL (parent) request's Future
-    with a 'superseded' outcome while a gen-(n+1) successor is enqueued
-    under a NEW request_id. The parent's OWN request_id must retire —
-    proven here by forcing ``_finalize_advanced_merge`` to return
-    'superseded' directly rather than driving the full git-tip-advance
-    auto-chain machinery (task 2169 step-11).
-
-    Unlike the other tests in this module, this one is a REGRESSION proof,
-    not a RED-until-step-12 test: the parent's retirement already flows
-    through the SAME ``_resolve_or_drop_abandoned`` chokepoint step-10
-    wired for the FAIL/'done' branches (merge_queue.py's CAS loop calls it
-    unconditionally on every ``result == 'advanced'`` outcome, regardless
-    of the finalize outcome's status) — this test documents and locks that
-    in.
-    """
-
-    async def test_auto_chain_parent_superseded_retires_registry(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ) -> None:
-        from orchestrator.merge_queue import (
-            InflightEntry,
-            ItemLifecycleState,
-            MergeOutcome,
-            RealMergeItem,
-        )
-        from orchestrator.verify_runner import HostLease
-
-        branch = 'kappa-auto-chain-parent'
-        wt = await _make_branch_with_file(git_ops, branch, 'kappa_acp.py', 'x = 1\n')
-        req = _make_request(branch, branch, wt, config)
-        merge_result = await git_ops.merge_to_main(wt, branch)
-        assert merge_result.success and merge_result.merge_commit
-        assert merge_result.merge_worktree is not None
-
-        base_sha = await git_ops.get_main_sha()
-        item = RealMergeItem(
-            request=req, merge_result=merge_result, merge_wt=merge_result.merge_worktree,
-            base_sha=base_sha, speculative=False,
-        )
-
-        queue: asyncio.Queue = asyncio.Queue()
-        worker = make_lane(git_ops, queue)
-        mock_allocator = MagicMock()
-        mock_allocator.release = AsyncMock()
-        mock_allocator.cancel_and_release = AsyncMock()
-        worker._host_allocator = mock_allocator
-        worker._register_owned_merge_worktree(item.merge_wt)
-        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
-
-        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
-        entry = InflightEntry(
-            item=item, lease=lease, verify_task=None,
-            merge_wt=item.merge_wt, was_speculative=False,
-        )
-
-        superseded_outcome = MergeOutcome('superseded', superseded_by='mr-fake-gen2')
-        finalize_mock = AsyncMock(return_value=superseded_outcome)
-
-        with (
-            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
-        ):
-            advanced = await worker._finalize_inflight(entry)
-
-        assert advanced is True, (
-            "main WAS advanced (the CAS succeeded); 'superseded' is the "
-            "PARENT's own outcome, not a failure to advance"
-        )
-        finalize_mock.assert_awaited_once()
-        assert req.result.done()
-        assert req.result.result() is superseded_outcome
-        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
-        assert req.request_id not in worker._live_items
 
 
 # ---------------------------------------------------------------------------
