@@ -1182,6 +1182,69 @@ budgets:
 models:
   implementer: opus
   debugger: opus
+  # merger -> claude-fable-5-1 (Leo ruling D6, 2026-09-10; applied 2026-09-12 after the
+  # D5 evidence package, plans/fable-evidence-package-2026-09-10.md §3/§6): on the 16
+  # in-window conflict fixtures Fable resolved 15/16 vs opus 13/16 at the D4 100-turn cap,
+  # in half the turns (p50 17 vs 24) and half the wall clock (p50 7 min vs 14), with no
+  # drop-guard violation and +23% per run ($1.64 vs $1.33 median) on ~18-79 runs/month.
+  # Cache read is $0.25/Mtok (measured), so the swap premium is output + cache-create only.
+  merger: claude-fable-5-1
+
+# Model routing (Leo ruling D6, 2026-09-10; applied 2026-09-12). Admits claude-fable-5-1
+# for exactly two roles: the merger (via models.merger above) and the steward on its
+# second attempt (the steward rule below). The reviewer stays opus: the D5 campaign's
+# pre-registered paired three-repeat F1 rule FAILED for Fable (Δ +0.028 / -0.062 /
+# -0.052); task 5438 reruns it on the D2 briefing. The architect and implementer are
+# out of scope by ruling.
+#
+# DELIBERATE DEVIATION from P4-06's "ladder top = fable": the ladder is left at
+# [haiku, sonnet, opus] because the shipped `retry-tier-up` rule bumps implementer,
+# debugger and architect retries by "+1" -- a ladder with fable on top would route those
+# excluded roles' retries to fable. Absolute model strings are used instead.
+#
+# A project-level `rules:` list REPLACES the fleet default list (config._deep_merge only
+# recurses into dicts), so the four shipped rules from orchestrator/defaults.yaml are
+# restated verbatim here ahead of the steward rule; keep them in step with that file.
+# `usage_cap.scoped_cap_models` (restart-tier) is set below so Fable's cap hits stay
+# scoped once the daemon restarts. Green-tier fields hot-reload.
+routing:
+  allowed_models: [haiku, sonnet, opus, claude-fable-5-1]
+  ladder: [haiku, sonnet, opus]
+  per_model_daily_ceiling_usd:
+    claude-fable-5-1: 150.0
+  rules:
+    - id: large-plan-steps
+      match:
+        role: [implementer, debugger]
+        plan_min_steps: 12
+      set:
+        model: opus
+        max_turns: 120
+    - id: large-plan-modules
+      match:
+        role: [implementer, debugger]
+        plan_min_modules: 3
+      set:
+        model: opus
+        max_turns: 120
+    - id: simple-saturated-full-path
+      match:
+        role: [architect]
+        simple_saturated: true
+      set:
+        model: opus
+    - id: retry-tier-up
+      match:
+        role: [implementer, debugger, architect]
+        min_routing_tier: 1
+      set:
+        model: "+1"
+    - id: steward-retry-fable
+      match:
+        role: [steward]
+        min_routing_tier: 1
+      set:
+        model: claude-fable-5-1
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
@@ -1199,6 +1262,10 @@ watcher_daily_cost_ceiling_usd: 150.0
 usage_cap:
   enabled: true
   accounts_file: "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"
+  # Restart-tier (not hot-reloadable): keeps claude-fable-5-1 cap hits scoped to that
+  # model per account instead of marking the whole account capped (ruling D6, 2026-09-12).
+  # Until the next restart a Fable cap hit counts against the general scope.
+  scoped_cap_models: [claude-fable-5, claude-fable-5-1]
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
