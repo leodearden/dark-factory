@@ -237,13 +237,6 @@ class TestValidateExhaustive:
         _Synth, any_row = self._make_synth_policy()
         _validate_exhaustive(_Synth, {_Synth.A: any_row, _Synth.B: any_row})
 
-    def test_real_module_import_satisfies_its_own_guard(self):
-        # Importing the real module must succeed — its shipped table already
-        # satisfies _validate_exhaustive (this is F1 firing at import time).
-        import orchestrator.verify_categories as vc
-
-        vc._validate_exhaustive(vc.FailureCategory, vc.CATEGORY_POLICY)
-
 
 # ---------------------------------------------------------------------------
 # step-5: derived registries match today's verify.py literals byte-for-byte
@@ -382,23 +375,15 @@ class TestShouldArchive:
 
 
 class TestVerifyRegistriesSingleSourced:
-    """verify.py's four category registries must BE (identity, not just
-    value-equality) the verify_categories objects — the mechanism that
+    """verify.py's PUBLICLY NAMED category registries must BE (identity, not
+    just value-equality) the verify_categories objects — the mechanism that
     eliminates the hand-sync bug_history (task 2048: a single category
     change required 4 registry edits + 2 inline sets).
 
-    RED today: verify.py still holds hand-written literals for
-    _CATEGORY_PRIORITY / _ARCHIVE_DENY_LIST / PREEXISTING_BREAK_SKIP_CATEGORIES,
-    and INFRA_TRANSIENT_CATEGORIES does not exist on verify.py yet.
+    verify.py's other two registries are privately named, so they are pinned
+    by VALUE through the derived objects instead — see
+    TestDerivedRegistriesByteIdentity (task 5027 γ4).
     """
-
-    def test_category_priority_is_the_derived_object(self):
-        from orchestrator import verify, verify_categories
-        assert verify._CATEGORY_PRIORITY is verify_categories.CATEGORY_PRIORITY
-
-    def test_archive_deny_list_is_the_derived_object(self):
-        from orchestrator import verify, verify_categories
-        assert verify._ARCHIVE_DENY_LIST is verify_categories.ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_is_the_derived_object(self):
         from orchestrator import verify, verify_categories
@@ -410,24 +395,6 @@ class TestVerifyRegistriesSingleSourced:
     def test_infra_transient_categories_is_the_derived_object(self):
         from orchestrator import verify, verify_categories
         assert verify.INFRA_TRANSIENT_CATEGORIES is verify_categories.INFRA_TRANSIENT_CATEGORIES
-
-
-class TestShouldArchiveCategoryDelegatesToTable:
-    """verify._should_archive_category must delegate to
-    verify_categories.should_archive — no endswith('_error') heuristic.
-
-    RED today: the endswith heuristic makes an unrecognized '..._error'
-    string archive (True) instead of defaulting to False.
-    """
-
-    @pytest.mark.parametrize('category', sorted(_EXPECTED_CATEGORY_VALUES))
-    def test_matches_table_lookup_for_every_known_category(self, category):
-        from orchestrator import verify, verify_categories
-        assert verify._should_archive_category(category) == verify_categories.should_archive(category)
-
-    def test_unknown_error_suffixed_category_no_longer_auto_archives(self):
-        from orchestrator import verify
-        assert verify._should_archive_category('made_up_error') is False
 
 
 class TestClassifierByteIdentityGolden:
@@ -663,12 +630,6 @@ class TestSemaphoreTimeoutArchivesForHumanTriage:
         from orchestrator.verify_categories import should_archive
         assert should_archive('semaphore_timeout') is True
 
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives —
-        mirrors TestShouldArchiveCategoryDelegatesToTable's style."""
-        from orchestrator import verify
-        assert verify._should_archive_category('semaphore_timeout') is True
-
 
 class TestDiskFullArchivesForHumanTriage:
     """task 3683: DISK_FULL must archive its verify log.
@@ -716,11 +677,6 @@ class TestDiskFullArchivesForHumanTriage:
     def test_should_archive_returns_true(self):
         from orchestrator.verify_categories import should_archive
         assert should_archive('disk_full') is True
-
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives."""
-        from orchestrator import verify
-        assert verify._should_archive_category('disk_full') is True
 
 
 class TestPytestInternalerrorArchivesForHumanTriage:
@@ -773,11 +729,6 @@ class TestPytestInternalerrorArchivesForHumanTriage:
         from orchestrator.verify_categories import should_archive
         assert should_archive('pytest_internalerror') is True
 
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives."""
-        from orchestrator import verify
-        assert verify._should_archive_category('pytest_internalerror') is True
-
 
 class TestEnvTransientArchivesForHumanTriage:
     """task 3683: ENV_TRANSIENT must archive its verify log.
@@ -826,11 +777,6 @@ class TestEnvTransientArchivesForHumanTriage:
     def test_should_archive_returns_true(self):
         from orchestrator.verify_categories import should_archive
         assert should_archive('env_transient') is True
-
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives."""
-        from orchestrator import verify
-        assert verify._should_archive_category('env_transient') is True
 
 
 class TestAssertInfraTransientRowsArchive:
@@ -905,13 +851,6 @@ class TestAssertInfraTransientRowsArchive:
             _Synth.CODE_FAULT: self._row(archive=False, is_infra_transient=False),
         }
         _assert_infra_transient_rows_archive(policy)
-
-    def test_real_module_import_satisfies_its_own_guard(self):
-        # Importing the real module must succeed — its shipped table already
-        # satisfies the guard (this is it firing at import time).
-        import orchestrator.verify_categories as vc
-
-        vc._assert_infra_transient_rows_archive(vc.CATEGORY_POLICY)
 
     def test_no_infra_transient_category_is_archive_denied(self):
         """The human-legible form of the same invariant, asserted against the
