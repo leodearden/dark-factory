@@ -5,7 +5,6 @@ import contextlib
 import fcntl
 import logging
 import os
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
@@ -1360,9 +1359,19 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
     This test saturates a (patched, small) ``_admission_executor`` with real
     task-role acquisitions permanently blocked against a held flock slot,
     then asserts a merge-role ``_admission_slot`` call still enters within a
-    bounded wall-clock budget. Pre-fix, this call queues behind the
-    saturating workers and only proceeds once they are cleaned up at the end
-    of the test — comfortably exceeding the budget.
+    bounded wall-clock budget.
+
+    Pre-fix, that call does not merely run slow — it never returns at all:
+    the merge ``cm.__enter__`` is queued on a pool whose workers only free
+    when ``holder_fd`` is closed, and that close lives in the same
+    ``finally`` the blocked ``async with`` prevents reaching. A bare
+    ``assert elapsed < budget`` after the acquire would therefore be
+    unreachable in exactly the scenario it exists to catch. The
+    ``asyncio.timeout`` bound below is what converts that deadlock into this
+    test's own failure, instead of letting it fall through to the suite-level
+    pytest-timeout — which, under this package's ``timeout_method =
+    "thread"``, ``os._exit()``s the xdist worker and reds a shifting victim
+    (see the ``--max-worker-restart=0`` note in orchestrator/pyproject.toml).
     """
 
     @pytest.mark.real_verify_admission
@@ -1395,17 +1404,16 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
             # loop (0.1s poll interval), so the pool is genuinely saturated.
             await asyncio.sleep(0.3)
 
-            start = time.monotonic()
-            async with verify._admission_slot('merge', config):
-                pass
-            elapsed = time.monotonic() - start
-
-            assert elapsed < 1.0, (
-                f'merge-role _admission_slot took {elapsed:.2f}s with the '
-                'admission executor fully saturated by task-role '
-                'acquisitions; a role acquire_task_slot never gates must '
-                'never queue behind the shared executor'
-            )
+            try:
+                async with asyncio.timeout(1.0), verify._admission_slot('merge', config):
+                    pass
+            except TimeoutError:
+                pytest.fail(
+                    'merge-role _admission_slot did not enter within 1.0s with the '
+                    'admission executor fully saturated by task-role acquisitions; '
+                    'a role acquire_task_slot never gates must never queue behind '
+                    'the shared executor'
+                )
         finally:
             os.close(holder_fd)
             await asyncio.wait_for(asyncio.gather(*saturating_tasks), timeout=5.0)
