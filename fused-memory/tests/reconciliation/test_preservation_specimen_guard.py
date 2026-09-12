@@ -609,3 +609,185 @@ class TestFilterPreservationSpecimenFlagsGraphitiChannel:
 
         assert result.kept_flags == [flag]
         assert result.suppressed_by_task == {}
+
+
+class TestBoundedScopeAndReadEconomy:
+    """What the guard must NOT drop, and what it must not spend to decide.
+
+    Over-suppression is the expensive direction: this guard runs on every
+    cycle's whole flag batch, so a scope error hides real findings fleet-wide.
+    The stranded-class discriminator is what bounds it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unrelated_flag_for_a_preserved_task_is_kept(self):
+        """(a) Preserved does not mean invisible.
+
+        Task 3105 carries a preservation citation, but a finding that says
+        something ELSE about it is not the adjudicated class and must still
+        reach Stage 2.  Without this the guard would turn a preserved specimen
+        into a blind spot.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flag = {
+            'task_id': '3105',
+            'flag_type': 'task_completed_not_reflected',
+            'description': 'Task 3105 has curator entries suggesting it is resolved.',
+        }
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+
+    @pytest.mark.asyncio
+    async def test_unrelated_flag_costs_no_backend_read(self):
+        """Narrowing happens BEFORE I/O, not after."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[{'task_id': '3105', 'flag_type': 'task_completed_not_reflected'}],
+        )
+
+        assert memory_service.get_memories_by_metadata.await_count == 0
+        assert memory_service.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_stranded_flag_without_citation_is_kept(self):
+        """(b) A genuinely stranded task is exactly what Stage 1 should report."""
+        memory_service = _make_memory_service()
+        flag = _stranded_flag(task_id='4102')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+        assert result.unresolved_task_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_batch_with_no_stranded_flag_short_circuits(self):
+        """(c) A cycle with nothing in this class costs ZERO backend calls."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flags = [
+            {'task_id': '3105', 'flag_type': 'duplicate_procedural_knowledge'},
+            {'task_id': '4102', 'flag_type': 'oversized_entity'},
+            {'task_id': '4103', 'flag_type': 'task_absent'},
+        ]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.kept_flags == flags
+        assert memory_service.get_memories_by_metadata.await_count == 0
+        assert memory_service.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('flags', [[], None])
+    async def test_empty_input_returns_empty_result_with_no_reads(self, flags):
+        """(d) Nothing in, nothing out, nothing spent."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+        assert result.unresolved_task_ids == ()
+        assert memory_service.get_memories_by_metadata.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_two_flags_for_one_task_cost_one_read(self):
+        """(e) The per-task verdict is memoized; N flags cost one corroboration."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flags = [
+            _stranded_flag(flag_type='task_stranded_no_claimant'),
+            _stranded_flag(flag_type='stranded_merge_phase_liveness'),
+        ]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 2}
+        assert memory_service.get_memories_by_metadata.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_uncorroborated_task_is_also_memoized(self):
+        """A negative verdict is cached too, so a noisy task is not re-read per flag."""
+        memory_service = _make_memory_service()
+        flags = [_stranded_flag(task_id='4102'), _stranded_flag(task_id='4102')]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.kept_flags == flags
+        assert memory_service.get_memories_by_metadata.await_count == 1
+        assert memory_service.get_entity.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_is_coerced_and_matches(self):
+        """(f) Task ids arrive as ints straight off a task dict."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag(task_id=3105)],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'task_id', [None, '', 0, [], {'nested': 'dict'}],
+    )
+    async def test_unusable_task_id_is_kept_without_reads(self, task_id):
+        """(f) A flag with no resolvable task is kept, never a junk backend query."""
+        memory_service = _make_memory_service()
+        flag = _stranded_flag(task_id=task_id)
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert memory_service.get_memories_by_metadata.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_absent_task_id_key_is_kept_without_reads(self):
+        """(f) ``items_flagged`` entries may omit task_id entirely."""
+        memory_service = _make_memory_service()
+        flag = {'flag_type': 'task_stranded_no_claimant', 'description': 'no task id'}
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert memory_service.get_memories_by_metadata.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_input_order_is_preserved_among_survivors(self):
+        """kept_flags is assigned straight back to items_flagged; order must hold."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        a = {'task_id': '4101', 'flag_type': 'task_absent'}
+        b = _stranded_flag()
+        c = {'task_id': '4103', 'flag_type': 'oversized_entity'}
+        d = _stranded_flag(task_id='4104')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[a, b, c, d],
+        )
+
+        assert result.kept_flags == [a, c, d]
