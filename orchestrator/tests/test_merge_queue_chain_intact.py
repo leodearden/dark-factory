@@ -10,7 +10,9 @@ NOT base==main.
 
 This file is the boundary-test leaf (PRD §7).  It reuses the merge-queue unit
 harness by bare module-name sibling import (no ``tests/__init__.py``):
-  - ``_make_worker`` / ``_make_fake_item`` — pure builders (test_merge_queue_two_layer_integration).
+  - ``_make_fake_item`` / ``_make_inflight_entry`` / ``_make_merged_item`` —
+    pure builders (test_merge_queue_two_layer_integration).  ``_make_worker`` is
+    LOCAL to this file: the sibling's forwards no collaborators.
 
 Step-1 (this commit) covers the pure predicate + recorder foundation:
   * ``_chain_dead_link(item, main_sha)`` — the single shared chain-intact predicate.
@@ -35,20 +37,20 @@ from test_merge_queue_two_layer_integration import (
     _make_fake_item,
     _make_inflight_entry,
     _make_merged_item,
-    _make_worker,
 )
 from test_merge_queue_verify_base_invariant import _fake_local_allocator
 from test_merge_speculation import _LateArrivalFakeEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
     MergeOutcome,
     RealMergeItem,
+    SpeculativeMergeWorker,
 )
 from orchestrator.verify_runner import HostLease
 
@@ -102,6 +104,34 @@ _MAIN = 'a' * 40
 # A LIVE deep predecessor merge_commit — != main and NOT in the dead set.  A
 # verdict on this base is verify-depth-agnostic INTACT (never voided).
 _LIVE_DEEP = 'e' * 40
+
+
+def _make_worker(
+    git_ops: GitOps, *, event_store: object = None,
+) -> SpeculativeMergeWorker:
+    """Build a bare worker, optionally carrying an injected event store.
+
+    Local to this file rather than the sibling ``_make_worker``
+    (test_merge_queue_two_layer_integration, merge-lane test group γ4): that one
+    forwards nothing, so an event store could only be attached by assigning
+    ``worker._event_store`` afterwards.  ``event_store=`` is a real constructor
+    parameter (merge_queue.py:9387, stored at :9404), so the tests here hold the
+    store they injected and read their speculative events straight off it.
+    """
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue(), event_store=event_store)
+
+
+def _awaiting_host(worker: SpeculativeMergeWorker) -> list[str]:
+    """Task ids of the items parked for re-dispatch, read from ``snapshot()``.
+
+    ``snapshot()`` enumerates the front-priority re-dispatch queue as entries in
+    state ``'awaiting_host'`` (merge_queue.py:13654-13659) — the public view of
+    the parking a voided verdict's re-merged replacement lands in.
+    """
+    return [
+        entry['task_id'] for entry in worker.snapshot()['entries']
+        if entry['state'] == 'awaiting_host'
+    ]
 
 
 def _make_mock_allocator() -> MagicMock:
@@ -240,17 +270,17 @@ class TestAdoptionFailVoid:
         _, item = await _make_merged_item(git_ops, config, 'task/void-fail', 'vf.py', 'x=1\n')
         item = dataclasses.replace(item, base_sha=_DEAD)
         req = item.request
+        main_sha = await git_ops.get_main_sha()   # the REAL tip the chain check reads
 
-        worker = _make_worker(git_ops)
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._event_store = _LateArrivalFakeEventStore()
         worker._dead_base_commits.add(_DEAD)
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
 
         # The re-merged (live-based) replacement _remerge would produce.
         _, remerged = _make_fake_item(
-            'remerged-fail', base_sha=_MAIN, merge_commit='rmc00000',
+            'remerged-fail', base_sha=main_sha, merge_commit='rmc00000',
             config=config, git_repo=git_repo,
         )
         worker._remerge = AsyncMock(return_value=remerged)  # type: ignore[method-assign]
@@ -264,10 +294,10 @@ class TestAdoptionFailVoid:
 
         assert result is False
         worker._remerge.assert_awaited_once()          # item re-merged against real main
-        assert remerged in worker._redispatch          # re-parked for re-verify
+        assert 'remerged-fail' in _awaiting_host(worker)  # re-parked for re-verify
         assert not req.result.done()                   # phantom FAIL never blocked the task
         assert worker._n_failed is False               # voided ≠ failed (no false cascade)
-        voided = worker._event_store.speculative_events(EventType.verdict_voided)
+        voided = store.speculative_events(EventType.verdict_voided)
         assert len(voided) == 1
         assert voided[0]['data']['dead_link'] == _DEAD
         assert voided[0]['data']['reason'] == 'chain_dead'
@@ -279,15 +309,15 @@ class TestAdoptionFailVoid:
         # base_sha == current main → chain intact even though an UNRELATED dead
         # commit sits in the ledger; a genuine FAIL IS adopted (one-shot).
         _, item = await _make_merged_item(git_ops, config, 'task/live-fail', 'lf.py', 'y=2\n')
-        item = dataclasses.replace(item, base_sha=_MAIN)
+        main_sha = await git_ops.get_main_sha()   # the REAL tip the chain check reads
+        item = dataclasses.replace(item, base_sha=main_sha)
         req = item.request
 
-        worker = _make_worker(git_ops)
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._event_store = _LateArrivalFakeEventStore()
         worker._dead_base_commits.add(_DEAD)  # unrelated dead commit
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
 
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
@@ -298,11 +328,11 @@ class TestAdoptionFailVoid:
 
         assert result is False
         worker._remerge.assert_not_awaited()           # NOT voided → not re-merged
-        assert not worker._redispatch                  # nothing re-parked
+        assert _awaiting_host(worker) == []            # nothing re-parked
         assert req.result.done()                       # genuine FAIL IS adopted (blocks)
         assert req.result.result().status == 'blocked'
         assert worker._n_failed is True
-        assert worker._event_store.speculative_events(EventType.verdict_voided) == []
+        assert store.speculative_events(EventType.verdict_voided) == []
 
 
 # ── Adoption-time PASS-void + depth-agnostic non-regression ───────────────────
@@ -323,25 +353,20 @@ class TestAdoptionPassVoid:
         _, item = await _make_merged_item(git_ops, config, 'task/void-pass', 'vp.py', 'p=1\n')
         item = dataclasses.replace(item, base_sha=_DEAD)
         req = item.request
+        # The REAL tip, both as the chain check's live main and as the fact the
+        # 'never advanced' assertion is made against — no advance_main spy needed:
+        # the dead-based tree not landing IS main's tip being unmoved.  The void
+        # fires before the CAS loop, so MAX_CAS_RETRIES never comes into play.
+        main_before = await git_ops.get_main_sha()
 
-        worker = _make_worker(git_ops)
-        # Today's RED run has no PASS-branch void yet, so it falls through to the
-        # CAS loop; MAX_CAS_RETRIES=0 makes that exit immediately (no real advance
-        # — advance_main is mocked to cas_failed) so the RED assertions below fail
-        # cleanly rather than looping.
-        worker.MAX_CAS_RETRIES = 0  # type: ignore[assignment]
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._event_store = _LateArrivalFakeEventStore()
         worker._dead_base_commits.add(_DEAD)
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
-        # advance_main spy — a dead-based tree must NEVER be advanced onto main.
-        worker._git_ops.advance_main = AsyncMock(  # type: ignore[method-assign]
-            return_value=AdvanceOutcome(result='cas_failed'),
-        )
 
         _, remerged = _make_fake_item(
-            'remerged-pass', base_sha=_MAIN, merge_commit='rmc11111',
+            'remerged-pass', base_sha=main_before, merge_commit='rmc11111',
             config=config, git_repo=git_repo,
         )
         worker._remerge = AsyncMock(return_value=remerged)  # type: ignore[method-assign]
@@ -352,12 +377,12 @@ class TestAdoptionPassVoid:
         result = await worker._finalize_inflight(entry)
 
         assert result is False
-        worker._git_ops.advance_main.assert_not_awaited()  # dead tree never advanced
+        assert await git_ops.get_main_sha() == main_before  # dead tree never advanced
         worker._remerge.assert_awaited_once()              # re-merged against real main
-        assert remerged in worker._redispatch              # re-parked for re-verify
+        assert 'remerged-pass' in _awaiting_host(worker)   # re-parked for re-verify
         assert not req.result.done()                       # PASS void leaves req unresolved
         assert worker._n_failed is False                   # voided ≠ failed
-        voided = worker._event_store.speculative_events(EventType.verdict_voided)
+        voided = store.speculative_events(EventType.verdict_voided)
         assert len(voided) == 1
         assert voided[0]['data']['dead_link'] == _DEAD
         assert voided[0]['data']['reason'] == 'chain_dead'
@@ -372,18 +397,17 @@ class TestAdoptionPassVoid:
         # and after the PASS-branch void is wired (a non-regression guard).
         _, item = await _make_merged_item(git_ops, config, 'task/deep-pass', 'dp.py', 'd=3\n')
         item = dataclasses.replace(item, base_sha=_LIVE_DEEP)
+        req = item.request
 
-        worker = _make_worker(git_ops)
+        main_before = await git_ops.get_main_sha()
+
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
         # Exit the CAS fast; we only assert the void branch is SKIPPED.
         worker.MAX_CAS_RETRIES = 0  # type: ignore[assignment]
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._event_store = _LateArrivalFakeEventStore()
         worker._dead_base_commits.add(_DEAD)  # unrelated dead commit; _LIVE_DEEP is NOT in it
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
-        worker._git_ops.advance_main = AsyncMock(  # type: ignore[method-assign]
-            return_value=AdvanceOutcome(result='cas_failed'),
-        )
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
 
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
@@ -393,10 +417,22 @@ class TestAdoptionPassVoid:
 
         # NOT voided: the deep intact chain proceeds to the normal CAS path.
         worker._remerge.assert_not_awaited()
-        assert not worker._redispatch
-        assert worker._event_store.speculative_events(EventType.verdict_voided) == []
-        # Proof the normal PASS/CAS path WAS reached (advance attempted), not voided.
-        worker._git_ops.advance_main.assert_awaited()
+        assert _awaiting_host(worker) == []
+        assert store.speculative_events(EventType.verdict_voided) == []
+        # Proof the normal PASS/CAS path WAS reached, not voided.  The REAL CAS
+        # ran: it compared-and-swapped against _LIVE_DEEP, which is not main's
+        # tip, exhausted its 0-retry budget and RESOLVED the request.  A void
+        # takes neither step — the dead-base sibling above asserts the exact
+        # opposite pair (request unresolved, plus a verdict_voided event).
+        assert req.result.done(), (
+            'the CAS path must have been entered and resolved the request; '
+            'a voided verdict leaves it unresolved'
+        )
+        assert req.result.result().status == 'blocked'
+        assert await git_ops.get_main_sha() == main_before, (
+            'the CAS expected-ref is the item\'s own _LIVE_DEEP base, which is '
+            'not main, so the swap correctly refuses to move main'
+        )
 
 
 # ── Dispatch-time / host-acquisition dead-base re-check (enforcement (a)) ──────
@@ -414,10 +450,10 @@ class TestDispatchDeadBaseRecheck:
     async def test_dead_base_rechecked_at_dispatch_despite_inflight_verify(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        worker = _make_worker(git_ops)
-        worker._event_store = _LateArrivalFakeEventStore()
+        main_sha = await git_ops.get_main_sha()   # the REAL tip the re-check reads
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
         worker._dead_base_commits.add(_DEAD)
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()  # one free local slot
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
@@ -426,7 +462,7 @@ class TestDispatchDeadBaseRecheck:
         # _remerge returns a DecidedItem so the post-remerge passthrough returns
         # WITHOUT ever launching a verify (proves no verify burned on the dead base).
         _, remerged = _make_fake_item(
-            'remerged-dispatch', base_sha=_MAIN, merge_commit=None,
+            'remerged-dispatch', base_sha=main_sha, merge_commit=None,
             config=config, git_repo=git_repo,
         )
         worker._remerge = AsyncMock(return_value=remerged)  # type: ignore[method-assign]
@@ -434,7 +470,7 @@ class TestDispatchDeadBaseRecheck:
         # A head entry WITH a verify_task → _has_inflight_verify is True (the exact
         # 5260 condition the old global-flag gate mis-handles).
         _, head = _make_fake_item(
-            'head', base_sha=_MAIN, merge_commit='headc', config=config, git_repo=git_repo,
+            'head', base_sha=main_sha, merge_commit='headc', config=config, git_repo=git_repo,
         )
         worker._inflight.append(_make_inflight_entry(head, verifying=True))
 
@@ -448,7 +484,7 @@ class TestDispatchDeadBaseRecheck:
 
         worker._remerge.assert_awaited_once()          # re-merged despite _has_inflight_verify True
         worker._run_inflight_verify.assert_not_called()  # NO verify burned on the dead base
-        voided = worker._event_store.speculative_events(EventType.verdict_voided)
+        voided = store.speculative_events(EventType.verdict_voided)
         assert len(voided) == 1
         assert voided[0]['data']['dead_link'] == _DEAD
         assert voided[0]['data']['reason'] == 'chain_dead'
@@ -460,10 +496,10 @@ class TestDispatchDeadBaseRecheck:
         # Control: base_sha == current main → chain intact; the item must dispatch
         # normally (verify launched, no remerge, no void) even though an UNRELATED
         # dead commit sits in the ledger and _has_inflight_verify is True.
-        worker = _make_worker(git_ops)
-        worker._event_store = _LateArrivalFakeEventStore()
+        main_sha = await git_ops.get_main_sha()   # the REAL tip the re-check reads
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
         worker._dead_base_commits.add(_DEAD)  # unrelated dead commit
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
@@ -472,12 +508,13 @@ class TestDispatchDeadBaseRecheck:
         )
 
         _, head = _make_fake_item(
-            'head2', base_sha=_MAIN, merge_commit='headc2', config=config, git_repo=git_repo,
+            'head2', base_sha=main_sha, merge_commit='headc2', config=config, git_repo=git_repo,
         )
         worker._inflight.append(_make_inflight_entry(head, verifying=True))
 
         _, item = _make_fake_item(
-            'live-straggler', base_sha=_MAIN, merge_commit='livec', config=config, git_repo=git_repo,
+            'live-straggler', base_sha=main_sha, merge_commit='livec', config=config,
+            git_repo=git_repo,
         )
         assert isinstance(item, RealMergeItem)
 
@@ -485,7 +522,7 @@ class TestDispatchDeadBaseRecheck:
 
         worker._remerge.assert_not_awaited()             # intact chain → no remerge
         worker._run_inflight_verify.assert_called_once()  # verify launched normally
-        assert worker._event_store.speculative_events(EventType.verdict_voided) == []
+        assert store.speculative_events(EventType.verdict_voided) == []
         assert entry is not None
 
 
@@ -553,89 +590,16 @@ async def _drive_cascade_recording(
 
 
 @pytest.mark.asyncio
-class TestCascadeRecordsDeadBase:
-    """(enforcement point (c), the PRD §3.3 prompt-invalidation optimization.)
-
-    When the head FAILs, the head-failure cascade re-merges every downstream
-    in-flight entry — but a straggler that was BUILT-AWAITING-HOST (parked on
-    ``_redispatch``, NOT in ``_inflight``) is invisible to the cascade and keeps
-    a DANGLING successor edge (base_sha → a commit that has been re-merged away).
-    The 5260 fix: the cascade must ``_record_dead_base`` the invalidated
-    predecessor commits (the failed head's merge commit AND each downstream's OLD
-    merge commit) so that straggler is caught at its next dispatch by the INV-3
-    dead-base re-check (enforcement (a)).
-
-    RED: the cascade records nothing today, so ``_dead_base_commits`` is empty
-    after it runs.  GREEN (step-10): both invalidated commits are recorded.
-    """
-
-    async def test_cascade_records_head_and_downstream_dead_bases(
-        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
-    ) -> None:
-        worker = _make_worker(git_ops)
-        worker._event_store = _LateArrivalFakeEventStore()
-        worker._host_allocator = _make_mock_allocator()
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
-        # Stub the FS/host-touching helpers so the cascade drives on fake SHAs.
-        worker._release_or_cleanup = AsyncMock()  # type: ignore[method-assign]
-        worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
-        worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
-        worker._remerge = _make_remerge_to_decided_stub()  # type: ignore[method-assign]
-
-        # HEAD: base == main (a GENUINE fail, not a dead-base void), merge_commit
-        # = HEAD_C.  Its verify resolves to a FAIL so FINALIZE-HEAD returns False
-        # and the cascade fires.
-        _, head_item = _make_fake_item(
-            'cascade-head', base_sha=_MAIN, merge_commit=_HEAD_C,
-            config=config, git_repo=git_repo,
-        )
-        assert isinstance(head_item, RealMergeItem)
-        head_lease = HostLease(name='local', runner=MagicMock(), is_local=True)
-        head_entry = _make_fail_entry(
-            head_item, head_lease,
-            MergeOutcome('blocked', reason='head verify fail'), head_item.merge_wt,
-        )
-
-        # DOWNSTREAM speculative: base == HEAD_C (stacked on the head's commit),
-        # merge_commit = DOWN_C.  A PASS verify (already resolved) — the cascade
-        # cancels + re-merges it regardless of its verdict.
-        _, down_item = _make_fake_item(
-            'cascade-down', base_sha=_HEAD_C, merge_commit=_DOWN_C,
-            config=config, git_repo=git_repo,
-        )
-        assert isinstance(down_item, RealMergeItem)
-        down_lease = HostLease(name='remote', runner=MagicMock(), is_local=False)
-        down_entry = _make_pass_entry(down_item, down_lease, down_item.merge_wt)
-
-        worker._inflight.append(head_entry)
-        worker._inflight.append(down_entry)
-        # Let the (trivial) verify-task coroutines resolve so DISPATCH-FILL sees
-        # no running in-flight verify and breaks straight to FINALIZE-HEAD.
-        await asyncio.sleep(0.05)
-
-        await _drive_cascade_recording(worker)
-
-        # The cascade DID re-merge the downstream (proves it ran to the remerge).
-        assert worker._remerge.await_count >= 1
-        # RED: the ledger is empty (cascade records nothing).
-        # GREEN (step-10): both invalidated predecessor commits are recorded so a
-        # straggler stacked on either is now catchable at dispatch.
-        assert _HEAD_C in worker._dead_base_commits, (
-            'the FAILED head\'s merge commit must be recorded dead by the cascade'
-        )
-        assert _DOWN_C in worker._dead_base_commits, (
-            'the downstream\'s OLD (re-merged-away) merge commit must be recorded '
-            'dead by the cascade so a built-awaiting-host straggler stacked on it '
-            'is caught at its next dispatch'
-        )
-
-
-@pytest.mark.asyncio
 class TestCascadeStragglerCaughtComposition:
-    """The headline 5260 end-to-end: the cascade's dead-base recording (c)
-    composes with the dispatch-time dead-base re-check (a) so a built-awaiting-
-    host straggler is CAUGHT — re-merged against real main, NOT verified for
-    43 min against a base the cascade already re-merged away.
+    """The headline 5260 end-to-end.
+
+    The cascade's dead-base recording (c) — it records each invalidated
+    predecessor commit as dead, so a built-awaiting-host straggler parked on the
+    re-dispatch queue, which is invisible to the cascade and left with a
+    DANGLING successor edge, becomes catchable at its next dispatch — composes
+    with the dispatch-time dead-base re-check (a) so that straggler is CAUGHT:
+    re-merged against real main, NOT verified for 43 min against a base the
+    cascade already re-merged away.
 
     Two phases in one deterministic drive (no fragile host-availability timing):
       · Phase 1 — drive the head-failure cascade so the downstream's OLD merge
@@ -653,10 +617,10 @@ class TestCascadeStragglerCaughtComposition:
     async def test_straggler_on_dead_downstream_base_caught_at_dispatch(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        worker = _make_worker(git_ops)
-        worker._event_store = _LateArrivalFakeEventStore()
+        main_sha = await git_ops.get_main_sha()   # the REAL tip the chain check reads
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
         worker._host_allocator = _make_mock_allocator()
-        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
         worker._release_or_cleanup = AsyncMock()  # type: ignore[method-assign]
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
@@ -667,7 +631,7 @@ class TestCascadeStragglerCaughtComposition:
 
         # ── Phase 1: drive the cascade so DOWN_C is recorded dead ─────────────
         _, head_item = _make_fake_item(
-            'comp-head', base_sha=_MAIN, merge_commit=_HEAD_C,
+            'comp-head', base_sha=main_sha, merge_commit=_HEAD_C,
             config=config, git_repo=git_repo,
         )
         assert isinstance(head_item, RealMergeItem)
@@ -693,9 +657,10 @@ class TestCascadeStragglerCaughtComposition:
 
         # ── Phase 2: the built-awaiting-host straggler finally dispatches ─────
         # Its base_sha is DOWN_C — the commit the cascade re-merged away.  Give it
-        # a free host slot (host-acquisition time) and a fresh event store so only
-        # the straggler's dispatch events are asserted.
-        worker._event_store = _LateArrivalFakeEventStore()
+        # a free host slot (host-acquisition time).  The injected store stays the
+        # constructor's; phase 2's events are read as the DELTA past this mark,
+        # which isolates them exactly as swapping in a fresh store did.
+        voided_before = len(store.speculative_events(EventType.verdict_voided))
         worker._host_allocator = _fake_local_allocator()
         worker._remerge = _make_remerge_to_decided_stub()  # reset await_count
         _, straggler = _make_fake_item(
@@ -709,11 +674,11 @@ class TestCascadeStragglerCaughtComposition:
         # Caught at dispatch: re-merged against real main, NO verify burned.
         worker._remerge.assert_awaited_once()
         worker._run_inflight_verify.assert_not_called()
-        voided = worker._event_store.speculative_events(EventType.verdict_voided)
+        voided = store.speculative_events(EventType.verdict_voided)[voided_before:]
         assert len(voided) == 1
         assert voided[0]['data']['dead_link'] == _DOWN_C
         assert voided[0]['data']['reason'] == 'chain_dead'
         assert voided[0]['data']['point'] == 'dispatch'
 
         # §5.3 stays clean throughout (monitored → enforced upgrade).
-        assert worker.two_layer_invariants(_MAIN) == []
+        assert worker.two_layer_invariants(main_sha) == []
