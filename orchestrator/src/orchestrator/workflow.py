@@ -4523,28 +4523,33 @@ class TaskWorkflow:
 
         Exits via :meth:`_repend_for_requeue` so the REQUEUED return is
         TRUTHFUL (the row is written ``pending`` before the harness slot is
-        released); a terminal row observed out-of-band during that write wins
-        over the requeue intent and is returned verbatim.
+        released). A terminal row observed out-of-band during that write is
+        returned INSTEAD of REQUEUED — but the two terminals then diverge at
+        the caller, so neither reading generalises: a ``cancelled`` row wins
+        over the requeue intent and ends the dispatch, while a ``done`` row is
+        returned as DONE, which :meth:`_execute_verify_review_loop`
+        deliberately reads with its ordinary ``_execute_iterations`` meaning
+        (execution finished, continue to VERIFY) rather than as a terminal
+        exit.
         """
         cls = classify_agent_failure(result)
         # Compose the `agent API error: HTTP <status>` marker into the reason
         # UNCONDITIONALLY rather than trusting cls.summary to lead with it.
-        # This method's entry guard is `is_server_error_status` (mandated by
-        # this task's sidecar delivered_check), while the SUMMARY comes from
-        # `classify_agent_failure`, whose precedence ladder is owned by
-        # shared/cli_invoke.py. That ladder's rule 3 (the marker producer)
-        # carries three negative guards (`is_timed_out_with_progress`,
-        # `subtype == 'error_max_turns'`, `ModelNotFound`) plus two rules
-        # ABOVE it (`OK`, `ended_awaiting_background`) — so the two
-        # predicates are not the same test and can in principle disagree, in
-        # which case cls.summary would describe this requeue as a "wedge"
-        # while this guard classified it as a provider outage. No such
-        # divergence is production-reachable today (each guard needs a flag
-        # combination a pre-first-token 5xx kill does not produce) — this is
-        # a DEFENSIVE invariant, not a live bug fix. Its authority is this
-        # task's own contract ("the marker in the reason"): the marker is
-        # what the legacy fallback in scheduler.is_transient_api_requeue, and
-        # every operator-facing block-reason reader, keys on. The structured
+        # The entry guard here (`is_server_error_status`, mandated by this
+        # task's sidecar delivered_check) and the summary producer
+        # (`shared/cli_invoke.py::classify_agent_failure`) are different
+        # predicates and can in principle disagree, in which case cls.summary
+        # would describe this requeue as a "wedge" while this guard classified
+        # it as a provider outage. Compose unconditionally so the reason never
+        # describes a provider outage as a wedge: the marker is what the
+        # legacy fallback in scheduler.is_transient_api_requeue, and every
+        # operator-facing block-reason reader, keys on. Which rules of that
+        # ladder defer, and why, is deliberately NOT restated here — the
+        # ladder is owned and enumerated by its own docstring, and a copy on
+        # this side would go stale on the next reorder with nothing to catch
+        # it. No divergence is production-reachable today, so this is a
+        # DEFENSIVE invariant, not a live bug fix; its authority is this
+        # task's own contract ("the marker in the reason"). The structured
         # api_error_status field routes correctly either way (INV-1).
         marker = f'agent API error: HTTP {result.api_error_status}'
         summary = cls.summary if marker in cls.summary else f'{marker} — {cls.summary}'

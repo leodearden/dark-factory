@@ -254,23 +254,24 @@ class TestExecuteIterationsMarkerAlwaysComposed:
     reason AND the structured field set" — UNCONDITIONALLY, not only when
     ``classify_agent_failure``'s precedence ladder happens to lead with it.
 
-    This is a DEFENSIVE invariant, not a bug fix: no shape below is
-    production-reachable today. ``classify_agent_failure`` rule 3 (the
-    marker producer) fires only under three negative guards —
-    ``not is_timed_out_with_progress(result)``, ``result.subtype !=
-    'error_max_turns'``, ``not isinstance(outcome, ModelNotFound)`` — each
-    of which requires a flag combination a pre-first-token 5xx kill does
-    not produce. This test trips one of those guards
-    (``subtype='error_max_turns'``) alongside a genuine zero-output 5xx, so
-    rule 3 DEFERS and the next rule, ``if result.timed_out:``, claims it:
-    ``cls.summary`` becomes ``'agent timed out after 1200000ms with no
-    transcript turns (wedge — no progress made)'`` — carrying NO marker at
-    all — even though the workflow's OWN entry guard (``is_server_error_status``,
-    a different predicate owned by a different module, ``orchestrator/``
-    rather than ``shared/``) still classifies this exact result as a 5xx
-    requeue. A reason that misdescribes a provider-outage requeue as a
-    "wedge" is actively misleading to an operator, so the marker must be
-    composed in regardless of what the classifier's precedence hands back.
+    The workflow's entry guard (``is_server_error_status``, read in
+    ``orchestrator/``) and the summary producer
+    (``shared/cli_invoke.py::classify_agent_failure``, which owns and
+    enumerates its own precedence ladder) are different predicates, so they
+    can in principle disagree. This test constructs one such shape — a
+    genuine zero-output 5xx additionally carrying
+    ``subtype='error_max_turns'``, which that ladder currently defers on,
+    leaving ``cls.summary`` the marker-less ``'agent timed out ... (wedge —
+    no progress made)'`` — and pins that the reason carries the marker
+    anyway. A reason that misdescribes a provider-outage requeue as a
+    "wedge" is actively misleading to an operator.
+
+    Which rules defer, and why, is deliberately NOT restated here: that
+    ladder is owned by ``shared/cli_invoke.py`` and a copy on this side
+    would go stale on the next reorder. The premise assertion below is the
+    mechanised dependency — it fails loudly if the ladder stops deferring
+    for this shape. This is a DEFENSIVE invariant, not a bug fix: no
+    divergent shape is production-reachable today.
     """
 
     async def test_reason_carries_marker_even_when_classifier_summary_does_not(
@@ -320,7 +321,10 @@ class TestExecuteVerifyReviewLoopPropagation:
 
     Today the loop's EXECUTE arm branches only on ESCALATED and BLOCKED, so
     an un-propagated REQUEUED would silently continue into VERIFY on a task
-    that has already been re-pended to ``pending`` elsewhere.
+    that has already been re-pended to ``pending`` elsewhere. The complement
+    is pinned too: a ``done`` terminal override must KEEP falling through,
+    so the deliberate done/cancelled asymmetry is executable rather than
+    guaranteed only by the arm's comment.
     """
 
     async def test_row1_requeued_leaves_loop_without_running_verify(
@@ -373,6 +377,54 @@ class TestExecuteVerifyReviewLoopPropagation:
         wf._verify_debugfix_loop.assert_not_awaited()
         assert wf.machine.state is WorkflowState.CANCELLED
         assert wf._terminal_report is None
+
+    async def test_done_terminal_override_falls_through_to_verify(
+        self, tmp_path,
+    ) -> None:
+        """(b2) The OTHER half of the terminal-override split, which the
+        loop's EXECUTE arm decides in prose only: a ``done`` row observed
+        during the re-pend write is returned as plain DONE and therefore
+        keeps today's ``_execute_iterations`` semantics — execution finished,
+        continue to VERIFY → REVIEW → MERGE, where the existing
+        already-merged / recovery guards adjudicate it. NOT returned as a
+        terminal exit, and NOT REQUEUED.
+
+        Pinned executably because the asymmetry is the expensive half and is
+        easy to 'tidy up' away: adding ``if exec_outcome == DONE: return ...``
+        next to the REQUEUED/CANCELLED checks would read as symmetry-restoring
+        while silently introducing a new done-legitimacy policy on a requeue
+        path. VERIFY is stubbed to ESCALATED purely as an inert sentinel, so
+        the assertion is about the fall-through decision and not about
+        REVIEW/MERGE behaviour.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.artifacts.get_review_cycles_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf.artifacts.get_amendment_rounds_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.ESCALATED)  # type: ignore[method-assign]
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+        _stub_iteration_helpers(wf, _zero_output_result(api_error_status=529))
+        wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=TerminalExitRejection(
+                task_id=wf.task_id, old_status='done',
+                target_status='pending', raw='terminal-exit gate',
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        # The fall-through itself: VERIFY ran, so the loop did not treat DONE
+        # as an exit.  Its ESCALATED sentinel is what comes back — crucially
+        # NOT REQUEUED (the requeue intent was dropped) and NOT DONE-as-exit.
+        wf._verify_debugfix_loop.assert_awaited_once()
+        assert outcome == WorkflowOutcome.ESCALATED
+        assert outcome != WorkflowOutcome.REQUEUED
+        assert wf.machine.state is WorkflowState.VERIFY
+        # No REQUEUED report stashed: _requeue_on_server_error returns the
+        # override BEFORE composing one, so nothing downstream can read this
+        # dispatch as a transient requeue.
+        assert wf._terminal_report is None
+        wf._mark_blocked.assert_not_awaited()
+        wf.scheduler.set_task_status.assert_awaited_once_with(wf.task_id, 'pending')
 
     async def test_row3_caller_regression_blocks_with_infra_issue(
         self, tmp_path,
