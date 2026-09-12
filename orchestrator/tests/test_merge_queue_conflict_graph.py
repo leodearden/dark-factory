@@ -17,9 +17,11 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from _merge_lane_fakes import FakeClock
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
     MergeRequest,
@@ -92,8 +94,14 @@ def _make_req(
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    """Build a bare MergeLane for unit tests (no harness wiring).
+
+    ``snapshot()`` is this file's only observation surface and it stamps
+    every read against the worker's clock, so the clock port is the fake
+    one.  The verify port is left production: nothing here runs a verify,
+    and an unexercised double would assert nothing.
+    """
+    return MergeLane(git_ops, asyncio.Queue(), clock=FakeClock())
 
 
 def _graph(worker: SpeculativeMergeWorker) -> dict:
