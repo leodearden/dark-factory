@@ -1533,7 +1533,7 @@
     "orchestrator/tests/test_warm_lane_seed_scrub.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_warm_lane_soft_floor.py": {"patch_targets": [], "private_reads": 24},
     "orchestrator/tests/test_warm_lane_structural_exhaustion.py": {"patch_targets": [], "private_reads": 44},
-    "orchestrator/tests/test_workflow.py": {"patch_targets": ["_check_plan_files_touched_in_branch", "_emit_merge_attempt", "_emit_merge_coalesced", "_run", "enqueue_merge_request", "register_and_enqueue_merge_request"], "private_reads": 156},
+    "orchestrator/tests/test_workflow.py": {"patch_targets": ["_check_plan_files_touched_in_branch"], "private_reads": 146},
     "orchestrator/tests/test_workflow_agent_session_preserve.py": {"patch_targets": [], "private_reads": 9},
     "orchestrator/tests/test_workflow_branch_base_sha.py": {"patch_targets": [], "private_reads": 10},
     "orchestrator/tests/test_workflow_cancellation.py": {"patch_targets": [], "private_reads": 42},
