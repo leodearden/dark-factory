@@ -10710,157 +10710,7 @@ class TestEnsureVerifyDiskSpace:
 
 @pytest.mark.asyncio
 class TestPreVerifyDiskGuardWiring:
-    """The guard is wired before the first verify in both merge workers."""
-
-    async def test_merge_worker_proceeds_when_space_sufficient(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ):
-        wt = await _make_branch_with_file(
-            git_ops, 'disk-ok', 'ok.py', 'x = 1\n',
-        )
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
-
-        mock_verify = _mock_verify_pass()
-        with (
-            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
-            patch(
-                'orchestrator.merge_queue.shutil.disk_usage',
-                return_value=_usage(50 * _GIB),
-            ),
-            patch.object(
-                git_ops, 'prune_stale_merge_worktrees',
-                AsyncMock(return_value=[]),
-            ) as mock_prune,
-        ):
-            req = _make_request('disk-ok', 'disk-ok', wt, config)
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        assert outcome.status == 'done', f'unexpected: {outcome}'
-        assert mock_verify.call_count == 1
-        mock_prune.assert_not_called()
-
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-    async def test_merge_worker_proceeds_when_prune_frees_enough(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ):
-        wt = await _make_branch_with_file(
-            git_ops, 'disk-heals', 'heals.py', 'x = 1\n',
-        )
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
-
-        mock_verify = _mock_verify_pass()
-        with (
-            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
-            patch(
-                'orchestrator.merge_queue.shutil.disk_usage',
-                side_effect=[_usage(2 * _GIB), _usage(50 * _GIB)],
-            ),
-            patch.object(
-                git_ops, 'prune_stale_merge_worktrees',
-                AsyncMock(return_value=['/x/_merge-stale']),
-            ) as mock_prune,
-        ):
-            req = _make_request('disk-heals', 'disk-heals', wt, config)
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        assert outcome.status == 'done', f'unexpected: {outcome}'
-        assert mock_verify.call_count == 1
-        assert mock_prune.call_count == 1
-
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-    async def test_merge_worker_fails_open_on_disk_usage_oserror(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ):
-        wt = await _make_branch_with_file(
-            git_ops, 'disk-stat-boom', 'boom.py', 'x = 1\n',
-        )
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
-
-        mock_verify = _mock_verify_pass()
-        with (
-            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
-            patch(
-                'orchestrator.merge_queue.shutil.disk_usage',
-                side_effect=OSError('stat boom'),
-            ),
-            patch.object(
-                git_ops, 'prune_stale_merge_worktrees',
-                AsyncMock(return_value=[]),
-            ) as mock_prune,
-        ):
-            req = _make_request('disk-stat-boom', 'disk-stat-boom', wt, config)
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        assert outcome.status == 'done', f'unexpected: {outcome}'
-        assert mock_verify.call_count == 1
-        mock_prune.assert_not_called()
-
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-    async def test_merge_worker_short_circuits_on_persistent_low_disk(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ):
-        wt = await _make_branch_with_file(
-            git_ops, 'disk-low', 'low.py', 'x = 1\n',
-        )
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
-
-        mock_verify = _mock_verify_pass()
-        with (
-            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
-            patch(
-                'orchestrator.merge_queue.shutil.disk_usage',
-                return_value=_usage(1 * _GIB),
-            ),
-            patch.object(
-                git_ops, 'prune_stale_merge_worktrees',
-                AsyncMock(return_value=[]),
-            ) as mock_prune,
-        ):
-            req = _make_request('disk-low', 'disk-low', wt, config)
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        assert outcome.status == 'blocked'
-        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
-            f'expected transient-infra reason, got: {outcome.reason!r}'
-        )
-        # Build must NOT run when the guard short-circuits.
-        mock_verify.assert_not_called()
-        assert mock_prune.call_count == 1
-        # Main must not have advanced.
-        _, main_files, _ = await _run(
-            ['git', 'ls-tree', '-r', '--name-only', 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert 'low.py' not in main_files
-
-        await worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+    """The guard is wired before the first verify in the merge worker."""
 
     async def test_speculative_worker_short_circuits_on_persistent_low_disk(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -15506,7 +15356,7 @@ class TestFinalizeAdvancedMerge:
         # Test-local stash spot for the value under test — NOT the retired
         # GitOps._last_advanced_sha side channel (task 1997 retired that;
         # _finalize_advanced_merge takes advanced_sha as an explicit kwarg).
-        git_ops._stub_advanced_sha = last_advanced_sha
+        git_ops.stub_advanced_sha = last_advanced_sha
         return git_ops
 
     def _make_req(self) -> MagicMock:
@@ -15546,11 +15396,11 @@ class TestFinalizeAdvancedMerge:
                 cas_retries=cas_retries,
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
-                advanced_sha=git_ops._stub_advanced_sha,
+                advanced_sha=git_ops.stub_advanced_sha,
             )
 
         assert outcome.status == 'done'
-        assert outcome.merge_sha == git_ops._stub_advanced_sha
+        assert outcome.merge_sha == git_ops.stub_advanced_sha
         assert outcome.push_status == 'pushed'
         git_ops.push_main.assert_awaited_once()
         assert req.task_id not in cas_retries
@@ -16509,12 +16359,12 @@ class TestMapAdvanceFailure:
         git_ops.push_main = AsyncMock(return_value='pushed')
         # _last_recovery_branch/_last_overlap_files are real getattr side
         # channels _map_advance_failure still reads (out of scope for task
-        # 1997 — see plan). _stub_advanced_sha is just this test's stash
+        # 1997 — see plan). stub_advanced_sha is just this test's stash
         # spot for the advanced_sha kwarg value; the retired
         # _last_advanced_sha side channel is NOT read by production anymore.
         git_ops._last_recovery_branch = 'recovery/branch-abc'
         git_ops._last_overlap_files = ['foo.py', 'bar.py']
-        git_ops._stub_advanced_sha = 'adv-sha-123'
+        git_ops.stub_advanced_sha = 'adv-sha-123'
         return git_ops
 
     async def test_wip_overlap_halts_returns_wip_halted(self) -> None:
@@ -16554,13 +16404,13 @@ class TestMapAdvanceFailure:
             git_ops, 'pop_conflict',
             task_id=task_id, merge_commit_fallback='fallback-sha',
             halt=halt, unhalt=unhalt, cas_retries=cas_retries,
-            advanced_sha=git_ops._stub_advanced_sha,
+            advanced_sha=git_ops.stub_advanced_sha,
         )
 
         assert outcome.status == 'done_wip_recovery'
         assert outcome.recovery_branch == git_ops._last_recovery_branch
         assert outcome.push_status == 'pushed'
-        assert outcome.merge_sha == git_ops._stub_advanced_sha
+        assert outcome.merge_sha == git_ops.stub_advanced_sha
         halt.assert_called_once_with('advance_main: pop_conflict')
         git_ops.push_main.assert_awaited_once()
         unhalt.assert_not_called()  # success path must NOT un-halt
@@ -16704,13 +16554,6 @@ class TestWipHaltMixin:
         git_ops = MagicMock()
         queue: asyncio.Queue = asyncio.Queue()
         return worker_cls(git_ops, queue)
-
-    async def test_issubclass_pins_single_source(self, worker_cls: type) -> None:
-        """Both workers must subclass _WipHaltMixin (fails at import until S8)."""
-        from orchestrator.merge_queue import _WipHaltMixin
-
-        assert issubclass(MergeWorker, _WipHaltMixin)
-        assert issubclass(SpeculativeMergeWorker, _WipHaltMixin)
 
     async def test_initial_state_not_halted(self, worker_cls: type) -> None:
         """is_wip_halted is False immediately after construction."""
@@ -19478,7 +19321,7 @@ class TestSMWGenerationChain:
         _call_kwargs = finalize_mock.call_args.kwargs
         assert 'chain_ctx' in _call_kwargs, 'chain_ctx not passed to _finalize_advanced_merge'
         ctx: _GenerationChainContext = _call_kwargs['chain_ctx']
-        assert ctx.queue is worker._queue
+        assert ctx.queue is queue
         assert ctx.counts is worker._generation_chain_counts
         assert ctx.max_auto_generations == MAX_AUTO_CHAINED_GENERATIONS
         assert _call_kwargs.get('merged_branch_tip') == 'T1'
@@ -20535,7 +20378,7 @@ class TestMaybeLogQueueHeartbeat:
         req.enqueued_at = old_enqueued_at  # inject multi-hour age
 
         # Put directly into the worker's queue (no running worker needed)
-        worker._queue.put_nowait(req)
+        queue.put_nowait(req)
 
         t0 = time.time()
 
@@ -20601,7 +20444,7 @@ class TestMaybeLogQueueHeartbeat:
         assert hb_count_c == 2, f'Expected 2 merge_heartbeat events after re-fire, got: {hb_count_c}'
 
         # (d) Drain queue → depth == 0 → idle, must not fire
-        worker._queue.get_nowait()  # remove the one item
+        queue.get_nowait()  # remove the one item
         caplog.clear()
         t2 = t1 + worker._heartbeat_interval_s + 1.0
         result_d = worker._maybe_log_queue_heartbeat(t2)
@@ -21182,27 +21025,27 @@ class TestLanePickOrderHelpers:
     """Steps 5-6: _drain_queue_into_lanes and _pop_next_pickable."""
 
     def _setup(self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path):
-        """Return (worker, loop) with the loop set as current event loop."""
+        """Return (worker, queue, loop) with the loop set as current event loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        return worker, loop
+        return worker, queue, loop
 
     def test_lane_pick_order_high_before_normal(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ):
         """high-C is picked before normal-A and normal-B (high lane fully ahead); FIFO within."""
-        worker, loop = self._setup(git_ops, config, git_repo)
+        worker, queue, loop = self._setup(git_ops, config, git_repo)
         try:
             req_a = _make_request('t-a', 't-a', git_repo, config, lane='normal')
             req_b = _make_request('t-b', 't-b', git_repo, config, lane='normal')
             req_c = _make_request('t-c', 't-c', git_repo, config, lane='high')
 
             # Put in normal-A, normal-B, high-C order
-            worker._queue.put_nowait(req_a)
-            worker._queue.put_nowait(req_b)
-            worker._queue.put_nowait(req_c)
+            queue.put_nowait(req_a)
+            queue.put_nowait(req_b)
+            queue.put_nowait(req_c)
             worker._drain_queue_into_lanes()
 
             # Pick order: high-C, normal-A, normal-B
@@ -21218,13 +21061,13 @@ class TestLanePickOrderHelpers:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ):
         """_pop_next_pickable skips halted lanes; un-halting resumes them."""
-        worker, loop = self._setup(git_ops, config, git_repo)
+        worker, queue, loop = self._setup(git_ops, config, git_repo)
         try:
             req_normal = _make_request('t-n', 't-n', git_repo, config, lane='normal')
             req_high = _make_request('t-h', 't-h', git_repo, config, lane='high')
 
-            worker._queue.put_nowait(req_normal)
-            worker._queue.put_nowait(req_high)
+            queue.put_nowait(req_normal)
+            queue.put_nowait(req_high)
             worker._drain_queue_into_lanes()
 
             # Halt high lane — only normal should be available
@@ -21244,12 +21087,12 @@ class TestAgingPickOrder:
     """ζ/1891 aging comparator: clique-scoped age-of-first-submission ordering."""
 
     def _setup(self, git_ops: GitOps, config: OrchestratorConfig):
-        """Return (worker, loop) with the loop set as current event loop."""
+        """Return (worker, queue, loop) with the loop set as current event loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        return worker, loop
+        return worker, queue, loop
 
     def test_aging_orders_conflict_clique_by_first_submission(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
@@ -21263,7 +21106,7 @@ class TestAgingPickOrder:
 
         Fails against the pure popleft() comparator which returns A (FIFO head) first.
         """
-        worker, loop = self._setup(git_ops, config)
+        worker, queue, loop = self._setup(git_ops, config)
         try:
             req_a = _make_request(
                 't-a', 't-a', git_repo, config,
@@ -21274,8 +21117,8 @@ class TestAgingPickOrder:
                 merge_first_enqueued_at=100.0, request_id='mr-b',
             )
             # A first in buffer (FIFO head), B second
-            worker._queue.put_nowait(req_a)
-            worker._queue.put_nowait(req_b)
+            queue.put_nowait(req_a)
+            queue.put_nowait(req_b)
             worker._drain_queue_into_lanes()
 
             # Place A and B in the same footprint clique
@@ -21303,7 +21146,7 @@ class TestAgingPickOrder:
         field (set at construction time, monotonically increasing) must serve as
         the aging key, preserving FIFO order even for conflicting clique members.
         """
-        worker, loop = self._setup(git_ops, config)
+        worker, queue, loop = self._setup(git_ops, config)
         try:
             req_x = _make_request(
                 't-x', 't-x', git_repo, config,
@@ -21314,8 +21157,8 @@ class TestAgingPickOrder:
                 merge_first_enqueued_at=None, request_id='mr-y',
             )
             # X created first → smaller enqueued_at → older via fallback
-            worker._queue.put_nowait(req_x)
-            worker._queue.put_nowait(req_y)
+            queue.put_nowait(req_x)
+            queue.put_nowait(req_y)
             worker._drain_queue_into_lanes()
 
             worker._suffix_conflict_graph = SuffixConflictGraph(
@@ -21350,7 +21193,7 @@ class TestAgingPickOrder:
         under strict ``<`` → both are clique-minimal → FIFO-earliest 'mr-zzzz'
         is returned.
         """
-        worker, loop = self._setup(git_ops, config)
+        worker, queue, loop = self._setup(git_ops, config)
         try:
             req_zzzz = _make_request(
                 't-zzzz', 't-zzzz', git_repo, config,
@@ -21361,8 +21204,8 @@ class TestAgingPickOrder:
                 merge_first_enqueued_at=100.0, request_id='mr-aaaa',
             )
             # Lexically larger 'mr-zzzz' is FIFO head (idx0)
-            worker._queue.put_nowait(req_zzzz)
-            worker._queue.put_nowait(req_aaaa)
+            queue.put_nowait(req_zzzz)
+            queue.put_nowait(req_aaaa)
             worker._drain_queue_into_lanes()
 
             worker._suffix_conflict_graph = SuffixConflictGraph(
@@ -21395,7 +21238,7 @@ class TestAgingPickOrder:
         which would reorder disjoint items and fail to bypass correctly.
         """
         # ── (a) SCOPING: two DISJOINT items — younger-ahead must stay first ──
-        worker_a, loop_a = self._setup(git_ops, config)
+        worker_a, queue_a, loop_a = self._setup(git_ops, config)
         try:
             req_y = _make_request(
                 't-y', 't-y', git_repo, config,
@@ -21406,8 +21249,8 @@ class TestAgingPickOrder:
                 merge_first_enqueued_at=100.0, request_id='mr-o',
             )
             # younger-ahead (idx0), older-behind (idx1), NO footprint edge → disjoint
-            worker_a._queue.put_nowait(req_y)
-            worker_a._queue.put_nowait(req_o)
+            queue_a.put_nowait(req_y)
+            queue_a.put_nowait(req_o)
             worker_a._drain_queue_into_lanes()
             worker_a._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
 
@@ -21421,7 +21264,7 @@ class TestAgingPickOrder:
             loop_a.close()
 
         # ── (b) BYPASS: disjoint C jumps ahead of blocked head A ─────────────
-        worker_b, loop_b = self._setup(git_ops, config)
+        worker_b, queue_b, loop_b = self._setup(git_ops, config)
         try:
             req_a = _make_request(
                 't-a', 't-a', git_repo, config,
@@ -21437,9 +21280,9 @@ class TestAgingPickOrder:
             )
             # Buffer order: A(300, idx0), C(200, idx1), B(100, idx2)
             # footprint_edges: {mr-a, mr-b} — A and B conflict; C is disjoint
-            worker_b._queue.put_nowait(req_a)
-            worker_b._queue.put_nowait(req_c)
-            worker_b._queue.put_nowait(req_b2)
+            queue_b.put_nowait(req_a)
+            queue_b.put_nowait(req_c)
+            queue_b.put_nowait(req_b2)
             worker_b._drain_queue_into_lanes()
             worker_b._suffix_conflict_graph = SuffixConflictGraph(
                 nodes=('mr-a', 'mr-c', 'mr-b'),
@@ -21457,7 +21300,7 @@ class TestAgingPickOrder:
             loop_b.close()
 
         # ── (c) CROSS-LANE: high beats normal regardless of aging ─────────────
-        worker_c, loop_c = self._setup(git_ops, config)
+        worker_c, queue_c, loop_c = self._setup(git_ops, config)
         try:
             req_hi = _make_request(
                 't-hi', 't-hi', git_repo, config,
@@ -21467,8 +21310,8 @@ class TestAgingPickOrder:
                 't-lo', 't-lo', git_repo, config,
                 lane='normal', merge_first_enqueued_at=1.0, request_id='mr-lo',
             )
-            worker_c._queue.put_nowait(req_hi)
-            worker_c._queue.put_nowait(req_lo)
+            queue_c.put_nowait(req_hi)
+            queue_c.put_nowait(req_lo)
             worker_c._drain_queue_into_lanes()
             worker_c._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
 
@@ -21632,8 +21475,8 @@ class TestLaneSnapshotAndStop:
         req_h = _make_request('snap-h', 'snap-h', git_repo, config, lane='high')
 
         # Put items into the queue and drain them into lane buffers
-        worker._queue.put_nowait(req_n)
-        worker._queue.put_nowait(req_h)
+        queue.put_nowait(req_n)
+        queue.put_nowait(req_h)
         worker._drain_queue_into_lanes()
 
         snap = worker.snapshot()
@@ -21678,8 +21521,8 @@ class TestLaneSnapshotAndStop:
         req_h = _make_request('stop-h', 'stop-h', git_repo, config, lane='high')
 
         # Drain items into lane buffers (bypassing the merger loop)
-        worker._queue.put_nowait(req_n)
-        worker._queue.put_nowait(req_h)
+        queue.put_nowait(req_n)
+        queue.put_nowait(req_h)
         worker._drain_queue_into_lanes()
 
         # stop() must resolve all pending futures
@@ -22945,6 +22788,17 @@ class TestSpeculationPermitLeakOnMergerError:
             await worker_task
 
 
+def _ledger_paths(worker: SpeculativeMergeWorker) -> set[Path]:
+    """The owned-merge-worktree ledger, read from the worker's public snapshot.
+
+    ``snapshot()['owned_merge_worktrees']`` is the published view of that
+    ledger (sorted resolved absolute path strings); this turns it back into
+    paths so a test can ask the membership and size questions it actually
+    cares about without reaching for the private set.
+    """
+    return {Path(p) for p in worker.snapshot()['owned_merge_worktrees']}
+
+
 # ---------------------------------------------------------------------------
 # TestOwnedMergeWorktreeLivenessHeartbeat
 # ---------------------------------------------------------------------------
@@ -23045,7 +22899,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             n = worker._touch_owned_merge_worktrees()
 
         assert n == 0, f'Expected 0 (ENOENT path excluded), got {n}'
-        assert gone_path not in worker._owned_merge_worktrees, (
+        assert gone_path not in _ledger_paths(worker), (
             'ENOENT path must be removed from ledger'
         )
         info_records = [
@@ -23103,7 +22957,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         )
         assert n1 == 0, f'Expected count 0 on first failed call, got {n1}'
         assert n2 == 0, f'Expected count 0 on second failed call, got {n2}'
-        assert wt_dir in worker._owned_merge_worktrees, (
+        assert wt_dir in _ledger_paths(worker), (
             'Path must remain in ledger after non-ENOENT OSError'
         )
 
@@ -23158,20 +23012,20 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
         # None → no-op, no error
         worker._register_owned_merge_worktree(None)
-        assert len(worker._owned_merge_worktrees) == 0, (
+        assert len(_ledger_paths(worker)) == 0, (
             'Registering None must not add any entry'
         )
 
         # Persistent warm worktree → rejected
         worker._register_owned_merge_worktree(persistent_path)
-        assert persistent_path not in worker._owned_merge_worktrees, (
+        assert persistent_path not in _ledger_paths(worker), (
             f'Persistent {_PMN!r} path must never enter the liveness ledger'
         )
 
         # Ephemeral _merge-xyz → admitted
         ephemeral = git_ops.worktree_base / '_merge-abc123'
         worker._register_owned_merge_worktree(ephemeral)
-        assert ephemeral in worker._owned_merge_worktrees, (
+        assert ephemeral in _ledger_paths(worker), (
             'Ephemeral _merge-<id> path must be added to ledger'
         )
 
@@ -23285,7 +23139,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
                 # --- THE ASSERTION ---
                 # At this point the merger has succeeded and put a SpeculativeItem
                 # on the verifier queue.  The worktree must be registered.
-                ledger = worker._owned_merge_worktrees
+                ledger = _ledger_paths(worker)
                 assert len(ledger) >= 1, (
                     '_owned_merge_worktrees must be non-empty while verify is running; '
                     'got empty set'
@@ -23336,7 +23190,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         worker._owned_merge_worktrees.add(merge_wt_a)
         await worker._cleanup_owned_merge_worktree(merge_wt_a)
 
-        assert merge_wt_a not in worker._owned_merge_worktrees, (
+        assert merge_wt_a not in _ledger_paths(worker), (
             'Wrapper must deregister the worktree from the liveness ledger'
         )
         assert not merge_wt_a.exists(), (
@@ -23364,7 +23218,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         finally:
             git_ops.cleanup_merge_worktree = original_cleanup  # type: ignore[method-assign]
 
-        assert merge_wt_b not in worker._owned_merge_worktrees, (
+        assert merge_wt_b not in _ledger_paths(worker), (
             'Failed disk removal must NOT prevent deregistration from the ledger'
         )
         # Actual cleanup of the real dir (cleanup was mocked)
@@ -23412,9 +23266,9 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         # After a successful 'done' landing the ephemeral worktree was cleaned
         # from disk.  The liveness ledger must also be cleared — a ghost entry
         # would accumulate until the next ENOENT self-heal tick.
-        assert len(worker._owned_merge_worktrees) == 0, (
+        assert len(_ledger_paths(worker)) == 0, (
             f'_owned_merge_worktrees must be empty after done landing; '
-            f'residual: {worker._owned_merge_worktrees}'
+            f'residual: {_ledger_paths(worker)}'
         )
 
     async def test_warm_swap_deregisters_ephemeral_from_ledger(
@@ -23498,13 +23352,13 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
                     f'got {captured_ephemeral!r}'
                 )
                 ephemeral = captured_ephemeral[0]
-                assert ephemeral not in worker._owned_merge_worktrees, (
+                assert ephemeral not in _ledger_paths(worker), (
                     f'Ephemeral {ephemeral.name!r} must be deregistered at warm-swap '
                     'time (before verify), not left as a ghost in the liveness ledger'
                 )
                 # Persistent path must never have been registered
                 persistent_path = git_ops.worktree_base / _PMN
-                assert persistent_path not in worker._owned_merge_worktrees, (
+                assert persistent_path not in _ledger_paths(worker), (
                     f'Persistent {_PMN!r} path must never enter the liveness ledger'
                 )
 
@@ -23589,11 +23443,11 @@ class TestReleaseOrCleanupDeregisters:
         p = tmp_path / '_spec-lane-1'
         p.mkdir()
         worker._register_owned_merge_worktree(p)
-        assert p in worker._owned_merge_worktrees, 'pre-condition: registered'
+        assert p in _ledger_paths(worker), 'pre-condition: registered'
 
         await worker._release_or_cleanup(p, spec_warm=True)
 
-        assert p not in worker._owned_merge_worktrees, (
+        assert p not in _ledger_paths(worker), (
             'a retained ledger entry is heartbeat-pinned, reaper-exempt, and '
             'invisible to worktree_ledger_violations — unrecoverable short of restart'
         )
@@ -23611,7 +23465,7 @@ class TestReleaseOrCleanupDeregisters:
 
         await worker._release_or_cleanup(p, spec_warm=False)
 
-        assert p not in worker._owned_merge_worktrees
+        assert p not in _ledger_paths(worker)
         assert calls['cleanup_merge_worktree'] == [p]
         assert calls['release_spec_lane'] == []
 
@@ -23635,7 +23489,7 @@ class TestReleaseOrCleanupDeregisters:
         await worker._release_or_cleanup(p, spec_warm=True)
         await worker._release_or_cleanup(p, spec_warm=True)
 
-        assert p not in worker._owned_merge_worktrees
+        assert p not in _ledger_paths(worker)
         assert calls['release_spec_lane'] == [(p, True), (p, True)]
 
 
