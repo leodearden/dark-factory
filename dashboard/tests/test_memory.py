@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from unittest.mock import AsyncMock, patch
@@ -19,20 +20,58 @@ from dashboard.data.memory import get_curator_state
 
 
 class _SessionAwareHandler:
-    """Mock handler that responds to initialize, notify, and tools/call."""
+    """Mock handler that responds to initialize, notify, and tools/call.
+
+    The one mock MCP server for this module — every failure shape is a knob
+    here rather than a separate handler class, because each such class
+    re-implements this same initialize / notifications / tools-call dispatch
+    and a drifted copy makes a test pass for the wrong reason.
+
+    The failure knobs model three distinct server states:
+
+    - ``fail_port`` — the server is DOWN: every request to that port raises
+      ``ConnectError`` before dispatch.
+    - ``error_on_all`` / ``error_on_tool`` / ``error_status`` — the server is
+      up and answering badly (a raised transport error, or an HTTP error
+      status on the ``tools/call``).
+    - ``hang_port`` / ``hang_always`` — the server is UP and SILENT: the
+      handshake completes, then ``tools/call`` parks on a never-set
+      ``asyncio.Event`` forever. This is the shape a per-HTTP-request budget
+      cannot bound, and the one that used to wedge a cached session or park an
+      aggregating loop before it reached the remaining urls.
+
+    ``__call__`` is ``async`` for the sake of that last knob:
+    ``httpx.MockTransport.handle_async_request`` awaits a handler that returns
+    an awaitable, so parking here parks the post exactly as a silent server
+    would. (It accepts sync handlers too, which is why this used to be a plain
+    ``def``; the async form is a superset for every async-client test here.)
+    """
 
     def __init__(self, tool_response: dict | None = None, *, error_status: int | None = None,
                  error_on_tool: Exception | None = None, error_on_all: Exception | None = None,
-                 fail_port: int | None = None):
+                 fail_port: int | None = None,
+                 hang_port: int | None = None, hang_always: bool = False):
         self.tool_response = tool_response or {}
         self.error_status = error_status
         self.error_on_tool = error_on_tool
         self.error_on_all = error_on_all
         self.fail_port = fail_port
+        self.hang_port = hang_port
+        self.hang_always = hang_always
+        self._never = asyncio.Event()
         self.calls: list[dict] = []
         self.ports_seen: set[int] = set()
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    @property
+    def tool_calls(self) -> int:
+        """How many ``tools/call`` requests reached dispatch — hung ones included.
+
+        Derived from ``calls`` rather than counted separately so the two can
+        never disagree; the hang below parks *after* the body is recorded.
+        """
+        return sum(1 for c in self.calls if c.get('method') == 'tools/call')
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
         """Dispatch a mock HTTP request.
 
         `ports_seen` records every attempted port, including those that raise
@@ -66,11 +105,22 @@ class _SessionAwareHandler:
             raise self.error_on_tool
         if self.error_status:
             return httpx.Response(self.error_status, text='Server Error')
+        if self.hang_always or (self.hang_port is not None and port == self.hang_port):
+            # Deliberately AFTER the handshake branches above: a silent server
+            # still completes initialize/notify, which is what makes the
+            # session cache-able — and therefore wedge-able.
+            await self._never.wait()
+            raise AssertionError('unreachable')  # pragma: no cover
         return mcp_tool_response(self.tool_response, request_id)
 
 
 class TestSessionAwareHandler:
-    """Unit tests for _SessionAwareHandler port-tracking behaviour."""
+    """Unit tests for _SessionAwareHandler port-tracking behaviour.
+
+    These drive ``__call__`` directly rather than through a transport, so each
+    is ``async`` and awaits it — the handler is a coroutine function so that
+    ``hang_port``/``hang_always`` can park a post (see its docstring).
+    """
 
     def _init_request(self, port: int = 9001) -> httpx.Request:
         """Build a minimal JSON-RPC initialize request targeting *port*."""
@@ -84,48 +134,65 @@ class TestSessionAwareHandler:
         handler = _SessionAwareHandler({'ok': True})
         assert handler.ports_seen == set()
 
-    def test_ports_seen_after_request(self):
+    async def test_ports_seen_after_request(self):
         """After a request to port 9001, ports_seen contains 9001."""
         handler = _SessionAwareHandler({'ok': True})
-        handler(self._init_request(9001))
+        await handler(self._init_request(9001))
         assert 9001 in handler.ports_seen
 
-    def test_calls_populated_for_successful_request(self):
+    async def test_calls_populated_for_successful_request(self):
         """handler.calls is populated after a successful request."""
         handler = _SessionAwareHandler({'ok': True})
-        handler(self._init_request(9001))
+        await handler(self._init_request(9001))
         assert len(handler.calls) == 1
         assert handler.calls[0]['method'] == 'initialize'
 
-    def test_fail_port_raises_connect_error(self):
+    async def test_fail_port_raises_connect_error(self):
         """Request to fail_port raises httpx.ConnectError."""
         handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
         with pytest.raises(httpx.ConnectError):
-            handler(self._init_request(9000))
+            await handler(self._init_request(9000))
 
-    def test_fail_port_records_port_before_error(self):
+    async def test_fail_port_records_port_before_error(self):
         """Port is recorded in ports_seen even when ConnectError is raised."""
         handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
         with pytest.raises(httpx.ConnectError):
-            handler(self._init_request(9000))
+            await handler(self._init_request(9000))
         assert 9000 in handler.ports_seen
         assert len(handler.calls) == 0
 
-    def test_fail_port_does_not_affect_other_ports(self):
+    async def test_fail_port_does_not_affect_other_ports(self):
         """Requests to ports other than fail_port succeed normally."""
         handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
-        response = handler(self._init_request(9001))
+        response = await handler(self._init_request(9001))
         assert response.status_code == 200
         assert 9001 in handler.ports_seen
         assert 9000 not in handler.ports_seen
 
-    def test_portless_url_raises_assertion_error(self):
+    async def test_portless_url_raises_assertion_error(self):
         """Request to a URL without an explicit port raises AssertionError."""
         handler = _SessionAwareHandler({'ok': True})
         body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}).encode()
         request = httpx.Request('POST', 'http://localhost/mcp', content=body)
         with pytest.raises(AssertionError):
-            handler(request)
+            await handler(request)
+
+    async def test_hang_port_still_completes_the_handshake(self):
+        """hang_port models a SILENT server, not a dead one: initialize answers.
+
+        The distinction is what makes the hang reachable at all — a session is
+        only cached (and so only wedge-able) once its handshake succeeded. If
+        the hang check ever migrates above the initialize branch, every test
+        that relies on it would park in the handshake instead of in
+        ``tools/call``, and would still "pass" by timing out for the wrong
+        reason.
+        """
+        handler = _SessionAwareHandler({'ok': True}, hang_port=9000)
+        response = await asyncio.wait_for(
+            handler(self._init_request(9000)), timeout=5,
+        )
+        assert response.status_code == 200
+        assert handler.tool_calls == 0, 'no tools/call was issued'
 
 
 @pytest.fixture(autouse=True)
@@ -231,6 +298,83 @@ class TestMcpToolCall:
             f'Expected all paths to be /mcp, got {captured_paths}'
         )
 
+
+# ── mcp_tool_call evicts a session that hangs or is cancelled ───
+
+
+class TestMcpToolCallInvalidatesOnHang:
+    """mcp_tool_call is the cache-aware chokepoint every MCP caller passes.
+
+    ``_get_session`` caches one ``McpSession`` per base url and
+    ``invalidate_session`` is the only teardown; ``McpSession.call_tool`` is an
+    instance method with no knowledge of that cache, so it structurally cannot
+    evict itself. A session whose post hangs must therefore be evicted HERE, or
+    it stays wedged in ``_sessions`` and every later poll reuses it — including
+    for callers outside this module (``task_runtime._probe_one`` catches
+    TimeoutError from its own wait_for and never invalidated at all).
+    """
+
+    async def test_cancellation_invalidates_the_cached_session(self):
+        from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _SessionAwareHandler(hang_always=True)
+        transport = httpx.MockTransport(handler)
+        _get_session(url)
+        assert url in _sessions
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(
+                    mcp_tool_call(client, url, 'get_status', {}), timeout=0.05,
+                )
+
+        assert handler.tool_calls == 1, 'the hang must be in tools/call'
+        assert url not in _sessions, (
+            'a session cancelled mid-post must be evicted, or every later '
+            'poll reuses the wedged session and hangs identically'
+        )
+
+    async def test_bare_timeout_error_propagates_and_invalidates(self):
+        from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _SessionAwareHandler(error_on_tool=TimeoutError('slow'))
+        transport = httpx.MockTransport(handler)
+        _get_session(url)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(TimeoutError):
+                await mcp_tool_call(client, url, 'get_status', {})
+
+        assert url not in _sessions, (
+            'an escaping builtin TimeoutError must evict the session too'
+        )
+
+    async def test_http_status_error_propagates_WITHOUT_invalidating(self):
+        """Negative control: the guard stays narrow, never `except BaseException`.
+
+        Teardown policy for ordinary transport/soft failures already belongs to
+        the callers (first_success, get_queue_stats, get_wal_status), which
+        invalidate themselves. A blanket handler here would force a cold
+        three-post handshake on every 500 and silently change that policy, so
+        this test fails if the guard is ever broadened.
+        """
+        from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _SessionAwareHandler(error_status=500)
+        transport = httpx.MockTransport(handler)
+        _get_session(url)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await mcp_tool_call(client, url, 'get_status', {})
+
+        assert url in _sessions, (
+            'mcp_tool_call must NOT invalidate on an HTTP status error — that '
+            "remains the caller's decision"
+        )
 
 # ── client_op_id injection (twin of orchestrator McpSession) ────
 
@@ -792,6 +936,79 @@ class TestAggregatingLoopsLogFailuresAtWarning:
             f'{[r.getMessage() for r in warnings]}'
         )
 
+
+# ── one hung url must not starve the hand-rolled per-URL loops ──
+
+
+class TestHandRolledLoopsBoundEachUrl:
+    """get_queue_stats / get_wal_status visit ALL N urls, in a plain for-loop.
+
+    Neither goes through ``first_success``, so neither inherited its
+    whole-operation deadline: a url that accepted the request and then went
+    silent parked the loop forever, and the remaining urls were never visited —
+    the aggregate simply never returned. Each url now gets the same
+    ``call_with_deadline`` bound, after which the hung url is logged,
+    invalidated and skipped.
+
+    The outer ``asyncio.wait_for(..., 5)`` is mandatory: without it a
+    regression is SIGALRM-killed at the suite's 60s pytest-timeout with no
+    traceback instead of failing fast.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _short_deadline(self, monkeypatch):
+        from dashboard.data import mcp_fanout
+
+        monkeypatch.setattr(mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', 0.05)
+
+    async def test_get_queue_stats_skips_the_hung_url_and_aggregates_the_rest(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import _get_session, _sessions, get_queue_stats
+
+        hung = 'http://localhost:9000'
+        _get_session(hung)
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, hang_port=9000)
+        transport = httpx.MockTransport(handler)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await asyncio.wait_for(
+                get_queue_stats(client, two_url_config), timeout=5,
+            )
+
+        assert 'offline' not in result, (
+            f'the healthy server must still aggregate, got {result}'
+        )
+        assert result['counts']['pending'] == 3, (
+            f"port 9001's contribution must be present, got {result}"
+        )
+        assert 9001 in handler.ports_seen, 'the loop must reach the second url'
+        assert hung not in _sessions, "the hung url's session must be evicted"
+
+    async def test_get_wal_status_skips_the_hung_url_and_reports_the_rest(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import _get_session, _sessions, get_wal_status
+
+        hung = 'http://localhost:9000'
+        _get_session(hung)
+        stores = {'graphiti': {'busy': 0}}
+        handler = _SessionAwareHandler({'stores': stores}, hang_port=9000)
+        transport = httpx.MockTransport(handler)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await asyncio.wait_for(
+                get_wal_status(client, two_url_config), timeout=5,
+            )
+
+        assert 'offline' not in result, (
+            f'the healthy server must still report, got {result}'
+        )
+        assert result['stores'] == {'http://localhost:9001': stores}, (
+            f"only port 9001's per-url entry is expected, got {result}"
+        )
+        assert 9001 in handler.ports_seen, 'the loop must reach the second url'
+        assert hung not in _sessions, "the hung url's session must be evicted"
 
 # ── Malformed responses ─────────────────────────────────────────
 
