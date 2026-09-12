@@ -370,9 +370,14 @@ def test_the_stamp_is_still_well_formed_json_for_a_hostile_token(
     printf cannot escape JSON, so an env value carrying a quote, a backslash, a
     newline or a brace could otherwise produce a syntactically broken file --
     and _read_clock_epoch fails OPEN on a corrupt body, which would disarm the
-    very min-interval cap this stamp exists to arm. The token's own value is not
-    asserted here (the sanitiser may drop characters from it); only that the
-    file a reader gets is still parseable and still carries a usable `ts`.
+    very min-interval cap this stamp exists to arm. The token's exact value is
+    not asserted (it is unrepresentable here by construction), but its
+    EMPTINESS is: sanitising away a token that was genuinely present would
+    forgive the very write it proves, since empty is what
+    df_pytest_isolation.py::deploy_clock_change_report reads as "no pytest
+    session was an ancestor of this write". So the sanitiser drops to a
+    non-empty sentinel rather than to nothing -- fail-closed in the same
+    direction as every other unattributable shape.
     """
     monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, 'ab"cd\\ef\ngh}ij')
     clock_file = tmp_path / "last_redeploy_orchestrator.json"
@@ -383,3 +388,8 @@ def test_the_stamp_is_still_well_formed_json_for_a_hostile_token(
     stamped = json.loads(clock_file.read_text())
     assert isinstance(stamped["ts"], (int, float)), f"ts must stay numeric; got {stamped!r}"
     assert isinstance(stamped[CLOCK_PROVENANCE_SESSION_KEY], str)
+    assert stamped[CLOCK_PROVENANCE_SESSION_KEY] != "", (
+        "a non-empty ambient token sanitised down to the empty string, which "
+        "the guard reads as a POSITIVE 'no pytest session wrote this' and "
+        f"forgives; got {stamped!r}"
+    )

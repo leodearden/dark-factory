@@ -463,7 +463,7 @@ stamp_fleet_deploy_clock() {
     # ::PYTEST_SESSION_TOKEN_ENV -- neither side can import the other, so both
     # mirrors are pinned together by
     # tests/scripts/test_restart_all_orchestrators.py.
-    local clock_dir tmp_file session_token
+    local clock_dir tmp_file raw_token session_token
     clock_dir="$(dirname "$CLOCK_FILE")"
     mkdir -p "$clock_dir"
     tmp_file="$(mktemp "$clock_dir/.last_redeploy_orchestrator.XXXXXX")"
@@ -472,7 +472,15 @@ stamp_fleet_deploy_clock() {
     # clock file -- and _read_clock_epoch fails OPEN on a corrupt body, which
     # would disarm the very min-interval cap this stamp exists to arm. A
     # uuid4().hex passes through untouched.
-    session_token="$(printf '%s' "${DF_PYTEST_SESSION_TOKEN:-}" | tr -cd '[:alnum:]_-')"
+    raw_token="${DF_PYTEST_SESSION_TOKEN:-}"
+    session_token="$(printf '%s' "$raw_token" | tr -cd '[:alnum:]_-')"
+    # Sanitising must never MANUFACTURE the empty token. Empty is not a
+    # neutral fallback here: it is the one value that forgives a change, so a
+    # token that stripped down to nothing would forgive precisely the
+    # test-spawned write it proves. Any loss at all becomes a non-empty
+    # sentinel, which keeps the guard on its accusing path -- fail-closed, as
+    # the pytest side is throughout.
+    [[ "$raw_token" == "$session_token" ]] || session_token="unsanitizable"
     printf '{"ts": %s, "iso": "%s", "source": "%s", "pytest_session": "%s"}\n' \
         "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
         "restart-all-orchestrators.sh" "$session_token" > "$tmp_file"
