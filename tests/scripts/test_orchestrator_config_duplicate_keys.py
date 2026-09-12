@@ -36,11 +36,109 @@ is orchestrator misconfiguration.
 """
 from __future__ import annotations
 
+from collections.abc import Hashable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 REPO_ROOT = Path(__file__).parents[2]
+
+
+@dataclass(frozen=True)
+class DuplicateKey:
+    """One repeated mapping key, as data rather than as a rendered message.
+
+    A caller that must aggregate findings across files, count them, or render
+    them into a failure message should not have to parse prose back out of a
+    formatted string to do it.
+    """
+
+    path: Path
+    key: object
+    first_line: int
+    duplicate_line: int
+
+
+class _DuplicateKeyError(yaml.constructor.ConstructorError):
+    """Raised at the first repeated key in a document, carrying both key nodes' marks."""
+
+    def __init__(self, key: object, first_mark: Any, duplicate_mark: Any) -> None:
+        super().__init__(
+            context=f'while constructing a mapping that already declares {key!r}',
+            context_mark=first_mark,
+            problem=f'found a duplicate key {key!r}',
+            problem_mark=duplicate_mark,
+        )
+        self.key = key
+        self.first_mark = first_mark
+        self.duplicate_mark = duplicate_mark
+
+
+class _NoDuplicateKeysLoader(yaml.SafeLoader):
+    """A SafeLoader that raises on a repeated mapping key instead of keeping the last.
+
+    A SUBCLASS, and never a mutation of ``yaml.SafeLoader`` itself: registering
+    the constructor on the shared class would change the behaviour of every
+    other yaml consumer in the same pytest process — including the production
+    loaders under test here, which must keep parsing the way they do in the
+    fleet for this file's reproduction tests to mean anything.
+
+    The pure-Python loader rather than ``CSafeLoader``: node ``start_mark``
+    line numbers are what every finding is built from, and the C loader's
+    speed argument is about hot paths, not about parsing eleven small files
+    once.
+    """
+
+
+def _construct_mapping_rejecting_duplicates(
+    loader: yaml.SafeLoader, node: yaml.nodes.MappingNode
+) -> dict[Any, Any]:
+    """Walk the key nodes for a repeat, then delegate the actual construction."""
+    seen: dict[Any, yaml.nodes.Node] = {}
+    for key_node, _value_node in node.value:
+        key = loader.construct_object(key_node, deep=True)
+        if not isinstance(key, Hashable):
+            # Not ours to report: the delegate below raises the proper
+            # "found unhashable key" ConstructorError for this shape.
+            continue
+        if key in seen:
+            raise _DuplicateKeyError(key, seen[key].start_mark, key_node.start_mark)
+        seen[key] = key_node
+    return yaml.SafeLoader.construct_mapping(loader, node)
+
+
+_NoDuplicateKeysLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping_rejecting_duplicates,
+)
+
+
+def duplicate_keys(path: Path) -> list[DuplicateKey]:
+    """Report the first repeated mapping key in *path*, at any nesting level.
+
+    Returns at most one finding per file — the loader stops at the first
+    repeat, which is the earliest possible stop inside one document and is
+    enough to turn the sweep red and name a file to fix.
+
+    Any OTHER ``yaml.YAMLError`` deliberately PROPAGATES. An orchestrator
+    config that does not parse at all is a louder defect than one with a
+    duplicate key, and swallowing it into a green empty list would report
+    exactly the silence this guard exists to remove.
+    """
+    try:
+        yaml.load(path.read_text(), _NoDuplicateKeysLoader)
+    except _DuplicateKeyError as exc:
+        return [
+            DuplicateKey(
+                path=path,
+                key=exc.key,
+                first_line=exc.first_mark.line + 1,
+                duplicate_line=exc.duplicate_mark.line + 1,
+            )
+        ]
+    return []
 
 
 def _yaml_file(tmp_path: Path, text: str) -> Path:
