@@ -639,6 +639,40 @@ def _install_fake_backend(monkeypatch, tasks):
     return backend_holder
 
 
+def _make_task_store(project_root: Path) -> Path:
+    """Create the tasks.db a `--project-root` resolves to — the same
+    three-segment path `target_store_preflight.task_store_path` derives."""
+    db = project_root / '.taskmaster' / 'tasks' / 'tasks.db'
+    db.parent.mkdir(parents=True)
+    db.touch()
+    return db
+
+
+@pytest.fixture
+def project_root(tmp_path: Path) -> Path:
+    """A project root whose task store EXISTS.
+
+    A `--project-root` with no task store is a mis-target, and `_run()`'s
+    preflight refuses one — so every test meaning to exercise the wiring
+    PAST that guard needs a real store rather than a bare path. Tests of the
+    refusal itself take `tmp_path` directly."""
+    _make_task_store(tmp_path)
+    return tmp_path
+
+
+def _run_args(
+    project_root: Path | str,
+    *,
+    ref: str = 'main',
+    config: str | None = None,
+    since: str = '2026-07-16T00:00:00Z',
+) -> argparse.Namespace:
+    """The parsed-args namespace `_run()` reads, as `main()` would build it."""
+    return argparse.Namespace(
+        project_root=str(project_root), config=config, ref=ref, since=since,
+    )
+
+
 @pytest.mark.asyncio
 class TestRunCliWiring:
     """_run() end-to-end: config load, the sibling audit import, backend
@@ -649,7 +683,7 @@ class TestRunCliWiring:
     owns parsing --since — see TestMainScopedValueErrorHandling below for
     the regression guard on that split)."""
 
-    async def test_exit_zero_when_no_fresh_flagged_tasks(self, monkeypatch):
+    async def test_exit_zero_when_no_fresh_flagged_tasks(self, monkeypatch, project_root):
         report = _report([_detail('9999', 'misattributed')])
         tasks = [_task('9999', BEFORE_SINCE)]  # stamp predates --since
         _install_fake_audit_module(monkeypatch, report)
@@ -659,19 +693,17 @@ class TestRunCliWiring:
         )
         backend_holder = _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 0
         backend = backend_holder['backend']
         assert backend.started is True
         assert backend.closed is True
-        assert backend.get_tasks_calls == ['/proj']
+        assert backend.get_tasks_calls == [str(project_root)]
 
     async def test_exit_one_when_post_since_misattributed_stamp_present(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         report = _report([_detail('8888', 'misattributed', commit='d' * 40)])
         # Stamp is fresh. Post-3576 that must be asserted with an actual
@@ -687,9 +719,7 @@ class TestRunCliWiring:
         )
         backend_holder = _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
@@ -706,7 +736,7 @@ class TestRunCliWiring:
         assert 'flag_class=misattributed' in captured.out
 
     async def test_exit_zero_when_only_legacy_offenders_despite_fresh_updated_at(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         """THE task-2683 regression: a backlog of legacy stamps whose
         updatedAt keeps getting bumped must stop forcing EXIT 1 forever.
@@ -724,9 +754,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 0
@@ -738,7 +766,7 @@ class TestRunCliWiring:
         assert captured.out.count('stamp_class=legacy') == 3
 
     async def test_exit_one_when_a_genuinely_fresh_stamp_is_flagged(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         """A stamp written after --since still gates — that is the whole
         point of the soak gate."""
@@ -751,9 +779,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
@@ -762,7 +788,7 @@ class TestRunCliWiring:
         assert 'stamp_class=fresh' in captured.out
 
     async def test_mixed_fresh_and_legacy_gates_on_the_fresh_one_and_prints_both(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         report = _report([
             _detail('900', 'misattributed'),
@@ -779,9 +805,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
@@ -792,7 +816,7 @@ class TestRunCliWiring:
         assert 'stamp_class=legacy' in captured.out
 
     async def test_last_stdout_line_is_json_on_the_legacy_only_exit_zero_path(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         """The FINAL stdout line must always be a parseable JSON counts object.
 
@@ -815,9 +839,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 0
@@ -832,7 +854,7 @@ class TestRunCliWiring:
         assert any('task_id=700' in ln for ln in out_lines[:-1])
 
     async def test_last_stdout_line_is_json_when_there_are_no_offenders(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         """Printed unconditionally, so the note shape never depends on the
         result — a clean run's note is the same structured object."""
@@ -843,9 +865,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, [])
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 0
@@ -857,7 +877,7 @@ class TestRunCliWiring:
         }
 
     async def test_last_stdout_line_is_json_on_the_exit_one_path_too(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         report = _report([
             _detail('900', 'misattributed'),
@@ -874,9 +894,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
@@ -889,7 +907,7 @@ class TestRunCliWiring:
         assert payload['sub_patterns'] == {'shared_bare_merge': 2}
 
     async def test_exit_one_when_only_corrupt_stamps_are_flagged(
-        self, monkeypatch, capsys,
+        self, monkeypatch, capsys, project_root,
     ):
         """A present-but-unparseable stamp gates: it proves a post-3576
         write, so the 'predates the field' exemption does not apply."""
@@ -902,9 +920,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, tasks)
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
@@ -918,7 +934,7 @@ class TestRunCliWiring:
         assert payload['stamp_classes'] == {'corrupt': 1}
 
     async def test_missing_taskmaster_config_returns_1_without_creating_backend(
-        self, monkeypatch,
+        self, monkeypatch, project_root,
     ):
         report = _report([])
         _install_fake_audit_module(monkeypatch, report)
@@ -932,15 +948,13 @@ class TestRunCliWiring:
             lambda *a, **kw: created.append(1),  # noqa: ARG005
         )
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root)
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
         assert created == []
 
-    async def test_ref_argument_is_threaded_into_build_audit_report(self, monkeypatch):
+    async def test_ref_argument_is_threaded_into_build_audit_report(self, monkeypatch, project_root):
         # Regression guard: a fake build_audit_report that ignored `ref`
         # (as the other tests' fakes do) would pass even if _run() dropped
         # or hardcoded it. This one captures the actual kwarg it received.
@@ -952,16 +966,13 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, [])
 
-        args = argparse.Namespace(
-            project_root='/proj', config=None, ref='origin/main',
-            since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root, ref='origin/main')
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 0
         assert ref_calls == ['origin/main']
 
-    async def test_config_arg_sets_config_path_env_var(self, monkeypatch):
+    async def test_config_arg_sets_config_path_env_var(self, monkeypatch, project_root):
         monkeypatch.delenv('CONFIG_PATH', raising=False)
         _install_fake_audit_module(monkeypatch, _report([]))
         monkeypatch.setattr(
@@ -970,10 +981,7 @@ class TestRunCliWiring:
         )
         _install_fake_backend(monkeypatch, [])
 
-        args = argparse.Namespace(
-            project_root='/proj', config='/path/to/fused-memory-config.yaml',
-            ref='main', since='2026-07-16T00:00:00Z',
-        )
+        args = _run_args(project_root, config='/path/to/fused-memory-config.yaml')
         exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 0
@@ -997,6 +1005,11 @@ class TestMainMalformedSinceExitCode:
             [
                 'check_found_on_main_spurious_rate.py',
                 '--since', 'not-a-date',
+                # Deliberately a NONEXISTENT path, unlike the rest of this
+                # file: main() parses --since before _run() is reached, so
+                # this pins that the usage error out-ranks _run()'s
+                # target-store guard. Pointing it at a real store would
+                # silently discard that precedence signal.
                 '--project-root', '/proj',
             ],
         )
@@ -1018,7 +1031,7 @@ class TestMainMalformedSinceExitCode:
 
 class TestMainScopedValueErrorHandling:
     def test_internal_valueerror_propagates_uncaught_not_mapped_to_exit_2(
-        self, monkeypatch,
+        self, monkeypatch, project_root,
     ):
         async def _raise_unrelated_valueerror(tasks, git, ref='main'):
             raise ValueError('boom: internal failure unrelated to --since')
@@ -1037,7 +1050,7 @@ class TestMainScopedValueErrorHandling:
             [
                 'check_found_on_main_spurious_rate.py',
                 '--since', '2026-07-16T00:00:00Z',  # a perfectly valid --since
-                '--project-root', '/proj',
+                '--project-root', str(project_root),
             ],
         )
 
