@@ -620,6 +620,128 @@ class TestCheckProposalMechanical:
 
 
 # ---------------------------------------------------------------------------
+# task 5361 step-1: three-state age reporting — `age_state` closed domain
+# ---------------------------------------------------------------------------
+
+
+class TestAgeStateThreeState:
+    """`check_proposal` names WHY it has no age, instead of collapsing to None.
+
+    Four distinct causes previously all surfaced as a bare `age_seconds: None`,
+    indistinguishable to every consumer: an absent timestamp, an unparseable
+    string (ValueError), a naive timestamp against an aware clock (TypeError),
+    and no clock supplied at all.  Each now gets its own `age_state`.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _states():
+        from orchestrator.b3_gate import (
+            AGE_ABSENT,
+            AGE_NO_CLOCK,
+            AGE_PARSED,
+            AGE_UNPARSEABLE,
+        )
+        return {AGE_PARSED, AGE_UNPARSEABLE, AGE_ABSENT, AGE_NO_CLOCK}
+
+    def test_valid_aware_timestamp_is_parsed(self):
+        from orchestrator.b3_gate import AGE_PARSED, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_PARSED, result
+        assert result['age_seconds'] == 10800.0, result
+
+    def test_unparseable_timestamp_is_distinguished(self):
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_naive_timestamp_against_aware_clock_is_unparseable(self):
+        """The TypeError branch — a DIFFERENT cause from the ValueError above,
+        and the one most likely to arise from a real producer bug."""
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': '2026-06-04T09:00:00'}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_missing_timestamp_key_is_absent(self):
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        entry = {**_LOW_RISK_ENTRY}
+        del entry['investigated_at']
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+        assert result['age_seconds'] is None, result
+
+    def test_empty_timestamp_is_absent(self):
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': ''}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+
+    def test_no_clock_is_its_own_state(self):
+        from orchestrator.b3_gate import AGE_NO_CLOCK, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=None,
+        )
+        assert result['age_state'] == AGE_NO_CLOCK, result
+        assert result['age_seconds'] is None, result
+
+    def test_none_entry_early_return_carries_age_state(self):
+        """Shape parity: EVERY return path carries the key, so a consumer never
+        has to distinguish 'absent key' from 'old entry' from a real state."""
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        result = check_proposal(
+            None, worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+        assert result['age_state'] in self._states(), result
+
+    def test_unparseable_timestamp_warns_instead_of_swallowing(self, caplog):
+        """Replaces today's silent `except Exception: pass`."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            check_proposal(
+                entry, worktree='/tmp', category=None,
+                run_git=_fake_git_fresh, now=self._NOW,
+            )
+
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+            and 'not-a-date' in r.getMessage()
+        ]
+        assert len(warn_records) == 1, (
+            f'Expected exactly one WARNING under orchestrator.b3_gate naming the '
+            f'offending investigated_at value; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-11: freshness P1/P2 against a REAL git fixture
 # ---------------------------------------------------------------------------
 
