@@ -144,18 +144,23 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-# Deliberately exempt from this file's deferred-import convention (see _run,
-# which defers `os`, the sibling audit module, and the fused_memory backend/
-# config imports). `dark-factory-shared` is a hard install dependency of the
+# BOTH module-level imports below are deliberately exempt from this file's
+# deferred-import convention (see _run, which defers `os`, the sibling audit
+# module, and the fused_memory backend/config imports), on the same grounds:
+# neither adds an environment requirement that running this script did not
+# already have. `dark-factory-shared` is a hard install dependency of the
 # fused-memory package — declared in fused-memory/pyproject.toml, not an
-# optional or path-sensitive one — so importing it at module level adds no
-# environment requirement that running this script did not already have. The
-# sibling audit script (audit_found_on_main_provenance.py) imports it at
-# module level from this same directory for the same reason. The deferred
-# imports below exist for a DIFFERENT reason: they are either sys.path[0]-
-# sensitive (the sibling script) or heavyweight, and the test suite
-# importlib-loads this module in isolation.
+# optional or path-sensitive one. `target_store_preflight` is pure stdlib
+# ("No probe write, no mem0 import, no network, no backend import" — its own
+# closing line) and ships inside the very package this script lives in. The
+# sibling audit script (audit_found_on_main_provenance.py) imports both at
+# module level from this same directory, as do the other two task-store
+# scripts for the guard. The deferred imports exist for a DIFFERENT reason:
+# they are either sys.path[0]-sensitive (the sibling script) or heavyweight,
+# and the test suite importlib-loads this module in isolation.
 from shared.task_metadata import parse_metadata
+
+from fused_memory.utils.target_store_preflight import assert_task_store_exists
 
 logger = logging.getLogger('check_found_on_main_spurious_rate')
 
@@ -453,6 +458,16 @@ def format_summary(offenders: list[dict[str, Any]]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 async def _run(args: argparse.Namespace, since: datetime) -> int:
+    # FIRST, ahead of the logging setup, the deferred imports and the config
+    # load: a mis-targeted --project-root is diagnosed before any of that, and
+    # out-ranks the coarse `config.taskmaster is None` -> 1 rung below. Here
+    # rather than in main() so programmatic callers inherit the guard;
+    # main() owns mapping the refusal onto exit 3 (module docstring
+    # "Contract"), exactly as it already does for parse_since -> 2.
+    assert_task_store_exists(
+        args.project_root, operation='check_found_on_main_spurious_rate',
+    )
+
     # `since` arrives already parsed by main() — this function never calls
     # parse_since itself. That keeps main()'s ValueError/exit-2 usage-error
     # mapping scoped tightly around just the parse_since(args.since) call:
