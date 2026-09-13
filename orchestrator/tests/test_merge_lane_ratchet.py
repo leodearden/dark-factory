@@ -194,6 +194,15 @@ def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     "this test swept no tree of its own", not "this test opened no file":
     `main(['--check'])` legitimately reads the baseline .json, which lives in
     the swept directory and must not trip the guard.
+
+    Parses are NOT scoped that way and cannot be: `metrics._parse` calls
+    `ast.parse(source)` with no filename, so every parse a sweep makes records
+    as '<unknown>' (measured) and a path-scoped parse counter would witness
+    nothing at all for the regrowth this fixture exists to catch. Broad is also
+    what makes it a backstop -- it still catches a sweep that reads through
+    `open()` and so slips the read counter. The price is that a guarded item
+    parsing anything of its own trips it, so reads (the precise counter) are
+    asserted FIRST and the parse message names both readings.
     """
     swept = _REPO_ROOT / 'orchestrator' / 'tests'
     parses: list[str] = []
@@ -218,13 +227,18 @@ def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         'module-scoped `live_report` fixture. Derive this anchor from that '
         'report instead of re-walking the tree.'
     )
-    assert parses == [], (
-        f'This test parsed {len(parses)} file(s) of its own '
-        f'(first: {parses[:3]}). {_SWEPT_ONCE}'
-    )
     assert reads == [], (
         f'This test read {len(reads)} test-tree *.py file(s) of its own '
         f'(first: {reads[:3]}). {_SWEPT_ONCE}'
+    )
+    assert parses == [], (
+        f'This test called ast.parse {len(parses)} time(s) '
+        f'(filenames: {parses[:3]}; sweeps record <unknown>). The read '
+        f'assertion above passed, so EITHER this is a sweep that read through '
+        f'`open()` -- {_SWEPT_ONCE} -- OR the parse was of something else '
+        f'entirely (a tmp_path fixture, a lazily imported module rewritten by '
+        f'pytest), in which case drop this fixture from this item rather than '
+        f'narrowing the counter; see the fixture docstring.'
     )
 
 # The 18 orchestrator/src literal paths of PRD Appendix A, verbatim. git_ops.py
@@ -2110,16 +2124,17 @@ class TestCheckCli:
         assert _MQ in err
         assert 'lines' in err
 
-    def test_check_is_clean_against_the_committed_baseline(
+    def test_check_resolves_its_defaults_and_exits_clean(
         self, stub_measurement: dict, no_private_tree_scan: None,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # No --baseline and no --root: the exact invocation the twenty
-        # downstream PRD tasks will run, end to end. What this still proves is
-        # the CLI's own half -- default root resolution, default baseline
-        # resolution, `load_baseline`, the comparator and the exit ladder --
-        # against the module's REAL live numbers, since `stub_measurement`
-        # hands back the live measurement rather than a fixture's.
+        # No --baseline and no --root: the argv the twenty downstream PRD tasks
+        # will run, exercising the CLI's half of it -- default root resolution,
+        # default baseline resolution, `load_baseline`, the comparator and the
+        # exit ladder -- against the module's REAL live numbers, since
+        # `stub_measurement` hands back the live measurement rather than a
+        # fixture's. NOT end to end: `build_report` is stubbed here, as it is
+        # at every `main(['--check'])` call site in this module.
         #
         # What moved elsewhere is the half this test used to re-prove: the
         # MEASUREMENT is TestBuildReport's, and the live-tree-versus-committed-

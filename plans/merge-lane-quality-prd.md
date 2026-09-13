@@ -600,7 +600,7 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
      it that way or drop the constraint.
 
    DISCHARGED by 5101: one live measurement per session with every anchor
-   reading it (the two real-tree anchors and the end-to-end `--check` test were
+   reading it (the two real-tree anchors and the `--check` CLI test were
    each taking their own full sweep), and each cluster file measured by
    complexipy once instead of twice. Both are held by work-counting guards
    (`TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once` and
