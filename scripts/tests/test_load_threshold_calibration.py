@@ -579,3 +579,190 @@ def test_smoke_against_the_two_real_committed_configs(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     payload = trailing_json(result.stdout)
     assert isinstance(payload['degradations'], list)
+
+
+# ── detail (D): leaves that merely restate the shipped code default ─────────
+
+# INJECTED, never fetched. The point of this whole check is that PRD §6.2
+# writes three values that are already the code defaults, giving one fact
+# three homes with no reconciler (INV-9). Hard-coding them into the script
+# would make it the FOURTH home and defeat the check it exists to be.
+_INJECTED_DEFAULTS = {
+    'mem_some_avg10': 15.0,
+    'mem_full_avg10': 3.0,
+    'io_some_avg10': 40.0,
+    'cpu_some_avg10': 85.0,
+}
+
+
+def test_leaves_restating_the_code_default_are_flagged():
+    module = load_script()
+    block = {
+        'mem_some_avg10': 15.0,
+        'mem_full_avg10': 3.0,
+        'io_some_avg10': 40.0,
+        'runqueue_ratio': 4.0,
+    }
+
+    result = module.compare_to_code_defaults(block, _INJECTED_DEFAULTS)
+
+    assert sorted(result['restates_default']) == [
+        'io_some_avg10', 'mem_full_avg10', 'mem_some_avg10']
+    assert 'runqueue_ratio' not in result['restates_default']
+
+
+def test_a_leaf_that_differs_from_the_default_is_not_flagged():
+    module = load_script()
+
+    result = module.compare_to_code_defaults(
+        {'cpu_some_avg10': 70.0}, _INJECTED_DEFAULTS)
+
+    assert result['restates_default'] == []
+    assert result['unknown_to_schema'] == []
+
+
+def test_int_and_float_spellings_do_not_hide_a_restatement():
+    module = load_script()
+
+    result = module.compare_to_code_defaults({'mem_some_avg10': 15}, _INJECTED_DEFAULTS)
+
+    assert result['restates_default'] == ['mem_some_avg10']
+
+
+def test_a_leaf_absent_from_the_defaults_is_reported_unknown_to_the_schema():
+    """Measured: PsiAdmissionConfig has no runqueue_ratio field today (β
+    unlanded). Reported, not flagged and not silently dropped — "this arm is
+    not in the model yet" is a fact the operator needs."""
+    module = load_script()
+
+    result = module.compare_to_code_defaults(
+        {'runqueue_ratio': 4.0, 'own_cpu_some_avg10': 50.0}, _INJECTED_DEFAULTS)
+
+    assert sorted(result['unknown_to_schema']) == [
+        'own_cpu_some_avg10', 'runqueue_ratio']
+    assert result['restates_default'] == []
+
+
+def test_an_absent_defaults_mapping_yields_no_verdict():
+    """When the shell could not obtain the defaults, nothing may be claimed."""
+    module = load_script()
+
+    assert module.compare_to_code_defaults({'mem_some_avg10': 15.0}, None) is None
+    assert module.compare_to_code_defaults(None, _INJECTED_DEFAULTS) is None
+
+
+def test_the_flags_are_produced_for_both_the_local_and_peer_blocks(tmp_path: Path):
+    module = load_script()
+    local = write_yaml(tmp_path / 'local.yaml', """
+psi_admission:
+  mem_some_avg10: 15.0
+""")
+    peer = write_yaml(tmp_path / 'peer.yaml', """
+psi_admission:
+  io_some_avg10: 40.0
+""")
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+
+    module.main([
+        '--db', str(db), '--config', str(local), '--peer-config', str(peer),
+        '--no-report',
+    ])
+    local_block, _ = module.load_psi_admission_block(local, 'local')
+    peer_block, _ = module.load_psi_admission_block(peer, 'peer')
+
+    assert module.compare_to_code_defaults(
+        local_block, _INJECTED_DEFAULTS)['restates_default'] == ['mem_some_avg10']
+    assert module.compare_to_code_defaults(
+        peer_block, _INJECTED_DEFAULTS)['restates_default'] == ['io_some_avg10']
+
+
+def test_the_script_never_states_an_arms_own_default_value():
+    """The check exists because PRD §6.2 gives one fact three homes.
+
+    Hard-coding the numbers here would make this script the FOURTH, and it
+    would report "restates the default" against its own stale copy long after
+    the model changed. The defaults must come from the live artifact.
+
+    Scoped to the arm-name/default-value PAIRING rather than to the bare
+    literals: the candidate ladders legitimately contain 3.0 and 40.0 as
+    rungs, and a blunt literal scan would force those rungs out of the ladders
+    for no reason. What must not exist is a line saying that THIS arm's
+    default is THAT number.
+    """
+    source_lines = SCRIPT.read_text().splitlines()
+    for arm, default in _INJECTED_DEFAULTS.items():
+        for line in source_lines:
+            assert not (arm in line and str(default) in line), (
+                f'scripts/load-threshold-calibration.py states {arm}\'s default '
+                f'({default}) at: {line.strip()!r}. Remove it — the defaults are '
+                'fetched from the live model, never restated here.')
+
+
+def test_compare_to_code_defaults_has_no_built_in_defaults_mapping():
+    """The same fact enforced at the signature: there is nothing to fall back
+    on, so a failed fetch cannot silently become a stale comparison."""
+    import inspect
+
+    module = load_script()
+    sig = inspect.signature(module.compare_to_code_defaults)
+    defaults_param = sig.parameters['defaults']
+
+    assert defaults_param.default is inspect.Parameter.empty, (
+        'compare_to_code_defaults must require its defaults mapping; a default '
+        'argument would be a second home for the values it exists to police.')
+
+
+def test_the_defaults_shell_degrades_named_when_the_subprocess_fails(tmp_path: Path):
+    module = load_script()
+
+    defaults, degradations = module.fetch_code_defaults(
+        command=['/bin/false'], cwd=tmp_path)
+
+    assert defaults is None
+    assert [d.split(':', 1)[0] for d in degradations] == ['code_defaults_unavailable']
+
+
+def test_the_defaults_shell_degrades_named_on_unparseable_output(tmp_path: Path):
+    module = load_script()
+
+    defaults, degradations = module.fetch_code_defaults(
+        command=['/bin/echo', 'not json'], cwd=tmp_path)
+
+    assert defaults is None
+    assert [d.split(':', 1)[0] for d in degradations] == ['code_defaults_unavailable']
+
+
+def test_the_defaults_shell_degrades_named_on_a_missing_binary(tmp_path: Path):
+    module = load_script()
+
+    defaults, degradations = module.fetch_code_defaults(
+        command=[str(tmp_path / 'no-such-uv')], cwd=tmp_path)
+
+    assert defaults is None
+    assert [d.split(':', 1)[0] for d in degradations] == ['code_defaults_unavailable']
+
+
+def test_the_whole_report_is_still_produced_when_defaults_are_unavailable(tmp_path: Path):
+    """Exit 0 with the degradation named, and every other section intact."""
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0, 3.0]})
+
+    result = run_script(
+        '--db', str(db), '--no-report', '--uv-bin', str(tmp_path / 'no-such-uv'))
+
+    assert result.returncode == 0, result.stderr
+    payload = trailing_json(result.stdout)
+    assert 'code_defaults_unavailable' in payload['degradations'], payload
+    assert payload['percentiles'], 'the rest of the report must survive'
+
+
+def test_the_defaults_command_uses_no_sync(tmp_path: Path):
+    """--no-sync is load-bearing: a plain `uv run --project shared` was
+    measured REMOVING orchestrator from the shared root venv, so a syncing
+    invocation here could break live processes."""
+    module = load_script()
+
+    command = module.default_defaults_command(Path('/home/leo/.local/bin/uv'))
+
+    assert '--no-sync' in command, command
+    assert '--frozen' in command, command
+    assert '--project' in command and 'orchestrator' in command, command
