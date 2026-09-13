@@ -35,6 +35,7 @@ dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
     # Needed by TestMergeRequestDedup / TestGetMergeQueue in tests/test_server.py
     # (added by task 1604), which lazily import orchestrator.merge_queue and

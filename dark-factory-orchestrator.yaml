@@ -75,13 +75,24 @@ lock_depth: 12
 # --timeout=300 (a CLI --timeout overrides each subproject's pyproject.toml
 # `[tool.pytest.ini_options].timeout`, which was 60 when this was written and
 # is now itself 300 — see shared/pyproject.toml, 2026-09-12):
-# orchestrator/fused-memory run pytest-xdist, and
+# some segments run pytest-xdist, and
 # under host CPU oversubscription a starved xdist worker crosses that ceiling,
 # gets os._exit()'d by pytest-timeout's thread method, and
 # --max-worker-restart=0 turns that into a false-failing per-test "node down"
-# on whatever test happens to be running. A uniform ``-n`` cap was rejected:
-# shared/escalation/dashboard declare no pytest-xdist, so ``-n`` would error
-# with "unrecognized arguments" on those segments. A 6th segment now also runs
+# on whatever test happens to be running. A uniform ``-n`` cap on THIS chain was
+# rejected and stays rejected: ``-n`` errors with "unrecognized arguments" on any
+# segment whose member does not declare pytest-xdist, and not every member does.
+# Task 5408 shrank that set without emptying it — dashboard, escalation and
+# cockpit joined orchestrator and fused-memory. WHICH members do is deliberately
+# not restated here, because a list like that drifts silently: the invariant that
+# a pytest leg running ``-n`` must DECLARE the plugin is derived structurally from
+# the module-config walk and enforced by
+# tests/scripts/test_merge_gate_parallelism_config.py::
+# test_every_pytest_leg_running_workers_declares_the_plugin. The worker count
+# belongs in each member's own addopts regardless: there it travels with that
+# member's own timeout/dist settings and also governs a bare
+# ``cd <member> && uv run pytest tests/``, which a flag added here would not.
+# A 6th segment now also runs
 # the repo-root tests/scripts/ suite (not a workspace member, so never covered
 # by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
 # scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
@@ -652,9 +663,21 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #                                                 -------
 #     honest green path (at orchestrator p50)      ~2645
 #
-# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
-# and cockpit both run serial (no pytest-xdist, per this file's own fanout
-# comment). 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
+# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s, and the
+# dashboard and cockpit estimates above were derived from it precisely because
+# those two segments also ran serial. TASK 5408 ENDED THAT: dashboard, escalation
+# and cockpit each declare pytest-xdist and carry `-n auto --dist loadgroup` in
+# their own addopts now, joining orchestrator and fused-memory. So three of the
+# figures above are OVER-estimates rather than wrong — measured on the 5408 tree
+# under those addopts: dashboard 2299 passed / 1 xfailed in 95.07s (estimated
+# ~190), escalation 1721 passed / 2 xfailed in 49.63s (estimated from its 123.29s
+# serial run), cockpit 346 passed in 16.78s (estimated ~44).
+# THE SUM IS DELIBERATELY NOT RE-DERIVED from those three. It already mixes
+# measured and estimated segments of two provenances, and 5408 re-measured only
+# the three segments it changed; the honest statement is that the headroom below
+# can only have moved in the SAFE direction. Whether 3600s can now be narrowed is
+# a measurement question for a whole-fleet run, not an arithmetic one.
+# 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
 # the 4902 re-measurement, and the margin has since collapsed.
 #
 # THE LOAD VARIANCE THAT HEADROOM HAS TO COVER is far wider than this comment
