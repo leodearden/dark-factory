@@ -574,10 +574,52 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    in-flight merges only; in-flight task agents are still soft-cancelled.
 7. **σ gains a runtime ceiling** (Leo, 2026-09-06): the ratchet module must complete
    in ≤ 60s wall on an idle box. α measured 147–251s per run (esc-5021-1); a
-   single full measurement is 72.7s, of which 13s is 22 separate complexipy
-   subprocesses, and the module then re-walks the 559-file test tree twice more
-   and recomputes radon MI five times. The fix is one measurement per session and
-   one complexipy invocation, with the CLI tests on a fixture tree — never a
-   "skip when nothing changed" gate (INV-10/INV-11) and never a narrower domain.
-   Until σ lands the per-verify-leg tax is accepted as measured. Task 5048's
-   details carry the constraints.
+   single full measurement is 72.7s, and the module then re-walks the 559-file
+   test tree twice more and recomputes radon MI five times. The fix is one
+   measurement per session and one complexipy invocation, with the CLI tests on a
+   fixture tree — never a "skip when nothing changed" gate (INV-10/INV-11) and
+   never a narrower domain. Until σ lands the per-verify-leg tax is accepted as
+   measured. Task 5048's details carry the constraints.
+
+   **Corrected and partly discharged by task 5101** (2026-09-13). Two factual
+   corrections to the paragraph above, both measured on the branch:
+
+   - "13s is 22 separate complexipy **subprocesses**" is wrong on both count and
+     mechanism. It was **50 in-process `complexipy.file_complexity` calls over 25
+     resolved files** — two per file, because `build_report` asked for the file
+     total and the per-function map separately and each fetched its own result.
+     `CLUSTER_PATHS` has 23 entries, two of which are globs, resolving to 25
+     files. No subprocess is involved.
+   - σ's "one complexipy invocation for the whole cluster" is **not available as
+     a drop-in**. complexipy 6.2.0's Python API, as used by
+     `scripts/merge_lane_metrics.py`, exposes only single-path entry points
+     (`file_complexity(file_path: str, check_script=False, no_ignore=False)` and
+     `code_complexity(...)`); there is no multi-path/one-JSON entry point.
+     Reaching for the CLI instead would trade 25 in-process calls for a
+     subprocess and a JSON parse — a design change, not a dedupe. σ should price
+     it that way or drop the constraint.
+
+   DISCHARGED by 5101: one live measurement per session with every anchor
+   reading it (the two real-tree anchors and the end-to-end `--check` test were
+   each taking their own full sweep), and each cluster file measured by
+   complexipy once instead of twice. Both are held by work-counting guards
+   (`TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once` and
+   the `no_private_tree_scan` fixture) rather than by discipline. Measured on one
+   unchanged tree: 215 items in **237.09s** before, 219 items in **62.45s and
+   90.60s** on two runs after — both AFTER samples reported rather than the
+   flattering one, since the spread is the point (see below). 27.19s of that is
+   the single remaining `build_report`.
+
+   STILL σ's: the CLI tests on a small committed fixture tree, the session-scope
+   hoist, and the ≤ 60s ceiling assertion itself — which is the reason 5101 does
+   not claim the ceiling. Neither AFTER sample is under 60s, and wall clock on
+   this host is too noisy to claim it either way: a four-run A/B of `--check`
+   over ONE unchanged tree read 19.1s, 46.0s, 25.6s, 33.2s and 43.4s. σ will
+   need a load-independent way to assert its ceiling, or it will assert a
+   coin flip. The remaining floor
+   σ must attack is the single `build_report` (27.19s), plus ~10s of radon MI in
+   the five `TestReportCli` items and 7.15s in
+   `test_merge_queue_anchor_reproduces_the_prd_background_numbers`, which still
+   measures merge_queue.py twice through the two public projections. The ceiling
+   and the INV-10/INV-11 prohibitions above are unchanged — this is a correction
+   of measured facts, not a renegotiation.

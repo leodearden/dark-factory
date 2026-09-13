@@ -47,13 +47,37 @@ from pathlib import Path
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This module AST-parses the 22-path Appendix A cluster plus every *.py under
-# orchestrator/tests/ (559 files at authorship time), and runs complexipy over
-# the cluster. MEASURED end to end at 35-65s. The 60s ini default would be a
-# coin flip, and pytest-timeout's thread method enforces it by os._exit()ing the
-# xdist worker -- which with --max-worker-restart=0 truncates the whole session
-# and reports against an innocent test (esc-3980-1). See
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py.
+# This module AST-parses the Appendix A cluster (23 CLUSTER_PATHS entries, 25
+# resolved files) plus every *.py under orchestrator/tests/ (573 today, 559 at
+# authorship time), and runs complexipy over the cluster.
+#
+# RUNTIME, measured rather than estimated. An earlier version of this comment
+# claimed "MEASURED end to end at 35-65s"; that estimate was wrong, and task
+# 5101 exists because it was wrong. The module measured 146.79s and 250.72s on
+# one UNCHANGED tree (esc-5021-1, and re-measured here at 237.09s before the
+# fix) -- it took FOUR live measurements of the same tree where one was
+# available. After task 5101 folded every anchor onto the single measurement:
+# 219 passed in 62.45s and 90.60s on two runs of the same tree, of which 27.19s
+# was that one shared build_report. Both AFTER samples are reported because one
+# of them is not a measurement -- see the wall-clock note below.
+#
+# A HIGH RUNTIME HERE DOES NOT INDICATE A WRONG COMPLEXIPY VERSION. 6.2.0 was
+# correctly resolved throughout every one of those runs and require_complexipy()
+# passed each time; a wrong version fails immediately and by name, before any
+# measurement. Do not read slowness as a version signal.
+#
+# Wall clock on this host is not a reliable measure of this module at all: a
+# four-run A/B of `--check` over ONE unchanged tree read 19.1s, 46.0s, 25.6s,
+# 33.2s and 43.4s. That is why every guard added by task 5101 counts WORK
+# (ast.parse / Path.read_text calls) and never elapsed time.
+#
+# The 60s ini default would be a coin flip, and pytest-timeout's thread method
+# enforces it by os._exit()ing the xdist worker -- which with
+# --max-worker-restart=0 truncates the whole session and reports against an
+# innocent test (esc-3980-1). See WHOLE_TREE_SCAN_TEST_TIMEOUT in
+# _orch_helpers.py. That mark is PER ITEM and the slowest single item has
+# always sat far below it (36.22s before the fix, 7.15s after), so it was never
+# the thing at risk here.
 #
 # NOTE this mark is deliberate and NOT compelled by the family guard
 # test_whole_tree_scan_timeout_guard.py: its ``_scans_whole_tree_py`` detector
@@ -64,10 +88,10 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 #
 # The xdist_group pins the WHOLE module to one worker. Without it, --dist
 # loadgroup distributes these items individually and every worker that draws one
-# pays build_report's measured 72.7s over again -- 22 complexipy runs plus a
-# 559-file AST sweep -- for a single cached result. Grouped, the module takes
-# that cost exactly ONCE (module-scoped `live_report` below) while running in
-# parallel with the rest of the suite. `xdist_group` is a registered marker; see
+# pays build_report over again -- 25 complexipy runs plus a 573-file AST sweep,
+# measured at 27.19s of a 62.45s module -- for a single cached result. Grouped,
+# the module takes that cost exactly ONCE (module-scoped `live_measurement`
+# below) while running in parallel with the rest of the suite. `xdist_group` is a registered marker; see
 # test_marker_registration_drift.py's allowlist.
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
@@ -99,11 +123,15 @@ class LiveMeasurement:
 def live_measurement() -> LiveMeasurement:
     """THE single real measurement this module takes, instrumented.
 
-    build_report measures 72.7s on an idle 32-core box: 22 complexipy runs over
-    the cluster (13.0s), the cluster AST/tokenize sweep (4.1s) and the 559-file
-    orchestrator/tests AST sweep (38.6s). Every test that needs live numbers
-    shares this one result, and the module's xdist_group keeps them on one
-    worker so it is paid once per session rather than once per worker.
+    build_report is the module's whole remaining cost: 25 complexipy runs over
+    the cluster and a 573-file orchestrator/tests AST sweep, measured at 27.19s
+    of the module's 62.45s. (It measured 72.7s when this module was authored,
+    of which 13.0s was complexipy -- halved by task 5101, since build_report
+    then measured every cluster file twice.) EVERY test that needs live numbers
+    shares this one result: task 5101 folded on the last three stragglers, and
+    `no_private_tree_scan` is what keeps them folded. The module's xdist_group
+    keeps them on one worker so the cost is paid once per session rather than
+    once per worker.
 
     The recording wrapper RECORDS AND DELEGATES, so the report is a real
     measurement and the call list is real work rather than a simulation of it.
@@ -1984,8 +2012,11 @@ def stub_measurement(monkeypatch: pytest.MonkeyPatch, live_report: dict) -> dict
 
     The CLI's own job is dispatch, rendering and the exit ladder; build_report
     is already pinned by TestBuildReport against the real tree. Re-measuring
-    once per CLI test would add ~6 x 72.7s to every orchestrator verify leg to
-    re-prove something already proven.
+    once per CLI test would add ~7 x 27.19s to every orchestrator verify leg to
+    re-prove something already proven -- more than the whole module now costs.
+
+    It hands back the module's REAL live measurement, not a synthetic one, so a
+    CLI test using this fixture still compares live numbers.
     """
     monkeypatch.setattr(
         metrics, 'build_report', lambda root: copy.deepcopy(live_report)
