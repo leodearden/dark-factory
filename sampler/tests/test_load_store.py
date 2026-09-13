@@ -307,3 +307,81 @@ class TestRetentionAndVacuum:
 
         # should_vacuum still False (only 1h elapsed)
         assert store.should_vacuum(now + 3600) is False
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-13: the retention window widens from 24 hours to 30 days
+# ---------------------------------------------------------------------------
+
+DAY = 86_400
+THIRTY_DAYS = 30 * DAY
+
+
+def _count_at(db_path: Path, ts: int) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            'SELECT COUNT(*) FROM samples WHERE ts = ?', (ts,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+class TestThirtyDayRetention:
+    """Asserted by BEHAVIOUR, not by signature introspection.
+
+    A default read off the signature would pass against a `cleanup_old` that
+    ignored it; what ε1/ε2 need is that a 29-day-old sample is still in the
+    corpus when the calibration runs.
+    """
+
+    def test_a_row_older_than_the_old_24h_default_now_survives(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        just_over_a_day = now - DAY - 60
+        just_over_thirty_days = now - THIRTY_DAYS - 60
+        store.insert_sample(just_over_a_day, 'runqueue_ratio', 1.0)
+        store.insert_sample(just_over_thirty_days, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, just_over_a_day) == 1, (
+            '25-hour-old rows must survive the widened window'
+        )
+        assert _count_at(db_path, just_over_thirty_days) == 0
+
+    def test_explicit_override_still_prunes_to_that_window(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        two_hours_old = now - 7200
+        half_an_hour_old = now - 1800
+        store.insert_sample(two_hours_old, 'runqueue_ratio', 1.0)
+        store.insert_sample(half_an_hour_old, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now, retain_seconds=3600)
+
+        assert _count_at(db_path, two_hours_old) == 0
+        assert _count_at(db_path, half_an_hour_old) == 1
+
+    def test_the_cutoff_stays_exclusive_exactly_as_today(self, tmp_path: Path):
+        """Only the NUMBER widens: a row exactly at the cutoff still survives."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        at_cutoff = now - THIRTY_DAYS
+        one_second_older = at_cutoff - 1
+        store.insert_sample(at_cutoff, 'runqueue_ratio', 1.0)
+        store.insert_sample(one_second_older, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, at_cutoff) == 1
+        assert _count_at(db_path, one_second_older) == 0
