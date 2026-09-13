@@ -324,3 +324,94 @@ class TestDedupeFold:
                 f'project:{_PROJECT}', 'operation:add_episode', 'error:unknown',
             ],
         )
+
+
+class TestTheRecordIsSelfSufficientForTriage:
+    """Everything a triager needs WITHOUT opening write_queue.db or write_journal.db.
+
+    Not a stylistic preference. The queue row is routinely swept by
+    `delete_dead_letters` — that sweep had already erased 26 of the 28 rows in
+    the esc-3561-3 investigation — and after it, this record is the only
+    surviving evidence that the write ever existed.
+
+    Assertions are LABELLED substrings (`attempts=5`, never a bare `5`): the
+    detail interpolates `project_root`, so a bare value assertion can be
+    satisfied by a coincidental digit in the tmp_path. The trap is documented
+    in `tests/server/test_markup_tripwire.py`.
+    """
+
+    def test_the_detail_carries_every_field_the_queue_row_held(self, tmp_path):
+        _emit(
+            tmp_path,
+            project_id='proj7', operation='add_memory_graphiti',
+            group_id='proj7', item_id=41, attempts=5,
+            error='NodeNotFoundError: node abc not found', write_op_id='W-77',
+        )
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert "project_id='proj7'" in detail, detail
+        assert "operation='add_memory_graphiti'" in detail, detail
+        assert "group_id='proj7'" in detail, detail
+        assert 'queue_item_id=41' in detail, detail
+        assert 'attempts=5' in detail, detail
+        assert "write_op_id='W-77'" in detail, detail
+        assert "error='NodeNotFoundError: node abc not found'" in detail, detail
+
+    def test_the_content_preview_is_carried_and_bounded(self, tmp_path):
+        """Bounded to the house 200 chars — the same bound `log_write_op` uses
+        for `params={'content': content[:200]}`. An escalation queue an
+        operator reads must not grow a full episode body per entry."""
+        content = 'A' * 200 + 'B' * 300
+        _emit(tmp_path, content_preview=content)
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert f"content_preview={('A' * 200)!r}" in detail, detail
+        assert 'B' not in detail, 'the tail beyond 200 chars must be dropped'
+
+    def test_the_summary_names_the_operation_and_the_project(self, tmp_path):
+        """So the queue LIST is legible without opening the record."""
+        _emit(tmp_path, project_id='proj7', operation='add_memory_graphiti',
+              group_id='proj7')
+        summary = _filed(tmp_path)[0]['summary']
+
+        assert 'add_memory_graphiti' in summary, summary
+        assert 'proj7' in summary, summary
+
+    def test_a_post_execute_death_warns_against_a_blind_replay(self, tmp_path):
+        """The one branch that can make a triager's first instinct WRONG.
+
+        `dead` means the queue gave up, not that the write never happened: the
+        callback runs after `_execute_write` returned, so a post-execute death
+        leaves a write that LANDED. Replaying it duplicates the write.
+        """
+        _emit(tmp_path, post_execute=True, write_op_id='W-77')
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert 'post_execute=True' in detail, detail
+        assert 'LANDED' in detail, detail
+        assert 'DUPLICATE' in detail.upper(), detail
+        assert 'backend_ops' in detail, detail
+        assert 'write_op_id' in detail, detail
+        assert 'backend_ops.operation' in detail, (
+            'the join must warn off backend_ops.operation, which is the literal '
+            "'add_episode' for both the add_episode and add_memory_graphiti paths"
+        )
+
+    def test_a_pre_execute_death_names_replay_as_the_safe_remediation(self, tmp_path):
+        _emit(tmp_path, post_execute=False)
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert 'post_execute=False' in detail, detail
+        assert 'did not land' in detail, detail
+        assert 'replay_dead_letters' in detail, detail
+        assert 'delete_dead_letters' in detail, detail
+
+    def test_the_detail_names_the_durable_write_op_record_it_was_raised_from(
+        self, tmp_path,
+    ):
+        """Task 3582's columns: the per-write durable record this alarm reads."""
+        _emit(tmp_path)
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert 'terminal_status' in detail, detail
+        assert 'terminal_error' in detail, detail
