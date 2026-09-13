@@ -111,3 +111,52 @@ class TestRenderDetail:
         rendered = render_detail(record, [record], datetime(2026, 7, 7, tzinfo=UTC))
 
         assert isinstance(rendered, str)
+
+
+def _make_decision(**overrides):
+    fields: dict = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'Should the reaper close this escalation?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+    }
+    fields.update(overrides)
+    return sr.DecisionRecord(**fields)
+
+
+class TestRenderDecisionDetail:
+    def test_renders_ids_severity_state_and_age(self):
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        decision = _make_decision(
+            id='dec-42',
+            project='df',
+            task_id='2085',
+            escalation_id='esc-99',
+            severity='blocking',
+            state=sr.DecisionState.OPEN,
+        )
+        now = datetime(2026, 7, 7, 0, 5, 0, tzinfo=UTC)
+
+        rendered = render_decision_detail(decision, [], now)
+
+        assert 'dec-42' in rendered
+        assert 'df' in rendered
+        assert '2085' in rendered
+        assert 'esc-99' in rendered
+        assert 'blocking' in rendered
+        assert 'open' in rendered
+        assert '5m' in rendered
+
+    def test_question_is_rendered_in_full_and_uncollapsed(self):
+        """The whole point of the pane: the queue row truncates at 60 chars, this must not."""
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        text = 'A' * 100 + '\n' + 'B' * 99
+        assert len(text) == 200
+        decision = _make_decision(text=text)
+
+        rendered = render_decision_detail(decision, [], datetime(2026, 7, 7, tzinfo=UTC))
+
+        assert text in rendered
+        assert '\n' + 'B' * 99 in rendered
