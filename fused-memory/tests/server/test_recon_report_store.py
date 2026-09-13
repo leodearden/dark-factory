@@ -942,11 +942,9 @@ class TestSupersedeAcrossEviction:
         (fd,) = [f for f in payload['findings'] if f['finding_id'] == finding_id]
         return fd
 
-    def _stage1_files_then_evicts(self, state, clock_holder):
-        """Drive the production shape and return Stage 1's finding_id.
-
-        Stage 1 files + completes at t=0; Stage 2 starts (so the run never
-        quiesces); the clock passes Stage 1's TTL and ``tick()`` evicts it.
+    def _stage1_files_and_completes(self, state):
+        """Stage 1 files its claim at t=0 and completes; Stage 2 then opens, so
+        the run stays live and never quiesces.  Returns Stage 1's finding_id.
         """
         state.start_report(run_id=self._RUN, stage=self._S1, project_id='dark_factory')
         stage1_fid = state.add_finding(
@@ -956,17 +954,19 @@ class TestSupersedeAcrossEviction:
             flag_type='memory_mechanism_contradiction',
         )['finding_id']
         state.complete(self._RUN, 'stage1 summary')
-
         state.start_report(run_id=self._RUN, stage=self._S2, project_id='dark_factory')
+        return stage1_fid
 
+    def _evict_stage1(self, state, clock_holder, stage1_fid):
+        """Age Stage 1 past its TTL, asserting the premise this class rests on:
+        gone from ``_state``, yet still resolvable through the
+        run-quiescence-scoped finding index — so a mutation still reaches it.
+        """
         clock_holder[0] = 301.0  # 301-0 > ttl(300) for s1; s2 is in-progress
         assert state.tick() == 1
-        # The premise: evicted from _state, yet still resolvable through the
-        # run-quiescence-scoped finding index — so a mutation still reaches it.
         assert (self._RUN, self._S1) not in state._state
         assert stage1_fid in state._run_finding_index[self._RUN]
-        assert self._RUN in self._run_ids_in_store(store=state._store)
-        return stage1_fid
+        assert self._RUN in self._run_ids_in_store(state._store)
 
     def _supersede(self, state, stage1_fid):
         return state.add_finding(
@@ -992,7 +992,8 @@ class TestSupersedeAcrossEviction:
         t = [0.0]
         try:
             state = self._make_state(store, t)
-            stage1_fid = self._stage1_files_then_evicts(state, t)
+            stage1_fid = self._stage1_files_and_completes(state)
+            self._evict_stage1(state, t, stage1_fid)
 
             result = self._supersede(state, stage1_fid)
             assert set(result) == {'finding_id'}, result
@@ -1018,7 +1019,8 @@ class TestSupersedeAcrossEviction:
         t = [0.0]
         try:
             state_a = self._make_state(store_a, t)
-            stage1_fid = self._stage1_files_then_evicts(state_a, t)
+            stage1_fid = self._stage1_files_and_completes(state_a)
+            self._evict_stage1(state_a, t, stage1_fid)
             stage2_fid = self._supersede(state_a, stage1_fid)['finding_id']
         finally:
             store_a.close()
@@ -1041,6 +1043,59 @@ class TestSupersedeAcrossEviction:
             ]
             assert item['superseded_by'] == stage2_fid
             assert item['actionable'] is False
+        finally:
+            store_b.close()
+
+    def test_retracting_the_superseder_unstamps_an_evicted_target(self, tmp_path):
+        """``_purge_finding``'s back-reference sweep must reach exactly the
+        entries the stamp could — the same scope mismatch, in the sibling path.
+
+        Note the retraction can only target A, the LIVE Stage-2 superseder:
+        ``delete_finding`` rejects a finding whose owning entry is completed,
+        which is precisely why only the supersession path can strand a pointer
+        on an evicted entry.  Left dangling, B stays neutered forever and
+        skipped by remediation forever, pointing at a row that no longer
+        exists — the stale-pointer class ``_purge_finding``'s own contract says
+        it exists to prevent.
+        """
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store_a, t)
+            stage1_fid = self._stage1_files_and_completes(state)  # B
+            stage2_fid = self._supersede(state, stage1_fid)['finding_id']  # A
+            self._evict_stage1(state, t, stage1_fid)
+
+            assert state.delete_finding(self._RUN, stage2_fid) == {
+                'status': 'deleted', 'finding_id': stage2_fid,
+            }
+
+            resolved = state._resolve_finding(self._RUN, stage1_fid)
+            assert resolved is not None
+            _entry, target = resolved
+            assert target.superseded_by is None
+
+            assert self._persisted_finding(store_a, stage1_fid)['superseded_by'] is None
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [
+                i for i in report['flagged_items'] if i['finding_id'] == stage1_fid
+            ]
+            assert item['superseded_by'] is None
+            assert item['actionable'] is True  # live and actionable again
         finally:
             store_b.close()
 
