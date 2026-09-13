@@ -41,6 +41,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.reconciliation import cli_stage_runner
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.standing_decision_constants import (
@@ -442,3 +443,36 @@ class TestNeverDropsAFinding:
         assert undecided_findings[0]['standing_decision_id'] is None
         assert 'standing_decision' in decided_citation
         assert 'standing_decision' not in undecided_citation
+
+
+# ---------------------------------------------------------------------------
+# Tool visibility: who may author a standing decision at all
+# ---------------------------------------------------------------------------
+
+
+class TestOnlyStage2MayAuthorAStandingDecision:
+    """PRD boundary row 14, closing η's frame.
+
+    β's ``TestStandingDecisionDisallowList`` stays the UNIT-level home of this
+    claim; the decompose-time capability manifest binds the row to η as well
+    ("η asserts both disallow-list entries"), so the overlap is deliberate,
+    bounded to one test over three constant lookups, and recorded here so a
+    reviewer does not read it as an oversight.
+
+    It belongs in the E2E gate because it is the frame every other leg assumes:
+    a row can only reach the ledger through a stage authorized to write one.
+    """
+
+    TOOL = 'mcp__recon-report__write_entity_standing_decision'
+
+    def test_stage_1_may_not_author_one(self) -> None:
+        """Stage 1 RAISES the flags a decision suppresses — letting it write its
+        own suppression would close the loop on itself."""
+        assert self.TOOL in cli_stage_runner.STAGE1_DISALLOWED
+
+    def test_stage_3_may_not_author_one(self) -> None:
+        """Stage 3 is read-only."""
+        assert self.TOOL in cli_stage_runner.STAGE3_DISALLOWED
+
+    def test_stage_2_is_the_sole_authoring_stage(self) -> None:
+        assert self.TOOL not in cli_stage_runner.STAGE2_DISALLOWED
