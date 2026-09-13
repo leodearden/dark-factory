@@ -7,9 +7,19 @@ fully unit-testable.
 Tick responsibilities
 ---------------------
 1. Write 6 PSI metrics with NULL window columns (kernel-windowed, no re-window).
-2. For each of 3 non-PSI metrics: compute the trailing window from the DB, then
+2. For each non-PSI metric: compute the trailing window from the DB, then
    write the row with window_mean + window_max populated.
-3. Call cleanup_old to enforce the 24-hour retention policy.
+3. Call cleanup_old to enforce the retention policy.
+
+Metric-name guard
+-----------------
+The per-tick metric count is NOT fixed. The load group emits one
+``own_cpu_some10:<leaf>`` and one ``own_read_ok:<leaf>`` row per cgroup leaf
+discovered at collection time, so its names cannot be enumerated in advance
+and no frozenset can admit them. ``unexpected_metric_names`` therefore
+validates a name against an exact-name set OR a registered STEM with a
+non-empty tail; the PSI and process groups register no stem, which leaves
+their strictness exactly where it is.
 
 Note: maybe_vacuum is NOT called here — it is called from ``__main__.main()``
 after run_tick completes, to keep concerns separated.
@@ -17,9 +27,42 @@ after run_tick completes, to keep concerns separated.
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from sampler.store import LoadSampleStore
 
-__all__ = ['run_tick']
+__all__ = ['run_tick', 'unexpected_metric_names']
+
+
+def unexpected_metric_names(
+    names: Collection[str],
+    *,
+    exact: frozenset[str],
+    stems: frozenset[str],
+) -> set[str]:
+    """Return the names matching neither an *exact* name nor a *stem* with a tail.
+
+    A name matches a stem when it splits on its FIRST ':' into a registered
+    stem and a NON-EMPTY tail. Both halves of that are load-bearing: a bare
+    stem is not itself a metric (nothing emits one, and admitting it would let
+    a collector that failed to append a leaf name write an anonymous row), and
+    an empty tail names no cgroup, so it would be per-leaf evidence about
+    nothing.
+
+    An EMPTY *stems* set degenerates to plain exact-set membership. That is
+    how the PSI and process groups keep exactly the strictness they have
+    today: neither has a dynamic component, so a typo there must still fail.
+    """
+    return {
+        name
+        for name in names
+        if name not in exact and not _matches_a_stem(name, stems)
+    }
+
+
+def _matches_a_stem(name: str, stems: frozenset[str]) -> bool:
+    stem, separator, tail = name.partition(':')
+    return bool(separator) and bool(tail) and stem in stems
 
 # PSI metric names that carry NULL windows (kernel-windowed already)
 _PSI_METRICS = frozenset([
@@ -37,6 +80,22 @@ _PROCESS_METRICS = frozenset([
     'verify_concurrency',
     'verify_rss_total_bytes',
 ])
+
+_LOAD_METRICS = frozenset([
+    'runqueue_ratio',
+    'runqueue_read_ok',
+])
+
+# One row per DISCOVERED cgroup leaf, so the tail is not knowable here — see
+# sampler.metrics.discover_pressure_cgroups.
+_LOAD_STEMS = frozenset([
+    'own_cpu_some10',
+    'own_read_ok',
+])
+
+# The PSI and process groups have no dynamic component, so they register no
+# stem and the guard stays exactly as strict as it is today.
+_NO_STEMS: frozenset[str] = frozenset()
 
 
 def run_tick(
@@ -56,13 +115,15 @@ def run_tick(
                          verify_concurrency, verify_rss_total_bytes).
     """
     # Guard against unexpected/misspelled metric keys that would silently
-    # persist without matching any consumer.  Subset checks (<=) rather than
-    # equality allow partial dicts when a collection group degrades to {} on
-    # error (see __main__.py degrade-and-continue handling).
-    assert set(psi) <= _PSI_METRICS, f'unexpected PSI keys: {set(psi) - _PSI_METRICS}'
-    assert set(process_metrics) <= _PROCESS_METRICS, (
-        f'unexpected process metric keys: {set(process_metrics) - _PROCESS_METRICS}'
+    # persist without matching any consumer. A PARTIAL dict is always legal —
+    # a collection group that degrades hands us {} (see __main__.py's
+    # degrade-and-continue handling), so only unrecognised names are an error.
+    unexpected_psi = unexpected_metric_names(psi, exact=_PSI_METRICS, stems=_NO_STEMS)
+    assert not unexpected_psi, f'unexpected PSI keys: {unexpected_psi}'
+    unexpected_process = unexpected_metric_names(
+        process_metrics, exact=_PROCESS_METRICS, stems=_NO_STEMS
     )
+    assert not unexpected_process, f'unexpected process metric keys: {unexpected_process}'
 
     # 1. Write PSI rows (NULL windows — PSI is already kernel-windowed)
     for metric, value in psi.items():
