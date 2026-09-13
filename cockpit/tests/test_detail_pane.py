@@ -200,3 +200,50 @@ class TestRenderDecisionDetail:
         )
         assert '(none)' in session_line
         assert 'None' not in session_line
+
+    def test_empty_or_unparseable_filed_at_degrades_to_the_age_placeholder(self):
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        now = datetime(2026, 7, 7, tzinfo=UTC)
+
+        for filed_at in ('', 'not-a-timestamp'):
+            rendered = render_decision_detail(_make_decision(filed_at=filed_at), [], now)
+
+            assert '?' in rendered
+
+    def test_absent_ids_render_a_placeholder_and_never_the_word_none(self):
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        decision = _make_decision(task_id=None, escalation_id=None, session_id=None)
+
+        rendered = render_decision_detail(decision, [], datetime(2026, 7, 7, tzinfo=UTC))
+
+        assert 'task_id: (none)' in rendered
+        assert 'escalation_id: (none)' in rendered
+        assert 'None' not in rendered
+
+    def test_unset_severity_and_unrecognized_state_still_render(self):
+        """Total over any record shape the registry hands it -- severity defaults
+        to '' (unknown) and state round-trips an unrecognized wire value."""
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        decision = _make_decision(severity='', state='some-future-state')
+
+        rendered = render_decision_detail(decision, [], datetime(2026, 7, 7, tzinfo=UTC))
+
+        assert 'some-future-state' in rendered
+
+    def test_options_are_rendered_only_when_present(self):
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        now = datetime(2026, 7, 7, tzinfo=UTC)
+
+        with_options = render_decision_detail(_make_decision(options=['a', 'b']), [], now)
+        assert 'options:' in with_options
+        assert 'a' in with_options
+        assert 'b' in with_options
+
+        for empty in (None, []):
+            rendered = render_decision_detail(_make_decision(options=empty), [], now)
+
+            assert 'options:' not in rendered
