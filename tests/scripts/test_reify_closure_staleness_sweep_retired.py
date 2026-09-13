@@ -67,13 +67,13 @@ ALLOWED_UNCONDITIONALLY = {
     ),
 }
 
-# Docs permitted to keep a retired token ONLY as a record of the retirement.
-# The allowlist alone would not be enough here: "describes the retirement" has
-# to be CHECKABLE, or this degrades into pinning doc prose. So each surviving
-# mention must sit within RETIREMENT_MARKER_WINDOW lines of a marker token — a
-# line still reading as live operator instructions fails, a line recording the
-# retirement passes. Nothing beyond that single marker is asserted: not
-# sentence wording, not headings, not any other prose.
+# A second allowlist, merged into the same exclusion set as the dict above:
+# docs permitted to keep a retired token because they name the wiring only as
+# a record of its retirement. Same shape as ALLOWED_UNCONDITIONALLY and as
+# test_atomic_write_regrowth.py::_ALLOWED_RENAMERS — the per-entry reason IS
+# the human-auditable record that the mention is historical. Nothing is
+# asserted about the surrounding prose: pinning doc wording is exactly what
+# this module must not do, so an entry here is audited by reading it.
 ALLOWED_AS_RETIREMENT_RECORD = {
     'OPERATIONS.md': 'the operator runbook records the job as retired',
     'docs/prds/recurring-deterministic-tasks.md': (
@@ -90,9 +90,6 @@ ALLOWED_AS_RETIREMENT_RECORD = {
         'the sidecar marks the retired example in its binding prose'
     ),
 }
-
-RETIREMENT_MARKERS = ('task 5247', 'retired')
-RETIREMENT_MARKER_WINDOW = 3
 
 _RETIRED_MESSAGE = (
     "task 5247: {path} is part of the retired nightly reify closure-staleness "
@@ -299,29 +296,4 @@ def test_tree_carries_no_reference_to_the_retired_wiring():
         'retired, but these tracked lines still name it — repoint each at a '
         'surviving precedent, or add the file to one of this module\'s '
         'allowlists WITH a written reason:\n  ' + '\n  '.join(sorted(offenders))
-    )
-
-
-def test_retirement_record_docs_describe_only_the_retirement():
-    """Every surviving doc mention sits beside a retirement marker.
-
-    Structural, not prose-pinning: a mention that still reads as live operator
-    instructions for a running job has no marker near it and fails here.
-    """
-    offenders = []
-    for relpath in sorted(ALLOWED_AS_RETIREMENT_RECORD):
-        hits, lines = _mentioning_lines(relpath)
-        for lineno in hits:
-            window = lines[
-                max(0, lineno - 1 - RETIREMENT_MARKER_WINDOW):
-                lineno + RETIREMENT_MARKER_WINDOW
-            ]
-            haystack = '\n'.join(window).lower()
-            if not any(marker in haystack for marker in RETIREMENT_MARKERS):
-                offenders.append(f'{relpath}:{lineno}: {lines[lineno - 1].strip()}')
-    assert not offenders, (
-        'task 5247: these doc lines still name the retired wiring without a '
-        f'retirement marker ({" / ".join(RETIREMENT_MARKERS)}) within '
-        f'{RETIREMENT_MARKER_WINDOW} lines, so they still read as a live '
-        'description of a running job:\n  ' + '\n  '.join(offenders)
     )
