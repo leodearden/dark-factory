@@ -1165,6 +1165,19 @@ class _MultiTenantFalkorDriver(FalkorDriver):
         return cloned
 
 
+# The one copy of the ``uuid=`` contract that ``GraphitiBackend.add_episode``
+# carries to its caller — interpolated into BOTH failure messages that seam
+# emits (the content-discard warning and the translated not-found), and pointed
+# at, not restated, by that method's docstring. Verified against graphiti_core
+# 0.28.2, ``graphiti_core/graphiti.py::Graphiti.add_episode``.
+_UUID_MEANS_LOAD = (
+    "A non-None uuid= selects graphiti_core's LOAD branch "
+    '(EpisodicNode.get_by_uuid), so it can only name an episode that ALREADY '
+    'exists, never one to create under that id. To create a NEW episode pass '
+    'uuid=None and read the minted uuid off result.episode.uuid.'
+)
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle.
 
@@ -1481,14 +1494,14 @@ class GraphitiBackend:
         the persisted episode: the harm being labelled is the EDGES extracted
         from it, not the tool response.
 
-        ``uuid`` means LOAD, never create-with-this-id (graphiti_core 0.28.2,
-        ``graphiti_core/graphiti.py::Graphiti.add_episode``): a non-None value
-        selects ``EpisodicNode.get_by_uuid``, so it can only name an episode that
-        ALREADY exists, and on that branch ``content`` is ignored in favour of
-        the stored episode body (warned about below). To create a NEW episode
-        pass ``uuid=None`` and read the minted uuid off ``result.episode.uuid``
-        — see ``services/memory_service.py::MemoryService._execute_graphiti_write``,
-        the only production caller, for why that identity is load-bearing.
+        ``uuid`` means LOAD, never create-with-this-id — the contract stated
+        once at ``graphiti_client.py::_UUID_MEANS_LOAD``, which is what both
+        failure messages below carry. See
+        ``services/memory_service.py::MemoryService._execute_graphiti_write``,
+        the only production caller, for why the minted identity is load-bearing.
+        A legitimate load-an-existing-episode call passes ``content=''``: any
+        non-empty ``content`` alongside a resolving ``uuid`` is discarded
+        upstream in favour of the stored episode body, and warns here.
 
         Raises:
             NodeNotFoundError: the module-local one, when a non-None ``uuid``
@@ -1500,9 +1513,8 @@ class GraphitiBackend:
         if uuid is not None and content:
             logger.warning(
                 f'add_episode called with both uuid={uuid} and content in group '
-                f'{group_id}: the content will NOT be stored. A non-None uuid= '
-                f'selects graphiti_core\'s LOAD branch, which re-uses the stored '
-                f'episode body. Pass uuid=None to create a new episode.'
+                f'{group_id}: the content will NOT be stored — the '
+                f'already-stored episode body wins. {_UUID_MEANS_LOAD}'
             )
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
@@ -1539,12 +1551,8 @@ class GraphitiBackend:
             if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
                 raise
             raise NodeNotFoundError(
-                f'Episodic node not found in group {group_id}: {uuid} — a '
-                f'non-None uuid= selects graphiti_core\'s LOAD branch '
-                f'(EpisodicNode.get_by_uuid), so it can only name an episode '
-                f'that ALREADY exists, never one to create under that id. To '
-                f'create a NEW episode pass uuid=None and read the minted uuid '
-                f'off result.episode.uuid.'
+                f'Episodic node not found in group {group_id}: {uuid} — '
+                f'{_UUID_MEANS_LOAD}'
             ) from exc
 
     @_canonicalize_group_args
