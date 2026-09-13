@@ -3573,23 +3573,38 @@ class TestCollectTasksWithCountsConcurrency:
         )
 
     def _tracking_stub(self, monkeypatch, *, dwell: float = 0.05, rows=None,
-                       offline_for=None, raise_for=None):
+                       offline_for=None, raise_for=None, serve_first=None):
         """Patch ``_shape_one_project`` with a stub that records enter/exit.
 
         Returns the shared ``events`` list of ``(label, 'enter'|'exit', t)``.
+
+        With *serve_first* set to N the first N ADMISSIONS return without
+        awaiting at all and every admission after them hangs forever, so which
+        roots a render serves is a property of the admission order rather than
+        a race between a dwell and a budget. Same idiom, and the same reason,
+        as ``TestCollectTasksWithCountsFairness._admission_recorder``.
         """
         import dashboard.data.active_tasks as at_mod
 
         events: list[tuple[str, str, float]] = []
         offline_for = set(offline_for or ())
         raise_for = set(raise_for or ())
+        admitted = 0
 
         async def _stub(client, config, project_root, **kwargs):
+            nonlocal admitted
             label = project_root.name
             loop = asyncio.get_running_loop()
             events.append((label, 'enter', loop.time()))
+            admitted += 1
             try:
-                await asyncio.sleep(dwell)
+                if serve_first is not None:
+                    if admitted > serve_first:
+                        # A wedged MCP leg: never returns, so the caller's own
+                        # budget is what ends it — on every host alike.
+                        await asyncio.Event().wait()
+                else:
+                    await asyncio.sleep(dwell)
                 if label in raise_for:
                     raise RuntimeError(f'shaping blew up for {label}')
                 if label in offline_for:
@@ -3610,7 +3625,12 @@ class TestCollectTasksWithCountsConcurrency:
     def _max_simultaneous(events) -> int:
         """Peak number of roots inside the stub at once, from the event log."""
         live = peak = 0
-        for _label, kind, _t in sorted(events, key=lambda e: (e[2], e[1] == 'enter')):
+        # Tie-break ENTER before EXIT at an identical loop.time(): the loop
+        # clock is coarse enough for a fast stub's exit and the next root's
+        # entry to share a timestamp, and ordering the exit first would
+        # under-count live occupancy and fail the strict `peak == width`
+        # assertion below for a reason that is not about the semaphore.
+        for _label, kind, _t in sorted(events, key=lambda e: (e[2], e[1] == 'exit')):
             if kind == 'enter':
                 live += 1
                 peak = max(peak, live)
@@ -3649,40 +3669,89 @@ class TestCollectTasksWithCountsConcurrency:
             'concurrency it claims to provide is not actually delivered'
         )
 
-    async def test_wall_clock_is_ceil_n_over_w_not_n(
+    async def test_admission_proceeds_in_ceil_n_over_w_waves(
         self, monkeypatch, tmp_path, dummy_client,
     ):
-        """(b) Elapsed time tracks ``ceil(N/W)`` waves, not N sequential roots.
+        """(b) The 9 roots are admitted in ``ceil(N/W)`` waves, not 9 turns.
 
         This is the assertion that actually pins the user-visible symptom —
-        "a cold render costs the entire 20 s budget and the tail degrades".
+        "a cold render costs the entire 20 s budget and the tail degrades" —
+        because wall clock is ``waves * per-root cost``.
+
+        DERIVED FROM THE EVENT LOG, NOT FROM A CLOCK. The earlier form ran 9
+        real ``asyncio.sleep(0.05)``s and asserted ``elapsed < 0.30s``, which
+        leaves ~0.15 s of headroom for scheduling — the same class of
+        host-speed race commit a83febb5bc removed three of elsewhere on this
+        branch, and one that fails LOUDEST under the xdist contention CI
+        actually runs with. Here each wave is released by an explicit gate, so
+        the wave COUNT is observed directly and no host can be too slow.
         """
         import math
 
         import dashboard.data.active_tasks as at_mod
 
+        width = at_mod._TASKS_ROOT_CONCURRENCY
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
-        dwell = 0.05
-        self._tracking_stub(monkeypatch, dwell=dwell)
 
-        started = time.monotonic()
-        await collect_tasks_with_counts(client=dummy_client, config=config)
-        elapsed = time.monotonic() - started
+        entered: list[str] = []
+        gate = asyncio.Event()
 
-        waves = math.ceil(9 / at_mod._TASKS_ROOT_CONCURRENCY)
-        concurrent_cost = waves * dwell
-        sequential_cost = 9 * dwell
-        # Generous tolerance: this asserts the SHAPE of the cost (waves, not
-        # roots), not a latency budget. The midpoint is the only threshold
-        # that cannot be met by the wrong implementation.
-        midpoint = (concurrent_cost + sequential_cost) / 2
-        assert elapsed < midpoint, (
-            f'the 9-root walk took {elapsed:.3f}s, closer to the sequential '
-            f'{sequential_cost:.3f}s than to the concurrent {concurrent_cost:.3f}s '
-            f'({waves} waves at width {at_mod._TASKS_ROOT_CONCURRENCY}) — the '
-            'roots are still being walked one at a time, which is the cost '
-            'model that made the cold render exhaust _TASKS_TOTAL_BUDGET'
+        async def _stub(client, config_, project_root, **kwargs):
+            entered.append(project_root.name)
+            # Reads `gate` at CALL time, so a root admitted in wave k waits on
+            # wave k's gate object and is unaffected by the rebinding below.
+            await gate.wait()
+            return [{'_task_uid': f'{project_root.name}/T-1', 'project': project_root.name}], False, 1
+
+        monkeypatch.setattr(at_mod, '_shape_one_project', _stub)
+
+        async def _settle() -> None:
+            """Yield until the walk stops admitting. Bounded, and clock-free."""
+            stable = 0
+            while stable < 5:
+                before = len(entered)
+                await asyncio.sleep(0)
+                stable = stable + 1 if len(entered) == before else 0
+
+        walk = asyncio.create_task(
+            collect_tasks_with_counts(client=dummy_client, config=config),
+        )
+
+        admitted = 0
+        wave_sizes: list[int] = []
+        while admitted < 9:
+            await _settle()
+            newly = len(entered) - admitted
+            assert 0 < newly <= width, (
+                f'wave {len(wave_sizes) + 1} admitted {newly} roots against a '
+                f'_TASKS_ROOT_CONCURRENCY of {width} — 0 means the walk '
+                'stalled with slots free, more than the width means the '
+                'semaphore is not bounding anything (an unbounded fan-out '
+                'against the single fused-memory server on the httpx client '
+                'the 3 s render polls share)'
+            )
+            wave_sizes.append(newly)
+            admitted += newly
+            opening, gate = gate, asyncio.Event()
+            opening.set()  # let this wave finish, freeing its slots
+
+        active, _offline, _counts, degraded, _unknown = await walk
+
+        assert len(wave_sizes) == math.ceil(9 / width), (
+            f'the 9-root walk took {len(wave_sizes)} waves '
+            f'({wave_sizes}) at width {width}, not the expected '
+            f'{math.ceil(9 / width)} — 9 means the roots are still walked one '
+            'at a time, which is the cost model that made the cold render '
+            'exhaust _TASKS_TOTAL_BUDGET and starve the tail'
+        )
+        assert wave_sizes[0] == width, (
+            f'the first wave admitted {wave_sizes[0]} of {width} slots; a '
+            'semaphore that is never saturated delivers none of the '
+            'concurrency it claims'
+        )
+        assert len(active) == 9 and degraded == [], (
+            'every root was released, so every root must have been served'
         )
 
     async def test_row_order_is_root_order_not_completion_order(
@@ -3721,19 +3790,73 @@ class TestCollectTasksWithCountsConcurrency:
             'leaks into the rendered table'
         )
 
+    async def test_two_roots_sharing_a_basename_both_render(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(g) Per-root results are paired by ROOT, never by display label.
+
+        ``_project_label`` is the directory BASENAME, so two configured roots
+        can share one (``/a/proj`` and ``/b/proj``). Keying the gathered
+        results by label collapses them: the survivor's rows are extended into
+        ``all_active`` TWICE — duplicate ``_task_uid``s, which the React tab
+        uses as its map key — and the other root's rows vanish with no
+        offline or degraded marker naming them. That is silent DATA LOSS, and
+        it is the invisible-failure class this whole task exists to close.
+        """
+        a = tmp_path / 'a' / 'proj'
+        b = tmp_path / 'b' / 'proj'
+        for root in (a, b):
+            root.mkdir(parents=True)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+        _register_runtime(monkeypatch, {})
+
+        async def _stub(client, config_, project_root, **kwargs):
+            uid = f'{project_root.parent.name}/{project_root.name}/T-1'
+            return [{'_task_uid': uid, 'project': project_root.name}], False, 1
+
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._shape_one_project', _stub,
+        )
+
+        active, offline, _counts, degraded, _unknown = (
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+        )
+
+        uids = [row['_task_uid'] for row in active]
+        assert sorted(uids) == ['a/proj/T-1', 'b/proj/T-1'], (
+            f'the two same-named roots rendered {uids}; each root must '
+            'contribute its OWN rows exactly once. A duplicated uid means one '
+            "root's rows were emitted twice under the other's identity, and a "
+            'missing one means a root was dropped with nothing naming it'
+        )
+        assert offline == [] and degraded == [], (
+            'both roots answered — neither may be marked offline or degraded'
+        )
+
     async def test_degraded_is_preserved_under_concurrency(
         self, monkeypatch, tmp_path, dummy_client, caplog,
     ):
-        """(d) A root the budget never served is degraded, not offline, and has NO count."""
+        """(d) A root the budget never served is degraded, not offline, and has NO count.
+
+        A MIXED partition is the whole point, and the earlier form of this
+        test never produced one: it dwelled 0.05 s against a 0.03 s
+        per-project budget, so all 9 roots blew their budget, `active` was
+        empty and `counts` was `{}` — the three `label not in ...` assertions
+        below iterated 9 labels against three EMPTY collections and could not
+        fail. The `serve_first` cut makes the partition deterministic: the
+        first 3 admissions return without awaiting, the rest hang until their
+        own per-project budget ends them.
+        """
         import dashboard.data.active_tasks as at_mod
 
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
-        # Each root costs more than its own share, and the total admits only
-        # the first wave or two.
-        self._tracking_stub(monkeypatch, dwell=0.05)
-        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.03)
-        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 0.12)
+        self._tracking_stub(monkeypatch, serve_first=3)
+        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
+        # Generous, deliberately: the TOTAL budget expiring is a DIFFERENT
+        # branch (tested by the fairness class). What must be exercised here
+        # is the per-project expiry.
+        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
 
         with caplog.at_level(logging.WARNING):
             active, offline, counts, degraded, _unknown = (
@@ -3741,11 +3864,20 @@ class TestCollectTasksWithCountsConcurrency:
             )
 
         assert degraded, (
-            'no root was reported degraded even though the total budget '
-            'admitted only a fraction of the 9 roots — a root the handler '
-            'never served must be NAMED, or it renders as "no active work"'
+            'no root was reported degraded even though 6 of the 9 roots never '
+            'returned — a root the handler never served must be NAMED, or it '
+            'renders as "no active work"'
         )
         served = {row['project'] for row in active}
+        # VACUITY GUARD, mirroring the fairness class's: the three assertions
+        # below compare the degraded labels against `served`/`counts`/`offline`,
+        # so all three pass trivially if those are empty.
+        assert 0 < len(served) < 9, (
+            f'{len(served)} of 9 roots were served — this test asserts a MIXED '
+            'partition, and is vacuous unless both halves are non-empty'
+        )
+        assert counts, 'the served roots must carry done counts, or the count assertions are vacuous'
+        assert len(degraded) == 9 - len(served)
         for label in degraded:
             assert label not in served, f'{label} is both degraded and served'
             assert label not in counts, (

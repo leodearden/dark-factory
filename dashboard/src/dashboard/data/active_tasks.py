@@ -203,7 +203,9 @@ _TASKS_PER_CALL_TIMEOUT = 4.4
 # What that sum does and does NOT claim: it bounds the sum of the
 # PER-HTTP-REQUEST budgets. It does NOT bound a cold MCP session, which
 # performs three posts (initialize, notifications/initialized, tools/call) and
-# so can reach ``3 * DEFAULT_PER_CALL_TIMEOUT`` for a SINGLE tool call. That
+# so can reach ``3 * _TASKS_PER_CALL_TIMEOUT`` for a SINGLE tool call — the
+# TAB'S per-call term, not the shared default, since that is what every call
+# below threads. That
 # residual is exactly what this ``wait_for`` layer exists to cap: the two
 # layers are complementary, not redundant (the same two-layer note
 # ``dashboard/src/dashboard/data/task_runtime.py``'s module docstring carries).
@@ -1162,6 +1164,10 @@ async def collect_tasks_with_counts(
         COMPLETION, and the Tasks tab renders ``all_active`` directly, so the
         table would reshuffle on every 3 s poll. The caller re-assembles these
         records in ROOT order below.
+
+        The record carries NO label: the caller pairs each one with the root
+        that produced it, which is the only identity that is unique (see the
+        re-assembly below).
         """
         label = _project_label(root)
         async with slots:
@@ -1181,7 +1187,7 @@ async def collect_tasks_with_counts(
                     'count are UNKNOWN for this render (not zero, and not offline)',
                     label, _TASKS_TOTAL_BUDGET,
                 )
-                return {'label': label, 'degraded': True}
+                return {'degraded': True}
             try:
                 active, offline, done_count = await asyncio.wait_for(
                     _shape_one_project(
@@ -1200,7 +1206,7 @@ async def collect_tasks_with_counts(
                     'UNKNOWN for this render (not zero, and not offline)',
                     label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
                 )
-                return {'label': label, 'degraded': True}
+                return {'degraded': True}
             except Exception:
                 # DEFENSE IN DEPTH, and deliberately broad. The fan-out
                 # normally converts a failed read into the offline marker, so
@@ -1234,11 +1240,8 @@ async def collect_tasks_with_counts(
                     'roots still render; this is a BUG, not an outage',
                     label, exc_info=True,
                 )
-                return {'label': label, 'offline': True}
-        return {
-            'label': label, 'active': active,
-            'offline': offline, 'done_count': done_count,
-        }
+                return {'offline': True}
+        return {'active': active, 'offline': offline, 'done_count': done_count}
 
     # return_exceptions=False is correct here BECAUSE the broad `except
     # Exception` above lives INSIDE _one: nothing can escape to the gather, so
@@ -1246,13 +1249,20 @@ async def collect_tasks_with_counts(
     # assembly code, a CancelledError) must still propagate rather than be
     # silently converted into a result object.
     results = await asyncio.gather(*(_one(root) for root in admission_order))
-    by_label = {result['label']: result for result in results}
+    # Keyed by ROOT, never by label. `_project_label` is the directory
+    # BASENAME, so two configured roots can share one (``/a/proj`` and
+    # ``/b/proj``) — and a label-keyed dict collapses them, which would extend
+    # the survivor's rows into `all_active` TWICE (duplicate `_task_uid`s, the
+    # React tab's map key) and drop the other root's rows entirely. Roots are
+    # deduped by `_all_project_roots`, so this pairing is total and 1:1;
+    # `strict=True` says so rather than trusting it.
+    by_root = dict(zip(admission_order, results, strict=True))
 
     # CANONICAL ROOT order — neither completion order nor admission order.
     # This is the only place the shared accumulators are written.
     for root in roots:
-        result = by_label[_project_label(root)]
-        label = result['label']
+        result = by_root[root]
+        label = _project_label(root)
         if result.get('degraded'):
             degraded_projects.append(label)
             continue

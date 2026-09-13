@@ -1077,14 +1077,25 @@ async def fetch_statuses(
 
     **Per-request budget.** *timeout* is threaded into
     :func:`dashboard.data.memory.mcp_tool_call` exactly as ``fetch_tasks``
-    threads its own, and shares ``fetch_tasks``'s default so the two agree by
-    construction.  This is not decoration: ``get_statuses`` is one of the
-    three calls enumerated in ``active_tasks._PER_PROJECT_MCP_CALLS``, whose
-    budget invariant (``DEFAULT_PER_CALL_TIMEOUT * 3 <=
-    _TASKS_PER_PROJECT_BUDGET``) is only a true statement about the shipped
-    system if every enumerated call actually carries the term.  Left on
-    ``mcp_tool_call``'s 10 s default, this one call could alone exceed the
-    per-project budget the arithmetic claims to bound.
+    threads its own, and DEFAULTS to the same shared
+    ``DEFAULT_PER_CALL_TIMEOUT``.  This is not decoration: ``get_statuses`` is
+    one of the three calls enumerated in
+    ``active_tasks._PER_PROJECT_MCP_CALLS``, whose budget invariant is only a
+    true statement about the shipped system if every enumerated call actually
+    carries the term.  Left on ``mcp_tool_call``'s 10 s default, this one call
+    could alone exceed the per-project budget the arithmetic claims to bound.
+
+    The DEFAULT is not the term that invariant uses, though — do not compute
+    the Tasks-tab arithmetic from it.  ``active_tasks._shape_one_project``
+    passes ``active_tasks._TASKS_PER_CALL_TIMEOUT`` (measured, and wider than
+    the shared default) into all three of its calls, so the shipped invariant
+    is ``_TASKS_PER_CALL_TIMEOUT * 3 <= _TASKS_PER_PROJECT_BUDGET`` — which is
+    what ``test_tasks_budget.py`` assertion (a) checks.  Reading the shared
+    default into that sum instead reports slack that does not exist.  The
+    shared default stays where it is deliberately: it is bound into three
+    unrelated route budgets via ``DEFAULT_WHOLE_OPERATION_BUDGET``, none of
+    which fetches a 5 000-task tree, so the Tasks tab widens its own constant
+    rather than theirs — see ``_TASKS_PER_CALL_TIMEOUT`` for that rationale.
     """
     project_root_str = str(project_root)
 
