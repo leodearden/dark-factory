@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -411,3 +412,106 @@ class TestRunTickLoadGroup:
             conn.close()
         assert loadish == 0
         assert total == 9, 'the other two groups must still write their rows'
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-17: __main__'s third independent degrade point
+# ---------------------------------------------------------------------------
+
+
+def _metrics_written(db_path: Path) -> set[str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return {row[0] for row in conn.execute('SELECT DISTINCT metric FROM samples')}
+    finally:
+        conn.close()
+
+
+def _run_main(monkeypatch, tmp_path: Path, **raising: bool):
+    """Drive sampler.__main__.main with each collector optionally raising."""
+    import sampler.__main__ as entry
+
+    monkeypatch.setenv('DARK_FACTORY_ROOT', str(tmp_path))
+
+    def collector(name: str, value: dict[str, float]):
+        def collect(**_kwargs):
+            if raising.get(name):
+                raise RuntimeError(f'{name} is down')
+            return value
+        return collect
+
+    monkeypatch.setattr(entry, 'collect_psi', collector('psi', FAKE_PSI))
+    monkeypatch.setattr(
+        entry, 'collect_process_metrics', collector('process', FAKE_PROCESS_METRICS)
+    )
+    monkeypatch.setattr(
+        entry, 'collect_load_metrics', collector('load', FAKE_LOAD_METRICS)
+    )
+    entry.main()
+    return tmp_path / 'data/load-samples.db'
+
+
+class TestMainDegradesEachGroupIndependently:
+    """Three collection groups, three loud degrade points, no shared fate.
+
+    The groups read unrelated kernel surfaces — /proc/pressure, the psutil
+    process scan, and /proc/stat + cgroupfs — so one failing must not discard
+    another's rows. Each falls back to {} so run_tick writes ZERO rows for it,
+    which is the shape that makes a fabricated healthy 0.0 impossible.
+    """
+
+    def test_all_three_groups_written_when_healthy(self, monkeypatch, tmp_path: Path):
+        db_path = _run_main(monkeypatch, tmp_path)
+
+        written = _metrics_written(db_path)
+        assert set(FAKE_PSI) <= written
+        assert set(FAKE_PROCESS_METRICS) <= written
+        assert set(FAKE_LOAD_METRICS) <= written
+
+    def test_load_failure_keeps_psi_and_process_rows(self, monkeypatch, tmp_path: Path, caplog):
+        with caplog.at_level(logging.ERROR):
+            db_path = _run_main(monkeypatch, tmp_path, load=True)
+
+        written = _metrics_written(db_path)
+        assert set(FAKE_PSI) <= written
+        assert set(FAKE_PROCESS_METRICS) <= written
+        assert not [m for m in written if m.startswith(('runqueue', 'own_'))], (
+            'a failed load group must write zero rows, not a 0.0-valued one'
+        )
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any('load' in m.lower() for m in messages), messages
+
+    def test_process_failure_keeps_load_rows(self, monkeypatch, tmp_path: Path, caplog):
+        with caplog.at_level(logging.ERROR):
+            db_path = _run_main(monkeypatch, tmp_path, process=True)
+
+        written = _metrics_written(db_path)
+        assert set(FAKE_LOAD_METRICS) <= written
+        assert set(FAKE_PSI) <= written
+        assert not set(FAKE_PROCESS_METRICS) & written
+
+    def test_psi_failure_keeps_load_rows(self, monkeypatch, tmp_path: Path, caplog):
+        with caplog.at_level(logging.ERROR):
+            db_path = _run_main(monkeypatch, tmp_path, psi=True)
+
+        written = _metrics_written(db_path)
+        assert set(FAKE_LOAD_METRICS) <= written
+        assert set(FAKE_PROCESS_METRICS) <= written
+        assert not set(FAKE_PSI) & written
+
+    def test_a_failing_group_does_not_abort_the_tick(self, monkeypatch, tmp_path: Path):
+        """Only store-construction failure justifies a non-zero exit."""
+        db_path = _run_main(monkeypatch, tmp_path, load=True, process=True)
+
+        assert set(FAKE_PSI) <= _metrics_written(db_path)
+
+    def test_the_tick_log_line_reports_the_load_group(self, monkeypatch, tmp_path: Path, caplog):
+        """An operator watching journalctl must be able to see the new group."""
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path)
+
+        tick_lines = [
+            r.getMessage() for r in caplog.records if r.getMessage().startswith('tick ')
+        ]
+        assert tick_lines, [r.getMessage() for r in caplog.records]
+        assert any('runqueue_ratio' in line for line in tick_lines), tick_lines
