@@ -876,14 +876,15 @@ def build_report(root: Path) -> dict[str, object]:
         source = _read_source(root, relpath)
         size = file_size_measures(source, path=relpath)
         target = root / relpath
+        cognitive = file_cognitive_measures(target)
         files[relpath] = {
             'lines': size.lines,
             'prose_lines': size.prose_lines,
-            'cognitive': file_cognitive_total(target),
+            'cognitive': cognitive.total,
             'function_local_imports': function_local_imports(source, path=relpath),
             'reexport_names': len(reexport_names(source, path=relpath)),
         }
-        for qualname, score in cognitive_complexity(target).items():
+        for qualname, score in cognitive.per_function.items():
             functions[f'{relpath}::{qualname}'] = score
 
     tests, test_enumeration = _sweep_test_tree(root)
