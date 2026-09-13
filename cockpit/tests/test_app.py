@@ -3447,3 +3447,92 @@ class TestStaleScanSequenceGuard:
             await pilot.pause()
 
             assert recorded_seqs == [issued]
+
+
+class TestDecisionQueueDetail:
+    @pytest.mark.timeout(10)
+    async def test_highlighting_a_decision_row_renders_its_full_question(self, tmp_path):
+        """The task's whole signal: a decision's question is truncated to 60 chars
+        in its queue row, so the detail pane is the only place it can be read in
+        full -- and syncing it there must not disturb the session table's own
+        detail sync or the selected-slug restore seam.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        # Two RUNNING sessions: neither joins the queue (order_queue takes
+        # awaiting-input ones only), and the older start_ts takes session-table
+        # row 0, so moving to session-target is a real move -- a move onto the
+        # already-highlighted row posts no RowHighlighted at all.
+        other_session = _make_record(
+            session_slug='session-other', start_ts='2026-07-07T00:00:00+00:00'
+        )
+        target_session = _make_record(
+            session_slug='session-target',
+            start_ts='2026-07-07T00:01:00+00:00',
+            task_id='7001',
+            escalation_id='esc-7001-1',
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for record in (other_session, target_session):
+            sr.write_record(record, root=tmp_path)
+
+        # dec-first outscores the target (manual_boost, TestDecisionQueueRender's
+        # own idiom) so the target is NOT the row highlighted at mount -- a move
+        # onto the already-highlighted row posts no RowHighlighted, which would
+        # make the assertion below vacuous.
+        long_question = (
+            'Should the reaper close this decision against the other escalation '
+            'queue, or leave it open for the watcher to re-file it?'
+        )
+        assert len(long_question) > 60
+        first = sr.DecisionRecord(
+            id='dec-first', project='df', text='Short one?',
+            filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+        )
+        target = sr.DecisionRecord(
+            id='dec-second', project='df', text=long_question,
+            filed_at='2026-07-07T00:00:00+00:00',
+            task_id='5449', escalation_id='esc-5449-2', severity='blocking',
+        )
+        for decision in (first, target):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            detail = app.query_one(DetailPane)
+
+            # (1) the move below is real: the target is not already highlighted
+            assert queue.highlighted_key() != 'decision:dec-second'
+            assert app._selected_slug == 'session-other'
+
+            # the row itself cannot carry the question -- that is the defect
+            assert long_question not in ' '.join(
+                str(cell) for cell in queue.get_row('decision:dec-second')
+            )
+
+            # (2) highlighting the decision row renders its full detail
+            assert queue.select_key('decision:dec-second')
+            await pilot.pause()
+
+            assert long_question in detail.rendered_text
+            assert 'dec-second' in detail.rendered_text
+            assert 'esc-5449-2' in detail.rendered_text
+
+            # (4) the queue move left the session table's restore seam alone
+            assert app._selected_slug == 'session-other'
+
+            # (3) the session table's own sync still works, unclobbered
+            table = app.query_one(SessionTable)
+            table.move_cursor(row=table.get_row_index('session-target'))
+            await pilot.pause()
+
+            assert 'Which port?' in detail.rendered_text
+            assert '7001' in detail.rendered_text
+            assert 'esc-7001-1' in detail.rendered_text
+            assert app._selected_slug == 'session-target'
