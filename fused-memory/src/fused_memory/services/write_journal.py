@@ -918,9 +918,12 @@ class WriteJournal:
         WHAT "DRAINS OVER SUCCESSIVE RESTARTS" REQUIRES, stated so the claim is
         checkable rather than hopeful. Non-search reads accrue at ~220,800/day,
         so a sweep only makes net progress if it removes more than
-        220,800/(redeploys per day) rows — at the observed 1-3 fleet redeploys
-        per day that is ~74,000-220,800 rows per run, i.e. ~2,500-7,400 rows/sec
-        against the stock 30 s deadline. Below that the backlog never clears
+        220,800/(redeploys per day) rows — at an ASSUMED 1-3 fleet redeploys per
+        day that is ~74,000-220,800 rows per run, i.e. ~2,500-7,400 rows/sec
+        against the stock 30 s deadline. The accrual rate is measured; the
+        redeploy cadence is an estimate, not a pinned figure (see OPERATIONS.md
+        §"Fleet redeploy & watchdog"), so treat the required rate as an order of
+        magnitude and the LOGGED rate below as the real answer. Below that the backlog never clears
         while the WARNING fires forever and reads as normal, so the achieved
         rate is MEASURED and logged (rows and rows/sec) on every partial sweep
         rather than assumed. If the first production run comes in under it, the
