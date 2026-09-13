@@ -34,13 +34,15 @@ validated against real data instead of a synthetic string.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     GROUNDS_TOKEN_FAMILIES,
@@ -50,6 +52,8 @@ from fused_memory.reconciliation.standing_decision_constants import (
 from fused_memory.reconciliation.standing_decision_writer import (
     write_entity_standing_decision,
 )
+from fused_memory.server.recon_report import ReconReportState
+from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 
 #: reify's 'orchestrator' node — the entity ``b0057f3d`` decided about.
 ENTITY_UUID = 'f02a32ea-0efd-4865-94b4-97a412d8ffda'
@@ -217,3 +221,160 @@ class TestBackfilledRowIsActiveAndListable:
         stems = GROUNDS_TOKEN_FAMILIES[GROUNDS_STRUCTURAL_SIZE_CONFLATION]
         assert any(stem in FALLBACK_FLAG_TYPE for stem in stems)
 
+
+
+# ---------------------------------------------------------------------------
+# The conjunction: one row, one cycle, both hooks
+# ---------------------------------------------------------------------------
+
+
+def make_fallback_flag() -> dict:
+    """The shape the motivating incident actually travelled.
+
+    NO ``entity_uuid`` / ``grounds`` stamps — the entity is named only inside
+    free-text prose — so γ can reach it solely through its FALLBACK arm: sole
+    cited uuid + a ``flag_type`` in the grounds' token family.
+    """
+    return {
+        'task_id': '2867',
+        'flag_type': FALLBACK_FLAG_TYPE,
+        'description': (
+            f'the {ENTITY_NAME} entity ({ENTITY_UUID}) has accumulated facts '
+            'spanning several concerns and should probably be split'
+        ),
+    }
+
+
+def make_unrelated_flag() -> dict:
+    """A flag no standing decision touches — the control."""
+    return {'task_id': '99', 'flag_type': 'missing_deliverable'}
+
+
+def make_base_report(items_flagged: list[dict]) -> StageReport:
+    """The StageReport ``BaseStage.run`` is patched to hand back."""
+    now = datetime.now(UTC)
+    return StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=now,
+        completed_at=now,
+        items_flagged=items_flagged,
+        stats={},
+        llm_calls=1,
+        tokens_used=100,
+    )
+
+
+async def run_one_cycle(ledger, items_flagged: list[dict]) -> tuple[StageReport, list]:
+    """Drive ONE REAL ``MemoryConsolidator.run()`` over *items_flagged*.
+
+    Returns ``(report, dedup_seen)`` — the second being what the ``dedup_flags``
+    spy observed, which is how the leg proves suppression happened BEFORE dedup
+    rather than after it (no marker churn for a flag the decision already
+    adjudicated).
+
+    Driving the real stage rather than calling ``filter_entity_standing_decisions``
+    directly is the point: the gate must observe the WIRED stat and the wired
+    ordering, not the filter's return value in isolation.
+    """
+    stage = make_consolidator('/proj')
+    stage.scope = make_scope(PROJECT_ID, '/proj')
+    stage.memory.recon_ledger = ledger
+
+    dedup_seen: list = []
+
+    async def _dedup_spy(**kwargs):
+        dedup_seen.append(list(kwargs.get('flags', [])))
+        return kwargs.get('flags', [])
+
+    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    with (
+        patch.object(
+            BaseStage, 'run', new=AsyncMock(return_value=make_base_report(items_flagged))
+        ),
+        patch(f'{module}.dedup_flags', new=_dedup_spy),
+        patch(
+            f'{module}.filter_false_absence_flags',
+            new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+        ),
+        patch(f'{module}.acknowledge_resolved_flags', new=AsyncMock(return_value=0)),
+    ):
+        report = await stage.run(
+            events=[],
+            watermark=Watermark(project_id=PROJECT_ID),
+            prior_reports=[],
+            run_id='run-eta-e2e',
+        )
+    return report, dedup_seen
+
+
+def state_with_finding(service) -> tuple[ReconReportState, str, str]:
+    """One started report plus one actionable finding: ``(state, run_id, id)``."""
+    state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0, memory_service=service)
+    run_id = 'run-eta-e2e'
+    state.start_report(run_id=run_id, stage='reconciler', project_id=PROJECT_ID)
+    result = state.add_finding(
+        run_id=run_id,
+        severity='moderate',
+        category='systemic_pattern',
+        description=f'{ENTITY_NAME} looks conflated',
+        suggested_action='split it',
+        actionable=True,
+        task_id='2867',
+        flag_type=FALLBACK_FLAG_TYPE,
+    )
+    return state, run_id, result['finding_id']
+
+
+class TestOneCycleSuppressesAndAnnotates:
+    """η's conjunction, off the ONE backfilled row, in one test body.
+
+    (A) a fallback-shape flag naming the entity is SUPPRESSED at Hook A and the
+    stat counts it; (B) a finding citing the same entity is ANNOTATED at Hook B
+    in both projections. Neither half is meaningful alone: the PRD's claim is
+    that a single row drives both, in the same cycle.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_backfilled_row_drives_both_hooks_in_one_cycle(
+        self, backfilled_decision
+    ) -> None:
+        ledger, service = backfilled_decision
+        fallback, unrelated = make_fallback_flag(), make_unrelated_flag()
+
+        # --- (A) Hook A: one real Stage-1 cycle -----------------------------
+        report, dedup_seen = await run_one_cycle(ledger, [fallback, unrelated])
+
+        assert report.stats['entity_standing_decision_suppressed'] == 1
+        assert fallback not in (report.items_flagged or [])
+        assert unrelated in (report.items_flagged or [])
+        # Suppressed BEFORE dedup_flags — the flag never reached it, so no
+        # recurrence marker churned for a complaint already adjudicated.
+        assert len(dedup_seen) == 1
+        assert fallback not in dedup_seen[0]
+        assert unrelated in dedup_seen[0]
+
+        # --- (B) Hook B: same ledger, same entity ---------------------------
+        state, run_id, finding_id = state_with_finding(service)
+        citation = await state.cite_entity(run_id, finding_id, ENTITY_NAME)
+
+        assert citation['entity_uuid'] == ENTITY_UUID
+        annotation = citation['standing_decision']
+        assert set(annotation) >= {
+            'standing_decision_id',
+            'grounds',
+            'decided_at',
+            'summary',
+        }
+        assert annotation['grounds'] == GROUNDS_STRUCTURAL_SIZE_CONFLATION
+
+        expected_id = f'{ENTITY_UUID}:{GROUNDS_STRUCTURAL_SIZE_CONFLATION}'
+        assert annotation['standing_decision_id'] == expected_id
+
+        # BOTH projections carry it: `get_findings_for_run` is the task-1966
+        # channel Stage 2 polls, `get_assembled_report` is the primary report.
+        raw = state.get_findings_for_run(run_id)
+        assert [f['standing_decision_id'] for f in raw] == [expected_id]
+        assembled = state.get_assembled_report(run_id, 'reconciler')
+        assert [
+            f['standing_decision_id'] for f in assembled['flagged_items']
+        ] == [expected_id]
