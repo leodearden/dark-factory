@@ -475,11 +475,6 @@ def _arm_for(metric: str, specs: list[ArmSpec]) -> str | None:
     return None
 
 
-def _spec_for(metric: str, specs: list[ArmSpec]) -> ArmSpec | None:
-    arm = _arm_for(metric, specs)
-    return ARM_METRIC_SELECTORS[arm] if arm else None
-
-
 def hold_table(
     series: dict[str, list[tuple[int, float]]],
     specs: list[ArmSpec],
@@ -509,9 +504,45 @@ def hold_table(
     return out
 
 
+def commit_report(path: Path, stamp: str) -> list[str]:
+    """`git add --` then `git commit --only <path>`; degrade named on failure.
+
+    `--only` and not a bare `git commit`: the repo this runs in is
+    machine-operated — the merge worker, the startup reconciler and git hooks
+    all act on it — so a bare commit would sweep in whatever a concurrent
+    process happens to have staged. That is a live hazard here, not a
+    stylistic preference.
+
+    A git failure is a NAMED degradation, never a non-zero exit. The analysis
+    is the deliverable and committing it is a convenience; ε1/ε2 classify a
+    non-zero rc as an INFRA FAULT with no gate, so letting git turn a
+    delivered calibration into a born-at-L2 page would be exactly backwards.
+    """
+    repo = str(path.parent.parent)
+    subject = (
+        f'plans: load-threshold calibration report {stamp} '
+        '(scripts/load-threshold-calibration.py)'
+    )
+    try:
+        for argv in (
+            ['git', '-C', repo, 'add', '--', str(path)],
+            ['git', '-C', repo, 'commit', '--only', str(path), '-q', '-m', subject],
+        ):
+            proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                return [
+                    f'report_commit_failed: {" ".join(argv[:4])} exited '
+                    f'{proc.returncode} ({proc.stderr.strip()[:200]})'
+                ]
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f'report_commit_failed: {exc}']
+    return []
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     now = datetime.now(UTC)
+    stamp = now.strftime('%Y-%m-%d')
 
     series, degradations = read_series(args.db, args.arm)
     specs = (
@@ -560,8 +591,9 @@ def main(argv: list[str] | None = None) -> int:
               'floor-occupancy measurement — in-flight floor occupancy is not in this '
               'corpus.', '']
     for metric, candidates in holds.items():
-        spec = _spec_for(metric, specs)
-        in_force = configured.get(_arm_for(metric, specs), None)
+        arm = _arm_for(metric, specs)
+        spec = ARM_METRIC_SELECTORS[arm] if arm else None
+        in_force = configured.get(arm) if arm else None
         lines += [
             f'### `{metric}` — {spec.unit if spec else ""}',
             '',
@@ -619,10 +651,18 @@ def main(argv: list[str] | None = None) -> int:
     print(report)
 
     if not args.no_report:
-        out = args.report_dir / f'load-threshold-calibration-{now.strftime("%Y-%m-%d")}.md'
+        # ONE clock read, reused for the filename, the heading above and the
+        # commit subject below — three reads could straddle midnight and
+        # produce a report whose own name disagrees with its heading.
+        out = args.report_dir / f'load-threshold-calibration-{stamp}.md'
         out.write_text(report, encoding='utf-8')
+        # To STDERR, so stdout's last line stays the single-line JSON.
         print(f'report: {out}', file=sys.stderr)
+        if args.commit:
+            degradations += commit_report(out, stamp)
 
+    # A degradation raised by the commit above lands in the JSON but not in the
+    # already-written report text — the report cannot narrate its own commit.
     print(json.dumps({
         'generated_at': now.isoformat(timespec='seconds'),
         'db': str(args.db),
