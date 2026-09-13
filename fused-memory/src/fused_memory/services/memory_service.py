@@ -82,6 +82,11 @@ from fused_memory.services.memory_metadata_census import (
     emit_schema_warnings,
     file_unknown_key_storm_escalation,
 )
+from fused_memory.services.read_telemetry import (
+    fallback_search_summary,
+    summarize_search_query,
+    summarize_search_results,
+)
 from fused_memory.services.topic_anchor import (
     _ANCHOR_SCROLL_LIMIT,
     _MAX_ANCHOR_TOPICS,
@@ -1517,8 +1522,11 @@ def _store_failure_diagnostics(
             error_type/error describe the timeout itself rather than a real
             exception object).
         query: The search query text — only its length is recorded (``query_len``),
-            not its content, matching the write-journal's existing
-            query[:200]-truncation-not-full-body convention.
+            never its content.  Diagnostics are logged and shipped off-box, so
+            they stay content-free by design; this is deliberately NOT the
+            write journal's rule, which since task 3212 records the query text
+            (bounded by ``read_telemetry.SEARCH_TELEMETRY_MAX_QUERY_CHARS``)
+            into a local SQLite file that nothing ships.
         project_id: The project scope the search ran under. Deliberately embedded
             in every per-store dict (even though one search() call shares a single
             project_id across all its diagnostics) so each entry is independently
@@ -2793,6 +2801,21 @@ class MemoryService:
     def set_write_journal(self, journal: WriteJournal) -> None:
         """Wire the write journal for durable auditing."""
         self._write_journal = journal
+
+    @property
+    def write_journal(self) -> WriteJournal | None:
+        """The wired journal, or None — a supported accessor for out-of-package readers.
+
+        ``reconciliation/context_assembler.py`` journals its memory_hints
+        executions (task 3212 item 3) and has no journal of its own: it receives
+        only (memory_service, taskmaster, config, project_root), and adding a
+        fifth constructor parameter would break six
+        ``fake_assembler_factory(...)`` stubs in ``tests/test_harness.py``.
+        This read-only property is the smallest honest alternative to reaching
+        across the package boundary into ``_write_journal``.  None means
+        unwired, which callers treat as "skip journalling", never as an error.
+        """
+        return self._write_journal
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -7197,6 +7220,37 @@ class MemoryService:
 
         # Log search when causation_id is present (recon paths)
         if causation_id and self._write_journal:
+            # The SECOND producer of the shape whose single home is
+            # fused_memory/services/read_telemetry.py::summarize_search_results
+            # (INV-5).  This site summarises the RAW `final` list, unlike the MCP
+            # tool site which summarises the GROUPED payload — correct in both
+            # places, because grouping is applied only at the MCP boundary, so
+            # below it the raw list IS what the caller receives.
+            #
+            # failed_stores is handed to the summariser rather than bolted onto
+            # its output: read_telemetry owns degraded/failed_stores so all
+            # three producers stamp it by one rule (it used to be added here
+            # unconditionally, only-when-degraded at the MCP site, and never at
+            # the hint site).
+            degraded_stores = [s.value for s in failed_stores]
+            try:
+                search_summary: dict[str, Any] = summarize_search_results(
+                    final, failed_stores=degraded_stores,
+                )
+            except Exception:
+                # A telemetry fault must never break a search.  The fallback is
+                # the FULL envelope marked telemetry_error, not a bare count, so
+                # a consumer can tell a broken summariser from a search that
+                # showed nothing.
+                logger.warning(
+                    'search telemetry FAILED for project=%s; journalling the '
+                    'telemetry_error envelope',
+                    project_id,
+                    exc_info=True,
+                )
+                search_summary = fallback_search_summary(
+                    len(final), failed_stores=degraded_stores,
+                )
             await self._write_journal.log_write_op(
                 write_op_id=str(uuid_mod.uuid4()),
                 causation_id=causation_id,
@@ -7206,11 +7260,8 @@ class MemoryService:
                 agent_id=agent_id,
                 session_id=session_id,
                 kind='read',
-                params={'query': query[:200], 'limit': limit},
-                result_summary={
-                    'count': len(final),
-                    'failed_stores': [s.value for s in failed_stores],
-                },
+                params={**summarize_search_query(query), 'limit': limit},
+                result_summary=search_summary,
                 success=not degraded,
             )
 

@@ -162,6 +162,11 @@ from fused_memory.services.completion_claim_gate import (
     verify_claims,
 )
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.read_telemetry import (
+    fallback_search_summary,
+    summarize_search_query,
+    summarize_search_results,
+)
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
@@ -1324,6 +1329,10 @@ def create_mcp_server(
                 error=error,
             )
         except Exception as e:
+            # Feed the SAME counter WriteJournal increments internally (INV-5).
+            # This outer handler fires rarely — log_write_op swallows its own
+            # failure first — but when it does the row is just as lost.
+            write_journal.record_journal_drop(operation)
             logger.warning(f'Failed to log read op: {e}')
 
     # ------------------------------------------------------------------
@@ -3903,6 +3912,21 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         include_planned: bool = False,
+        # ATTRIBUTION, not filtering (task 3212, INV-1).  These record WHO IS
+        # ASKING in the journal and are never passed to memory_service.search —
+        # conflating them with the agent_id FILTER above is the design conflict
+        # that left 99.7% of journal rows unattributed.
+        #
+        # _resolve_identity's clientInfo read is deliberately left exactly as it
+        # is and is NOT repurposed for this: clientInfo is hardcoded to
+        # 'orchestrator' in orchestrator/mcp/mcp_lifecycle.py and is dropped
+        # entirely by stateless HTTP, so it can never carry per-task identity.
+        #
+        # Consumer: task 3659 threads these from the briefing assembler across
+        # all its builders.  This task is server-side only and edits no
+        # orchestrator briefing code.  No other tool gains these params.
+        caller_agent_id: str | None = None,
+        caller_task_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Search across both memory stores with automatic routing.
@@ -3931,6 +3955,8 @@ def create_mcp_server(
             agent_id: Filter by authoring agent (optional, auto-derived from MCP context)
             session_id: Filter by session (optional, auto-derived from MCP context)
             include_planned: Include planning-episode edges (default: False)
+            caller_agent_id: Who is ASKING — recorded in the journal, never used to filter
+            caller_task_id: Which task is asking — recorded in the journal, never used to filter
 
         Returns:
             {'results': [...]} — plus 'degraded'/'failed_stores'/
@@ -4002,6 +4028,21 @@ def create_mcp_server(
             }
         if limit > 1000:
             limit = 1000
+        # One params dict for both journalling sites (success and error), built
+        # once so the two cannot drift.  The query text and its disclosed cap
+        # come from read_telemetry, the same single home that owns the
+        # result_summary shape — see the summarise site below.  The
+        # caller-identity keys are present only when supplied, so an
+        # un-attributed caller's row shape is byte-identical to what it was
+        # before this channel existed.
+        journal_params: dict[str, Any] = {
+            **summarize_search_query(query),
+            'limit': limit,
+        }
+        if caller_agent_id is not None:
+            journal_params['caller_agent_id'] = caller_agent_id
+        if caller_task_id is not None:
+            journal_params['caller_task_id'] = caller_task_id
         try:
             results = await memory_service.search(
                 query=query,
@@ -4048,13 +4089,53 @@ def create_mcp_server(
                 diagnostics = getattr(results, 'failure_diagnostics', [])
                 if diagnostics:
                     response['failed_store_diagnostics'] = diagnostics
+            # The shape's SINGLE home is
+            # fused_memory/services/read_telemetry.py::summarize_search_results
+            # — three producers, one contract (INV-5).  Summarise
+            # `grouped_results`, not `results`: grouping runs at THIS boundary,
+            # so the grouped list is literally what the agent was shown, and
+            # leaf eta's (task 3213) question is "was the agent SHOWN the thing
+            # it then re-wrote?".  The raw list would over-report top-level
+            # visibility and omit the folded child ids the agent did see.
+            #
+            # The near-full query is journalled for search rows only — the
+            # 200-char convention at every other _log_read caller is
+            # deliberately left alone.  A retrieval metric computed from half a
+            # query measures the wrong thing.
+            #
+            # failed_stores is read off `results` (the SearchResults object)
+            # exactly as the response block above does — it does not survive the
+            # list transform — and handed to the summariser rather than bolted
+            # onto its output, so all three producers stamp degraded/
+            # failed_stores by one rule instead of three.
+            degraded_stores = getattr(results, 'failed_stores', None)
+            try:
+                search_summary: dict[str, Any] = summarize_search_results(
+                    grouped_results, failed_stores=degraded_stores,
+                )
+            except Exception:
+                # A telemetry fault must never turn a working search into an
+                # error — same degradation posture as the grouping guard above.
+                # The fallback is the FULL envelope marked telemetry_error, not
+                # a bare count: a consumer must be able to tell "the summariser
+                # broke" from "the agent was shown nothing".
+                logger.warning(
+                    'search: result telemetry FAILED for project=%s; journalling the '
+                    'telemetry_error envelope',
+                    project_id,
+                    exc_info=True,
+                    extra={'project_id': project_id},
+                )
+                search_summary = fallback_search_summary(
+                    len(results), failed_stores=degraded_stores,
+                )
             await _log_read(
                 operation='search',
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query[:200], 'limit': limit},
-                result_summary={'count': len(results)},
+                params=journal_params,
+                result_summary=search_summary,
             )
             return response
         except Exception as e:
@@ -4063,7 +4144,7 @@ def create_mcp_server(
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query[:200], 'limit': limit},
+                params=journal_params,
                 success=False,
                 error=str(e),
             )
@@ -7209,6 +7290,20 @@ def create_mcp_server(
             and (halt := _halt_payload(project_id)) is not None
         ):
             result['reconciliation_halt'] = halt
+
+        # task 3212 (item 5): surface rows the write journal LOST. Deliberately
+        # not fault-only, unlike `degraded` / `failed_stores`: a zero is a
+        # meaningful assertion that nothing was lost, and an absent key would be
+        # indistinguishable from an unwired journal both to an operator and to
+        # leaf eta (task 3213), whose metric reads a dropped search row as
+        # "never asked" — a wrong answer rather than a missing one.
+        #
+        # Top-level rather than under `queue` for the same reason as
+        # `reconciliation_halt` above: `queue` is the durable-write-queue
+        # subsystem, and the write journal is not it. Conflating the two is the
+        # exact mis-triage task 2920 fixed.
+        if write_journal is not None and isinstance(result, dict) and 'error' not in result:
+            result['journal_drops'] = write_journal.journal_drop_stats()
 
         return result
 

@@ -33,7 +33,8 @@ TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 # Environment= absolutely and the installed unit is a byte copy of the
 # committed one -- so this must NOT be derived from a REPO_ROOT, which is a
 # .worktrees/<id> path when the suite runs in a lane. Precedent + rationale:
-# scripts/tests/test_install_reify_closure_staleness_sweep_timer.py:27-32.
+# scripts/tests/test_install_reclaim_orphaned_worktrees_timer.py::test_install_copies_units_enables_timer_and_kicks_drain,
+# which asserts that byte-copy directly.
 PRODUCTION_CLAUDE_BIN = "/home/leo/.local/bin/claude"
 
 
