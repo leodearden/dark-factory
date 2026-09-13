@@ -779,3 +779,147 @@ def test_an_expected_role_with_no_runs_is_a_visible_zero_not_a_missing_line(runs
     )
 
     assert [(r.role, r.count) for r in containment.by_role] == [('merger', 0), ('steward', 1)]
+
+
+# --- audit / render_markdown / render_json / main (report assembly and CLI) ---
+
+WINDOW = (APPLY, APPLY + timedelta(hours=24))
+
+
+@pytest.fixture
+def live_shaped_db(runs_db):
+    """A fixture seeded to mirror the shape actually observed post-D6-apply.
+
+    One config-layer Fable merger dispatch that ran 45 turns and resolved a
+    merge, and one policy-rule Fable steward dispatch at routing tier 1.
+    """
+    _event(
+        runs_db, _at(hours=2), 'routing_decision', task_id='4377', role='merger',
+        data=_routing_payload(role='merger', model=FABLE),
+    )
+    _event(
+        runs_db, _at(days=1), 'routing_decision', task_id='4211', role='steward',
+        data=_routing_payload(
+            role='steward', model=FABLE, source_layer='policy_rule',
+            rule_id='steward-retry-fable', routing_tier=1,
+        ),
+    )
+    _fable_merger_run(runs_db, task_id='4377')
+    _event(
+        runs_db, _at(hours=2, minutes=30), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(branch='4377', state='done', merge_sha='d411f107'),
+    )
+    _invocation(
+        runs_db, model=FABLE, role='steward', task_id='4211', cost_usd=3.86,
+        duration_ms=90_000, started_at=_at(hours=19), completed_at=_at(hours=20),
+    )
+    _event(
+        runs_db, _at(hours=3), 'service_restart', task_id='4319',
+        data={'service': 'orchestrator', 'reason': 'fleet_redeploy'},
+    )
+    return runs_db
+
+
+def _audit(conn, **overrides):
+    kwargs = {
+        'model': FABLE, 'since': APPLY, 'expected_roles': ('merger', 'steward'),
+        'window': WINDOW, 'ceiling_usd': 150.0,
+    }
+    return audit_model_admission.audit(conn, **{**kwargs, **overrides})
+
+
+def test_the_markdown_body_carries_the_measured_values_not_a_summary(live_shaped_db):
+    body = audit_model_admission.render_markdown(_audit(live_shaped_db))
+
+    for token in (
+        FABLE,                # the target model, named in the sections
+        'config',             # the merger's source_layer
+        'steward-retry-fable',  # the rule that matched
+        '45',                 # turns, joined from invocation_end
+        'done',               # the merge state resolved
+        'd411f107',           # the merge sha
+        '9.94',               # 6.08 + 3.86 spend in window
+        '150',                # the ceiling it is measured against
+    ):
+        assert token in body, f'{token!r} missing from the rendered report'
+
+
+def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
+    payload = json.loads(audit_model_admission.render_json(_audit(live_shaped_db)))
+
+    assert set(payload) == {
+        'meta', 'routing_decisions', 'invocations', 'steward_tier_escalation',
+        'scoped_cap', 'spend', 'role_containment',
+    }
+    assert payload['meta']['model'] == FABLE
+    assert payload['invocations'][0]['turns'] == 45
+
+
+def _tier_section(result):
+    return json.loads(audit_model_admission.render_json(result))['steward_tier_escalation']
+
+
+def test_a_tier_escalation_that_never_happened_does_not_render_as_one(runs_db):
+    """Absence is not failure — but the two must not render identically, or a
+    reader cannot tell "the rule never got a chance" from "the rule matched".
+
+    Both audits read the SAME store, taken before and after the tier-1 dispatch
+    is seeded: audit() is a pure read, so ordering the seeding is what keeps the
+    two cases independent without needing two databases.
+    """
+    _event(
+        runs_db, _at(hours=2), 'routing_decision', task_id='4377', role='merger',
+        data=_routing_payload(role='merger', model=FABLE),
+    )
+    never = _audit(runs_db)
+
+    _event(
+        runs_db, _at(days=1), 'routing_decision', task_id='4211', role='steward',
+        data=_routing_payload(
+            role='steward', model=FABLE, source_layer='policy_rule',
+            rule_id='steward-retry-fable', routing_tier=1,
+        ),
+    )
+    exercised = _audit(runs_db)
+
+    assert exercised.tier_escalations and not never.tier_escalations
+    assert _tier_section(exercised)['exercised'] is True
+    assert _tier_section(never)['exercised'] is False
+    assert 'steward-retry-fable' in audit_model_admission.render_markdown(exercised)
+    assert 'steward-retry-fable' not in audit_model_admission.render_markdown(never)
+
+
+def test_main_emits_parseable_json_and_exits_zero(runs_db_path, live_shaped_db, capsys):
+    exit_code = audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--window', '24h', '--ceiling', '150',
+        '--runs-db', str(runs_db_path), '--format', 'json',
+    ])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['meta']['model'] == FABLE
+    assert [r['role'] for r in payload['invocations']] == ['merger', 'steward']
+
+
+def test_main_leaves_the_store_byte_for_byte_unchanged(runs_db_path, live_shaped_db, capsys):
+    before = (runs_db_path.read_bytes(), runs_db_path.stat().st_mtime_ns)
+
+    audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--runs-db', str(runs_db_path),
+    ])
+    capsys.readouterr()
+
+    assert (runs_db_path.read_bytes(), runs_db_path.stat().st_mtime_ns) == before
+
+
+def test_the_connection_factory_refuses_a_write(runs_db_path):
+    conn = audit_model_admission._connect_ro(runs_db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute(
+                "INSERT INTO events (timestamp, run_id, event_type) VALUES ('t', 'r', 'e')"
+            )
+    finally:
+        conn.close()
