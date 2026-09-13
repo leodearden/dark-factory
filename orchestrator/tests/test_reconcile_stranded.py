@@ -43,6 +43,16 @@ async def _reconcile_stranded(
     )
 
 
+def _bind_queue(harness: Harness, path: Path) -> EscalationQueue:
+    """Bind a real EscalationQueue rooted at *path* and hand it back.
+
+    The suite's coupling to this private attribute lives here and nowhere
+    else, so a rename costs one edit instead of one per test.
+    """
+    queue = EscalationQueue(path)
+    harness._escalation_queue = queue
+    return queue
+
 
 @pytest.fixture(autouse=True)
 def _reset_merge_provenance():
@@ -1000,7 +1010,6 @@ class TestReconcileStrandedInProgress:
         copy is no longer called on this path, task 4028).
         """
         from escalation.models import Escalation
-        from escalation.queue import EscalationQueue
 
         harness.scheduler.get_statuses.return_value = ({'60': 'in-progress'}, None)  # type: ignore[attr-defined]
 
@@ -1020,9 +1029,9 @@ class TestReconcileStrandedInProgress:
 
         # Real EscalationQueue with an open L1 for task 60 (the human handoff).
         queue_dir = harness.git_ops.worktree_base.parent / 'escalations'
-        harness._escalation_queue = EscalationQueue(queue_dir)
-        harness._escalation_queue.submit(Escalation(
-            id=harness._escalation_queue.make_id('60'),
+        queue = _bind_queue(harness, queue_dir)
+        queue.submit(Escalation(
+            id=queue.make_id('60'),
             task_id='60',
             agent_role='task-steward',
             severity='blocking',
@@ -1052,7 +1061,6 @@ class TestReconcileStrandedInProgress:
         path, task 4028).
         """
         from escalation.models import Escalation
-        from escalation.queue import EscalationQueue
 
         harness.scheduler.get_statuses.return_value = ({'61': 'in-progress'}, None)  # type: ignore[attr-defined]
 
@@ -1070,10 +1078,10 @@ class TestReconcileStrandedInProgress:
         }))
 
         queue_dir = harness.git_ops.worktree_base.parent / 'escalations'
-        harness._escalation_queue = EscalationQueue(queue_dir)
+        queue = _bind_queue(harness, queue_dir)
         # L1 belongs to an unrelated task — must NOT shield task 61.
-        harness._escalation_queue.submit(Escalation(
-            id=harness._escalation_queue.make_id('999'),
+        queue.submit(Escalation(
+            id=queue.make_id('999'),
             task_id='999',
             agent_role='task-steward',
             severity='blocking',
@@ -1612,13 +1620,12 @@ class TestReconcileStrandedInProgress:
         observation.
         """
         from escalation.models import Escalation
-        from escalation.queue import EscalationQueue
 
         # Wire up a real EscalationQueue and submit an L1 record for task 50.
         queue_dir = tmp_path / 'escalations'
-        harness._escalation_queue = EscalationQueue(queue_dir)
-        harness._escalation_queue.submit(Escalation(
-            id=harness._escalation_queue.make_id('50'),
+        queue = _bind_queue(harness, queue_dir)
+        queue.submit(Escalation(
+            id=queue.make_id('50'),
             task_id='50',
             agent_role='task-steward',
             severity='blocking',
@@ -3108,9 +3115,9 @@ async def test_in_progress_on_main_with_open_l2_escalation_leaves_untouched(
     # No plan.lock/worktree for '71' — if the sweep fell through to the
     # revert applier, it would revert (no-lock orphan path).
 
-    harness._escalation_queue = EscalationQueue(tmp_path / 'esc_l2_on_main')
-    harness._escalation_queue.submit(Escalation(
-        id=harness._escalation_queue.make_id('71'),
+    queue = _bind_queue(harness, tmp_path / 'esc_l2_on_main')
+    queue.submit(Escalation(
+        id=queue.make_id('71'),
         task_id='71', agent_role='steward', severity='critical',
         category='infra_issue', summary='open L2, on-main evidence present',
         level=2, status='pending',
@@ -4519,9 +4526,9 @@ def _submit_open(
     level: int = 1,
 ) -> Escalation:
     """Bind a real queue and open ONE record on *tid*."""
-    harness._escalation_queue = EscalationQueue(tmp_path / f'esc_{tid}')
+    queue = _bind_queue(harness, tmp_path / f'esc_{tid}')
     esc = Escalation(
-        id=harness._escalation_queue.make_id(tid),
+        id=queue.make_id(tid),
         task_id=tid,
         agent_role='steward',
         severity=severity,
@@ -4530,7 +4537,7 @@ def _submit_open(
         level=level,
         status='pending',
     )
-    harness._escalation_queue.submit(esc)
+    queue.submit(esc)
     return esc
 
 
@@ -4622,7 +4629,7 @@ class TestInProgressApplierConsumesTheSharedPredicate:
         with patch.object(
             harness, '_emit_recovery_disposition', wraps=harness._emit_recovery_disposition,
         ) as spy:
-            await harness._reconcile_one_stranded('3544', 'in-progress', mid_run=False)
+            await _reconcile_stranded(harness, '3544', 'in-progress')
 
         assert spy.call_count == 1, (
             'the tail arm is belt-and-braces for a future refactor, not a '
@@ -4654,7 +4661,7 @@ class TestMidRunPlanLockExceptionSurvives:
     async def test_mid_run_plan_lock_claimant_with_no_records_reverts(
         self, harness: Harness, tmp_path: Path,
     ):
-        harness._escalation_queue = EscalationQueue(tmp_path / 'esc_r3_empty')
+        _bind_queue(harness, tmp_path / 'esc_r3_empty')
         _off_main_in_progress(harness, '3545')
         self._stage_live_plan_lock(harness, '3545')
 
