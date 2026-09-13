@@ -1074,6 +1074,52 @@ The agreed reading of each headline lives in `docs/code-quality.md` when the
 repository under review carries that file — read it there rather than guessing
 at a headline's intent. The readings are deliberately not restated here so that
 doc stays the one normative copy.
+
+Name the heuristic you are applying — say "heuristic 13, files make internal
+sense in isolation" — whenever a finding or a design decision turns on it. An
+unnamed appeal to "quality" is neither reviewable nor actionable.
+
+## Two stances
+
+- **Comments.** Aim for code that is clear with no or low comments. Needing
+  abundant and escalating amounts of commenting is a symptom of poor clarity,
+  and comments drift away from the code they describe. Rationale that must
+  persist belongs in memory or in the incident record, with a pointer from the
+  code. This does not license deleting existing rationale during unrelated work.
+- **Tests.** Test access to a module's internals is an interface design smell:
+  such a test pins implementation rather than behaviour, and the seam it reaches
+  through is usually the real defect. Five symptoms, each reportable as an
+  interface-design finding rather than a style nit: monkeypatching a private
+  name by dotted path; reading a private attribute from a test; a
+  reach-back import into a parent module; a function-local import placed to
+  break an import cycle; and a re-export shim that exists only to keep an old
+  path resolving.
+
+## Do not steer by
+
+- **Raw line count.** Comments and docstrings can be most of a file; one large
+  module in this factory's own code measured 55% prose.
+- **Average complexity.** A file can average a good grade while eight of its
+  functions score the worst one.
+- **Line coverage under autouse stubs.** A suite that stubs the thing under test
+  into passing reports coverage of paths it cannot fail.
+- **Test count or test-to-code ratio.** Tests that pin implementation are a
+  liability carrying a green tick.
+"""
+
+
+# Architect-only, and deliberately NOT admitted into the shared constant above:
+# a reviewer variant and an architect variant would each carry their own copy of
+# the fourteen headlines, which is the exact defect that constant exists to
+# prevent. Public rather than underscore-private so its drift guard can assert
+# against a NAMED CONSTANT rather than a prose literal.
+ARCHITECT_CODE_QUALITY_ADDENDUM = """
+## Splitting or extracting a module
+
+When a plan splits or extracts a module, heuristics 13 and 14 bind hardest. A
+split is legitimate only when every resulting file makes internal sense in
+isolation: size is necessary, not sufficient. Small satellites that are
+function-bags over a parent's private state fail 13 while passing 14.
 """
 
 
@@ -1179,7 +1225,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
