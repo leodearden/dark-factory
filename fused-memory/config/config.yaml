@@ -170,6 +170,11 @@ taskmaster:
 # (server/main.py), so nothing re-reads these values afterwards; a changed leaf
 # is correctly reported restart_required by mcp__escalation__reload_config.
 #
+# These are the DEPLOYED values, and they are meant to be edited. The fallback
+# for an omitted leaf is config/schema.py::WriteJournalConfig, which is the one
+# place the numbers are defined — prune_write_ops itself takes all six as
+# required arguments precisely so there is no third copy to drift.
+#
 # MEASURED STARTING STATE (2026-09-11, before this section existed): write_ops
 # held 35,428,715 rows / 16 GB spanning 157 days, never pruned. The mix is
 # lopsided, which is why the horizons are:
@@ -198,7 +203,12 @@ taskmaster:
 # VACUUM (a full-file rewrite needing ~16 GB of scratch), never run at startup.
 #
 # A first run against a large backlog legitimately needs many restarts to drain;
-# each partial sweep logs a WARNING naming which horizon is still behind.
+# each partial sweep logs a WARNING naming which horizon is still behind AND the
+# rows/sec it achieved. Reads accrue at ~220,800/day, so a sweep must sustain
+# ~2,500-7,400 rows/sec (at 1-3 fleet redeploys/day) to make net progress. If the
+# measured rate comes in under that, raise prune_max_seconds here for the drain
+# phase, or bulk-delete once against a STOPPED server where no startup grace
+# applies — otherwise the WARNING repeats forever while the backlog never clears.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}

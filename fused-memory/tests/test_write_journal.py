@@ -1263,6 +1263,29 @@ async def _surviving_ids(journal) -> set[str]:
         return {row[0] for row in await cursor.fetchall()}
 
 
+async def _prune(journal, **overrides):
+    """Run the prune at the SHIPPED retention values, overriding only what a test is about.
+
+    `prune_write_ops` takes all six bounds as required arguments and
+    `WriteJournalConfig` is their single home, so the numbers are read from that
+    config here rather than restated. That is what makes these tests exercise
+    the horizons production actually runs with — and it is why no separate
+    signature-vs-config drift guard is needed: there is only one copy left.
+    """
+    from fused_memory.config.schema import WriteJournalConfig
+
+    config = WriteJournalConfig()
+    bounds = {
+        'read_older_than_days': config.read_retention_days,
+        'search_older_than_days': config.search_retention_days,
+        'write_older_than_days': config.write_retention_days,
+        'batch_size': config.prune_batch_size,
+        'max_rows': config.prune_max_rows_per_run,
+        'max_seconds': config.prune_max_seconds,
+    }
+    return await journal.prune_write_ops(**{**bounds, **overrides})
+
+
 @pytest.mark.asyncio
 async def test_prune_write_ops_keeps_rows_inside_the_cutoff(journal):
     """(a)+(d) Only rows beyond a horizon are deleted; the return value is the count."""
@@ -1271,7 +1294,7 @@ async def test_prune_write_ops_keeps_rows_inside_the_cutoff(journal):
         journal, operation='get_task', kind='read', created_at=_days_ago(90)
     )
 
-    deleted = await journal.prune_write_ops()
+    deleted = await _prune(journal)
 
     assert deleted == 1, f'RED: expected exactly the 1 stale row deleted, got {deleted}'
     remaining = await _surviving_ids(journal)
@@ -1293,7 +1316,7 @@ async def test_prune_write_ops_honours_three_independent_horizons(journal):
         journal, operation='add_memory', kind='write', created_at=aged
     )
 
-    deleted = await journal.prune_write_ops()
+    deleted = await _prune(journal)
 
     remaining = await _surviving_ids(journal)
     assert search_row in remaining, (
@@ -1321,7 +1344,7 @@ async def test_prune_write_ops_search_horizon_is_a_horizon_not_an_exemption(jour
         journal, operation='search', kind='read', created_at=_days_ago(100)
     )
 
-    deleted = await journal.prune_write_ops()
+    deleted = await _prune(journal)
 
     remaining = await _surviving_ids(journal)
     assert ancient not in remaining, (
@@ -1343,7 +1366,7 @@ async def test_prune_write_ops_row_budget_bounds_a_single_run(journal, caplog):
         await _seed_write_op(journal, operation='get_task', kind='read', created_at=aged)
 
     with caplog.at_level(logging.WARNING, logger=wj.logger.name):
-        deleted = await journal.prune_write_ops(batch_size=1, max_rows=2)
+        deleted = await _prune(journal, batch_size=1, max_rows=2)
 
     assert deleted == 2, f'RED: max_rows must bound the run to 2, got {deleted}'
     assert len(await _surviving_ids(journal)) == 3, (
@@ -1381,7 +1404,7 @@ async def test_prune_write_ops_deadline_bounds_a_single_run(journal, caplog, mon
     monkeypatch.setattr(wj, '_monotonic', _JumpingClock())
 
     with caplog.at_level(logging.WARNING, logger=wj.logger.name):
-        deleted = await journal.prune_write_ops(batch_size=1, max_rows=1_000_000)
+        deleted = await _prune(journal, batch_size=1, max_rows=1_000_000)
 
     assert 0 < deleted < 5, (
         'RED: the deadline must stop the loop between batches with work remaining; '
@@ -1397,29 +1420,29 @@ async def test_prune_write_ops_never_raises(journal):
     """(g) A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
     journal._db = None
-    assert await journal.prune_write_ops() == 0
+    assert await _prune(journal) == 0
 
 
-def test_prune_write_ops_defaults_match_write_journal_config():
-    """The retention numbers exist twice; a drift guard keeps the copies equal."""
+def test_prune_write_ops_takes_every_bound_from_its_caller():
+    """No bound has a default: WriteJournalConfig is the numbers' single home.
+
+    Replaces a drift guard that kept the signature defaults equal to the config.
+    Deleting the second copy is strictly better than policing it — and pinning
+    the ABSENCE keeps a future edit from quietly reintroducing one.
+    """
     import inspect
 
-    from fused_memory.config.schema import WriteJournalConfig
-
-    defaults = inspect.signature(WriteJournal.prune_write_ops).parameters
-    config = WriteJournalConfig()
-    for parameter, field in (
-        ('read_older_than_days', 'read_retention_days'),
-        ('search_older_than_days', 'search_retention_days'),
-        ('write_older_than_days', 'write_retention_days'),
-        ('batch_size', 'prune_batch_size'),
-        ('max_rows', 'prune_max_rows_per_run'),
-        ('max_seconds', 'prune_max_seconds'),
-    ):
-        assert defaults[parameter].default == getattr(config, field), (
-            f'RED: prune_write_ops({parameter}=...) and '
-            f'WriteJournalConfig.{field} must not diverge'
-        )
+    parameters = inspect.signature(WriteJournal.prune_write_ops).parameters
+    defaulted = [
+        name for name, parameter in parameters.items()
+        if name != 'self' and parameter.default is not inspect.Parameter.empty
+    ]
+    assert defaulted == [], (
+        'RED: prune_write_ops re-grew a default for '
+        f'{defaulted} — that is a second copy of a number whose home is '
+        'config/schema.py::WriteJournalConfig, and server/main.py already '
+        'passes all six from there.'
+    )
 
 
 # ------------------------------------------------------------------

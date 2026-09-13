@@ -863,18 +863,25 @@ class WriteJournal:
     async def prune_write_ops(
         self,
         *,
-        read_older_than_days: float = 30.0,
-        search_older_than_days: float = 365.0,
-        write_older_than_days: float = 730.0,
-        batch_size: int = 5000,
-        max_rows: int = 500_000,
-        max_seconds: float = 30.0,
+        read_older_than_days: float,
+        search_older_than_days: float,
+        write_older_than_days: float,
+        batch_size: int,
+        max_rows: int,
+        max_seconds: float,
     ) -> int:
         """Age out ``write_ops`` past three independent retention horizons.
 
         Same fire-and-forget contract as ``prune_mem0_intents`` — logs loudly,
         never raises, returns the count deleted, returns 0 when uninitialised.
         Intended to run once at startup.
+
+        EVERY BOUND IS REQUIRED, with no default here. The six numbers have a
+        single home — ``config/schema.py::WriteJournalConfig`` — and the sole
+        production caller (``server/main.py``) already passes all six from it.
+        A second copy as signature defaults would be a copy nothing reads, kept
+        equal to the first only by a drift-guard test; requiring the arguments
+        deletes the copy instead of policing it.
 
         THREE HORIZONS, because the rows are not interchangeable. Measured
         2026-09-11 over a never-pruned 157-day span: non-search READS are
@@ -906,8 +913,22 @@ class WriteJournal:
         ``max_seconds`` bounds it directly, because rows-per-second is not
         knowable in advance — it depends on page-cache warmth and on six index
         b-trees per delete. The deadline is checked BETWEEN batches, never
-        mid-batch. A first run against the current backlog will legitimately need
-        many restarts to drain, which the WARNING discloses rather than hides.
+        mid-batch.
+
+        WHAT "DRAINS OVER SUCCESSIVE RESTARTS" REQUIRES, stated so the claim is
+        checkable rather than hopeful. Non-search reads accrue at ~220,800/day,
+        so a sweep only makes net progress if it removes more than
+        220,800/(redeploys per day) rows — at the observed 1-3 fleet redeploys
+        per day that is ~74,000-220,800 rows per run, i.e. ~2,500-7,400 rows/sec
+        against the stock 30 s deadline. Below that the backlog never clears
+        while the WARNING fires forever and reads as normal, so the achieved
+        rate is MEASURED and logged (rows and rows/sec) on every partial sweep
+        rather than assumed. If the first production run comes in under it, the
+        two ways out are raising ``prune_max_seconds`` (a config leaf, restart
+        to apply) for the drain phase, or a one-off operator-run bulk delete
+        against a stopped server, where no startup grace applies. A first run
+        against the current backlog legitimately needs many restarts either way,
+        which the WARNING discloses rather than hides.
 
         ``terminal_status='dead'`` rows are NOT exempted, unlike the dead-letters
         ``prune_mem0_intents`` deliberately preserves: a dead ``write_ops`` row
@@ -925,15 +946,26 @@ class WriteJournal:
         a startup operation.
         """
         horizons = (
-            # Cheapest first, each written to range-seek an index that already
+            # Cheapest first, and each written against an index that already
             # exists — no new DDL, because building one on this table would
             # reintroduce the startup stall the batching exists to avoid.
+            #
+            # The two kind-scoped horizons range-seek idx_wo_kind_time
+            # (kind, created_at), so the cutoff bounds the scan. The search
+            # horizon does NOT: idx_wo_operation is on (operation) alone, so it
+            # seeks the operation='search' partition and applies created_at as
+            # a residual filter — a scan of that whole partition (~481k rows
+            # measured) on every startup, even once the horizon is drained.
+            # Correct, and cheap relative to the read horizon, but it is a
+            # partition scan and not a seek. Only widen the index to
+            # (operation, created_at) if that scan ever shows up in startup
+            # timings: the DDL cost above is the reason it is not there today.
             ('read', "kind = 'read' AND operation <> 'search' AND created_at < ?",
-             read_older_than_days),       # idx_wo_kind_time
+             read_older_than_days),       # idx_wo_kind_time — seek
             ('search', "operation = 'search' AND created_at < ?",
-             search_older_than_days),     # idx_wo_operation
+             search_older_than_days),     # idx_wo_operation — partition scan
             ('write', "kind = 'write' AND created_at < ?",
-             write_older_than_days),      # idx_wo_kind_time
+             write_older_than_days),      # idx_wo_kind_time — seek
         )
         try:
             deadline = _monotonic() + max_seconds
@@ -985,11 +1017,19 @@ class WriteJournal:
                     write_older_than_days, by_horizon.get('write', 0),
                 )
             if halted:
+                # The achieved rate is the ONLY thing that says whether "drains
+                # over successive restarts" is true on this disk: reads accrue
+                # at ~220,800/day, so a sweep sustaining less than
+                # ~2,500-7,400 rows/sec (at 1-3 redeploys/day) never catches up
+                # and this WARNING would otherwise repeat forever looking normal.
+                elapsed = max(_monotonic() - (deadline - max_seconds), 1e-9)
                 logger.warning(
-                    'write_ops prune stopped early on the %s after %d rows; '
-                    'horizons still holding a backlog: %s. The table drains over '
-                    'successive restarts.',
-                    halted, total, ', '.join(backlog),
+                    'write_ops prune stopped early on the %s after %d rows in %.1fs '
+                    '(%.0f rows/sec; ~2500-7400 rows/sec is needed to beat the '
+                    '~220,800 reads/day accrual at 1-3 redeploys/day); horizons '
+                    'still holding a backlog: %s. The table drains over successive '
+                    'restarts only while that rate holds.',
+                    halted, total, elapsed, total / elapsed, ', '.join(backlog),
                 )
             return total
         except Exception as e:
