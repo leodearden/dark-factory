@@ -42,3 +42,16 @@ def test_config_resolution_is_independent_of_the_process_cwd(monkeypatch, tmp_pa
     assert before_chdir.taskmaster is not None
     assert after_chdir.taskmaster is not None
     assert after_chdir.model_dump() == before_chdir.model_dump()
+
+
+def test_code_default_config_yields_pure_code_defaults(code_default_config):
+    """The escape hatch the pin makes necessary: schema defaults, on request.
+
+    With `CONFIG_PATH` now always naming a real file, a test that wants to
+    assert what the SCHEMA declares — rather than what the tracked
+    `fused-memory/config/config.yaml` overrides it to — has no other way to
+    get there.  `.taskmaster` is the sharpest probe for the same reason as
+    above: its code default is `None` and the YAML supplies a real section, so
+    it reads `None` exactly when the YAML layer is genuinely absent.
+    """
+    assert FusedMemoryConfig().taskmaster is None
