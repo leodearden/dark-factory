@@ -161,6 +161,38 @@ def _failure_diagnostics(result: Any) -> dict[str, Any]:
     }
 
 
+def _task_context_block(task: dict[str, Any] | None) -> str:
+    """Render the blocked task's own text for the investigation prompt.
+
+    Labels and ordering mirror ``agents/briefing.py::_format_task`` so the two
+    agent-facing surfaces read alike; the code is deliberately not shared (that
+    renderer is an uncapped instance method serving a different purpose, and
+    this one exists to bound its output).
+
+    ``metadata.files`` IS included here even though ``build_architect_prompt``
+    passes ``include_files=False`` to omit it.  Anti-anchoring applies to
+    deriving a NEW footprint, which is the architect's job; this investigator
+    does the opposite one — judging whether a proposed fix falls OUTSIDE the
+    footprint the architect already declared, which is exactly
+    ``skills/unblock-auto/SKILL.md``'s `human-review-required` scope-creep
+    trigger.  It cannot apply that rule with no scope to compare against.
+    """
+    if not task:
+        return ''
+    lines = []
+    for label, value in (
+        ('Title', task.get('title')),
+        ('Description', task.get('description')),
+        ('Details', task.get('details')),
+    ):
+        if value:
+            lines.append(f'**{label}:** {value}')
+    files = (task.get('metadata') or {}).get('files')
+    if files:
+        lines.append(f'**Declared files:** {", ".join(str(f) for f in files)}')
+    return '\n'.join(lines)
+
+
 # Read-only tools the dry-run agent is allowed to use.
 # Bash(pytest:*) and Bash(cargo:*) are intentionally omitted: both can
 # write .pyc/__pycache__/target/ files or fetch from the network, which
@@ -308,12 +340,21 @@ async def run_dry_run_unblock(
         # is forced True and a pre-turn-1 wedge burns the full timeout ceiling.
         config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
 
+        # Fetched ONCE, above the prompt build, so the single fetch serves both
+        # the prompt's task-context block and the route resolution below.
+        try:
+            task_doc = await scheduler.get_task(task_id)
+        except Exception:
+            task_doc = None
+        md = (task_doc or {}).get('metadata') or {}
+
         system_prompt = _load_skill_system_prompt()
         user_prompt = (
             f'Task ID: {task_id}\n'
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n\n'
+            f'{_task_context_block(task_doc)}\n\n'
             'Investigate and emit your structured proposal.'
         )
 
@@ -331,11 +372,7 @@ async def run_dry_run_unblock(
         # read is skipped and this RoleDefaults base stands (byte-equivalent to
         # pre-η at stock config). Resolved ONCE here (not inside _one_attempt)
         # so the single zero-output-timeout retry does not double-emit.
-        try:
-            _fetched = await scheduler.get_task(task_id)
-            md = (_fetched or {}).get('metadata') or {}
-        except Exception:
-            md = {}
+        # `md` comes from the single task fetch above the prompt build.
         decision = await resolve_and_record_route(
             role_name='unblock_auto',
             role_defaults=RoleDefaults(
