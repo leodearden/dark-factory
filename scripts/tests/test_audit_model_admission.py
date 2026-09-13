@@ -549,3 +549,107 @@ def test_rows_before_since_and_rows_on_other_models_are_excluded(runs_db):
     rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
 
     assert [r.task_id for r in rows] == ['4904']
+
+
+# --- scan_scoped_cap: the scoped-cap posture (check 4) ---
+
+
+def test_a_cap_hit_scoped_to_the_model_is_reported_with_its_account_and_reason(runs_db):
+    _account_event(
+        runs_db, account_name='max-b', event_type='cap_hit', created_at=_at(hours=8),
+        details={'reason': "You've hit your limit", 'scope': FABLE},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert len(scan.scoped_hits) == 1
+    assert scan.scoped_hits[0].account_name == 'max-b'
+    assert scan.scoped_hits[0].reason == "You've hit your limit"
+    assert scan.unscoped_cap_hit_count == 0
+
+
+def test_a_cap_hit_scoped_to_another_model_is_neither_scoped_nor_unscoped_here(runs_db):
+    _account_event(
+        runs_db, account_name='max-b', event_type='cap_hit', created_at=_at(hours=8),
+        details={'reason': 'limit', 'scope': 'claude-fable-5'},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.scoped_hits == ()
+    assert scan.unscoped_cap_hit_count == 0
+
+
+def test_an_account_level_cap_hit_is_counted_rather_than_dropped(runs_db):
+    """The failure mode check 4 exists for is a Fable cap that marked the WHOLE
+    account because the restart-tier scoped_cap_models leaf had not taken effect
+    yet. Dropping scope-less rows would make exactly that case invisible."""
+    _account_event(
+        runs_db, account_name='max-a', event_type='cap_hit', created_at=_at(hours=9),
+        details={'reason': "You're out of extra usage"},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.scoped_hits == ()
+    assert scan.unscoped_cap_hit_count == 1
+
+
+def test_a_bare_non_json_details_string_is_tolerated_as_unscoped(runs_db):
+    """The live table holds details='Escalation watcher (auto)'."""
+    _account_event(
+        runs_db, account_name='max-a', event_type='cap_hit', created_at=_at(hours=10),
+        details='Escalation watcher (auto)',
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.scoped_hits == ()
+    assert scan.unscoped_cap_hit_count == 1
+
+
+def test_cap_hits_before_since_are_excluded(runs_db):
+    _account_event(
+        runs_db, account_name='max-b', event_type='cap_hit', created_at=_at(hours=-5),
+        details={'reason': 'limit', 'scope': FABLE},
+    )
+    _account_event(
+        runs_db, account_name='max-a', event_type='cap_hit', created_at=_at(hours=-5),
+        details={'reason': 'limit'},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.scoped_hits == ()
+    assert scan.unscoped_cap_hit_count == 0
+
+
+def test_restarts_are_windowed_ordered_and_name_the_service_that_restarted(runs_db):
+    """WHICH service restarted is the whole question: usage_cap.scoped_cap_models
+    is restart-tier on the ORCHESTRATOR, so a dashboard or fused-memory restart
+    is not evidence that the leaf took effect."""
+    _event(
+        runs_db, _at(hours=-2), 'service_restart',
+        data={'service': 'dashboard', 'reason': 'post_merge_dashboard_code_change'},
+    )
+    _event(
+        runs_db, _at(hours=12), 'service_restart',
+        data={'service': 'orchestrator', 'reason': 'fleet_redeploy'},
+    )
+    _event(
+        runs_db, _at(hours=5), 'service_restart',
+        data={'service': 'fused-memory', 'reason': 'post_merge_fused_memory_code_change'},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert [r.service for r in scan.restarts] == ['fused-memory', 'orchestrator']
+    assert scan.restarts[1].reason == 'fleet_redeploy'
+
+
+def test_zero_scoped_hits_is_an_empty_tuple_not_none(runs_db):
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.scoped_hits == ()
+    assert scan.restarts == ()
+    assert scan.unscoped_cap_hit_count == 0
