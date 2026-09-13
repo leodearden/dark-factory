@@ -136,20 +136,55 @@ def worker_id(request) -> str:
     return resolve_xdist_worker_id(request)
 
 
-@pytest.fixture(autouse=True)
-def preserve_config_path():
-    """Save and restore os.environ['CONFIG_PATH'] around every test.
+#: The canonical fused-memory config, by ABSOLUTE path, for the autouse
+#: ``_isolate_fm_config`` pin below.  Derived from this file's location and
+#: NEVER from ``Path.cwd()`` — a CWD-derived path would reintroduce the exact
+#: leak the pin exists to close.
+FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 
-    This is a safety net: if a test (or the code under test) modifies CONFIG_PATH,
-    it won't leak into subsequent tests.  The fixture is autouse so all tests in this
-    package are covered without needing to request it explicitly.
+
+@pytest.fixture(autouse=True)
+def _isolate_fm_config(monkeypatch):
+    """Pin ``CONFIG_PATH`` at the canonical config so config resolution does
+    not depend on the process CWD (task 5444).
+
+    ``FusedMemoryConfig`` is a pydantic-settings ``BaseSettings``, not a plain
+    ``BaseModel``: ``fused_memory.config.schema::FusedMemoryConfig.settings_customise_sources``
+    reads ``CONFIG_PATH`` with a default of the RELATIVE ``config/config.yaml``,
+    and ``fused_memory.config.schema::YamlSettingsSource.__call__`` returns
+    ``{}`` — silently — when that path does not exist.
+
+    WITHOUT THIS PIN the YAML layer is present only when pytest happens to run
+    from ``fused-memory/``.  Run the identical commit from the repo root and
+    every field a test does not pass explicitly drops to its code default; the
+    tracked ``taskmaster:`` section disappears and ``config.taskmaster``
+    becomes ``None``.  That is not hypothetical: it is why
+    ``test_referent_repair.py``'s taskmaster test read as green for both
+    registered verify commands (both ``cd`` into ``fused-memory/``) and red for
+    a human running it from the root — a phantom main-red that cost an
+    investigation and produced a fix for a test that was never broken.  See
+    ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``.
+
+    Pinning the CANONICAL file rather than an absent one reproduces the
+    CWD=``fused-memory/`` semantics every currently-green test was written
+    against, so the pin changes no test's meaning — it only makes the result
+    the same from everywhere.  Tests that want pure schema defaults opt into
+    ``code_default_config`` below.
+
+    Mirrors ``orchestrator/tests/conftest.py::_isolate_orch_config``, whose
+    docstring records the same reasoning for ``ORCH_CONFIG_PATH`` ("the
+    absolute path is also CWD-independent, so the config no longer depends on
+    running from ``orchestrator/``").  That hardening was applied
+    subproject-locally and never propagated; this is the propagation.
+
+    ``monkeypatch.setenv`` restores the pre-existing value at teardown, so this
+    SUBSUMES the ``preserve_config_path`` fixture it replaced — one fixture
+    owning ``CONFIG_PATH`` rather than two with no defined ordering between
+    them.  A test that sets ``CONFIG_PATH`` itself still wins: a
+    function-scoped ``monkeypatch.setenv`` in the test body runs after this
+    autouse fixture.
     """
-    original = os.environ.get('CONFIG_PATH')
-    yield
-    if original is None:
-        os.environ.pop('CONFIG_PATH', None)
-    else:
-        os.environ['CONFIG_PATH'] = original
+    monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -477,7 +512,16 @@ def make_edge_backend():
 
 @pytest.fixture
 def mock_config(tmp_path) -> FusedMemoryConfig:
-    """A FusedMemoryConfig that doesn't require real API keys or services."""
+    """A FusedMemoryConfig that doesn't require real API keys or services.
+
+    NOT hermetic, despite reading that way.  ``FusedMemoryConfig`` is a
+    pydantic-settings ``BaseSettings``: only the sections passed explicitly
+    below are fixed here.  Every other field — ``taskmaster`` among them —
+    comes from the YAML that ``_isolate_fm_config`` pins and from the
+    environment (the model sets ``env_prefix=''``).  A test asserting on a
+    field this factory does not name is asserting on the tracked
+    ``fused-memory/config/config.yaml``, not on a code default.
+    """
     return FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',
