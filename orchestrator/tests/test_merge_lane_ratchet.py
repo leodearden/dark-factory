@@ -1040,31 +1040,39 @@ class TestPatchTargets:
             metrics.patch_targets('def (:\n', path='broken.py')
         assert 'broken.py' in str(excinfo.value)
 
-    def test_real_tree_union_anchor(self, no_private_tree_scan: None) -> None:
-        # Anti-vacuity: the PRD Background table's "79 distinct names"; the
-        # string-path form alone measures 78 on this tree.
+    def test_real_tree_union_anchor(
+        self, live_report: dict, no_private_tree_scan: None
+    ) -> None:
+        # Anti-vacuity, read off the ONE live sweep rather than a private
+        # re-walk of the same tree. The PRD Background table's "79 distinct
+        # names", and the 78 the string-path form alone measured, are DAY-ONE
+        # figures and stay written as they were.
         #
-        # Those are DAY-ONE figures and stay written as they were. The floor
-        # below is not: the γ wave retires patch targets by design, so the
-        # union falls as the wave lands and a floor pinned near the day-one
-        # magnitude becomes a countdown timer against the work it measures.
-        # It first bit on γ4 (task 5027) as pure INTEGRATION SKEW — γ1 and γ4
-        # each measured 71 alone, and 69 merged, because each retires names
-        # the other still counts, so neither branch could see it before the
-        # merge. The substantive anti-vacuity check is the membership
-        # assertion below, which a broken detector cannot satisfy at any
-        # magnitude; task 5446 retires the numeric floor outright when it
-        # drives both measures to 0.
+        # The report's union covers only
+        # lane-importing files, where the old body unioned every *.py in
+        # orchestrator/tests. In principle the whole-tree union could be
+        # larger, since a string-path patch needs no import -- MEASURED on this
+        # tree it is not: both unions are equal and their set difference is
+        # EMPTY. The whole-tree DENOMINATOR stays witnessed by
+        # TestBaselineIsNotVacuous::test_the_live_sweep_denominator_covers_the_whole_test_tree,
+        # which floors `enumeration.requested` at 400 orchestrator/tests paths
+        # on this same live report. So this anchor now floors the measure the
+        # gate actually gates -- the same number `derive_totals` computes and
+        # the committed baseline ratchets.
+        #
+        # The FLOOR is deliberately slack, and stays that way. The gamma wave
+        # retires patch targets by design, so the union falls as the wave lands
+        # and a floor pinned near the current magnitude becomes a countdown
+        # timer against the work it measures. It first bit on gamma4 (task
+        # 5027) as pure INTEGRATION SKEW -- gamma1 and gamma4 each measured 71
+        # alone and 69 merged, because each retires names the other still
+        # counts, so neither branch could see it before the merge. The
+        # substantive anti-vacuity check is the membership assertion below,
+        # which a broken detector cannot satisfy at any magnitude; task 5446
+        # retires the numeric floor outright when it drives both measures to 0.
         union: set[str] = set()
-        for path in sorted((_REPO_ROOT / 'orchestrator' / 'tests').rglob('*.py')):
-            try:
-                source = path.read_text(encoding='utf-8')
-            except (OSError, UnicodeDecodeError):
-                continue
-            try:
-                union |= metrics.patch_targets(source, path=str(path))
-            except metrics.MetricsError:
-                continue
+        for entry in live_report['tests'].values():
+            union.update(entry['patch_targets'])
         assert len(union) >= 40, len(union)
         assert 'run_scoped_verification' in union
 
@@ -1177,26 +1185,18 @@ class TestTestFileMeasures:
         assert measures is not None
         assert measures['patch_targets'] == ['a', 'z']
 
-    def test_real_tree_anchors(self, no_private_tree_scan: None) -> None:
-        # Anti-vacuity: >= 150 lane-importing files (measured 167) and a
-        # cluster-wide private-read total > 5000 (measured 9,355).
-        lane_files = 0
-        total_private = 0
-        for path in sorted((_REPO_ROOT / 'orchestrator' / 'tests').rglob('*.py')):
-            try:
-                source = path.read_text(encoding='utf-8')
-            except (OSError, UnicodeDecodeError):
-                continue
-            try:
-                measures = metrics.test_file_measures(source, path=str(path))
-            except metrics.MetricsError:
-                continue
-            if measures is None:
-                continue
-            lane_files += 1
-            private_reads = measures['private_reads']
-            assert isinstance(private_reads, int)
-            total_private += private_reads
+    def test_real_tree_anchors(
+        self, live_report: dict, no_private_tree_scan: None
+    ) -> None:
+        # Anti-vacuity, read off the ONE live sweep rather than a private
+        # re-walk of the same tree: >= 150 lane-importing files (measured 229)
+        # and a cluster-wide private-read total > 5000 (measured 7,847).
+        #
+        # `derive_totals` is the single encoding of the cluster-wide sum, so
+        # this floors the very number the ratchet compares rather than a
+        # second summation of the same per-file entries.
+        lane_files = len(live_report['tests'])
+        total_private = metrics.derive_totals(live_report)['private_reads']
         assert lane_files >= 150, lane_files
         assert total_private > 5000, total_private
 
