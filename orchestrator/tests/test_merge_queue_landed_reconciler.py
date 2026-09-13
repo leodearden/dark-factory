@@ -23,6 +23,7 @@ test_merge_queue_train_attribution.py) with a real ``LandedOutbox`` on
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -915,9 +916,15 @@ class TestWrappersForwardDeliveredChecksParamsToTheRow:
     discriminator that makes it observable: ``False`` leaves the guard inert
     with zero I/O (``marked_done``, ``get_task`` never called, row consumed),
     ``True`` arms it (``delivered_checks_withheld``, ``get_task`` consulted,
-    row retained). ``project_root``/``check_timeout_secs`` are proven by the
-    armed case reaching the guard at all — an unarmed row never does, which
+    row retained). Both wrappers are driven at BOTH settings: the unarmed case
+    alone reports exactly what a wrapper forwarding nothing would.
+    ``project_root`` is proven by the armed case reaching the guard at all — an
+    unarmed row never does, which
     ``test_unarmed_caller_never_reaches_the_guard`` above pins directly.
+    ``check_timeout_secs`` needs a case of its own, because a withholding
+    reports the same disposition whatever the bound is: see
+    ``test_check_timeout_secs_bounds_a_hanging_check``, which reads the value
+    back off the bound it actually enforced.
     """
 
     @staticmethod
@@ -935,22 +942,38 @@ class TestWrappersForwardDeliveredChecksParamsToTheRow:
             'delivered_checks_enabled': enabled,
         }
 
+    @pytest.mark.parametrize('enabled,gated,consults_task,row_retained', [
+        (False, True, False, False),
+        (True, False, True, True),
+    ])
     async def test_reconcile_landed_task_forwards_all_three(
-        self, tmp_path: Path,
+        self, tmp_path: Path, enabled: bool,
+        gated: bool, consults_task: bool, row_retained: bool,
     ) -> None:
+        """Both settings of the kill switch must reach the row and change what
+        the wrapper returns.
+
+        The unarmed case alone cannot see a dropped param: its entire
+        observable signature is "the guard stayed inert", which is also what a
+        wrapper that forwarded nothing at all would produce.  The ARMED case is
+        the discriminator -- ``gated`` flips to False, ``get_task`` is
+        consulted and the row is retained only when ``enabled=True`` actually
+        arrived at the row.
+        """
         outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path)
 
-        gated = await reconcile_landed_task(
+        returned = await reconcile_landed_task(
             'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-            **self._armed(tmp_path, enabled=False),
+            **self._armed(tmp_path, enabled=enabled),
         )
 
-        # enabled=False reached the row: the guard stayed inert with zero
-        # I/O, so the done-write went through and the row was consumed.
-        assert gated is True
-        scheduler.get_task.assert_not_called()
-        scheduler.mark_done.assert_awaited_once_with('Z', kind='merged', sha='ADV')
-        assert outbox.lookup('Z') is None
+        assert returned is gated
+        assert scheduler.get_task.called is consults_task
+        assert (outbox.lookup('Z') is not None) is row_retained
+        if not enabled:
+            scheduler.mark_done.assert_awaited_once_with('Z', kind='merged', sha='ADV')
+        else:
+            scheduler.mark_done.assert_not_called()
 
     @pytest.mark.parametrize('enabled,disposition,consults_task,row_retained', [
         (False, 'marked_done', False, False),
@@ -972,6 +995,57 @@ class TestWrappersForwardDeliveredChecksParamsToTheRow:
         assert report[disposition] == 1, report
         assert scheduler.get_task.called is consults_task
         assert (outbox.lookup('Z') is not None) is row_retained
+
+    @pytest.mark.parametrize('wrapper', ['task', 'outbox'])
+    async def test_check_timeout_secs_bounds_a_hanging_check(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, wrapper: str,
+    ) -> None:
+        """The forwarded bound is what cancels a check that never returns.
+
+        The other two params are proven by the armed case reaching the guard;
+        ``check_timeout_secs`` was not, because a withholding reports the same
+        disposition whatever its value is.  Here a ``script`` check sleeps past
+        the forwarded bound, so the outer ``asyncio.wait_for`` in
+        ``verify_delivered_checks_on_main`` fires and logs the value it was
+        given.  A wrapper that dropped the param leaves the guard UNARMED
+        (``reconcile_landed_row`` requires it non-None), so no bound is
+        applied, no warning is logged, and this goes red.
+        """
+        root = tmp_path / wrapper
+        root.mkdir()
+        script = root / 'hang.sh'
+        script.write_text('#!/bin/sh\nsleep 5\n')
+        script.chmod(0o755)
+        outbox, git_ops, scheduler, _row = _mq_row_fixture(
+            root,
+            metadata={'delivered_checks': [{
+                'name': 'cap-hang', 'kind': 'script',
+                'script': 'hang.sh', 'timeout_secs': 30,
+            }]},
+        )
+        armed = {
+            'project_root': str(root),
+            'check_timeout_secs': 0.05,
+            'delivered_checks_enabled': True,
+        }
+
+        with caplog.at_level(logging.WARNING):
+            if wrapper == 'task':
+                await reconcile_landed_task(
+                    'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox, **armed,
+                )
+            else:
+                await reconcile_landed_outbox(outbox, git_ops, scheduler, **armed)
+
+        assert any(
+            'check_timeout_secs=0.05' in rec.getMessage() for rec in caplog.records
+        ), (
+            'the hanging check was never bounded by the forwarded '
+            f'check_timeout_secs; log={[r.getMessage() for r in caplog.records]!r}'
+        )
+        assert outbox.lookup('Z') is not None, (
+            'an ERRORED check must withhold the done-write and retain the row'
+        )
 
     async def test_unarmed_defaults_stay_byte_identical(
         self, tmp_path: Path,
