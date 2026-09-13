@@ -59,7 +59,7 @@ from cockpit.panes.decision_queue import (
     order_queue,
     resolve_target,
 )
-from cockpit.panes.detail_pane import DetailPane
+from cockpit.panes.detail_pane import DetailPane, DetailSource
 from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
@@ -433,11 +433,39 @@ class CockpitApp(App):
         the FULL self._records, so outstanding-children counts never
         undercount a visible parent's non-terminal child just because that
         child itself is filtered out of view.
+
+        The rebuild owns the detail pane only while the pane still belongs
+        to the session table: a rebuild refreshes whichever kind currently
+        owns the detail, and only an operator cursor move transfers that
+        ownership (see on_data_table_row_highlighted). Hence the two
+        deliberate moves below -- `prevent` so a programmatic rebuild emits
+        no cursor events at all, and _resync_session_detail so the explicit
+        re-sync that replaces them respects the same ownership rule. The
+        re-sync has always been explicit rather than left to those reposts,
+        because clear()'s cursor reset only reposts when the highlighted row
+        INDEX changes; suppressing them costs nothing and stops a
+        same-content rebuild from stealing a decision an operator is reading.
         """
         visible = self._records if self._show_history else filter_live_sessions(self._records)
         table = self.query_one('#session-table', SessionTable)
-        table.replace_rows(visible, self._now_fn(), all_records=self._records)
-        self._sync_detail_pane(table.highlighted_slug())
+        with self.prevent(DataTable.RowHighlighted):
+            table.replace_rows(visible, self._now_fn(), all_records=self._records)
+        self._resync_session_detail(table.highlighted_slug())
+
+    def _resync_session_detail(self, slug: str | None) -> None:
+        """Rebuild-time counterpart of _sync_detail_pane -- remember, re-render if ours.
+
+        _selected_slug is assigned unconditionally, so cockpit-ui.json's
+        restore seam stays a pure function of the session table's cursor
+        regardless of which pane is on screen. The RE-RENDER is what's
+        gated: a rebuild refreshes the detail only while the pane still
+        shows a session, never stealing it back from a decision the
+        operator moved to.
+        """
+        self._selected_slug = slug
+        detail = self.query_one('#detail', DetailPane)
+        if detail.source is DetailSource.SESSION:
+            self._show_session_detail(slug)
 
     def _poll_registry(self) -> None:
         """on_mount's set_interval callback: launch the threaded scan worker.
