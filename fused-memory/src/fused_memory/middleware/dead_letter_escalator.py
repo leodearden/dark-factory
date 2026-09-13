@@ -62,11 +62,19 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
 try:
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        content_fingerprint_key,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
+
+from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +86,29 @@ _AGENT_ROLE = 'fused-memory/dead-letter-guard'
 _CATEGORY = 'durable_write_dead_letter'
 
 _FINDING_CATEGORY = 'queue_dead_letter'
+
+
+def _error_class(error: str | None) -> str:
+    """The exception CLASS name out of a queue-reported error string.
+
+    ``_handle_failure`` writes ``f'{type(exc).__name__}: {exc}'``, optionally
+    behind ``POST_EXECUTE_DEAD_PREFIX``. That prefix is imported from
+    ``services.durable_queue`` rather than restated here: it is one constant
+    with one owner, and a local copy would silently stop stripping the day the
+    wording changed.
+
+    Falls back to ``'unknown'`` for ``None`` or an unparseable message, which
+    folds those deaths together rather than dropping them.
+    """
+    if not error:
+        return 'unknown'
+    text = error
+    if text.startswith(POST_EXECUTE_DEAD_PREFIX):
+        text = text[len(POST_EXECUTE_DEAD_PREFIX):]
+    head, sep, _ = text.partition(': ')
+    if not sep or not head or any(c.isspace() for c in head):
+        return 'unknown'
+    return head
 
 
 def emit_dead_letter_escalation(
@@ -186,8 +217,40 @@ def emit_dead_letter_escalation(
             # consumer at all, and would merely wait out `orphan_l0_timeout_secs`
             # before being promoted to exactly where L1 puts it immediately.
             level=1,
+            # Over (category, finding_category, project, operation, error
+            # class) ONLY. Deliberately NOT over item_id, attempts or
+            # content_preview: all three change on EVERY death, so including
+            # any of them would mint a fresh escalation per death and defeat
+            # the very folding this fingerprint exists to provide. The three
+            # that are here are exactly the triple an operator needs to tell
+            # "the same failure again" from "a new failure mode" — which is
+            # also why this is not the per-project anchor scan
+            # `referent_repair_storm_escalator` uses, a shape that folds every
+            # event in a project into one entry and can attribute none of them.
+            dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
+                _CATEGORY,
+                _FINDING_CATEGORY,
+                affected_ids=[
+                    f'project:{project_id}',
+                    f'operation:{operation}',
+                    # The CLASS, never the message: the esc-3561-3 errors were
+                    # all `node <uuid> not found` with a different uuid per
+                    # write, so a message-keyed fingerprint would have minted
+                    # 28 separate escalations.
+                    f'error:{_error_class(error)}',
+                ],
+            ),
         )
-        esc_id = queue.submit(esc)
+        config = DedupeConfig(  # type: ignore[possibly-unbound]
+            infra_dedupe_enabled=True,
+            # UNBOUNDED window: these deaths arrive days apart (esc-3561-3 ran
+            # for three and a half months), so any finite window would page
+            # again for what is still the same failure.
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=(_CATEGORY,),
+            key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
+        )
+        esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
     except Exception:
         # The item is already committed dead; a queue I/O failure must cost the
         # operator a heads-up, never the worker that was draining the group.
