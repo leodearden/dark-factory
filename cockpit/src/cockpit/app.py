@@ -751,6 +751,15 @@ class CockpitApp(App):
         decision-row boost) call this afterward instead of waiting for the
         next poll tick.
 
+        Like its _rebuild_session_table sibling, this rebuild is
+        programmatic, so it emits no cursor events at all -- replace_rows
+        does clear() + move_cursor, which reposts RowHighlighted on every
+        rebuild whose highlighted row INDEX shifts, and `prevent` stops
+        that repost from handing the detail pane to the queue behind the
+        operator's back. A rebuild refreshes whichever table currently owns
+        the detail; only an operator cursor move transfers that ownership
+        (see on_data_table_row_highlighted).
+
         Also prunes self._handling down to the keys still present in the
         freshly-built queue: a key whose item LEFT the queue (resolved/
         dropped, or a session moved off AWAITING_INPUT) stops being
@@ -799,7 +808,8 @@ class CockpitApp(App):
             deferred=self._deferred,
         )
         queue = self.query_one('#decision-queue', DecisionQueue)
-        queue.replace_rows(queue_items, now)
+        with self.prevent(DataTable.RowHighlighted):
+            queue.replace_rows(queue_items, now)
         self._queue_items_by_key = {item.key: item for item in queue_items}
         self._handling &= self._queue_items_by_key.keys()
         self._update_attention(queue_items)
