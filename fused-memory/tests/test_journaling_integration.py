@@ -385,7 +385,15 @@ async def test_causation_search_row_carries_the_widened_shape(service, write_jou
         'failed_stores was already recorded here and must SURVIVE the widening — a '
         f'widening that drops a pre-existing fact is a regression. got {summary!r}.'
     )
+    assert summary.get('degraded') is False, (
+        'The recon producer stamps degraded by the same rule as the other two, so a '
+        f'healthy row says so rather than staying silent. got {summary!r}.'
+    )
     assert params.get('query') == _LONG_QUERY, (
         'The full query must be journalled on the recon path as well, '
         f'got {params.get("query")!r}. RED: still truncated at 200.'
+    )
+    assert params.get('query_truncated') is False, (
+        'The query bound is disclosed on this row too — one contract, three '
+        f'producers. got {params!r}.'
     )

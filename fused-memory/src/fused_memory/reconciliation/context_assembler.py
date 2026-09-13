@@ -23,7 +23,10 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     Watermark,
 )
-from fused_memory.services.read_telemetry import summarize_search_results
+from fused_memory.services.read_telemetry import (
+    summarize_search_query,
+    summarize_search_results,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 if TYPE_CHECKING:
@@ -306,9 +309,8 @@ class ContextAssembler:
         hints = (task.get('metadata') or {}).get('memory_hints', {})
         queries = hints.get('queries', []) if isinstance(hints, dict) else []
         # Resolved ONCE, not per query, and via the public accessor rather than
-        # MemoryService's private attribute. None means an unwired deployment
-        # (and the AsyncMock-based assembler tests), which must journal nothing
-        # rather than fail.
+        # MemoryService's private attribute. None means an unwired deployment,
+        # which must journal nothing rather than fail.
         journal = getattr(self.memory, 'write_journal', None)
         _hint_exc_logged = False
         _hint_journal_exc_logged = False
@@ -344,6 +346,15 @@ class ContextAssembler:
                 # assembler has no run_id or causation_id at assemble() time,
                 # and gaining one would mean a 5th __init__ parameter that
                 # tests/test_harness.py's six assembler stubs do not accept.
+                #
+                # degraded/failed_stores is recorded here exactly as the other
+                # two producers record it.  Without it a hint search that ran
+                # against a downed store journals a row indistinguishable from
+                # one that genuinely found nothing — a wrong answer rather than
+                # a missing one, in the field leaf eta reads first.  getattr
+                # because a back-compat plain list carries no degrade metadata,
+                # and a plain list never degrades.
+                hint_failed_stores = getattr(results, 'failed_stores', None)
                 await journal.log_write_op(
                     write_op_id=str(uuid.uuid4()),
                     source=_HINT_JOURNAL_SOURCE,
@@ -351,11 +362,14 @@ class ContextAssembler:
                     project_id=project_id,
                     kind='read',
                     params={
-                        'query': query,
+                        **summarize_search_query(query),
                         'limit': _HINT_SEARCH_LIMIT,
                         'caller_task_id': str(task_id),
                     },
-                    result_summary=summarize_search_results(results),
+                    result_summary=summarize_search_results(
+                        results, failed_stores=hint_failed_stores,
+                    ),
+                    success=not getattr(results, 'degraded', False),
                 )
             except Exception:
                 # Telemetry must never cost the caller its hint results. The

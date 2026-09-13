@@ -223,6 +223,46 @@ class TestFullQueryText:
         )
 
 
+class TestQueryIsBoundedAndSaysSo:
+    """`query` is caller-supplied and lands in the table this task also prunes."""
+
+    @pytest.mark.asyncio
+    async def test_a_realistic_query_is_whole_and_marked_untruncated(self, write_journal):
+        _, server = _make_server(write_journal)
+
+        await server._tool_manager.call_tool(
+            'search', {'query': _LONG_QUERY, 'project_id': _PROJECT_ID}
+        )
+
+        params = (await _one_search_row(write_journal))['params']
+        assert params.get('query') == _LONG_QUERY, f'RED: got {params!r}'
+        assert params.get('query_truncated') is False, (
+            'The bound is disclosed the same way the result cap is, so a consumer never '
+            f'has to guess whether it is reading a whole query. got {params!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pathological_query_cannot_write_an_unbounded_row(self, write_journal):
+        from fused_memory.services.read_telemetry import SEARCH_TELEMETRY_MAX_QUERY_CHARS
+
+        huge = 'z' * (SEARCH_TELEMETRY_MAX_QUERY_CHARS + 1000)
+        _, server = _make_server(write_journal)
+
+        await server._tool_manager.call_tool(
+            'search', {'query': huge, 'project_id': _PROJECT_ID}
+        )
+
+        params = (await _one_search_row(write_journal))['params']
+        assert len(params['query']) == SEARCH_TELEMETRY_MAX_QUERY_CHARS, (
+            'Nothing upstream bounds query length — only limit is clamped — so one '
+            f'buggy caller could grow write_ops without bound. RED: logged '
+            f'{len(params["query"])} chars.'
+        )
+        assert params.get('query_truncated') is True, (
+            f'RED: the cap must never be silent, got {params!r}'
+        )
+
+
 class TestErrorPath:
     """A failed search is still a read that happened — and still attributable."""
 
@@ -262,9 +302,28 @@ class TestDegradedFactsSurvive:
             f'the widening, got {summary!r}. RED: pre-existing fact dropped.'
         )
         assert summary.get('count') == 0, f'RED: got {summary!r}'
+        assert summary.get('degraded') is True, (
+            f'A degraded search must SAY so on the row, got {summary!r}.'
+        )
         assert summary.get('size_unit') == 'chars', (
             f'The widened keys must be present on the degraded path too, got {summary!r}.'
         )
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_row_states_it_was_not_degraded(self, write_journal):
+        """An outage and a genuine miss must not journal the same row."""
+        _, server = _make_server(write_journal, results=SearchResults([]))
+
+        await server._tool_manager.call_tool(
+            'search', {'query': _LONG_QUERY, 'project_id': _PROJECT_ID}
+        )
+
+        summary = (await _one_search_row(write_journal))['result_summary']
+        assert summary.get('degraded') is False, (
+            'degraded is stamped on EVERY row, not only the degraded ones — an absent '
+            f'key is indistinguishable from a producer that never records it. {summary!r}'
+        )
+        assert summary.get('failed_stores') == [], f'RED: got {summary!r}'
 
 
 class TestGroupedPayloadIsWhatIsSummarised:
@@ -482,6 +541,16 @@ class TestTelemetryFaultCannotBreakSearch:
         assert summary.get('count') == 2, (
             f'The fallback must still record the count, got {summary!r}. RED: row lost entirely.'
         )
+        assert summary.get('telemetry_error') is True, (
+            'A summariser fault must be readable AS a fault: without this marker the '
+            'row reads as "the agent was shown nothing" to any consumer using '
+            f'summary.get("results", []). got {summary!r}. RED: bare-count fallback.'
+        )
+        assert summary.get('schema_version') is not None, (
+            'read_telemetry promises schema_version on every row it produces, so the '
+            f'fallback must not KeyError a consumer written to that contract. {summary!r}'
+        )
+        assert summary.get('results') == [], f'RED: got {summary!r}'
 
 
 # ── Item (5): journal drops are visible to a reader ─────────────────

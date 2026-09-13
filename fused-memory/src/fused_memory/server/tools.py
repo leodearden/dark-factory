@@ -162,7 +162,11 @@ from fused_memory.services.completion_claim_gate import (
     verify_claims,
 )
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.services.read_telemetry import summarize_search_results
+from fused_memory.services.read_telemetry import (
+    fallback_search_summary,
+    summarize_search_query,
+    summarize_search_results,
+)
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
@@ -4025,11 +4029,16 @@ def create_mcp_server(
         if limit > 1000:
             limit = 1000
         # One params dict for both journalling sites (success and error), built
-        # once so the two cannot drift.  The FULL query is recorded for search
-        # rows — see the summarise site below.  The caller-identity keys are
-        # present only when supplied, so an un-attributed caller's row shape is
-        # byte-identical to what it was before this channel existed.
-        journal_params: dict[str, Any] = {'query': query, 'limit': limit}
+        # once so the two cannot drift.  The query text and its disclosed cap
+        # come from read_telemetry, the same single home that owns the
+        # result_summary shape — see the summarise site below.  The
+        # caller-identity keys are present only when supplied, so an
+        # un-attributed caller's row shape is byte-identical to what it was
+        # before this channel existed.
+        journal_params: dict[str, Any] = {
+            **summarize_search_query(query),
+            'limit': limit,
+        }
         if caller_agent_id is not None:
             journal_params['caller_agent_id'] = caller_agent_id
         if caller_task_id is not None:
@@ -4089,27 +4098,37 @@ def create_mcp_server(
             # it then re-wrote?".  The raw list would over-report top-level
             # visibility and omit the folded child ids the agent did see.
             #
-            # The FULL query is journalled for search rows only — the 200-char
-            # convention at every other _log_read caller is deliberately left
-            # alone.  A retrieval metric computed from half a query measures
-            # the wrong thing.
+            # The near-full query is journalled for search rows only — the
+            # 200-char convention at every other _log_read caller is
+            # deliberately left alone.  A retrieval metric computed from half a
+            # query measures the wrong thing.
+            #
+            # failed_stores is read off `results` (the SearchResults object)
+            # exactly as the response block above does — it does not survive the
+            # list transform — and handed to the summariser rather than bolted
+            # onto its output, so all three producers stamp degraded/
+            # failed_stores by one rule instead of three.
+            degraded_stores = getattr(results, 'failed_stores', None)
             try:
-                search_summary: dict[str, Any] = summarize_search_results(grouped_results)
+                search_summary: dict[str, Any] = summarize_search_results(
+                    grouped_results, failed_stores=degraded_stores,
+                )
             except Exception:
                 # A telemetry fault must never turn a working search into an
                 # error — same degradation posture as the grouping guard above.
+                # The fallback is the FULL envelope marked telemetry_error, not
+                # a bare count: a consumer must be able to tell "the summariser
+                # broke" from "the agent was shown nothing".
                 logger.warning(
-                    'search: result telemetry FAILED for project=%s; journalling count only',
+                    'search: result telemetry FAILED for project=%s; journalling the '
+                    'telemetry_error envelope',
                     project_id,
                     exc_info=True,
                     extra={'project_id': project_id},
                 )
-                search_summary = {'count': len(results)}
-            # Read off `results` (the SearchResults object) exactly as the
-            # response block above does — this fact does not survive a list
-            # transform, and the widening must not drop what was already recorded.
-            if getattr(results, 'degraded', False):
-                search_summary['failed_stores'] = getattr(results, 'failed_stores', [])
+                search_summary = fallback_search_summary(
+                    len(results), failed_stores=degraded_stores,
+                )
             await _log_read(
                 operation='search',
                 project_id=project_id,

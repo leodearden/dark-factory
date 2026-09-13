@@ -1063,6 +1063,66 @@ async def test_hint_execution_journals_widened_result_summary(
 
 
 @pytest.mark.asyncio
+async def test_degraded_hint_search_is_distinguishable_from_a_genuine_miss(
+    mock_memory, mock_taskmaster, hint_journal,
+):
+    """An empty hint search against a DOWNED store must not look like a real miss.
+
+    This site used to record no degradation at all and pass no `success=`, so a
+    hint search that ran while mem0 was down journalled a row byte-identical to
+    a healthy search that genuinely found nothing — a wrong answer in the field
+    leaf eta reads first, rather than a missing one.
+    """
+    from fused_memory.services.memory_service import SearchResults
+
+    mock_taskmaster.get_task = AsyncMock(return_value=_hint_task('only hint'))
+    mock_memory.search = AsyncMock(
+        return_value=SearchResults([], degraded=True, failed_stores=['mem0']),
+    )
+    mock_memory.write_journal = hint_journal
+
+    await _assemble_task_event(_make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster,
+    ))
+
+    rows = await _search_rows(hint_journal)
+    assert len(rows) == 1, f'RED: expected exactly 1 hint search row, got {len(rows)}'
+    summary = json.loads(rows[0]['result_summary'])
+    assert summary['degraded'] is True, (
+        f'RED: the hint site records no degradation, got {summary!r}'
+    )
+    assert summary['failed_stores'] == ['mem0'], (
+        f'RED: which store failed is the fact that decides miss-vs-outage. {summary!r}'
+    )
+    assert rows[0]['success'] == 0, (
+        'RED: the hint site defaulted success=True, unlike the other two producers; '
+        f'a degraded read is not a successful one. got {rows[0]["success"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_healthy_hint_search_states_it_was_not_degraded(
+    mock_memory, mock_taskmaster, hint_journal,
+):
+    """The other half of the pair: absent is not the same as False."""
+    mock_taskmaster.get_task = AsyncMock(return_value=_hint_task('only hint'))
+    mock_memory.search = AsyncMock(return_value=[_make_memory_result()])
+    mock_memory.write_journal = hint_journal
+
+    await _assemble_task_event(_make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster,
+    ))
+
+    rows = await _search_rows(hint_journal)
+    summary = json.loads(rows[0]['result_summary'])
+    assert summary['degraded'] is False, f'RED: got {summary!r}'
+    assert summary['failed_stores'] == [], f'RED: got {summary!r}'
+    assert rows[0]['success'] == 1, (
+        f'A healthy hint read is still a success, got {rows[0]["success"]!r}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_hint_execution_journals_full_query_and_caller_task_id(
     mock_memory, mock_taskmaster, hint_journal,
 ):
@@ -1085,6 +1145,10 @@ async def test_hint_execution_journals_full_query_and_caller_task_id(
     assert params['query'] == _LONG_HINT_QUERY, (
         'RED: the hint query must be journalled in full — a truncated query cannot be '
         'matched against a later write'
+    )
+    assert params['query_truncated'] is False, (
+        'The query bound is disclosed here exactly as it is at the MCP boundary, so a '
+        f'consumer never has to guess whether it read a whole query. Got {params!r}'
     )
     assert params['caller_task_id'] == '3212', (
         'RED: the event task id is the one identity in scope at this site; without it '

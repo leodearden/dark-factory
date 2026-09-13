@@ -15,9 +15,12 @@ import uuid
 
 from fused_memory.models.memory import MemoryCategory, MemoryResult, SourceStore
 from fused_memory.services.read_telemetry import (
+    SEARCH_TELEMETRY_MAX_QUERY_CHARS,
     SEARCH_TELEMETRY_MAX_RESULTS,
     SEARCH_TELEMETRY_SCHEMA_VERSION,
     SEARCH_TELEMETRY_SIZE_UNIT,
+    fallback_search_summary,
+    summarize_search_query,
     summarize_search_results,
 )
 
@@ -304,4 +307,141 @@ class TestTruncation:
             f'The cap is derived from observed callers (5-10 results), not a round guess; '
             f'50 is 5-10x headroom and bounds a pathological row to ~6 KB. '
             f'RED: got {SEARCH_TELEMETRY_MAX_RESULTS!r}.'
+        )
+
+
+class TestDegradationIsOwnedHere:
+    """`degraded`/`failed_stores` decides miss-vs-outage, so one rule serves all three producers.
+
+    It used to be bolted on per producer with three different rules — only when
+    degraded at the MCP site, unconditionally in MemoryService, never at the
+    hint site — which made a degraded hint search byte-indistinguishable from a
+    healthy search that genuinely found nothing.
+    """
+
+    def test_healthy_search_says_so_rather_than_omitting_the_key(self):
+        summary = summarize_search_results([_make_result()])
+
+        assert summary['degraded'] is False, (
+            f'degraded must be stamped on EVERY row, got {summary.get("degraded")!r}. '
+            'RED: an absent key is indistinguishable from a producer that never '
+            'records degradation.'
+        )
+        assert summary['failed_stores'] == [], (
+            f'A healthy search reports no failed stores explicitly, got {summary!r}.'
+        )
+
+    def test_degraded_search_names_the_stores(self):
+        summary = summarize_search_results([], failed_stores=['mem0'])
+
+        assert summary['degraded'] is True, (
+            f'RED: a search with a failed store must report degraded, got {summary!r}'
+        )
+        assert summary['failed_stores'] == ['mem0'], f'RED: got {summary!r}'
+        assert summary['count'] == 0, f'RED: got {summary!r}'
+
+    def test_an_outage_is_distinguishable_from_a_genuine_miss(self):
+        """The failure the single home exists to prevent, pinned directly."""
+        miss = summarize_search_results([])
+        outage = summarize_search_results([], failed_stores=['graphiti'])
+
+        assert miss != outage, (
+            'RED: an empty result list from a downed store journals a row identical '
+            'to one that genuinely found nothing — a WRONG answer, not a missing one.'
+        )
+
+    def test_store_names_are_coerced_to_plain_strings(self):
+        """MemoryResult stores are StrEnums; the row is json.dumps-ed."""
+        summary = summarize_search_results([], failed_stores=[SourceStore.mem0])
+
+        assert summary['failed_stores'] == ['mem0'], f'RED: got {summary!r}'
+        json.dumps(summary)  # RED: raises TypeError if an enum leaks through.
+
+
+class TestFallbackEnvelope:
+    """A summariser fault must be readable AS a fault, not as an empty search."""
+
+    def test_fallback_carries_the_full_envelope(self):
+        summary = fallback_search_summary(2)
+
+        assert summary['schema_version'] == SEARCH_TELEMETRY_SCHEMA_VERSION, (
+            'The module promises schema_version on every row, so a consumer written '
+            f'against that contract must not KeyError here. RED: got {summary!r}'
+        )
+        assert summary['size_unit'] == SEARCH_TELEMETRY_SIZE_UNIT, f'RED: got {summary!r}'
+        assert summary['results'] == [], f'RED: got {summary!r}'
+        assert summary['results_logged'] == 0, f'RED: got {summary!r}'
+        assert summary['count'] == 2, (
+            f'The count survives a summariser fault and must be carried, got {summary!r}'
+        )
+
+    def test_fallback_is_distinguishable_from_a_zero_visibility_search(self):
+        faulted = fallback_search_summary(2)
+        genuinely_empty = summarize_search_results([])
+
+        assert faulted.get('telemetry_error') is True, (
+            'RED: `summary.get("results", [])` reads the fallback as "the agent was '
+            f'shown nothing" — the same false negative the drop counter exists to '
+            f'make visible. got {faulted!r}'
+        )
+        assert genuinely_empty.get('telemetry_error') is None, (
+            'telemetry_error is FAULT-ONLY, so a healthy row carries no marker and '
+            f'`.get()` reads False. RED: got {genuinely_empty!r}'
+        )
+        assert faulted['results_truncated'] is True, (
+            f'2 results existed and none were logged — that is truncation. RED: {faulted!r}'
+        )
+
+    def test_a_faulted_empty_search_truncated_nothing(self):
+        summary = fallback_search_summary(0)
+
+        assert summary['results_truncated'] is False, (
+            'An empty search loses nothing to the fault; claiming truncation would '
+            f'add a second false signal. RED: got {summary!r}'
+        )
+        assert summary['telemetry_error'] is True, f'RED: got {summary!r}'
+
+    def test_fallback_still_records_degradation(self):
+        summary = fallback_search_summary(0, failed_stores=['mem0'])
+
+        assert summary['degraded'] is True, (
+            'Degradation survives a summariser fault and is exactly when it matters '
+            f'most. RED: got {summary!r}'
+        )
+        assert summary['failed_stores'] == ['mem0'], f'RED: got {summary!r}'
+
+
+class TestQueryBound:
+    """`query` is caller-supplied over MCP and lands in a 16 GB table."""
+
+    def test_a_realistic_query_is_journalled_whole(self):
+        query = 'what did the architect decide about retention horizons ' * 4
+        assert len(query) < SEARCH_TELEMETRY_MAX_QUERY_CHARS, 'fixture guard'
+
+        params = summarize_search_query(query)
+
+        assert params['query'] == query, (
+            'A metric computed from half a query measures the wrong thing, so every '
+            f'realistic query is kept whole. RED: got {params!r}'
+        )
+        assert params['query_truncated'] is False, f'RED: got {params!r}'
+
+    def test_a_pathological_query_is_bounded_and_says_so(self):
+        query = 'x' * (SEARCH_TELEMETRY_MAX_QUERY_CHARS + 500)
+
+        params = summarize_search_query(query)
+
+        assert len(params['query']) == SEARCH_TELEMETRY_MAX_QUERY_CHARS, (
+            'One buggy caller must not be able to write an unbounded string into the '
+            f'table this task adds a prune for. RED: logged {len(params["query"])} chars.'
+        )
+        assert params['query_truncated'] is True, (
+            f'The cap is disclosed exactly as results_truncated is. RED: got {params!r}'
+        )
+
+    def test_the_bound_is_generous_not_the_old_200(self):
+        assert SEARCH_TELEMETRY_MAX_QUERY_CHARS == 4096, (
+            'The bound must stay far above any real query — it removes the unbounded '
+            f'tail, it does not reinstate the retired query[:200]. RED: got '
+            f'{SEARCH_TELEMETRY_MAX_QUERY_CHARS!r}.'
         )
