@@ -20,17 +20,36 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, observed_submit_response
+from escalation.server import create_server
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _QUEUE_LOGGER = 'escalation.queue'
+
+_COMMON_KWARGS: dict[str, Any] = {
+    'task_id': 'task-5368',
+    'agent_role': 'implementer',
+    'category': 'infra_issue',
+    'summary': 'post-write re-read could not confirm persistence',
+}
+
+
+async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('escalate_blocker')
+    return await tool.fn(**kwargs)
+
+
+async def _info(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('escalate_info')
+    return await tool.fn(**kwargs)
 
 
 def _submit_pending(queue: EscalationQueue, *, level: int = 1) -> str:
@@ -199,3 +218,112 @@ class TestUnpersistedLogsAtError:
             f'Expected an ERROR naming {esc_id}; got: '
             f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Server boundary: the envelope the agent actually reads
+# ---------------------------------------------------------------------------
+
+
+class TestUnpersistedReachesTheAgentFacingEnvelope:
+    """The status must change the INSTRUCTION, not just the label beside it.
+
+    `escalate_blocker` appended `action='terminate_cleanly'` to every response
+    unconditionally.  That key, not `status`, is what the filer acts on — an
+    agent told to terminate cleanly removes its task from every recovery path,
+    believing a human will see the escalation.  Changing only `status` would
+    leave the envelope self-contradictory: a filing marked unpersisted while
+    still being told to stand down.
+    """
+
+    @pytest.mark.asyncio
+    async def test_healthy_queue_still_terminates_cleanly(self, tmp_path: Path):
+        """(a) The undegraded path is unchanged — queued, terminate_cleanly."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued', f'Unexpected status: {result}'
+        assert result['action'] == 'terminate_cleanly', (
+            f'The healthy blocker path must still stand the agent down: {result}'
+        )
+        assert result['level'] == 1, f'Level echo missing: {result}'
+
+    @pytest.mark.asyncio
+    async def test_absent_record_tells_the_blocker_to_keep_driving(self, tmp_path: Path):
+        """(b) Nothing persisted → the agent must NOT stand down.
+
+        This is the assertion that closes S8-13's wrong decision: with no
+        record on disk, no L1 or L2 drain will ever see this filing, so
+        terminating cleanly strands the task in silence.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result['status'] == 'accepted_unpersisted', f'Unexpected status: {result}'
+        assert result['action'] == 'keep_driving', (
+            f"Expected 'keep_driving' on an unpersisted filing, got: {result}"
+        )
+        assert result['action'] != 'terminate_cleanly'
+        assert result['level'] == 1, f'Level echo missing: {result}'
+
+    @pytest.mark.asyncio
+    async def test_unreadable_record_tells_the_blocker_to_keep_driving(self, tmp_path: Path):
+        """(c) An unreadable re-read carries the same instruction as an absent one."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        def _boom(escalation_id: str):
+            raise OSError('simulated unreadable escalation file')
+
+        queue.get = _boom  # type: ignore[method-assign]
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result['status'] == 'accepted_unpersisted', f'Unexpected status: {result}'
+        assert result['action'] == 'keep_driving', (
+            f"Expected 'keep_driving' on an unpersisted filing, got: {result}"
+        )
+        assert result['level'] == 1, f'Level echo missing: {result}'
+
+    @pytest.mark.asyncio
+    async def test_info_path_surfaces_status_and_grows_no_action_key(self, tmp_path: Path):
+        """(d) escalate_info never had an `action`, and must not acquire one."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'accepted_unpersisted', f'Unexpected status: {result}'
+        assert 'action' not in result, (
+            f'The info path has no instruction to give and must stay that way: {result}'
+        )
+        assert 'level' in result, f'Level echo missing: {result}'
+
+    @pytest.mark.asyncio
+    async def test_born_at_l2_bypass_also_keeps_driving(self, tmp_path: Path):
+        """(e) The L2 front door is covered too — it does NOT route through dedupe.
+
+        A born-at-L2 filing reaches `observed_submit_response` by its own path
+        in `_submit_or_dedupe`, so it needs its own assertion; and it is the
+        filing whose loss costs the most, being the one addressed to a human.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        assert result['status'] == 'accepted_unpersisted', f'Unexpected status: {result}'
+        assert result['action'] == 'keep_driving', (
+            f"Expected 'keep_driving' on an unpersisted L2 filing, got: {result}"
+        )
+        assert 'level' in result, f'Level echo missing: {result}'
