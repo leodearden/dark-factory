@@ -157,11 +157,11 @@ class TestExceptionType:
 
 
 class TestFamilyWrappers:
-    """The two entry points the five scripts actually call.
+    """The two entry points the six scripts actually call.
 
     ``assert_task_store_exists`` / ``assert_queue_dir_exists`` exist so that
     only ``operation`` varies between call sites: the target derivation and the
-    family-constant ``what``/``remedy`` prose live in one place instead of five
+    family-constant ``what``/``remedy`` prose live in one place instead of six
     (task 4319 amendment pass).  What is pinned here is that they are genuinely
     equivalent to the general helper -- same refusal type, same anti-litter
     property, same resolved path in the message -- and that the shared remedy

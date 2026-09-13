@@ -69,16 +69,6 @@ See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
 for the mechanism, the probe-vs-existence argument, the prior art and the
 placement rules -- that module is the single normative copy, and this note
 deliberately does not restate it.
-
-THE WRAPPER DOES NOT INHERIT THIS (measured, task 4319).
-``scripts/check_found_on_main_spurious_rate.py::_run`` does NOT invoke
-:func:`_run` and never reads its ``--fail-on-findings`` 0/1/2 ladder: it
-imports :func:`build_audit_report` and constructs its OWN ``SqliteTaskBackend``,
-calling ``get_tasks(args.project_root)`` directly.  So that predicate -- whose
-exit 0 means "check passed" -- remains exposed to the same false all-clear this
-guard closes here.  Covering it was outside task 4319's lock scope and is filed
-as follow-up; do not read the guard below as protecting it.
-
 """
 
 from __future__ import annotations
