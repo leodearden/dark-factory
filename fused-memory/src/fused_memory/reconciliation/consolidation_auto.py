@@ -95,6 +95,7 @@ class AutoReasonCode(StrEnum):
     member_carries_correction_banner = 'member_carries_correction_banner'
     canonical_carries_correction = 'canonical_carries_correction'
     mixed_category = 'mixed_category'
+    proposal_category_mismatch = 'proposal_category_mismatch'
     canonical_category_mismatch = 'canonical_category_mismatch'
     multiple_canonicals = 'multiple_canonicals'
     canonical_count_unavailable = 'canonical_count_unavailable'
@@ -148,6 +149,14 @@ class AutoProposal:
     absent — claim shape is the emit boundary's business
     (``server/consolidation.py::validate_consolidate_args``), and the predicate
     re-derives none of it.
+
+    ``category`` is present because it is WRITE-BEARING and LLM-supplied: PRD C3
+    writes it as the minted canonical's ``metadata.category``, and C1 checks
+    only that it is in the six-category vocabulary — never that it agrees with
+    the records it is about to index. So the predicate reads it, at rung 2,
+    under ``proposal_category_mismatch``. Every other LLM-supplied field here is
+    already distrusted the same way; a field this module carried but never
+    checked would be one task delta had no reason not to trust.
     """
 
     topic: str
@@ -330,6 +339,25 @@ def _member_categories(
     return pairs
 
 
+def _sole_category(categorised: Sequence[tuple[str, str]]) -> str | None:
+    """The one category every categorised member shares, or ``None``.
+
+    ONE home for "what category IS this cluster", because two rules compare
+    something against it: the incumbent canonical's own category
+    (``canonical_category_mismatch``) and the proposal's declared category
+    (``proposal_category_mismatch``). Two independent derivations would let the
+    two rules disagree about what the members are.
+
+    ``None`` covers both of the cases in which there is nothing to contradict.
+    Members spanning SEVERAL categories are ``mixed_category``'s business, and a
+    cluster that cannot agree with itself supplies no single value for anything
+    else to be measured against. Members carrying NONE is the same rule
+    :func:`_member_categories` states: absence is not contradiction.
+    """
+    distinct = {category for _, category in categorised}
+    return next(iter(distinct)) if len(distinct) == 1 else None
+
+
 def _slug_jaccard(left: str, right: str) -> float:
     """Token overlap of two topic slugs: ``|A n B| / |A u B|``.
 
@@ -455,15 +483,43 @@ def _member_hazards(
                 )
 
     categorised = _member_categories(proposal, members)
+    categorised_ids = tuple(member_id for member_id, _ in categorised)
     distinct = {category for _, category in categorised}
     if len(distinct) > 1:
         reasons.append(
             AutoReason(
                 code=AutoReasonCode.mixed_category,
-                ids=tuple(member_id for member_id, _ in categorised),
+                ids=categorised_ids,
                 detail=(
                     'the proposed members span more than one category '
                     f'({", ".join(sorted(distinct))}); one canonical cannot index two'
+                ),
+            ),
+        )
+
+    # The proposal's OWN declared category, checked against the members it
+    # claims to be about. `proposal.category` is LLM-supplied and write-bearing
+    # — PRD C3 stamps it on the canonical this predicate is about to authorise
+    # — and C1 checks only that it names one of the six categories, never that
+    # it names the RIGHT one. Unchecked, rung 6 would hand the executor a mint
+    # instruction for a canonical whose category contradicts every record it
+    # indexes: exactly the state `canonical_category_mismatch` refuses for a
+    # canonical that already exists, so refusing it only there would enforce
+    # the invariant on the incumbent and not on the record about to be written.
+    #
+    # `_sole_category` returning None is the over-refusal guard, not an
+    # oversight: unstamped members, or members that disagree among themselves,
+    # offer nothing for this to contradict.
+    sole_category = _sole_category(categorised)
+    if sole_category is not None and proposal.category != sole_category:
+        reasons.append(
+            AutoReason(
+                code=AutoReasonCode.proposal_category_mismatch,
+                ids=categorised_ids,
+                detail=(
+                    f'the proposal declares category {proposal.category}, but the '
+                    f'members it indexes are {sole_category}; the canonical it asks '
+                    'for would be filed under a category none of them carries'
                 ),
             ),
         )
@@ -550,8 +606,7 @@ def _canonical_hazards(
             ),
         )
 
-    categories = {category for _, category in _member_categories(proposal, members)}
-    sole_category = next(iter(categories)) if len(categories) == 1 else None
+    sole_category = _sole_category(_member_categories(proposal, members))
 
     # Only an incumbent of THIS topic contradicts THIS topic's count. A member
     # that is the canonical of a DIFFERENT topic is `member_already_canonical`
@@ -664,7 +719,9 @@ def evaluate_auto_predicate(
        first, so one human sitting names every problem. Among them: a
        *canonical_count* of zero CONTRADICTED by a named member that is this
        topic's canonical — two non-atomic reads disagreeing, which leaves the
-       topic's canonical state undecidable here.
+       topic's canonical state undecidable here — and a *proposal* whose
+       declared ``category`` contradicts the one its members share, which would
+       otherwise reach the executor as the minted canonical's own category.
     3. An incumbent canonical of THIS topic named in the member list is
        STRIPPED from the retained set and disclosed.
     4. ``already_consolidated`` -> NOOP, judged over the RETAINED set.

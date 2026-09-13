@@ -121,6 +121,7 @@ def _judge(
     *,
     proposal_ids: Sequence[str] | None = None,
     topic: str = TOPIC,
+    category: str = 'procedural_knowledge',
     canonical_count: int | None = 0,
     open_gate_id: str | None = None,
     existing_canonical_slugs: Sequence[str] = (),
@@ -132,10 +133,15 @@ def _judge(
     hazard is thereby claiming that hazard is what decided the verdict, because
     nothing else it left unsaid could have. Proposing the mapping's own keys by
     default keeps the proposal and the reads from drifting apart.
+
+    *category* defaults to the SAME value :func:`_member` stamps on a record,
+    so the benign fixture agrees with itself and a test that says nothing about
+    category is not silently tripping ``proposal_category_mismatch``. A test of
+    that code disagrees explicitly, on one side or the other.
     """
     ids = tuple(proposal_ids) if proposal_ids is not None else tuple(members)
     return evaluate_auto_predicate(
-        _proposal(ids, topic=topic),
+        _proposal(ids, topic=topic, category=category),
         members=members,
         canonical_count=canonical_count,
         open_gate_id=open_gate_id,
@@ -1194,6 +1200,124 @@ class TestCountAndMemberSetContradictions:
         assert AutoReasonCode.already_consolidated in _codes(verdict)
         assert AutoReasonCode.no_retained_members not in _codes(verdict)
 
+class TestProposalCategoryIsChecked:
+    """The proposal's own declared category, measured against its members.
+
+    Review finding (reviewer_comprehensive/correctness): ``proposal.category``
+    was declared on :class:`AutoProposal` and read by nothing. It is
+    LLM-supplied and write-bearing — PRD C3 stamps it as the minted canonical's
+    ``metadata.category``, and C1 checks only that it names one of the six
+    categories, never that it names the right one — so rung 6 could hand the
+    executor a mint instruction for a canonical contradicting every record it
+    indexes, with not one reason recorded. Same shape as the count/member-set
+    holes closed in ``cc2ec475fb``: an unguarded contradiction reaching a
+    write-bearing PASS.
+    """
+
+    def test_a_proposal_contradicting_its_members_is_refused(self):
+        """The measured hole, now a FAIL: PASS with no reason was the defect."""
+        members = _members(
+            _member('m1', category='observations_and_summaries'),
+            _member('m2', category='observations_and_summaries'),
+        )
+
+        verdict = _judge(members, category='procedural_knowledge', canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert verdict.outcome is not AutoOutcome.PASS
+        mismatches = _reasons_for(verdict, AutoReasonCode.proposal_category_mismatch)
+        assert len(mismatches) == 1
+        assert mismatches[0].ids == ('m1', 'm2')
+        assert 'observations_and_summaries' in mismatches[0].detail
+        assert verdict.retain_ids == ()
+
+    def test_an_agreeing_proposal_still_passes(self):
+        """The rule refuses CONTRADICTION, not the ordinary agreeing cluster."""
+        members = _members(
+            _member('m1', category='preferences_and_norms'),
+            _member('m2', category='preferences_and_norms'),
+        )
+
+        verdict = _judge(members, category='preferences_and_norms', canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.PASS
+        assert AutoReasonCode.proposal_category_mismatch not in _codes(verdict)
+        assert verdict.retain_ids == ('m1', 'm2')
+
+    def test_members_carrying_no_category_still_pass(self):
+        """Over-refusal guard: absence is not contradiction.
+
+        The same rule ``_member_categories`` already states — an unstamped
+        record predates the vocabulary rather than disagreeing with it — so a
+        cluster of unstamped members supplies nothing for the proposal's
+        category to contradict. Refusing here would refuse most older clusters.
+        """
+        members = _members(
+            _member('m1', category=None),
+            _member('m2', category=None),
+        )
+
+        verdict = _judge(members, category='procedural_knowledge', canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.PASS
+        assert AutoReasonCode.proposal_category_mismatch not in _codes(verdict)
+
+    def test_mixed_members_report_the_spread_and_not_a_mismatch(self):
+        """Over-refusal guard: a cluster that disagrees with ITSELF is one fault.
+
+        ``_sole_category`` returns ``None`` for a spread, so the members' own
+        disagreement is reported once as ``mixed_category`` rather than twice.
+        One problem must not look like two to the human sitting.
+        """
+        members = _members(
+            _member('m1', category='procedural_knowledge'),
+            _member('m2', category='preferences_and_norms'),
+        )
+
+        verdict = _judge(members, category='temporal_facts', canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.mixed_category in _codes(verdict)
+        assert AutoReasonCode.proposal_category_mismatch not in _codes(verdict)
+
+    def test_the_incumbent_canonical_does_not_set_the_members_category(self):
+        """The two category rules stay disjoint and share one ``_sole_category``.
+
+        An incumbent is excluded from ``_member_categories``, so its own
+        category is what ``canonical_category_mismatch`` measures and never
+        what the proposal is measured against. Both rules read the SAME helper,
+        so they cannot drift about what the members are.
+        """
+        members = _members(
+            _member('m1', category='procedural_knowledge'),
+            _member('C', topic=TOPIC, canonical=True, category='observations_and_summaries'),
+        )
+
+        verdict = _judge(members, category='procedural_knowledge', canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.canonical_category_mismatch in _codes(verdict)
+        assert AutoReasonCode.proposal_category_mismatch not in _codes(verdict)
+
+    def test_a_tag_only_pass_is_guarded_too(self):
+        """Hazards outrank rung 5: a contradicting proposal cannot tag either.
+
+        PASS_TAG_ONLY does not mint, but it stamps records onto a topic whose
+        canonical the proposal has just disagreed with — the cluster is not
+        decidable here whichever rung it would otherwise land on.
+        """
+        members = _members(
+            _member('m1', category='observations_and_summaries'),
+            _member('C', topic=TOPIC, canonical=True, category='observations_and_summaries'),
+        )
+
+        verdict = _judge(members, category='procedural_knowledge', canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert verdict.outcome is not AutoOutcome.PASS_TAG_ONLY
+        assert AutoReasonCode.proposal_category_mismatch in _codes(verdict)
+
+
 #: Every reason code, mapped to inputs that actually PRODUCE it.
 #:
 #: The table is the deliverable "one test per reason code" made
@@ -1244,6 +1368,13 @@ REASON_CODE_FIXTURES: dict[AutoReasonCode, Callable[[], AutoVerdict]] = {
             _member('m1', category='procedural_knowledge'),
             _member('m2', category='preferences_and_norms'),
         ),
+    ),
+    AutoReasonCode.proposal_category_mismatch: lambda: _judge(
+        _members(
+            _member('m1', category='observations_and_summaries'),
+            _member('m2', category='observations_and_summaries'),
+        ),
+        category='procedural_knowledge',
     ),
     AutoReasonCode.canonical_category_mismatch: lambda: _judge(
         _members(
