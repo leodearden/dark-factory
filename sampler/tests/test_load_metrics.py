@@ -795,3 +795,141 @@ class TestCollectLoadMetricsRunqueue:
 
         sig = inspect.signature(collect_load_metrics)
         assert sig.parameters['read_runqueue'].default is shared.psi.read_runqueue_ratio
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-5: collect_load_metrics — the per-cgroup own-pressure half
+# ---------------------------------------------------------------------------
+
+
+def _healthy_runqueue(**_kwargs):
+    from shared.psi import RunqueueReading
+
+    return RunqueueReading(1.0, True)
+
+
+def _collect(tree, **overrides):
+    from sampler.metrics import collect_load_metrics
+
+    return collect_load_metrics(
+        read_runqueue=_healthy_runqueue,
+        own_cgroup_path=overrides.pop('own_cgroup_path', tree.own_cgroup_path),
+        cgroup_root=overrides.pop('cgroup_root', tree.cgroup_root),
+        **overrides,
+    )
+
+
+class TestCollectLoadMetricsOwnPressure:
+    """One own_cpu_some10 + one own_read_ok row per DISCOVERED leaf, and no more.
+
+    ``own_read_ok:<leaf>`` is per-LEAF evidence — it answers "did THIS
+    cgroup's pressure file read". Every degradation is therefore carried by
+    value against a real leaf name (INV-11), and never fabricated against an
+    invented one.
+    """
+
+    def test_seven_leaves_yield_fourteen_keys_with_parsed_values(self, tmp_path):
+        tree = live_topology(tmp_path)
+
+        result = _collect(tree)
+
+        own = {k: v for k, v in result.items() if k.startswith('own_')}
+        assert len(own) == 14
+        # live_topology gives leaf i a `some avg10` of 0.5 + i, in
+        # LIVE_ORCHESTRATOR_LEAVES order.
+        for i, leaf in enumerate(LIVE_ORCHESTRATOR_LEAVES):
+            assert own[f'own_cpu_some10:{leaf}'] == pytest.approx(0.5 + i)
+            assert own[f'own_read_ok:{leaf}'] == 1.0
+        # The leaf tail is the FULL leaf directory name, verbatim.
+        assert 'own_cpu_some10:orchestrator-dark-factory.service' in own
+
+    def test_absent_pressure_file_degrades_only_its_own_leaf(self, tmp_path):
+        broken = 'orchestrator-reify.service'
+        tree = live_topology(tmp_path, **{broken.replace('.', '_').replace('-', '_'): None})
+
+        result = _collect(tree)
+
+        assert result[f'own_read_ok:{broken}'] == 0.0
+        assert f'own_cpu_some10:{broken}' not in result
+        # The other six are untouched — the failure is isolated, not pooled.
+        for leaf in LIVE_ORCHESTRATOR_LEAVES:
+            if leaf == broken:
+                continue
+            assert result[f'own_read_ok:{leaf}'] == 1.0
+            assert f'own_cpu_some10:{leaf}' in result
+
+    def test_unparseable_pressure_file_behaves_exactly_like_an_absent_one(self, tmp_path):
+        broken = 'orchestrator-reify.service'
+        key = broken.replace('.', '_').replace('-', '_')
+        tree = live_topology(tmp_path, **{key: GARBAGE_PRESSURE_TEXT})
+
+        result = _collect(tree)
+
+        assert result[f'own_read_ok:{broken}'] == 0.0
+        assert f'own_cpu_some10:{broken}' not in result
+        assert len([k for k in result if k.startswith('own_')]) == 13
+
+    def test_zero_discovered_leaves_emit_no_own_rows_and_warn(self, tmp_path, caplog):
+        """Decision 2: no leaf means no subject, so no row — and one WARNING.
+
+        A synthesised ``own_read_ok:<invented>`` = 0.0 would put a key into
+        the DB that ε2 would then average, so the assertion is on the ABSENCE
+        of any own_ key rather than on a particular invented name.
+        """
+        tree = build_cgroup_tree(tmp_path, groups={})
+
+        with caplog.at_level(logging.WARNING):
+            result = _collect(tree)
+
+        assert [k for k in result if k.startswith('own_')] == []
+        # The runqueue half is unaffected — the two halves degrade separately.
+        assert result['runqueue_read_ok'] == 1.0
+        warnings = [r.message % r.args for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('user@1000.service' in msg for msg in warnings), (
+            f'Expected a WARNING naming the attempted anchor; got: {warnings}'
+        )
+
+    def test_some_only_pressure_file_still_reads_ok(self, tmp_path):
+        """A cgroup cpu.pressure may legitimately carry no ``full`` line.
+
+        α's parser returns a dict in that case, not None, so this is a
+        successful read and must not be reported as a failure.
+        """
+        leaf = 'orchestrator-reify.service'
+        key = leaf.replace('.', '_').replace('-', '_')
+        tree = live_topology(tmp_path, **{key: pressure_text(some=3.25, full=None)})
+
+        result = _collect(tree)
+
+        assert result[f'own_read_ok:{leaf}'] == 1.0
+        assert result[f'own_cpu_some10:{leaf}'] == pytest.approx(3.25)
+
+    def test_df_topology_names_rows_by_the_slice_leaf(self, tmp_path):
+        tree = df_topology(tmp_path, 'dark_factory', 'reify')
+
+        result = _collect(tree)
+
+        assert result['own_read_ok:df-dark_factory.slice'] == 1.0
+        assert result['own_read_ok:df-reify.slice'] == 1.0
+        assert len([k for k in result if k.startswith('own_')]) == 4
+
+    def test_every_value_is_a_float(self, tmp_path):
+        tree = live_topology(tmp_path, orchestrator_reify_service=None)
+
+        result = _collect(tree)
+
+        for key, value in result.items():
+            assert type(value) is float, f'{key} is {type(value).__name__}: {value!r}'
+
+    def test_no_second_pressure_parser_exists(self):
+        """The cgroup text goes through α's parser, not a copy of it (INV-5)."""
+        import shared.psi
+
+        import sampler.metrics
+
+        assert sampler.metrics.parse_pressure_file is shared.psi.parse_pressure_file
+        source = Path(sampler.metrics.__file__).read_text()
+        assert 'avg10=' not in source, (
+            'sampler.metrics must not contain a pressure-line pattern of its own; '
+            'shared.psi.parse_pressure_file is the single parser (INV-5).'
+        )
