@@ -177,8 +177,8 @@ class TestGuardFailsOpen:
 
         backend, _fake = backend_with_fake_graphiti(mock_config)
         raising = _RaisingFake()
-        backend.client = raising
-        backend._client_for = MagicMock(return_value=raising)
+        backend.client = raising  # type: ignore[assignment]
+        backend._client_for = MagicMock(return_value=raising)  # type: ignore[method-assign]
         return backend
 
     @pytest.mark.asyncio
