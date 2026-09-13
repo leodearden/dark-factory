@@ -31,8 +31,26 @@ arrival by design: they exist so an over-broad deletion fails loudly instead of
 silently removing a surviving owner.
 """
 import pathlib
+import subprocess
+
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+# The two tokens the task's acceptance grep pins, matched EXACTLY. Deliberately
+# NOT loosened to a bare 'reify-closure-staleness': task 4681's pending
+# delivered_checks grep scripts/ for 'reify-closure-staleness-predicate', a
+# distinct and still-wanted string, and a loose pattern here would put this
+# guard in a fight with that task.
+RETIRED_TOKENS = ('consume_redispatch_requests', 'reify-closure-staleness-sweep')
+
+# This module necessarily contains both tokens — every absence assertion above
+# names a retired path — so it can never clear its own sweep. Exclude it by
+# repo-relative path rather than by any token-shaped heuristic, which would
+# also silence a real offender.
+SELF_RELPATH = pathlib.Path(__file__).resolve().relative_to(REPO_ROOT).as_posix()
+
+CODE_TREE_PATHSPECS = ('scripts', 'tests')
 
 _RETIRED_MESSAGE = (
     "task 5247: {path} is part of the retired nightly reify closure-staleness "
@@ -162,4 +180,75 @@ def test_hard_constraint_stage2_reconciliation_preserved():
     )
     assert p.is_file(), _HARD_CONSTRAINT_MESSAGE.format(
         what=f"{p} (Stage 2: Task-Knowledge Sync)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reference sweep: the executable form of the task's acceptance grep.
+# ---------------------------------------------------------------------------
+
+
+def _tracked_files(*pathspecs):
+    """Repo-relative tracked paths, or None when this is not a git checkout.
+
+    Uses ``git ls-files`` rather than a filesystem walk, following the house
+    convention in shared/tests/test_capability_manifest.py::discover_manifests
+    and scripts/tests/test_audit_manifest_descriptor_drift.py: an untracked
+    scratch file in a lane must not be able to fail this guard, and a tracked
+    one must not be able to hide from it.
+    """
+    try:
+        completed = subprocess.run(
+            ['git', 'ls-files', '-z', '--', *pathspecs],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return [entry for entry in completed.stdout.split('\0') if entry]
+
+
+def _offending_lines(relpaths):
+    """Sorted ``path:line`` citations of every surviving retired-wiring token."""
+    offenders = []
+    for relpath in relpaths:
+        if relpath == SELF_RELPATH:
+            continue
+        p = REPO_ROOT / relpath
+        if not p.is_file():
+            continue
+        text = p.read_text(encoding='utf-8', errors='replace')
+        if not any(token in text for token in RETIRED_TOKENS):
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if any(token in line for token in RETIRED_TOKENS):
+                offenders.append(f'{relpath}:{lineno}')
+    return sorted(offenders)
+
+
+def test_reference_sweep_is_not_vacuous():
+    """An empty corpus would pass the sweep silently — the fail-soft to prevent."""
+    tracked = _tracked_files(*CODE_TREE_PATHSPECS)
+    if tracked is None:
+        pytest.skip('not a git checkout (git ls-files failed)')
+    assert tracked, (
+        'task 5247: git ls-files returned an empty corpus for '
+        f'{CODE_TREE_PATHSPECS}, so the reference sweep below would pass '
+        'without checking anything'
+    )
+
+
+def test_code_tree_carries_no_reference_to_the_retired_wiring():
+    """No tracked file under scripts/ or tests/ still cites the retired wiring."""
+    tracked = _tracked_files(*CODE_TREE_PATHSPECS)
+    if tracked is None:
+        pytest.skip('not a git checkout (git ls-files failed)')
+    offenders = _offending_lines(tracked)
+    assert not offenders, (
+        'task 5247: the nightly reify closure-staleness sweep wiring is '
+        'retired, but these tracked code-tree lines still name it — repoint '
+        'each at a surviving precedent rather than leaving a comment pointing '
+        'at a deleted file:\n  ' + '\n  '.join(offenders)
     )
