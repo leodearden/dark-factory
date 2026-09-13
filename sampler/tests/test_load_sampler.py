@@ -188,8 +188,9 @@ class TestRunTick:
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
 
-        # Pre-insert a very old row (older than 24h)
-        very_old_ts = 1_000_000 - 86401
+        # Pre-insert a very old row (older than the 30-day retention window,
+        # widened from 24h by task 3592 step-14).
+        very_old_ts = 1_000_000 - 2_592_001
         store.insert_sample(very_old_ts, 'psi_cpu_some_avg10', 0.0)
 
         now = 1_000_000

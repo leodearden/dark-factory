@@ -17,9 +17,28 @@ Mirrors orchestrator.run_store.RunStore:
 
 Retention policy
 ----------------
-- cleanup_old(now): DELETE rows older than 24h, called every tick.
+- cleanup_old(now): DELETE rows older than 30 days, called every tick.
 - maybe_vacuum(now): VACUUM at most once per 24h, gated by meta.last_vacuum_ts.
   VACUUM runs outside a transaction to satisfy SQLite constraints.
+
+The 30-day window is what the threshold calibration in PRD
+``plans/load-throttle-harmonisation-prd.md`` D11 needs: a fortnight of
+production load with enough margin either side to see a weekly cycle.
+
+Sizing, measured on this host rather than estimated, so the next reader
+inherits the numbers instead of re-deriving them:
+
+    metrics/tick   25  (6 PSI + 3 process + 2 runqueue + 2 x 7 cgroup leaves)
+    ticks/day      17,280  (the paired .timer's OnUnitActiveSec=5s)
+    rows/day       432,000
+    rows at 30 d   12,960,000
+    bytes/row      125.3  including the index, which is 43% of the file
+    file at 30 d   ~1.62 GB
+
+against ~19 MB for the 9-metric, 24-hour steady state this replaces — about
+85x, NOT the ~30x the originating task estimated. That estimate counted the
+retention widening (24 h -> 30 d) but not the metric-count widening (9 -> 25)
+that lands in the same change.
 
 Trailing window
 ---------------
@@ -149,8 +168,12 @@ class LoadSampleStore:
     # Retention
     # ------------------------------------------------------------------
 
-    def cleanup_old(self, now: int, *, retain_seconds: int = 86400) -> None:
-        """Delete samples older than ``retain_seconds`` relative to ``now``."""
+    def cleanup_old(self, now: int, *, retain_seconds: int = 2_592_000) -> None:
+        """Delete samples older than ``retain_seconds`` relative to ``now``.
+
+        The default is 30 days (see "Retention policy" above). The cutoff is
+        exclusive — a row at exactly ``now - retain_seconds`` survives.
+        """
         cutoff = now - retain_seconds
         conn = self._connect()
         try:
