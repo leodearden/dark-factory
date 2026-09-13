@@ -16483,6 +16483,9 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         assert unrelated in (report.items_flagged or [])
         assert report.stats['preservation_specimen_suppressed'] == 1
         assert report.stats['preservation_specimen_unresolved'] == 0
+        # Not just the count: the citation travels into the stats blob Stage 2
+        # is handed verbatim, so the suppression is never anonymous there.
+        assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
 
     @pytest.mark.asyncio
     async def test_remediation_pass_suppresses_too(self, mock_deps):
@@ -16509,6 +16512,7 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
 
         assert specimen not in (report.items_flagged or [])
         assert report.stats['preservation_specimen_suppressed'] == 1
+        assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
 
     @pytest.mark.asyncio
     async def test_stats_are_present_and_zero_on_a_quiet_full_cycle(self, mock_deps):
@@ -16628,6 +16632,9 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         assert specimen in (report.items_flagged or [])
         assert report.stats['preservation_specimen_suppressed'] == 0
         assert report.stats['preservation_specimen_unresolved'] == 0
+        # Pre-inited above the early return, so the key is never conditionally
+        # absent — the always-present convention the sibling stats follow.
+        assert report.stats['preservation_specimen_citations'] == {}
 
     @pytest.mark.asyncio
     async def test_guard_failure_on_a_remediation_pass_is_also_swallowed(self, mock_deps):

@@ -346,6 +346,7 @@ class MemoryConsolidator(BaseStage):
         # success and the stats stay at their pre-inited 0.
         report.stats['preservation_specimen_suppressed'] = 0
         report.stats['preservation_specimen_unresolved'] = 0
+        report.stats['preservation_specimen_citations'] = {}
         preservation_result = None
         try:
             preservation_result = await filter_preservation_specimen_flags(
@@ -362,6 +363,15 @@ class MemoryConsolidator(BaseStage):
             # the blob Stage 2's prompt serializes, not only in the process log.
             report.stats['preservation_specimen_unresolved'] = len(
                 preservation_result.unresolved_task_ids
+            )
+            # The evidence travels with the number.  A count alone is the
+            # anonymous drop citations_by_task exists to prevent: the storm
+            # escape only names a citation above its threshold, so in normal
+            # operation this map is the ONLY place an operator (or Stage 2,
+            # which is handed this blob verbatim) can see WHICH record
+            # authorised the suppression and judge whether it is still current.
+            report.stats['preservation_specimen_citations'] = dict(
+                preservation_result.citations_by_task
             )
             # Suppression is NOT resolution — but unlike Hook A below, that needs
             # no signature bookkeeping here: this guard runs ABOVE the
