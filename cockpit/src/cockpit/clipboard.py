@@ -1,22 +1,29 @@
 """cockpit.clipboard — put text on THIS host's system clipboard, fail-soft.
 
-One purpose: hand *text* to a local clipboard helper (wl-copy / xclip /
-xsel) and report structurally what happened. No Textual import, no event
+Hand *text* to a local clipboard helper (wl-copy / xclip / xsel), then
+decide what the operator is told about the result and whether the OSC 52
+fallback still has to run (copy_feedback). No Textual import, no event
 loop, no widget — the whole surface is exercisable from a plain unit test
-(see cockpit/tests/test_clipboard.py). The POLICY built on top of that
-report — whether to also write the OSC 52 fallback, and what to tell the
-operator — lives in cockpit/src/cockpit/app.py::CockpitApp.action_copy.
+(see cockpit/tests/test_clipboard.py).
+cockpit/src/cockpit/app.py::CockpitApp.action_copy owns only the
+highlighted-row lookup, the guard around this seam, and the two side
+effects copy_feedback asks it for.
 
 Nothing here raises. The cockpit is a view, never a dependency (PRD §2), so
 a missing helper, an unusable DISPLAY or a hung helper all degrade to a
 return value the caller can act on.
 
-WHY THIS MODULE EXISTS. Task 2517 shipped the 'y' copy affordance as
-Textual's App.copy_to_clipboard alone — an OSC 52 escape sequence — which
-is a measured total no-op on Konsole 23.08.5: the operator pressed 'y' and
-nothing reached the clipboard and nothing said so (task 5448). OSC 52 is
-still the right fallback when no local helper can reach a clipboard (the
-over-SSH case); it is just not sufficient on its own.
+WHY THIS MODULE EXISTS — the incident account every other file on this path
+cites rather than restates (heuristic 11, SPOT). Task 2517 shipped the 'y'
+copy affordance as Textual's App.copy_to_clipboard alone, i.e. a single OSC
+52 escape sequence. That is a measured total no-op on Konsole 23.08.5: the
+operator pressed 'y', nothing reached the clipboard, and nothing said so.
+Its tests passed anyway, because they asserted on `app._clipboard`, which
+Textual sets BEFORE the escape write and regardless of whether the terminal
+understands it — so the attribute cannot tell "wrote OSC 52" from "did
+nothing at all" (task 5448). OSC 52 remains the right fallback when no
+local helper can reach a clipboard (the over-SSH case); it is just not
+sufficient on its own, and it cannot report its own failure.
 """
 
 from __future__ import annotations
@@ -28,13 +35,21 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Literal, Protocol
 
 logger = logging.getLogger(__name__)
 
-# Mirrors cockpit/src/cockpit/backends/base.py::_COMMAND_TIMEOUT_SECONDS, so
-# the two external-command seams read alike.
-_COPY_TIMEOUT_SECONDS = 5.0
+# The wall-clock budget for ONE 'y' press, not for one subprocess. The whole
+# walk runs synchronously on Textual's message-pump thread, so this is a
+# UI-freeze ceiling: copy_to_system_clipboard divides it across the
+# candidates it actually tries, and the interface can never be blocked for
+# longer than this however many helpers are installed. Measured on this host,
+# a healthy xclip returns in 0.19s and an xclip against an unusable DISPLAY
+# in 0.06s — so 2.0s is ~10x headroom over the slowest healthy path, and the
+# ceiling exists only for a WEDGED helper. (Deliberately not
+# cockpit/src/cockpit/backends/base.py::_COMMAND_TIMEOUT_SECONDS's 5.0s: that
+# one bounds a wm query nobody is waiting on mid-keystroke.)
+_COPY_BUDGET_SECONDS = 2.0
 
 # POSIX's "command not executable/found" code, reused for every degraded
 # outcome: the caller only ever asks "was this zero?".
@@ -86,7 +101,7 @@ def available_copy_commands(
 
 
 def run_clipboard_command(
-    argv: Sequence[str], text: str, *, timeout: float = _COPY_TIMEOUT_SECONDS
+    argv: Sequence[str], text: str, *, timeout: float = _COPY_BUDGET_SECONDS
 ) -> int:
     """Run *argv*, feeding *text* on its stdin; return its exit code, fail-soft.
 
@@ -145,12 +160,19 @@ class CopyAttempt:
     command: tuple[str, ...] = ()
 
 
-# argv + text -> POSIX return code. Deliberately NOT cockpit.backends.base's
-# CommandRunner: that alias carries no stdin channel and returns a
-# CommandResult whose stdout/stderr a clipboard helper never produces (they
-# are DEVNULL by design, see run_clipboard_command). The
-# nonzero-means-unavailable reading is shared; the type is not.
-ClipboardRunner = Callable[[Sequence[str], str], int]
+class ClipboardRunner(Protocol):
+    """argv + text + this call's slice of the budget -> POSIX return code.
+
+    Deliberately NOT cockpit.backends.base's CommandRunner: that alias
+    carries no stdin channel and returns a CommandResult whose
+    stdout/stderr a clipboard helper never produces (they are DEVNULL by
+    design, see run_clipboard_command). The nonzero-means-unavailable
+    reading is shared; the type is not. *timeout* is keyword-only and
+    required so no implementation can silently ignore the UI-freeze budget
+    copy_to_system_clipboard is dividing up.
+    """
+
+    def __call__(self, argv: Sequence[str], text: str, *, timeout: float) -> int: ...
 
 
 def copy_to_system_clipboard(
@@ -159,6 +181,7 @@ def copy_to_system_clipboard(
     environ: Mapping[str, str] = os.environ,
     which: Callable[[str], str | None] = shutil.which,
     runner: ClipboardRunner = run_clipboard_command,
+    budget: float = _COPY_BUDGET_SECONDS,
 ) -> CopyAttempt:
     """Hand *text* to the first local clipboard helper that takes it.
 
@@ -167,14 +190,26 @@ def copy_to_system_clipboard(
     and nothing is spawned; with every helper refusing it is HELPER_FAILED
     naming the last one tried. Either way the caller still owes the
     operator an OSC 52 fallback and a toast — see copy_feedback.
+
+    WHY *budget* IS DIVIDED across the walk rather than handed to each
+    candidate whole: this runs on the caller's UI thread (see
+    _COPY_BUDGET_SECONDS), and a Wayland host running XWayland offers three
+    candidates, so a per-candidate ceiling would let one keypress freeze the
+    interface for three times the ceiling. Dividing makes the bound the
+    operator actually experiences — time from 'y' to toast — exactly
+    *budget*. The cost is that a slow-but-working first helper can be cut
+    short by the smaller slice; that degrades to HELPER_FAILED, which is
+    loud (a warning toast) and still writes the OSC 52 fallback, so the copy
+    can still land. A frozen cockpit has no such recovery.
     """
     commands = available_copy_commands(environ=environ, which=which)
-    for command in commands:
-        if runner(command, text) == 0:
-            return CopyAttempt(CopyOutcome.COPIED, command)
-        logger.warning('copy_to_system_clipboard: %s did not take the payload', list(command))
     if not commands:
         return CopyAttempt(CopyOutcome.NO_HELPER)
+    timeout = budget / len(commands)
+    for command in commands:
+        if runner(command, text, timeout=timeout) == 0:
+            return CopyAttempt(CopyOutcome.COPIED, command)
+        logger.warning('copy_to_system_clipboard: %s did not take the payload', list(command))
     return CopyAttempt(CopyOutcome.HELPER_FAILED, commands[-1])
 
 

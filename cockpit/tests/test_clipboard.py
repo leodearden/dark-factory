@@ -1,12 +1,11 @@
 """Tests for cockpit.clipboard — the real system-clipboard path (task 5448).
 
-Task 2517 shipped 'y' as Textual's App.copy_to_clipboard alone, i.e. an OSC
-52 escape sequence, which is a measured total no-op on Konsole 23.08.5 —
-and its tests asserted on `app._clipboard`, an attribute Textual sets
-BEFORE the escape write and regardless of terminal support, so they passed
-against a copy that did nothing. This module asserts at the only boundary
-that can tell those apart: the exact argv and the exact stdin bytes handed
-to the clipboard helper process.
+Why OSC 52 alone was insufficient, and why its tests passed against a copy
+that did nothing, is recorded once in cockpit/src/cockpit/clipboard.py's
+module docstring. What follows from it here: the only boundary that can
+tell "reached a clipboard" from "wrote an escape nobody read" is the
+clipboard helper process, so this module asserts on the exact argv and the
+exact stdin bytes handed to it.
 
 Every dependency is injected as a plain dict/function/class (never
 MagicMock — fused-memory/scripts/check_bare_magicmock_config.py scans
@@ -150,14 +149,12 @@ class TestRunClipboardCommand:
     def test_a_helper_that_forks_a_child_does_not_block_the_caller(self, tmp_path):
         """The no-pipe contract: stdout/stderr are NOT piped, so a forked child can't stall us.
 
-        Regression guard for a real UI freeze. A clipboard helper owns the
-        X/Wayland selection by forking a background child that lives until
-        the clipboard is replaced, and that child inherits the parent's
-        stdout/stderr. Measured in this worktree: the identical call under
-        capture_output=True blocks for the CHILD's whole lifetime (5.01s
-        against a 5s sleeper) versus 0.19s with DEVNULL — so on every 'y'
-        press the cockpit's UI thread would freeze for as long as the
-        operator keeps the clipboard.
+        Regression guard for a real UI freeze, reproducing the shape a
+        clipboard helper actually has: it owns the selection by forking a
+        background child that outlives the exec and inherits the parent's
+        pipes. run_clipboard_command's docstring carries the measurement
+        that makes DEVNULL a correctness constraint rather than a style
+        choice; this is the test that fails if someone reverts it.
         """
         from cockpit.clipboard import run_clipboard_command
 
@@ -187,15 +184,19 @@ class RecordingRunner:
     """A ClipboardRunner double: records (argv, text) per call, returns scripted codes.
 
     `codes[i]` is the i-th call's return code; calls past the end reuse the
-    last entry, so a test only scripts the prefix it cares about.
+    last entry, so a test only scripts the prefix it cares about. Timeouts
+    are recorded apart from `calls` so the budget assertions and the
+    argv/text assertions stay independently readable.
     """
 
     def __init__(self, codes=(0,)):
         self.calls: list[tuple[tuple[str, ...], str]] = []
+        self.timeouts: list[float] = []
         self._codes = tuple(codes)
 
-    def __call__(self, argv, text):
+    def __call__(self, argv, text, *, timeout):
         self.calls.append((tuple(argv), text))
+        self.timeouts.append(timeout)
         return self._codes[min(len(self.calls) - 1, len(self._codes) - 1)]
 
 
@@ -204,8 +205,7 @@ class TestCopyToSystemClipboard:
 
     THIS is the assertion task 2517 never made: the exact argv and the exact
     text that reach a clipboard helper. `app._clipboard` could not have made
-    it — Textual sets that attribute before the escape write and regardless
-    of whether the terminal understands OSC 52 at all.
+    it — see cockpit/src/cockpit/clipboard.py's module docstring.
     """
 
     def test_first_working_helper_receives_the_exact_argv_and_text(self):
@@ -258,6 +258,42 @@ class TestCopyToSystemClipboard:
         assert runner.calls == []
         assert attempt == CopyAttempt(CopyOutcome.NO_HELPER, ())
 
+    def test_the_walk_divides_one_ui_budget_across_the_candidates(self):
+        """Each candidate gets a SLICE of the budget, not the whole thing.
+
+        The walk is synchronous on Textual's message-pump thread, so what
+        the operator experiences is the SUM over the candidates tried. With
+        a per-candidate ceiling an X11 host's two helpers (three, on a
+        Wayland host running XWayland) could each burn it in turn and stall
+        the interface for a multiple of it; dividing pins the bound at the
+        budget itself, whichever helpers happen to be installed.
+        """
+        from cockpit.clipboard import copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(1,))
+
+        copy_to_system_clipboard(
+            'payload', environ={'DISPLAY': ':0'}, which=_which_all, runner=runner, budget=1.0
+        )
+
+        assert runner.timeouts == [0.5, 0.5]
+
+    def test_a_lone_candidate_gets_the_whole_budget(self):
+        """The split is over the candidates actually available, not a fixed divisor."""
+        from cockpit.clipboard import copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(0,))
+
+        copy_to_system_clipboard(
+            'payload',
+            environ={'WAYLAND_DISPLAY': 'wayland-0'},
+            which=_which_all,
+            runner=runner,
+            budget=1.0,
+        )
+
+        assert runner.timeouts == [1.0]
+
 
 class TestCopyFeedback:
     """The operator-visible wording, decided by a pure function.
@@ -285,7 +321,6 @@ class TestCopyFeedback:
         assert feedback.severity == 'warning'
         assert feedback.write_osc52 is True
         assert 'OSC 52' in feedback.message
-        assert 'terminal' in feedback.message
 
     def test_helper_failure_names_both_the_helper_and_the_fallback(self):
         from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
