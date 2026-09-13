@@ -451,6 +451,28 @@ class TestClassifyAndMergeSpeculativeWorker:
         containment and eject the task with its novel commit unmerged.  Green
         both pre- and post-impl (pre-impl there is no backstop); it pins the
         safety arm against a future over-trigger.
+
+        NOT separately pinned any more (task 5031): the helper's FAIL-OPEN arm
+        — content genuinely patch-id-contained, helper answers False anyway
+        (``git cherry`` rc != 0), guard must still merge.  The deleted
+        ``test_patch_id_fail_open_falls_through_to_merge`` forced that answer by
+        monkeypatching ``merge_queue.patch_content_contained``, and this test
+        cannot substitute for it: here the content really is not contained, so
+        it cannot tell "the guard trusts the helper's return" apart from "the
+        guard re-derives containment itself".
+
+        There is no in-scope way to force the real helper to False on contained
+        content.  Its only lever is ``cwd=git_ops.project_root``
+        (``merge_queue.py::patch_content_contained``) — the same root
+        ``classify_and_merge`` re-resolves ``actual_main`` from via
+        ``git_ops.get_main_sha()`` and then merges in, so pointing it at a
+        non-git directory (the real-fail-open trick
+        test_merge_queue_store.py::test_divergence_replaces_and_warns uses at
+        the ``recover_pending_merges`` call site, where nothing else needs the
+        root) breaks the merge this test must observe.  Retiring the residue
+        needs one production change: thread the containment predicate into
+        ``classify_and_merge`` as an injectable port, as ``verifier=`` already
+        is for verification.
         """
         from orchestrator.merge_queue import classify_and_merge, patch_content_contained
 

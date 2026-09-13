@@ -37,6 +37,7 @@ from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.merge_queue import (
     _MAX_EVENT_EVIDENCE_ITEMS,
+    MAIN_HEALTH_PROBE_PENDING_NOTE,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
@@ -121,7 +122,9 @@ def _commit_file(root: Path, rel_path: str, content: str, message: str) -> str:
     ).stdout.strip()
 
 
-def _make_config(project_root: Path) -> OrchestratorConfig:
+def _make_config(
+    project_root: Path, *, escalate_preexisting_main_break: bool = False,
+) -> OrchestratorConfig:
     """``escalate_preexisting_main_break=False`` retires the second probe seam.
 
     That probe (``verify_failure_is_preexisting_on_main``) is a real
@@ -138,11 +141,16 @@ def _make_config(project_root: Path) -> OrchestratorConfig:
     test_deferred_returns_promptly_with_provisional_outcome, which also pins
     the live probe task this harness no longer spawns.  status, disposition,
     failure_diagnostic and skew_evidence are byte-identical either way.
+
+    Passing ``escalate_preexisting_main_break=True`` restores the SHIPPED
+    default (``config.py``) so this harness still touches the configuration an
+    orchestrator actually runs in at least once -- see
+    :class:`TestShippedMainHealthConfiguration`.
     """
     return OrchestratorConfig(
         project_root=project_root,
         max_concurrent_tasks=1,
-        escalate_preexisting_main_break=False,
+        escalate_preexisting_main_break=escalate_preexisting_main_break,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -152,11 +160,23 @@ def _make_config(project_root: Path) -> OrchestratorConfig:
     )
 
 
-def _make_git_ops(project_root: Path) -> GitOps:
+def _make_git_ops(
+    project_root: Path, *, main_sha: str = 'should-not-be-used-sha',
+) -> GitOps:
+    """*main_sha* is what ``get_main_sha()`` answers.
+
+    The default name says it: the skew verdict is built from ``item.base_sha``
+    and the real repo, never from this.  ``''`` is ``get_main_sha``'s own
+    documented error return, and handing it to the DEFERRED main-health probe
+    stops that probe at ``verify_failure_is_preexisting_on_main``'s ``if not
+    main_sha`` early return -- which is how
+    :class:`TestShippedMainHealthConfiguration` can let the probe really spawn
+    without paying for a probe build.
+    """
     git_ops = MagicMock(spec=GitOps)
     git_ops.project_root = project_root
     git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    git_ops.get_main_sha = AsyncMock(return_value='should-not-be-used-sha')
+    git_ops.get_main_sha = AsyncMock(return_value=main_sha)
     return git_ops
 
 
@@ -263,8 +283,11 @@ def _make_item(
     future: asyncio.Future,
     *,
     merged_branch_tip: str | None,
+    escalate_preexisting_main_break: bool = False,
 ) -> tuple[MergeRequest, RealMergeItem]:
-    config = _make_config(repo)
+    config = _make_config(
+        repo, escalate_preexisting_main_break=escalate_preexisting_main_break,
+    )
     merge_wt = tmp_path / 'merge-wt'
     merge_wt.mkdir(exist_ok=True)
     req = MergeRequest(
@@ -284,6 +307,7 @@ def _make_item(
 
 def _skew_worker(
     repo: Path, store: EventStore, verify_result: VerifyResult = _XPY_FAILURE,
+    *, main_sha: str = 'should-not-be-used-sha',
 ) -> SpeculativeMergeWorker:
     """The harness worker, with the verify port INJECTED rather than patched.
 
@@ -299,7 +323,8 @@ def _skew_worker(
     that ``fails(category=, summary=)`` cannot express.
     """
     return SpeculativeMergeWorker(
-        git_ops=_make_git_ops(repo), queue=asyncio.Queue(), event_store=store,
+        git_ops=_make_git_ops(repo, main_sha=main_sha), queue=asyncio.Queue(),
+        event_store=store,
         verifier=FakeVerifier(default=VerifyScript(result=verify_result)),
     )
 
@@ -308,6 +333,7 @@ async def _finalize_via_real_worker(
     tmp_path: Path, repo: Path, topology: dict[str, str], store: EventStore,
     *, merged_branch_tip: str | None,
     verify_result: VerifyResult = _XPY_FAILURE,
+    shipped_main_health: bool = False,
 ) -> MergeOutcome | None:
     """Drive the REAL ``SpeculativeMergeWorker._finalize_inflight`` (step 18)
     and hand back the MergeOutcome it delivered on ``req.result``.
@@ -316,8 +342,18 @@ async def _finalize_via_real_worker(
     ``MergeOutcome.skew_evidence`` — the seam the widened step-18 emit guard
     keys on — from the same run that produced the runs.db row, rather than
     inferring the outcome's shape from the row alone.
+
+    *shipped_main_health* runs the case under the configuration an orchestrator
+    actually ships with: ``escalate_preexisting_main_break`` at its default, so
+    ``_spawn_main_health_probe`` really spawns and the provisional note really
+    is appended — paired with a ``get_main_sha()`` that fail-opens to ``''`` so
+    the spawned probe stops at its own first guard instead of running a build
+    on main.  Default ``False`` keeps every other caller byte-identical.
     """
-    worker = _skew_worker(repo, store, verify_result)
+    worker = _skew_worker(
+        repo, store, verify_result,
+        main_sha='' if shipped_main_health else 'should-not-be-used-sha',
+    )
     alloc = MagicMock()
     alloc.release = AsyncMock()
     alloc.cancel_and_release = AsyncMock()
@@ -328,6 +364,7 @@ async def _finalize_via_real_worker(
     _req, item = _make_item(
         tmp_path, repo, topology, future,
         merged_branch_tip=merged_branch_tip,
+        escalate_preexisting_main_break=shipped_main_health,
     )
     entry = InflightEntry(
         item=item,
@@ -869,3 +906,69 @@ class TestReviewBounceStaleGreenTradeoff:
         diag_joined = ' '.join(outcome.failure_diagnostic.values())
         assert topology['landing_sha'] in diag_joined, diag_joined
         assert 'src/x.py' in diag_joined, diag_joined
+
+
+# ---------------------------------------------------------------------------
+# The one case that runs under the SHIPPED main-health configuration
+# ---------------------------------------------------------------------------
+
+
+class TestShippedMainHealthConfiguration:
+    """Keeps this harness honest about the configuration it runs in.
+
+    Every other case here sets ``escalate_preexisting_main_break=False``
+    (``_make_config``) to retire the ``verify_failure_is_preexisting_on_main``
+    patch.  That knob defaults to True in ``config.py``, so without this case
+    the module — whose whole stated value is that everything except the scoped
+    verify runs against real production code — would never touch the shipped
+    configuration, and the deferred-probe arm of ``_run_post_merge_verify``
+    would be unreachable from here.
+
+    The probe is made CHEAP, not fake: ``get_main_sha()`` fail-opens to ``''``,
+    which is its own documented error return, so the spawned probe stops at
+    ``verify_failure_is_preexisting_on_main``'s ``if not main_sha`` guard
+    instead of paying for a build/test on main.  Everything up to and
+    including the spawn — the three cheap guards, the spawn itself, and the
+    caller's decision to annotate the provisional reason — is real.
+    """
+
+    def test_shipped_default_spawns_the_probe_and_annotates_the_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, topology, store = _setup_skew_scenario(tmp_path)
+
+        outcome = asyncio.run(
+            _finalize_via_real_worker(
+                tmp_path, repo, topology, store,
+                merged_branch_tip=topology['branch_tip_sha'],
+                shipped_main_health=True,
+            )
+        )
+
+        assert outcome is not None
+        assert MAIN_HEALTH_PROBE_PENDING_NOTE in outcome.reason, (
+            f'under the shipped default the blocked outcome must be marked '
+            f'as pending reclassification; got reason={outcome.reason!r}'
+        )
+
+    def test_the_knob_does_not_move_the_skew_verdict(self, tmp_path: Path) -> None:
+        """The delta ``_make_config`` documents is confined to the provisional
+        note: disposition, failure_diagnostic and skew_evidence must read the
+        same under the shipped default as under the knob-off harness."""
+        repo, topology, store = _setup_skew_scenario(tmp_path)
+
+        outcome = asyncio.run(
+            _finalize_via_real_worker(
+                tmp_path, repo, topology, store,
+                merged_branch_tip=topology['branch_tip_sha'],
+                shipped_main_health=True,
+            )
+        )
+
+        assert outcome is not None
+        assert outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW
+        assert outcome.failure_diagnostic is not None
+        diag_joined = ' '.join(outcome.failure_diagnostic.values())
+        assert topology['landing_sha'] in diag_joined, diag_joined
+        assert 'src/x.py' in diag_joined, diag_joined
+        assert outcome.skew_evidence is not None
