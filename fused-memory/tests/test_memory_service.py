@@ -13499,3 +13499,153 @@ class TestQueueGroupIdToProjectId:
         service.set_known_projects({})
         assert service._project_id_from_queue_group_id('mem0_ghost') == 'ghost'
         assert service._project_id_from_queue_group_id('ghost') == 'ghost'
+
+
+class TestDeadLetterAlarmWiring:
+    """`initialize()` wires the alarm; `_report_queue_dead_letter` files it."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_wires_the_bound_report_method(self, service):
+        """A BOUND METHOD, for the same call-time-resolution reason
+        `_record_queue_terminal_outcome`'s docstring gives: `server/main.py`
+        calls `initialize()` BEFORE `set_known_projects()`, so the map is still
+        empty at the moment the hook is constructed."""
+        service.graphiti.initialize = AsyncMock()
+        await service.initialize()
+        try:
+            assert (
+                service.durable_queue._on_dead_letter
+                == service._report_queue_dead_letter
+            )
+        finally:
+            await service.durable_queue.close()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_project_files_nothing_and_warns(
+        self, service, caplog, monkeypatch,
+    ):
+        """No cwd fallback, ever.
+
+        `config.taskmaster.project_root` defaults to `'.'`, so a fallback would
+        file into the server's cwd where no operator watches and report success
+        doing it — a silent misfile is strictly worse than a logged refusal,
+        because it also destroys the evidence the alarm ever fired.
+        """
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        emitted = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: emitted.append((a, kw)),
+        )
+        service.set_known_projects({'somewhere_else': '/root/elsewhere'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='orphan', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id='W1',
+            payload={'content': 'x'}, post_execute=False,
+        )
+        with caplog.at_level(logging.WARNING, logger=memory_service.__name__):
+            await service._report_queue_dead_letter(event)
+
+        assert emitted == [], 'nothing may be filed against a guessed root'
+        assert caplog.records, 'the refusal must stay recoverable from logs'
+        assert 'orphan' in caplog.text, caplog.text
+        assert 'add_episode' in caplog.text, caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_project_emits_off_the_event_loop(
+        self, service, monkeypatch,
+    ):
+        """`EscalationQueue.submit` is blocking file I/O and this hook runs on
+        the event loop inside the queue worker, so the emit must go through
+        `asyncio.to_thread` — the same discipline as `_record_entity_mint`."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        calls = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        threads = []
+        real_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(fn, *a, **kw):
+            threads.append(fn)
+            return await real_to_thread(fn, *a, **kw)
+
+        monkeypatch.setattr(asyncio, 'to_thread', spy_to_thread)
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='proj1', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id='W1',
+            payload={'content': 'lost content'}, post_execute=False,
+        )
+        await service._report_queue_dead_letter(event)
+
+        assert len(calls) == 1, calls
+        args, kwargs = calls[0]
+        assert args == ('/root/proj1',), 'project_root is passed positionally'
+        assert kwargs['project_id'] == 'proj1'
+        assert kwargs['operation'] == 'add_episode'
+        assert kwargs['group_id'] == 'proj1'
+        assert kwargs['item_id'] == 3
+        assert kwargs['attempts'] == 5
+        assert kwargs['write_op_id'] == 'W1'
+        assert kwargs['post_execute'] is False
+        assert kwargs['content_preview'] == 'lost content'
+        assert memory_service.emit_dead_letter_escalation in threads, (
+            'the blocking escalation write must not run on the event loop'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_emit_never_reaches_the_queue_worker(
+        self, service, monkeypatch, caplog,
+    ):
+        """Belt to the escalator's own never-raise braces."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        def _explode(*_a, **_kw):
+            raise OSError('escalation queue is on fire')
+
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation', _explode
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='proj1', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id=None,
+            payload=None, post_execute=False,
+        )
+        with caplog.at_level(logging.ERROR, logger=memory_service.__name__):
+            await service._report_queue_dead_letter(event)
+
+        assert caplog.records, 'a swallowed failure must still be visible'
+
+    @pytest.mark.asyncio
+    async def test_a_missing_payload_still_files(self, service, monkeypatch):
+        """`payload` is None when the queue row would not parse; the alarm is
+        needed MORE in that case, not less."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        calls = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='mem0_proj1',
+            operation='mem0_classify_and_add', attempts=5,
+            error='RuntimeError: boom', write_op_id=None,
+            payload=None, post_execute=False,
+        )
+        await service._report_queue_dead_letter(event)
+
+        assert len(calls) == 1, calls
+        assert calls[0][1]['project_id'] == 'proj1'
+        assert calls[0][1]['content_preview'] == ''

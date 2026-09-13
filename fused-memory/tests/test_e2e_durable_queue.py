@@ -955,3 +955,115 @@ class TestTerminalOutcomeWrittenBack:
         # clobbering it.
         assert row['terminal_status'] == 'completed'
         assert row['terminal_error'] is None
+
+
+# ---------------------------------------------------------------------------
+# THE ACCEPTANCE TEST (task 3583).
+#
+# The property under test is not "a dead-letter is recorded" — task 3582
+# already established that, on `write_ops.terminal_status`. It is that the
+# failure REACHES someone: observable by reading the escalation queue ALONE,
+# with write_queue.db and write_journal.db never opened. Those two are exactly
+# what an operator does not have once routine `delete_dead_letters` cleanup has
+# run, which is how 28 permanently-failed writes went unnoticed for three and a
+# half months in the esc-3561-3 investigation.
+# ---------------------------------------------------------------------------
+
+
+def _filed_escalations(root):
+    """The parsed escalation payloads under ``{root}/data/escalations``."""
+    import json
+
+    queue_dir = root / 'data' / 'escalations'
+    if not queue_dir.exists():
+        return []
+    return [json.loads(p.read_text()) for p in sorted(queue_dir.glob('esc-*.json'))]
+
+
+async def _poll_for_escalation(root):
+    """Wait for the alarm to land, reading ONLY the escalation queue."""
+    return await poll_until(
+        lambda: _filed_escalations(root) or None,
+        timeout=20.0,
+        interval=0.05,
+        message=f'no escalation was ever filed under {root}/data/escalations',
+    )
+
+
+class TestAddEpisodeDeadLetterIsObservable:
+    @pytest.mark.asyncio
+    async def test_a_dead_lettered_add_episode_reaches_the_escalation_queue(
+        self, journaled_service, tmp_path,
+    ):
+        svc, _journal = journaled_service
+        # The esc-3561-3 shape: NodeNotFoundError, one per write, each naming a
+        # different uuid — which is why the fold keys on the class, not the text.
+        svc.graphiti.add_episode = AsyncMock(
+            side_effect=RuntimeError('node 0e1d2c3b-aaaa-bbbb-cccc-444455556666 not found')
+        )
+        # The fixture deliberately does NOT do this, mirroring server/main.py's
+        # initialize()-then-inject order. Without it the escalation correctly
+        # refuses to file rather than guessing a root.
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        response = await svc.add_episode(
+            content='an episode the caller was told had been accepted',
+            project_id='main',
+        )
+
+        # The synchronous contract is deliberately UNCHANGED: hedging the word
+        # would not fix a caller that gets 'queued' and later gets nothing.
+        assert response.status.value == 'queued'
+        episode_id = response.episode_id
+
+        filed = await _poll_for_escalation(tmp_path)
+
+        assert len(filed) == 1, f'expected one alarm, got {filed}'
+        record = filed[0]
+        assert record['category'] == 'durable_write_dead_letter'
+        assert "operation='add_episode'" in record['detail'], record['detail']
+        assert 'add_episode' in record['summary'], record['summary']
+        assert "project_id='main'" in record['detail'], record['detail']
+
+        # The line that makes this actionable rather than merely alarming: it
+        # says not only that a write died but that a caller ACTED on a success
+        # that will never be true, and names the id that caller holds.
+        assert 'reported_to_caller=' in record['detail'], record['detail']
+        assert 'queued' in record['detail'], record['detail']
+        assert episode_id in record['detail'], (
+            'the returned episode_id must appear verbatim so an operator can '
+            'tie the alarm back to the call that was lied to'
+        )
+
+    @pytest.mark.asyncio
+    async def test_nothing_but_the_escalation_queue_was_needed(
+        self, journaled_service, tmp_path,
+    ):
+        """The negative half of the property: the alarm is self-sufficient.
+
+        Deletes BOTH sqlite files before asserting, reproducing the state an
+        operator is actually in after `delete_dead_letters` — and then reads
+        the escalation and finds the operation, the project, the attempt count
+        and the lost content still there.
+        """
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        await svc.add_episode(
+            content='the only surviving copy of this content', project_id='main',
+        )
+        await _poll_for_escalation(tmp_path)
+
+        await svc.close()
+        await journal.close()
+        for db in tmp_path.rglob('*.db*'):
+            db.unlink()
+
+        record = _filed_escalations(tmp_path)[0]
+        assert "operation='add_episode'" in record['detail'], record['detail']
+        assert "project_id='main'" in record['detail'], record['detail']
+        assert 'attempts=' in record['detail'], record['detail']
+        assert 'the only surviving copy of this content' in record['detail'], (
+            'the content preview is the last trace of what was lost'
+        )
