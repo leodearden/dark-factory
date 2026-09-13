@@ -2131,3 +2131,143 @@ class TestDeadLetterHook:
             assert events == []
         finally:
             await q.close()
+
+    @pytest.mark.asyncio
+    async def test_the_alarm_is_not_gated_on_a_write_op_id(self, tmp_path):
+        """The hole task 3582 left, and the one point the two hooks diverge.
+
+        `_notify_terminal` skips a payload with no `_write_op_id` — correctly,
+        since there is genuinely nothing to join the outcome back to, and its
+        docstring names `replay_from_store` and `mem0_classify_and_add` as the
+        operations that shape. But that gate silently exempts every
+        `mem0_classify_and_add` (one per extracted fact per episode) from the
+        alarm, whose death today reaches nothing but a log line. An operator
+        alarm needs no join key.
+        """
+        events, hook = self._recorder()
+        terminal_calls: list = []
+
+        async def terminal_hook(write_op_id, status, error):
+            terminal_calls.append((write_op_id, status, error))
+
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+            on_terminal=terminal_hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='mem0_proj1', operation='mem0_classify_and_add',
+                payload={'fact_text': 'no join key here', 'project_id': 'proj1'},
+            )
+            await _poll_until_dead(
+                q, group_id='mem0_proj1', expected_dead=1, timeout=20.0
+            )
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1
+            assert events[0].write_op_id is None
+            assert events[0].operation == 'mem0_classify_and_add'
+            assert events[0].group_id == 'mem0_proj1'
+            assert terminal_calls == [], (
+                'on_terminal still has nothing to join back to and must stay '
+                'gated; only the alarm fires'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_post_execute_death_is_flagged_structurally(self, tmp_path):
+        """'dead' does NOT imply the backend write never happened.
+
+        The callback runs after `_execute_write` has already returned, so a
+        callback that keeps failing dead-letters an item whose write DID land.
+        That flag is what tells a triager a blind replay would DUPLICATE it, so
+        it must reach the alarm as a boolean rather than as a prefix the
+        consumer has to notice and parse.
+        """
+        events, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'the write landed', '_write_op_id': 'W4'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1
+            event = events[0]
+            assert event.post_execute is True
+            assert event.error is not None
+            assert event.error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+            assert 'callback keeps failing' in event.error
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_raising_hook_is_swallowed_and_logged(self, tmp_path, caplog):
+        """The queue's correctness must never depend on the alarm succeeding.
+
+        The item is already committed dead by the time this runs; a raise here
+        would escape `_process_item` into `_worker_loop` and kill the worker,
+        so one failed alarm would stop the group draining entirely.
+        """
+        seen: list[int] = []
+
+        async def exploding_hook(event):
+            seen.append(event.item_id)
+            raise RuntimeError('the escalation queue is on fire')
+
+        q = self._queue(
+            tmp_path,
+            hook=exploding_hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        db_path = tmp_path / 'queue' / 'write_queue.db'
+        await q.initialize()
+        try:
+            with caplog.at_level(logging.WARNING, logger=dq_module.__name__):
+                first = await q.enqueue(
+                    group_id='proj1', operation='add_episode',
+                    payload={'content': 'a', '_write_op_id': 'W5'},
+                )
+                await q.enqueue(
+                    group_id='proj1', operation='add_episode',
+                    payload={'content': 'b', '_write_op_id': 'W6'},
+                )
+                # The worker keeps draining despite the hook raising on item 1.
+                await _poll_until_dead(
+                    q, group_id='proj1', expected_dead=2, timeout=20.0
+                )
+                await poll_until(
+                    lambda: len(seen) >= 2, timeout=20.0, interval=0.05
+                )
+
+            assert f'{first}' in caplog.text, caplog.text
+            assert 'add_episode' in caplog.text, caplog.text
+        finally:
+            await q.close()
+
+        async with aiosqlite.connect(str(db_path)) as raw_db:
+            raw_db.row_factory = aiosqlite.Row
+            cursor = await raw_db.execute(
+                'SELECT status FROM write_queue ORDER BY id'
+            )
+            rows = await cursor.fetchall()
+        assert [r['status'] for r in rows] == ['dead', 'dead'], (
+            'a failing alarm must not disturb the committed terminal state'
+        )
