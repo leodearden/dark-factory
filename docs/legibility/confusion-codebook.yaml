@@ -337,6 +337,19 @@ entries:
     origin_phase: implement
     manifested_phase: verify
     note: Verify summary truncates test output (5658 of 7658 bytes dropped); assertion message shows identical values ('opus' != 'opus') making root cause undiagnosable from the block report
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 784a2394-cb13-4536-9901-55b06ea10517
+    origin_phase: verify
+    manifested_phase: unknown
+    note: Post-merge verification summary reports category 'unknown_test_failure' with aggregate '8 errors' and pass count only; no test names, assertion failures, file paths, or command/SHA provenance in the block-report detail, preventing triage.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 4b74bd83-3340-46b2-a5ed-0a28f405a13b
+    origin_phase: verify
+    manifested_phase: merge
+    invariant_violated: block_report_summary lacks test name, SHA, or failure details
+    note: 'Post-merge verification block report reduced to bare ''blocked:'' with no test name or failure context. Failed test: test_every_escalation_server_tool_is_classified. Digest also reports not-found signal at same turn.'
 - id: verify-scope-asymmetry
   title: 'Verify scope asymmetry: scoped merge-verify lands red main while full/fallback task verify charges pre-existing and infra failures to innocent tasks'
   severity: high
@@ -972,6 +985,12 @@ entries:
     origin_phase: recon
     manifested_phase: ops
     note: 'Session re-probes escalations filed during automated/recon phases and discovers diagnoses are incorrect. Examples: esc-4910 race premise false after code inspection, merge-verify hypotheses wrong (not stuck, waiting on pool), stale L2 premises. Escalations assert causal diagnoses without re-verification when underlying state changes.'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: db8a3d49-5c2d-4b2b-8278-1bc95a1debc2
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Guards fired (df_guard:2) and blocked on missing prerequisites (not_found:2) without clear context; gates depend on evidence (files/paths) that don't exist in the worktree. Orchestrated task ended in 540 bytes, suggesting early guard failure.
 - id: merge-state-not-git-corroborated
   title: Merge-lane state answers come from run-scoped caches and persisted snapshots that diverge from git truth
   severity: high
@@ -1201,6 +1220,12 @@ entries:
     manifested_phase: merge
     invariant_violated: No feed-forward of prior analysis across retries; repeated operations without diagnostic context
     note: Session shows 12x retry on get_merge_queue with empty response, 3x failed release_workflow attempts, and 7x merge_status retries, each operating independently without visible progress tracking or prior-attempt context. Matches 'Block-time investigators... launch cold and die silent' pattern.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 6a1b33ae-222e-4f23-bdad-8a15f9ae6604
+    origin_phase: prd
+    manifested_phase: architect
+    note: Planning-phase dispatch consumed 124 transcript turns and exhausted $15 budget with zero output—characteristic pattern of amnesiac investigation running retry loops until budget exhaustion
 - id: recon-prompt-schema-drift
   title: Recon stage prompts show pseudocode diverging from real MCP schemas; fused-memory identifier naming is inconsistent across sibling tools
   severity: medium
@@ -1924,6 +1949,18 @@ entries:
     origin_phase: unknown
     manifested_phase: merge
     note: Watcher agent (agent_class='watcher') terminated with SIGKILL (exit 137) during pytest verification in merge conflict resolution; consistent with documented harness bg-task reaping of watcher loops
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 2ee58614-3533-4df9-a956-9755f8227511
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session shows 30+ background 'Re-arm L2 watcher' tasks repeatedly killed by memory pressure, with only 1 completion (bcnszc4ld). Matches documented bg-task reaping issue; watcher loop spawns many tasks, most fail under resource constraints.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 375b7c3f-88d0-4608-bbf2-c4ab9d7bce91
+    origin_phase: ops
+    manifested_phase: ops
+    note: Background tasks killed by memory pressure (turns 415-416); watcher agent in retry loops (40x reap-decisions, 35x heartbeat/lease/drain checks); session score 36.0 with 4 tool_errors and 2 not_found signals
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -2226,6 +2263,19 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: 'StructuredOutput schema double-wrapping: response wraps output as {"decisions": {"decisions": [...]}} (schema parameter name + required field wrapper) when schema expects /decisions to be a top-level array. Validation error: ''Output does not match required schema: /decisions: must be array''. Matches documented collision between StructuredOutput parameter name and schema top-level key.'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 3b7a07d2-ffc0-4347-9c27-a2574ed38265
+    origin_phase: unknown
+    manifested_phase: review
+    note: 'StructuredOutput double-wrap: decisions field nested inside itself ({"decisions": {"decisions": [...]}}), matching module-tagger pattern where parameter name collides with schema top-level key'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 02beb94c-ca8e-49d1-801c-c9339e73131b
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: 'StructuredOutput schema contract mismatch: root object missing ''severity'' property; ''findings'' value is object instead of array. Output double-wraps: {"findings": {"findings": [...]}} instead of {"severity": "...", "findings": [...]}'
+    note: 'Recon stage StructuredOutput output violates schema shape at turn 25. Pattern matches subagent-runner-protocol-defects: the StructuredOutput parameter name conflates with schema structure, causing incorrect nesting and missing root properties.'
 - id: prose-routing-intent
   title: Execution-routing intent lives only in description prose — no-code deploys, gates, operator actions, and design decisions dispatch into the TDD architect pipeline
   severity: medium
@@ -2455,6 +2505,12 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: Guard trip 'darkfactorypathscopeviolation' during code review aligns with known path-scope guard over-firing pattern (3 interactive over-fires in adjudicated batch)
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 18c9a82c-6745-48cf-a24f-967e452537c9
+    origin_phase: implement
+    manifested_phase: unknown
+    note: Path-scope guard (darkfactorypathscopeviolation) fired twice in interactive session; matches known over-firing issue (task 2434)
 - id: oneoff-2026-07-02
   title: 'Implementer twice re-built the explicitly forbidden _xdist_resilience custom scheduler (task 1907) — model negative-instruction attractor; mitigate mechanically: lead descriptions '
   severity: low
@@ -4305,6 +4361,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Score 3.0 assigned despite digest body containing only 3 bare signal templates; signal_counts detected but substance collapsed to empty boilerplate
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 5875250c-45e1-4cde-a884-015643a332bf
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Session digest is minimal (456 bytes) with mostly zero signal_counts and a single sparse not_found entry; collapsed to near-boilerplate substance.
 - id: entry-cand-20260720-7
   title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
   severity: medium
@@ -5617,6 +5679,19 @@ entries:
     origin_phase: unknown
     manifested_phase: review
     note: 'User provides explicit correction teaching the distinction: resemblance-to-prior-round ≠ verified resolution. Session shows remediation of adjudicator confusion by stating the rule clearly: ''Classify settled ONLY when confident concern was actually resolved earlier, never merely because it resembles something raised before.'' Prior-deferred concerns remain open and must still be emitted.'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 33c07b8f-1f5d-42d7-90b4-5922b5f2e4eb
+    origin_phase: review
+    manifested_phase: review
+    note: 'Session contains explicit instructions distinguishing ''settled/resolved'' from ''deferred/still-open'' prior concerns in review adjudication. The PRIOR-ROUND block teaches the exact pattern: a current suggestion matching only a deferred (unaddressed) prior concern must NOT be classified as settled. This directly validates the candidate premise.'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 8472b8fc-5eac-4b51-a42f-04a99b25450e
+    origin_phase: review
+    manifested_phase: review
+    invariant_violated: resemblance-to-prior-round ≠ verified resolution
+    note: 'User explicitly clarifies distinction between ''settled'' (genuinely resolved) vs ''deferred'' (still open, unaddressed) prior concerns in review adjudication. Instruction: ''Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. Classify settled ONLY when you are confident the concern was actually resolved earlier, never merely because it resembles something raised before.'' This confirms agents conflate resemblance with resolution.'
 - id: entry-cand-20260715-4
   title: watcher-rearm.sh requires DARK_FACTORY_ROOT, unset by the rotation's injected supervisor prompt
   severity: medium
@@ -5725,6 +5800,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Session's 'User Corrections' bucket mislabels an injected trickle-coder task prompt ('You are the periodic-census synthesis writer...') as user feedback, demonstrating recursive self-pollution of the codebook corpus via digest capture pipeline.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: ca8c9ae2-8a65-45c3-8321-468b7ceedd34
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Session digest contains the literal example turn reference from the trickle-coder prompt specification ('(turn 70) does not exist') as an actual 'not_found' signal. Indicates digest-capture pipeline is recursively ingesting the trickle-coder's own meta-prompt/specification as session content, realizing the self-pollution risk.
 - id: entry-cand-20260714-3
   title: Recon dedup 'fully resolved' claims come from an under-scoped search radius, so live near-duplicates recur across cycles
   severity: medium
@@ -6459,6 +6540,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: ModuleNotFoundError in Not Found signals matches worktree module import failures during or after code changes
+  - date: '2026-09-12'
+    project: dark_factory
+    session: a4b22214-5b58-4e8a-9222-0945041a2969
+    origin_phase: architect
+    manifested_phase: recon
+    note: ModuleNotFoundError (turns 181, 234) and command-not-found (turn 311) match the pattern, though manifested in recon/curation phase rather than architect. Suggests root cause generalizes beyond architect context.
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -6942,6 +7029,12 @@ entries:
     origin_phase: review
     manifested_phase: ops
     note: Digest 'User Corrections' section captures what appears to be the injected task prompt ('Match reviewer findings to ground truth issues in this code diff') rather than actual user feedback. Turn annotation (turn 4) contradicts n_user_turns=1; all signal_counts are 0.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 2441fa37-e1b1-425a-a27f-3c716feaf120
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest 'User Corrections' bucket captures an injected system/task instruction about review-adjudication logic ('Classify "settled" ONLY when...'), mislabeling it as user-provided feedback
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -7752,6 +7845,30 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Not Found signal rendered as incomplete template '(turn 80) not found in' with matched substring/context dropped; should show what wasn't found and where
+  - date: '2026-09-12'
+    project: dark_factory
+    session: e7139855-736f-46ee-85c0-3ce44a02b1a7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Not-found signals rendered as bare templates stripped of context: ''does not exist'', ''not found in'' (×3) with no file paths, search scopes, or diagnostic detail'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: f08a986a-346a-46e7-97ad-0a1447bb37fd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Guard trip rendered as bare template: ''(turn 4) blocked:'' with no detail. The matched substring (guard name, condition, or reason) is completely missing. Suggests digest extraction failed to capture guard context or reason.'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 2fd02c94-58ca-4289-adb3-edb6ba47d344
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest renders not_found signals as bare '(turn N) does not exist' templates without indicating what was actually requested or why the turn was out-of-range.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 6da1b74a-cbff-46e1-befa-9c6d78e53fe6
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest generator renders not_found signals as bare templates ('does not exist') without diagnostic context about what was attempted
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -8654,6 +8771,18 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: Digest 'User Corrections' captures '(turn 4) Match reviewer findings to ground truth issues in this code diff' — task instruction or reviewer directive, not actual user feedback/correction to the session.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 339e925c-70d2-43ec-a45c-8c452ae80fe0
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Digest 'User Corrections' bucket mislabels task block failure diagnostics (verify logs, test failures, block reasons) as corrective user feedback; session has n_user_turns=1 but digest attributes system output at turn 26 as user input at turn 4
+  - date: '2026-09-12'
+    project: dark_factory
+    session: ae3444c0-b396-47d3-ad95-bf4892a93882
+    origin_phase: review
+    manifested_phase: review
+    note: Digest 'User Corrections' bucket captures structured code-review blocking-issues report (reviewer_comprehensive feedback with Location/Issue/Suggested fix sections) as if it were user corrective feedback; 58KB of 60KB report content truncated
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -9373,6 +9502,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Digest score (26.0) and ''User Corrections'' bucket (5 items) decoupled from signal_counts: {not_found:1, others:0}'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: ae3444c0-b396-47d3-ad95-bf4892a93882
+    origin_phase: review
+    manifested_phase: review
+    note: Score 5.0 and 'User Corrections' label assigned despite all signal_counts reading zero (tool_error=0, self_correct=0, not_found=0, df_guard=0, interrupt=0, designed_outcome=0)
 - id: entry-cand-20260729-3
   title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
   severity: medium
@@ -9959,6 +10094,18 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: Score 5.0 assigned despite all signal_counts (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome) reading zero; digest severity decoupled from evidence body.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 2441fa37-e1b1-425a-a27f-3c716feaf120
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest assigned severity score of 5.0 despite all signal_counts reading 0 across all categories
+  - date: '2026-09-12'
+    project: dark_factory
+    session: ae3444c0-b396-47d3-ad95-bf4892a93882
+    origin_phase: review
+    manifested_phase: review
+    note: High severity score (5.0) assigned to digest despite every individual signal_count reading zero
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -10617,6 +10764,18 @@ entries:
     manifested_phase: recon
     invariant_violated: Digest 'User Corrections' bucket should not capture structured orchestrator output (verify summaries, test counts, archive log paths); only actual user input or task-framing corrections belong there
     note: Orchestrated task 4936 post-merge-verification failure (20813 passed, 16 errors) captured in digest 'User Corrections' section with structured test failure summary, archive paths, and verify-log references — indistinguishable from a user-provided correction in the digest schema
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 84a28543-927e-450f-91bb-7dc556951cd1
+    origin_phase: unknown
+    manifested_phase: recon
+    note: The autonomous watcher's injected supervisor briefing (ROTATION_ESCALATIONS, ROTATION_HOURS, DARK_FACTORY_ROOT setup, watcher-rearm.sh instruction) is filed under 'User Corrections' in the digest despite explicit '(injected by supervisor)' marker. The briefing is system-injected task context, not a user edit.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: e65e5284-140a-434a-b5c3-dc4bce02b9c5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest 'User Corrections' section captures the watcher rotation's injected supervisor prompt (ROTATION_ESCALATIONS, ROTATION_HOURS, project root, DARK_FACTORY_ROOT, watcher-rearm.sh instructions) rather than actual user-provided corrections. Same mislabeling pattern as dispatched-task variants, applied to watcher rotation session context.
 - id: entry-cand-20260729-5
   title: Sibling planning sessions race on a shared in-progress design doc
   severity: medium
@@ -11500,6 +11659,12 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: Digest labels dispatched task's injected adjudication-instruction briefing block ('You are adjudicating...PRIOR-ROUND SUGGESTIONS') as 'User Corrections' instead of recognizing it as task-injected context. The instruction text is the task's own framing for the adjudication role, not user feedback.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 33c07b8f-1f5d-42d7-90b4-5922b5f2e4eb
+    origin_phase: review
+    manifested_phase: review
+    note: 'The ''User Corrections'' bucket captures an injected task-briefing instruction block (review adjudication guidelines) rather than actual user corrections or feedback. This is mislabeling by the digest generator: the content is templated task context, not user feedback.'
 - id: entry-cand-20260728-3
   title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
   severity: medium
@@ -13649,6 +13814,36 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Repeated 'no such file or directory' (2x) in Not Found signals suggests file resolution failures in task worktree context
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 9c03a7bb-8d3c-42f8-a54c-212d5aaf5bf5
+    origin_phase: unknown
+    manifested_phase: verify
+    note: 8 'no such file or directory', 'does not exist', and 'ModuleNotFoundError' signals at turns 47, 75, 118, 185, 189, 656, 1694, 1792 during /unblock task orchestration; matches pattern of repeated path resolution failures in worktree context, though session is interactive rather than dedicated orchestrated task
+  - date: '2026-09-12'
+    project: dark_factory
+    session: e7139855-736f-46ee-85c0-3ce44a02b1a7
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated worktree task 3568 fires repeated 'no such file or directory' errors (4 not_found + 1 tool_error) searching for nonexistent test files (test_add_episode_uuid_seed.py, test_graphiti_add_episode_uuid_param.py in fused-memory/tests/) with no diagnostic context beyond the errors themselves
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 6ba99ee3-3e1a-4c83-825a-2b30bb711fef
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Orchestrated worktree task fires repeated ''no such file or directory'' errors: .task/metadata.json (turns 26, 28, 41), .task/plan.json (turns 28, 41), merge_gates.py (turn 61). 4 not_found signals + 5 tool_error signals. No diagnostic beyond repeated failures.'
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 6a1b33ae-222e-4f23-bdad-8a15f9ae6604
+    origin_phase: unknown
+    manifested_phase: architect
+    note: Orchestrated task worktree fires repeated 'no such file or directory' errors (turns 61, 70, 81) while globbing for files in subagents/ directory that does not exist in the task's .task/claude-config structure
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 339e925c-70d2-43ec-a45c-8c452ae80fe0
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Orchestrated worktree task (3781) fires file-read error (exit 1) when attempting diagnostic read of .task/metadata.json; file empty or missing; stderr suppressed by 2>/dev/null redirection leaves no diagnostic signal
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -13982,6 +14177,18 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: Digest 'Retry Loops' section flags multiple watcher-rearm.sh and time-remaining-check Bash calls as retry behavior, but signal_counts marks them as designed_outcome (2 ceiling exits). Watcher's bounded-wait polling and rotation-deadline checks are designed once-per-iteration behavior, not actual retries, yet digest presentation conflates them.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 375b7c3f-88d0-4608-bbf2-c4ab9d7bce91
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest 'Retry Loops' bucket contains 40x identical reap-decisions command and 35x identical lease-heartbeat/loop/fires/drain monitoring command — designed watcher polling operations flagged as retry loops
+  - date: '2026-09-12'
+    project: dark_factory
+    session: fa46b9ce-5a21-471f-a14e-735a1ee5cb10
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest 'Retry Loops' bucket aggregates 4 watcher-rearm.sh calls (2 shown with designed exit 124 CEILING outcomes in turns 204, 215, 282) and 3 date checks—these are designed operational loops (escalation re-arm + rotation deadline checks), not error retries
 - id: entry-cand-20260827-23
   title: Edit's multi-match error hint gets invoked as a nonexistent standalone 'replace_all' tool
   severity: medium
@@ -14059,6 +14266,18 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Same root cause (leaked MCP tool-call envelope markup in structured JSON), manifesting in StructuredOutput tool within automated recon session rather than add_design_decision. Raw payload shows `<parameter name="entry_id">null` mixed into JSON findings field.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 09352451-0678-4bea-aea1-e9d03098176b
+    origin_phase: architect
+    manifested_phase: architect
+    note: Three consecutive add_design_decision calls (turns 223, 232, 237) all rejected for leaked MCP envelope markup (</invoke>, </rationale>) in the 'rationale' field. Agent persisted across all three attempts despite immediate rejections, suggesting no incorporation of error feedback into repair attempts.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 8d33332b-3c9b-4b96-a2ee-1dbe6ac1bfa4
+    origin_phase: unknown
+    manifested_phase: architect
+    note: 'add_design_decision tool rejected 5 consecutive calls (turns 349, 357, 368, 376, 387) with mcp_markup_detected errors. Leaked fragments: ''</invoke>'' and ''</rationale>'' in the ''rationale'' field. Tool response included repaired_call with markup stripped each time, but agent did not resubmit repaired payloads.'
 - id: entry-cand-20260907-21
   title: Agent busy-polls a long-running background pytest run via repeated foreground Bash ps/pgrep instead of a blocking wait primitive
   severity: medium
@@ -25487,3 +25706,302 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: Bash exit 128 from 'git log --oneline -1 9af436fe' when verifying a reference found in stage1.py during diff review; grep succeeded locating the reference text in stage1.py and stage3.py, but git log failed on the non-existent commit object
+- id: cand-20260912-1
+  title: Task-kill notifications swept into digest User Corrections
+  cause: Digest extraction treats structured task-notification XML (status=killed) blocks as user feedback rather than filtering them from narrative sections
+  area: digest_extraction
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 2ee58614-3533-4df9-a956-9755f8227511
+    origin_phase: unknown
+    manifested_phase: ops
+    evidence_quote: '"User Corrections" section contains ~30 `<task-notification>` blocks with killed-status summaries interspersed with one genuine user comment (turn 623); notification noise dominates the correction bucket'
+- id: cand-20260912-2
+  title: Orchestrated worktree task guard checks fire on unestablished premises
+  cause: Task filed with assumptions about worktree state (a file exists, a path resolves, a module is available) without verification at dispatch time. Guards in the task's verify/block phase check these premises and fail, but the 'does not exist' signal is not corroborated back to the original dispatch decision or made actionable.
+  area: unverified-task-premises × verify-gate guard logic
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: db8a3d49-5c2d-4b2b-8278-1bc95a1debc2
+    origin_phase: architect
+    manifested_phase: verify
+    evidence_quote: orchestrated-task in .worktrees/4377 fires df_guard:2 blocked signals paired with not_found:2 signals; session 540 bytes, 0 user turns, no self-correct or tool_error — guard gates early and silently.
+- id: cand-20260912-3
+  title: Monitor tool parameter contract drift
+  cause: Agent passes unsupported `timeout` parameter to Monitor tool, causing InputValidationError; indicates stale caller code or Monitor API signature change without corresponding update to invocation sites
+  area: tool-contract
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 9c03a7bb-8d3c-42f8-a54c-212d5aaf5bf5
+    origin_phase: unknown
+    manifested_phase: merge
+    evidence_quote: 'Turn 826: Monitor({...command..., timeout: ...}) → InputValidationError: An unexpected parameter `timeout` was provided'
+- id: cand-20260912-4
+  title: Cross-project curation tasks hit unrecoverable environment/import errors in spawned agents
+  cause: When /curate-fused-memories spawns agents to process entries across multiple projects, those agents encounter cascading ModuleNotFoundError, command-not-found, and file-read errors because spawned worktrees or subprocesses lack consistent dependency/path context across target projects
+  area: Cross-project orchestration / spawned agent environment isolation
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: a4b22214-5b58-4e8a-9222-0945041a2969
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'Signal counts: tool_error=2, not_found=5 in a 2-turn 4.2KB session. Turn 181,234: modulenotfounderror; turn 311: command not found; turn 266: JSONDecodeError (Expecting value at line 1 col 1 — empty/missing config file)'
+- id: cand-20260912-5
+  title: add_memory rejects payloads with leaked MCP envelope markup when content contains XML-like syntax
+  cause: Orchestrated implementer agents constructing multi-turn refactoring workflows may inadvertently embed MCP tool-call envelope fragments (like </content>) into the payload when persisting procedural knowledge that itself contains XML-like or structured text patterns. Content that *looks like* MCP markup triggers rejection even though it is intended as the actual payload content.
+  area: fused_memory_api
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: f4bb9544-cc8a-47ac-bf17-f722a0188d15
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'Turn 1200: add_memory rejected with ''Tool call rejected: it carries raw MCP envelope markup in ''content''... matched_pattern: ''</content>'''' while persisting procedural knowledge entry ''MERGE-LANE RATCHET GOTCHA'' containing technical documentation about test baseline refactoring (session: orchestrated-task agent, task 5033, 9 total tool_errors)'
+- id: cand-20260912-6
+  title: Scripts calling stateful escalation MCP server without required session handshake
+  cause: 'The escalation MCP server is built as FastMCP(''escalation'') served via mcp_server.http_app() with stateless_http=False (default), requiring a three-call handshake: initialize() session-less to obtain mcp-session-id from response header, then use that session-id in subsequent tools/call requests. Infrastructure scripts like scripts/merge-pytest-n-ab-switch.sh use bare curl without this handshake, receive HTTP 400 ''Bad Request: Missing session ID'', but exit silently (curl has no -f flag) and fail to detect the error.'
+  area: MCP contract understanding, escalation server integration, infrastructure scripting
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 09352451-0678-4bea-aea1-e9d03098176b
+    origin_phase: implement
+    manifested_phase: verify
+    evidence_quote: 'Measured live 2026-09-12 against 127.0.0.1:8102: curl -X POST http://127.0.0.1:8102/mcp → HTTP/1.1 400 Bad Request {"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Bad Request: Missing session ID"}}. Task incident timeline corroborates: script committed bd4825403e 2026-09-10 12:42:14Z, ''but the hot-reload didn''t take effect until an unrelated config_reload at 19:06:50Z'' — exactly matching a silent 400 error prediction. Correct solution exists in legibility.census_trigger.post_mcp_tool_call (task 3644).'
+- id: cand-20260912-7
+  title: Agent constructs malformed Python one-liners in bash -c with improper statement separation
+  cause: When embedding Python code in `bash -c 'python3 -c ...'` commands, the agent concatenates multiple statements without proper separators (semicolons or newlines), causing Python IndentationError on parse
+  area: Bash tool — embedded Python code generation
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: ac4e92c0-0e55-48dc-bd8f-f5c1436b8387
+    origin_phase: implement
+    manifested_phase: verify
+    evidence_quote: 'Turns 48, 691, 940: IndentationError: unexpected indent when executing python3 -c with concatenated statements like ''import json p=json.load(open(...)) for d in ...'' lacking line breaks between statements'
+- id: cand-20260912-8
+  title: Task agent cannot read .task/metadata.json in cold-verified worktree
+  cause: Worktree cold-provisioning via verify_cold_preprovision_command does not create or copy .task/metadata.json; file is absent when task agent tries to read it, despite other .task/ contents (plan.json, verify*, claude-config-*) being present.
+  area: worktree provisioning, task dispatch, task agent initialization
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 784a2394-cb13-4536-9901-55b06ea10517
+    origin_phase: verify
+    manifested_phase: unknown
+    evidence_quote: 'Turn 24: Read(file_path: /home/leo/src/dark-factory/.worktrees/4319/.task/metadata.json) → File does not exist. Turn 28 directory listing shows .task/ contains [claude-config-4319, claude-config-4319-unblock, plan.json, verify, verify_warmed_fused-memory] but no metadata.json.'
+- id: cand-20260912-9
+  title: Task-termination XML mislabeled as User Corrections in digest
+  cause: Digest extraction pipeline incorrectly categorizes system harness events (task-notification status=killed) as user-provided corrections and feedback
+  area: digest-extraction
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 375b7c3f-88d0-4608-bbf2-c4ab9d7bce91
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Turns 415-416: <task-notification> XML with status="killed" and summary="...system is running low on memory" appear in ''User Corrections'' section alongside user directives and skill invocations'
+- id: cand-20260912-10
+  title: Watcher runtime missing required Python dependencies for graph operations
+  cause: Watcher rotation provisioned without redis module, causing ModuleNotFoundError when attempting to execute graph database queries that are part of normal operation
+  area: watcher-provisioning
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 375b7c3f-88d0-4608-bbf2-c4ab9d7bce91
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'Turn 608: Bash attempting ''redis.Redis(...)'' fails with ModuleNotFoundError; combined with turns 605 ''command not found'' and digest showing 2 not_found signals — suggests incomplete environment for watcher''s intended operations'
+- id: cand-20260912-11
+  title: Digest not_found signal references non-existent turn in tiny session
+  cause: Turn-reference extraction in the digest pipeline generates turn numbers that don't correspond to actual turns in the session, or turn counter is stale; orchestrated-task with n_user_turns=0 and 456-byte body yields a signal pointing to turn 180.
+  area: digest pipeline / signal extraction
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 5875250c-45e1-4cde-a884-015643a332bf
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 180) does not exist — in a 456-byte session with n_user_turns=0, truncated_items=0
+- id: cand-20260912-12
+  title: Task worktree subagents/ directory does not exist or is not populated
+  cause: Task worktrees provisioned without the .task/claude-config/projects/<encoded>/subagents/ directory structure that dispatched agents assume exists when trying to inspect prior subagent run metadata
+  area: task-worktree-provisioning
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 6a1b33ae-222e-4f23-bdad-8a15f9ae6604
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: Bash attempts to glob $D/subagents/*.meta.json and $D/subagents/*.jsonl fail with 'No such file or directory'; agent retries across three turns before budget exhaustion; path structure suggests agent tried to read output from spawned subagents but directory structure missing
+- id: cand-20260912-13
+  title: Agent assumes database table existence without schema verification
+  cause: Agent located a database file and queried it for a specific table without verifying the actual schema structure
+  area: Task data store / database access patterns
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 06f38c11-609f-42c1-8e5f-92874ce52aca
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'DB=$(ls -t data/*.db data/**/*.db .taskmaster/*.db 2>/dev/null | head -1); ... sqlite3 "$DB" "select ... from tasks ..." ... Error: in prepare, no such table: tasks'
+- id: cand-20260912-14
+  title: Agent symbol exploration in task worktree fails systematically; grep searches for expected definitions return no matches
+  cause: Worktree checkout incomplete or stale, search patterns overly specific to refactored/non-existent symbols, or agent searching with assumption of API that diverged from actual code state
+  area: Symbol discovery / exploration during investigation or implementation in task worktrees
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 1e1946f4-0df0-4871-a2dd-7e3fd3d0f709
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: Turn 31 grep for _run_probe_cmd/_probe_nextest_planned/_kill_probe_process_tree (exit 2); Turn 71 grep for sleep patterns (exit 1); Turn 80 class MergeLane and MergeLane() usage searches (exit 1); Turn 65 'does not exist' not_found signal. Session in .worktrees/5025 with 3 tool_errors and no diagnostic context of what symbols were expected or why they were being searched.
+- id: cand-20260912-15
+  title: Digest pipeline turn-reference validation missing in worktree sessions
+  cause: Digest extraction attempts to report on turns (28, 50) that exceed or fall outside the session's actual transcript bounds, generating bare 'does not exist' errors instead of diagnostics about index validation, session truncation, or transcript loading failures.
+  area: digest/recon
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 2fd02c94-58ca-4289-adb3-edb6ba47d344
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: 'not_found: 2; ''(turn 28) does not exist''; ''(turn 50) does not exist''; session size 443 bytes, 0 user turns in .worktrees/5029 context'
+- id: cand-20260912-16
+  title: Digest Bash-call count divergence between Retry Loops and Designed Outcomes sections
+  cause: Signal aggregator reports 'Bash x4' for watcher-rearm.sh in Retry Loops; Designed Outcomes section itemizes 3 discrete turns (204, 215, 282) with exit 124—reconciliation between aggregated and itemized counts is unclear
+  area: digest generation / signal counting
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: fa46b9ce-5a21-471f-a14e-735a1ee5cb10
+    origin_phase: ops
+    manifested_phase: unknown
+    evidence_quote: 'Retry Loops: ''Bash x4 (2 designed-outcome results: [exit 124] [watcher-rearm-declared])''; Designed Outcomes: 3 listed turns with exit 124 watcher-rearm.sh outcomes'
+- id: cand-20260912-17
+  title: Digest generator references phantom or out-of-range turns
+  cause: 'Turn numbering mismatch: digest signals reference turns 46 and 57 in a session with 0 user turns, suggesting either misaligned turn indices (absolute vs relative) or attempts to reference pruned content'
+  area: digest extraction and indexing
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 6da1b74a-cbff-46e1-befa-9c6d78e53fe6
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: not_found signals at turns 46 and 57 claiming 'does not exist' in a 443-byte interactive worktree session with n_user_turns=0
+- id: cand-20260912-18
+  title: Sub-agent in worktree hits file/module lookup failures with no path-resolution fallback
+  cause: Worktree environment isolation or inheritance defects cause imports/file lookups to fail; guard trips on the failure but does not bridge to parent venv or inherited VIRTUAL_ENV state
+  area: architect
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 1e1946f4-0df0-4871-a2dd-7e3fd3d0f709
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Session in .worktrees/5025 (worktree, not main): 2 ''not found'' signals (turn 11 ''does not exist'', turn 41 ''not found in''); 1 guard trip ''blocked:'' (turn 72); 0 user turns (automated/spawned dispatch); sparse evidence (478 bytes) with no tool_error or self_correct signals'
+- id: cand-20260912-19
+  title: Worktree session encounters multiple sequential 'does not exist' errors paired with guard assertion
+  cause: Task assumes resources or dependencies exist (verified during decompose/architect phases) but checks at verify time find them absent — phantom paths, unverified prerequisites, or resource state misalignment in worktree
+  area: orchestrator/worktree/prerequisites
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 4c635494-3ae5-4b3e-8df8-0307459874f0
+    origin_phase: decompose
+    manifested_phase: verify
+    evidence_quote: '(turn 15) blocked: guard trip; (turn 15) does not exist; (turn 32) does not exist'
+- id: cand-20260912-20
+  title: Interactive session classified with zero user turns contradicts definition
+  cause: Session digest pipeline marks sessions as 'interactive' despite n_user_turns=0, indicating either void/aborted sessions being captured, misclassified automated runs, or trickle-coder's own meta-session (analysis-in-progress with no user interaction yet) being ingested
+  area: session-capture / digest-generation
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 05c46d31-e961-422f-8baa-5881ba2d5311
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'agent_class: "interactive" with n_user_turns: 0, size_bytes: 378, score: 0.0, all signal_counts: 0'
+- id: cand-20260912-21
+  title: Bash tool pre-check fails on AST node limit even for commands needing only a file prefix
+  cause: Bash tool's static-analysis pre-check parses entire source files unconditionally, rejecting commands like `head` when the file exceeds AST node limit (100,000 nodes) even though the command only accesses a prefix
+  area: bash-tool, static-analysis-pre-checks, file-size-limits
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: f8a0e99f-3a0a-4f1c-8755-986ea600e531
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'head -120 orchestrator/tests/test_merge_queue.py → Exit code 1: ''Failed to parse source code: Too many AST nodes: 100001 (max: 100000). Possible malicious input.'''
+- id: cand-20260912-22
+  title: Digest Retry Loops designed-outcome count contradicts Designed Outcomes section
+  cause: 'Retry Loops section reports ''Bash x6 (3 designed-outcome results)'' for watcher-rearm.sh calls, but Designed Outcomes section displays 4 entries (all watcher-rearm.sh exit 124), and signal_counts.designed_outcome: 4. A 3 vs 4 mismatch suggests digest extraction is reading inconsistent counters or conflating separate invocation counts.'
+  area: digest extraction / signal accounting
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: e65e5284-140a-434a-b5c3-dc4bce02b9c5
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Retry Loops: ''Bash x6 (3 designed-outcome results: [exit 124])'' vs Designed Outcomes: 4 dated entries (turns 127,136,148,157) all watcher-rearm.sh exit 124; signal_counts.designed_outcome: 4'
+- id: cand-20260912-23
+  title: Empty or minimal sessions captured in digest pipeline
+  cause: 'Session capture mechanism records trivial sessions (no user turns, zero signal counts) which reach the digest tool, suggesting either: (1) sessions with only harness-injected system context are not filtered before submission, or (2) the digest pipeline''s own metadata/scaffolding is being recursively captured as session input'
+  area: digest-extraction
+  first_seen: '2026-09-12'
+  disposition: pending
+  sightings:
+  - date: '2026-09-12'
+    project: dark_factory
+    session: e7a5130a-3b2a-417c-8c20-4628944231f8
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'size_bytes: 378, n_user_turns: 0, all signal_counts: 0, score: 0.0 — session processed through digest pipeline despite carrying no substantive content'
