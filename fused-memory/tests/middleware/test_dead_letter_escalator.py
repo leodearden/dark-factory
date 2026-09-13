@@ -178,3 +178,149 @@ class TestNeverRaises:
         text = caplog.text
         assert 'add_episode' in text, text
         assert _PROJECT in text, text
+
+
+class TestDedupeFold:
+    """Folds on `(project, operation, error class)` — the triple an operator
+    needs to tell "the same failure again" from "a new failure mode".
+
+    The fingerprint route, not the per-project open-escalation anchor scan
+    `referent_repair_storm_escalator` uses: that shape folds every event in a
+    project into ONE entry and so cannot attribute a burst. Here attribution is
+    the entire point — an alarm that collapsed a NodeNotFoundError storm on
+    add_episode together with an unrelated TimeoutError on add_memory_graphiti
+    would hide the second behind the first.
+    """
+
+    def test_the_fingerprint_is_over_project_operation_and_error_class_only(
+        self, tmp_path,
+    ):
+        """Deliberately NOT over item_id, attempts or content_preview: all
+        three change on every death, so including any would mint a fresh
+        escalation per death and defeat the folding this exists to provide."""
+        from escalation.dedupe import compute_content_fingerprint
+
+        _emit(tmp_path)
+
+        expected = compute_content_fingerprint(
+            dle_mod._CATEGORY,
+            dle_mod._FINDING_CATEGORY,
+            affected_ids=[
+                f'project:{_PROJECT}',
+                'operation:add_episode',
+                'error:NodeNotFoundError',
+            ],
+        )
+        assert _filed(tmp_path)[0]['dedupe_fingerprint'] == expected
+
+        # And it is genuinely item/attempt/content independent.
+        _emit(tmp_path, item_id=999, attempts=55, content_preview='something else')
+        assert {p['dedupe_fingerprint'] for p in _filed(tmp_path)} == {expected}
+
+    def test_a_repeat_death_folds_into_the_pending_parent(self, tmp_path):
+        """The 28-dead-writes case pages ONCE, not 28 times."""
+        first = _emit(tmp_path)
+        second = _emit(tmp_path, item_id=8)
+        third = _emit(tmp_path, item_id=9)
+
+        assert first is not None
+        assert second == first
+        assert third == first
+
+        payloads = _filed(tmp_path)
+        assert len(payloads) == 1, f'expected one surviving record, got {payloads}'
+        assert payloads[0]['id'] == first
+        assert payloads[0]['dedupe_count'] == 2
+        assert len(payloads[0]['dedupe_children']) == 2
+
+    def test_the_same_error_class_with_a_different_message_still_folds(
+        self, tmp_path,
+    ):
+        """The reason the fingerprint keys on the CLASS, not the message.
+
+        Every error in the esc-3561-3 corpus was `node <uuid> not found` with a
+        DIFFERENT uuid per write. A message-keyed fingerprint would have minted
+        28 separate escalations and reproduced the paging storm the fold exists
+        to prevent.
+        """
+        first = _emit(tmp_path, error='NodeNotFoundError: node abc not found')
+        second = _emit(tmp_path, error='NodeNotFoundError: node def not found')
+
+        assert second == first
+        assert len(_filed(tmp_path)) == 1
+
+    def test_the_post_execute_prefix_does_not_defeat_the_fold(self, tmp_path):
+        """`POST_EXECUTE_DEAD_PREFIX` is prepended to the error text, so the
+        class parse has to strip it or a post-execute death would never fold
+        with anything."""
+        from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
+
+        plain = _emit(tmp_path, error='RuntimeError: callback keeps failing')
+        prefixed = _emit(
+            tmp_path,
+            error=f'{POST_EXECUTE_DEAD_PREFIX}RuntimeError: callback keeps failing',
+            post_execute=True,
+        )
+
+        assert prefixed == plain
+        assert len(_filed(tmp_path)) == 1
+        assert dle_mod._error_class(
+            f'{POST_EXECUTE_DEAD_PREFIX}TimeoutError: too slow'
+        ) == 'TimeoutError'
+
+    def test_a_different_operation_mints_a_new_escalation(self, tmp_path):
+        """add_memory's Graphiti leg dying is not the same news as add_episode
+        dying, and one entry naming neither cannot be triaged."""
+        first = _emit(tmp_path, operation='add_episode')
+        second = _emit(tmp_path, operation='add_memory_graphiti')
+
+        assert first is not None and second is not None
+        assert second != first
+        assert len(_filed(tmp_path)) == 2
+
+    def test_a_different_error_class_mints_a_new_escalation(self, tmp_path):
+        first = _emit(tmp_path, error='NodeNotFoundError: node abc not found')
+        second = _emit(tmp_path, error='TimeoutError: backend did not respond')
+
+        assert first is not None and second is not None
+        assert second != first
+        assert len(_filed(tmp_path)) == 2
+
+    def test_a_different_project_mints_a_new_escalation(self, tmp_path):
+        """Asserted in ONE root, so it is the fingerprint being tested rather
+        than two queues that could not have collided anyway."""
+        first = _emit(tmp_path, project_id='proj1', group_id='proj1')
+        second = _emit(tmp_path, project_id='proj2', group_id='proj2')
+
+        assert first is not None and second is not None
+        assert second != first
+        assert len(_filed(tmp_path)) == 2
+
+    def test_the_fold_window_is_unbounded(self, tmp_path):
+        """A durable write can die once every few days for months — which is
+        exactly what esc-3561-3 was. Under any finite window the next death
+        would page again."""
+        first = _emit(tmp_path)
+        parent_path = next(iter((tmp_path / 'data' / 'escalations').glob('esc-*.json')))
+        payload = json.loads(parent_path.read_text())
+        payload['timestamp'] = '2016-01-01T00:00:00+00:00'
+        parent_path.write_text(json.dumps(payload))
+
+        second = _emit(tmp_path, item_id=8)
+
+        assert second == first
+        assert len(_filed(tmp_path)) == 1
+
+    def test_an_unparseable_error_still_files(self, tmp_path):
+        """`None` or a message with no class prefix is a reason to fold under
+        `'unknown'`, never a reason to drop the alarm."""
+        from escalation.dedupe import compute_content_fingerprint
+
+        assert _emit(tmp_path, error=None) is not None
+        assert _filed(tmp_path)[0]['dedupe_fingerprint'] == compute_content_fingerprint(
+            dle_mod._CATEGORY,
+            dle_mod._FINDING_CATEGORY,
+            affected_ids=[
+                f'project:{_PROJECT}', 'operation:add_episode', 'error:unknown',
+            ],
+        )
