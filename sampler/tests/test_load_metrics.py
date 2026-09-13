@@ -7,6 +7,10 @@ fd9-exists predicates) so they are fully deterministic and safe to run in pytest
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 
 import pytest
 
@@ -28,6 +32,136 @@ PSI_IO_TEXT = (
     'some avg10=0.75 avg60=0.60 avg300=0.40 total=11111\n'
     'full avg10=0.45 avg60=0.30 avg300=0.20 total=2222\n'
 )
+
+
+# ---------------------------------------------------------------------------
+# cgroup-tree fixtures (PRD plans/load-throttle-harmonisation-prd.md §6.4/§7)
+#
+# Every own-pressure test drives discovery and reading through a tmp_path tree
+# plus a matching ``0::`` kernel path, so nothing here reads the live
+# /sys/fs/cgroup — whose topology differs per host and per day.
+# ---------------------------------------------------------------------------
+
+# The segment prefix a systemd user manager puts every user unit under. The
+# ``user@<uid>.service`` element is the discovery ANCHOR (see
+# sampler.metrics.discover_pressure_cgroups).
+USER_MANAGER_PREFIX = 'user.slice/user-1000.slice/user@1000.service'
+
+# Parent slices of the two topologies PRD §6.4 names. ``df.slice`` is the
+# post-3394 shape (PRD §7 row 1); ``app.slice`` is the shape measured live on
+# this host on 2026-09-13, where 3394 has not landed and there is no df-*.slice
+# anywhere — so the orchestrator-*.service fallback is today's LIVE branch.
+DF_PARENT = 'df.slice'
+APP_PARENT = 'app.slice'
+
+# The seven leaves measured under app.slice on this host, and the 0:: path the
+# sampler's own process reports there.
+LIVE_ORCHESTRATOR_LEAVES = (
+    'orchestrator-autopilot-video.service',
+    'orchestrator-dark-factory.service',
+    'orchestrator-know-live.service',
+    'orchestrator-my-solar-challenge.service',
+    'orchestrator-pump-web-ui.service',
+    'orchestrator-reify.service',
+    'orchestrator-solar-challenge-platform.service',
+)
+LIVE_OWN_CGROUP_PATH = f'/{USER_MANAGER_PREFIX}/{APP_PARENT}/orchestrator-dark-factory.service'
+
+# A cpu.pressure body that no parser can extract an avg10 from — the "exists
+# but is garbage" case, which must degrade exactly like an absent file.
+GARBAGE_PRESSURE_TEXT = 'nothing here resembles a pressure line\n'
+
+
+def pressure_text(*, some: float, full: float | None = 0.0) -> str:
+    """Return a cpu.pressure body in the shape measured on a live cgroup.
+
+    ``full=None`` omits the ``full`` line entirely — a legitimate kernel state
+    for CPU pressure, which shared.psi.parse_pressure_file reads as a partial
+    miss (a dict, not None).
+    """
+    lines = [f'some avg10={some:.2f} avg60=0.10 avg300=0.07 total=717833958']
+    if full is not None:
+        lines.append(f'full avg10={full:.2f} avg60=0.05 avg300=0.03 total=350000000')
+    return '\n'.join(lines) + '\n'
+
+
+class CgroupTree(NamedTuple):
+    """The seams a built fixture tree exposes.
+
+    ``cgroup_root`` and ``own_cgroup_path`` are what
+    sampler.metrics.discover_pressure_cgroups takes; ``proc_cgroup_path`` is
+    the α seam (shared.psi.resolve_own_cgroup) that produces the same
+    ``own_cgroup_path`` from a ``0::`` line, so a test can prove the fixture's
+    kernel-path text and its directory layout agree.
+    """
+
+    cgroup_root: Path
+    own_cgroup_path: str
+    proc_cgroup_path: Path
+
+
+def build_cgroup_tree(
+    root: Path,
+    *,
+    groups: Mapping[str, Mapping[str, str | None]],
+    outside: Mapping[str, str] = MappingProxyType({}),
+    own_cgroup_path: str = LIVE_OWN_CGROUP_PATH,
+) -> CgroupTree:
+    """Write a sysfs-shaped cgroup tree under *root* and return its seams.
+
+    Args:
+        root: A tmp_path. The tree is written under ``root/cgroup``.
+        groups: ``{parent_slice_name: {leaf_name: cpu_pressure_text_or_None}}``,
+            planted under the ``user@1000.service`` anchor. A ``None`` text
+            creates the leaf directory with NO cpu.pressure file.
+        outside: ``{leaf_name: text}`` planted under ``root/cgroup/system.slice``
+            — i.e. OUTSIDE the anchor, so an anchored search must not find them.
+        own_cgroup_path: The ``0::`` kernel path the sampler's own process
+            reports. Also written to ``root/proc_self_cgroup``.
+    """
+    cgroup_root = root / 'cgroup'
+    anchor = cgroup_root / USER_MANAGER_PREFIX
+    for parent, leaves in groups.items():
+        for leaf, text in leaves.items():
+            leaf_dir = anchor / parent / leaf
+            leaf_dir.mkdir(parents=True, exist_ok=True)
+            if text is not None:
+                (leaf_dir / 'cpu.pressure').write_text(text)
+    for leaf, text in outside.items():
+        leaf_dir = cgroup_root / 'system.slice' / leaf
+        leaf_dir.mkdir(parents=True, exist_ok=True)
+        (leaf_dir / 'cpu.pressure').write_text(text)
+
+    proc_cgroup_path = root / 'proc_self_cgroup'
+    proc_cgroup_path.write_text(f'0::{own_cgroup_path}\n')
+    return CgroupTree(cgroup_root, own_cgroup_path, proc_cgroup_path)
+
+
+def live_topology(root: Path, **pressures: str | None) -> CgroupTree:
+    """Build topology (a): the seven app.slice leaves, no df-*.slice anywhere.
+
+    Keyword overrides are keyed by leaf name with '.' and '-' replaced by '_',
+    so a test can make one leaf's cpu.pressure absent or garbage without
+    restating the other six.
+    """
+    leaves = {
+        name: pressures.get(
+            name.replace('.', '_').replace('-', '_'),
+            pressure_text(some=round(0.5 + i, 2)),
+        )
+        for i, name in enumerate(LIVE_ORCHESTRATOR_LEAVES)
+    }
+    return build_cgroup_tree(root, groups={APP_PARENT: leaves})
+
+
+def df_topology(root: Path, *project_ids: str) -> CgroupTree:
+    """Build topology (b): one ``df-<project_id>.slice`` leaf per id, post-3394."""
+    leaves = {
+        f'df-{pid}.slice': pressure_text(some=round(1.5 + i, 2))
+        for i, pid in enumerate(project_ids)
+    }
+    return build_cgroup_tree(root, groups={DF_PARENT: leaves})
+
 
 
 # ---------------------------------------------------------------------------
