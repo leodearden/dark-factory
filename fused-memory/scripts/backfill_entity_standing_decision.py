@@ -66,6 +66,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STATE_ACTIVE,
 )
 from fused_memory.reconciliation.standing_decision_writer import (
+    LedgerUnavailable,
     write_entity_standing_decision,
 )
 from fused_memory.utils.store_mutation_preflight import (
@@ -492,12 +493,28 @@ async def run_backfill(memory_service: Any, *, apply: bool) -> dict[str, Any]:
         (``would_write`` / ``written`` / ``already_migrated``) and one row per
         stamp target (``would_stamp`` / ``stamped`` / ``stamp_error``).
     """
+    # The ledger is read for the idempotence check BEFORE β ever sees the
+    # service, so an unwired one would surface here as an opaque
+    # ``AttributeError`` on ``None`` — precisely the failure β's typed
+    # LedgerUnavailable was introduced to replace for η's direct callers. Raise
+    # β's own error rather than minting a second one, so both the migration's
+    # read and its write report an unwired ledger identically (INV-5).
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        raise LedgerUnavailable(
+            'backfill_entity_standing_decision: no recon_ledger wired on '
+            f'memory_service for project {PROJECT_ID!r} — the migration cannot '
+            'tell whether the row already exists, and must not guess; hint: '
+            'attach a ReconLedgerStore before calling (main() does this from '
+            'the configured reconciliation data_dir).'
+        )
+
     source_record = await memory_service.get_memory_by_id(PROJECT_ID, SOURCE_MEMORY_ID)
     entity_uuid = resolve_source_entity_uuid(source_record)
     scrolled = await memory_service.get_memories_by_metadata(
         PROJECT_ID, {'entity_uuid': entity_uuid}
     )
-    active_row = await memory_service.recon_ledger.get_active_entity_standing_decision(
+    active_row = await ledger.get_active_entity_standing_decision(
         PROJECT_ID, entity_uuid
     )
     plan = plan_backfill(source_record, scrolled or [], active_row)
