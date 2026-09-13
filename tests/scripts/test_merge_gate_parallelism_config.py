@@ -31,6 +31,7 @@ from __future__ import annotations
 import pathlib
 import re
 import shlex
+import subprocess
 import tomllib
 from typing import TYPE_CHECKING
 
@@ -627,4 +628,219 @@ def test_the_already_parallel_members_still_resolve_through_the_shared_knob(
         'is authoritative. If 3589 is what you are landing, update this pin in '
         'that commit and say so; do not let the five parallel modules diverge '
         'silently onto two different worker-count sources'
+    )
+
+
+# ---------------------------------------------------------------------------
+# `pyright --threads 8` where pyright is the long pole (task 5408)
+# ---------------------------------------------------------------------------
+
+THREADS_FLAG = '--threads'
+THREADS_VALUE = '8'
+
+# The two modules whose type leg is SLOWER than their test leg, so threading
+# pyright is where their wall-clock actually is: shared 65s pyright vs 45s
+# pytest, sampler 11s vs 4s.
+PYRIGHT_LONG_POLE_MODULES = ('shared', 'sampler')
+
+# Whose configured runner spelling the EXECUTION probes below use. ONE module,
+# not both: `--threads` acceptance is a property of the pyright BINARY, and both
+# modules resolve the same pinned one, so a second probe would pay another uv +
+# node startup for no new information.
+THREADS_PROBE_MODULE = 'shared'
+
+# The flag `--threads` is mutually exclusive with, and the exact refusal pyright
+# emits. This pair is the negative control: it is what proves the positive probe
+# is really exercising flag acceptance.
+PYRIGHT_STATS_FLAG = '--stats'
+PYRIGHT_THREADS_STATS_REFUSAL = "'threads' option cannot be used with 'stats' option"
+PYRIGHT_USAGE_ERROR_RC = 4
+
+# Co-locates the two subprocess probes on ONE xdist worker under
+# `--dist loadgroup`, so the pair cannot land on two workers and run two
+# concurrent pyright processes on an already-loaded host.
+PYRIGHT_PROBE_GROUP = 'pyright_threads_probe'
+
+# Bounds the probe subprocess itself, INSIDE each probe's @pytest.mark.timeout,
+# so a wedged pyright surfaces as a TimeoutExpired carrying its captured output
+# rather than as pytest's axe carrying nothing.
+#
+# Those markers are 120s, which TIGHTENS rather than raises: the scripts verify
+# leg passes --timeout=300 on the command line, and a probe that checks ONE
+# trivially clean file has no business taking two minutes even behind a uv
+# resolve and a node startup on a loaded 32-core host. Failing at 2 minutes with
+# pyright's own captured output beats consuming the full 300s to say nothing.
+PROBE_SUBPROCESS_TIMEOUT_SECS = 100
+
+_PROBE_SRC = 'def f(x: int) -> int:\n    return x + 1\n'
+
+
+def _pyright_argv(
+    module_configs: dict[str, ModuleConfig], prefix: str
+) -> tuple[list[str], list[str]]:
+    """``(pre, post)`` tokens of *prefix*'s ``type_check_command``, split at the anchor.
+
+    PRE is the ``uv run --directory <m>`` wrapper's; POST is pyright's own argv.
+    Reading the whole segment instead would be the category error
+    ``vci.anchor_split`` exists to prevent — ``--project`` before the anchor
+    selects an ENVIRONMENT, after it redirects pyright's CONFIG FILE.
+    """
+    assert prefix in module_configs, (
+        f'{prefix}/orchestrator.yaml is not discovered by the production '
+        f'config._discover_module_configs walk. Discovered: {sorted(module_configs)}'
+    )
+    command = module_configs[prefix].type_check_command
+    assert command, (
+        f'{prefix}/orchestrator.yaml declares no type_check_command, so the '
+        'assertions below would be satisfied for the wrong reason'
+    )
+    label = f'{prefix}/orchestrator.yaml type_check_command'
+    segment = vci.required_segment(command, vci.PYRIGHT, label=label)
+    return vci.anchor_split(segment, vci.PYRIGHT, label=label)
+
+
+def _run_probe(
+    pre_tokens: list[str], probe: pathlib.Path, *extra: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the configured pyright spelling over *probe*, with *extra* flags appended.
+
+    The wrapper tokens come from the module's OWN configured command rather than
+    being spelled here, so this probe cannot drift into testing an invocation the
+    gate does not use. Run from the repo root, which is where verify runs these
+    commands from and what the wrapper's own ``--directory`` is relative to.
+    """
+    return subprocess.run(
+        [*pre_tokens, vci.PYRIGHT, THREADS_FLAG, THREADS_VALUE, *extra, str(probe)],
+        capture_output=True,
+        text=True,
+        timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+
+
+def _write_probe(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A trivially type-clean file under *tmp_path*, never a repo path.
+
+    A repo path would make these probes go red on any unrelated type error
+    anywhere in the checked tree — reporting "pyright rejects --threads" for a
+    defect that has nothing to do with the flag.
+    """
+    probe = tmp_path / 'probe.py'
+    probe.write_text(_PROBE_SRC, encoding='utf-8')
+    return probe
+
+
+@pytest.mark.parametrize('prefix', PYRIGHT_LONG_POLE_MODULES)
+def test_pyright_long_pole_modules_pass_threads_eight(
+    prefix: str,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """``shared`` and ``sampler`` pass ``--threads 8`` to pyright.
+
+    These are the two modules where pyright, not pytest, is the long pole —
+    shared 65s vs 45s, sampler 11s vs 4s — so parallelising the type checker is
+    where their wall-clock is. MEASURED on orchestrator: 2.0x, 240s -> 118s, 0
+    errors either arm.
+
+    THIS EDIT IS ALSO WHAT REACHES THE MERGE GATE'S LEG-2 UNSCOPED TYPE CHECK.
+    ``merge_queue._run_unscoped_typechecks`` re-runs each module's OWN
+    ``type_check_command`` verbatim (``dataclasses.replace(mc,
+    test_command=None, lint_command=None)`` at role='merge'), so there is no
+    separate leg-2 command to assert about — this one is it.
+
+    Asserted on the POST-anchor argv, so uv's pre-anchor wrapper can never be
+    mistaken for one of pyright's own flags.
+    """
+    _, post = _pyright_argv(discover_module_configs(), prefix)
+
+    assert _flag_value(post, THREADS_FLAG) == THREADS_VALUE, (
+        f"{prefix}/orchestrator.yaml's type_check_command passes pyright "
+        f'{post!r}, which does not carry `{THREADS_FLAG} {THREADS_VALUE}` '
+        '(task 5408). pyright is this module\'s LONG POLE, so this is where its '
+        'merge-gate wall-clock is; the same command is what '
+        'merge_queue._run_unscoped_typechecks re-runs for leg 2'
+    )
+    assert PYRIGHT_STATS_FLAG not in post, (
+        f"{prefix}/orchestrator.yaml's type_check_command passes pyright both "
+        f'{THREADS_FLAG} and {PYRIGHT_STATS_FLAG}, which pyright REFUSES: '
+        f'{PYRIGHT_THREADS_STATS_REFUSAL} (exit {PYRIGHT_USAGE_ERROR_RC}). The '
+        'two are mutually exclusive — pick one'
+    )
+
+
+@pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
+@pytest.mark.timeout(120)
+def test_the_configured_pyright_actually_accepts_threads_eight(
+    tmp_path: pathlib.Path,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """RUN pyright with the flag. A string assertion cannot see a usage error.
+
+    The task asked for this deliberately, and INV-10 is why: ``--threads`` is
+    mutually exclusive with ``--stats``, so a config that carried both would
+    satisfy every string assertion above while pyright exited on a usage error
+    (``PYRIGHT_USAGE_ERROR_RC``) having checked nothing. Only running it tells
+    the difference between an accepted flag and a refused one.
+
+    Pinned at the 5408 measurement: on the repo's pyright 1.1.408,
+    ``uv run --directory sampler pyright --threads 8 src/ tests/`` returned rc=0
+    with "0 errors, 0 warnings, 0 informations" — the verdict is unchanged by the
+    flag and the flag parses correctly before the positional targets.
+
+    Its companion negative control is
+    ``test_pyright_refuses_threads_together_with_stats``; the two share an
+    ``xdist_group`` so they never run as two concurrent pyright processes.
+    """
+    pre, _ = _pyright_argv(discover_module_configs(), THREADS_PROBE_MODULE)
+    result = _run_probe(pre, _write_probe(tmp_path))
+
+    assert result.returncode == 0, (
+        f'the configured {THREADS_PROBE_MODULE} pyright spelling exited '
+        f'{result.returncode} with `{THREADS_FLAG} {THREADS_VALUE}` over a '
+        'trivially type-clean probe file, so the flag the merge gate now passes '
+        'is not accepted by the pinned pyright. Check the pyright version pin '
+        f'(root package.json and uv.lock) before changing the flag.\n'
+        f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+    )
+
+
+@pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
+@pytest.mark.timeout(120)
+def test_pyright_refuses_threads_together_with_stats(
+    tmp_path: pathlib.Path,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """THE NEGATIVE CONTROL, and the only reason the positive probe is not vacuous.
+
+    If this stops returning ``PYRIGHT_USAGE_ERROR_RC`` with pyright's refusal,
+    then a usage error no longer distinguishes itself from success on this
+    binary, and its sibling's ``returncode == 0`` stops proving that
+    ``--threads`` was accepted rather than merely tolerated.
+
+    It is also the executable form of the warning in both configs' comments: no
+    one may add ``--stats`` (or anything else mutually exclusive with
+    ``--threads``) to those type_check_commands.
+
+    MEASURED on the 5408 tree: ``pyright --threads 8 --stats <file>`` -> rc=4,
+    "'threads' option cannot be used with 'stats' option".
+    """
+    pre, _ = _pyright_argv(discover_module_configs(), THREADS_PROBE_MODULE)
+    result = _run_probe(pre, _write_probe(tmp_path), PYRIGHT_STATS_FLAG)
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == PYRIGHT_USAGE_ERROR_RC, (
+        f'pyright exited {result.returncode}, not {PYRIGHT_USAGE_ERROR_RC}, for '
+        f'`{THREADS_FLAG} {THREADS_VALUE} {PYRIGHT_STATS_FLAG}` — a combination '
+        'it is supposed to refuse. Until this holds, the sibling probe\'s rc==0 '
+        'does not distinguish an ACCEPTED flag from a tolerated one, and both '
+        'configs\' "never add --stats" comments are unenforced.\n'
+        f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+    )
+    assert PYRIGHT_THREADS_STATS_REFUSAL in combined, (
+        f'pyright exited {PYRIGHT_USAGE_ERROR_RC} as expected but did not say '
+        f'{PYRIGHT_THREADS_STATS_REFUSAL!r}, so the exit code may be reporting a '
+        'DIFFERENT usage error and this control is no longer anchored to the '
+        f'{THREADS_FLAG}/{PYRIGHT_STATS_FLAG} conflict.\n'
+        f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
     )
