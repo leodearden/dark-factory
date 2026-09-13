@@ -3001,7 +3001,8 @@ def create_server(
         - ``0`` (default): return immediately — dispatched branch returns
           ``status='queued'``; coalesced branch returns ``status='attached'``.
           Shape: ``{status, request_id, snapshot_tip, generation, position,
-          queue_depth, eta_seconds}``.
+          queue_depth, eta_seconds}``, where ``position`` is ``int | None``
+          (see the Queued shape below).
         - ``>0``: server-clamped to ``≤_MAX_WAIT_SECS`` (100 s); bounded
           wait via ``asyncio.wait_for(asyncio.shield(future), clamp)``.
           Resolves within clamp → terminal outcome shape.
@@ -3040,7 +3041,9 @@ def create_server(
           (e.g. ``'mr-a1b2c3d4'``).
         - Queued: ``{status='queued', request_id, snapshot_tip, generation,
           position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
-          (or wait_secs timeout expired).
+          (or wait_secs timeout expired).  ``position`` is ``int | None``;
+          ``None`` means the live merge-worker snapshot was unavailable, so
+          render it as "unknown" — NEVER as front-of-queue (task 5368).
         - Attached: ``{status='attached', request_id, snapshot_tip, generation,
           position, queue_depth, eta_seconds, inflight_task_id, source,
           inflight_request_id, poll_by, pollable}``.  Branch is
@@ -3402,10 +3405,19 @@ def create_server(
             request_id; falls back to merge_queue.qsize() when no worker is
             reachable (standalone / unit tests that wire a bare asyncio.Queue).
             eta_seconds from the in-flight registry; generation is always 0 in β1.
+
+            ``position`` is ``int | None``.  ``None`` means the live worker
+            snapshot was unavailable, i.e. NOBODY COMPUTED A POSITION — render
+            it as "unknown", never as front-of-queue.  It is never omitted, so
+            a caller keying on it reads that verdict rather than hitting a
+            KeyError.  The two branches that fall back to
+            ``max(0, queue_depth - 1)`` are not fabrications: the request was
+            just enqueued, so "last in a queue of this depth" is an honest
+            derivation from a real ``queue_depth``.
             """
             request_id_val = req_id_override if req_id_override is not None else req.request_id
             worker = _get_merge_worker(harness)
-            position: int = 0
+            position: int | None = None
             queue_depth: int = merge_queue.qsize()  # type: ignore[union-attr]
             if worker is not None:
                 try:
@@ -3418,8 +3430,15 @@ def create_server(
                             break
                     else:
                         position = max(0, queue_depth - 1)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # position stays None: the snapshot is the only source that
+                    # could have told us, so reporting any number here would be
+                    # inventing one.
+                    logger.warning(
+                        'Live merge-worker snapshot failed for request_id=%s (%s); '
+                        'reporting position as unknown',
+                        request_id_val, exc,
+                    )
             else:
                 # No live worker: queue_depth already holds merge_queue.qsize() from
                 # the initialiser above; only position needs to be set.
