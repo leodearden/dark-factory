@@ -213,13 +213,24 @@ class TestBuildRemoteRunnersDfCheckout:
         """df_local_checkout == the dispatcher's own checkout root, shared.
 
         The REAL resolver runs.  It walks up from the orchestrator source file
-        to the ``.git`` marker, so in a test process it returns the checkout
-        this suite is running from — a value the test can recognise without
+        to the ``.git`` marker, so it returns the checkout the DISPATCHER
+        itself was imported from — a value the test can recognise without
         substituting the resolver.  The identity check is what "resolved ONCE
         for the whole build, not re-walked per runner" is observable as: one
         object threaded into every runner.
+
+        The containment check anchors on the resolver's OWN start point
+        (``verify_runner.__file__``), never on ``__file__`` here: an agent
+        shell routinely runs a worktree's tests against the main checkout's
+        installed ``orchestrator``, so a test-file anchor asserts the two
+        trees coincide — a claim about import provenance that has nothing to
+        do with the once-and-shared guarantee this test names, and that
+        reddens under any layout where the worktree is not nested under the
+        main root.
         """
         from pathlib import Path
+
+        from orchestrator import verify_runner
 
         config = _make_config(verify_runners=[
             _make_runner_cfg('r1', df_checkout_path='/remote/df1'),
@@ -236,8 +247,9 @@ class TestBuildRemoteRunnersDfCheckout:
         assert resolved is not None, 'the running checkout must resolve'
         root = Path(resolved)
         assert (root / '.git').exists(), f'{root} is not a checkout root'
-        assert Path(__file__).resolve().is_relative_to(root), (
-            f'{root} is not the checkout this test is running from'
+        assert Path(verify_runner.__file__).resolve().is_relative_to(root), (
+            f'{root} is not the checkout the dispatcher itself was imported '
+            f'from ({verify_runner.__file__})'
         )
 
 

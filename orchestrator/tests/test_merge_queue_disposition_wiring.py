@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -139,8 +140,15 @@ def _make_req(
     config: OrchestratorConfig,
     *,
     branch: QueuedBranch | None = None,
+    result: asyncio.Future | None = None,
 ) -> MergeRequest:
-    future = make_placeholder_future()
+    """Build a MergeRequest for the tests here.
+
+    *result* defaults to a placeholder future, which is what the sync bodies
+    below want: they call one function directly and never resolve the request.
+    A body that drives a path which DOES resolve it (the worker's own lease
+    path) passes a future created on its running loop instead.
+    """
     return MergeRequest(
         task_id=task_id,
         branch=branch or QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
@@ -149,7 +157,7 @@ def _make_req(
         task_files=None,
         module_configs=[],
         config=config,
-        result=future,
+        result=result if result is not None else make_placeholder_future(),
         lane='normal',
     )
 
@@ -705,6 +713,115 @@ class TestDispatchTimeMergeBaseResolution:
         assert asyncio.run(
             _resolve_dispatch_time_merge_base(repo, base_sha, None)
         ) is None
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyFreezesDispatchTimeMainSha:
+    """The PRODUCTION CALLER half of the two classes either side of this one:
+    ``_run_inflight_verify`` feeds ``_run_post_merge_verify`` the FROZEN
+    dispatch-time ``item.base_sha`` as ``main_sha`` — never a fresh
+    ``git_ops.get_main_sha()`` re-read (task 2383 β, 2357).
+
+    Read off the DISPOSITION the whole path produces, with the real
+    ``_run_post_merge_verify`` running underneath, rather than off a kwarg
+    captured from a stub of it. What makes the two readings tell apart is the
+    orphan fixture of :class:`TestRunPostMergeVerifyRealMainHeadFilter` below,
+    lifted one level up:
+
+      FROZEN — ``item.base_sha`` is an ORPHANED speculative tip, so the
+          real-main ancestor filter prunes the commit it implicates and the
+          verdict is the honest BRANCH_BUG.
+      FRESH  — a re-read would name the real main head, whose landing commit
+          touches the very file the verify failed on, survives the filter, and
+          fabricates INTEGRATION_SKEW.
+
+    Both readings resolve to the SAME ``merge_base_sha`` (the task branch and
+    both tips fork at one commit), so the disposition swings on the frozen-vs-
+    fresh choice alone. That is what keeps
+    :class:`TestRunPostMergeVerifyRealMainHeadFilter`'s premise honest: its
+    orphan can only reach the filter if this caller declines to re-read main.
+    """
+
+    async def test_frozen_orphan_base_yields_branch_bug_not_skew(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        fork_point = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base / real fork)')
+        subprocess.run(
+            ['git', 'checkout', '-q', '-b', 'task/2381', fork_point],
+            cwd=repo, check=True, capture_output=True,
+        )
+        branch_tip = _commit_file(repo, 'src/branch_only.py', 'v1', 'task work')
+        subprocess.run(
+            ['git', 'checkout', '-q', 'main'], cwd=repo, check=True, capture_output=True,
+        )
+        # Real main advances with a LANDING that touches src/x.py — the file
+        # _XPY_FAILURE's failing test maps to. A fresh read would find it and
+        # call the failure INTEGRATION_SKEW.
+        real_main_head = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
+        # The frozen dispatch-time base: an orphan speculative tip forked at
+        # the same point, touching the same file, never merged onto real main.
+        subprocess.run(
+            ['git', 'checkout', '-q', '-b', 'orphan', fork_point],
+            cwd=repo, check=True, capture_output=True,
+        )
+        orphan_tip = _commit_file(repo, 'src/x.py', 'v2-orphan', 'orphan speculative edit x')
+        subprocess.run(
+            ['git', 'checkout', '-q', 'main'], cwd=repo, check=True, capture_output=True,
+        )
+
+        config = _make_config(repo)
+        git_ops = _make_git_ops(repo)
+        git_ops.get_main_sha = AsyncMock(return_value=real_main_head)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        task_wt = tmp_path / 'task-wt'
+        task_wt.mkdir()
+        req = _make_req(
+            '2381', task_wt, config,
+            result=asyncio.get_running_loop().create_future(),
+        )
+        _seed_main_health_probe(_XPY_FAILURE, real_main_head, preexisting=False)
+
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        store.emit(
+            EventType.workflow_verify, task_id='2381',
+            data={'passed': True, 'base_sha': fork_point, 'branch': 'task/2381'},
+        )
+
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit='deadbeef', merge_worktree=merge_wt,
+            ),
+            merge_wt=merge_wt,
+            base_sha=orphan_tip,
+            speculative=True,
+            merged_branch_tip=branch_tip,
+        )
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops,
+            queue=asyncio.Queue(),
+            event_store=store,
+            verifier=FakeVerifier(default=VerifyScript(result=_XPY_FAILURE)),
+        )
+
+        advanced = await drive_verify_and_advance(worker, item)
+
+        assert advanced is False, 'a failing verify must not advance main'
+        git_ops.ephemeral_worktree.assert_not_called()
+        outcome = req.result.result()
+        assert outcome.disposition == MergeFailureDisposition.BRANCH_BUG, (
+            f'Expected BRANCH_BUG — main_sha must be the FROZEN orphaned '
+            f'item.base_sha, whose implicated commit the real-main ancestor '
+            f'filter prunes. INTEGRATION_SKEW here means the caller re-read '
+            f'main; got {outcome.disposition!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
