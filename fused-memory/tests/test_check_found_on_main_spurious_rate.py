@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from fused_memory.utils.target_store_preflight import TargetStoreMissing
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'check_found_on_main_spurious_rate.py'
 )
@@ -671,6 +673,68 @@ def _run_args(
     return argparse.Namespace(
         project_root=str(project_root), config=config, ref=ref, since=since,
     )
+
+
+@pytest.mark.asyncio
+class TestRunTargetStorePreflight:
+    """The target-store refusal (task 4319) — the first `_run()` tests here.
+
+    `SqliteTaskBackend.get_tasks` auto-creates `.taskmaster/tasks/tasks.db`
+    and returns `{"tasks": []}` for ANY `--project-root`, never raising.
+    `.taskmaster/` is neither present in nor tracked by a task worktree, so
+    without this guard a worktree path yields an empty task tree, a clean
+    report and exit 0 — a false all-clear on a predicate whose exit 0 means
+    "check passed".
+
+    `_run()` imports the backend and config FUNCTION-LOCALLY, so these reuse
+    the fakes' SOURCE-module patches; patching an attribute on the script
+    module would have no effect.
+    """
+
+    def _patch(self, monkeypatch) -> dict:
+        _install_fake_audit_module(monkeypatch, _report([]))
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        return _install_fake_backend(monkeypatch, [])
+
+    async def test_refuses_a_missing_task_store(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_run_args(tmp_path), SINCE)
+
+    async def test_refusal_constructs_no_backend(self, tmp_path, monkeypatch):
+        """The load-bearing pin: reaching get_tasks is what CREATES the empty
+        db, so refusing before the backend exists is what makes the guard
+        non-destructive rather than merely noisy."""
+        backend_holder = self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_run_args(tmp_path), SINCE)
+
+        assert 'backend' not in backend_holder
+
+    async def test_refusal_leaves_the_db_absent(self, tmp_path, monkeypatch):
+        """The guard writes nothing in either direction — no probe file, no
+        mkdir (see target_store_preflight's "WHY NOT A CAPABILITY PROBE")."""
+        self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_run_args(tmp_path), SINCE)
+
+        assert not (tmp_path / '.taskmaster').exists()
+
+    async def test_proceeds_when_the_db_exists(self, project_root, monkeypatch):
+        """The regression pair: a guard that refuses a project which works
+        would be caught here, not by the three refusal tests above."""
+        backend_holder = self._patch(monkeypatch)
+
+        exit_code = await _mod._run(_run_args(project_root), SINCE)
+
+        assert exit_code == 0
+        assert backend_holder['backend'].closed is True
 
 
 @pytest.mark.asyncio
