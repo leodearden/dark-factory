@@ -13,6 +13,17 @@ import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
+# --- the config pin's own value, read from its one definition ---------------
+#
+# ``conftest`` is safe to import by name here: pytest installs this suite's
+# conftest.py as ``sys.modules['conftest']`` before any test module is
+# imported, so this binds that same object rather than re-executing it.  The
+# sibling-subproject collision conftest.py's docstring warns about is a
+# cross-suite hazard, and each registered verify command runs one subproject
+# per process.  Importing it is what keeps the expected path out of this file:
+# restating the derivation here would give the pin two definitions, and the
+# copy could not detect a regression in the original.
+import conftest
 import pytest
 from _fm_helpers import (
     extract_cypher,
@@ -29,38 +40,53 @@ from _fm_helpers import (
 from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
 
 # ---------------------------------------------------------------------------
-# preserve_config_path fixture tests
+# _isolate_fm_config fixture tests
 # ---------------------------------------------------------------------------
 
-class TestPreserveConfigPath:
-    """preserve_config_path autouse fixture saves/restores CONFIG_PATH around each test."""
+class TestIsolateFmConfig:
+    """The autouse ``_isolate_fm_config`` pins CONFIG_PATH CWD-independently.
 
-    def test_absent_key_is_absent(self, preserve_config_path):
-        """When CONFIG_PATH is not set, the fixture doesn't interfere."""
-        # Remove CONFIG_PATH if present so we start clean
-        os.environ.pop('CONFIG_PATH', None)
-        assert os.environ.get('CONFIG_PATH') is None
+    Task 5444.  It replaced ``preserve_config_path``, which only saved and
+    restored the variable and so left resolution a function of the process
+    CWD; these tests assert the replacement's stronger guarantee instead of
+    the old one's.
+    """
 
-    def test_can_set_config_path_during_test(self, preserve_config_path):
-        """Setting CONFIG_PATH during a test is visible within the test."""
-        os.environ['CONFIG_PATH'] = '/tmp/inside_test.yaml'
-        assert os.environ['CONFIG_PATH'] == '/tmp/inside_test.yaml'
-        # Cleanup is the fixture's responsibility; we just verify it's set here
+    def test_config_path_is_pinned_to_the_canonical_absolute_config(self):
+        """CONFIG_PATH names the tracked config, by a path that exists and is absolute.
 
-    def test_fixture_accepts_pre_set_value(self, preserve_config_path):
-        """The fixture can be requested explicitly even when CONFIG_PATH was set before."""
-        os.environ['CONFIG_PATH'] = '/tmp/pre_set.yaml'
-        # Fixture should save this value on entry; test can see it
-        assert os.environ['CONFIG_PATH'] == '/tmp/pre_set.yaml'
+        Requests no fixture by name, so the pin being visible at all is what
+        observes the fixture's autouse-ness.
 
-    def test_is_autouse_so_no_explicit_request_needed(self):
-        """preserve_config_path is autouse; tests don't need to request it by name.
-
-        This test requests no fixture by name but still passes when autouse is active.
-        If the fixture is broken (e.g., raises on setup) this test will fail.
+        ``is_absolute`` is the load-bearing assertion: a relative path is
+        precisely the defect — ``YamlSettingsSource.__call__`` resolves it
+        against the process CWD and silently returns ``{}`` when it misses, so
+        a regression to a CWD-derived pin would still satisfy an equality
+        check run from ``fused-memory/`` and fail from anywhere else.
         """
-        # No CONFIG_PATH interaction; just confirms autouse doesn't break normal tests
-        assert True
+        pinned = os.environ['CONFIG_PATH']
+
+        assert pinned == str(conftest.FM_CONFIG_PATH)
+        assert Path(pinned).is_absolute()
+        assert Path(pinned).exists()
+
+    def test_a_test_local_config_path_overrides_the_pin_and_does_not_leak(self, tmp_path):
+        """The escape hatch the pin must leave open, and its boundary.
+
+        Fifteen test modules set ``CONFIG_PATH`` themselves and keep working
+        because a function-scoped ``setenv`` runs after the autouse fixture.
+        The nested ``MonkeyPatch.context()`` is what makes the restore half
+        observable in-test: an assertion in a test body cannot see the autouse
+        fixture's own teardown, and reading the value back from a later test
+        would be the cross-test coupling this fixture exists to remove.
+        """
+        local_config = tmp_path / 'local.yaml'
+
+        with pytest.MonkeyPatch.context() as local:
+            local.setenv('CONFIG_PATH', str(local_config))
+            assert os.environ['CONFIG_PATH'] == str(local_config)
+
+        assert os.environ['CONFIG_PATH'] == str(conftest.FM_CONFIG_PATH)
 
 
 # ---------------------------------------------------------------------------
