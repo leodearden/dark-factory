@@ -1,7 +1,7 @@
 """The ``uuid=`` contract at ``GraphitiBackend.add_episode`` (task 3568).
 
 graphiti_core 0.28.2 treats a caller-supplied ``uuid`` as a LOAD instruction,
-never as create-with-this-id (``graphiti_core/graphiti.py:906-920``)::
+never as create-with-this-id (``graphiti_core/graphiti.py::Graphiti.add_episode``)::
 
     episode = (await EpisodicNode.get_by_uuid(self.driver, uuid)  # LOAD (raises)
                if uuid is not None

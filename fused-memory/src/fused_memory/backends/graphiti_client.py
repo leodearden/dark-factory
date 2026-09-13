@@ -1482,8 +1482,8 @@ class GraphitiBackend:
         from it, not the tool response.
 
         ``uuid`` means LOAD, never create-with-this-id (graphiti_core 0.28.2,
-        ``graphiti.py:906-920``): a non-None value selects
-        ``EpisodicNode.get_by_uuid``, so it can only name an episode that
+        ``graphiti_core/graphiti.py::Graphiti.add_episode``): a non-None value
+        selects ``EpisodicNode.get_by_uuid``, so it can only name an episode that
         ALREADY exists, and on that branch ``content`` is ignored in favour of
         the stored episode body (warned about below). To create a NEW episode
         pass ``uuid=None`` and read the minted uuid off ``result.episode.uuid``
