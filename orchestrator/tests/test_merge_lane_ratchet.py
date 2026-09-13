@@ -54,22 +54,37 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # RUNTIME, measured rather than estimated. An earlier version of this comment
 # claimed "MEASURED end to end at 35-65s"; that estimate was wrong, and task
 # 5101 exists because it was wrong. The module measured 146.79s and 250.72s on
-# one UNCHANGED tree (esc-5021-1, and re-measured here at 237.09s before the
-# fix) -- it took FOUR live measurements of the same tree where one was
-# available. After task 5101 folded every anchor onto the single measurement:
-# 219 passed in 62.45s and 90.60s on two runs of the same tree, of which 27.19s
-# was that one shared build_report. Both AFTER samples are reported because one
-# of them is not a measurement -- see the wall-clock note below.
+# one UNCHANGED tree (esc-5021-1), and 237.09s re-measured here before the fix.
+#
+# WHAT TASK 5101 CHANGED, stated as work rather than seconds, because work is
+# what is deterministic here: the module took FOUR full sweeps of the 573-file
+# test tree where ONE was available, and measured each of the 25 resolved
+# cluster files with complexipy TWICE. It now takes one sweep and one
+# measurement per file. Both are held by counting guards -- see
+# `no_private_tree_scan` and
+# TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once --
+# so a regrown sweep fails immediately instead of silently re-adding the cost.
+#
+# The load-independent size of that win, taken WITHIN the single BEFORE run so
+# every item saw the same load: the three folded items cost 46.78s + 32.88s +
+# 26.41s = 106.07s of that run's 237.09s, i.e. 45% of the module, and now all
+# three fall below pytest's 0.005s reporting floor.
+#
+# Whole-module wall clock AFTER, all on the same unchanged tree: 62.45s, 90.60s
+# and 113.87s over three runs. Every sample is reported rather than the
+# flattering one, because the spread between them is as large as the effect --
+# which is the point of the next paragraph.
+#
+# WALL CLOCK ON THIS HOST IS NOT A RELIABLE MEASURE of this module: a four-run
+# A/B of `--check` over ONE unchanged tree read 19.1s, 46.0s, 25.6s, 33.2s and
+# 43.4s. That is why every guard added by task 5101 counts WORK (ast.parse /
+# Path.read_text calls) and never elapsed time, and why none of them asserts a
+# runtime ceiling.
 #
 # A HIGH RUNTIME HERE DOES NOT INDICATE A WRONG COMPLEXIPY VERSION. 6.2.0 was
 # correctly resolved throughout every one of those runs and require_complexipy()
 # passed each time; a wrong version fails immediately and by name, before any
 # measurement. Do not read slowness as a version signal.
-#
-# Wall clock on this host is not a reliable measure of this module at all: a
-# four-run A/B of `--check` over ONE unchanged tree read 19.1s, 46.0s, 25.6s,
-# 33.2s and 43.4s. That is why every guard added by task 5101 counts WORK
-# (ast.parse / Path.read_text calls) and never elapsed time.
 #
 # The 60s ini default would be a coin flip, and pytest-timeout's thread method
 # enforces it by os._exit()ing the xdist worker -- which with
@@ -89,7 +104,8 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # The xdist_group pins the WHOLE module to one worker. Without it, --dist
 # loadgroup distributes these items individually and every worker that draws one
 # pays build_report over again -- 25 complexipy runs plus a 573-file AST sweep,
-# measured at 27.19s of a 62.45s module -- for a single cached result. Grouped,
+# measured at 27.19s of a 62.45s module and 55.46s of a 113.87s one -- for a
+# single cached result. Grouped,
 # the module takes that cost exactly ONCE (module-scoped `live_measurement`
 # below) while running in parallel with the rest of the suite. `xdist_group` is a registered marker; see
 # test_marker_registration_drift.py's allowlist.
@@ -125,7 +141,7 @@ def live_measurement() -> LiveMeasurement:
 
     build_report is the module's whole remaining cost: 25 complexipy runs over
     the cluster and a 573-file orchestrator/tests AST sweep, measured at 27.19s
-    of the module's 62.45s. (It measured 72.7s when this module was authored,
+    of the module's 62.45s and 55.46s of a slower run's 113.87s. (It measured 72.7s when this module was authored,
     of which 13.0s was complexipy -- halved by task 5101, since build_report
     then measured every cluster file twice.) EVERY test that needs live numbers
     shares this one result: task 5101 folded on the last three stragglers, and
@@ -2012,8 +2028,9 @@ def stub_measurement(monkeypatch: pytest.MonkeyPatch, live_report: dict) -> dict
 
     The CLI's own job is dispatch, rendering and the exit ladder; build_report
     is already pinned by TestBuildReport against the real tree. Re-measuring
-    once per CLI test would add ~7 x 27.19s to every orchestrator verify leg to
-    re-prove something already proven -- more than the whole module now costs.
+    once per CLI test would add ~7 x build_report (27.19s in the fastest run
+    measured) to every orchestrator verify leg to re-prove something already
+    proven -- several times what the whole module now costs.
 
     It hands back the module's REAL live measurement, not a synthetic one, so a
     CLI test using this fixture still compares live numbers.

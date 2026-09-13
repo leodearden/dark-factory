@@ -604,21 +604,26 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    each taking their own full sweep), and each cluster file measured by
    complexipy once instead of twice. Both are held by work-counting guards
    (`TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once` and
-   the `no_private_tree_scan` fixture) rather than by discipline. Measured on one
-   unchanged tree: 215 items in **237.09s** before, 219 items in **62.45s and
-   90.60s** on two runs after — both AFTER samples reported rather than the
-   flattering one, since the spread is the point (see below). 27.19s of that is
-   the single remaining `build_report`.
+   the `no_private_tree_scan` fixture) rather than by discipline.
+
+   Measured on one unchanged tree: 215 items in **237.09s** before; 219 items in
+   **62.45s, 90.60s and 113.87s** over three runs after. Every AFTER sample is
+   reported rather than the flattering one, because the spread between them is
+   as large as the effect. The load-independent figure, taken WITHIN the single
+   BEFORE run so every item saw the same load: the three folded items cost
+   46.78s + 32.88s + 26.41s = **106.07s of that run's 237.09s — 45% of the
+   module** — and now all three fall below pytest's 0.005s reporting floor.
 
    STILL σ's: the CLI tests on a small committed fixture tree, the session-scope
    hoist, and the ≤ 60s ceiling assertion itself — which is the reason 5101 does
-   not claim the ceiling. Neither AFTER sample is under 60s, and wall clock on
+   not claim the ceiling. No AFTER sample is under 60s, and wall clock on
    this host is too noisy to claim it either way: a four-run A/B of `--check`
    over ONE unchanged tree read 19.1s, 46.0s, 25.6s, 33.2s and 43.4s. σ will
    need a load-independent way to assert its ceiling, or it will assert a
    coin flip. The remaining floor
-   σ must attack is the single `build_report` (27.19s), plus ~10s of radon MI in
-   the five `TestReportCli` items and 7.15s in
+   σ must attack is the single `build_report` (27.19s of the fastest AFTER run,
+   55.46s of the slowest), plus the radon MI recomputed in each of the five
+   `TestReportCli` items and the 6–7s in
    `test_merge_queue_anchor_reproduces_the_prd_background_numbers`, which still
    measures merge_queue.py twice through the two public projections. The ceiling
    and the INV-10/INV-11 prohibitions above are unchanged — this is a correction
