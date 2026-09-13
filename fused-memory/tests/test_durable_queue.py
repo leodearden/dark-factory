@@ -1996,3 +1996,138 @@ class TestTerminalHook:
             await poll_until(_completed, timeout=20.0, interval=0.05)
         finally:
             await q.close()
+
+
+class TestDeadLetterHook:
+    """The PUSH seam (task 3583): `on_dead_letter`, fired for every dead item.
+
+    Distinct from `on_terminal` above, which exists to write a terminal outcome
+    back onto a `write_ops` row and therefore correctly skips an item with no
+    `_write_op_id` to join on, and fires on 'completed' too. This hook is an
+    operator ALARM: it fires only on 'dead', and it fires whether or not a join
+    key exists.
+    """
+
+    @staticmethod
+    def _recorder():
+        events: list = []
+
+        async def hook(event):
+            events.append(event)
+
+        return events, hook
+
+    @staticmethod
+    def _queue(
+        tmp_path, *, hook, execute_write, max_attempts=1,
+        retry_base_seconds=0.05, **kwargs,
+    ):
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute_write,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+            write_timeout_seconds=2.0,
+            on_dead_letter=hook,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_fires_the_hook_once_with_a_structured_event(
+        self, tmp_path
+    ):
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'never lands', '_write_op_id': 'W1'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1, f'exactly one alarm per death, got {events}'
+            event = events[0]
+            assert isinstance(event, dq_module.DeadLetterEvent)
+            assert isinstance(event.item_id, int) and event.item_id > 0
+            assert event.group_id == 'proj1'
+            assert event.operation == 'add_episode'
+            # The COMMITTED attempt count, matching the row and the WARN line —
+            # not the pre-increment value the claimed item carried.
+            assert event.attempts == 1
+            assert event.error is not None
+            assert event.error.startswith('RuntimeError: boom'), event.error
+            assert event.write_op_id == 'W1'
+            assert event.payload == {'content': 'never lands', '_write_op_id': 'W1'}
+            # _execute_write itself failed, so the backend write did NOT land:
+            # this one is safe to replay, and the alarm must say so structurally.
+            assert event.post_execute is False
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_rescheduled_retry_does_not_fire_the_hook(self, tmp_path):
+        """Only permanent abandonment is worth paging on.
+
+        A retry is the queue working as designed; firing here would page once
+        per attempt for every write that eventually lands.
+        """
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+            max_attempts=3,
+            # Long enough that the item sits visibly in 'retry' while we
+            # assert, instead of racing exhaustion at the 0.05s default.
+            retry_base_seconds=10.0,
+            retry_max_delay_seconds=30.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'fails once', '_write_op_id': 'W2'},
+            )
+
+            async def _in_retry():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('retry', 0) >= 1
+
+            await poll_until(_in_retry, timeout=20.0, interval=0.05)
+            assert events == [], f'a retry is not a death, got {events}'
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_successful_completion_does_not_fire_the_hook(self, tmp_path):
+        """Unlike on_terminal, which fires on 'completed' as well."""
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            max_attempts=3,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'lands fine', '_write_op_id': 'W3'},
+            )
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            assert events == []
+        finally:
+            await q.close()
