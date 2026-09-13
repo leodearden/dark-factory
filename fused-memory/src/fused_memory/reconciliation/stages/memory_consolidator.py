@@ -325,17 +325,17 @@ class MemoryConsolidator(BaseStage):
         # DOCUMENTED as deliberate — a preserved validation specimen.  Task 3105
         # is in-progress with a null claimant and a null heartbeat on purpose,
         # and this finding twice became an operator-gate task asking for it to be
-        # reset (5080, and 5104 born-at-L2 critical); both were declined by hand.
+        # reset (tasks 5080 and 5104, the second born-at-L2 critical); both were
+        # declined by hand.
         #
         # Placement is the whole point, and it is NOT beside Hook A below.  The
         # remediation early-return three lines down sits ABOVE the entire filter
         # chain, so anything wired next to filter_entity_standing_decisions is
         # unreachable on a remediation pass — and a BLANKET stage1_flag_suppression
-        # for task 3105 (mem0 63905117, widened 2026-09-07) failed to stop the
-        # recurrence for exactly that reason: the two post-widening recurrences
-        # (run f16954ae 2026-08-26, run 720ebf37 2026-09-11) were both remediation
-        # runs.  This is the placement verify_cited_memories already uses to cover
-        # both passes, for the same reason.
+        # for task 3105 failed to stop the recurrence for exactly that reason: the
+        # recurrences that continued after it was widened were remediation runs.
+        # This is the placement verify_cited_memories already uses to cover both
+        # passes, for the same reason.
         #
         # Both stats are pre-inited here, above the return, so neither key is ever
         # conditionally absent from a remediation report (the always-present

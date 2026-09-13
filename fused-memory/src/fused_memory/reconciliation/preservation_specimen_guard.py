@@ -9,45 +9,40 @@ attention".  So it re-emits a moderate/actionable stranded finding for such a
 task on roughly every cycle, and downstream that finding becomes a request to
 destroy the very thing it is looking at.
 
-THE MEASURED DAMAGE.  dark_factory task 3105 is the sole preserved live
-validation specimen for gate task 3546's soak/flip checklist.  Its re-flag
-twice became an operator-gate ``submit_task`` asking for the specimen to be
-reset out of ``in-progress`` — task 5080 (filed 2026-09-04T09:18:52Z) and task
-5104 (filed 2026-09-04T14:09:16Z, born-at-L2 critical).  Both were declined
-and cancelled by hand, without touching 3105.  Its twin specimen, task 3371,
-was not so lucky: it stopped being a specimen when its pinning escalation lost
-open status in an orphan-reaper cascade on 2026-08-08.
+THE MEASURED DAMAGE.  Task 3105 is held ``in-progress`` as a preserved live
+validation specimen for a gate task's soak/flip checklist.  Its re-flag twice
+became an operator-gate ``submit_task`` asking for the specimen to be reset out
+of ``in-progress`` (tasks 5080 and 5104, the second born-at-L2 critical); both
+were declined and cancelled by hand.  A twin specimen was not so lucky — it
+stopped being one when its pinning escalation lost open status in an
+orphan-reaper cascade.  Task 4223's record holds the dates, ids and counts.
 
 WHY A SUPPRESSION LIST DID NOT FIX IT.  A ``stage1_flag_suppression`` record
-for task 3105 already exists (mem0 63905117-add7-4d47-89f2-90bb34157afc) and
-was WIDENED to blanket on 2026-09-07 by removing its ``flag_types`` key.
-Recurrence continued anyway, for two independent reasons this module is shaped
-around:
+for task 3105 already existed, and was later WIDENED to blanket by removing its
+``flag_types`` key.  Recurrence continued anyway, for two independent reasons
+this module is shaped around:
 
 1. ``stages/memory_consolidator.py``'s remediation early-return sits ABOVE the
    whole filter chain, so nothing wired beside ``filter_entity_standing_decisions``
-   runs on a remediation pass — and the two post-widening recurrences (run
-   f16954ae on 2026-08-26, run 720ebf37 on 2026-09-11) were both remediation
-   runs.  This guard is therefore wired ABOVE that early-return.
+   runs on a remediation pass — and the recurrences that continued after the
+   widening were remediation runs.  This guard is therefore wired ABOVE that
+   early-return.
 2. ``flag_type`` is free-form LLM output.  This ONE false positive has already
-   worn three distinct namings — ``task_stranded_no_claimant``,
-   ``task_stranded_no_claimant_heartbeat``, ``stranded_merge_phase_liveness``
-   — as mem0 4dcf7de6 states outright ("the THIRD occurrence of this false
-   positive under a THIRD distinct flag_type naming").  An enumerated
-   ``(task_id, flag_type)`` list cannot keep up, which is why the scoped record
-   had to be widened in the first place.
+   worn at least three distinct namings — ``task_stranded_no_claimant``,
+   ``task_stranded_no_claimant_heartbeat``, ``stranded_merge_phase_liveness``.
+   An enumerated ``(task_id, flag_type)`` list cannot keep up, which is why the
+   scoped record had to be widened in the first place.
 
 So the verdict is DERIVED from the preservation evidence rather than looked up
-in a hand-authored list.  That also closes the gap 5080 and 5104 were filed in:
-a specimen is protected on the first cycle it is documented, not on the first
-cycle somebody remembers to write a suppression record for it.
+in a hand-authored list.  That also closes the gap those two gate tasks were
+filed in: a specimen is protected on the first cycle it is documented, not on
+the first cycle somebody remembers to write a suppression record for it.
 
 COMPOSITE TASK IDS, AND THE DEFECT THIS AVOIDS.  A flag's OWN ``task_id`` is
-routinely comma-joined — 29 of 235 live ``stage1_flag_marker`` ledger rows are,
-and task 3105 appears as ``'3105,5080'``, ``'3105,5080,5104'`` and
-``'3105,4223'`` — so every candidate id is DECOMPOSED before corroboration and
-the counters key on the corroborated COMPONENT, not on the raw string.  That is
-a correctness requirement rather than a refinement, and the reason is visible in
+routinely comma-joined — task 3105 has been flagged as ``'3105,5080'`` and
+``'3105,4223'``, among others — so every candidate id is DECOMPOSED before
+corroboration and the counters key on the corroborated COMPONENT, not on the
+raw string.  That is a correctness requirement rather than a refinement, and the reason is visible in
 the sibling: ``flag_dedup.filter_suppressed._keep`` looks its flag's task_id up
 VERBATIM while only the suppression ROW side is decomposed (see
 ``_decompose_suppression_task_id``'s docstring, which scopes itself to that
@@ -144,11 +139,13 @@ __all__ = [
 #: task's odd state is deliberate because the task is being kept as evidence.
 #:
 #: Curated from the live corpus, not invented.  ``'validation specimen'`` alone
-#: covers all five of task 3105's ``investigation_outcome`` rows and both the
-#: Graphiti edge and node summary, across four different surrounding phrasings
-#: ("sole preserved live ...", "preserved dark-factory ...", "preserved SOLE
-#: live ...", "sole remaining preserved live ...") — which is exactly why the
-#: family holds the invariant NOUN PHRASE rather than any one full sentence.
+#: matched every ``investigation_outcome`` row and both Graphiti sources found
+#: for the specimen when this was written, across several different surrounding
+#: phrasings ("sole preserved live ...", "preserved dark-factory ...",
+#: "preserved SOLE live ...") — which is exactly why the family holds the
+#: invariant NOUN PHRASE rather than any one full sentence.  Recall is a
+#: property of a corpus that grows every cycle, so it is asserted by the
+#: matcher tests against fixture prose, never claimed as a count here.
 #:
 #: Every member is multi-word by rule.  The bare words this class is written in
 #: — ``preserved``, ``specimen``, ``intentional``, ``deliberate`` — all occur
@@ -372,9 +369,9 @@ def _is_usable_task_id(component: str) -> bool:
 def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
     """Every task id *flag* names, in order, deduped; ``()`` when none is usable.
 
-    Stage 1 routinely emits COMPOSITE task_ids — 29 of 235 live
-    ``stage1_flag_marker`` ledger rows are comma-joined, and task 3105 is flagged
-    as ``'3105,5080'``, ``'3105,5080,5104'`` and ``'3105,4223'`` — so a verbatim
+    Stage 1 routinely emits COMPOSITE task_ids — a substantial minority of live
+    ``stage1_flag_marker`` ledger rows are comma-joined, and task 3105 has been
+    flagged as ``'3105,5080'`` and ``'3105,4223'`` among others — so a verbatim
     lookup would find nothing for exactly the task this guard exists to protect.
     Components are stripped, so an LLM-authored ``'3105, 4223'`` resolves too,
     and a separator-only value (``','``) yields no candidates rather than a junk
@@ -902,9 +899,9 @@ async def filter_preservation_specimen_flags(
             kept_task_ids.update(task_ids)
             continue
         # Counters key on the CORROBORATED COMPONENT, never the raw composite:
-        # task 3105 is flagged as '3105,5080', '3105,5080,5104' and '3105,4223',
-        # and keying on the string would scatter one task's suppressions across
-        # three counters — the storm threshold would never trip and the citation
+        # one task is flagged under several comma-joined spellings, and keying on
+        # the string would scatter its suppressions across a counter per
+        # permutation — the storm threshold would never trip and the citation
         # audit trail would fragment.
         cited_task, citation = cited
         suppressed_by_task[cited_task] = suppressed_by_task.get(cited_task, 0) + 1

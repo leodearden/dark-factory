@@ -1,12 +1,12 @@
 """Tests for the Stage-1 preservation-specimen corroboration guard (task 4223).
 
 Task 3105 is ``in-progress`` with a null claimant and a null heartbeat *on
-purpose*: it is the sole preserved live validation specimen for gate task
-3546.  Stage 1's stranded-task heuristic cannot see that, so it re-emits a
-moderate/actionable "stranded" finding on roughly every cycle, and twice that
-finding became an operator-gate task asking for the specimen to be reset —
-5080 (filed 2026-09-04T09:18:52Z) and 5104 (born-at-L2 critical, filed
-2026-09-04T14:09:16Z).  Both were declined and cancelled by hand.
+purpose*: it is a preserved live validation specimen for a gate task's
+soak/flip checklist.  Stage 1's stranded-task heuristic cannot see that, so it
+re-emits a moderate/actionable "stranded" finding on roughly every cycle, and
+twice that finding became an operator-gate task asking for the specimen to be
+reset (tasks 5080 and 5104, the second born-at-L2 critical).  Both were
+declined and cancelled by hand.
 
 This module's guard derives the verdict from the preservation evidence that
 already exists in both stores, so the recommendation is dropped before it can
@@ -52,7 +52,9 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
 #   get_entity('Task 3105', 'dark_factory')                      -> edge a8fd36a8
 #   get_memories_by_metadata('dark_factory',
 #       {'kind': 'investigation_outcome', 'task_id': '3105',
-#        'actionable': False})                                   -> 5 rows
+#        'actionable': False})                                   -> the rows below
+# The scroll GROWS every time a stage concludes another investigation, so these
+# are examples of the live shapes, never an exhaustive set.
 
 #: Graphiti edge a8fd36a8-46db-4ca8-a21c-554c38a918ee, verbatim.
 LIVE_GRAPHITI_EDGE_FACT = (
@@ -1614,12 +1616,12 @@ class TestMaybeEscalatePreservationSuppressionStorm:
 class TestCompositeFlagTaskIds:
     """A flag's OWN task_id is routinely comma-joined, and must be decomposed.
 
-    This is a correctness requirement, not a refinement. 29 of 235 live
-    ``stage1_flag_marker`` ledger rows carry a composite task_id, and task 3105
-    specifically appears as ``'3105,5080'``, ``'3105,5080,5104'`` and
-    ``'3105,4223'``. A guard that looked its flag's task_id up VERBATIM would
-    find nothing for those and let the destructive recommendation through on
-    exactly the task it exists to protect.
+    This is a correctness requirement, not a refinement. A substantial minority
+    of live ``stage1_flag_marker`` ledger rows carry a composite task_id, and
+    task 3105 specifically has appeared as ``'3105,5080'`` and ``'3105,4223'``
+    among others. A guard that looked its flag's task_id up VERBATIM would find
+    nothing for those and let the destructive recommendation through on exactly
+    the task it exists to protect.
 
     ``filter_suppressed._keep`` has precisely this gap — it looks the flag
     task_id up verbatim while only the suppression ROW side is decomposed. This
