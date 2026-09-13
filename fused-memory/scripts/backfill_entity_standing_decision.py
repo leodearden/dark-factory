@@ -181,7 +181,10 @@ def resolve_source_entity_uuid(record: Any) -> str:
         )
 
     entity_uuid = metadata.get('entity_uuid')
-    if not is_full_uuid(entity_uuid):
+    # The ``isinstance`` half is redundant at runtime — ``is_full_uuid`` already
+    # rejects every non-str — and carries its weight as the narrowing a plain
+    # ``bool`` predicate cannot give a type checker reading the ``str`` return.
+    if not isinstance(entity_uuid, str) or not is_full_uuid(entity_uuid):
         raise BackfillSourceInvalid(
             f'source memory {SOURCE_MEMORY_ID!r} has entity_uuid {entity_uuid!r}, '
             'which is not a canonical 36-char dashed UUID; hint: the ledger row '

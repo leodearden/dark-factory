@@ -376,6 +376,7 @@ class TestOneCycleSuppressesAndAnnotates:
         raw = state.get_findings_for_run(run_id)
         assert [f['standing_decision_id'] for f in raw] == [expected_id]
         assembled = state.get_assembled_report(run_id, 'reconciler')
+        assert assembled is not None, 'get_assembled_report returned None'
         assert [
             f['standing_decision_id'] for f in assembled['flagged_items']
         ] == [expected_id]
