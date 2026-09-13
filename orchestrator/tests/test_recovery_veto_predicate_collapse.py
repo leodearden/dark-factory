@@ -59,13 +59,12 @@ _RECORD_COLLECTIONS = frozenset({
 #: could silently allowlist a NEW bare test elsewhere in the same 700-line
 #: function.  The rationale for each carve-out belongs in the source comment at
 #: the site, once — not duplicated into an assertion here.
-_ALLOWLIST: tuple[dict, ...] = (
-    {
-        'module': 'harness.py',
-        'function': '_reconcile_one_stranded',
-        'body': ('return None',),
-    },
-)
+#: EMPTY as of task 3541's review pass: the last carve-out — the re-file dedup
+#: guard — was given its own shared predicate
+#: (`recovery_pins.records_would_duplicate_a_handoff`) rather than kept as a
+#: bare truthiness test.  The matcher and its synthetic-entry coverage stay for
+#: the next genuine carve-out.
+_ALLOWLIST: tuple[dict, ...] = ()
 
 
 def _module_source(name: str) -> str:

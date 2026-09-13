@@ -99,6 +99,7 @@ from orchestrator.recovery_pins import (
     records_pin_blocked_done_flip,
     records_pin_blocked_recovery,
     records_pin_recovery,
+    records_would_duplicate_a_handoff,
 )
 
 if TYPE_CHECKING:
@@ -128,6 +129,7 @@ __all__ = [
     'report_pins_blocked_done_flip',
     'report_pins_blocked_recovery',
     'report_pins_recovery',
+    'report_would_duplicate_a_handoff',
 ]
 
 
@@ -1198,6 +1200,20 @@ def report_pins_blocked_done_flip(report: TruthReport) -> bool:
     :func:`orchestrator.recovery_pins.records_pin_blocked_done_flip`.
     """
     return records_pin_blocked_done_flip(
+        '',
+        report.open_escalations,
+        live_claimant=report.live_claimant is not None,
+        live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_would_duplicate_a_handoff(report: TruthReport) -> bool:
+    """Does a record with an OWNER already sit on *report*'s task?
+
+    The re-file DEDUP question, report-shaped.  See
+    :func:`orchestrator.recovery_pins.records_would_duplicate_a_handoff`.
+    """
+    return records_would_duplicate_a_handoff(
         '',
         report.open_escalations,
         live_claimant=report.live_claimant is not None,

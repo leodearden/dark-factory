@@ -11,8 +11,12 @@ split is deliberate and is the whole reason this module exists:
   config-free and CATEGORY-free, and is shared with the escalation server, so
   orchestrator policy must not leak into it.
 * THIS module owns the orchestrator's CATEGORY policy — which escalation
-  classes a merge can itself remediate — and composes the two into the one
-  predicate every recovery/redispatch veto site consumes.
+  classes a merge can itself remediate — and composes the two into the
+  predicates that answer EVERY orchestrator-side question about a task's open
+  records: does it pin recovery, does it forbid a done-flip, would a re-file
+  duplicate an existing handoff.  All three come from ONE classification, which
+  is what makes them incapable of disagreeing about level, severity or
+  store-unavailability.
 
 It lives in its own module rather than in ``harness.py`` so
 ``scheduler.py`` can import it too: before task eta the scheduler's
@@ -41,6 +45,10 @@ So, readable from this module alone:
   here and ``task_ground_truth._vetoes_done_flip`` at the resolver.  Consumed
   by the ON_MAIN blocked-arm clause, the ``_RECOVERY`` table's escalation
   element, and the already-landed dispatch gate.
+* RE-FILE DEDUP -> the OWNED buckets, via
+  :func:`records_would_duplicate_a_handoff`.  A third question, not a third
+  spelling of the first two: "does a record with an owner already sit on this
+  task?".  Consumed by the harness re-file dedup guard.
 
 The precedence chain that decides a record's pin class is documented once, in
 ``escalation/src/escalation/pins.py``; this module deliberately does not
@@ -66,6 +74,7 @@ __all__ = [
     'records_pin_blocked_done_flip',
     'records_pin_blocked_recovery',
     'records_pin_recovery',
+    'records_would_duplicate_a_handoff',
 ]
 
 
@@ -222,3 +231,39 @@ def records_pin_blocked_done_flip(
         live_claimant=live_claimant,
         live_claimant_id=live_claimant_id,
     ).vetoes_done_flip and not only_merge_remediable(records)
+
+
+def records_would_duplicate_a_handoff(
+    task_id: str,
+    records: Sequence[PinRecord] | None,
+    *,
+    live_claimant: bool,
+    live_claimant_id: str | None = None,
+) -> bool:
+    """Does a record with an OWNER already sit on this task?
+
+    The re-file DEDUP question — "would filing another escalation stack a
+    duplicate?" — and a genuinely different one from either pin predicate
+    above, which is why it gets its own name rather than borrowing theirs.
+
+    An ``info`` record is excluded: it is an annotation with no consumer, so
+    re-filing over it stacks nothing and the re-file the resolver ordered must
+    proceed.  A ``dead_l0`` IS included even though it does not PIN: it is
+    still a record on the task, and the orphan-L0 reaper promotes it to L1, so
+    a second L1 filed now would be exactly the duplicate this guard prevents.
+
+    Computed from the BUCKETS rather than by borrowing ``vetoes_done_flip``,
+    whose formula happens to coincide today.  The two answer different
+    questions and must stay free to diverge: a change to the done-flip policy
+    must not silently retune the dedup.
+
+    ``records is None`` fails safe to True — you cannot tell what you would be
+    stacking.
+    """
+    report = classify_pins(
+        task_id,
+        records,
+        live_claimant=live_claimant,
+        live_claimant_id=live_claimant_id,
+    )
+    return bool(report.queue_handoff or report.dead_l0 or report.store_unavailable)
