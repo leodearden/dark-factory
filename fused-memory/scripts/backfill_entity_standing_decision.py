@@ -56,8 +56,10 @@ opened a ``ReconLedgerStore`` would create the schema at whatever path it was
 misdirected to, and the ``--apply`` that followed would then find a target the
 gate accepts — the gate disarmed by the rehearsal prescribed to protect it.
 So on a MISSING or NO_SCHEMA target the rehearsal reads no store at all: the
-answer to "is there already an active row" is ``None`` by construction, and
-``ledger_db_state`` in the report says which of the two it was.
+answer to "is there already an active row" is ``None`` by construction,
+``ledger_db_state`` in the report says which of the two it was, and the run
+WARNS on ``stderr`` naming the resolved path — a rehearsal whose whole purpose
+is discovery should not make the operator go looking for the finding.
 
 OPEN QUESTION 6 — the evidence-only stamping shape — IS RESOLVED HERE
 ---------------------------------------------------------------------
@@ -857,6 +859,45 @@ READABLE_LEDGER_STATES = frozenset(
 )
 
 
+#: Why a rehearsal would read nothing at the target, per non-readable verdict.
+#: A mapping rather than a branch, so that the set of verdicts worth warning
+#: about and :data:`READABLE_LEDGER_STATES` stay visibly complementary.
+_UNREADABLE_TARGET_REASONS = {
+    LedgerTargetState.MISSING: (
+        'nothing exists at that path, so this rehearsal read no ledger at all '
+        'and planned as though no standing decision were on record'
+    ),
+    LedgerTargetState.NO_SCHEMA: (
+        f'the file there is a SQLite database with no {LEDGER_TABLE_NAME!r} '
+        'table, so no fused-memory server has ever opened it as its ledger'
+    ),
+}
+
+
+def warn_unreadable_ledger_target(state: LedgerTargetState, db_path: Path) -> None:
+    """Say on the channel an operator watches that this rehearsal read no ledger.
+
+    The rehearsal is how a misconfigured target is meant to be DISCOVERED —
+    that is why :func:`assert_ledger_target_live` exempts it. A report field
+    alone discharges that only for a reader who already suspects the problem
+    and knows which field to consult, so the finding also goes to ``stderr``,
+    where an operator is already looking.
+
+    Silent on a readable target, which is what keeps the signal worth reading.
+    """
+    reason = _UNREADABLE_TARGET_REASONS.get(state)
+    if reason is None:
+        return
+    logger.warning(
+        'backfill_entity_standing_decision: DRY RUN against an unusable recon '
+        'ledger target %s (state=%s) — %s. reconciliation.data_dir is resolved '
+        'against this process CWD (%r); re-run from the fused-memory server\'s '
+        'own working directory, or point --config at that deployment, before '
+        '--apply — which refuses this target rather than seeding it.',
+        str(db_path), str(state), reason, os.getcwd(),
+    )
+
+
 class _AbsentLedger:
     """The ledger of a database that is not there, for a rehearsal to read.
 
@@ -978,6 +1019,11 @@ def main(argv: list[str] | None = None) -> int:
             assert_ledger_target_live(
                 state=state, db_path=db_path, recon_ledger_enabled=ledger_enabled
             )
+        else:
+            # Only on the rehearsal: an --apply already has the refusal above as
+            # its loud channel, and saying it twice would make the quieter line
+            # the one an operator learns to skip.
+            warn_unreadable_ledger_target(state, db_path)
 
         memory = MemoryService(config)
         # A rehearsal must not CREATE the ledger whose absence the gate refuses.
