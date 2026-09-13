@@ -50,14 +50,31 @@ shape and the reasoning.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     STATE_ACTIVE,
 )
+from fused_memory.reconciliation.standing_decision_writer import (
+    write_entity_standing_decision,
+)
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 from fused_memory.utils.validation import is_full_uuid
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Pinned identity — ONE memory id, and no copy of the entity uuid
@@ -421,3 +438,263 @@ def plan_backfill(
         ),
         evidence_refs=tuple(build_evidence_refs(selected, entity_uuid)),
     )
+
+
+#: Who authorized this write. β's ``authorized_by`` arm SKIPS the evidence gate
+#: and records an operator-authorization provenance entry naming this value, so
+#: the row says on its face that a migration — not an LLM mid-cycle — wrote it.
+#:
+#: The bypass is used rather than leaned on: the cited evidence includes the
+#: human-authored record in :data:`HUMAN_EVIDENCE_MEMORY_IDS`, so the row would
+#: satisfy arm 1 on its own merits if that record were metadata-discoverable.
+AUTHORIZED_BY = 'backfill_entity_standing_decision (task 2900 η)'
+
+#: Stamped on every ``update_memory`` so the amendment is attributable in the
+#: mem0 history a content-amendment audit reads.
+WRITE_SOURCE = 'backfill_entity_standing_decision'
+WRITE_REASON = (
+    'superseded by an entity_standing_decision ledger row (PRD decision 5); '
+    'retained as evidence only'
+)
+
+#: A record outcome that means the run did not fully land. Graded by
+#: :func:`resolve_exit_code` off the SAME set the report uses, so the exit code
+#: and the artifact can never disagree about whether a run was clean.
+ERROR_OUTCOMES = frozenset({'stamp_error'})
+
+
+async def run_backfill(memory_service: Any, *, apply: bool) -> dict[str, Any]:
+    """Read the live state, plan, then (when applying) write the row and stamps.
+
+    ORDER IS LOAD-BEARING and NOT reversible: **the ledger row is written
+    first, and a stamp failure never rolls it back.** The row is the
+    authoritative machine-consulted artifact — PRD decision 6 makes the ledger
+    kind the sole form γ and δ read — while the stamps are advisory provenance
+    on records nothing reads. Stamping first would leave originals asserting
+    they are superseded by a row that does not exist: a strictly worse
+    intermediate state than an un-stamped original, because it misleads the one
+    audience the stamp exists for. Both legs are independently idempotent
+    (:func:`plan_backfill`), so a re-run completes whatever the first missed.
+
+    This function does NOT run the store-mutation preflight; :func:`main` does,
+    once per run, ahead of both the scan and the first mutation. Probing here
+    would put a ``RuntimeError`` subclass inside the per-record ``except``
+    below, downgrading a run-wide environment denial into N ``stamp_error``
+    rows in a report that otherwise reads as a completed sweep.
+
+    Args:
+        memory_service: A live service with ``recon_ledger`` attached.
+        apply: ``False`` (the default everywhere) rehearses every read and
+            decision and withholds only the writes.
+
+    Returns:
+        A JSON-serializable report: the decided entity, a ``ledger`` disposition
+        (``would_write`` / ``written`` / ``already_migrated``) and one row per
+        stamp target (``would_stamp`` / ``stamped`` / ``stamp_error``).
+    """
+    source_record = await memory_service.get_memory_by_id(PROJECT_ID, SOURCE_MEMORY_ID)
+    entity_uuid = resolve_source_entity_uuid(source_record)
+    scrolled = await memory_service.get_memories_by_metadata(
+        PROJECT_ID, {'entity_uuid': entity_uuid}
+    )
+    active_row = await memory_service.recon_ledger.get_active_entity_standing_decision(
+        PROJECT_ID, entity_uuid
+    )
+    plan = plan_backfill(source_record, scrolled or [], active_row)
+
+    report: dict[str, Any] = {
+        'apply': apply,
+        'project_id': PROJECT_ID,
+        'source_memory_id': SOURCE_MEMORY_ID,
+        'entity_uuid': plan.entity_uuid,
+        'grounds': plan.grounds,
+        'evidence_refs': [dict(ref) for ref in plan.evidence_refs],
+        'ledger': 'already_migrated',
+        'records': [],
+    }
+
+    if plan.needs_ledger_write and not apply:
+        report['ledger'] = 'would_write'
+    elif plan.needs_ledger_write:
+        # Loud by omission: β raises (LedgerUnavailable, a graphiti sampling
+        # error, α's grounds/expiry validation) rather than returning a status,
+        # and those propagate from here UNCAUGHT — before the stamp loop below
+        # has begun, so no original is ever marked superseded by a row that
+        # does not exist.
+        written = await write_entity_standing_decision(
+            memory_service,
+            project_id=PROJECT_ID,
+            entity_uuid=plan.entity_uuid,
+            grounds=plan.grounds,
+            evidence=[dict(ref) for ref in plan.evidence_refs],
+            authorized_by=AUTHORIZED_BY,
+        )
+        report['ledger'] = 'written'
+        report['decided_at'] = written['decided_at']
+        report['expires_at'] = written['expires_at']
+        report['edge_count_at_decision'] = written['edge_count_at_decision']
+
+    migrated_at = report.get('decided_at') or datetime.now(UTC).isoformat()
+    patch = build_evidence_only_patch(
+        entity_uuid=plan.entity_uuid, grounds=plan.grounds, migrated_at=migrated_at
+    )
+    for memory_id in plan.stamp_targets:
+        report['records'].append(
+            {'memory_id': memory_id, 'outcome': 'would_stamp', 'patch': dict(patch)}
+            if not apply
+            else await _stamp_one(memory_service, memory_id, patch)
+        )
+    return report
+
+
+async def _stamp_one(
+    memory_service: Any, memory_id: str, patch: dict[str, str]
+) -> dict[str, Any]:
+    """Demote one original to evidence-only, reporting its outcome in isolation.
+
+    Every failure is captured PER RECORD and none rolls the ledger row back:
+    the row is already the authoritative artifact, and a re-run stamps whatever
+    is still missing. Two failure shapes are caught, because ``update_memory``
+    has two: it RAISES on a vocabulary rejection but REPORTS a not-found (and
+    other refusals) by returning an ``{'error_type': ...}`` envelope — so a
+    caller that guarded only against exceptions would score a refused write as
+    a stamp.
+    """
+    try:
+        response = await memory_service.update_memory(
+            memory_id=memory_id,
+            project_id=PROJECT_ID,
+            metadata_patch=dict(patch),
+            metadata_mode='merge',
+            reason=WRITE_REASON,
+            agent_id=WRITE_SOURCE,
+            _source=WRITE_SOURCE,
+        )
+    except Exception as exc:
+        return {
+            'memory_id': memory_id,
+            'outcome': 'stamp_error',
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+        }
+    if isinstance(response, dict) and response.get('error_type'):
+        return {
+            'memory_id': memory_id,
+            'outcome': 'stamp_error',
+            'error_type': response.get('error_type'),
+            'error': response.get('error'),
+        }
+    return {'memory_id': memory_id, 'outcome': 'stamped'}
+
+
+def resolve_exit_code(report: dict[str, Any]) -> int:
+    """0 on a clean run, 1 when any record did not land as planned.
+
+    An honest non-zero is the one signal an automated caller can act on: the
+    stamps are per-record and partial failure is a real shape, so a bare 0
+    would let a half-stamped corpus read as a completed migration.
+    """
+    return 1 if any(
+        row.get('outcome') in ERROR_OUTCOMES for row in report.get('records') or []
+    ) else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI. Dry run is the DEFAULT, and ``--apply`` is the only way past it."""
+    parser = argparse.ArgumentParser(
+        description=(
+            'One-shot migration of reify mem0 record b0057f3d into an '
+            'entity_standing_decision ledger row, stamping the ad-hoc mem0 '
+            'originals evidence-only (PRD leaf η, task 2900).'
+        ),
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Commit the ledger row and the stamps. Without it the run is a '
+             'full rehearsal that reads and decides everything but writes '
+             'nothing. Must be run from the fused-memory MCP server host: an '
+             'in-sandbox --apply is refused by the store-mutation preflight.',
+    )
+    parser.add_argument(
+        '--json-out', default=None,
+        help='Write the JSON report here in addition to stdout.',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config; sets CONFIG_PATH for this run.',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Build a live service, run the migration, print the report, exit graded."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        stream=sys.stderr,
+    )
+    args = build_parser().parse_args(argv)
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    # Fail-CLOSED capability preflight — ONE probe per run, ahead of the scan
+    # AND of the first mutation, which is what makes "--apply is an operator
+    # action" enforceable rather than advisory. Kept out of `run_backfill` so a
+    # run-wide environment denial cannot be swallowed by that function's
+    # per-record error handling and re-reported as N stamp failures.
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(
+                operation='backfill_entity_standing_decision --apply'
+            )
+        except StoreMutationUnavailable:
+            logger.error(
+                'backfill_entity_standing_decision: --apply NOT started '
+                "(fail-closed) — this process cannot write mem0's history "
+                'directory, so a stamp would patch a record and then fail to '
+                'record the change. Nothing was scrolled, no ledger row was '
+                'written and no record was stamped. Re-run from the '
+                'fused-memory MCP server host (the unsandboxed owner of the '
+                'store). To obtain the report safely from anywhere, re-run '
+                'without --apply.'
+            )
+            raise
+
+    async def _run_live() -> dict[str, Any]:
+        # Deferred so importing this module — which the tests do, by path —
+        # never constructs a backend.
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.reconciliation.recon_ledger import (  # noqa: PLC0415
+            ReconLedgerStore,
+        )
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        ledger = ReconLedgerStore(
+            Path(config.reconciliation.data_dir) / 'reconciliation.db'
+        )
+        try:
+            await memory.initialize()
+            await ledger.initialize()
+            memory.set_recon_ledger(ledger)
+            return await run_backfill(memory, apply=args.apply)
+        finally:
+            await ledger.close()
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    report = asyncio.run(_run_live())
+
+    rendered = json.dumps(report, indent=2, sort_keys=True)
+    if args.json_out:
+        Path(args.json_out).write_text(rendered + '\n', encoding='utf-8')
+    print(rendered)
+    if not args.apply:
+        print('DRY RUN — nothing was modified. Re-run with --apply to commit.')
+    return resolve_exit_code(report)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
