@@ -1359,6 +1359,24 @@ class TestMainReportNamesItsTarget:
             harness.db_path.resolve()
         )
 
+    @pytest.mark.parametrize(
+        'shape',
+        [
+            _mod.LedgerTargetState.LIVE,
+            _mod.LedgerTargetState.MISSING,
+            _mod.LedgerTargetState.NO_SCHEMA,
+        ],
+    )
+    def test_the_report_says_what_was_at_the_target(
+        self, shape, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The path alone cannot separate "wrote into the server's ledger" from
+        "aimed at a database that was absent or schemaless" — both name the same
+        file. The verdict is the field that tells them apart after the fact."""
+        harness = _LiveHarness(tmp_path, target=shape)
+        harness.run(monkeypatch, [])
+        assert harness.report(capsys)['ledger_db_state'] == shape
+
     def test_the_consumer_flag_is_echoed(
         self, tmp_path, monkeypatch, capsys
     ) -> None:

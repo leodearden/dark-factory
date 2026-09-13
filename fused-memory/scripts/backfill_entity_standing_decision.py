@@ -45,9 +45,19 @@ ledger file the running server actually has open. Both halves of that path —
 CWD, and ``ReconLedgerStore.initialize()`` creates what it does not find, so a
 misdirected ``--apply`` would otherwise report a written row and exit 0 having
 seeded a fresh empty db nothing reads. :func:`assert_ledger_target_live` is the
-refusal that closes that, and every report names its
-``ledger_db_path`` so a landed migration is distinguishable from a misdirected
+refusal that closes that, and every report names its ``ledger_db_path`` and
+``ledger_db_state`` so a landed migration is distinguishable from a misdirected
 one after the fact.
+
+THE REHEARSAL IS NON-CREATING, which is what makes the sequence above safe.
+Rehearse first, read the report, then ``--apply``: a dry run touches nothing,
+INCLUDING the ledger file. That is not incidental tidiness. A rehearsal that
+opened a ``ReconLedgerStore`` would create the schema at whatever path it was
+misdirected to, and the ``--apply`` that followed would then find a target the
+gate accepts — the gate disarmed by the rehearsal prescribed to protect it.
+So on a MISSING or NO_SCHEMA target the rehearsal reads no store at all: the
+answer to "is there already an active row" is ``None`` by construction, and
+``ledger_db_state`` in the report says which of the two it was.
 
 OPEN QUESTION 6 — the evidence-only stamping shape — IS RESOLVED HERE
 ---------------------------------------------------------------------
@@ -837,6 +847,39 @@ def assert_ledger_target_live(
         )
 
 
+#: The verdicts on which there is a readable file at the path. LIVE is the
+#: migration's real target; UNDETERMINED is accepted by the gate (fail-open)
+#: and something IS there, so the store gets its own chance to open it and to
+#: fail loudly if it cannot. MISSING and NO_SCHEMA are the two where opening a
+#: ``ReconLedgerStore`` would CREATE the very state the gate reads.
+READABLE_LEDGER_STATES = frozenset(
+    {LedgerTargetState.LIVE, LedgerTargetState.UNDETERMINED}
+)
+
+
+class _AbsentLedger:
+    """The ledger of a database that is not there, for a rehearsal to read.
+
+    NOT a test stub standing in for the real thing: ``None`` is the CORRECT
+    answer to "is there an active standing decision for this entity" when the
+    file that would hold the rows does not exist or was never seeded. Serving
+    that answer from here rather than from a ``ReconLedgerStore`` is what makes
+    a dry run non-creating, and it leaves :func:`run_backfill` and its
+    ``LedgerUnavailable`` guard completely untouched — what that guard refuses
+    is an UNWIRED ledger (the attribute is ``None``), which this is not.
+
+    ONE method, because ``run_backfill`` consults exactly one. If it ever
+    consults a second, this raises ``AttributeError`` rather than answering —
+    the right direction for a rehearsal, whose entire value is that its report
+    is trustworthy.
+    """
+
+    async def get_active_entity_standing_decision(
+        self, project_id: str, entity_uuid: str
+    ) -> None:
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI. Dry run is the DEFAULT, and ``--apply`` is the only way past it."""
     parser = argparse.ArgumentParser(
@@ -849,12 +892,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--apply', action='store_true',
         help='Commit the ledger row and the stamps. Without it the run is a '
-             'full rehearsal that reads and decides everything but writes '
-             'nothing. Must be run from the fused-memory MCP server host AND '
-             "from that server's own working directory: an in-sandbox --apply "
-             'is refused by the store-mutation preflight, and one aimed at a '
-             'ledger the server does not read is refused by '
-             'assert_ledger_target_live.',
+             'full rehearsal that reads and decides everything and writes '
+             'nothing at all — not the records, not the ledger row, and not '
+             'the ledger FILE, so rehearsing against a wrong target cannot '
+             'make the --apply that follows it look legitimate. Must be run '
+             "from the fused-memory MCP server host AND from that server's own "
+             'working directory: an in-sandbox --apply is refused by the '
+             'store-mutation preflight, and one aimed at a ledger the server '
+             'does not read is refused by assert_ledger_target_live.',
     )
     parser.add_argument(
         '--json-out', default=None,
@@ -935,22 +980,31 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         memory = MemoryService(config)
-        ledger = ReconLedgerStore(db_path)
+        # A rehearsal must not CREATE the ledger whose absence the gate refuses.
+        # ``ReconLedgerStore.initialize()`` mkdirs and runs CREATE TABLE IF NOT
+        # EXISTS, so a dry run that opened one would hand the --apply after it a
+        # target that now passes — the gate disarmed by the very rehearsal the
+        # docstring prescribes. Open a store only where there is something to
+        # read; elsewhere the answer is known without opening anything.
+        store = ReconLedgerStore(db_path) if state in READABLE_LEDGER_STATES else None
         try:
             await memory.initialize()
-            await ledger.initialize()
-            memory.set_recon_ledger(ledger)
+            if store is not None:
+                await store.initialize()
+            memory.set_recon_ledger(store if store is not None else _AbsentLedger())
             report = await run_backfill(memory, apply=args.apply)
-            # Which file, and whether anything reads it — carried in the
-            # ARTIFACT, on every run. A report that names neither cannot tell a
-            # landed migration from one that seeded an empty db in the wrong
-            # directory, which is the outcome the gate above now forbids and
-            # the dry run must still be able to diagnose.
+            # Which file, what was at it, and whether anything reads it —
+            # carried in the ARTIFACT, on every run. A report that named none of
+            # these could not tell a landed migration from one that seeded an
+            # empty db in the wrong directory, which is the outcome the gate
+            # forbids and the dry run must still be able to diagnose.
             report['ledger_db_path'] = str(db_path)
+            report['ledger_db_state'] = state
             report['recon_ledger_enabled'] = ledger_enabled
             return report
         finally:
-            await ledger.close()
+            if store is not None:
+                await store.close()
             if hasattr(memory, 'close'):
                 await memory.close()
 
