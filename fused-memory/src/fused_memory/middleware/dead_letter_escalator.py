@@ -83,8 +83,6 @@ try:
 except ImportError:
     HAS_ESCALATION = False
 
-from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
-
 logger = logging.getLogger(__name__)
 
 _QUEUE_DIRNAME = 'data/escalations'
@@ -142,11 +140,21 @@ def _error_class(error: str | None) -> str:
     with one owner, and a local copy would silently stop stripping the day the
     wording changed.
 
+    The import is DEFERRED into this function to break an import cycle, not as
+    a style choice. At module scope it reaches ``services/__init__``, which
+    eagerly imports ``MemoryService``, which imports this module back — so
+    whenever this module is imported FIRST (collecting
+    ``tests/middleware/`` alone does exactly that) the service layer finds it
+    half-initialized and ``emit_dead_letter_escalation`` undefined. By call
+    time both modules are fully loaded.
+
     Falls back to ``'unknown'`` for ``None`` or an unparseable message, which
     folds those deaths together rather than dropping them.
     """
     if not error:
         return 'unknown'
+    from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
+
     text = error
     if text.startswith(POST_EXECUTE_DEAD_PREFIX):
         text = text[len(POST_EXECUTE_DEAD_PREFIX):]

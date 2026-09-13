@@ -63,6 +63,78 @@ def _emit(root, *, project_id=_PROJECT, operation='add_episode',
     )
 
 
+class TestImportsCleanlyOnItsOwn:
+    """This module must be importable FIRST, before the service layer.
+
+    Regression pin for a real cycle. `_error_class` needs
+    `POST_EXECUTE_DEAD_PREFIX` from `services.durable_queue`; importing that at
+    MODULE scope reaches `services/__init__`, which eagerly imports
+    `MemoryService`, which imports this module back — so whichever of the two
+    loads first finds the other half-initialized. It bit asymmetrically and was
+    therefore easy to miss: most test modules pull in `memory_service` first
+    via some other import and the cycle resolves, but collecting
+    `tests/middleware/` on its own imports this module first and the whole file
+    errors out at collection. The remedy is the deferred import inside
+    `_error_class`, and this is what keeps it deferred.
+
+    A SUBPROCESS is load-bearing: by the time any in-process test runs, both
+    modules are long since in `sys.modules`, so an in-process import assertion
+    would pass no matter what and pin nothing.
+    """
+
+    @staticmethod
+    def _run(code: str):
+        import subprocess
+        import sys
+
+        return subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_importing_the_escalator_first_does_not_cycle(self):
+        """Importing this module before the service layer must succeed."""
+        proc = self._run(
+            'from fused_memory.middleware.dead_letter_escalator import ('
+            '    emit_dead_letter_escalation,\n)\n'
+            'assert callable(emit_dead_letter_escalation)\n'
+            'print("ok")\n'
+        )
+        assert proc.returncode == 0, (
+            'importing dead_letter_escalator first must not cycle; stderr:\n'
+            f'{proc.stderr}'
+        )
+        assert 'ok' in proc.stdout
+
+    def test_importing_the_service_layer_first_still_works(self):
+        """The other order must keep working too — the fix is not a swap."""
+        proc = self._run(
+            'from fused_memory.services.memory_service import MemoryService\n'
+            'from fused_memory.middleware.dead_letter_escalator import ('
+            '    emit_dead_letter_escalation,\n)\n'
+            'assert MemoryService is not None and callable(emit_dead_letter_escalation)\n'
+            'print("ok")\n'
+        )
+        assert proc.returncode == 0, f'stderr:\n{proc.stderr}'
+        assert 'ok' in proc.stdout
+
+    def test_deferred_import_still_strips_the_prefix_at_call_time(self):
+        """The deferral must not cost the behaviour it exists to preserve:
+        `_error_class` still reaches the real constant when actually called,
+        escalator-imported-first."""
+        proc = self._run(
+            'from fused_memory.middleware.dead_letter_escalator import _error_class\n'
+            'from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX\n'
+            "assert _error_class(POST_EXECUTE_DEAD_PREFIX + 'TimeoutError: slow') == "
+            "'TimeoutError'\n"
+            'print("ok")\n'
+        )
+        assert proc.returncode == 0, f'stderr:\n{proc.stderr}'
+        assert 'ok' in proc.stdout
+
+
 class TestTheFiledEscalation:
     def test_files_exactly_one_escalation_and_returns_its_id(self, tmp_path):
         esc_id = _emit(tmp_path)
