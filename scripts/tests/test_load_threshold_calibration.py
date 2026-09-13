@@ -244,3 +244,134 @@ def test_a_missing_db_exits_zero_with_a_named_degradation(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     payload = trailing_json(result.stdout)
     assert 'db_unavailable' in payload['degradations'], payload
+
+
+# ── D11: hold fraction and hold streak ──────────────────────────────────────
+
+
+def test_hold_fraction_uses_ge_matching_the_gate(tmp_path: Path):
+    """`>=`, not `>`, mirroring shared.psi's arm comparison.
+
+    A report that disagreed with the gate on the boundary would recommend a
+    threshold the gate then behaves differently at.
+    """
+    module = load_script()
+
+    assert module.hold_fraction([1.0, 2.0, 3.0, 4.0], 3.0) == pytest.approx(0.5)
+    # Every sample exactly AT the candidate holds.
+    assert module.hold_fraction([3.0, 3.0, 3.0], 3.0) == pytest.approx(1.0)
+
+
+def test_hold_fraction_saturates_at_both_ends(tmp_path: Path):
+    module = load_script()
+    values = [1.0, 2.0, 3.0]
+
+    assert module.hold_fraction(values, 99.0) == pytest.approx(0.0)
+    assert module.hold_fraction(values, 1.0) == pytest.approx(1.0)
+    assert module.hold_fraction([], 1.0) == pytest.approx(0.0)
+
+
+def test_each_candidate_is_labelled_against_the_twenty_percent_target():
+    """D11: "the gate holds on a minority of ticks (target <= 20%)"."""
+    module = load_script()
+
+    assert module.within_d11_target(0.05) is True
+    assert module.within_d11_target(0.20) is True
+    assert module.within_d11_target(0.35) is False
+
+
+def test_longest_hold_run_is_reported_in_ticks_and_wall_clock():
+    module = load_script()
+    # 240 consecutive holds at the pinned 5 s cadence = 20 minutes.
+    values = [0.0] * 10 + [9.0] * 240 + [0.0] * 10
+
+    run = module.longest_hold_run(values, 5.0, spacing_seconds=5)
+
+    assert run['ticks'] == 240
+    assert run['seconds'] == 1200
+    assert run['human'] == '20m'
+
+
+def test_one_long_block_is_distinguished_from_the_same_fraction_as_blips():
+    """The whole reason D11's second clause is reported separately.
+
+    A fraction alone cannot tell 20% delivered as single-tick blips from 20%
+    delivered as one continuous block, and those are opposite verdicts for a
+    dispatch throttle.
+    """
+    module = load_script()
+    block = [0.0] * 800 + [9.0] * 200
+    blips = [9.0 if i % 5 == 0 else 0.0 for i in range(1000)]
+
+    assert module.hold_fraction(block, 5.0) == pytest.approx(0.2)
+    assert module.hold_fraction(blips, 5.0) == pytest.approx(0.2)
+    assert module.longest_hold_run(block, 5.0, spacing_seconds=5)['ticks'] == 200
+    assert module.longest_hold_run(blips, 5.0, spacing_seconds=5)['ticks'] == 1
+
+
+def test_observed_spacing_is_measured_from_the_corpus_not_assumed(tmp_path: Path):
+    """A 5 s cadence is the unit's setting, not a property of the corpus."""
+    module = load_script()
+
+    assert module.observed_spacing([100, 105, 110, 115]) == 5
+    assert module.observed_spacing([100, 130, 160]) == 30
+    # Degenerate inputs must not raise; they fall back to the unit's cadence.
+    assert module.observed_spacing([100]) == 5
+    assert module.observed_spacing([]) == 5
+
+
+def test_the_ladder_lands_in_the_trailing_json(tmp_path: Path):
+    """ε1/ε2's escalation is what a human actually reads."""
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_ratio': [0.5] * 80 + [6.0] * 20,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    candidates = payload['holds']['runqueue_ratio']
+    by_threshold = {c['threshold']: c for c in candidates}
+    assert set(by_threshold) == {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0}
+
+    at_six = by_threshold[6.0]
+    assert at_six['hold_fraction'] == pytest.approx(0.2)
+    assert at_six['within_d11_target'] is True
+    assert at_six['longest_hold_run']['ticks'] == 20
+    assert at_six['longest_hold_run']['seconds'] == 100
+
+    at_eight = by_threshold[8.0]
+    assert at_eight['hold_fraction'] == pytest.approx(0.0)
+
+
+def test_a_stem_arm_reports_per_leaf_and_is_never_pooled(tmp_path: Path):
+    """Averaging seven unrelated projects' CPU pressure describes nothing."""
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'own_cpu_some10:orchestrator-reify.service': [90.0] * 100,
+        'own_cpu_some10:orchestrator-dark-factory.service': [1.0] * 100,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    holds = payload['holds']
+    assert set(holds) == {
+        'own_cpu_some10:orchestrator-reify.service',
+        'own_cpu_some10:orchestrator-dark-factory.service',
+    }
+    hot = {c['threshold']: c for c in holds['own_cpu_some10:orchestrator-reify.service']}
+    cold = {c['threshold']: c
+            for c in holds['own_cpu_some10:orchestrator-dark-factory.service']}
+    assert hot[80.0]['hold_fraction'] == pytest.approx(1.0)
+    assert cold[80.0]['hold_fraction'] == pytest.approx(0.0)
+
+
+def test_the_human_report_carries_the_unit_label(tmp_path: Path):
+    """"4.0" means nothing to the human reading the escalation without it."""
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0, 3.0]})
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+
+    assert result.returncode == 0, result.stderr
+    assert 'runnable threads per CPU' in result.stdout, result.stdout
