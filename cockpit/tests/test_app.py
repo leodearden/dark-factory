@@ -3794,3 +3794,146 @@ class TestDecisionQueueDetail:
             assert queue.get_row_index('decision:dec-existing') == 1
             assert 'BBB parked session question?' in detail.rendered_text
             assert app._selected_slug == 'session-parked'
+
+    @pytest.mark.timeout(10)
+    async def test_a_queue_session_row_survives_and_refreshes_across_a_rebuild(self, tmp_path):
+        """The pane belongs to whichever TABLE last moved, not to whichever record
+        KIND is on screen.
+
+        A queue SESSION row renders through the same show_record path the session
+        table uses, so arbitrating on the rendered KIND hands the pane straight
+        back to the session table's -- different -- highlighted session on the
+        next rebuild. The parked session-table cursor below is load-bearing: a
+        test that leaves both tables pointing at the same session passes for the
+        wrong reason.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        awaiting = _make_record(
+            session_slug='session-awaiting',
+            status=sr.Status.AWAITING_INPUT,
+            start_ts='2026-07-07T00:01:00+00:00',
+            task_id='7002',
+            question=sr.Question(text='QQQ host bind?', asked_at='2026-07-07T00:01:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+        sr.write_record(
+            _make_record(
+                session_slug='session-other',
+                start_ts='2026-07-07T00:00:00+00:00',
+                task_id='7003',
+                question=sr.Question(text='Unrelated?', asked_at='2026-07-07T00:00:00+00:00'),
+            ),
+            root=tmp_path,
+        )
+        # outscores the session row, so the queue's session row is not row 0
+        assert sr.write_decision(
+            sr.DecisionRecord(
+                id='dec-first', project='df', text='Short one?',
+                filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+            ),
+            root=tmp_path,
+        )
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            # park the session table on a DIFFERENT session than the queue row
+            table.move_cursor(row=table.get_row_index('session-other'))
+            await pilot.pause()
+            assert app._selected_slug == 'session-other'
+
+            assert queue.select_key('session:session-awaiting')
+            await pilot.pause()
+            assert 'QQQ host bind?' in detail.rendered_text
+
+            # the queue's own row gets FRESH data on a rebuild -- neither stolen
+            # by the session table's cursor nor left stale
+            sr.write_record(
+                _make_record(
+                    session_slug='session-awaiting',
+                    status=sr.Status.AWAITING_INPUT,
+                    start_ts='2026-07-07T00:01:00+00:00',
+                    task_id='7002',
+                    question=sr.Question(
+                        text='QQQ host bind, REVISED?', asked_at='2026-07-07T00:03:00+00:00'
+                    ),
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'QQQ host bind, REVISED?' in detail.rendered_text
+            assert '7003' not in detail.rendered_text
+            assert app._selected_slug == 'session-other'
+
+    @pytest.mark.timeout(10)
+    async def test_a_queue_decision_row_survives_a_rebuild(self, tmp_path):
+        """The decision-row counterpart of the test above, as a regression guard:
+        a session-table reordering must not pull the pane off the queue's
+        highlighted decision either. Already green -- it stays that way.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
+            sr.write_record(
+                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                root=tmp_path,
+            )
+        long_question = (
+            'Should the reaper close this decision against the other escalation '
+            'queue, or leave it open for the watcher to re-file it?'
+        )
+        for decision in (
+            sr.DecisionRecord(
+                id='dec-first', project='df', text='Short one?',
+                filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+            ),
+            sr.DecisionRecord(
+                id='dec-second', project='df', text=long_question,
+                filed_at='2026-07-07T00:00:00+00:00',
+            ),
+        ):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            assert queue.select_key('decision:dec-second')
+            await pilot.pause()
+            assert long_question in detail.rendered_text
+
+            # an awaiting-input session order_sessions ranks first, so the
+            # highlighted session row's INDEX genuinely shifts on rebuild
+            sr.write_record(
+                _make_record(
+                    session_slug='session-new',
+                    status=sr.Status.AWAITING_INPUT,
+                    start_ts='2026-07-06T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.get_row_index('session-a') != 0
+            assert long_question in detail.rendered_text
