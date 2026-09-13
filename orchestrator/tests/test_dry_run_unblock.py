@@ -2627,3 +2627,47 @@ class TestPromptCarriesTaskContext:
         assert 'verify exhausted' in prompt, prompt
         assert 'All 5 attempts timed out' in prompt, prompt
         assert 'Investigate and emit your structured proposal.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_oversized_task_text_is_bounded_and_marked(self, tmp_path):
+        """An oversized task record must not blow the investigation's budget.
+
+        Asserted by length against the module's declared cap, not by exact
+        prose, and the repo's truncation marker must be present so the clip is
+        visible to the reading agent rather than silent — the failure mode the
+        160/120-char block-`detail` clips already exhibit.
+        """
+        import re
+
+        from orchestrator.dry_run_unblock import _TASK_TEXT_FIELD_CHARS
+
+        oversized = 'x' * 20000
+        scheduler = _TaskDocScheduler({**_TASK_DOC, 'description': oversized})
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+
+        assert _TASK_TEXT_FIELD_CHARS < 20000, 'the cap must bound a 20000-char field'
+        assert oversized not in prompt, 'the 20000-char description was not capped'
+        assert '... [' in prompt and 'truncated] ...' in prompt, prompt
+
+        longest_run = max((len(m) for m in re.findall('x+', prompt)), default=0)
+        assert longest_run <= _TASK_TEXT_FIELD_CHARS, (
+            f'rendered description must be capped at {_TASK_TEXT_FIELD_CHARS} '
+            f'chars; found a run of {longest_run}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_task_fetch_is_marked_not_silently_omitted(self, tmp_path):
+        """Loud over silent: the investigator must be able to tell "this task
+        has no description" from "we could not fetch it".
+
+        The marker phrase is asserted with its spaces intact — `tmp_path`
+        embeds the test's own name and is interpolated into the prompt as
+        `Worktree:`, so a single bare word can pass spuriously.
+        """
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+
+        assert 'task record unavailable' in prompt.lower(), prompt
+        # Still a well-formed prompt — degradation is additive, not destructive.
+        assert 'Investigate and emit your structured proposal.' in prompt, prompt
+        assert 'verify exhausted' in prompt, prompt
