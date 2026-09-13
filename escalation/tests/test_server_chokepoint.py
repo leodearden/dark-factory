@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import shutil
 import types
 from pathlib import Path
@@ -4641,3 +4642,145 @@ class TestHonestResponseContract:
             f'Expected accepted_unpersisted, got: {result}'
         )
         assert 'id' in result
+
+
+# ---------------------------------------------------------------------------
+# Task 5368 (S8-25): an unknown queue position is reported as unknown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPositionIsNoneWhenTheSnapshotIsUnavailable:
+    """`_nonblocking_state_response` must not fabricate a position.
+
+    Three of its four branches set `position` from something real — the index
+    the request_id was found at, or `max(0, queue_depth - 1)` for a request
+    that was just enqueued.  The fourth, where `worker.snapshot()` raises,
+    returned the `0` initialiser: the single most misleading value in the
+    range, since it is indistinguishable from a genuine front-of-queue and is
+    what an operator reads as "next to merge".
+    """
+
+    @staticmethod
+    def _raising_worker_harness():
+        def _boom():
+            raise RuntimeError('simulated merge-worker snapshot failure')
+
+        return types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(snapshot=_boom),
+            git_ops=None,  # skip already_merged fast-path and worktree scan
+        )
+
+    @staticmethod
+    async def _submit(server, tmp_path: Path, *, branch: str = 'snap-fail'):
+        return await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id=branch,
+                branch=branch,
+                worktree=str(tmp_path / f'wt-{branch}'),
+                wait_secs=0,
+            ),
+            timeout=3.0,
+        )
+
+    async def test_raising_snapshot_reports_position_none(self, tmp_path: Path):
+        """(a) A snapshot that raises yields position=None, never 0."""
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        assert result['position'] is None, (
+            'A position nobody computed must be reported as unknown, not as '
+            f'front-of-queue: {result}'
+        )
+
+    async def test_rest_of_the_shape_survives_a_raising_snapshot(self, tmp_path: Path):
+        """(b) Only `position` degrades — every other key is present and real.
+
+        `queue_depth` in particular still reports the bare `merge_queue.qsize()`
+        initialiser, which is a genuine measurement the snapshot failure does
+        not invalidate.  `position` must stay PRESENT so a caller keying on it
+        reads "unknown" rather than hitting a KeyError.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        for key in ('request_id', 'snapshot_tip', 'generation', 'position',
+                    'queue_depth', 'eta_seconds'):
+            assert key in result, f'Missing key {key!r}: {result}'
+        assert result['status'] == 'queued', f'Unexpected status: {result}'
+        assert result['request_id'].startswith('mr-'), f'Malformed request_id: {result}'
+        assert result['generation'] == 0, f'Unexpected generation: {result}'
+        assert result['queue_depth'] >= 1, (
+            f'queue_depth is a real measurement and must survive: {result}'
+        )
+
+    async def test_raising_snapshot_is_logged_not_swallowed(self, tmp_path: Path, caplog):
+        """(c) The failure is visible: a WARNING naming the request_id.
+
+        `except Exception: pass` left an operator with no way to learn the
+        live worker was unreachable.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await self._submit(server, tmp_path)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and result['request_id'] in r.getMessage()
+        ]
+        assert matching, (
+            f"Expected a WARNING naming request_id {result['request_id']!r}; got: "
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+
+    async def test_succeeding_snapshot_still_reports_an_int(self, tmp_path: Path):
+        """(d) The None is confined to the failure branch.
+
+        A live worker whose snapshot works keeps returning an int, so this
+        change cannot be mistaken for "position is now optional everywhere".
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        healthy_harness = types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(
+                snapshot=lambda: {'entries': [], 'depth': 1, 'head_of_line': None},
+            ),
+            git_ops=None,
+        )
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=healthy_harness,
+        )
+
+        result = await self._submit(server, tmp_path, branch='snap-ok')
+
+        assert isinstance(result['position'], int), (
+            f"Expected an int position from a healthy snapshot, got: {result}"
+        )
