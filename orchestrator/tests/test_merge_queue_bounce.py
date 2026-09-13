@@ -195,6 +195,29 @@ async def _await_frozen_tip(lane, timeout: float = _FROZEN_PREFIX_TIMEOUT) -> st
     )
 
 
+async def _until_probed_against_the_tip(
+    lane, req: MergeRequest, timeout: float = _FROZEN_PREFIX_TIMEOUT,
+) -> None:
+    """Wait until *req* has been graphed against the current frozen-prefix tip.
+
+    ``recompute_suffix_conflict_graph`` enrols every unfrozen suffix item as a
+    node keyed by ``request_id`` and publishes the result through
+    ``snapshot()['suffix_conflict_graph']``, so the node appearing is the
+    public evidence that the item has been through one probe cycle -- which is
+    the cycle that would have bounced it had it conflicted.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if req.request_id in lane.snapshot()['suffix_conflict_graph']['nodes']:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(
+        f'{req.task_id} was never probed against the frozen-prefix tip within '
+        f'{timeout}s; graph={lane.snapshot()["suffix_conflict_graph"]!r}'
+    )
+
+
 # ── Helpers: the bounce layer's own seam ─────────────────────────────────────
 
 
@@ -361,23 +384,28 @@ class TestBounceDrivenByTheLane:
             await queue.put(suffix)
             outcome = await wait_responsive(suffix.result, label='conflicting suffix bounce')
 
-            assert outcome.status == 'blocked', (
-                f'expected the conflicting suffix item to be bounced, got {outcome!r}'
-            )
-            assert outcome.reason is not None
-            assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
-                f'expected a needs_rebase escalation, got reason={outcome.reason!r}'
-            )
-            assert tip in outcome.reason, (
-                f'the bounce probed {outcome.reason!r}, not the frozen-prefix tip '
-                f'{tip!r} -- a suffix item must be stacked onto the tip, not bare main'
-            )
-            assert 'suffix-b' not in verifier.verified, (
-                'the bounced item consumed a verify slot: the bounce must divert it '
-                f'before dispatch, but the verifier was asked for {verifier.verified!r}'
-            )
-
-            release.set()
+            # The release is in a `finally` so a RED here reports as the failing
+            # assertion: leaving the held-open verify parked would hand teardown
+            # a hung verify to race `stop()`'s bounded wait, and the real cause
+            # would surface 30s later through a suppressed-exception path.
+            try:
+                assert outcome.status == 'blocked', (
+                    f'expected the conflicting suffix item to be bounced, got {outcome!r}'
+                )
+                assert outcome.reason is not None
+                assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+                    f'expected a needs_rebase escalation, got reason={outcome.reason!r}'
+                )
+                assert tip in outcome.reason, (
+                    f'the bounce probed {outcome.reason!r}, not the frozen-prefix tip '
+                    f'{tip!r} -- a suffix item must be stacked onto the tip, not bare main'
+                )
+                assert 'suffix-b' not in verifier.verified, (
+                    'the bounced item consumed a verify slot: the bounce must divert it '
+                    f'before dispatch, but the verifier was asked for {verifier.verified!r}'
+                )
+            finally:
+                release.set()
 
     async def test_item_clean_against_frozen_tip_is_not_bounced(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -401,6 +429,23 @@ class TestBounceDrivenByTheLane:
             await queue.put(frozen)
             await _await_frozen_tip(lane)
             await queue.put(clean)
+            # Releasing here, before the probe has run, would let the frozen
+            # prefix unwind first and every assertion below would still pass --
+            # on an interleaving where the clean item was never probed against
+            # the frozen tip at all, which is the whole subject of this control.
+            # Enrolment in the conflict graph is the probe's public footprint:
+            # `nodes` is written by recompute_suffix_conflict_graph and
+            # `conflicts_with_main` is its verdict against the frozen-prefix tip
+            # (the bounce runs off that verdict, immediately after the
+            # recompute, in the same _acquire_next_request cycle).
+            await _until_probed_against_the_tip(lane, clean)
+            assert clean.request_id not in (
+                lane.snapshot()['suffix_conflict_graph']['conflicts_with_main']
+            ), (
+                'the clean suffix item was probed against the frozen tip and '
+                'found CONFLICTING, so this run exercises the bounce path, not '
+                'the control it claims to be'
+            )
             release.set()
 
             frozen_outcome = await wait_responsive(

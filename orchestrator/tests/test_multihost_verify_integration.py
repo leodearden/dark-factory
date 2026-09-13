@@ -64,8 +64,12 @@ import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript, passes
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
+    HEAVY_BARRIER_TEST_TIMEOUT,
+    PYPROJECT_DEFAULT_TIMEOUT,
     _inject_two_host_allocator,
     _make_branch_with_file,
+    _timeout_mark_offenders,
+    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1164,6 +1168,17 @@ _INCIDENT_RU = (
 _LANE_SETTLE_TIMEOUT = 30.0
 _LANE_STOP_TIMEOUT = 30.0
 
+#: Per-test ceiling for the host capstone, whose methods settle a real-git lane
+#: through several ``wait_responsive`` waits and a reprobe sweep.  Sized above
+#: the budget ``TestTimeoutMarkCoverage`` recomputes from this module's own
+#: source rather than from any figure written here; ``HEAVY_BARRIER_TEST_TIMEOUT``
+#: (300s) is NOT enough for it.  Why a mark at all: pytest-timeout's thread
+#: method ``os._exit()``s the xdist worker on expiry, and ``--max-worker-restart=0``
+#: then truncates the whole session against an innocent test -- so a
+#: slow-but-correct run under a too-tight default is strictly worse than the
+#: tail it would otherwise have reported (esc-3980-1, task 3492).
+HOST_CAPSTONE_TEST_TIMEOUT = 2 * HEAVY_BARRIER_TEST_TIMEOUT
+
 
 async def _setup_repo(repo: Path) -> None:
     """Initialise a git repo with a single commit (README.md) on main."""
@@ -1241,14 +1256,23 @@ async def _running_lane(git_ops: GitOps, **ports: Any):
 
 
 async def _until(predicate, *, what: str, timeout: float = _LANE_SETTLE_TIMEOUT) -> None:
-    """Wait for *predicate* to hold, or fail naming *what* was expected."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError(f'timed out after {timeout}s waiting for {what}')
+    """Wait for *predicate* to hold, or fail naming *what* was expected.
+
+    For a public observation that has no event to await on -- a host row
+    flipping out of quarantine, say.  The budget is charged in loop-RESPONSIVE
+    time via ``wait_responsive``, because this repo measured >=11x wall-clock
+    tails at load 246 on 32 cores and a raw ``loop.time()`` deadline converts
+    that starvation into a spurious red (task 3980; see ``wait_responsive``).
+    Byte-for-byte the same contract as the twin in
+    test_merge_speculation.py::_until -- two spellings of one wait policy would
+    be read as interchangeable by the next reader whether or not they were.
+    """
+
+    async def _poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.02)
+
+    await wait_responsive(_poll(), timeout=timeout, label=what)
 
 
 async def _submitted(
@@ -1431,6 +1455,7 @@ async def _lane_with_remote(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HOST_CAPSTONE_TEST_TIMEOUT)
 class TestUnreachableHostCapstone:
     """END-TO-END: an unreachable remote can neither strand itself nor stall the queue.
 
@@ -2608,3 +2633,67 @@ class TestIndeterminateLocalLegDoesNotVeto:
         assert 'laptop' in quarantine
         assert len(eq.submitted) == 1
         assert es.events_of(EventType.verify_cross_check_mismatch)
+
+
+# ===========================================================================
+# Task 5030 amendment: the timeout-mark guard, generalised to THIS module.
+# ===========================================================================
+
+
+class TestTimeoutMarkCoverage:
+    """Enforced invariant: every class in THIS module whose computed
+    worst-per-method wait budget clears the pyproject default timeout must
+    carry a ``@pytest.mark.timeout`` mark whose value clears that budget.
+
+    Task 3492 built this guard, and task 5030 gave test_merge_speculation.py
+    its own copy -- but both resolve ``Path(__file__)`` against their own
+    source, so neither reaches this module.  That mattered here the moment
+    γ7 replaced this file's mock-driven host tests with real-git lane-settling
+    polls: ``TestUnreachableHostCapstone`` went from trivially fast to a
+    computed 360s budget against a 300s default, with no mark anywhere in the
+    file.
+
+    The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
+    than reimplemented: they are deliberately pure (source text in, offender
+    list out, class resolver injected as ``globals().get``) precisely so they
+    can be driven with foreign input, and a third copy would be free to drift
+    from the marks it audits.
+
+    The computed budget is a conservative FLOOR over call SHAPES: it bills
+    ``wait_responsive`` / ``asyncio.wait_for`` / ``_await_outcome`` sites and
+    nothing else, so this module's ``_until(...)`` polls -- which do bound
+    their own budget, through ``wait_responsive`` one frame down -- are not
+    counted. An unrecognised shape can only under-count, never fabricate a
+    wait, so a class this guard passes may still deserve a wider mark than the
+    floor demands; a class it fails is genuinely under-marked.
+    """
+
+    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
+        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
+        carry a ``timeout`` mark whose value clears its own computed budget.
+
+        Recomputes from source; no figure written anywhere in this file is
+        load-bearing for the assertion.  (For orientation only, current at the
+        time of writing: 360s for TestUnreachableHostCapstone against its
+        HOST_CAPSTONE_TEST_TIMEOUT mark -- if the comment on that constant
+        disagrees with this guard, the guard is right.)
+        """
+        source = Path(__file__).read_text()
+        budgets = _worst_per_method_wait_budget(source)
+        offenders = _timeout_mark_offenders(budgets, globals().get)
+
+        assert not offenders, (
+            'The following classes have a worst-case per-method wait '
+            f'budget at or above the pyproject default timeout '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
+            f'[tool.pytest.ini_options].timeout setting in '
+            f'orchestrator/pyproject.toml) but lack an adequate '
+            f'@pytest.mark.timeout mark:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
+            'the xdist worker under --max-worker-restart=0, so a '
+            'slow-but-correct run reports as a worker death instead of a '
+            'clean per-test failure -- strictly worse than the flake being '
+            'fixed. Add @pytest.mark.timeout(HOST_CAPSTONE_TEST_TIMEOUT) '
+            'directly above each offending class.'
+        )

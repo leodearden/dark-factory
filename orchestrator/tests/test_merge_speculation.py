@@ -923,6 +923,17 @@ class TestSpecLaneWarmPath:
 
         assert req_a.result.result().status == 'done'
         assert req_b.result.result().status == 'done'
+        # Without this the ordering assertions below hold just as well on the
+        # interleaving where the lane drained A before B was dequeued — B would
+        # then have merged NON-speculatively and the Lever C contract this test
+        # names would never have been exercised.  The seed argv record is the
+        # warm acquire's own footprint, so it is absent on that interleaving.
+        lane0 = git_ops.worktree_base / '_spec-0'
+        assert _lane_was_seeded(lane0), (
+            f'B must have verified WARM in {lane0} for this to be the '
+            'speculative interleaving; no seed argv record means B was merged '
+            'serially after A and speculation was never exercised.'
+        )
 
         _, main_files, _ = await _run(
             ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=spec_git_repo,
@@ -1049,9 +1060,10 @@ class TestSpecLaneShadowSafetyValve:
     A warm verify is only trustworthy if a from-scratch cold verify can be
     compared against it, so the spec-lane warm path must produce a parseable
     per-test baseline — and must ALARM when it cannot, rather than letting an
-    unchecked warm pass through.  The compare itself (parity stays quiet,
-    divergence is born at L2) is pinned at its own seam in
-    test_merge_shadow.py::TestCoarseShadowCompare and its per-test-map sibling.
+    unchecked warm pass through.  The compare itself over a per-test map —
+    divergence born at L2, Option-B two-cold-run re-confirmation, a flaky flip
+    staying quiet — is pinned at its own seam in
+    test_merge_queue_warm_cold_shadow.py::TestRunShadowCompare.
     """
 
     async def test_unparseable_warm_output_alarms(
