@@ -887,6 +887,165 @@ class TestStoreGC:
 
 
 # ---------------------------------------------------------------------------
+# task-4653 step-19: supersession REACHES an evicted-but-still-indexed entry,
+# so persistence must reach it too — RED until step-20 widens _persist_run's
+# scope to match _resolve_finding's.
+# ---------------------------------------------------------------------------
+
+
+class TestSupersedeAcrossEviction:
+    """A Stage-2 finding supersedes a Stage-1 finding whose entry has already
+    aged out of ``_state``.  This is the ORDINARY production shape, not a corner:
+    ``recon_report_state_ttl_seconds`` defaults to 300 while a reconciliation run
+    stays live for minutes, and ``tick()``'s own docstring describes Stage 1
+    filing a finding and completing early while Stage 2/3 + remediation keep the
+    run alive.  Stage 1's entry therefore leaves ``_state`` mid-run while
+    ``_run_finding_index`` deliberately keeps it reachable until run quiescence
+    so its findings stay citable — which is precisely the
+    later-stage-retires-an-earlier-completed-stage's-claim case that
+    ``add_finding``'s ``supersedes`` docstring calls supersession's whole purpose.
+
+    The mutation therefore lands in memory (``_resolve_finding`` reaches the
+    evicted entry) but ``_persist_run`` walks only ``_state``, so the stamp is
+    never serialised: the run's own retraction of the claim is silently lost,
+    and a restart hydrates the refuted finding back as live and actionable.
+    """
+
+    _RUN = 'evict-sup-run'
+    _S1 = 'memory_consolidator'
+    _S2 = 'task_knowledge_sync'
+
+    def _make_state(self, store, clock_holder):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: clock_holder[0],
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    def _run_ids_in_store(self, store):
+        return {r['run_id'] for r in store.load_all()}
+
+    def _stage1_row(self, store):
+        (row,) = [r for r in store.load_all() if r['stage'] == self._S1]
+        return row
+
+    def _persisted_finding(self, store, finding_id):
+        import json
+
+        payload = json.loads(self._stage1_row(store)['entry_json'])
+        (fd,) = [f for f in payload['findings'] if f['finding_id'] == finding_id]
+        return fd
+
+    def _stage1_files_then_evicts(self, state, clock_holder):
+        """Drive the production shape and return Stage 1's finding_id.
+
+        Stage 1 files + completes at t=0; Stage 2 starts (so the run never
+        quiesces); the clock passes Stage 1's TTL and ``tick()`` evicts it.
+        """
+        state.start_report(run_id=self._RUN, stage=self._S1, project_id='dark_factory')
+        stage1_fid = state.add_finding(
+            run_id=self._RUN, severity='moderate', category='memory_stale',
+            description='mechanism X contradicts Y', suggested_action='act',
+            actionable=True, task_id='999',
+            flag_type='memory_mechanism_contradiction',
+        )['finding_id']
+        state.complete(self._RUN, 'stage1 summary')
+
+        state.start_report(run_id=self._RUN, stage=self._S2, project_id='dark_factory')
+
+        clock_holder[0] = 301.0  # 301-0 > ttl(300) for s1; s2 is in-progress
+        assert state.tick() == 1
+        # The premise: evicted from _state, yet still resolvable through the
+        # run-quiescence-scoped finding index — so a mutation still reaches it.
+        assert (self._RUN, self._S1) not in state._state
+        assert stage1_fid in state._run_finding_index[self._RUN]
+        assert self._RUN in self._run_ids_in_store(store=state._store)
+        return stage1_fid
+
+    def _supersede(self, state, stage1_fid):
+        return state.add_finding(
+            run_id=self._RUN, severity='low', category='memory_stale',
+            description='mechanism X was fixed', suggested_action='none',
+            actionable=True, task_id='999',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=stage1_fid,
+        )
+
+    def test_stamp_on_an_evicted_stage_is_persisted(self, tmp_path):
+        """The stamp lands in memory AND on the evicted stage's persisted row.
+
+        ``add_finding`` must also report a plain success — the operation
+        genuinely works rather than being reported as an error, which is the
+        design decision that chose widening persistence over a new
+        failure-to-function error case.
+        """
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store, t)
+            stage1_fid = self._stage1_files_then_evicts(state, t)
+
+            result = self._supersede(state, stage1_fid)
+            assert set(result) == {'finding_id'}, result
+            stage2_fid = result['finding_id']
+
+            resolved = state._resolve_finding(self._RUN, stage1_fid)
+            assert resolved is not None
+            _entry, target = resolved
+            assert target.superseded_by == stage2_fid  # in-memory reach is wide
+
+            assert self._persisted_finding(store, stage1_fid)['superseded_by'] == stage2_fid
+        finally:
+            store.close()
+
+    def test_stamp_on_an_evicted_stage_survives_a_restart(self, tmp_path):
+        """After a restart the retired claim stays retired: the stamp hydrates
+        back and the report projects it neutered with its forward pointer."""
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state_a = self._make_state(store_a, t)
+            stage1_fid = self._stage1_files_then_evicts(state_a, t)
+            stage2_fid = self._supersede(state_a, stage1_fid)['finding_id']
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+
+            resolved = state_b._resolve_finding(self._RUN, stage1_fid)
+            assert resolved is not None, 'the stage-1 row did not hydrate'
+            _entry, target = resolved
+            assert target.superseded_by == stage2_fid
+
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [
+                i for i in report['flagged_items'] if i['finding_id'] == stage1_fid
+            ]
+            assert item['superseded_by'] == stage2_fid
+            assert item['actionable'] is False
+        finally:
+            store_b.close()
+
+
+# ---------------------------------------------------------------------------
 # step-13: fresh in-process runs stay byte-identical with/without a store —
 # RED until step-14 confirms every persistence touchpoint short-circuits on
 # store=None.  (The shadow store must NEVER feed back into a live run.)
