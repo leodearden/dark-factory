@@ -14,6 +14,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Coroutine, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -237,6 +238,45 @@ CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
 # this module's deliberate independence from fused-memory-specific components.
 TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
 
+
+@dataclass(frozen=True)
+class DeadLetterEvent:
+    """Everything an operator alarm needs about one permanently-abandoned write.
+
+    A frozen dataclass rather than positional hook arguments: the event has
+    eight fields with no natural order, and a consumer that had to remember
+    which position held ``operation`` versus ``group_id`` would be a meaningful
+    string in disguise (structured data, not positional convention). Frozen
+    because the hook runs after the item's state is already committed — there
+    is nothing a consumer could usefully mutate, and a mutation would only
+    diverge the alarm from the row it describes.
+
+    ``attempts`` is the COMMITTED count (the value now on the row), not the
+    pre-increment count the claimed item carried, so it matches both the
+    ``write_queue`` row and the dead-letter WARN line.
+
+    ``post_execute`` is the structured form of ``POST_EXECUTE_DEAD_PREFIX``:
+    True means the backend write LANDED and only the post-execute work kept
+    failing, so a blind replay DUPLICATES it. The prefix is still applied to
+    ``error`` — nothing about the journal contract changes — but a consumer
+    branching on remediation should read this flag rather than re-parse it.
+    """
+
+    item_id: int
+    group_id: str
+    operation: str
+    attempts: int
+    error: str | None
+    write_op_id: str | None
+    payload: dict[str, Any] | None
+    post_execute: bool
+
+
+# (event) -> None. Invoked once per item that reaches 'dead', and never on
+# 'completed' or an intermediate retry. Injected exactly as ``on_terminal`` is,
+# keeping this module free of any fused-memory-specific import.
+DeadLetterHookFn = Callable[[DeadLetterEvent], Coroutine[Any, Any, None]]
+
 # Prefix applied to the reported error when an item dead-letters AFTER
 # _execute_write already returned — i.e. the registered callback (or the
 # completion commit) is what kept failing, not the backend write. 'dead' alone
@@ -266,10 +306,12 @@ class DurableWriteQueue:
         transient_error_names: Iterable[str] | None = None,
         identity_payload_keys: Mapping[str, str] | None = None,
         on_terminal: TerminalHookFn | None = None,
+        on_dead_letter: DeadLetterHookFn | None = None,
     ):
         self._data_dir = Path(data_dir)
         self._execute_write = execute_write
         self._on_terminal = on_terminal
+        self._on_dead_letter = on_dead_letter
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
@@ -480,8 +522,10 @@ class DurableWriteQueue:
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
 
-        The terminal hook, by contrast, runs AFTER the queue's own commit and
-        OUTSIDE the semaphore — see ``_notify_terminal``.
+        Both post-commit hooks, by contrast, run AFTER the queue's own commit
+        and OUTSIDE the semaphore: ``_notify_terminal`` (the durable write-back
+        onto the ``write_ops`` row) and then, for a dead item only,
+        ``_notify_dead_letter`` (the operator alarm).
         """
         terminal: tuple[str, str | None] | None = None
         write_op_id: str | None = None
@@ -521,6 +565,13 @@ class DurableWriteQueue:
             if status == 'dead' and executed:
                 error = f'{POST_EXECUTE_DEAD_PREFIX}{error}'
             await self._notify_terminal(item.id, write_op_id, status, error)
+            if status == 'dead':
+                # AFTER the journal write-back, deliberately: the durable audit
+                # trail must land before the best-effort alarm gets a chance to
+                # misbehave.
+                await self._notify_dead_letter(
+                    item, write_op_id, error, post_execute=executed
+                )
 
     async def _notify_terminal(
         self,
@@ -552,6 +603,39 @@ class DurableWriteQueue:
                 'Item %d: on_terminal hook failed for write_op %s (%s)',
                 item_id, write_op_id, status, exc_info=True,
             )
+
+    async def _notify_dead_letter(
+        self,
+        item: QueueItem,
+        write_op_id: str | None,
+        error: str | None,
+        *,
+        post_execute: bool,
+    ) -> None:
+        """Report a permanently-abandoned write to the ``on_dead_letter`` hook.
+
+        Shares ``_notify_terminal``'s post-commit, outside-the-semaphore
+        discipline for the same reasons, and diverges from it on exactly one
+        point.
+        """
+        if self._on_dead_letter is None:
+            return
+        try:
+            payload: dict[str, Any] | None = item.parsed_payload()
+        except (ValueError, TypeError):
+            payload = None
+        event = DeadLetterEvent(
+            item_id=item.id,
+            group_id=item.group_id,
+            operation=item.operation,
+            # The committed count: _handle_failure wrote item.attempts + 1.
+            attempts=item.attempts + 1,
+            error=error,
+            write_op_id=write_op_id,
+            payload=payload,
+            post_execute=post_execute,
+        )
+        await self._on_dead_letter(event)
 
     async def _mark_completed(self, item: QueueItem) -> None:
         assert self._db is not None
