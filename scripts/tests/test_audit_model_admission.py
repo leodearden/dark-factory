@@ -653,3 +653,18 @@ def test_zero_scoped_hits_is_an_empty_tuple_not_none(runs_db):
     assert scan.scoped_hits == ()
     assert scan.restarts == ()
     assert scan.unscoped_cap_hit_count == 0
+
+
+def test_restarts_are_found_even_though_live_rows_carry_a_task_id(runs_db):
+    """Every service_restart row in the live store has a task_id — the merge
+    that triggered it. Reading these grouped by task and taking the untagged
+    bucket reports zero restarts against real data while passing against a
+    fixture that leaves task_id NULL."""
+    _event(
+        runs_db, _at(hours=3), 'service_restart', task_id='4319',
+        data={'service': 'fused-memory', 'reason': 'post_merge_fused_memory_code_change'},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert [r.service for r in scan.restarts] == ['fused-memory']

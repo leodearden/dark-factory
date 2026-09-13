@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -253,28 +254,48 @@ class InvocationRecord:
     at_or_over_wall_clock: bool | None
 
 
-def _events_by_task(
-    conn: sqlite3.Connection, event_type: str, since: datetime
-) -> dict[str | None, list[tuple[str, str, dict[str, Any]]]]:
-    """Load *event_type* rows at or after *since* as {task_id: [(ts, role, payload)]}.
+@dataclass(frozen=True)
+class EventRow:
+    """One parsed `events` row, reduced to the four fields this audit reads."""
 
-    One pass, grouped in Python.  A per-invocation correlated subquery against a
-    181 MB store would be the obvious alternative and is why this is spelled
-    out: the whole scan is two table reads regardless of how many runs match.
-    Rows stay in (timestamp, id) order within each task, so callers can take
-    "the first at or after X" or "the last" by position.
+    timestamp: str
+    task_id: str | None
+    role: str
+    payload: dict[str, Any]
+
+
+def _load_events(
+    conn: sqlite3.Connection, event_type: str, since: datetime
+) -> list[EventRow]:
+    """Load *event_type* rows at or after *since*, in (timestamp, id) order.
+
+    Rows whose payload is not a JSON object are skipped — see
+    :func:`_loads_object` for why tolerance is the right posture against a live
+    store.
     """
     cursor = conn.execute(
         'SELECT timestamp, task_id, role, data FROM events '
         'WHERE event_type = ? AND timestamp >= ? ORDER BY timestamp, id',
         (event_type, _iso(since)),
     )
-    grouped: dict[str | None, list[tuple[str, str, dict[str, Any]]]] = {}
+    rows = []
     for timestamp, task_id, role, raw in cursor:
         payload = _loads_object(raw)
-        if payload is None:
-            continue
-        grouped.setdefault(task_id, []).append((timestamp, role or '', payload))
+        if payload is not None:
+            rows.append(EventRow(timestamp, task_id, role or '', payload))
+    return rows
+
+
+def _by_task(rows: Iterable[EventRow]) -> dict[str | None, list[EventRow]]:
+    """Group *rows* by task_id, preserving each task's chronological order.
+
+    Grouping in Python rather than issuing a correlated subquery per invocation:
+    the whole of :func:`scan_invocations` is three table reads regardless of how
+    many runs match, which is what makes it safe against a 181 MB live store.
+    """
+    grouped: dict[str | None, list[EventRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.task_id, []).append(row)
     return grouped
 
 
@@ -301,8 +322,8 @@ def scan_invocations(
     task_id ALONE — the producer leaves these events' `role` column empty.
     """
     limits = DEFAULT_WALL_CLOCK_LIMITS_SECS if wall_clock_limits is None else wall_clock_limits
-    ends = _events_by_task(conn, 'invocation_end', since)
-    merges = _events_by_task(conn, 'merge_finalized', since)
+    ends = _by_task(_load_events(conn, 'invocation_end', since))
+    merges = _by_task(_load_events(conn, 'merge_finalized', since))
     cursor = conn.execute(
         'SELECT task_id, project_id, role, account_name, cost_usd, duration_ms, '
         'capped, started_at, completed_at FROM invocations '
@@ -313,23 +334,22 @@ def scan_invocations(
     for (task_id, project_id, role, account_name, cost_usd, duration_ms,
          capped, started_at, completed_at) in cursor:
         end = next(
-            (payload for timestamp, event_role, payload in ends.get(task_id, ())
-             if event_role == role and timestamp >= started_at),
+            (row.payload for row in ends.get(task_id, ())
+             if row.role == role and row.timestamp >= started_at),
             None,
         )
         merge = None
         if role == 'merger':
             finalized = [
-                (timestamp, payload) for timestamp, _, payload in merges.get(task_id, ())
-                if timestamp >= started_at
+                row for row in merges.get(task_id, ()) if row.timestamp >= started_at
             ]
             if finalized:
-                timestamp, payload = finalized[-1]
+                last = finalized[-1]
                 merge = MergeOutcome(
-                    timestamp=timestamp,
-                    state=payload.get('state') or '',
-                    merge_sha=payload.get('merge_sha'),
-                    reason=payload.get('reason'),
+                    timestamp=last.timestamp,
+                    state=last.payload.get('state') or '',
+                    merge_sha=last.payload.get('merge_sha'),
+                    reason=last.payload.get('reason'),
                 )
         limit_secs = limits.get(role)
         records.append(InvocationRecord(
@@ -351,3 +371,88 @@ def scan_invocations(
             ),
         ))
     return tuple(records)
+
+
+@dataclass(frozen=True)
+class ScopedCapHit:
+    """One cap_hit that capped a single model scope rather than the account."""
+
+    created_at: str
+    account_name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ServiceRestart:
+    """One service restart, named — the service is what makes it evidence or not."""
+
+    timestamp: str
+    service: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class ScopedCapScan:
+    """Whether the model's cap scope has been hit, and whether it can yet be (check 4)."""
+
+    scoped_hits: tuple[ScopedCapHit, ...]
+    unscoped_cap_hit_count: int
+    restarts: tuple[ServiceRestart, ...]
+
+
+def scan_scoped_cap(
+    conn: sqlite3.Connection, *, model: str, since: datetime
+) -> ScopedCapScan:
+    """Cap hits attributable to *model*'s scope, plus the restarts since *since*.
+
+    The writer of the shape read here is ``shared/src/shared/usage_gate.py::
+    AccountPool`` — its scoped path emits ``{"reason": ..., "scope": <model>}``
+    and deliberately bypasses the account-level site, which emits a payload with
+    no ``scope`` key at all.  So the KEY'S PRESENCE is the discriminator; a
+    substring scan for the model name is not, since it would also match
+    unrelated cap-message prose.
+
+    Cap hits partition three ways, not two: scoped to *model*, scoped to some
+    OTHER model, and unscoped.  Unscoped hits are counted rather than dropped
+    because ``usage_cap.scoped_cap_models`` is restart-tier — before the
+    orchestrator restarts, a cap on *model* lands on the account-level path, and
+    dropping scope-less rows would hide precisely that.
+
+    Restarts are returned NAMED for the same reason: only an orchestrator
+    restart reloads a restart-tier leaf, so a count that lumps in dashboard and
+    fused-memory restarts answers "has it had a chance to take effect?" wrongly.
+    """
+    cursor = conn.execute(
+        'SELECT created_at, account_name, details FROM account_events '
+        'WHERE event_type = ? AND created_at >= ? ORDER BY created_at, id',
+        ('cap_hit', _iso(since)),
+    )
+    scoped: list[ScopedCapHit] = []
+    unscoped = 0
+    for created_at, account_name, raw in cursor:
+        details = _loads_object(raw)
+        scope = details.get('scope') if details else None
+        if scope is None:
+            unscoped += 1
+        elif scope == model:
+            scoped.append(ScopedCapHit(
+                created_at=created_at,
+                account_name=account_name,
+                reason=(details or {}).get('reason') or '',
+            ))
+    # Read FLAT, not grouped by task: every service_restart row in the live
+    # store carries a task_id (the merge that triggered it), so bucketing these
+    # by task and reading one bucket would silently report zero restarts.
+    restarts = [
+        ServiceRestart(
+            timestamp=row.timestamp,
+            service=row.payload.get('service') or '',
+            reason=row.payload.get('reason'),
+        )
+        for row in _load_events(conn, 'service_restart', since)
+    ]
+    return ScopedCapScan(
+        scoped_hits=tuple(scoped),
+        unscoped_cap_hit_count=unscoped,
+        restarts=tuple(restarts),
+    )
