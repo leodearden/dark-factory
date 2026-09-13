@@ -2593,37 +2593,6 @@ async def _run(
     return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
 
 
-async def _guarded_abort(verb: str, cwd: Path) -> tuple[int, str, str]:
-    """Run ``git <verb> --abort`` in *cwd* with the rerere-recovery guard.
-
-    THE single abort path for this module.  Every ``rebase --abort`` and
-    ``merge --abort`` git_ops issues goes through here, because the failures it
-    guards are invisible at the call site: an operator reading any one of them
-    would have no reason to suspect that aborting can segfault.
-
-    Two things happen, in this ORDER, and the order is the contract:
-
-    1. :func:`rebase_recovery.preflight_rebase_recovery` quarantines a MERGE_RR
-       whose rr-cache refs dangle and clears abandoned ``*.lock`` files.  It
-       must precede the abort — a successful abort DELETES MERGE_RR, so a
-       preflight running afterwards would find nothing, report clean, and
-       preserve no evidence.
-    2. The abort itself runs prefixed with
-       :data:`rebase_recovery.RECOVERY_GIT`, so git never opens MERGE_RR.  That
-       neutralises both the dangling-ref crash and the stale-lock rc 128.
-
-    The preflight is sync filesystem work, so it runs off-thread rather than
-    blocking the event loop.  It never raises: a preflight that cannot resolve
-    the worktree degrades to an unguarded abort, which is still strictly better
-    than no abort at all.
-
-    Returns ``_run``'s ``(rc, stdout, stderr)`` unchanged, so no call site's
-    control flow, return value or logging has to change.
-    """
-    await asyncio.to_thread(rebase_recovery.preflight_rebase_recovery, cwd)
-    return await _run([*rebase_recovery.RECOVERY_GIT, verb, '--abort'], cwd=cwd)
-
-
 def _git_clean_failure_is_benign(stderr: str) -> bool:
     """Return True iff every non-empty stderr line is a benign ENOENT ``failed to remove`` warning.
 
@@ -9651,7 +9620,7 @@ class GitOps:
             cwd=worktree,
         )
         if rc != 0:
-            await _guarded_abort('rebase', worktree)
+            await rebase_recovery.guarded_abort('rebase', worktree, _run)
             logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
             return False
         return True
@@ -10045,8 +10014,7 @@ class GitOps:
             cwd=solo_wt,
         )
         if rc != 0:
-            # Abort the rebase and clean up both the worktree and temp branch.
-            await _guarded_abort('rebase', solo_wt)
+            await rebase_recovery.guarded_abort('rebase', solo_wt, _run)
             logger.info(
                 'materialize_member_solo: rebase conflict for member %s '
                 '(predecessor=%s): %s — cleaning up',
@@ -13792,7 +13760,7 @@ class GitOps:
             logger.warning(
                 f'Rebase failed (attempt {attempt + 1}): {rebase_err}'
             )
-            await _guarded_abort('rebase', merge_worktree)
+            await rebase_recovery.guarded_abort('rebase', merge_worktree, _run)
 
             if full_branch is None:
                 # No branch to re-merge from — cannot recover
@@ -15026,7 +14994,7 @@ class GitOps:
 
     async def abort_merge(self, cwd: Path) -> None:
         """Abort an in-progress merge."""
-        await _guarded_abort('merge', cwd)
+        await rebase_recovery.guarded_abort('merge', cwd, _run)
         logger.info('Merge aborted')
 
     async def rename_worktree(

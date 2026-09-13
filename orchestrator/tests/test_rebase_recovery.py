@@ -672,28 +672,52 @@ class TestPreflightEndToEnd:
 # git_ops wiring
 # ---------------------------------------------------------------------------
 
-@contextlib.contextmanager
-def _git_command_spy():
-    """Record every command vector git_ops issues, delegating to the real ``_run``.
+async def _isolated_run(cmd, cwd=None, **kwargs) -> tuple[int, str, str]:
+    """An :data:`rebase_recovery.AbortRunner` that keeps both isolation layers.
 
-    The ``_run`` seam is the only place a command vector is observable without
-    asserting on a rendered string, which is what lets these cases assert on
-    STRUCTURE — token order and membership — rather than on a formatted line
-    that a harmless reflow would break.
+    ``guarded_abort`` takes its runner as a PARAMETER, so a caller supplies one
+    rather than reaching into git_ops for the private ``_run`` it happens to
+    pass.  Here that parameter earns its keep twice over: these cases run real
+    aborts against real conflicted repos, and routing them through
+    :func:`_run_argv` keeps them inside the module's isolation contract.
     """
-    original_run = git_ops_module._run
-    recorded: list[list[str]] = []
+    assert cwd is not None
+    proc = _run_argv(Path(cwd), cmd)
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
-    async def recording_run(cmd, cwd=None, **kwargs):
+
+def _recording_run(recorded: list[list[str]]):
+    """A runner that records the command vector and spawns nothing.
+
+    Lets a case assert on command STRUCTURE — token order and membership —
+    rather than on a rendered line a harmless reflow would break.
+    """
+    async def run(cmd, cwd=None, **kwargs) -> tuple[int, str, str]:
         recorded.append(list(cmd))
-        return await original_run(cmd, cwd=cwd, **kwargs)
+        return 0, '', ''
 
-    with patch('orchestrator.git_ops._run', side_effect=recording_run):
+    return run
+
+
+@contextlib.contextmanager
+def _guard_spy():
+    """Record every ``(verb, cwd)`` git_ops routes through the public guard.
+
+    Patches :func:`rebase_recovery.guarded_abort` — the seam the two modules
+    genuinely share — so the wiring cases are phrased in the vocabulary of that
+    interface instead of reaching through git_ops' private ``_run``.  The real
+    guard still runs underneath, so the abort these cases observe is the one
+    production issues.
+    """
+    recorded: list[tuple[str, Path]] = []
+    real_guard = rebase_recovery.guarded_abort
+
+    async def recording_guard(verb, cwd, run):
+        recorded.append((verb, Path(cwd)))
+        return await real_guard(verb, cwd, run)
+
+    with patch.object(rebase_recovery, 'guarded_abort', side_effect=recording_guard):
         yield recorded
-
-
-def _abort_vectors(recorded) -> list[list[str]]:
-    return [cmd for cmd in recorded if '--abort' in cmd]
 
 
 def _make_git_ops(repo: Path):
@@ -718,7 +742,9 @@ class TestGitOpsGuardedAbort:
         repo, conflict_id = build_mid_rebase_repo(tmp_path)
         _make_dangling(repo, conflict_id)
 
-        rc, _, err = await git_ops_module._guarded_abort('rebase', repo)
+        rc, _, err = await rebase_recovery.guarded_abort(
+            'rebase', repo, _isolated_run,
+        )
 
         assert rc == 0, err
         assert not (repo / '.git' / 'rebase-merge').exists()
@@ -732,14 +758,12 @@ class TestGitOpsGuardedAbort:
     ) -> None:
         """Asserted by token ORDER, never by matching a rendered command line."""
         repo, _ = build_mid_rebase_repo(tmp_path)
+        recorded: list[list[str]] = []
 
-        with _git_command_spy() as recorded:
-            await git_ops_module._guarded_abort('rebase', repo)
+        await rebase_recovery.guarded_abort('rebase', repo, _recording_run(recorded))
 
-        vectors = _abort_vectors(recorded)
-        assert len(vectors) == 1
-        assert vectors[0] == [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']
-        assert vectors[0].index('rerere.enabled=false') < vectors[0].index('rebase')
+        assert recorded == [[*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']]
+        assert recorded[0].index('rerere.enabled=false') < recorded[0].index('rebase')
 
     async def test_preflight_runs_BEFORE_the_abort(self, tmp_path: Path) -> None:
         """Ordering is the contract: a preflight after the abort guards nothing.
@@ -758,20 +782,19 @@ class TestGitOpsGuardedAbort:
             observed.append('preflight')
             return real_preflight(worktree, **kwargs)
 
-        original_run = git_ops_module._run
-
         async def spy_run(cmd, cwd=None, **kwargs):
-            if '--abort' in cmd:
-                observed.append('abort')
-            return await original_run(cmd, cwd=cwd, **kwargs)
+            observed.append('abort')
+            return await _isolated_run(cmd, cwd=cwd, **kwargs)
 
-        with patch(
-            'orchestrator.rebase_recovery.preflight_rebase_recovery',
-            side_effect=spy_preflight,
-        ), patch('orchestrator.git_ops._run', side_effect=spy_run):
-            await git_ops_module._guarded_abort('rebase', repo)
+        with patch.object(
+            rebase_recovery, 'preflight_rebase_recovery', side_effect=spy_preflight,
+        ):
+            await rebase_recovery.guarded_abort('rebase', repo, spy_run)
 
         assert observed == ['preflight', 'abort']
+        backups = list((repo / '.git').glob('MERGE_RR.quarantined-*'))
+        assert len(backups) == 1, 'the preflight that ran first kept the evidence'
+        assert conflict_id.encode() in backups[0].read_bytes()
 
     async def test_rebase_onto_main_failure_path_aborts_through_the_guard(
         self, tmp_path: Path,
@@ -780,13 +803,11 @@ class TestGitOpsGuardedAbort:
         _git_ok(repo, 'rebase', '--abort')
         ops = _make_git_ops(repo)
 
-        with _git_command_spy() as recorded:
+        with _guard_spy() as recorded:
             landed = await ops.rebase_onto_main(repo)
 
         assert landed is False, 'fixture expected the rebase to conflict'
-        assert _abort_vectors(recorded) == [
-            [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'],
-        ]
+        assert recorded == [('rebase', repo)]
 
     async def test_abort_merge_aborts_through_the_same_guard(
         self, tmp_path: Path,
@@ -803,12 +824,10 @@ class TestGitOpsGuardedAbort:
         _git_ok(repo, 'rebase', '--abort')
         ops = _make_git_ops(repo)
 
-        with _git_command_spy() as recorded:
+        with _guard_spy() as recorded:
             await ops.abort_merge(repo)
 
-        assert _abort_vectors(recorded) == [
-            [*rebase_recovery.RECOVERY_GIT, 'merge', '--abort'],
-        ]
+        assert recorded == [('merge', repo)]
 
 
 class TestGitOpsAbortUniformity:
@@ -817,11 +836,17 @@ class TestGitOpsAbortUniformity:
     def test_no_unguarded_abort_vector_survives_anywhere_in_git_ops(self) -> None:
         """SPOT, enforced against the file rather than against known call sites.
 
-        Four sites route through one helper precisely so a future edit cannot
+        Four sites route through one guard precisely so a future edit cannot
         fix three and miss the fourth.  A per-site spy cannot see that: it
         asserts about the sites it already knows, so a newly ADDED fifth
         unguarded abort passes it silently.  Scanning the source closes that,
         and it is the only assertion here that gets stronger as the file grows.
+
+        The guard lives in ``rebase_recovery``, so git_ops should now spell an
+        abort ONLY as a call to it and carry no ``--abort`` literal of its own.
+        Both halves are asserted: a bare literal is the regression, and the
+        count of routed sites is what stops the scan passing vacuously if a
+        future edit deletes the calls rather than guarding them.
         """
         source = Path(git_ops_module.__file__).read_text()
         quoted_abort = re.compile(r"""['"]--abort['"]""")
@@ -831,6 +856,11 @@ class TestGitOpsAbortUniformity:
             if quoted_abort.search(line) and 'RECOVERY_GIT' not in line
         ]
         assert offenders == []
+        routed = [
+            line for line in source.splitlines()
+            if 'rebase_recovery.guarded_abort(' in line
+        ]
+        assert len(routed) == 4, routed
 
 
 # ---------------------------------------------------------------------------

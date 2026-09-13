@@ -31,12 +31,14 @@ capability the remaining half never had.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -471,7 +473,7 @@ def preflight_rebase_recovery(
 
     Scans MERGE_RR, quarantines it when suspect, and sweeps abandoned locks.
     The abort itself is the CALLER's to issue, prefixed with
-    :data:`RECOVERY_GIT` — see ``git_ops._guarded_abort``.
+    :data:`RECOVERY_GIT` — see :func:`guarded_abort`, which pairs the two.
 
     *report_only* performs detection and reporting with no mutation, so an
     operator can inspect before authorising a repair.
@@ -522,6 +524,45 @@ def preflight_rebase_recovery(
         locks_removed=sweep.removed,
         locks_retained=sweep.retained,
     )
+
+
+#: The subprocess runner :func:`guarded_abort` delegates to.  Injected rather
+#: than imported because the only caller is
+#: ``orchestrator/src/orchestrator/git_ops.py``, which imports THIS module; a
+#: reciprocal import would be a cycle.
+AbortRunner = Callable[..., Awaitable[tuple[int, str, str]]]
+
+
+async def guarded_abort(
+    verb: str, cwd: Path, run: AbortRunner,
+) -> tuple[int, str, str]:
+    """Run ``git <verb> --abort`` in *cwd* behind the recovery guard.
+
+    THE single abort path for the orchestrator.  Every ``rebase --abort`` and
+    ``merge --abort`` routes through here, because the failures it guards are
+    invisible at the call site: an operator reading any one of them would have
+    no reason to suspect that aborting can segfault.
+
+    Two things happen, in this ORDER, and the order is the contract:
+
+    1. :func:`preflight_rebase_recovery` quarantines a MERGE_RR whose rr-cache
+       refs dangle and clears abandoned ``*.lock`` files.  It must precede the
+       abort — a successful abort DELETES MERGE_RR, so a preflight running
+       afterwards would find nothing, report clean, and preserve no evidence.
+    2. The abort itself runs prefixed with :data:`RECOVERY_GIT`, so git never
+       opens MERGE_RR.  That neutralises both the dangling-ref crash and the
+       stale-lock rc 128.
+
+    The preflight is sync filesystem work, so it runs off-thread rather than
+    blocking the event loop.  It never raises: a preflight that cannot resolve
+    the worktree degrades to an unguarded abort, which is still strictly better
+    than no abort at all.
+
+    Returns *run*'s ``(rc, stdout, stderr)`` unchanged, so no call site's
+    control flow, return value or logging has to change.
+    """
+    await asyncio.to_thread(preflight_rebase_recovery, cwd)
+    return await run([*RECOVERY_GIT, verb, '--abort'], cwd=cwd)
 
 
 # ---------------------------------------------------------------------------
