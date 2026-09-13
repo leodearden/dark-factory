@@ -1260,21 +1260,54 @@ class CockpitApp(App):
         detail = self.query_one('#detail', DetailPane)
         detail.show_record(record, self._records, self._now_fn())
 
+    def _sync_queue_detail(self, key: str | None) -> None:
+        """Render the DecisionQueue row *key*'s backing decision into the detail pane.
+
+        Resolves *key* the way every other queue action does -- key ->
+        QueueItem (self._queue_items_by_key) -> DecisionRecord -- so the
+        pane sees the same item identity as focus/boost/copy, with no
+        second index. Takes the true DecisionRecord rather than the
+        QueueItem: the record carries severity/state and the real filed_at,
+        which the queue's deferred overlay may have shifted.
+
+        Fail-soft (PRD §2): an empty queue, a key with no QueueItem, or an
+        item whose backing record is gone leaves the pane as it is rather
+        than raising or blanking it.
+        """
+        if key is None:
+            return
+        item = self._queue_items_by_key.get(key)
+        if item is None or item.decision_id is None:
+            return
+        decision = self._decision_by_id(item.decision_id)
+        if decision is None:
+            return
+        detail = self.query_one('#detail', DetailPane)
+        detail.show_decision(decision, self._records, self._now_fn())
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Keep the detail pane in sync with the SessionTable's highlighted row.
+        """Keep the detail pane in sync with whichever table's cursor moved.
 
         Covers interactive cursor moves (e.g. arrow keys, or a test/caller
-        calling move_cursor directly). The complementary rebuild-time sync
-        lives in refresh_registry -- clear()'s cursor reset only reposts
-        this message when the highlighted row index actually changes, so a
-        same-row-different-content rebuild needs its own explicit sync.
+        calling move_cursor directly). SessionTable and DecisionQueue are
+        both DataTable subclasses, so Textual routes both their
+        RowHighlighted messages through this same handler (dispatch is by
+        the base DataTable message namespace, not the subclass) --
+        event.data_table disambiguates, the same way
+        on_data_table_row_selected does.
 
-        SessionTable and DecisionQueue are both DataTable subclasses, so
-        Textual routes both their RowHighlighted messages through this same
-        handler (dispatch is by the base DataTable message namespace, not
-        the subclass) -- event.data_table disambiguates so moving the
-        DecisionQueue's cursor never clobbers the session detail sync.
+        This handler is the ONLY thing that transfers detail-pane
+        ownership between the two tables: an operator cursor move hands the
+        pane to the table that moved, and a registry rebuild then refreshes
+        whichever one currently owns it (see _rebuild_session_table). Only
+        the session branch touches _selected_slug/cockpit-ui.json -- that
+        restore seam is the session table's alone, and a decision has no
+        session slug to restore to.
         """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        if event.data_table is queue:
+            self._sync_queue_detail(event.row_key.value)
+            return
         table = self.query_one('#session-table', SessionTable)
         if event.data_table is not table:
             return
