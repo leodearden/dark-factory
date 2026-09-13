@@ -932,12 +932,18 @@ class TestClassifyLedgerTarget:
     def test_the_verdicts_are_a_closed_named_vocabulary(self) -> None:
         """A verdict is carried into the JSON report, so it is a ``StrEnum``
         (the house shape, cf. ``models/reconciliation.py``) rather than a bare
-        string: closed at the type level, and still JSON-serializable."""
-        assert issubclass(_mod.LedgerTargetState, str)
-        assert {member.value for member in _mod.LedgerTargetState} == {
+        string: closed at the type level, and still JSON-serializable.
+
+        The ``issubclass`` check comes LAST deliberately — pyright narrows the
+        class to ``type[str]`` from that assert onward, which would make every
+        later member access an error.
+        """
+        verdicts = _mod.LedgerTargetState
+        assert {member.value for member in verdicts} == {
             'live', 'missing', 'no_schema', 'undetermined',
         }
-        assert json.dumps(_mod.LedgerTargetState.LIVE) == '"live"'
+        assert json.dumps(verdicts.LIVE) == '"live"'
+        assert issubclass(verdicts, str)
 
 
 class TestAssertLedgerTargetLive:
