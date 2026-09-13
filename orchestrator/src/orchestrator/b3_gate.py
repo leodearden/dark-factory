@@ -377,6 +377,11 @@ def check_proposal(
       5. head_sha or main_sha missing/None -> drift 'no sha anchor'
       6. HEAD != head_sha -> abort (git-anchored; P1)
       7. diff main_sha..main -- files_referenced non-empty -> drift (P2)
+      7b. age_state != AGE_PARSED -> abort.  A gate authorising unattended
+          edits and merges to main must not certify a proposal fresh when it
+          cannot determine the proposal's age at all.  Placed last so every
+          earlier verdict keeps its more specific reason; abort and drift are
+          both already non-launching, so only the FRESH path needs gating.
       8. else fresh
 
     Keys: verdict, reason, head_sha, main_sha, age_seconds, age_state.
@@ -493,6 +498,17 @@ def check_proposal(
             return _result(DRIFT, f'could not verify footprint drift (git diff rc={rc})')
         if diff_out.strip():
             return _result(DRIFT, 'main moved within proposal footprint (files_referenced)')
+
+    # --- (7b) Fail closed on an undeterminable age ---
+    # Deliberately last: abort and drift are already non-launching for every
+    # consumer, so gating only the FRESH path is sufficient, and every entry
+    # that fails for a more specific reason keeps that reason verbatim.
+    if age_state != AGE_PARSED:
+        return _result(
+            ABORT,
+            f'proposal age is not determinable (age_state={age_state}) — B3 never '
+            f'certifies a proposal fresh without a parsed investigated_at',
+        )
 
     # --- (8) Fresh ---
     return _result(FRESH, 'sha anchors valid and footprint unchanged')
