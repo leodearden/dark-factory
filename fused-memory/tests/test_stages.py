@@ -177,6 +177,12 @@ class TestMockTypesConstant:
 # cannot mislead a stage about the reconciliation queue — not a formality.
 _REVIEWED_STAGE_SAFE = {
     'mcp__escalation__claim_warm_worktree',
+    # declare_pin (task 4377) is stamp_triage's structural twin: a
+    # restrictive-only write that marks a record as load-bearing.  Against the
+    # reconciliation queue it can only ever answer "not found" — it reads no
+    # per-task escalation state, so it cannot present a categorical [] as
+    # proof of absence, which is the harm DISALLOW_ESCALATION_READS exists for.
+    'mcp__escalation__declare_pin',
     'mcp__escalation__escalate_blocker',
     'mcp__escalation__escalate_info',
     'mcp__escalation__get_merge_halt_status',

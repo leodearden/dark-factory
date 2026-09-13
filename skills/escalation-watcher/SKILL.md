@@ -1075,9 +1075,20 @@ question: esc-3105-3 scores 15/15 ruled members on this probe and must NOT be cl
 last hold on task 3105 / task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk
 close cascade on 2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag as
 `root_cause = veto-pin-do-not-close:3105`). From the member chain alone, a pin and an answered
-question are indistinguishable. Until task 4377 lands `pin_declared_by` as the machine-readable
-opt-out, the only protection is reading the record and its companions before proposing any
-disposition.
+question are indistinguishable. The machine-readable marker now exists (task 4377): a record whose
+**`pin_declared_by`** is non-empty has been declared load-bearing, and `resolve_issue` refuses
+every non-`park` action on it — and on any L2 whose cascade would close it — with
+`{'code': 'declared_pin_refused', 'declared_pins': [...]}`. It rides every compact row, so read it
+on the drain; `pin_declared_reason` (the free-text why) is only on the full record via
+`get_escalation`. Read what `pin_declared_by` NAMES and consult it — `acknowledge_declared_pins`
+exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
+check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
+it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
+companions before proposing any disposition remains the protection. Note also who can WRITE the
+marker: `declare_pin` is operator/steward-only today — it is not in the rotation's allowed tools
+(`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
+likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
+appears to rely on it, for a human to declare. esc-3105-3 itself is still in that state.
 
 **Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
 permission a second time to do the bookkeeping on a decision he has already made and that has
@@ -1105,10 +1116,11 @@ esc-3105-5 fails at item 5 and keeps working exactly as it does today.
    enumerable via the `ListAgents` tool; a session that ran out of context, was closed, or whose
    work landed hours ago with the record still open is terminated for this purpose. If it may still
    be running, leave the record and note it.
-5. **The record is NOT a pin.** `pins_recovery` is empty, `root_cause` is not a
-   `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same task.
-   **This is the protection that must not be weakened** — if any of the three is unclear, treat the
-   record as a pin and stop.
+5. **The record is NOT a pin.** `pin_declared_by` is empty, `pins_recovery` is empty, `root_cause`
+   is not a `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same
+   task. **This is the protection that must not be weakened** — if any of the four is unclear, treat
+   the record as a pin and stop. (A non-empty `pin_declared_by` is refused by `resolve_issue`
+   regardless; `acknowledge_declared_pins` is never the answer on this path.)
 6. **The sideways check has been run** — `get_pending_escalations(task_id=...)` for the subject
    task, dispositioning any twin L2 sharing a member in the same sitting (see "At every resolve,
    look sideways before moving on" under "Resolving Escalations" below).
@@ -1130,7 +1142,7 @@ exist. Leo ruled it option C on 2026-09-01 via the "The Identity Seam" briefing 
 now opens `RETARGETED 2026-09-01 — option C of esc-3881-3, ruled by Leo via "The Identity Seam"
 briefing`, its scope was rewritten to the safe-A shape, and deps were wired to 3669/3672/4932/4985
 — but that session ran out of context before closing the record, so the L2 sat pending with its
-question already answered. `pins_recovery` empty, `root_cause` the substantive
+question already answered. `pin_declared_by` empty, `pins_recovery` empty, `root_cause` the substantive
 `design-concern:3881:…` key rather than a veto-pin key, no DO-NOT-CLOSE companion, sole member
 `esc-3881-2` cascade-closing cleanly: all six hold, so the watcher closes it and reports.
 

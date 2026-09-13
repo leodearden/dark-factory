@@ -36,6 +36,7 @@ from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.canonical import canonical_root_cause
+from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
@@ -438,6 +439,31 @@ _COMPACT_ESCALATION_FIELDS = (
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
     'root_cause', 'member_ids',
+    # pin_declared_by (task 4377) — the declared-dependency marker.
+    #
+    # WHY IT IS PROJECTED: a bulk closer that drains COMPACT rows must be able
+    # to tell a declared pin from an ordinary homogeneous cluster member BEFORE
+    # it acts.  On 2026-08-08 all eleven members of esc-3237-5 were
+    # indistinguishable by id, level, category, severity, agent_role and
+    # summary, and the sole marker on esc-3371-2 lived in prose nothing linked
+    # from; the cascade close spent it and mu-gate specimen task 3371 is gone.
+    # Same class of finding as task 3997's dedup-critical fields.
+    #
+    # ITS COST, named: it rides EVERY compact row as `[]` for the overwhelming
+    # majority of records (~22 bytes), including the dashboard's
+    # fetch_pins_recovery poll.  In practice the populated form is short too — a
+    # handful of short declarer strings — which is the actual basis for
+    # including it rather than an assertion that it is free.
+    #
+    # WHY pin_declared_reason IS NOT PROJECTED: unbounded free text, the same
+    # property that keeps `detail` out.  The projected declarer list is the
+    # signal to pull the full record via get_escalation.
+    #
+    # WHY IT IS ALWAYS PROJECTED, never conditionally omitted: `pins_recovery`
+    # already gives ABSENCE a specific meaning here ("could not be computed"),
+    # and giving absence a second, different meaning on a neighbouring key would
+    # be exactly the legibility trap that contract exists to prevent.
+    'pin_declared_by',
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -1712,6 +1738,7 @@ def create_server(
         resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        acknowledge_declared_pins: list[str] | None = None,
         escalate_model: bool = False,
         terminate: Any = None,
     ) -> dict[str, Any]:
@@ -1810,6 +1837,86 @@ def create_server(
         not ``illegal_transition`` — no record is mutated by either gate, so
         this ordering is an error-reporting precedence only, not a correctness
         difference.
+
+        **Declared-pin gate** (task 4377).  A record carrying
+        ``pin_declared_by`` has something OUTSIDE the escalation store relying
+        on it staying OPEN — a deviation notice, an operator gate.  That
+        matters because an open escalation is a PRESERVATION MECHANISM for its
+        subject task: ``orchestrator/task_ground_truth.py::_RECOVERY`` has no
+        row for the pinned shape, so it falls through to
+        ``RecoveryAction.LEAVE`` and the row survives; closing the record flips
+        ``has_open_escalation`` and the same shape recovers to
+        REVERT_TO_PENDING.  So closing a marked record is a state-changing act
+        on its subject task even under ``action='close_only'``.
+
+        Any such close is refused with
+        ``{'error': ..., 'code': 'declared_pin_refused', 'declared_pins':
+        [{escalation_id, declared_by, reason}, ...]}`` — structured as well as
+        prose, per INV-2, so a caller never has to parse the message to recover
+        a fact the emitter held in a variable.  The predicate is
+        ``escalation/declared_pins.py::blocking_pin_declarations``.
+
+        The check covers the TARGET **and EVERY MEMBER** of an L2 cluster.
+        Both halves are load-bearing.  ``queue.resolve`` archives the head
+        BEFORE it cascades, so a per-member check inside the cascade could only
+        ever half-close a cluster — head archived, members still pending —
+        which is why this is a PRE-FLIGHT here rather than a refusal down
+        there.  And the bulk close of a homogeneous cluster is precisely the
+        operation that hides a member serving double duty as a pin: on
+        2026-08-08 all eleven members of esc-3237-5 were indistinguishable by
+        id, level, category, severity, agent_role and summary, and the sole
+        marker on esc-3371-2 lived in prose nothing linked from.  A member
+        ``queue.get`` cannot return is treated as unmarked and skipped, matching
+        the cascade's existing best-effort contract (see the in-code note for
+        the named limitation).
+
+        Only records this resolve could ACTUALLY CLOSE are considered — the
+        target and each member are both filtered to ``status == 'pending'``.
+        An already-closed record's pin cannot be spent again (``queue.resolve``
+        no-ops on a non-pending record, and its cascade no-ops over an
+        already-archived member), so refusing on one would name a record the
+        close could not touch and would re-block an operator who already spent
+        that pin deliberately.  A spurious refusal is the thing that teaches a
+        rotation to acknowledge reflexively.
+
+        ``acknowledge_declared_pins`` is the deliberate override.  It must NAME
+        each escalation id whose declared pin is being spent — a list, not a
+        boolean, because a boolean is one keystroke and is exactly what a
+        rotation working through a homogeneous cluster would set reflexively to
+        make an unexpected error go away, reproducing the incident with an extra
+        parameter.  A PARTIAL acknowledgement still refuses and reports only the
+        remainder, which is the property that stops a bulk closer from waving a
+        whole cluster through on the one id the error happened to mention first.
+        Naming an id that is not blocked is a harmless no-op.
+
+        This acknowledgement is the ONLY release valve: this task ships no
+        un-declare verb, deliberately — withdrawal then happens at the moment of
+        the close, named in the resolution, by the party actually spending the
+        pin, rather than as a separate untraceable write that leaves the record
+        looking as though it was never protected.  A caller reaching for it
+        should first go READ what ``pin_declared_by`` names and consult it, not
+        silence it.
+
+        No extra logging is needed here: ``queue.resolve`` emits one WARNING per
+        pin actually spent — for the head and, via its cascade recursion, for
+        every marked member — so an acknowledged close is loud in the log even
+        though it is permitted.
+
+        COVERS every action EXCEPT ``park``: ``resume``, ``restart``,
+        ``abandon`` and ``close_only`` all run ``queue.resolve()`` and archive
+        the record, flipping the boolean identically — a ``resume`` would spend
+        a pin just as completely as the ``close_only`` cascade that spent the
+        mu-gate specimen on 2026-08-08, and would additionally re-dispatch the
+        very task the pin preserves.  ``park`` keeps ``status='pending'`` and
+        never archives, so it cannot spend a pin; the exemption is encoded
+        POSITIONALLY (the gate sits after park's early return) so it cannot be
+        got wrong by a later edit.
+
+        In the **Gate precedence** ordering this gate runs LAST: after
+        ``bad_capability_header`` / ``level_forbidden`` and after
+        ``illegal_transition``, so a caller failing several gates learns about
+        the capability and legality problems first.  None of the four mutates
+        the record, so the ordering is an error-reporting precedence only.
 
         NOTE: the ``target_status`` values above are not yet written by
         resolve_issue — this call changes only the escalation record; the
@@ -1963,6 +2070,70 @@ def create_server(
             if esc is None:
                 return {'error': f'Escalation {escalation_id} not found'}
             return esc.to_dict()
+
+        # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
+        # this docstring.  Its POSITION is load-bearing in two ways.  It sits
+        # AFTER the `park` early-return above, so park is structurally exempt
+        # with no `action != 'park'` condition that a later edit could get wrong
+        # — park keeps the record OPEN and never archives it, so it cannot spend
+        # a pin.  And it sits BEFORE the resolution_action pre-stamp below, so a
+        # refusal persists nothing (INV-1), exactly as the capability and Table B
+        # gates do.
+        #
+        # Classifies the TARGET plus EVERY member of an L2 cluster, because the
+        # BULK CLOSE of a homogeneous cluster is precisely the operation that
+        # hides a member serving double duty as a pin.  A member `queue.get`
+        # cannot return is treated as UNMARKED and skipped, deliberately
+        # matching queue.resolve's best-effort cascade contract (pinned by
+        # test_queue.py::TestResolveCascade::test_cascade_to_nonexistent_member_
+        # is_best_effort): a record that does not exist cannot carry a marker,
+        # and refusing a whole resolve on a dangling member id would break
+        # behaviour the cascade tests already pin.  NAMED LIMITATION: queue.get
+        # collapses "absent" and "unparseable" into None, so a CORRUPT member
+        # file reads as unmarked — the opposite fail-direction from
+        # escalation/pins.py (records=None => store_unavailable).  Distinguishing
+        # them would require changing queue.get's return contract; out of scope.
+        #
+        # COST, considered: one queue.get per member on a resolve.  A resolve is
+        # a rare, human/watcher-driven operation and `get` memoises its archive
+        # listing, so this is not an unconsidered N+1.
+        #
+        # Only records this resolve could ACTUALLY CLOSE are candidates, hence
+        # the `status == 'pending'` filter on both the target and each member.
+        # An already-closed record's pin cannot be spent again: queue.resolve
+        # early-returns as a no-op on `status != 'pending'`, and its cascade
+        # no-ops over an already-archived member the same way.  Refusing on one
+        # would be a pure false positive that names a record the close could not
+        # touch — and, worse, it would force an operator who ALREADY spent that
+        # pin deliberately (naming it in acknowledge_declared_pins on the close
+        # that archived it) to re-acknowledge it on every subsequent operation
+        # on the cluster.  That erodes exactly the signal this gate exists to
+        # make trustworthy: a rotation that learns the refusal is routinely
+        # spurious starts acknowledging reflexively, which is the failure mode
+        # acknowledge_declared_pins-as-a-list was shaped to prevent.  The target
+        # needs the filter for the same reason a member does — queue.get falls
+        # back to the ARCHIVE, so `rec` itself may already be closed.
+        candidates = [rec] if rec.status == 'pending' else []
+        for member_id in rec.members:
+            member = queue.get(member_id)
+            if member is not None and member.status == 'pending':
+                candidates.append(member)
+        blocked = blocking_pin_declarations(
+            candidates, acknowledged=acknowledge_declared_pins or (),
+        )
+        if blocked:
+            return {
+                'error': format_refusal(blocked),
+                'code': 'declared_pin_refused',
+                'declared_pins': [
+                    {
+                        'escalation_id': d.escalation_id,
+                        'declared_by': list(d.declared_by),
+                        'reason': d.reason,
+                    }
+                    for d in blocked
+                ],
+            }
 
         # Pre-stamp resolution_action on the pending record so resolve()'s
         # read-modify-write carries it into the archived JSON (C1 persistence).
@@ -2303,6 +2474,132 @@ def create_server(
             triaged_by = identity
         esc = queue.stamp_triage(escalation_id, triaged_by=triaged_by, triage_note=triage_note)
         if esc is None:
+            return {'error': f'Escalation {escalation_id} not found or not pending'}
+        return esc.to_dict()
+
+    @mcp.tool()
+    def declare_pin(
+        escalation_id: str,
+        declared_by: list[str],
+        reason: str = '',
+    ) -> dict[str, Any]:
+        """Declare that something outside the escalation store RELIES on this
+        pending record staying OPEN (task 4377).
+
+        An open escalation is a PRESERVATION MECHANISM for its subject task:
+        ``orchestrator/task_ground_truth.py::_RECOVERY`` has no row for the
+        pinned shape, so the row falls through to ``RecoveryAction.LEAVE``.
+        Closing the record flips ``has_open_escalation`` and the task reverts —
+        which makes a close a state-changing act on the subject task even under
+        ``action='close_only'``.  This tool is what makes that dependency
+        DECLARABLE on the record itself, instead of living in prose (a deviation
+        notice, an operator gate) that a bulk closer never reads.
+
+        Once marked, ``resolve_issue`` REFUSES every action except ``park``
+        (``resume`` / ``restart`` / ``abandon`` / ``close_only`` all archive the
+        record) for this record AND for any L2 whose cascade would close it,
+        unless the caller names its id in ``acknowledge_declared_pins``.  That
+        acknowledgement is the ONLY release valve — this ships no un-declare
+        verb, deliberately: withdrawal then happens at the moment of the close,
+        named in the resolution, by the party actually spending the pin.
+
+        *declared_by* names WHAT relies on the record staying open
+        (``'task-3546-second-deviation-notice'``), NOT who stamped it.  Entries
+        are stripped, blanks dropped, already-present entries dropped, then
+        APPENDED in declaration order.  *reason* is the free-text why,
+        overwritten only when non-empty.
+
+        WHO CAN CALL THIS, stated because it is a real limitation and not an
+        oversight: declaring is **operator/steward/interactive-session only**
+        in this task's scope.  The escalation-watcher-auto rotation — the agent
+        most likely to *notice* that a record is load-bearing — CANNOT declare
+        one: ``orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS``
+        grants it ``stamp_triage`` (the ungated-annotation precedent this tool
+        mirrors) but not ``declare_pin``, and dispatched task agents hold only
+        ``escalate_info`` / ``escalate_blocker``
+        (``orchestrator/src/orchestrator/agents/roles.py``).  Wiring the
+        rotation as a writer is deliberately OUT OF SCOPE here — this task holds
+        no lock on the orchestrator package — so until that follow-up lands, a
+        watcher that spots a candidate pin REPORTS it (its skill says so) and a
+        human or steward runs this tool.  Consequence worth naming: the refusal
+        gate can only fire for records a human has actually marked, so the
+        surviving sibling pin esc-3105-3 stays protected by prose until someone
+        declares it.
+
+        Two deliberate departures from ``stamp_triage``, its structural twin:
+
+        - **NOT level-gated**, for ``stamp_triage``'s stated reason: a
+          declaration is restrictive-only — it can never widen what a
+          connection may do, only narrow it — so gating it would let a
+          level-capped connection OBSERVE a pin it is forbidden to declare.
+        - **The ``X-Escalation-Identity`` header is NOT read** to override
+          *declared_by*.  ``resolved_by`` / ``triaged_by`` are WHO-acted
+          attributions and the non-spoofable server override is right for
+          those; ``pin_declared_by`` answers a different question — WHAT
+          outside the store relies on this record — and overwriting it with a
+          connection identity would destroy the single fact the field exists to
+          carry, silently converting every declaration into "the watcher
+          connection declared this", which names nothing a closer could go
+          consult.  The asymmetry is deliberate; please do not "fix" it.
+
+        Returns the updated record as a full dict on success.  The THREE
+        non-success outcomes are distinguished so a caller is not left guessing
+        — ``queue.declare_pin`` collapses them all into ``None``:
+
+        - ``{'error': ..., 'code': 'empty_declared_by'}`` — *declared_by*
+          normalises to nothing (checked here, before the queue is touched: a
+          silent no-op would leave the declarer believing the record is
+          protected when it is not).
+        - ``{'error': ..., 'code': 'already_declared', 'pin_declared_by': [...],
+          'pin_declared_reason': ...}`` — the record is found and pending and
+          ALREADY carries every declarer named, so nothing was added.  An
+          idempotent retry is the natural thing for an operator or a script to
+          do, and reporting "not found" for it would be false about the record;
+          the current declarers come back structurally (INV-2) so the caller
+          need not parse the message.  NOTE this outcome also means *reason* was
+          not updated — a wholly-redundant call writes nothing at all, so a
+          rationale correction needs a declarer that is not already present.
+        - ``{'error': ...}`` — the record is not in the queue root, is
+          unparseable, or is not pending.
+        """
+        if not [entry for entry in declared_by if entry.strip()]:
+            return {
+                'error': (
+                    f'declare_pin on {escalation_id} names no declarer: declared_by must '
+                    'carry at least one non-blank entry naming WHAT relies on this record '
+                    'staying open (e.g. "task-3546-second-deviation-notice"). '
+                    'Nothing was stamped — the record is NOT protected.'
+                ),
+                'code': 'empty_declared_by',
+            }
+        esc = queue.declare_pin(escalation_id, declared_by=declared_by, reason=reason)
+        if esc is None:
+            # queue.declare_pin collapses several outcomes into None, and one of
+            # them — a WHOLLY REDUNDANT re-declaration — is not a missing record
+            # at all: the record is found, pending, and already carries every
+            # declarer named.  Reporting "not found or not pending" for it would
+            # be factually false about the record, and an idempotent retry (the
+            # natural thing for an operator or a script to do) is exactly when
+            # it happens.  So re-read before choosing the message.  A record
+            # resolved between the two calls reads as non-pending here and
+            # correctly falls through to the generic message.
+            existing = queue.get(escalation_id)
+            if existing is not None and existing.status == 'pending':
+                return {
+                    'error': (
+                        f'Escalation {escalation_id} is ALREADY declared by '
+                        f'{", ".join(existing.pin_declared_by)}; nothing was added. '
+                        'The record IS protected — resolve_issue already refuses '
+                        'every non-park action on it. NOTE: a wholly-redundant '
+                        'call does not update `reason` either; to record a '
+                        'different rationale, name a declarer not already present.'
+                    ),
+                    'code': 'already_declared',
+                    # Structural, per INV-2 — a caller should never have to parse
+                    # the message to recover what the record already carries.
+                    'pin_declared_by': list(existing.pin_declared_by),
+                    'pin_declared_reason': existing.pin_declared_reason,
+                }
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
 

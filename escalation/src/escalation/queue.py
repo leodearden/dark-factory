@@ -25,6 +25,14 @@ from escalation import archive
 from escalation.canonical import canonical_root_cause
 from escalation.classify import default_resolution_class_for_resolver
 
+# The declared-pin field's normalisation (strip / drop blanks / order-preserving
+# de-dup) is ONE contract with two sides — this writer and the read-side
+# predicate `declared_pins.blocking_pin_declarations`.  Sharing the helper is
+# what keeps them from drifting; declared_pins is a pure leaf (it imports
+# models only under TYPE_CHECKING), so there is no cycle.  Imported under its
+# real, public name for the same reason as `max_severity` below.
+from escalation.declared_pins import normalise_declarers
+
 # max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
 # stay total over (task 3976), so server.py can share it without reaching for a
 # module-private symbol.  Imported under its real, public name: it is a shared
@@ -1230,6 +1238,28 @@ class EscalationQueue:
         members still pending at callback time; they should re-query member state
         rather than assuming terminality.  This ordering is stable — do not rely
         on members being resolved at the moment the L2 callback fires.
+
+        **Declared pins (task 4377): this method WARNS but never REFUSES.**
+        Closing a record carrying ``pin_declared_by`` logs a WARNING naming the
+        id, every declarer and the reason — an audit line, so an un-gated close
+        is observable from ANY caller rather than silent.  Cascade members are
+        covered for free by the self-recursion below.
+
+        REFUSAL lives one layer up, at the
+        ``escalation/server.py::resolve_issue`` chokepoint, which consults
+        ``escalation/declared_pins.py::blocking_pin_declarations`` as a
+        PRE-FLIGHT over the target plus every member.  Two mechanical reasons
+        it cannot live here: (i) this method archives the L2 head BEFORE it
+        cascades, so a refusal discovered per-member could only ever produce a
+        half-closed cluster — head archived, members still pending — which is
+        worse than either outcome; and (ii) ``resolve()`` returns
+        ``Escalation | None``, so a refusal is indistinguishable from "not
+        found" unless it raises, and most in-repo callers (harness
+        self-clearing sentinels, workflow.py / steward.py L0 teardown,
+        ``dismiss_all_pending``) wrap this call in a best-effort ``try/except``
+        — a raise would be swallowed into a silent no-op, turning a protection
+        into an invisible one and potentially wedging a sentinel auto-clearing
+        a record it filed itself.
         """
         if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
             raise ValueError(
@@ -1266,6 +1296,18 @@ class EscalationQueue:
             self._archive_resolved(escalation_id, esc.resolved_at)
 
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
+
+        # Declared-pin AUDIT LINE (task 4377) — see the "Declared pins" section
+        # of this docstring.  Because resolve() recurses into itself for each L2
+        # member below, cascade members are covered by this same line with no
+        # extra code — which matters, since the cascade is the path that spent
+        # the mu-gate specimen on 2026-08-08.
+        if esc.pin_declared_by:
+            logger.warning(
+                'Escalation %s closed (%s) despite a DECLARED PIN — declared_by=%s reason=%r. '
+                'An open escalation preserves its subject task; this close may have spent it.',
+                escalation_id, esc.status, ', '.join(esc.pin_declared_by), esc.pin_declared_reason,
+            )
 
         if self._resolve_callback:
             try:
@@ -1910,6 +1952,95 @@ class EscalationQueue:
                 esc.triage_note = triage_note
             self._rewrite(escalation_id, esc)
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
+            return esc
+
+    def declare_pin(
+        self, escalation_id: str, *, declared_by: list[str], reason: str = '',
+    ) -> Escalation | None:
+        """Declare that something outside the escalation store RELIES on this
+        record staying OPEN (task 4377).
+
+        NOT a triage-class annotation, despite the shared shape.  ``stamp_triage``
+        records that a watcher looked at a record; this CHANGES WHAT A RESOLVER
+        MAY DO to it — ``escalation/server.py::resolve_issue`` refuses every
+        non-``park`` action on a marked record (via
+        ``escalation/declared_pins.py::blocking_pin_declarations``) unless the
+        caller names its id in ``acknowledge_declared_pins``.  That is why a
+        no-op stamp here returns ``None`` rather than quietly succeeding: a
+        declarer who believes a record is protected when it is not is exactly
+        the failure this marker exists to close.
+
+        *declared_by* names WHAT relies on the record — a deviation notice, an
+        operator gate (``'task-3546-second-deviation-notice'``) — NOT who
+        stamped it.  Entries go through
+        ``escalation/declared_pins.py::normalise_declarers`` (stripped, blanks
+        dropped, de-duplicated order-preservingly) — THE one normalisation, so
+        this writer and the read-side predicate cannot drift — and are then
+        filtered against the entries already on the record before being
+        APPENDED in declaration order.  When nothing
+        survives that normalisation (empty, all-blank, or wholly redundant)
+        this returns ``None`` and writes nothing — including when *reason* was
+        supplied, since a reason with no new declarer changes no protection.
+
+        *reason* is the free-text why, overwritten only when NON-EMPTY — the
+        asymmetric-overwrite contract ``stamp_triage`` establishes for
+        ``triage_note``, so appending a second declarer with no new prose does
+        not silently wipe the recorded rationale.
+
+        **Concurrency contract (sidecar flock).**  Serialized per-id by
+        ``escalation_id_lock``, mirroring ``stamp_triage`` /
+        ``add_members_to_l2`` / ``attach_dedupe_child``.
+
+        Loads the record directly from ``queue_dir/{escalation_id}.json``
+        (queue root ONLY) — deliberately NOT ``self.get()``, which falls back
+        to the archive.  Declaring a dependency on an already-closed record is
+        meaningless, and loading via the archive fallback followed by
+        ``_rewrite`` (which always targets the queue root) would RESURRECT an
+        archived record into the pending pile — the Defect-2 class of bug that
+        motivated task 1498's ``add_members_to_l2`` guard.
+
+        Does NOT touch ``status``, ``level``, ``triaged_at`` or ``updated_at``.
+        ``add_members_to_l2`` remains the SOLE ``updated_at`` writer, so that
+        signal keeps meaning exactly one thing ("real member append"); the
+        protection here is the loud refusal at resolve time, not a freshness
+        bump (see the task's design decision).
+
+        Returns the updated ``Escalation``, or ``None`` when *escalation_id* is
+        not found in the queue root, fails to parse, is not pending, or when
+        *declared_by* normalises to nothing new.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                return None
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+
+            if esc.status != 'pending':
+                return None
+
+            existing = list(esc.pin_declared_by)
+            # Shared normalisation (strip / drop blanks / order-preserving
+            # de-dup), then the write-side-only step: drop entries the record
+            # already carries, so a re-declaration never duplicates one.
+            added = [
+                declarer for declarer in normalise_declarers(declared_by)
+                if declarer not in existing
+            ]
+            if not added:
+                return None
+
+            esc.pin_declared_by = existing + added
+            if reason:
+                esc.pin_declared_reason = reason
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'declare_pin: %s is now declared load-bearing by %s (reason=%r)',
+                escalation_id, ', '.join(added), esc.pin_declared_reason,
+            )
             return esc
 
     def attach_dedupe_child(
