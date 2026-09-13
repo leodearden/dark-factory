@@ -64,7 +64,43 @@ __all__ = [
     'collect_process_metrics',
     'discover_pressure_cgroups',
     'collect_load_metrics',
+    'ARM_METRIC_STEMS',
 ]
+
+ARM_METRIC_STEMS = {
+    'mem_full_avg10': 'psi_mem_full_avg10',
+    'mem_some_avg10': 'psi_mem_some_avg10',
+    'io_some_avg10': 'psi_io_some_avg10',
+    'cpu_some_avg10': 'psi_cpu_some_avg10',
+    'runqueue_ratio': 'runqueue_ratio',
+    'own_cpu_some_avg10': 'own_cpu_some10',
+}
+"""Gate ARM name -> the sampler metric name (or ':' stem) recording that arm.
+
+PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4, boundary row 11. The
+gate decides on arms (``shared.psi._ARMS``, whose field names are also the
+``psi_admission`` config leaves and the ``tripping_metric`` vocabulary); this
+module records metrics; ε1/ε2 calibrate one against the other. Those are two
+vocabularies for one set of signals, so the correspondence needs a single
+home (heuristic 11) — this one — and a reconciler, which is
+``TestArmMetricStemParity`` in sampler/tests/test_load_metrics.py. That test
+enumerates ``_ARMS`` itself rather than a copy, asserts BOTH directions so
+the mapping can neither miss an arm nor keep a dead key, and asserts each
+stem is actually emitted.
+
+The stems are NOT mechanically derivable from the arm names, which is exactly
+why this is an explicit table and not a rule: the four host arms gain a
+``psi_`` prefix, ``own_cpu_some_avg10`` records as ``own_cpu_some10``
+(``avg10`` against ``10``), and ``runqueue_ratio`` maps to itself. Neither
+the identity nor a systematic rewrite covers all three.
+
+Two of the six values are ':' STEMS rather than whole metric names —
+``own_cpu_some10`` is emitted as ``own_cpu_some10:<cgroup-leaf>``, one row
+per discovered leaf (PRD open question 1, resolved as the stem spelling).
+``scripts/load-threshold-calibration.py`` carries the same correspondence by
+necessity — it runs under the system python3 and cannot import this module —
+and a lockstep test reconciles the two.
+"""
 
 # The cgroup v2 unified-hierarchy mountpoint. A DEFAULT for the injected
 # ``cgroup_root`` seam, in the same shape as ``_default_fd9_exists`` below —
