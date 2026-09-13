@@ -409,10 +409,12 @@ class _BodyVerifier(FakeVerifier):
 class _TwoHostAllocator:
     """``HostAllocator`` double that leases out the runner doubles a test owns.
 
-    ``_run_drift_check`` acquires both of its legs through the allocator it is
-    given, and only calls the local factory when the allocator asks for one —
-    so leasing both here is what lets a drift test run the real detector
-    against runners it controls.
+    For the one case that must drive a local leg it controls — a verify that
+    parks on a gate, so the detective is observably in flight.  Drift tests
+    that only need the two legs to agree or diverge use the REAL
+    ``HostAllocator`` instead (see ``TestRunDriftCheck._drift_allocator``),
+    because only the real one builds the local trust anchor from the drift
+    check's own factory.
     """
 
     def __init__(self, local, remote):
@@ -420,7 +422,16 @@ class _TwoHostAllocator:
         self._remote = remote
         self.released: list[str] = []
 
-    def acquire_local(self, factory):  # noqa: ARG002 — the test owns the runner
+    def acquire_local(self, factory):
+        """Lease the test-owned local double — but build the factory's runner
+        first, exactly where the real allocator builds it.
+
+        The product is dropped rather than leased (this double exists so a
+        test can dispatch on a runner it controls), yet invoking the factory
+        still matters: it is the only thing keeping a double that bypasses the
+        local leg from also silencing a broken ``_local_factory``.
+        """
+        factory()
         return HostLease(name=self._local.name, runner=self._local, is_local=True)
 
     def acquire_remote(self):
@@ -1080,19 +1091,26 @@ class TestRunDriftCheck:
         eq.submit = MagicMock()
         return eq
 
-    def _drift_legs(self, *, local_result=None, remote_result=None):
-        """The two verify hosts a drift check compares, as runner doubles.
+    def _drift_allocator(self, *, remote_result=None, quarantine=None):
+        """The REAL allocator, pre-loaded with the remote leg as a double.
 
-        Both legs go in through the ``allocator=`` collaborator
-        _run_drift_check already takes, so the real DriftDetector and the real
-        VerifyRunnerPool run and the local trust anchor is a runner rather
-        than a stubbed module-level verify entry point.  _run_drift_check only
-        builds a LocalRunner of its own when the allocator asks its factory
-        for one, which this allocator never does.
+        Real, not a double, because ``HostAllocator.acquire_local`` is what
+        invokes ``_run_drift_check``'s local factory: the local leg is then
+        the ``LocalRunner`` the drift check builds for itself — over the
+        throwaway checkout, with the full-gate spec — rather than a runner
+        handed in by the test, and the genuine acquire/release/quarantine
+        predicate runs.  That leg verifies through
+        ``orchestrator.merge_queue.run_scoped_verification``, which conftest's
+        autouse fixture already answers with a pass, so the agree/diverge
+        matrix is driven entirely by *remote_result*.
+
+        *quarantine* is the same set ``_run_drift_check`` quarantines into, so
+        the allocator honours a host it has just quarantined.
         """
-        local = _runner_double('local', is_local=True, result=local_result)
         remote = _runner_double('laptop', is_local=False, result=remote_result)
-        return local, remote, cast(HostAllocator, _TwoHostAllocator(local, remote))
+        return HostAllocator(
+            [remote], quarantine=set() if quarantine is None else quarantine,
+        )
 
     async def test_agree_emits_verdict_parity_ok(self, tmp_path):
         """When local and remote agree, a verdict_parity_ok event is emitted."""
@@ -1104,7 +1122,7 @@ class TestRunDriftCheck:
         eq = self._make_fake_escalation_queue()
         es = _RecordingEventStore()
         quarantine_set: set[str] = set()
-        _local, _remote, allocator = self._drift_legs()
+        allocator = self._drift_allocator(quarantine=quarantine_set)
 
         await _run_drift_check(
             git_ops, req, 'abc123', eq, es, quarantine_set,
@@ -1134,7 +1152,7 @@ class TestRunDriftCheck:
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
-        _local, _remote, allocator = self._drift_legs()
+        allocator = self._drift_allocator()
 
         run_scoped = AsyncMock(return_value=_make_pass_result())
         with patch('orchestrator.merge_queue.run_scoped_verification', new=run_scoped):
@@ -1174,7 +1192,9 @@ class TestRunDriftCheck:
         fail_result = VerifyResult(
             passed=False, test_output='FAIL', lint_output='', type_output='', summary='fail',
         )
-        _local, _remote, allocator = self._drift_legs(remote_result=fail_result)
+        allocator = self._drift_allocator(
+            remote_result=fail_result, quarantine=quarantine_set,
+        )
 
         await _run_drift_check(
             git_ops, req, 'abc123', eq, es, quarantine_set,
