@@ -623,8 +623,10 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    coin flip. The remaining floor
    σ must attack is the single `build_report` (27.19s of the fastest AFTER run,
    55.46s of the slowest), plus the radon MI recomputed in each of the five
-   `TestReportCli` items and the 6–7s in
-   `test_merge_queue_anchor_reproduces_the_prd_background_numbers`, which still
-   measures merge_queue.py twice through the two public projections. The ceiling
-   and the INV-10/INV-11 prohibitions above are unchanged — this is a correction
-   of measured facts, not a renegotiation.
+   `TestReportCli` items. (The 6–7s in
+   `test_merge_queue_anchor_reproduces_the_prd_background_numbers` was a third
+   double-measure of merge_queue.py — through `cognitive_complexity` and
+   `file_cognitive_total` — and 5101 closed it on review by deleting both
+   now-callerless accessors and reading `file_cognitive_measures` once.) The
+   ceiling and the INV-10/INV-11 prohibitions above are unchanged — this is a
+   correction of measured facts, not a renegotiation.

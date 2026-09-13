@@ -550,13 +550,21 @@ class FileCognitive:
 def file_cognitive_measures(path: Path) -> FileCognitive:
     """Measure *path* with complexipy ONCE and derive both projections from it.
 
-    The two projections are two VIEWS of a single ``FileComplexity``, so this
-    is where the derivation lives and ``cognitive_complexity`` /
-    ``file_cognitive_total`` are its named halves. Deliberately NOT a cache:
-    a memo keyed on a path would return the file as it WAS, would retain every
-    result for the life of a process the merge lane runs on every verify leg,
-    and would need a carve-out to keep ``_file_complexity``'s MetricsError from
-    being swallowed. One call site needs no cache to make one call.
+    The file total and the per-function map are two VIEWS of a single
+    ``FileComplexity``, so one call answers both and ``build_report`` -- the
+    only caller -- asks once per file. There are deliberately no separate
+    ``cognitive_complexity`` / ``file_cognitive_total`` accessors: with one
+    call site, a named half per projection would be surface kept alive by its
+    own tests. Deliberately NOT a cache either: a memo keyed on a path would
+    return the file as it WAS, would retain every result for the life of a
+    process the merge lane runs on every verify leg, and would need a carve-out
+    to keep ``_file_complexity``'s MetricsError from being swallowed.
+
+    ``total`` is reported and ratcheted alongside ``per_function`` because it
+    also counts module-level control flow belonging to no function. complexipy
+    already emits ``Class::method`` for methods, so the keys need no
+    post-processing, and a module with no functions yields an empty map -- a
+    real measurement, not a skipped one.
     """
     result = _file_complexity(path)
     return FileCognitive(
@@ -565,25 +573,6 @@ def file_cognitive_measures(path: Path) -> FileCognitive:
             function.name: function.complexity for function in result.functions
         },
     )
-
-
-def cognitive_complexity(path: Path) -> dict[str, int]:
-    """Per-function cognitive complexity of *path*, keyed by complexipy qualname.
-
-    complexipy already emits ``Class::method`` for methods, so the key needs no
-    post-processing. A module with no functions yields an empty map -- that is a
-    real measurement, not a skipped one.
-    """
-    return file_cognitive_measures(path).per_function
-
-
-def file_cognitive_total(path: Path) -> int:
-    """complexipy's whole-file cognitive total for *path*.
-
-    Reported and ratcheted alongside the per-function map, because the file
-    total also counts module-level control flow that belongs to no function.
-    """
-    return file_cognitive_measures(path).total
 
 
 def maintainability_index(source: str, *, path: str) -> float:

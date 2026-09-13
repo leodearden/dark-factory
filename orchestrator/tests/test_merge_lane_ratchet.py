@@ -768,18 +768,18 @@ class TestCognitiveComplexity:
     def test_keyed_by_complexipy_qualname(self, tmp_path: Path) -> None:
         target = tmp_path / 'tiny.py'
         target.write_text(_TINY_SOURCE, encoding='utf-8')
-        scores = metrics.cognitive_complexity(target)
+        scores = metrics.file_cognitive_measures(target).per_function
         assert scores == {'f': 6, 'C::m': 0}
 
     def test_module_with_no_functions_returns_an_empty_map(self, tmp_path: Path) -> None:
         target = tmp_path / 'empty.py'
         target.write_text('X = 1\n', encoding='utf-8')
-        assert metrics.cognitive_complexity(target) == {}
+        assert metrics.file_cognitive_measures(target).per_function == {}
 
     def test_file_total_is_reported_separately(self, tmp_path: Path) -> None:
         target = tmp_path / 'tiny.py'
         target.write_text(_TINY_SOURCE, encoding='utf-8')
-        assert metrics.file_cognitive_total(target) == 6
+        assert metrics.file_cognitive_measures(target).total == 6
 
     def test_both_projections_come_from_one_complexipy_measurement(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -793,8 +793,9 @@ class TestCognitiveComplexity:
         # equalities below are still checked against a real measurement.
         target = tmp_path / 'tiny.py'
         target.write_text(_TINY_SOURCE, encoding='utf-8')
-        expected_total = int(metrics._file_complexity(target).complexity)
-        expected_per_function = metrics.cognitive_complexity(target)
+        raw = metrics._file_complexity(target)
+        expected_total = int(raw.complexity)
+        expected_per_function = {f.name: f.complexity for f in raw.functions}
         # Anti-vacuity: a module measuring 0 with no functions would satisfy
         # the equalities below while witnessing nothing.
         assert expected_total > 0
@@ -814,17 +815,6 @@ class TestCognitiveComplexity:
         assert measures.total == expected_total
         assert measures.per_function == expected_per_function
 
-    def test_file_cognitive_measures_propagates_an_unmeasurable_file(
-        self, tmp_path: Path
-    ) -> None:
-        # INV-11's polarity must survive the restructure: a file the instrument
-        # cannot measure is the FINDING, never a silent 0 and never a skip.
-        target = tmp_path / 'broken.py'
-        target.write_text('def (:\n', encoding='utf-8')
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.file_cognitive_measures(target)
-        assert 'broken.py' in str(excinfo.value)
-
     def test_missing_complexipy_raises_naming_the_tool(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -834,16 +824,18 @@ class TestCognitiveComplexity:
         target = tmp_path / 'tiny.py'
         target.write_text(_TINY_SOURCE, encoding='utf-8')
         with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.cognitive_complexity(target)
+            metrics.file_cognitive_measures(target)
         message = str(excinfo.value)
         assert 'complexipy' in message
         assert 'dev' in message
 
     def test_unparseable_file_raises_naming_the_path(self, tmp_path: Path) -> None:
+        # INV-11's polarity: a file the instrument cannot measure is the
+        # FINDING, never a silent 0 and never a skip.
         target = tmp_path / 'broken.py'
         target.write_text('def (:\n', encoding='utf-8')
         with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.cognitive_complexity(target)
+            metrics.file_cognitive_measures(target)
         assert 'broken.py' in str(excinfo.value)
 
     def test_merge_queue_anchor_reproduces_the_prd_background_numbers(self) -> None:
@@ -868,10 +860,10 @@ class TestCognitiveComplexity:
         # comparator's params.complexipy_version check already hard-block every
         # other major with a named failure.
         target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
-        scores = metrics.cognitive_complexity(target)
-        assert scores['SpeculativeMergeWorker::_verifier_loop'] >= 100
-        assert scores['SpeculativeMergeWorker::stop'] >= 50
-        assert metrics.file_cognitive_total(target) >= 1000
+        measures = metrics.file_cognitive_measures(target)
+        assert measures.per_function['SpeculativeMergeWorker::_verifier_loop'] >= 100
+        assert measures.per_function['SpeculativeMergeWorker::stop'] >= 50
+        assert measures.total >= 1000
 
 
 class TestComplexipyVersionContract:
