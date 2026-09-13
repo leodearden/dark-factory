@@ -35,6 +35,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 from shared.psi import parse_pressure_file, read_pressure
@@ -48,7 +49,76 @@ __all__ = [
     'count_verify_concurrency',
     'sum_verify_rss',
     'collect_process_metrics',
+    'discover_pressure_cgroups',
 ]
+
+_USER_MANAGER_PREFIX = 'user@'
+_DF_LEAF_GLOB = '*/df-*.slice'
+_ORCHESTRATOR_LEAF_GLOB = '*/orchestrator-*.service'
+
+
+def _anchor_segments(own_cgroup_path: str) -> list[str] | None:
+    """Return the segments of *own_cgroup_path* up to its ``user@<uid>.service``.
+
+    ``None`` when there is no such segment — i.e. nothing to anchor at, which
+    is not an error: a sampler running outside a systemd user manager (or one
+    handed α's ``OwnCgroup('', None)`` failure value) simply has no per-slice
+    neighbourhood to enumerate.
+    """
+    segments = own_cgroup_path.split('/')
+    for depth, segment in enumerate(segments, start=1):
+        if segment.startswith(_USER_MANAGER_PREFIX):
+            return segments[:depth]
+    return None
+
+
+def discover_pressure_cgroups(
+    *,
+    own_cgroup_path: str,
+    cgroup_root: Path,
+) -> list[tuple[str, Path]]:
+    """Return sorted ``(leaf_name, cpu_pressure_path)`` for the sibling cgroups.
+
+    PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4: one row per
+    ``df-*.slice`` present, ELSE one per ``orchestrator-*.service``. The
+    fallback is not a theoretical branch — measured on this host on
+    2026-09-13 there are ZERO ``df-*.slice`` (task 3394 has not landed) and
+    seven ``orchestrator-*.service`` leaves, so the ELSE arm is the one
+    actually running today.
+
+    The search is ANCHORED at the ``user@<uid>.service`` segment of
+    *own_cgroup_path* rather than walking down from *cgroup_root*, for two
+    reasons. Cost: measured here, ``rglob('orchestrator-*.service')`` from the
+    cgroup root takes 32.7 ms and an ``os.walk`` capped at depth 6 takes
+    19.9 ms, against 0.30 ms for the anchored glob — and this runs every 5 s,
+    so an unanchored sweep would spend 0.6% of every tick walking cgroupfs for
+    a result that changes only when a unit starts. Correctness: another user
+    manager's slices are not ours, and an unanchored search would report them
+    under our own metric names.
+
+    The anchor costs no new /proc/self/cgroup reader: α's
+    ``shared.psi.resolve_own_cgroup(None)`` already parses the ``0::`` line
+    and returns that kernel path, and this takes the segments up to and
+    including the ``user@`` one (INV-5 — reuse the reader, add no second
+    parser).
+
+    Never raises. Any failure — an unanchorable path, a cgroup_root that does
+    not exist, a permission error mid-glob — returns ``[]``, which the caller
+    reads as "no leaves discovered" and reports as such (see
+    ``collect_load_metrics``); it never synthesises a leaf name.
+    """
+    segments = _anchor_segments(own_cgroup_path)
+    if segments is None:
+        return []
+    anchor = Path(cgroup_root).joinpath(*(s for s in segments if s))
+    try:
+        leaves = sorted(anchor.glob(_DF_LEAF_GLOB))
+        if not leaves:
+            leaves = sorted(anchor.glob(_ORCHESTRATOR_LEAF_GLOB))
+    except OSError:
+        logger.warning('cgroup discovery failed under %s', anchor, exc_info=True)
+        return []
+    return [(leaf.name, leaf / 'cpu.pressure') for leaf in leaves]
 
 # ---------------------------------------------------------------------------
 # PSI helpers — parse_pressure_file/read_pressure are re-homed to shared.psi
