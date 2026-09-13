@@ -142,6 +142,30 @@ def worker_id(request) -> str:
 #: leak the pin exists to close.
 FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 
+#: The top-level fields ``FusedMemoryConfig`` exposes to the environment.
+#: DERIVED from the model, never listed by hand: a field added later is then
+#: covered with no edit here, which is the drift that let this leak class
+#: survive in one subproject after being fixed in the other.
+_FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
+
+
+def _reads_as_a_config_override(env_name):
+    """Whether pydantic-settings would read *env_name* as a config field.
+
+    ``env_prefix=''`` makes the WHOLE name a top-level field name, and
+    ``env_nested_delimiter='__'`` makes everything before the first ``__`` the
+    top-level field of a nested override.  Both are matched case-insensitively
+    because the model sets ``case_sensitive=False``.
+
+    Nothing else matches: ``PATH`` is not ``path_scope_adjudicator``, and
+    ``FOO__TASKMASTER`` has the head ``foo``.  That narrowness is deliberate —
+    unrelated fixtures and the uv/venv machinery legitimately need the ambient
+    environment, so a blanket clear would trade one nondeterminism for a worse
+    one.
+    """
+    lowered = env_name.lower()
+    return lowered in _FM_CONFIG_FIELDS or lowered.split('__', 1)[0] in _FM_CONFIG_FIELDS
+
 
 @pytest.fixture(autouse=True)
 def _isolate_fm_config(monkeypatch):
@@ -182,8 +206,26 @@ def _isolate_fm_config(monkeypatch):
     owning ``CONFIG_PATH`` rather than two with no defined ordering between
     them.  A test that sets ``CONFIG_PATH`` itself still wins: a
     function-scoped ``monkeypatch.setenv`` in the test body runs after this
-    autouse fixture.
+    autouse fixture.  That same ordering is why the scrub below cannot — and
+    must not — stop a test setting ``SERVER__PORT`` deliberately; it removes
+    only what pytest INHERITED.
+
+    THE ENVIRONMENT HALF.  Pinning the file closes only half the leak.  The
+    model sets ``env_prefix=''``, so a bare ambient variable named after any
+    top-level field is an unprefixed override that outranks the YAML.
+    Measured: ``TASKMASTER='{"project_root": "/pwned-by-env"}'`` rewrites
+    ``config.taskmaster.project_root`` even with ``CONFIG_PATH`` pointing at a
+    missing file, so whatever the shell, the CI runner or a parent process
+    happens to export decides what a test reads.  The names are DERIVED from
+    the model rather than listed, mirroring
+    ``orchestrator/src/orchestrator/verify.py``'s reason for scrubbing the
+    whole ``ORCH_`` prefix: so a variable added later cannot reintroduce the
+    class.  The comprehension snapshots the names before the loop deletes any,
+    since mutating ``os.environ`` while iterating it raises.
     """
+    for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
+        monkeypatch.delenv(inherited, raising=False)
+
     monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
 
 
