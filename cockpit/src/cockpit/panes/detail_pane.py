@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 _NO_RESULT_FILE_PLACEHOLDER = '(no result file)'
 
+# Every optional id routes through this rather than being interpolated
+# possibly-None, so a missing id never surfaces as the literal 'None'
+# (fail-soft, PRD §2). Spelled to match
+# cockpit/src/cockpit/panes/decision_queue.py::_ID_PLACEHOLDER, so the pane
+# and the clipboard payload read the same for the same absent id.
+_ID_PLACEHOLDER = '(none)'
+
 
 def result_file_tail(result_file: str | None, max_lines: int = 20) -> str:
     """Return the last *max_lines* lines of *result_file*, fail-soft.
@@ -97,21 +104,23 @@ def render_decision_detail(
     lines = [
         f'decision_id: {decision.id}',
         f'project: {decision.project}',
-        f'task_id: {decision.task_id}',
-        f'escalation_id: {decision.escalation_id}',
+        f'task_id: {decision.task_id or _ID_PLACEHOLDER}',
+        f'escalation_id: {decision.escalation_id or _ID_PLACEHOLDER}',
         f'severity: {decision.severity}',
         f'state: {decision.state}',
         f'filed: {decision.filed_at} ({format_age(decision.filed_at, now)})',
         f'session: {_linked_session(decision.session_id, sessions)}',
-        f'question: {decision.text}',
     ]
+    if decision.options:
+        lines.append(f'options: {", ".join(decision.options)}')
+    lines.append(f'question: {decision.text}')
     return '\n'.join(lines)
 
 
 def _linked_session(session_id: str | None, sessions: Sequence[SessionRecord]) -> str:
     """Render *session_id* as a linked-session value -- see render_decision_detail."""
     if not session_id:
-        return '(none)'
+        return _ID_PLACEHOLDER
     session = next((s for s in sessions if s.session_slug == session_id), None)
     if session is None:
         return f'{session_id} (unresolved)'
