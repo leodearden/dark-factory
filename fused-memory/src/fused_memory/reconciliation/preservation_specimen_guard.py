@@ -447,11 +447,48 @@ def _first_citation(
     return None
 
 
+def _is_degraded_entity_result(entity: Any) -> bool:
+    """Return True iff *entity* is ``get_entity``'s degraded-fallback result.
+
+    ``services/memory_service.py::_degrade_or_reraise`` does NOT re-raise a
+    rate-limit/quota error: it returns
+    ``{'nodes': [], 'edges': [], 'degraded': True, 'failed_stores': [...]}``.
+    So that outcome arrives through the SUCCESS path, carrying collections
+    byte-identical to a genuine "this task has no preservation fact" — which is
+    why the Graphiti channel needs this screen in ADDITION to its ``except``.
+
+    Either marker alone suffices.  The two keys are written together today, so
+    demanding both would make the verdict depend on a coincidence of the
+    producer rather than on what either key means.  ``failed_stores`` counts
+    only when it is a NON-EMPTY list/tuple: the empty list is what a healthy
+    result carries, and treating it as degradation would report every clean
+    cycle as unreadable.
+
+    Sniffs dict KEYS, not attributes: ``get_entity``'s degraded dict and
+    ``search()``'s attribute-carrying ``SearchResults`` are deliberately
+    different shapes (``_graphiti_degraded_entity_result``'s own docstring).
+
+    Total over malformed input — every value here comes off a raw backend read.
+    Pure, sync, no I/O.
+    """
+    if not isinstance(entity, dict):
+        return False
+    if entity.get('degraded') is True:
+        return True
+    failed_stores = entity.get('failed_stores')
+    return isinstance(failed_stores, (list, tuple)) and bool(failed_stores)
+
+
 def _graphiti_citation(entity: Any) -> str | None:
     """Return the uuid of the first edge fact / node summary citing preservation.
 
     Consults :data:`_GRAPHITI_CITATION_SOURCES` in order.  ``None`` for a
     non-mapping result, a missing collection, or no match.  Pure, sync, no I/O.
+
+    Requires :func:`_is_degraded_entity_result` as a pre-screen: this matcher
+    cannot tell a degraded read from an empty graph, so calling it on an
+    unscreened ``get_entity`` result silently converts a Graphiti outage into a
+    "no citation" verdict.
     """
     if not isinstance(entity, dict):
         return None
@@ -512,6 +549,17 @@ async def _corroborate_preservation(
     channel, and marks the verdict ``degraded`` — it is NEVER counted as
     evidence either way.  ``asyncio.CancelledError``/``KeyboardInterrupt``/
     ``SystemExit`` propagate unchanged: a shutdown is not a backend blip.
+
+    ``try``/``except`` is NOT full coverage of channel 2.  ``get_entity`` has
+    THREE outcomes: it can answer, it can raise, and on a rate-limit/quota
+    error it can ABSORB the failure and return the degraded superset dict
+    (``memory_service.py::_degrade_or_reraise``).  That third outcome arrives
+    through the success path with empty ``nodes``/``edges``, so left unscreened
+    it would read as a clean "this task has no preservation fact" and the
+    specimen would go unprotected on a cycle reported as fully resolved.  The
+    success path is therefore screened by :func:`_is_degraded_entity_result`
+    as well, BEFORE the citation matcher runs — a read that failed is not
+    evidence in either direction.
     """
     degraded = False
 
@@ -551,6 +599,14 @@ async def _corroborate_preservation(
             'preservation_specimen_guard: graphiti corroboration read failed for '
             'task %s in project %s — verdict unresolved, flag kept',
             task_id, project_id, exc_info=True,
+        )
+        return _Corroboration(citation=None, degraded=True)
+
+    if _is_degraded_entity_result(entity):
+        log.warning(
+            'preservation_specimen_guard: graphiti corroboration read degraded for '
+            'task %s in project %s — verdict unresolved, flag kept',
+            task_id, project_id,
         )
         return _Corroboration(citation=None, degraded=True)
 
