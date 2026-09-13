@@ -2071,12 +2071,44 @@ class TestCheckCli:
         assert 'lines' in err
 
     def test_check_is_clean_against_the_committed_baseline(
-        self, no_private_tree_scan: None, capsys: pytest.CaptureFixture[str]
+        self, stub_measurement: dict, no_private_tree_scan: None,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # No stub and no --baseline: the exact invocation the twenty downstream
-        # PRD tasks will run. RED until the baseline is generated and committed.
+        # No --baseline and no --root: the exact invocation the twenty
+        # downstream PRD tasks will run, end to end. What this still proves is
+        # the CLI's own half -- default root resolution, default baseline
+        # resolution, `load_baseline`, the comparator and the exit ladder --
+        # against the module's REAL live numbers, since `stub_measurement`
+        # hands back the live measurement rather than a fixture's.
+        #
+        # What moved elsewhere is the half this test used to re-prove: the
+        # MEASUREMENT is TestBuildReport's, and the live-tree-versus-committed-
+        # baseline RATCHET is test_merge_lane_ratchet_holds'. Both run against
+        # this same tree and this same baseline, so the second unstubbed
+        # `build_report` here bought nothing but 46.78s.
+        #
+        # The stub replaces `build_report` ONLY, so the baseline read is real
+        # -- which is what makes `no_private_tree_scan` a live check that the
+        # counter's `*.py` scoping does not count that .json.
         assert metrics.main(['--check']) == 0
         assert capsys.readouterr().err == ''
+
+    def test_check_hands_build_report_the_resolved_repo_root(
+        self, live_report: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The ONE seam `stub_measurement` stops witnessing above: that `main`
+        # threads its resolved `args.root` INTO build_report, since the stub
+        # ignores its argument. `test_root_defaults_to_the_repo_root` pins only
+        # the PARSER default, so without this the threading would be untested.
+        roots: list[Path] = []
+
+        def recording(root: Path) -> dict:
+            roots.append(root)
+            return copy.deepcopy(live_report)
+
+        monkeypatch.setattr(metrics, 'build_report', recording)
+        assert metrics.main(['--check']) == 0
+        assert [r.resolve() for r in roots] == [_REPO_ROOT.resolve()]
 
 
 class TestWriteBaselineCli:
