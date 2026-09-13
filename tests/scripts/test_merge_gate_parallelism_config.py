@@ -29,10 +29,22 @@ Citations are by ``path::symbol``, never file:line — the house style
 from __future__ import annotations
 
 import pathlib
+import re
 import shlex
 import tomllib
+from typing import TYPE_CHECKING
 
 import pytest
+
+# The shared verify/lint/type command parser. "IMPORT ME, DO NOT COPY ME" is its
+# own docstring's instruction, and it resolves by the conftest.py sys.path
+# insertion this directory relies on under --import-mode=importlib.
+import verify_command_invariants as vci
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from orchestrator.config import ModuleConfig
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -57,22 +69,41 @@ DIST_VALUE = 'loadgroup'
 COCKPIT_MARKER_EXPRESSION = 'not smoke'
 
 
-def _addopts(member: str) -> str:
-    """*member*'s declared ``[tool.pytest.ini_options].addopts``.
+def _pyproject(member: str) -> dict:
+    """*member*'s parsed ``pyproject.toml``.
 
     Read with ``tomllib`` from the file on disk rather than through the
-    orchestrator config loader, because addopts is pytest's OWN configuration:
-    it is what governs a bare ``cd <member> && uv run pytest tests/`` as well as
-    the verify leg, and no module config restates it.
+    orchestrator config loader, because neither addopts nor a dependency group
+    is orchestrator configuration: addopts is what governs a bare
+    ``cd <member> && uv run pytest tests/`` as much as the verify leg, and the
+    dependency group is what uv resolves the plugin from.
     """
     pyproject = REPO_ROOT / member / 'pyproject.toml'
     assert pyproject.is_file(), (
         f'{member}/pyproject.toml does not exist, so every assertion below '
         'would be about a file this repo does not have'
     )
-    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
-    ini_options = data.get('tool', {}).get('pytest', {}).get('ini_options', {})
-    addopts = ini_options.get('addopts', '')
+    return tomllib.loads(pyproject.read_text(encoding='utf-8'))
+
+
+def _declared_addopts(member: str) -> str:
+    """*member*'s ``[tool.pytest.ini_options].addopts``, ``''`` when it declares none.
+
+    NON-asserting, unlike :func:`_addopts`. The structural walk below reads
+    every discovered module, and a module that declares no addopts at all is a
+    legitimate answer there — it simply contributes no ``-n``.
+    """
+    ini_options = _pyproject(member).get('tool', {}).get('pytest', {}).get('ini_options', {})
+    return ini_options.get('addopts', '')
+
+
+def _addopts(member: str) -> str:
+    """*member*'s addopts, asserted PRESENT.
+
+    The asserting entry point, for the three members this file pins by name. A
+    missing addopts key there is the defect, not an absence to tolerate.
+    """
+    addopts = _declared_addopts(member)
     assert addopts, (
         f'{member}/pyproject.toml declares no '
         '[tool.pytest.ini_options].addopts, so its pytest leg runs '
@@ -216,4 +247,199 @@ def test_cockpit_addopts_keeps_its_smoke_deselection() -> None:
         'host DISPLAY and are opt-in only. Keep it a single flat `not X` term — '
         'test_pytest_workspace_collection.py::_FLAT_DESELECT_RE rejects any '
         'richer shape rather than approximating it'
+    )
+
+
+# ---------------------------------------------------------------------------
+# The internal-sense invariant: `-n` requires a DECLARED plugin (task 5408)
+# ---------------------------------------------------------------------------
+
+# The distribution that supplies `-n`, PEP 503-normalised for comparison.
+XDIST_DISTRIBUTION = 'pytest-xdist'
+
+# The dependency group uv installs by default, and so the only group in which a
+# declaration actually reaches the interpreter that runs the verify leg. Every
+# member of this workspace declares its test-time plugins here.
+DEFAULT_DEPENDENCY_GROUP = 'dev'
+
+# uv's member selectors, read from a command's PRE-anchor tokens only. The
+# pre/post split is exactly the category distinction `vci.anchor_split` records:
+# before the anchor `--project` selects the ENVIRONMENT the binary resolves
+# from, after it the identically spelled flag would redirect the CHECKER's own
+# config. Only POSITION tells the two apart.
+MEMBER_SELECTORS = ('--directory', '--project')
+
+_REQUIREMENT_NAME_RE = re.compile(r'^\s*([A-Za-z0-9._-]+)')
+
+
+def _canonical(name: str) -> str:
+    """*name* PEP 503-normalised, so ``pytest_xdist`` and ``PyTest-XDist`` compare equal."""
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def _dependency_group_requirements(member: str, group: str) -> set[str]:
+    """Canonical distribution names in *member*'s *group*, following ``include-group``.
+
+    ``include-group`` is resolved TRANSITIVELY rather than skipped, because
+    skipping it would make this a guard that passes vacuously the moment a
+    member factors its plugins into a base group — reporting a missing
+    declaration as present is the one failure mode a dependency check must not
+    have. Cycles are impossible to follow twice: a group already visited is not
+    re-entered.
+    """
+    groups = _pyproject(member).get('dependency-groups', {})
+    names: set[str] = set()
+    pending = [group]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for entry in groups.get(current, []):
+            if isinstance(entry, str):
+                matched = _REQUIREMENT_NAME_RE.match(entry)
+                if matched:
+                    names.add(_canonical(matched.group(1)))
+            elif isinstance(entry, dict) and 'include-group' in entry:
+                pending.append(entry['include-group'])
+    return names
+
+
+def _selected_member(pre_anchor_tokens: list[str]) -> str | None:
+    """The workspace member uv's PRE-anchor selector names, or ``None`` if there is none.
+
+    Both spellings, because ``--project shared`` and ``--project=shared`` are the
+    same uv invocation and a reader that recognises only one of them rejects a
+    correct command. Same both-spellings contract as
+    ``test_scripts_module_config.py::_uv_project_member``, which reads the same
+    slice for the same reason.
+
+    ``None`` covers a command with no selector at all — where uv resolves
+    against the workspace ROOT project, which declares no dependency groups, so
+    there is no member whose declaration could be asserted about.
+    """
+    for i, token in enumerate(pre_anchor_tokens):
+        for selector in MEMBER_SELECTORS:
+            if token == selector:
+                return pre_anchor_tokens[i + 1] if i + 1 < len(pre_anchor_tokens) else None
+            if token.startswith(selector + '='):
+                return token.split('=', 1)[1]
+    return None
+
+
+def _pytest_legs_carrying_workers(
+    module_configs: dict[str, ModuleConfig],
+) -> list[tuple[str, str, str]]:
+    """``(module prefix, selected member, where -n came from)`` for every parallel leg.
+
+    DERIVED STRUCTURALLY from the production config walk, never from a
+    hardcoded list: a tenth module config that declares ``-n`` must be caught by
+    this guard on the day it lands, not on the day someone remembers to extend a
+    table here.
+
+    ``-n`` can reach pytest from either of two places, and both count because
+    pytest cannot tell them apart:
+
+      * the command's own POST-anchor argv (how the ``scripts`` leg gets it, its
+        targets being repo-root paths under no member's pyproject.toml);
+      * the SELECTED member's own addopts (how the ``--directory <m>`` legs get
+        it).
+
+    Read no more strongly than it holds: the addopts consulted is the selected
+    member's, which for a ``--directory <m>`` command is also the rootdir
+    inifile pytest reads, but for a root-cwd ``--project <m>`` command is not.
+    In that second shape this can only ever require a declaration pytest would
+    not in fact have needed — over-requiring, never under-requiring — which is
+    the safe direction for a guard whose failure mode is a missing plugin.
+    """
+    legs: list[tuple[str, str, str]] = []
+    for prefix, module_config in sorted(module_configs.items()):
+        command = module_config.test_command
+        if not command:
+            continue
+        segment = vci.optional_token_segment(command, vci.PYTEST)
+        if segment is None:
+            # A module whose test_command runs something other than pytest
+            # contributes no pytest leg — the documented contract of
+            # `optional_token_segment`, and the correct semantic rather than an
+            # error (`verify._has_source_files` already keys on .rs as well).
+            continue
+        pre, post = vci.anchor_split(segment, vci.PYTEST, label=f'{prefix} test_command')
+        member = _selected_member(pre)
+        if member is None:
+            continue
+        sources = []
+        if WORKERS_FLAG in post:
+            sources.append(f'{prefix}/orchestrator.yaml::test_command argv')
+        if WORKERS_FLAG in shlex.split(_declared_addopts(member)):
+            sources.append(f'{member}/pyproject.toml addopts')
+        if sources:
+            legs.append((prefix, member, ' and '.join(sources)))
+    return legs
+
+
+def test_every_pytest_leg_running_workers_declares_the_plugin(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """A module config that runs ``-n`` must select a member that DECLARES pytest-xdist.
+
+    HEURISTIC 13 — a file has to make internal sense in isolation. A
+    ``pyproject.toml`` whose addopts says ``-n auto`` while its dependency
+    groups never mention the plugin that implements ``-n`` does not: read on its
+    own it describes a configuration that cannot run.
+
+    AND IT IS NOT MERELY UNTIDY — MEASURED on the task-5408 tree. From a venv
+    lacking the plugin, ``uv run --directory dashboard python -c "import
+    xdist"`` raises ModuleNotFoundError; after ``uv sync --all-packages`` it
+    imports, and a later ``uv run --directory dashboard`` does not prune it. So
+    an undeclared ``-n`` works only by ACCIDENT of
+    ``verify_cold_preprovision_command``'s ``uv sync --all-packages`` dragging
+    ANOTHER member's dev dependency into the one shared root ``.venv`` — the
+    identical accident ``dark-factory-orchestrator.yaml`` already records for
+    psutil/sampler. Lose that sync order and pytest exits 4 with
+    ``unrecognized arguments: -n``: a latent red for every warm worktree, agent
+    shell and contributor following CONTRIBUTING.md.
+
+    THE MEMBER ASSERTED ABOUT is the one uv's PRE-anchor selector names, because
+    that is the environment the plugin has to be installed into — not whichever
+    module config happens to declare the command. For the ``scripts`` leg those
+    differ: it selects ``shared``.
+    """
+    legs = _pytest_legs_carrying_workers(discover_module_configs())
+    assert legs, (
+        f'no discovered module config runs pytest with {WORKERS_FLAG} at all, so '
+        'this guard has nothing to check and would pass vacuously. At least '
+        'orchestrator and fused-memory have carried it in their addopts since '
+        'before task 5408 — a zero here means the walk stopped seeing the real '
+        'commands, not that the repo went serial'
+    )
+
+    undeclared = [
+        (prefix, member, source)
+        for prefix, member, source in legs
+        if XDIST_DISTRIBUTION
+        not in _dependency_group_requirements(member, DEFAULT_DEPENDENCY_GROUP)
+    ]
+    assert not undeclared, (
+        'these pytest legs run with '
+        f'{WORKERS_FLAG} while the member their uv selector names declares no '
+        f'{XDIST_DISTRIBUTION} in its [dependency-groups] '
+        f'{DEFAULT_DEPENDENCY_GROUP} group (task 5408):\n'
+        + '\n'.join(
+            f'  - module {prefix!r} selects member {member!r}; {WORKERS_FLAG} '
+            f'comes from {source}'
+            for prefix, member, source in undeclared
+        )
+        + f'\nAdd "{XDIST_DISTRIBUTION}>=3.5.0" to that member\'s '
+        f'{DEFAULT_DEPENDENCY_GROUP} group and re-run a plain `uv lock`. '
+        'Without the declaration the flag works only by ACCIDENT of '
+        'verify_cold_preprovision_command\'s `uv sync --all-packages` pulling '
+        'another member\'s dev dependency into the single root .venv — measured '
+        'on the 5408 tree, from a venv lacking it `uv run --directory dashboard '
+        'python -c "import xdist"` raises ModuleNotFoundError, and pytest then '
+        f'exits 4 with `unrecognized arguments: {WORKERS_FLAG}`. '
+        f'{DEFAULT_DEPENDENCY_GROUP} specifically: it is the group uv installs '
+        'by default, so a declaration parked anywhere else never reaches the '
+        'interpreter that runs the leg'
     )
