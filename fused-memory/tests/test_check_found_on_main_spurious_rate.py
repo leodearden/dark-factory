@@ -1086,11 +1086,82 @@ class TestMainMalformedSinceExitCode:
 
 
 # ===========================================================================
-# main()'s ValueError->exit-2 mapping is scoped tightly around parse_since
-# only — a ValueError raised later (inside _run(), e.g. from
-# build_audit_report) must propagate uncaught, never get mislabeled as an
-# "invalid --since" usage error just because it shares the same exception
-# type. Regression guard for reviewer suggestion #1.
+# main() — a mis-targeted task store maps to reserved exit 3, never the
+# business-logic 0/1 (see module docstring "Contract").
+# ===========================================================================
+
+class TestMainTargetStoreMissingExitCode:
+    def _argv(self, monkeypatch, project_root, *, since='2026-07-16T00:00:00Z'):
+        monkeypatch.setattr(
+            sys, 'argv',
+            [
+                'check_found_on_main_spurious_rate.py',
+                '--since', since,
+                '--project-root', str(project_root),
+            ],
+        )
+
+    def _patch(self, monkeypatch, config=_FakeFusedMemoryConfigWithTaskmaster):
+        _install_fake_audit_module(monkeypatch, _report([]))
+        monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', config)
+        _install_fake_backend(monkeypatch, [])
+
+    def test_missing_task_store_exits_three(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch)
+        self._argv(monkeypatch, tmp_path)
+
+        assert _mod.main() == 3
+
+    def test_missing_task_store_exits_neither_zero_nor_one(self, tmp_path, monkeypatch):
+        """The property that matters, pinned separately from the literal code.
+
+        Exit 0 would be the false all-clear this guard exists to kill. Exit 1
+        already means BOTH "gating offenders found" and "task backend not
+        configured", so a refusal landing there is indistinguishable from a
+        genuine finding under an exit-code-only contract.
+        """
+        self._patch(monkeypatch)
+        self._argv(monkeypatch, tmp_path)
+
+        assert _mod.main() not in (0, 1)
+
+    def test_refusal_message_reaches_stderr(self, tmp_path, monkeypatch, capsys):
+        """The operator gets the diagnosis, not a bare number — and it lands
+        on stderr, so it can never be read as the trailing JSON verdict."""
+        self._patch(monkeypatch)
+        self._argv(monkeypatch, tmp_path)
+
+        _mod.main()
+
+        captured = capsys.readouterr()
+        assert str(tmp_path.resolve()) in captured.err
+        assert 'tasks.db' in captured.err
+        assert '--project-root' in captured.err
+
+    def test_missing_store_outranks_unconfigured_taskmaster(self, tmp_path, monkeypatch):
+        """Pins _run()'s ordering from the outside: the guard runs before the
+        config load, so a mis-target is never reported as the coarse infra-1."""
+        self._patch(monkeypatch, config=_FakeFusedMemoryConfigWithoutTaskmaster)
+        self._argv(monkeypatch, tmp_path)
+
+        assert _mod.main() == 3
+
+    def test_malformed_since_still_outranks_the_store_guard(self, tmp_path, monkeypatch):
+        """main() parses --since before _run() is reached, so the usage error
+        stays on top of the ladder even when the store is also absent."""
+        self._patch(monkeypatch)
+        self._argv(monkeypatch, tmp_path, since='not-a-date')
+
+        assert _mod.main() == 2
+
+
+# ===========================================================================
+# Both of main()'s exception->exit-code mappings are scoped tightly: each
+# catches ONE exception type around ONE call, so an unrelated failure of the
+# same type raised later (inside _run(), e.g. from build_audit_report) must
+# propagate uncaught rather than be mislabeled as the usage error that
+# mapping names. ValueError->2 is the parse_since case (regression guard for
+# reviewer suggestion #1); TargetStoreMissing->3 is the store-guard case.
 # ===========================================================================
 
 class TestMainScopedValueErrorHandling:
@@ -1127,6 +1198,41 @@ class TestMainScopedValueErrorHandling:
         # The backend's try/finally close() still runs even though the
         # exception propagates past it.
         assert backend_holder['backend'].closed is True
+
+    def test_internal_runtimeerror_propagates_uncaught_not_mapped_to_exit_3(
+        self, monkeypatch, project_root,
+    ):
+        """The same guarantee for the TargetStoreMissing->exit-3 catch.
+
+        TargetStoreMissing subclasses RuntimeError, so the way that catch
+        could go over-broad is by widening to `except RuntimeError` — which
+        would swallow an unrelated internal failure into a "mis-targeted
+        store" verdict. The store is PRESENT here, so the preflight passes
+        and the RuntimeError can only have come from inside _run().
+        """
+        async def _raise_unrelated_runtimeerror(tasks, git, ref='main'):
+            raise RuntimeError('boom: internal failure unrelated to the store')
+
+        fake_mod = types.ModuleType('audit_found_on_main_provenance')
+        fake_mod.build_audit_report = _raise_unrelated_runtimeerror  # type: ignore[attr-defined]
+        fake_mod.GitFacts = _FakeGitFacts  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, 'audit_found_on_main_provenance', fake_mod)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, [])
+        monkeypatch.setattr(
+            sys, 'argv',
+            [
+                'check_found_on_main_spurious_rate.py',
+                '--since', '2026-07-16T00:00:00Z',
+                '--project-root', str(project_root),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match='boom: internal failure'):
+            _mod.main()
 
 
 # ===========================================================================
