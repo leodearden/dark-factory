@@ -694,3 +694,104 @@ class TestDiscoverPressureCgroups:
         assert own.path == tree.own_cgroup_path
         assert own.pressure_path is not None
         assert own.pressure_path.read_text().startswith('some avg10=')
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-3: collect_load_metrics — the runqueue half (PRD detail A)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectLoadMetricsRunqueue:
+    """After D1, runqueue_ratio is the only LIVE CPU arm.
+
+    So an unreadable /proc/stat must leave a counter behind rather than
+    silently making the arm inert: ``runqueue_read_ok`` is always emitted, and
+    ``runqueue_ratio`` is emitted only when the read actually succeeded.
+    """
+
+    @staticmethod
+    def _reader(reading):
+        def read_runqueue(**_kwargs):
+            return reading
+        return read_runqueue
+
+    def test_healthy_read_emits_ratio_and_ok(self, tmp_path):
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(2.75, True)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        assert result['runqueue_ratio'] == pytest.approx(2.75)
+        assert result['runqueue_read_ok'] == 1.0
+
+    def test_failed_read_emits_ok_zero_and_no_ratio(self, tmp_path):
+        """α degrades to RunqueueReading(0.0, False) — a value, not a reading.
+
+        Persisting that 0.0 under ``runqueue_ratio`` would put a fabricated
+        "completely idle host" row in the corpus ε1/ε2 calibrate against, which
+        is the defect class task 1817 fixed in this module. The read_ok row
+        alone carries the failure.
+        """
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(0.0, False)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        assert result['runqueue_read_ok'] == 0.0
+        assert 'runqueue_ratio' not in result
+
+    def test_a_genuine_zero_ratio_is_still_recorded(self, tmp_path):
+        """A real 0.0 reading is distinguishable from a failed one: read_ok=1."""
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(0.0, True)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        assert result['runqueue_ratio'] == 0.0
+        assert result['runqueue_read_ok'] == 1.0
+
+    @pytest.mark.parametrize('read_ok', [True, False])
+    def test_every_value_is_a_float(self, tmp_path, read_ok):
+        """The store's value column is REAL, so a bool read_ok must not leak."""
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(1.25, read_ok)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        for key, value in result.items():
+            assert type(value) is float, f'{key} is {type(value).__name__}: {value!r}'
+
+    def test_default_reader_is_alphas_read_runqueue_ratio(self):
+        """No /proc/stat reading of our own — α owns that reader (INV-5)."""
+        import inspect
+
+        import shared.psi
+
+        from sampler.metrics import collect_load_metrics
+
+        sig = inspect.signature(collect_load_metrics)
+        assert sig.parameters['read_runqueue'].default is shared.psi.read_runqueue_ratio
