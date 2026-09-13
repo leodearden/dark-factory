@@ -43,6 +43,7 @@ explicit ``@pytest.mark.asyncio``.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -62,6 +63,22 @@ FRESH = 'fresh-uuid-never-stored'
 # grepping FalkorDB for the graph key.
 GROUP = 'grp-3568'
 CANONICAL_GROUP = 'grp_3568'
+
+
+def _discard_warnings(caplog) -> list[str]:
+    """WARNINGs about a discarded episode body, by the fact they state.
+
+    Selected on 'content' + 'stored' rather than on record count, so an
+    unrelated warning from elsewhere in the backend cannot make a
+    no-warning assertion fail for the wrong reason.
+    """
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and 'content' in r.getMessage().lower()
+        and 'stored' in r.getMessage().lower()
+    ]
 
 
 @pytest.fixture
@@ -209,4 +226,105 @@ class TestGuardFailsOpen:
         assert not isinstance(caught.value, graphiti_client.NodeNotFoundError), (
             f'Nothing on the uuid=None production path may be reinterpreted '
             f'by this guard; got {str(caught.value)!r}.'
+        )
+
+
+class TestResolvingUuidDiscardsContentLoudly:
+    """The same misconception, with the strictly worse outcome.
+
+    When the uuid DOES resolve there is no error at all: graphiti_core adopts
+    the STORED node and the ``content`` just handed to it never lands (task
+    3561's TRAP 1).  A caller who passes both ``content`` and a resolving
+    ``uuid=`` holds exactly the create-with-this-id misconception this module
+    exists to correct — so instead of a cryptic error they get silent data
+    loss.  That must be loud, but a WARNING rather than a raise: naming an
+    already-stored episode is the parameter's one legitimate documented use.
+    """
+
+    @staticmethod
+    async def _mint(backend) -> str:
+        """A resolvable uuid, obtained through the fake's own create path.
+
+        Minting it rather than reaching into ``fake.episodes`` keeps the test
+        honest: the uuid it later passes is one production really could hold.
+        """
+        result = await backend.add_episode(
+            name='n', content='original text', group_id=GROUP
+        )
+        return result.episode.uuid
+
+    @pytest.mark.asyncio
+    async def test_resolving_uuid_returns_the_stored_episode_not_the_passed_content(
+        self, backend_and_fake
+    ):
+        backend, fake = backend_and_fake
+        stored_uuid = await self._mint(backend)
+
+        result = await backend.add_episode(
+            name='n', content='replacement text', group_id=GROUP, uuid=stored_uuid
+        )
+
+        # The pass-through is intact — the uuid really does reach upstream.
+        assert fake.calls[-1]['uuid'] == stored_uuid
+        # ...and upstream really did discard the caller's content. This
+        # characterises the upstream behaviour, so the warning below is
+        # provably about something real rather than hypothetical.
+        assert result.episode.content == 'original text', (
+            f'Expected upstream to adopt the STORED episode body; got '
+            f'{result.episode.content!r}.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_warning_names_the_uuid_and_the_discarded_content(
+        self, backend_and_fake, caplog
+    ):
+        backend, _fake = backend_and_fake
+        stored_uuid = await self._mint(backend)
+
+        with caplog.at_level(logging.WARNING, logger=graphiti_client.logger.name):
+            await backend.add_episode(
+                name='n', content='replacement text', group_id=GROUP, uuid=stored_uuid
+            )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        matching = [r for r in warnings if stored_uuid in r.getMessage()]
+        assert matching, (
+            f'A resolving uuid= silently discards content — that must warn, '
+            f'naming the uuid. Warnings seen: {[r.getMessage() for r in warnings]}.'
+        )
+        message = matching[0].getMessage().lower()
+        assert 'content' in message, (
+            f'The warning must name what was lost; got {matching[0].getMessage()!r}.'
+        )
+        assert 'not' in message and 'stored' in message, (
+            f'The warning must say the content was NOT stored; got '
+            f'{matching[0].getMessage()!r}.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_uuid_is_none(self, backend_and_fake, caplog):
+        backend, _fake = backend_and_fake
+
+        with caplog.at_level(logging.WARNING, logger=graphiti_client.logger.name):
+            await backend.add_episode(name='n', content='c', group_id=GROUP)
+
+        assert not _discard_warnings(caplog), (
+            f'The uuid=None production path must gain no log noise; got '
+            f'{_discard_warnings(caplog)}.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_no_content_was_offered(self, backend_and_fake, caplog):
+        backend, _fake = backend_and_fake
+        stored_uuid = await self._mint(backend)
+
+        with caplog.at_level(logging.WARNING, logger=graphiti_client.logger.name):
+            await backend.add_episode(
+                name='n', content='', group_id=GROUP, uuid=stored_uuid
+            )
+
+        # A caller offering nothing to store is not making the
+        # create-with-this-id mistake, so there is nothing to warn about.
+        assert not _discard_warnings(caplog), (
+            f'An empty content= must not be nagged; got {_discard_warnings(caplog)}.'
         )
