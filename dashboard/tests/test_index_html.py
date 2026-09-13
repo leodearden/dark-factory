@@ -817,7 +817,7 @@ def test_endpoint_staleness_js_loads_before_app_jsx(index_html_body: str) -> Non
     closes: the 2026-08-27 wedge ran 19.8h with the UI showing stale numbers
     and saying nothing about it.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _ENDPOINT_STALENESS_PREFIX,
         _APP_JSX_PREFIX,
