@@ -56,6 +56,29 @@ Usage
   # Audit lineage against a ref other than main.
   python scripts/audit_found_on_main_provenance.py --project-root /path/to/project \\
       --ref origin/main
+
+WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
+-------------------------------------------------------------
+:func:`_run` refuses, before it constructs a backend, unless ``--project-root``
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists.  A task
+worktree has none, and merely reaching ``get_tasks`` would create one empty and
+print a clean, empty report -- indistinguishable from a project with nothing
+flagged.
+
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
+
+THE WRAPPER DOES NOT INHERIT THIS (measured, task 4319).
+``scripts/check_found_on_main_spurious_rate.py::_run`` does NOT invoke
+:func:`_run` and never reads its ``--fail-on-findings`` 0/1/2 ladder: it
+imports :func:`build_audit_report` and constructs its OWN ``SqliteTaskBackend``,
+calling ``get_tasks(args.project_root)`` directly.  So that predicate -- whose
+exit 0 means "check passed" -- remains exposed to the same false all-clear this
+guard closes here.  Covering it was outside task 4319's lock scope and is filed
+as follow-up; do not read the guard below as protecting it.
+
 """
 
 from __future__ import annotations
@@ -71,6 +94,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from shared.task_metadata import parse_metadata
+
+from fused_memory.utils.target_store_preflight import assert_task_store_exists
 
 logger = logging.getLogger('audit_found_on_main_provenance')
 
@@ -924,6 +949,8 @@ async def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
+
+    assert_task_store_exists(args.project_root, operation='audit_found_on_main_provenance')
 
     import os  # noqa: PLC0415
 

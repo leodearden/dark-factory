@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from fused_memory.utils.target_store_preflight import TargetStoreMissing
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_found_on_main_provenance.py'
 
 
@@ -1992,3 +1994,139 @@ class TestHasFlaggedFindings:
         flagged' rather than raising — this is a defensive CLI-exit-code
         helper, not a data-integrity check."""
         assert _has_flagged_findings({}) is False
+
+
+# ---------------------------------------------------------------------------
+# TestRunTargetStorePreflight
+# ---------------------------------------------------------------------------
+
+class _RecordingBackendFactory:
+    """Stand-in for SqliteTaskBackend that RECORDS every construction.
+
+    Doubles as the "guard fired before the backend existed" probe: reaching
+    ``get_tasks`` is precisely what auto-creates the empty tasks.db, so a
+    refusal that happens after construction has already lost.
+    """
+
+    def __init__(self):
+        self.constructions: list[object] = []
+
+    def __call__(self, taskmaster_config=None, **kwargs):  # noqa: ARG002
+        self.constructions.append(taskmaster_config)
+        return _FakeRunBackend()
+
+
+class _FakeRunBackend(FakeAuditBackend):
+    """Extends FakeAuditBackend with the start/close/get_tasks surface
+    ``_run()`` drives directly."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.started = False
+        self.closed = False
+        self.get_tasks_calls: list[str] = []
+
+    async def start(self):
+        self.started = True
+
+    async def close(self):
+        self.closed = True
+
+    async def get_tasks(self, project_root):
+        self.get_tasks_calls.append(project_root)
+        return {'tasks': []}
+
+
+class _FakeFusedMemoryConfigWithTaskmaster:
+    """Fake FusedMemoryConfig() whose .taskmaster is configured (non-None),
+    so ``_run()`` proceeds past its early-return guard.  ``_run()`` only ever
+    checks ``config.taskmaster is None``, never inspects its fields."""
+
+    def __init__(self, *args, **kwargs):
+        self.taskmaster = object()
+
+
+def _run_args(
+    project_root: Path, *, apply: bool = False, fail_on_findings: bool = False,
+) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        project='dark_factory',
+        project_root=str(project_root),
+        config=None,
+        ref='main',
+        apply=apply,
+        fail_on_findings=fail_on_findings,
+    )
+
+
+@pytest.mark.asyncio
+class TestRunTargetStorePreflight:
+    """The target-store refusal (task 4319) — the first ``_run()`` tests here.
+
+    ``SqliteTaskBackend.get_tasks`` auto-creates ``.taskmaster/tasks/tasks.db``
+    and returns ``{"tasks": []}`` for ANY ``--project-root``, never raising.
+    ``.taskmaster/`` is neither present in nor tracked by a task worktree, so
+    without this guard a worktree path yields an empty task tree, a clean
+    report and exit 0 — a false all-clear.
+
+    ``_run()`` imports the backend and config FUNCTION-LOCALLY, so these
+    monkeypatch the SOURCE module paths; patching an attribute on the script
+    module would have no effect.
+    """
+
+    def _patch(self, monkeypatch) -> _RecordingBackendFactory:
+        factory = _RecordingBackendFactory()
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', factory,
+        )
+        return factory
+
+    @pytest.mark.parametrize('apply', [False, True])
+    async def test_refuses_a_missing_task_store(self, tmp_path, monkeypatch, apply):
+        factory = self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_run_args(tmp_path, apply=apply))
+
+        assert factory.constructions == []
+
+    async def test_refusal_leaves_the_db_absent(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_run_args(tmp_path))
+
+        assert not (tmp_path / '.taskmaster').exists()
+
+    @pytest.mark.parametrize('fail_on_findings', [False, True])
+    async def test_refusal_is_not_one_of_the_fail_on_findings_exit_codes(
+        self, tmp_path, monkeypatch, fail_on_findings,
+    ):
+        """A refusal is an exception, never 0 / 1 / 2.
+
+        ``--fail-on-findings`` exists so a clean exit only ever means "nothing
+        flagged", and ``scripts/check_found_on_main_spurious_rate.py`` wraps
+        this script as a CI predicate reading that ladder. The guard must not
+        be confusable with "clean report" (0) or "findings present" (2).
+        """
+        self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(
+                _run_args(tmp_path, fail_on_findings=fail_on_findings),
+            )
+
+    async def test_proceeds_when_the_db_exists(self, tmp_path, monkeypatch):
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True)
+        db.touch()
+        factory = self._patch(monkeypatch)
+
+        exit_code = await _mod._run(_run_args(tmp_path))
+
+        assert exit_code == 0
+        assert len(factory.constructions) == 1
