@@ -250,9 +250,11 @@ def stub_mcp_fanout_probe(monkeypatch):
       On a developer machine that server is frequently RUNNING, so without this
       the module's assertions would depend on live infrastructure.
     * SEMANTICS — a cold probe against a tmp_path project root cannot complete
-      inside ``_MCP_PROBE_TIMEOUT``, so it would report 'timeout' and flip every
-      one of this module's 200-expecting cases to 503 for a reason that has
-      nothing to do with what they test.
+      inside ``_MCP_PROBE_TIMEOUT``, so every case here would exercise the
+      probe's cold path (``'probing'`` until its background fetch is older than
+      ``_MCP_PROBE_OUTSTANDING_LIMIT``, then ``'timeout'``) rather than the
+      deadline arithmetic these tests are about — and the later cases would
+      flip to 503 for a reason that has nothing to do with what they test.
     """
     async def _ok(_client, _config, _budget):
         return 'ok'
