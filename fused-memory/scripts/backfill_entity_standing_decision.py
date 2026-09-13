@@ -219,3 +219,111 @@ def select_evidence_only_targets(
         and record['metadata'].get('kind') in DEMOTED_AD_HOC_KINDS
         and record['metadata'].get('entity_uuid') == entity_uuid
     )
+
+
+#: Evidence-ref types. β's ``resolve_evidence_refs`` treats ``'mem0'`` as the
+#: one locally-resolvable type and stamps every other type
+#: ``locally_resolved=False`` without a lookup.
+EVIDENCE_TYPE_MEM0 = 'mem0'
+EVIDENCE_TYPE_ESCALATION = 'escalation'
+
+
+def build_evidence_refs(stamp_ids: list[str], entity_uuid: str) -> list[dict[str, str]]:
+    """Assemble the row's cited provenance: bare ``{type, id}`` refs.
+
+    Deliberately resolves NOTHING. β's ``resolve_evidence_refs`` is what stamps
+    ``locally_resolved`` (mem0 refs looked up against this project, foreign refs
+    marked ``False`` without a lookup), and it does so exactly once for both the
+    gate and the row payload. A builder that pre-stamped resolution would be a
+    second opinion about whether an id exists — one formed without touching the
+    store (INV-5).
+
+    The SOURCE record leads, so the row's provenance reads as "this record,
+    plus its corroboration" rather than an unordered bag. The remaining stamp
+    targets follow in their (sorted) selection order, then the pinned
+    human-authored records, then the opening escalation.
+
+    :data:`HUMAN_EVIDENCE_MEMORY_IDS` and :data:`ESCALATION_EVIDENCE_ID` are
+    cited unconditionally, including on an idempotent re-run that selects no
+    stamp targets at all: the row's provenance is a property of the decision,
+    not of how much work a previous run happened to leave undone.
+
+    Args:
+        stamp_ids: The evidence-only stamp targets from
+            :func:`select_evidence_only_targets`.
+        entity_uuid: The decided entity, naming which decision this provenance
+            belongs to. No ref embeds it: the ledger row carries the entity in
+            its own indexed column, which is the field γ/δ query on, so
+            repeating it inside a ref would be a second copy nothing reads.
+
+    Returns:
+        Bare refs in citation order, each id appearing exactly once.
+    """
+    del entity_uuid  # see Args — the row's own column is the entity's home.
+    ordered: list[str] = [SOURCE_MEMORY_ID, *stamp_ids, *HUMAN_EVIDENCE_MEMORY_IDS]
+    seen: set[str] = set()
+    refs: list[dict[str, str]] = []
+    for memory_id in ordered:
+        if memory_id in seen:
+            continue
+        seen.add(memory_id)
+        refs.append({'type': EVIDENCE_TYPE_MEM0, 'id': memory_id})
+    refs.append({'type': EVIDENCE_TYPE_ESCALATION, 'id': ESCALATION_EVIDENCE_ID})
+    return refs
+
+
+#: PRD Open Question 6, RESOLVED (plan design decision 1, recorded at this code
+#: site per the batch convention rather than by editing ``plans/``).
+#:
+#: The four keys the evidence-only stamp writes. ``x_`` is Tier-C: ``memory_
+#: metadata.classify_unknown_keys`` exempts the prefix, so the stamp adds no
+#: ``code=unknown_key`` census line — exactly the affordance
+#: ``docs/task-authoring.md`` §Tier-C points ad-hoc annotations at.
+EVIDENCE_ONLY_STATUS_KEY = 'x_standing_decision_status'
+EVIDENCE_ONLY_ENTITY_KEY = 'x_standing_decision_entity_uuid'
+EVIDENCE_ONLY_GROUNDS_KEY = 'x_standing_decision_grounds'
+EVIDENCE_ONLY_MIGRATED_AT_KEY = 'x_standing_decision_migrated_at'
+
+#: The value that marks a record superseded by a ledger row. An operator
+#: enumerates the whole demoted population with
+#: ``get_memories_by_metadata('reify', {EVIDENCE_ONLY_STATUS_KEY: this})``.
+EVIDENCE_ONLY_STATUS = 'evidence_only'
+
+
+def build_evidence_only_patch(
+    *, entity_uuid: str, grounds: str, migrated_at: str
+) -> dict[str, str]:
+    """Build the metadata patch that demotes one ad-hoc original to evidence.
+
+    FLAT SCALARS, not one nested dict, and that is the substance of Open
+    Question 6's resolution: Qdrant payload filters do exact-match on scalars,
+    so four flat keys leave the demoted population ENUMERABLE —
+    ``get_memories_by_metadata(PROJECT_ID, {EVIDENCE_ONLY_STATUS_KEY:
+    EVIDENCE_ONLY_STATUS})`` returns every record this migration touched, which
+    is the operator affordance the demotion exists to provide. A single nested
+    ``{'standing_decision': {...}}`` value would be unqueryable, and the stamp
+    would be legible only to a human reading one record at a time.
+
+    ``entity_uuid`` and ``grounds`` ride as SEPARATE fields rather than δ's
+    joined ``f'{uuid}:{grounds}'`` ``standing_decision_id``: structured data
+    instead of a meaningful string, and no second site re-deriving that join.
+
+    The patch is METADATA-ONLY and merge-mode at the call site, so the record's
+    content and its existing metadata survive untouched — the stamp is an
+    annotation, not a rewrite.
+
+    Args:
+        entity_uuid: The decided entity, from :func:`resolve_source_entity_uuid`.
+        grounds: The ledger row's grounds — :data:`GROUNDS`.
+        migrated_at: When this run wrote the row, ISO-8601 UTC. Echoed verbatim
+            so a reader can line the stamp up against the row's ``decided_at``.
+
+    Returns:
+        The four-key patch.
+    """
+    return {
+        EVIDENCE_ONLY_STATUS_KEY: EVIDENCE_ONLY_STATUS,
+        EVIDENCE_ONLY_ENTITY_KEY: entity_uuid,
+        EVIDENCE_ONLY_GROUNDS_KEY: grounds,
+        EVIDENCE_ONLY_MIGRATED_AT_KEY: migrated_at,
+    }
