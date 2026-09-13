@@ -306,11 +306,13 @@ tasks:
       was retired by task 5247, and the argument stands on the detectors that remain.'
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: set_task_claimant
-      paths:
-      - fused-memory/src/fused_memory/backends/sqlite_task_backend.py
-      expect: present
+      kind: manual
+      reason: which columns the claimant UPDATE names is a function-body property —
+        set_task_claimant assembles its column list at runtime, so there is no literal
+        list to match, and a grep for set_task_claimant in the writer's own file is
+        already satisfied by its `async def`. The contingent caller the check used to
+        ride on (scripts/) was retired by task 5247. Pinned by reading the body against
+        update_task, which always appends updated_at.
   - name: per-row-corroboration-before-each-write
     binding: capability→producer — INV-3; the aggregate holder intersection is NOT
       sufficient, because a done row can be reopened to in-progress with a fresh claimant
