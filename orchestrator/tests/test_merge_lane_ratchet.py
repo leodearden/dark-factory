@@ -651,6 +651,50 @@ class TestCognitiveComplexity:
         target.write_text(_TINY_SOURCE, encoding='utf-8')
         assert metrics.file_cognitive_total(target) == 6
 
+    def test_both_projections_come_from_one_complexipy_measurement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The file total and the per-function map are two VIEWS of one
+        # complexipy result, not two measurements. build_report asked each
+        # cluster path for both and so paid complexipy 44 times over 22 files;
+        # this counter is what forbids that shape from growing back.
+        #
+        # The counter RECORDS AND DELEGATES rather than stubbing, so the
+        # equalities below are still checked against a real measurement.
+        target = tmp_path / 'tiny.py'
+        target.write_text(_TINY_SOURCE, encoding='utf-8')
+        expected_total = int(metrics._file_complexity(target).complexity)
+        expected_per_function = metrics.cognitive_complexity(target)
+        # Anti-vacuity: a module measuring 0 with no functions would satisfy
+        # the equalities below while witnessing nothing.
+        assert expected_total > 0
+        assert expected_per_function
+
+        calls: list[Path] = []
+        original = metrics._file_complexity
+
+        def counting(path: Path):
+            calls.append(path)
+            return original(path)
+
+        monkeypatch.setattr(metrics, '_file_complexity', counting)
+        measures = metrics.file_cognitive_measures(target)
+
+        assert calls == [target], calls
+        assert measures.total == expected_total
+        assert measures.per_function == expected_per_function
+
+    def test_file_cognitive_measures_propagates_an_unmeasurable_file(
+        self, tmp_path: Path
+    ) -> None:
+        # INV-11's polarity must survive the restructure: a file the instrument
+        # cannot measure is the FINDING, never a silent 0 and never a skip.
+        target = tmp_path / 'broken.py'
+        target.write_text('def (:\n', encoding='utf-8')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.file_cognitive_measures(target)
+        assert 'broken.py' in str(excinfo.value)
+
     def test_missing_complexipy_raises_naming_the_tool(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
