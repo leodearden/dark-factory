@@ -20,21 +20,30 @@ they are what makes the kind half of the selection predicate load-bearing.
 
 from __future__ import annotations
 
+import json
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 from _fm_helpers import load_script_module
 
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
     classify_unknown_keys,
 )
+from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    STANDING_DECISION_TTL_DAYS,
     STATE_ACTIVE,
     STATE_EXPIRED,
     STATE_REVOKED,
+)
+from fused_memory.reconciliation.standing_decision_writer import (
+    EVIDENCE_TYPE_OPERATOR_AUTHORIZATION,
 )
 from fused_memory.utils.validation import is_full_uuid
 
@@ -469,3 +478,199 @@ class TestPlanBackfill:
     def test_an_invalid_source_stops_the_plan(self) -> None:
         with pytest.raises(_mod.BackfillSourceInvalid):
             _mod.plan_backfill(None, LIVE_ENTITY_SCROLL, None)
+
+
+# ---------------------------------------------------------------------------
+# run_backfill — the live legs, against a REAL ledger and a faked mem0
+# ---------------------------------------------------------------------------
+
+#: The edge count the faked graphiti reports. β samples it at decision time and
+#: ζ's growth sweep later compares against it, so the row must carry exactly
+#: what was sampled — not a default and not a recount.
+FAKE_EDGE_COUNT = 7
+
+
+@pytest_asyncio.fixture
+async def ledger(tmp_path):
+    """A REAL, function-scoped ``ReconLedgerStore`` on a fresh tmp db."""
+    store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+    await store.initialize()
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
+def _memory_service(ledger_obj, *, scroll: list[dict] | None = None):
+    """An AsyncMock mem0/graphiti façade with a REAL ledger mounted.
+
+    Serves the four reads/writes ``run_backfill`` and β make: the source
+    fetch, the entity scroll, the stamp write, and β's edge sample plus its
+    best-effort mem0 mirror.
+    """
+    service = AsyncMock()
+    service.recon_ledger = ledger_obj
+    service.get_memory_by_id = AsyncMock(return_value=SOURCE_RECORD)
+    service.get_memories_by_metadata = AsyncMock(
+        return_value=LIVE_ENTITY_SCROLL if scroll is None else scroll
+    )
+    service.update_memory = AsyncMock(
+        return_value={'status': 'updated', 'store': 'mem0'}
+    )
+    service.graphiti.get_valid_edges_for_node = AsyncMock(
+        return_value=[{'uuid': f'edge-{n}'} for n in range(FAKE_EDGE_COUNT)]
+    )
+    return service
+
+
+async def _rows(ledger_obj) -> list:
+    return await ledger_obj.list_entity_standing_decisions(_mod.PROJECT_ID)
+
+
+class TestRunBackfillDryRun:
+    """A dry run reads and decides everything, and writes nothing."""
+
+    @pytest.mark.asyncio
+    async def test_writes_no_ledger_row_and_stamps_nothing(self, ledger) -> None:
+        service = _memory_service(ledger)
+        await _mod.run_backfill(service, apply=False)
+        assert await _rows(ledger) == []
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_report_still_names_the_work_it_would_do(self, ledger) -> None:
+        service = _memory_service(ledger)
+        report = _mod.run_backfill(service, apply=False)
+        report = await report
+        assert report['apply'] is False
+        assert report['entity_uuid'] == ENTITY_UUID
+        assert report['ledger'] == 'would_write'
+        assert [row['memory_id'] for row in report['records']] == EXPECTED_STAMP_TARGETS
+        assert {row['outcome'] for row in report['records']} == {'would_stamp'}
+
+    @pytest.mark.asyncio
+    async def test_the_report_is_json_serializable(self, ledger) -> None:
+        report = await _mod.run_backfill(_memory_service(ledger), apply=False)
+        assert json.loads(json.dumps(report)) == report
+
+
+class TestRunBackfillApply:
+    """``--apply`` writes exactly one row, then stamps exactly two records."""
+
+    @pytest.mark.asyncio
+    async def test_writes_one_active_row_for_the_decided_entity(self, ledger) -> None:
+        await _mod.run_backfill(_memory_service(ledger), apply=True)
+        rows = await _rows(ledger)
+        assert len(rows) == 1
+        assert rows[0].state == STATE_ACTIVE
+        assert rows[0].entity_uuid == ENTITY_UUID
+        assert rows[0].flag_type == GROUNDS_STRUCTURAL_SIZE_CONFLATION
+
+    @pytest.mark.asyncio
+    async def test_the_row_carries_the_freshly_sampled_edge_count(self, ledger) -> None:
+        await _mod.run_backfill(_memory_service(ledger), apply=True)
+        payload = json.loads((await _rows(ledger))[0].payload_json)
+        assert payload['edge_count_at_decision'] == FAKE_EDGE_COUNT
+
+    @pytest.mark.asyncio
+    async def test_the_row_expires_after_the_shared_ttl(self, ledger) -> None:
+        await _mod.run_backfill(_memory_service(ledger), apply=True)
+        row = (await _rows(ledger))[0]
+        span = datetime.fromisoformat(row.expires_at) - datetime.fromisoformat(
+            row.created_at
+        )
+        assert span == timedelta(days=STANDING_DECISION_TTL_DAYS)
+
+    @pytest.mark.asyncio
+    async def test_the_row_cites_every_evidence_ref_plus_the_operator_bypass(
+        self, ledger
+    ) -> None:
+        await _mod.run_backfill(_memory_service(ledger), apply=True)
+        evidence = json.loads((await _rows(ledger))[0].payload_json)['evidence']
+        mem0_ids = {
+            ref['id'] for ref in evidence if ref['type'] == _mod.EVIDENCE_TYPE_MEM0
+        }
+        assert mem0_ids == {
+            SOURCE_ID,
+            CORRECTION_ID,
+            *_mod.HUMAN_EVIDENCE_MEMORY_IDS,
+        }
+        assert {
+            ref['type'] for ref in evidence
+        } >= {EVIDENCE_TYPE_OPERATOR_AUTHORIZATION}
+
+    @pytest.mark.asyncio
+    async def test_the_foreign_escalation_ref_is_not_locally_resolved(
+        self, ledger
+    ) -> None:
+        """β marks a non-mem0 ref unresolved WITHOUT a lookup — the escalation
+        queue is not this project's mem0 corpus."""
+        await _mod.run_backfill(_memory_service(ledger), apply=True)
+        evidence = json.loads((await _rows(ledger))[0].payload_json)['evidence']
+        escalation = [
+            ref for ref in evidence if ref['type'] == _mod.EVIDENCE_TYPE_ESCALATION
+        ]
+        assert escalation == [
+            {
+                'type': _mod.EVIDENCE_TYPE_ESCALATION,
+                'id': _mod.ESCALATION_EVIDENCE_ID,
+                'locally_resolved': False,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stamps_exactly_the_two_demoted_originals(self, ledger) -> None:
+        service = _memory_service(ledger)
+        await _mod.run_backfill(service, apply=True)
+        stamped = [
+            call.kwargs['memory_id'] for call in service.update_memory.await_args_list
+        ]
+        assert sorted(stamped) == EXPECTED_STAMP_TARGETS
+
+    @pytest.mark.asyncio
+    async def test_never_stamps_a_machine_read_or_off_entity_record(
+        self, ledger
+    ) -> None:
+        service = _memory_service(ledger)
+        await _mod.run_backfill(service, apply=True)
+        stamped = {
+            call.kwargs['memory_id'] for call in service.update_memory.await_args_list
+        }
+        assert not stamped & {
+            'aa46fbad-0c2e-4e7b-8a19-2f7d5b3c6e84',
+            'd79f6b28-4a13-45c9-b6e2-8c0f1a9d7e35',
+            OFF_ENTITY_CORRECTION_ID,
+        }
+
+    @pytest.mark.asyncio
+    async def test_each_stamp_is_a_metadata_only_merge_of_the_four_keys(
+        self, ledger
+    ) -> None:
+        service = _memory_service(ledger)
+        await _mod.run_backfill(service, apply=True)
+        for call in service.update_memory.await_args_list:
+            assert call.kwargs['metadata_mode'] == 'merge'
+            assert call.kwargs['project_id'] == _mod.PROJECT_ID
+            assert call.kwargs.get('content') is None
+            patch = call.kwargs['metadata_patch']
+            assert patch == _mod.build_evidence_only_patch(
+                entity_uuid=ENTITY_UUID,
+                grounds=_mod.GROUNDS,
+                migrated_at=patch[_mod.EVIDENCE_ONLY_MIGRATED_AT_KEY],
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_second_apply_run_is_a_no_op(self, ledger) -> None:
+        """Idempotence end-to-end: the second run sees its own row and its own
+        stamps, and does nothing."""
+        first = _memory_service(ledger)
+        await _mod.run_backfill(first, apply=True)
+
+        already_stamped = _scroll_with(*EXPECTED_STAMP_TARGETS)
+        second = _memory_service(ledger, scroll=already_stamped)
+        report = await _mod.run_backfill(second, apply=True)
+
+        assert len(await _rows(ledger)) == 1
+        second.update_memory.assert_not_awaited()
+        assert report['ledger'] == 'already_migrated'
+        assert report['records'] == []
