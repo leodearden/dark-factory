@@ -742,6 +742,63 @@ class TestAgeStateThreeState:
 
 
 # ---------------------------------------------------------------------------
+# task 5361 step-3: the gate never certifies FRESH without a parsed age
+# ---------------------------------------------------------------------------
+
+
+class TestFreshRequiresParsedAge:
+    """FRESH authorises unattended edits and merges to main.
+
+    A gate with that authority must not certify a proposal fresh when it cannot
+    determine the proposal's age at all — whatever the cause.  The positive
+    control is the load-bearing case here: without it, "fails closed" could be
+    satisfied by a gate that never returns FRESH at all.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def _check(self, entry, *, now):
+        from orchestrator.b3_gate import check_proposal
+        return check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=now,
+        )
+
+    def test_parsed_age_still_certifies_fresh(self):
+        """POSITIVE CONTROL — the gate is not made vacuous by the guard."""
+        from orchestrator.b3_gate import AGE_PARSED, FRESH
+        result = self._check(_LOW_RISK_ENTRY, now=self._NOW)
+        assert result['verdict'] == FRESH, result
+        assert result['age_state'] == AGE_PARSED, result
+
+    def test_unparseable_timestamp_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_UNPARSEABLE
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+        result = self._check(entry, now=self._NOW)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        reason = result['reason'].lower()
+        assert 'age' in reason, result['reason']
+        assert AGE_UNPARSEABLE in result['reason'], result['reason']
+
+    def test_absent_timestamp_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_ABSENT
+        entry = {**_LOW_RISK_ENTRY}
+        del entry['investigated_at']
+        result = self._check(entry, now=self._NOW)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_ABSENT, result
+        assert 'age' in result['reason'].lower(), result['reason']
+
+    def test_no_clock_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_NO_CLOCK
+        result = self._check(_LOW_RISK_ENTRY, now=None)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_NO_CLOCK, result
+        assert 'age' in result['reason'].lower(), result['reason']
+
+
+# ---------------------------------------------------------------------------
 # step-11: freshness P1/P2 against a REAL git fixture
 # ---------------------------------------------------------------------------
 
