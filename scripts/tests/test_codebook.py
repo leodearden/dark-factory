@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -781,6 +782,7 @@ _NO_CHANGES = {
     "candidates_applied": 0,
     "candidate_disposition_conflicts": 0,
     "corrections_applied": 0,
+    "correction_skipped": 0,
     "record_invalid": False,
 }
 
@@ -871,18 +873,125 @@ def test_apply_coding_record_correction_never_deletes_and_does_not_mutate_input(
     assert codebook == original
 
 
-def test_apply_coding_record_correction_re_apply_is_a_no_op():
+def test_apply_coding_record_correction_re_apply_is_a_no_op(caplog):
     """The whole correction — field writes AND provenance sighting — is gated
     by the one `session` dedup the match path already uses, so `apply` re-run
     over the same file (nightly, or to resolve a rebase) changes nothing."""
     codebook = _codebook_with_entry_a()
     record = _correction_record()
 
-    once, _ = mod.apply_coding_record(codebook, record)
-    twice, stats = mod.apply_coding_record(once, record)
+    with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
+        once, _ = mod.apply_coding_record(codebook, record)
+        twice, stats = mod.apply_coding_record(once, record)
 
     assert stats == _NO_CHANGES
     assert twice == once
+    # SILENT by design, and that is the whole point of the distinction: an
+    # already-merged record is the dedup doing its job. `correction_skipped`
+    # and its WARNING are reserved for the sibling-op collision below, where
+    # a correction genuinely failed to land.
+    assert caplog.records == []
+
+
+def _match_and_correction_record(entry_id="entry-a"):
+    """One record that both matches and corrects the same entry — the shape in
+    which the per-(session, entry) sighting dedup forces a choice between the
+    two ops."""
+    record = _correction_record(entry_id=entry_id)
+    record["matches"] = [
+        {
+            "entry_id": entry_id,
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+            "note": "the match's own note",
+        }
+    ]
+    return record
+
+
+def test_apply_coding_record_correction_outranks_a_sibling_match_on_one_entry():
+    """Both ops write at most one sighting per (session, entry), so a record
+    carrying both for one entry can land only one — and it must be the
+    correction: a match's sighting is one interchangeable observation, while
+    the correction is the only op that can withdraw a refuted framing."""
+    codebook = _codebook_with_entry_a()
+    record = _match_and_correction_record()
+    correction = record["corrections"][0]
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["title"] == correction["title"]
+    assert [s["note"] for s in entry["sightings"]] == [correction["note"]]
+    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_colliding_correction_is_counted_and_logged(caplog):
+    """Two corrections for one entry in one record collide on that same single
+    slot. The loser cannot land — but it must not be dropped SILENTLY, since a
+    vanished framing withdrawal is indistinguishable from a successful one in
+    the returned codebook."""
+    codebook = _codebook_with_entry_a()
+    record = _correction_record()
+    loser = copy.deepcopy(record["corrections"][0])
+    loser["title"] = "A second, conflicting retitle"
+    record["corrections"].append(loser)
+
+    with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
+        result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["title"] == record["corrections"][0]["title"]
+    assert stats == {**_NO_CHANGES, "corrections_applied": 1, "correction_skipped": 1}
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "entry-a" in message and record["session"] in message
+    assert mod.validate(result) == []
+
+
+# The never-clear guard's input grid. ("status", "empty") is absent by
+# construction: "" is not in STATUSES, so an emptied status never reaches the
+# truthiness guard — `validate_coding_record` rejects the whole record first,
+# which `_correction_with_an_empty_status` pins below.
+_UNSUPPLIED_FIELD_SPELLINGS = [
+    ("title", "empty"),
+    ("title", "omitted"),
+    ("cause", "empty"),
+    ("cause", "omitted"),
+    ("status", "omitted"),
+]
+
+
+@pytest.mark.parametrize(("field", "spelling"), _UNSUPPLIED_FIELD_SPELLINGS)
+def test_apply_coding_record_correction_never_clears_a_field(field, spelling):
+    """The never-delete boundary of the one op allowed to overwrite instead of
+    append: a field the correction does not actually supply — spelled `""` or
+    left out — keeps its pre-correction value, while the fields it does supply
+    are still written and the provenance sighting is still appended."""
+    codebook = _codebook_with_entry_a()
+    # entry-a carries no `cause` by default; a correction that omits one can
+    # only be shown to preserve it if there was something to preserve.
+    codebook["entries"][0]["cause"] = "The original, not-yet-refuted explanation."
+    before = copy.deepcopy(codebook["entries"][0])
+
+    record = _correction_record()
+    correction = record["corrections"][0]
+    if spelling == "empty":
+        correction[field] = ""
+    else:
+        del correction[field]
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry[field] == before[field]
+    for still_supplied in {"title", "cause", "status"} - {field}:
+        assert entry[still_supplied] == correction[still_supplied]
+    assert [s["note"] for s in entry["sightings"]] == [correction["note"]]
+    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
+    assert mod.validate(result) == []
 
 
 def test_apply_coding_record_correction_unknown_entry_id_is_skipped_and_counted():
@@ -925,13 +1034,36 @@ def _correction_without_its_required_note():
     return record
 
 
+def _correction_with_an_empty_note():
+    """`""` is a missing audit trail spelled differently: `_build_sighting`
+    emits `note` only when truthy, so an empty one would rewrite the entry's
+    framing and leave a bare sighting that says nothing about why."""
+    record = _correction_record()
+    record["corrections"][0]["note"] = ""
+    return record
+
+
+def _correction_with_an_empty_status():
+    """Unlike title/cause, an emptied `status` is not a silently-ignored
+    "field not supplied": "" is outside STATUSES, so the record is rejected
+    before the never-clear guard ever sees it."""
+    record = _correction_record()
+    record["corrections"][0]["status"] = ""
+    return record
+
+
 @pytest.mark.parametrize(
     "build_record",
-    [_correction_with_out_of_enum_status, _correction_without_its_required_note],
+    [
+        _correction_with_out_of_enum_status,
+        _correction_without_its_required_note,
+        _correction_with_an_empty_note,
+        _correction_with_an_empty_status,
+    ],
 )
 def test_apply_coding_record_invalid_correction_is_skipped_whole(build_record):
     """An entry's framing may never change without an audit trail, and never
-    into a status outside STATUSES. Both failures are caught by
+    into a status outside STATUSES. Every such failure is caught by
     `validate_coding_record`, which skips the record WHOLE — no partial field
     write survives."""
     codebook = _codebook_with_entry_a()
