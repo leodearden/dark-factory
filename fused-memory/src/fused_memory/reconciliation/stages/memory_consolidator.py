@@ -331,14 +331,16 @@ class MemoryConsolidator(BaseStage):
         # Same always-present contract for the orphaned-recon-escalation sweep
         # (task 3052).  Zeroed HERE, above the remediation early-return, so a
         # remediation pass — which never runs the sweep — still publishes the
-        # keys.  With all seven present a reader can distinguish a clean cycle
+        # keys.  With all eight present a reader can distinguish a clean cycle
         # that found nothing (scanned > 0, flags_emitted == 0, errors == 0)
-        # from a degraded one (errors > 0) and from a registry gap
-        # (unresolvable > 0), without a .get(..., 0) fallback.
+        # from a degraded one (errors > 0), from a registry gap
+        # (unresolvable > 0) and from a cross-tag id collision
+        # (ambiguous > 0), without a .get(..., 0) fallback.
         report.stats['orphaned_recon_escalations_scanned'] = 0
         report.stats['orphaned_recon_escalations_terminal'] = 0
         report.stats['orphaned_recon_escalations_missing'] = 0
         report.stats['orphaned_recon_escalations_live'] = 0
+        report.stats['orphaned_recon_escalations_ambiguous'] = 0
         report.stats['orphaned_recon_escalations_unresolvable'] = 0
         report.stats['orphaned_recon_escalations_errors'] = 0
         report.stats['orphaned_recon_escalations_flags_emitted'] = 0
@@ -594,6 +596,9 @@ class MemoryConsolidator(BaseStage):
                     'missing'
                 ]
                 report.stats['orphaned_recon_escalations_live'] = orphan_sweep['live']
+                report.stats['orphaned_recon_escalations_ambiguous'] = orphan_sweep[
+                    'ambiguous'
+                ]
                 report.stats['orphaned_recon_escalations_unresolvable'] = orphan_sweep[
                     'unresolvable'
                 ]

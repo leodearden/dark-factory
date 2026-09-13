@@ -2093,7 +2093,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
-            # report.stats never has to .get() them.  All seven stay 0 here —
+            # report.stats never has to .get() them.  All eight stay 0 here —
             # the orphaned-recon-escalation sweep is guarded on BOTH
             # _escalation_queue and taskmaster being set, and this stage is
             # built from mock_deps with no escalation queue, so it never runs.
@@ -2101,6 +2101,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'orphaned_recon_escalations_terminal': 0,
             'orphaned_recon_escalations_missing': 0,
             'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
             'orphaned_recon_escalations_unresolvable': 0,
             'orphaned_recon_escalations_errors': 0,
             'orphaned_recon_escalations_flags_emitted': 0,
@@ -2249,7 +2250,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
-            # report.stats never has to .get() them.  All seven stay 0 here —
+            # report.stats never has to .get() them.  All eight stay 0 here —
             # the orphaned-recon-escalation sweep is guarded on BOTH
             # _escalation_queue and taskmaster being set, and this stage is
             # built from mock_deps with no escalation queue, so it never runs.
@@ -2257,6 +2258,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'orphaned_recon_escalations_terminal': 0,
             'orphaned_recon_escalations_missing': 0,
             'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
             'orphaned_recon_escalations_unresolvable': 0,
             'orphaned_recon_escalations_errors': 0,
             'orphaned_recon_escalations_flags_emitted': 0,

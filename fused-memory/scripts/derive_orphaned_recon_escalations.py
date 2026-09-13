@@ -57,6 +57,12 @@ Safety properties:
 - A record whose ``project_id`` cannot be parsed, or whose project is not in
   the roots map, is counted ``unresolvable`` and NEVER closed — its subject
   was never checked, so closing it would be a reap on no evidence.
+- A record whose subject id exists in MORE THAN ONE tag with differing
+  statuses is counted ``ambiguous`` and NEVER closed.  Ids are per-tag
+  (``PRIMARY KEY (tag, id)`` with a per-tag ``id_counters`` high-water mark
+  in ``backends/sqlite_task_backend.py``), so every tag numbers its tasks
+  from 1 and a collision is the norm; a record carries no tag, so the subject
+  cannot be identified and a last-tag-wins merge could close a live record.
 - Each project's census is CROSS-TAG-COMPLETE (``list_tags`` then one
   ``get_statuses_fresh`` per tag), because ``get_statuses_fresh`` defaults to
   a single tag and a single-tag read would report a subject living elsewhere
@@ -84,6 +90,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_orphan,
     escalation_project_id,
     select_reapable_escalations,
+    sole_subject_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,6 +199,7 @@ async def _derive(queue_dir, project_roots, taskmaster, *, apply, resolved_by) -
         'terminal': 0,
         'missing': 0,
         'live': 0,
+        'ambiguous': 0,
         'unresolvable': 0,
         'errors': 0,
         'reaped': 0,
@@ -219,6 +227,13 @@ async def _derive(queue_dir, project_roots, taskmaster, *, apply, resolved_by) -
         if classification == 'live':
             report['live'] += 1
             continue
+        if classification == 'ambiguous':
+            # The subject id lives in several tags with differing statuses, so
+            # the record (which carries no tag) cannot name its own subject.
+            # Never reapable: closing it could close a still-blocked task's
+            # record on another task's evidence.
+            report['ambiguous'] += 1
+            continue
 
         report[classification] += 1
         report['reapable_ids'].append(esc.id)
@@ -227,7 +242,7 @@ async def _derive(queue_dir, project_roots, taskmaster, *, apply, resolved_by) -
             continue
 
         note = _resolution_note(
-            esc, classification, project_id, census.get(str(esc.task_id)),
+            esc, classification, project_id, sole_subject_status(esc, census),
         )
         result = queue.resolve(
             esc.id, note,
@@ -241,6 +256,16 @@ async def _derive(queue_dir, project_roots, taskmaster, *, apply, resolved_by) -
             )
             continue
         report['reaped'] += 1
+
+    if report['ambiguous']:
+        logger.warning(
+            '%d of %d reapable record(s) name a subject id present in more than '
+            'one tag with differing statuses and were NOT classified — ids are '
+            'per-tag, and a record carries no tag, so the subject cannot be '
+            'identified; check by hand which tag each subject lives in before '
+            'touching those records',
+            report['ambiguous'], report['scanned'],
+        )
 
     if report['unresolvable']:
         logger.warning(

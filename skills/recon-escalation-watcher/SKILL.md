@@ -636,6 +636,16 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   of ids goes stale between the moment it is written and the moment you act
   on it — **always re-derive live; never work a copied roster.**
 
+  *The `ambiguous` bucket is NOT an orphan either.* Task ids are per-tag, not
+  global (`PRIMARY KEY (tag, id)` in
+  `fused-memory/src/fused_memory/backends/sqlite_task_backend.py`), so the same
+  id in two tags is normal — and a record names only its `project_id`, never a
+  tag. When a subject id carries differing statuses across tags the subject
+  cannot be identified, so the record is counted
+  `orphaned_recon_escalations_ambiguous`, never flagged, and never reaped by
+  `--apply`. Check by hand which tag the record's subject actually lives in
+  before touching it.
+
   *The `unresolvable` bucket is NOT an orphan.* A record whose `project_id:`
   detail line is unparseable, or whose project is absent from the known-projects
   registry, is counted `orphaned_recon_escalations_unresolvable` and
