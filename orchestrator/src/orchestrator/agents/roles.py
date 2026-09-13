@@ -1024,6 +1024,59 @@ SCOPE_BOUNDARY_GUIDANCE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE
 SCOPE_BOUNDARY_GUIDANCE_SIMPLE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE_SIMPLE
 
 
+# Inlined from docs/code-quality.md, which remains the single normative copy
+# (INV-9). Only what is useless as a pointer is carried here -- the headline
+# TOKENS, the two stances, the do-not-steer-by list -- never the agreed reading
+# of each headline. The inline copy exists at all because a dispatched agent's
+# system prompt cannot follow a cross-reference, the same reason this module
+# already carries its own copy of the refs/stash prohibition.
+#
+# orchestrator/tests/test_code_quality_guidance_parity.py is the drift guard: it
+# parses the numbered list out of BOTH the doc and the production-RENDERED
+# prompt with one parser and one anchor, so this copy is provably derived rather
+# than a second source. Cited by FILE PATH, not by test class name, because
+# test_cited_test_class_drift.py requires every cited Test<CamelCase> identifier
+# in src prose to resolve to a real class.
+#
+# Interpolation-safe by contract: this reaches _REVIEWER_HEURISTICS_TEMPLATE's
+# str.format() call, so it must carry no literal brace.
+CODE_QUALITY_GUIDANCE = """
+## Code quality — judge against this definition
+
+Code quality is the expected cost and risk of the next change. In a
+factory-operated codebase the next change is made by an agent working from a
+partial view of the code, reviewed by an agent, and verified by machine. So
+quality means two things: how cheaply and safely an agent can make a correct
+change, and how likely a wrong change is to be caught before it lands.
+
+The mechanical gates — pytest, ruff, pyright — are the FLOOR. This definition
+is the BAR. A change can pass every gate and still be correctly rejected
+against it.
+
+## The fourteen heuristics
+
+1. **Informative names.**
+2. **Simple control flows.**
+3. **Carefully factored orthogonal dimensions of variability.**
+4. **Small function scopes.**
+5. **Minimum data access scopes and lifetimes.**
+6. **Well-defined purpose for each entity.**
+7. **Prefer stateless interactions between modules.**
+8. **Prefer immutable data.**
+9. **Deep modules with appropriate nesting and coherent narrow interfaces.**
+10. **Clear invariants, informatively, redundantly, uniformly enforced.**
+11. **SPOT — single point of truth.**
+12. **Structured data instead of meaningful strings.**
+13. **Files make internal sense in isolation.**
+14. **No file too large.**
+
+The agreed reading of each headline lives in `docs/code-quality.md` when the
+repository under review carries that file — read it there rather than guessing
+at a headline's intent. The readings are deliberately not restated here so that
+doc stays the one normative copy.
+"""
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -1126,7 +1179,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -1321,7 +1374,7 @@ _REVIEWER_HEURISTICS_TEMPLATE = """\
    - Style, naming, or structural preferences
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
-
+""" + CODE_QUALITY_GUIDANCE + """
 ## Your Specialization: {specialization}
 """
 
@@ -2203,7 +2256,7 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 3. **Be specific.** Every finding must have a file location and concrete description.
 4. **Don't flag style.** Naming preferences, formatting, comment style — these are noise.
 5. **Focus on the boundary.** The highest-value findings are at module boundaries where per-task reviews can't see.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
