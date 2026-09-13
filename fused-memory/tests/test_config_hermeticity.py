@@ -22,7 +22,16 @@ the leak cannot silently return; `conftest.py::_isolate_fm_config` is what
 holds it.
 """
 
+import json
+
+import pytest
+
 from fused_memory.config.schema import FusedMemoryConfig
+
+#: A value nothing in the tracked config or the schema could ever produce, so
+#: seeing it back out of ``FusedMemoryConfig()`` can only mean the environment
+#: reached in.
+PWNED = '/pwned-by-env'
 
 
 def test_config_resolution_is_independent_of_the_process_cwd(monkeypatch, tmp_path):
@@ -55,3 +64,47 @@ def test_code_default_config_yields_pure_code_defaults(code_default_config):
     it reads `None` exactly when the YAML layer is genuinely absent.
     """
     assert FusedMemoryConfig().taskmaster is None
+
+
+class TestAmbientEnvCannotRewriteTheConfig:
+    """The other half of the same leak, and the one the file pin does NOT close.
+
+    ``FusedMemoryConfig`` sets ``env_prefix=''`` with
+    ``env_nested_delimiter='__'`` and ``case_sensitive=False``, so a BARE
+    environment variable named after any of the model's nineteen top-level
+    fields is an unprefixed override — and env settings outrank the YAML.
+    Whatever shell, CI runner or parent process happens to export
+    ``TASKMASTER`` can therefore rewrite a value a test reads.  Measured: this
+    reproduces with ``CONFIG_PATH`` pointing at a missing file, which is what
+    makes it independent of the CWD half.
+    """
+
+    @pytest.fixture(
+        scope='class',
+        autouse=True,
+        params=[
+            ('TASKMASTER', json.dumps({'project_root': PWNED})),
+            ('TASKMASTER__PROJECT_ROOT', PWNED),
+        ],
+        ids=['bare-field-name', 'nested-delimiter'],
+    )
+    def _ambient_taskmaster(self, request):
+        """Plant the hostile variable AMBIENTLY — before per-test isolation runs.
+
+        Class scope is load-bearing, not tidiness: pytest instantiates
+        higher-scoped fixtures first, so this runs before the function-scoped
+        autouse ``conftest.py::_isolate_fm_config`` and the variable is
+        already there when isolation happens.  That is precisely the shape of
+        the real defect — a variable inherited from whoever launched pytest.
+        Setting it in the test BODY instead would model nothing: it would land
+        after isolation, and a deliberate test-local override is a documented
+        escape hatch rather than a leak.
+        """
+        name, value = request.param
+        ambient = pytest.MonkeyPatch()
+        ambient.setenv(name, value)
+        yield name
+        ambient.undo()
+
+    def test_an_ambient_bare_env_var_cannot_rewrite_the_suite_config(self):
+        assert FusedMemoryConfig().taskmaster.project_root != PWNED
