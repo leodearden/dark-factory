@@ -18,8 +18,11 @@ events.  It is safe to run against a live store while the orchestrator is
 merging.
 
 WHAT THIS DOES NOT DO: it asserts no threshold.  It prints what it measures and
-FLAGS observations — at-or-over-ceiling, at-or-over-wall-clock, unexpected-role
-— for a human narrative to interpret.  The close-or-escalate judgement belongs
+FLAGS observations — at-or-over-ceiling, over-the-flat-role-ceiling,
+unexpected-role — for a human narrative to interpret.  In particular, exceeding
+the flat per-role ceiling is NOT a failure (see `DEFAULT_ROLE_CEILINGS_SECS`);
+`timed_out` is the field that says a run was killed.  The close-or-escalate
+judgement belongs
 to the reader and to the milestone task's own conditional, not to a pass/fail
 hardcoded inside a read-only audit.  Each rendered section is labelled with the
 concrete resolved window and target model it was computed over, so a report that
@@ -214,12 +217,23 @@ def scan_routing_decisions(
     )
 
 
-# timeouts.merger, from orchestrator/src/orchestrator/defaults.yaml::timeouts.
+# timeouts.<role>, from orchestrator/src/orchestrator/defaults.yaml::timeouts.
 # Passed IN rather than read from config: scripts/tests/ imports no first-party
 # package (dark-factory-orchestrator.yaml:111-112), so importing orchestrator
-# config here would break test collection outright. Stated as seconds because
-# that is the unit the config states it in.
-DEFAULT_WALL_CLOCK_LIMITS_SECS: dict[str, int] = {'merger': 600}
+# config here would break test collection outright.
+#
+# THIS IS NOT A TOTAL WALL CLOCK, and the distinction is the whole reason the
+# flag derived from it is named for the FLAT CEILING rather than for a timeout.
+# workflow.py's working-regime progress extension (task 2360) enforces this
+# number flatly only until the transcript proves liveness; from turn 1 onward
+# the bound becomes max(timeouts.working_idle_secs, this) as an IDLE bound,
+# itself capped by invocation_timeout. At stock dark-factory config that is
+# 600 s flat -> 1800 s idle -> 7200 s absolute. A healthy merger that keeps
+# producing turns therefore runs well past 600 s BY DESIGN — measured: three
+# opus merger runs at 642-1103 s and one claude-fable-5-1 run at 1149 s, all
+# successful, none timed out. Read InvocationRecord.timed_out for the
+# producer's own kill verdict; never infer one from duration.
+DEFAULT_ROLE_CEILINGS_SECS: dict[str, int] = {'merger': 600}
 
 
 @dataclass(frozen=True)
@@ -241,8 +255,12 @@ class InvocationRecord:
     column, which is what makes "is this a lineage alias or the literal string?"
     answerable rather than assumed.
 
-    ``at_or_over_wall_clock`` is None, not False, for a role with no configured
-    limit: False would assert "ran under the limit" for a limit we do not know.
+    ``at_or_over_flat_role_ceiling`` is None, not False, for a role with no
+    configured ceiling: False would assert "ran under the ceiling" for a ceiling
+    we do not know.  It is NOT a failure signal — see
+    :data:`DEFAULT_ROLE_CEILINGS_SECS` for why a healthy run exceeds it.
+    ``timed_out`` is the producer's own kill verdict, and is the field to read
+    for "did this run die at a wall clock".
     """
 
     task_id: str | None
@@ -256,9 +274,10 @@ class InvocationRecord:
     completed_at: str
     turns: int | None
     succeeded: bool | None
+    timed_out: bool | None
     end_event_model: str | None
     merge_outcome: MergeOutcome | None
-    at_or_over_wall_clock: bool | None
+    at_or_over_flat_role_ceiling: bool | None
 
 
 @dataclass(frozen=True)
@@ -311,7 +330,7 @@ def scan_invocations(
     *,
     model: str,
     since: datetime,
-    wall_clock_limits: dict[str, int] | None = None,
+    role_ceilings_secs: dict[str, int] | None = None,
 ) -> tuple[InvocationRecord, ...]:
     """Every run of *model* completed at or after *since*, with its outcome.
 
@@ -328,7 +347,7 @@ def scan_invocations(
     the merger having failed to resolve a merge it did resolve.  Matched on
     task_id ALONE — the producer leaves these events' `role` column empty.
     """
-    limits = DEFAULT_WALL_CLOCK_LIMITS_SECS if wall_clock_limits is None else wall_clock_limits
+    ceilings = DEFAULT_ROLE_CEILINGS_SECS if role_ceilings_secs is None else role_ceilings_secs
     ends = _by_task(_load_events(conn, 'invocation_end', since))
     merges = _by_task(_load_events(conn, 'merge_finalized', since))
     cursor = conn.execute(
@@ -358,7 +377,7 @@ def scan_invocations(
                     merge_sha=last.payload.get('merge_sha'),
                     reason=last.payload.get('reason'),
                 )
-        limit_secs = limits.get(role)
+        ceiling_secs = ceilings.get(role)
         records.append(InvocationRecord(
             task_id=task_id,
             project_id=project_id,
@@ -371,10 +390,11 @@ def scan_invocations(
             completed_at=completed_at,
             turns=end.get('turns') if end else None,
             succeeded=end.get('success') if end else None,
+            timed_out=end.get('timed_out') if end else None,
             end_event_model=end.get('model') if end else None,
             merge_outcome=merge,
-            at_or_over_wall_clock=(
-                None if limit_secs is None else duration_ms >= limit_secs * 1000
+            at_or_over_flat_role_ceiling=(
+                None if ceiling_secs is None else duration_ms >= ceiling_secs * 1000
             ),
         ))
     return tuple(records)
@@ -603,7 +623,7 @@ def audit(
     expected_roles: Sequence[str],
     window: tuple[datetime, datetime],
     ceiling_usd: float,
-    wall_clock_limits: dict[str, int] | None = None,
+    role_ceilings_secs: dict[str, int] | None = None,
 ) -> AuditResult:
     """Run all five scans against one connection and freeze the results.
 
@@ -621,7 +641,7 @@ def audit(
         expected_roles=tuple(expected_roles),
         routing=scan_routing_decisions(conn, model=model, since=since),
         invocations=scan_invocations(
-            conn, model=model, since=since, wall_clock_limits=wall_clock_limits,
+            conn, model=model, since=since, role_ceilings_secs=role_ceilings_secs,
         ),
         scoped_cap=scan_scoped_cap(conn, model=model, since=since),
         spend=spend_in_window(
@@ -699,11 +719,11 @@ def render_markdown(result: AuditResult) -> str:
 
     out += [f'### 2. Invocations on `{model}` and how they ended, since {since}', '']
     out += _table(
-        ['task', 'project', 'role', 'account', 'cost $', 'turns', 'ok',
-         'model @end', 'duration ms', 'at/over wall clock', 'merge'],
+        ['task', 'project', 'role', 'account', 'cost $', 'turns', 'ok', 'timed out',
+         'model @end', 'duration ms', 'over flat ceiling', 'merge'],
         [(r.task_id or '-', r.project_id, r.role, r.account_name, f'{r.cost_usd:.2f}',
-          '-' if r.turns is None else r.turns, r.succeeded,
-          r.end_event_model or '-', r.duration_ms, r.at_or_over_wall_clock,
+          '-' if r.turns is None else r.turns, r.succeeded, r.timed_out,
+          r.end_event_model or '-', r.duration_ms, r.at_or_over_flat_role_ceiling,
           _merge_cell(r.merge_outcome)) for r in result.invocations],
     )
     out += ['']

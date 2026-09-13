@@ -504,7 +504,7 @@ def test_an_invocation_with_no_matching_end_event_reports_turns_none(runs_db):
         ('steward', 900_000, None),   # no configured limit: unknown, not "under"
     ],
 )
-def test_the_wall_clock_flag_is_at_or_above_and_unknown_without_a_limit(
+def test_the_flat_ceiling_flag_is_at_or_above_and_unknown_without_a_limit(
     runs_db, role, duration_ms, expected
 ):
     _invocation(
@@ -513,10 +513,28 @@ def test_the_wall_clock_flag_is_at_or_above_and_unknown_without_a_limit(
     )
 
     rows = audit_model_admission.scan_invocations(
-        runs_db, model=FABLE, since=APPLY, wall_clock_limits={'merger': 600},
+        runs_db, model=FABLE, since=APPLY, role_ceilings_secs={'merger': 600},
     )
 
-    assert rows[0].at_or_over_wall_clock is expected
+    assert rows[0].at_or_over_flat_role_ceiling is expected
+
+
+def test_the_killed_at_timeout_signal_is_read_from_the_end_event_not_inferred(runs_db):
+    """Exceeding the flat per-role ceiling does NOT mean a run was killed.
+
+    Once a transcript proves liveness the watchdog stops enforcing the flat
+    ceiling and enforces max(working_idle_secs, ceiling) as an IDLE bound
+    instead (workflow.py, task 2360). A healthy merger that keeps producing
+    turns therefore runs well past 600 s by design — so the audit reports the
+    producer's own `timed_out` verdict rather than inferring one from duration.
+    """
+    _fable_merger_run(runs_db, task_id='4377', duration_ms=1_149_252)
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert rows[0].at_or_over_flat_role_ceiling is True
+    assert rows[0].timed_out is False
+    assert rows[0].succeeded is True
 
 
 def test_a_zero_cost_row_survives_to_the_output(runs_db):
