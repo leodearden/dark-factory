@@ -1635,23 +1635,60 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
 
         assert _done_provenance(harness, tid) is not None
 
-    async def test_dead_l0_pin_no_longer_vetoes_the_on_main_self_heal(
+    async def test_dead_l0_pin_still_vetoes_the_on_main_done_flip(
         self, harness: Harness, tmp_path: Path,
     ) -> None:
-        """The clauses already require `report.live_claimant is None`.
+        """PRD D3 / spec §6 demand 3 — the DONE-FLIP veto stays maximally
+        conservative: ANY non-info open record still vetoes MARK_DONE.
 
-        So `classify_pins` link 4 reaches its identity-independent branch and
-        PROVES the filing incarnation dead — the handoff has no consumer left,
-        and holding the task for it helps nobody.
+        A dead-filer L0 does not pin RECOVERY — its handoff has no consumer
+        left, so conversion and re-dispatch proceed.  A done-flip is different
+        in kind: it is TERMINAL, and completing a task past an unconsumed
+        handoff is the phantom-done the already-landed dispatch gate closed at
+        the other end.  The record gets an owner later, when the orphan-L0
+        reaper promotes it; until then the task stays blocked and VISIBLE.
         """
         tid = _TID
         queue = self._arm(harness, tmp_path, tid, 'deadl0_on_main')
         _wire_on_main_mark_done(harness, tid, tmp_path)
-        _seed_pending(queue, tid, 'task_failure', level=0)
+        seeded = _seed_pending(queue, tid, 'task_failure', level=0)
 
         await _reconcile_stranded(harness, tid, 'blocked')
 
-        assert _done_provenance(harness, tid) is not None
+        assert _done_provenance(harness, tid) is None, (
+            'a dead-filer L0 must not be done-flipped past — D3 names the '
+            'done-flip veto as the half of the veto family that was always '
+            'right'
+        )
+        assert seeded in {e.id for e in queue.get_by_task(tid, status='pending')}
+
+    async def test_the_same_dead_l0_still_takes_the_off_main_upgrade(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """THE DELIBERATE ASYMMETRY between the two blocked-arm clauses.
+
+        Same record, same liveness — different clause, different question.
+        RE_FILE_ESCALATION is not a done-flip: it re-files or auto-merges, both
+        recoverable, so it correctly keeps the `pins` relaxation and the
+        dead-filer L0 does not hold it.  Pinned here so the split is a checked
+        decision rather than an artefact of which clause someone edited.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'deadl0_off_main')
+        _wire_exists_off_main(harness, tid)
+        _seed_pending(queue, tid, 'task_failure', level=0)
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert harness._merge_queue.qsize() == 1, (
+            'the off-main clause is not a done-flip, so it keeps the dead-L0 '
+            'relaxation'
+        )
 
     async def test_human_concern_l1_still_vetoes_the_on_main_self_heal(
         self, harness: Harness, tmp_path: Path,

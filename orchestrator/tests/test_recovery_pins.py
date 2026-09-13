@@ -26,6 +26,7 @@ from escalation.pins import classify_pins
 from orchestrator.recovery_pins import (
     MERGE_REMEDIABLE_ESC_CATEGORIES,
     only_merge_remediable,
+    records_pin_blocked_done_flip,
     records_pin_blocked_recovery,
     records_pin_recovery,
 )
@@ -328,3 +329,125 @@ class TestNoOrchestratorCycle:
             name == 'escalation.pins' or name.startswith('escalation.pins.')
             for name in imported
         ), f'recovery_pins.py must consume escalation.pins; imports were {sorted(imported)}'
+
+
+# ---------------------------------------------------------------------------
+# REVIEW FINDING 2 — the blocked arm's DONE-FLIP question (PRD D3, spec §6
+# demand 3).
+#
+# `records_pin_blocked_recovery` expands to `pins and not only_merge_remediable`
+# and `pins` deliberately calls a dead-filer L0 NON-pinning — correct for
+# "may this task be re-dispatched / re-filed?", and WRONG for "may this task be
+# flipped to done?".  D3 is explicit: "Done-flip vetoes stay maximally
+# conservative: ANY non-info open record still vetoes MARK_DONE".
+#
+# So the blocked arm needs the conservative twin, built from the SAME
+# classification read for the other question.  The two differ on EXACTLY one
+# input class, and the table-driven test below makes that an enumerated,
+# checked set rather than an accident.
+# ---------------------------------------------------------------------------
+
+
+class TestRecordsPinBlockedDoneFlip:
+    """`vetoes_done_flip` narrowed by the merge-remediable relaxation."""
+
+    def test_empty_does_not_pin(self) -> None:
+        """An unpinned task still self-heals — the relaxation is not a veto."""
+        assert records_pin_blocked_done_flip(_TID, [], live_claimant=False) is False
+
+    def test_lone_stranded_blocked_l1_does_not_pin(self) -> None:
+        """The merge-remediable relaxation is preserved VERBATIM.
+
+        A task whose branch landed while it was still blocked is usually held
+        by the reaper's own `stranded_blocked` — the record that ASKED for this
+        landing.  Letting it veto the done-flip pins the task forever after its
+        work is already on main.
+        """
+        assert records_pin_blocked_done_flip(
+            _TID, [_ref('stranded_blocked')], live_claimant=False,
+        ) is False
+
+    def test_task_failure_l1_pins(self) -> None:
+        assert records_pin_blocked_done_flip(
+            _TID, [_ref('task_failure')], live_claimant=False,
+        ) is True
+
+    def test_a_dead_filer_l0_pins(self) -> None:
+        """THE NEW ROW, and the whole reason this predicate exists.
+
+        `records_pin_blocked_recovery` returns False here — a dead L0 has no
+        consumer left, so conversion and re-dispatch proceed.  A DONE-FLIP is
+        different in kind: it is terminal, and completing a task past an
+        unconsumed handoff is the phantom-done the dispatch gate already
+        closed at the other end.  The record's owner arrives later, when the
+        orphan-L0 reaper promotes it.
+        """
+        records = [_ref('task_failure', level=0)]
+        assert records_pin_blocked_done_flip(_TID, records, live_claimant=False) is True
+        assert records_pin_blocked_recovery(_TID, records, live_claimant=False) is False
+
+    def test_info_only_in_a_remediable_category_does_not_pin(self) -> None:
+        records = [_ref('stranded_blocked', severity='info')]
+        assert records_pin_blocked_done_flip(_TID, records, live_claimant=False) is False
+
+    def test_mixed_remediable_l1_and_foreign_class_info_pins(self) -> None:
+        """`all(...)` category semantics, unchanged from its twin."""
+        records = [
+            _ref('stranded_blocked'),
+            _ref('design_concern', severity='info', esc_id='esc-3541-2'),
+        ]
+        assert records_pin_blocked_done_flip(_TID, records, live_claimant=False) is True
+
+    def test_store_unavailable_pins(self) -> None:
+        """An unreadable store never relaxes — same ordering as its twin."""
+        assert records_pin_blocked_done_flip(_TID, None, live_claimant=False) is True
+
+
+class TestTheTwoBlockedPredicatesDivergeOnExactlyOneRow:
+    """The asymmetry is an ENUMERATED set, not an emergent accident.
+
+    Walking both predicates over the same fixtures and naming the one row they
+    may disagree on means a future edit to either cannot silently widen the
+    divergence — which is the failure mode that produced this finding.
+    """
+
+    _FIXTURES = (
+        ('empty', []),
+        ('lone-remediable-l1', [_ref('stranded_blocked')]),
+        ('human-concern-l1', [_ref('task_failure')]),
+        ('dead-filer-l0', [_ref('task_failure', level=0)]),
+        ('info-only', [_ref('stranded_blocked', severity='info')]),
+        ('mixed-categories', [
+            _ref('stranded_blocked'),
+            _ref('task_failure', esc_id='esc-3541-2'),
+        ]),
+    )
+
+    #: The ONLY label at which the two answers may differ.
+    _EXPECTED_DIVERGENCE = frozenset({'dead-filer-l0'})
+
+    @pytest.mark.parametrize(
+        'label,records', _FIXTURES, ids=[f[0] for f in _FIXTURES],
+    )
+    def test_they_agree_everywhere_except_the_named_row(
+        self, label: str, records: list,
+    ) -> None:
+        recovery = records_pin_blocked_recovery(_TID, records, live_claimant=False)
+        done_flip = records_pin_blocked_done_flip(_TID, records, live_claimant=False)
+
+        if label in self._EXPECTED_DIVERGENCE:
+            assert done_flip is True and recovery is False, (
+                f'{label} is the one row the two predicates exist to disagree '
+                f'about; it must diverge in the CONSERVATIVE direction'
+            )
+        else:
+            assert done_flip is recovery, (
+                f'{label} is not an enumerated divergence — the done-flip '
+                f'predicate has widened beyond the dead-L0 row it was added '
+                f'for (recovery={recovery}, done_flip={done_flip})'
+            )
+
+    def test_store_unavailable_agrees_too(self) -> None:
+        assert records_pin_blocked_done_flip(_TID, None, live_claimant=False) is (
+            records_pin_blocked_recovery(_TID, None, live_claimant=False)
+        )
