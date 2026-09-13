@@ -228,8 +228,12 @@ def classify_orphan(esc, statuses):
 
     *statuses* must be a successfully-read census.  An errored or partial read
     must never reach here: it would render as ``missing`` for every record.
-    The async orchestrator enforces that by classifying nothing for a project
-    whose census read failed.
+    That guarantee does NOT rest on the backend raising —
+    ``backends/sqlite_task_backend.py::get_statuses_fresh`` never does, it
+    "fails open to ``{}`` on any error" — so ``_project_status_census``
+    additionally rejects an EMPTY read as a failed one, and returns ``None``
+    for the whole project rather than a census this function could mistake
+    for evidence of absence.
 
     Pure: no I/O, no side effects.
     """
@@ -394,6 +398,25 @@ async def _project_status_census(taskmaster, project_root, *, log = logger):
     falling back would perform precisely the single-tag read this helper
     exists to avoid.
 
+    AN EMPTY CENSUS IS ALSO A FAILURE, not an empty store.  The production
+    backend never raises: ``backends/sqlite_task_backend.py::get_statuses_fresh``
+    "fails open to ``{}`` on any error" — a non-existent DB file, a permission
+    error, a disk I/O failure, a corrupt file, an exhausted 5000ms WAL
+    ``busy_timeout`` under write contention — and only logs a warning.  The
+    except ladders above would therefore never fire for it, and a failed read
+    would arrive here as a clean ``{}`` that ``classify_orphan`` renders
+    ``'missing'`` for every record.  ``list_tags`` is
+    ``SELECT DISTINCT tag FROM tasks``, so every tag it returns has at least
+    one row by construction: an empty per-tag map is PROOF of a fail-open
+    read.  The emptiness check below is what makes that proof load-bearing.
+
+    We deliberately do NOT try to tell a fail-open apart from the vanishingly
+    rare, benign race where a listed tag's last row was deleted between
+    ``list_tags`` and the read.  Both resolve to "classify nothing this
+    cycle", which costs at most one cycle of detection — the next cycle
+    re-checks — whereas the opposite error is an irreversible close of a live
+    record by the sole closer.
+
     ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate
     unchanged.
     """
@@ -413,12 +436,37 @@ async def _project_status_census(taskmaster, project_root, *, log = logger):
     census: dict[str, str] = {}
     try:
         if not tags:
-            census.update(await taskmaster.get_statuses_fresh(project_root))
+            # No tags reported: one untagged read, held to the same standard.
+            # This helper only runs for a project with >=1 pending reapable
+            # record naming it, and a store with zero task rows in any tag
+            # cannot have produced a gate-backlog escalation naming a
+            # `blocked` subject — so an all-empty census here is far likelier
+            # an unreadable or not-yet-created DB than ground truth.
+            untagged = await taskmaster.get_statuses_fresh(project_root)
+            if not untagged:
+                log.warning(
+                    'orphaned_recon_escalation_sweep: empty untagged census for '
+                    'project_root=%s — treating as a FAILED read (get_statuses_fresh '
+                    'fails open to {} on any error) and classifying nothing',
+                    project_root,
+                )
+                return None
+            census.update(untagged)
         else:
             for tag in tags:
-                census.update(
-                    await taskmaster.get_statuses_fresh(project_root, tag=tag),
-                )
+                per_tag = await taskmaster.get_statuses_fresh(project_root, tag=tag)
+                if not per_tag:
+                    log.warning(
+                        'orphaned_recon_escalation_sweep: empty census for '
+                        'project_root=%s tag=%s, which list_tags just reported — '
+                        'SELECT DISTINCT tag FROM tasks only yields a tag with >=1 '
+                        'row, so this is a fail-open read; classifying nothing for '
+                        'this project (a partial census is indistinguishable from a '
+                        'failed one)',
+                        project_root, tag,
+                    )
+                    return None
+                census.update(per_tag)
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
     except Exception:
