@@ -46,6 +46,15 @@ built FRESH per call inside its own ``try/except`` because constructing it
 CREATES its directory — a read-only root raises at construction, and a cache
 would defer that raise to an arbitrary later call.
 
+WHAT THE CALLER WAS TOLD is carried explicitly, via ``_REPORTED_TO_CALLER``,
+keyed on the durable-queue OPERATION name. The two enqueue sites that report a
+synchronous success make DIFFERENT claims — ``add_episode`` returns
+``status='queued'``, ``add_memory`` returns ``stores_written`` containing
+graphiti — and an alarm that misreported which one was made would not be
+triageable. A new enqueue site that reports success synchronously must add an
+entry there; the default is deliberately neutral rather than optimistic, so a
+forgotten entry under-claims instead of inventing a caller to warn.
+
 NEVER RAISES. This runs after the queue has already committed the item's dead
 state, from inside ``_process_item``; turning a lost alarm into an exception
 would cost the worker as well as the signal. Every failure mode degrades to a
@@ -91,17 +100,26 @@ _FINDING_CATEGORY = 'queue_dead_letter'
 # content it records, so the two records truncate the same way.
 _PREVIEW_CHARS = 200
 
-# What the CALLER was synchronously told, keyed on the durable-queue operation
+# What the CALLER was synchronously told, keyed on the durable-queue OPERATION
 # name. This is what makes the record say not merely "a write died" but "a
 # caller acted on a success that will never be true" — the difference between
 # an alarm an operator can triage and one they cannot.
+#
+# A new enqueue site that reports success synchronously must add an entry here.
 _REPORTED_TO_CALLER = {
     'add_episode': (
         "add_episode returned status='queued' and an episode_id, so the caller "
         'was told the write had been durably accepted and would land'
     ),
+    'add_memory_graphiti': (
+        'add_memory returned stores_written containing graphiti at enqueue '
+        'time — the caller was told this write LANDED, not that it was queued'
+    ),
 }
 
+# Deliberately NEUTRAL rather than optimistic, so a forgotten entry
+# UNDER-claims. An operator wrongly told a caller was lied to would go hunting
+# for a caller to warn and find none; the reverse error merely under-reports.
 _REPORTED_TO_CALLER_DEFAULT = (
     'no synchronous success was reported to any caller for this operation'
 )
