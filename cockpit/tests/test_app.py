@@ -3536,3 +3536,64 @@ class TestDecisionQueueDetail:
             assert '7001' in detail.rendered_text
             assert 'esc-7001-1' in detail.rendered_text
             assert app._selected_slug == 'session-target'
+
+    @pytest.mark.timeout(10)
+    async def test_highlighting_a_session_queue_row_renders_that_session(self, tmp_path):
+        """The queue mixes decisions and awaiting-input sessions and truncates both
+        row kinds' questions, so both must populate the pane -- one list where some
+        rows fill the pane and others silently don't is worse than either
+        consistent alternative. The queue's session row still must not write
+        _selected_slug: that restore seam is the session TABLE's alone.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+
+        # Both awaiting, so both are queue rows; session-other's older start_ts
+        # takes session-table row 0, so at mount the pane shows session-other and
+        # the queue move below genuinely has to change it.
+        awaiting = _make_record(
+            session_slug='session-awaiting',
+            status=sr.Status.AWAITING_INPUT,
+            start_ts='2026-07-07T00:01:00+00:00',
+            task_id='7002',
+            question=sr.Question(
+                text='Which host should the worker bind to?',
+                asked_at='2026-07-07T00:01:00+00:00',
+            ),
+        )
+        other_session = _make_record(
+            session_slug='session-other',
+            status=sr.Status.AWAITING_INPUT,
+            start_ts='2026-07-07T00:00:00+00:00',
+            task_id='7003',
+            question=sr.Question(text='Unrelated?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for record in (awaiting, other_session):
+            sr.write_record(record, root=tmp_path)
+
+        # outscores the session row, so the session row is not highlighted at mount
+        decision = sr.DecisionRecord(
+            id='dec-first', project='df', text='Short one?',
+            filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            detail = app.query_one(DetailPane)
+
+            # the move is real: neither the queue cursor nor the pane is there yet
+            assert queue.highlighted_key() != 'session:session-awaiting'
+            assert 'Which host should the worker bind to?' not in detail.rendered_text
+            assert app._selected_slug == 'session-other'
+
+            assert queue.select_key('session:session-awaiting')
+            await pilot.pause()
+
+            assert 'Which host should the worker bind to?' in detail.rendered_text
+            assert '7002' in detail.rendered_text
+            assert app._selected_slug == 'session-other'

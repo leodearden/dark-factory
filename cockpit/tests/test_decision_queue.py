@@ -656,3 +656,24 @@ class TestKnownProjectRoots:
         roots = known_project_roots(sessions, ['/home/leo/src/dark-factory'])
 
         assert roots == ['/home/leo/src/dark-factory']
+
+
+class TestQueueItemSessionSlug:
+    """QueueItem.session_slug -- the one place the 'session:<slug>' key
+    encoding is decoded, next to _session_key that writes it."""
+
+    def test_session_item_yields_the_slug_from_its_key(self):
+        item = _make_queue_item(key='session:abc-1', kind='session', decision_id=None)
+
+        assert item.session_slug == 'abc-1'
+
+    def test_decision_item_has_no_session_slug(self):
+        item = _make_queue_item(key='decision:dec-1', kind='decision')
+
+        assert item.session_slug is None
+
+    def test_malformed_key_without_a_prefix_degrades_to_the_key_itself(self):
+        """Fail-soft (PRD §2), matching the split format_copy_payload already performed."""
+        item = _make_queue_item(key='abc-1', kind='session', decision_id=None)
+
+        assert item.session_slug == 'abc-1'
