@@ -2734,26 +2734,44 @@ def observed_submit_response(
     still reported to its filer as 'queued'.  The filer then had no way to
     learn its escalation had been swallowed.
 
+    Task 5368 AMENDS that fix.  3236 left the two degraded branches — a re-read
+    that returns ``None``, and one that raises — returning the historical
+    ``'queued'`` shape, byte-identical to the branch that had actually
+    confirmed the record on disk.  That reintroduced 3236's own failure one
+    case over: a filer whose write never landed was told it had.  This function
+    now NEVER reports write intent as observed state on any branch.
+
     Re-reads the persisted record and returns:
     - still pending → ``{'id', 'status': 'queued', 'level'}`` (as before, plus
       the persisted level so a caller that asked for ``level=1`` can confirm
-      it landed);
+      it landed).  ``'queued'`` means, and only means, that the re-read found
+      the record pending on disk;
+    - re-read unavailable → ``{'id', 'status': 'accepted_unpersisted',
+      'persist_check', 'level'}``.  The write was accepted but its durability
+      is UNCONFIRMED, so nothing is guaranteed for L1 or L2 to drain and the
+      caller must keep driving the blocked task rather than standing down;
     - anything else → the auto-resolved shape ``escalate_blocker``'s docstring
       already promises, ``{'id', 'status', 'resolution', 'resolved_by',
-      'level'}``, carrying the record's REAL values.  No new status vocabulary
-      is invented, so no consumer needs updating.
+      'level'}``, carrying the record's REAL values.
 
-    FAIL-OPEN by construction: a re-read that returns ``None`` or raises falls
-    back to the historical ``'queued'`` response and logs a WARNING rather than
-    raising.  A filing must never be lost to a bookkeeping read — that is the
-    very failure mode being fixed here.
+    ``persist_check`` discriminates the two causes, which are materially
+    different for an operator debugging the outage: ``'absent'`` means
+    ``queue.get`` exhausted the queue root, the archive, a targeted archive
+    re-probe AND the TOCTOU re-locate retry, so the record genuinely is not on
+    disk; ``'unreadable'`` means the read itself failed and the record's state
+    is simply unknown.  It is a structured field rather than two statuses
+    because the distinction does not change what the caller should do.
+
+    STILL FAIL-OPEN, in the sense that matters: a bookkeeping read never raises
+    at the ladder's front door and never costs the caller its escalation id.
+    What it no longer does is launder an unconfirmed write into a confirmation.
 
     ``fallback_level`` is the level the CALLER wrote (i.e. ``esc.level``).  It
-    is echoed on the two fail-open branches so ``level`` is present on EVERY
+    is echoed on the two unpersisted branches so ``level`` is present on EVERY
     response this function can return: the ``level`` echo is documented as the
     way a caller confirms its requested level landed, and a caller written to
-    that contract must not hit a ``KeyError`` in exactly the degraded case the
-    fail-open exists to survive.  It is a fallback, never an override — when
+    that contract must not hit a ``KeyError`` in exactly the degraded case
+    these branches exist to survive.  It is a fallback, never an override — when
     the re-read succeeds, the PERSISTED level is reported even if it differs
     from what the caller asked for (born-at-L2 severity legitimately overrides
     a requested level=1).
@@ -2769,25 +2787,28 @@ def observed_submit_response(
     from the root — i.e. an O(archive) scan is possible on the submit path in
     exactly the resolve+archive race this targets.  Acceptable at current
     volumes; if it ever shows up in a storm profile (e.g. a 30-task infra
-    fan-out), read ``queue_dir/{id}.json`` directly and treat an absent record
-    as the fail-open 'queued' case — that is already this function's documented
-    behaviour for an unreadable record, though it would forfeit the honest
-    observed-state report for a record archived between submit and re-read.
+    fan-out), read ``queue_dir/{id}.json`` directly — but note that a bare
+    root read cannot tell an archived record from an absent one, so it would
+    report ``'accepted_unpersisted'`` for a record that legitimately landed and
+    was archived between submit and re-read.
     """
     try:
         persisted = queue.get(esc_id)
     except Exception as exc:
-        logger.warning(
-            'Post-submit re-read of %s failed (%s); reporting queued (fail-open)',
+        logger.error(
+            'Post-submit re-read of %s failed (%s); its persistence is '
+            'UNCONFIRMED and it may never reach L1 or L2',
             esc_id, exc,
         )
-        return _fail_open_queued(esc_id, fallback_level)
+        return _unpersisted_response(esc_id, fallback_level, 'unreadable')
     if persisted is None:
-        logger.warning(
-            'Post-submit re-read of %s returned nothing; reporting queued (fail-open)',
+        logger.error(
+            'Post-submit re-read of %s found no record in the queue root or '
+            'the archive; the filing did not persist and will never reach '
+            'L1 or L2',
             esc_id,
         )
-        return _fail_open_queued(esc_id, fallback_level)
+        return _unpersisted_response(esc_id, fallback_level, 'absent')
     if persisted.status == 'pending':
         return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
     logger.warning(
@@ -2804,12 +2825,20 @@ def observed_submit_response(
     }
 
 
-def _fail_open_queued(esc_id: str, fallback_level: int | None) -> dict[str, Any]:
-    """The fail-open 'queued' response, carrying *fallback_level* when known.
+def _unpersisted_response(
+    esc_id: str,
+    fallback_level: int | None,
+    persist_check: str,
+) -> dict[str, Any]:
+    """The unconfirmed-persist response, carrying *fallback_level* when known.
+
+    *persist_check* is ``'absent'`` (the record is not on disk) or
+    ``'unreadable'`` (the read failed, so its state is unknown).
 
     ``level`` is omitted only when the caller supplied no fallback — legacy
     callers that predate the echo contract — so the key is never fabricated.
     """
+    response = {'id': esc_id, 'status': 'accepted_unpersisted', 'persist_check': persist_check}
     if fallback_level is None:
-        return {'id': esc_id, 'status': 'queued'}
-    return {'id': esc_id, 'status': 'queued', 'level': fallback_level}
+        return response
+    return {**response, 'level': fallback_level}
