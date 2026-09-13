@@ -129,6 +129,13 @@ _T = TypeVar('_T')
 # must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
 
+# The durable-queue group_id prefix that distinguishes a project's Mem0 writes
+# from its Graphiti ones, whose group_id is the bare project_id
+# (``Scope.graphiti_group_id``). Written by ``_dual_write_callback`` and read
+# back by ``_project_id_from_queue_group_id``; one constant so the two can
+# never drift apart.
+_MEM0_GROUP_PREFIX = 'mem0_'
+
 # Reciprocal Rank Fusion constant for the cross-store merge in
 # MemoryService.search (task 3658, PRD D4 — deliberately a module constant, not
 # config: it is part of the documented read contract, not an operator knob).
@@ -3041,6 +3048,37 @@ class MemoryService:
             terminal_error=error,
         )
 
+    def _project_id_from_queue_group_id(self, group_id: str) -> str:
+        """Resolve a durable-queue ``group_id`` to the project it belongs to.
+
+        The ORDER is the whole content of this method:
+
+        1. An EXACT match against ``self._known_projects`` wins. A project
+           literally named ``mem0_thing`` has a Graphiti group_id of
+           ``mem0_thing``, which is indistinguishable by shape from the Mem0
+           group of a project named ``thing``; the injected registry is the
+           only evidence that settles it, so it outranks the prefix strip.
+        2. Otherwise, a ``mem0_`` prefix whose remainder IS in the registry
+           strips to that remainder — the shape ``_dual_write_callback``
+           writes.
+        3. Otherwise a ``mem0_`` prefix strips anyway. The map may be empty or
+           stale, and a prefix this codebase itself writes is better evidence
+           than none.
+        4. Otherwise the group_id is returned UNCHANGED, so the caller reaches
+           its unresolvable-root WARNING rather than filing into a project it
+           guessed.
+
+        A pure function of injected data: no I/O, and deliberately no fallback
+        to ``config.taskmaster.project_root``, which defaults to ``'.'`` — a
+        fallback would file into the server's cwd where no operator watches,
+        and report success while doing it.
+        """
+        if group_id in self._known_projects:
+            return group_id
+        if group_id.startswith(_MEM0_GROUP_PREFIX):
+            return group_id[len(_MEM0_GROUP_PREFIX):]
+        return group_id
+
     @staticmethod
     def _mem0_payload_digest(
         content: str,
@@ -5915,7 +5953,7 @@ class MemoryService:
 
         if edges:
             project_id = payload.get('project_id', 'main')
-            group_id = f'mem0_{project_id}'
+            group_id = f'{_MEM0_GROUP_PREFIX}{project_id}'
 
             batch = [
                 {
