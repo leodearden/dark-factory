@@ -383,9 +383,23 @@ class PreservationSuppressionResult:
     unresolved_task_ids: tuple[str, ...]
 
 
-#: Canonical Graphiti entity label for a task.  ``get_entity`` resolves this
-#: shape by EXACT, case-sensitive match, so it lands on the task's own node
-#: instead of scattering across fuzzy neighbours.
+#: Canonical Graphiti entity label for a task.  ``get_entity`` TRIES this shape
+#: as an EXACT, case-sensitive match first, and on a HIT it lands on the task's
+#: own node, with edges gathered topologically from that node's uuid.
+#:
+#: On a MISS it does not return empty.  It falls back to a purely SEMANTIC
+#: gather — ``search_nodes(query='Task <id>', max_nodes=5)`` plus
+#: ``graphiti.search(query='Task <id>', num_results=edge_limit)`` — whose own
+#: docstring warns it "can surface edges whose fact merely mentions the
+#: entity's name (or is contextually related) without that edge being
+#: RELATES_TO-incident on this node at all".  ``'Task 3105'`` and ``'Task
+#: 5231'`` embed almost identically, so task 3105's preservation edge is
+#: exactly the kind of edge that fuzzy branch surfaces for ANY other task.
+#:
+#: Both branches return the SAME ``{'nodes', 'edges'}`` shape, so a caller
+#: cannot tell them apart by shape alone.  That is why
+#: :func:`_entity_is_scoped_to_task` re-derives this label and requires it
+#: before any citation is trusted.
 GRAPHITI_TASK_ENTITY_TEMPLATE: str = 'Task {task_id}'
 
 #: The Graphiti sub-collections consulted for a preservation citation, in
@@ -479,16 +493,61 @@ def _is_degraded_entity_result(entity: Any) -> bool:
     return isinstance(failed_stores, (list, tuple)) and bool(failed_stores)
 
 
+def _entity_is_scoped_to_task(entity: Any, task_id: str) -> bool:
+    """Return True iff *entity* carries *task_id*'s OWN node, matched by name.
+
+    THE SECOND THING A ``get_entity`` RESULT CAN BE.  Like
+    :func:`_is_degraded_entity_result`, this screens an outcome that arrives
+    through the success path wearing the shape of a good answer.  There the
+    imposter was a degraded read; here it is ``get_entity``'s SEMANTIC
+    fallback, taken whenever no node is named exactly
+    ``GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id)`` (see that
+    constant's comment).  A fuzzy result is a set of nodes and edges that are
+    merely TEXTUALLY NEAR the query string — it is evidence about the corpus,
+    never about this task.
+
+    WHAT GOES WRONG WITHOUT IT.  Task 3105's preservation edge is prose
+    containing the words a fuzzy search for any other ``'Task N'`` ranks
+    highly, so an ordinary undocumented stranded task would borrow 3105's
+    citation and have its finding SUPPRESSED — the hidden-finding harm this
+    module's docstring says it is biased against, and worse than a plain miss
+    because the drop is logged with a citation uuid belonging to a DIFFERENT
+    task, so the audit trail actively misleads the reader who checks it.
+
+    Presence of the exact-named node is the available proxy for "the exact
+    branch was taken": that branch is the only one that resolves nodes BY that
+    name, and a node genuinely carrying the name is about this task whichever
+    branch surfaced it.  Multiple nodes may share the name (the duplicate-name
+    pathology ``get_entity`` unions edges across) — one suffices.
+
+    Total over malformed input — every value here comes off a raw backend
+    read.  Pure, sync, no I/O.
+    """
+    if not isinstance(entity, dict):
+        return False
+    nodes = entity.get('nodes')
+    if not isinstance(nodes, (list, tuple)):
+        return False
+    expected = GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id)
+    return any(isinstance(node, dict) and node.get('name') == expected for node in nodes)
+
+
 def _graphiti_citation(entity: Any) -> str | None:
     """Return the uuid of the first edge fact / node summary citing preservation.
 
     Consults :data:`_GRAPHITI_CITATION_SOURCES` in order.  ``None`` for a
     non-mapping result, a missing collection, or no match.  Pure, sync, no I/O.
 
-    Requires :func:`_is_degraded_entity_result` as a pre-screen: this matcher
-    cannot tell a degraded read from an empty graph, so calling it on an
-    unscreened ``get_entity`` result silently converts a Graphiti outage into a
-    "no citation" verdict.
+    Requires BOTH pre-screens, because this matcher reads TEXT only and so
+    cannot tell any of ``get_entity``'s three same-shaped outcomes apart:
+
+    - :func:`_is_degraded_entity_result` — else a Graphiti outage is silently
+      converted into a "no citation" verdict.
+    - :func:`_entity_is_scoped_to_task` — else a semantic-fallback result is
+      silently converted into a citation for a task it does not describe.
+
+    The two screens fail in OPPOSITE directions, which is why neither
+    substitutes for the other.
     """
     if not isinstance(entity, dict):
         return None
@@ -560,6 +619,16 @@ async def _corroborate_preservation(
     success path is therefore screened by :func:`_is_degraded_entity_result`
     as well, BEFORE the citation matcher runs — a read that failed is not
     evidence in either direction.
+
+    NOR IS A READ THAT ANSWERED ABOUT SOMETHING ELSE.  ``get_entity`` resolves
+    the exact label only when a node carries it; otherwise it returns a
+    SEMANTIC gather over whatever merely reads like ``'Task <id>'``, in the
+    same ``{'nodes', 'edges'}`` shape.  Trusting that would let one documented
+    specimen's edge corroborate every OTHER task whose label embeds near it,
+    silently suppressing genuine stranded findings and citing a uuid that
+    belongs to a different task.  :func:`_entity_is_scoped_to_task` is
+    therefore the second pre-screen, and its failure is a resolved negative
+    rather than a degradation — see the comment at that call site.
     """
     degraded = False
 
@@ -609,6 +678,20 @@ async def _corroborate_preservation(
             task_id, project_id,
         )
         return _Corroboration(citation=None, degraded=True)
+
+    if not _entity_is_scoped_to_task(entity, task_id):
+        # A resolved NEGATIVE, not a degraded read: the lookup answered, and
+        # what it answered is that this task has no node of its own.  Marking
+        # it unresolved would file an `unresolved_corroboration` report for
+        # every ordinary task absent from the graph — i.e. for most stranded
+        # flags — drowning the signal that channel exists to carry.
+        log.debug(
+            'preservation_specimen_guard: graphiti returned no node named %r for task '
+            '%s in project %s (semantic fallback) — not evidence about this task, '
+            'flag kept',
+            GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id), task_id, project_id,
+        )
+        return _Corroboration(citation=None, degraded=degraded)
 
     return _Corroboration(citation=_graphiti_citation(entity), degraded=degraded)
 

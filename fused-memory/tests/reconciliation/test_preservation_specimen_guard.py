@@ -666,6 +666,142 @@ class TestFilterPreservationSpecimenFlagsGraphitiChannel:
         assert result.suppressed_by_task == {}
 
 
+class TestGraphitiCitationIsBoundToTheTaskQueried:
+    """The citation must describe the task asked about, not merely rank near it.
+
+    ``get_entity`` answers an exact-name MISS with a SEMANTIC gather —
+    ``search_nodes(query='Task <id>')`` plus ``graphiti.search(...)`` — in the
+    same ``{'nodes', 'edges'}`` shape as an exact hit.  ``'Task 3105'`` and
+    ``'Task 5231'`` embed almost identically, so task 3105's preservation edge
+    is exactly what that fallback surfaces for an unrelated task.  Accepting it
+    would SUPPRESS a genuine stranded finding and log the drop citing a uuid
+    belonging to a different task — the misleading audit trail being worse than
+    the hidden finding, since a reader who checks it is led to the wrong task.
+    """
+
+    @pytest.mark.asyncio
+    async def test_another_tasks_preservation_edge_does_not_corroborate(self):
+        """The exact over-suppression: 3105's edge, surfaced for task 5231."""
+        fuzzy = {
+            'nodes': [
+                {
+                    'uuid': '95719d7c-3778-4687-8b50-10ec5ad46e75',
+                    'name': 'Task 3105',
+                    'summary': LIVE_PRESERVATION_SENTENCES[-1],
+                },
+            ],
+            'edges': [
+                {
+                    'uuid': 'a8fd36a8-46db-4ca8-a21c-554c38a918ee',
+                    'fact': LIVE_GRAPHITI_EDGE_FACT,
+                },
+            ],
+        }
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(return_value=fuzzy)
+        flag = _stranded_flag(task_id='5231')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+
+    @pytest.mark.asyncio
+    async def test_a_fuzzy_miss_is_a_resolved_negative_not_a_degradation(self):
+        """Absent from the graph is an ANSWER, and must not be reported unresolved.
+
+        Most stranded tasks have no node of their own.  Reporting each as
+        unreadable would file an ``unresolved_corroboration`` subject for
+        nearly every flag, drowning the channel that exists to disclose a
+        genuine outage.
+        """
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(
+            return_value={'nodes': [{'uuid': 'n-9', 'name': 'Task 3105'}], 'edges': []},
+        )
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag('5231')],
+        )
+
+        assert result.unresolved_task_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_the_task_own_node_still_corroborates(self):
+        """The screen must not cost the exact-hit path its verdict."""
+        memory_service = _make_memory_service(entities={'Task 3105': LIVE_GRAPHITI_ENTITY})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert result.kept_flags == []
+        assert result.citations_by_task == {'3105': 'a8fd36a8-46db-4ca8-a21c-554c38a918ee'}
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_named_node_alongside_neighbours_corroborates(self):
+        """One exact-named node suffices — ``get_entity`` unions duplicate names.
+
+        The exact branch resolves EVERY node carrying the name and unions their
+        edges, so demanding that all nodes match would break on the very
+        duplicate-name pathology that branch is written to handle.
+        """
+        entity = {
+            'nodes': [
+                {'uuid': 'n-a', 'name': 'Task 3105 review', 'summary': 'unrelated'},
+                {
+                    'uuid': 'n-b',
+                    'name': 'Task 3105',
+                    'summary': LIVE_PRESERVATION_SENTENCES[-1],
+                },
+            ],
+            'edges': [],
+        }
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(return_value=entity)
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert result.kept_flags == []
+        assert result.citations_by_task == {'3105': 'n-b'}
+
+    @pytest.mark.parametrize(
+        'entity',
+        [
+            None,
+            'not a mapping',
+            {},
+            {'nodes': None},
+            {'nodes': 'oops'},
+            {'nodes': 7},
+            {'nodes': [None, 'x', 42]},
+            {'nodes': [{'uuid': 'n-1'}]},
+            {'nodes': [{'name': None}]},
+            {'nodes': [{'name': 'task 3105'}]},
+            {'nodes': [{'name': 'Task 31050'}]},
+            {'nodes': [{'name': 'Task 3105 '}]},
+        ],
+    )
+    def test_scope_screen_is_total_and_exact(self, entity):
+        """Neither malformed input nor a near-miss name passes the screen.
+
+        Matching is EQUALITY, not a substring: ``'Task 31050'`` contains
+        ``'Task 3105'``, and a substring test would bind a citation to the
+        wrong task in precisely the way this screen exists to prevent.
+        """
+        assert preservation_specimen_guard._entity_is_scoped_to_task(entity, '3105') is False
+
+    def test_scope_screen_accepts_the_canonical_label(self):
+        entity = {'nodes': [{'uuid': 'n-1', 'name': 'Task 3105'}]}
+
+        assert preservation_specimen_guard._entity_is_scoped_to_task(entity, '3105') is True
+
+
 class TestBoundedScopeAndReadEconomy:
     """What the guard must NOT drop, and what it must not spend to decide.
 
