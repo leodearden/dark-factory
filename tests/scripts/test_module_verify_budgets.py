@@ -6,14 +6,25 @@ Task 3473. ``verify_command_timeout_secs`` is a PER-COMMAND budget, and
 of every other module's and of the repo root's. A module that declares none
 does NOT get something "inherit-ish": per ``verify._resolve_verify_timeout``'s
 cascade it is a hard fall-through to ``config.verify_command_timeout_secs``,
-the whole-fleet ceiling (3600s warm). Declaring is the only way to narrow.
+the whole-fleet ceiling — an OPERATOR-TUNABLE value (3600s warm when this guard
+was written; raised since, see ``RULED_INTERIM_BUDGET_EXCEPTIONS``) sized for
+nine subprojects chained into ONE shell command. Declaring is the only way to
+narrow.
 
 Before this task, seven of nine discovered module configs declared nothing, so
 a hang in any of them surfaced only after the whole-fleet ceiling — about an
 hour rather than the minutes the root yaml's own "tight timeouts surface hangs"
-intent claims. This guard closes six of those seven and REPORTS the remaining
-one (``orchestrator``, task 3353) through ``MODULE_BUDGET_EXCLUSIONS`` rather
-than hiding it.
+intent claims. This guard closed six of those seven directly and REPORTED the
+seventh (``orchestrator``, task 3353) through ``MODULE_BUDGET_EXCLUSIONS``
+rather than hiding it.
+
+THAT LAST GAP IS NOW CLOSED (task 5422). ``orchestrator`` declares its own
+budget, ``MODULE_BUDGET_EXCLUSIONS`` is EMPTY, and every discovered module
+config declares a warm budget — so this guard's advertised reach and its real
+reach are the same again, which is the property the SCOPE note below insists
+on. Orchestrator's budget is the one that deliberately does NOT narrow below
+the fleet ceiling — it sits AT OR ABOVE it, and which of the two it is today is
+the operator's doing; see ``RULED_INTERIM_BUDGET_EXCEPTIONS``.
 
 GENERALISED FROM, not imported from, two sibling guards:
 ``tests/scripts/test_scripts_module_config.py::
@@ -188,8 +199,8 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 here that does not exist.
 #
 #   shared        W was RE-MEASURED by task 5131 under a real NINE-WAY gather
-#                 at base 1b3c50e98f, so unlike the other five entries here it
-#                 is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
+#                 at base 1b3c50e98f, so unlike the other entries drawn from
+#                 the task-3473 sweep it is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
 #                 4802 (+48%) over that epoch, but the worst-run wall clock
 #                 grew only ~35.5% (219.08s -> 296.88s) — LESS than the count
 #                 ratio predicts. Do NOT scale this figure by a test-count
@@ -203,7 +214,35 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 filed as a follow-up re-measure (tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R)
 #                 instead.
 #
-# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE, save one entry. The concurrent
+#   orchestrator  NOT SIZED LIKE ANY OTHER ENTRY HERE, and its presence does
+#                 not gate a min_budget(worst) floor — see
+#                 RULED_INTERIM_BUDGET_EXCEPTIONS below, which is where its
+#                 budget is actually justified. What this figure DOES gate is
+#                 the ruled-exception branch's own measurement floor: that
+#                 branch asserts the declared budget clears W (7200 > 5288
+#                 today), so the number here is load-bearing rather than
+#                 decorative.
+#                 PROVENANCE — esc-4211-6's 2026-09-08 FOLD AMENDMENT (filed
+#                 against task 4792), NOT the 2026-09-07 ruling itself: this
+#                 is a POST-ruling census maximum. That amendment records a
+#                 fleet census of the BYTE-IDENTICAL orchestrator verify
+#                 command across .worktrees/*/.task/verify/*.summary.json —
+#                 n=92 runs, 19 timed out, six GREEN completions above the
+#                 THEN-3600s budget at 5288 / 5269 / 5196 / 5093 / 4991 /
+#                 4708s, three of them on 2026-09-08 alone. W = 5288.0, the
+#                 max green, per this table's worst-RUN rule. RE-MEASURE BY
+#                 REPEATING THAT CENSUS over the same summary.json corpus, so
+#                 the next figure is a repeat rather than a re-derivation.
+#                 The census is LATER than, and larger than, the
+#                 864.83-3310.50s post-cap spread task 4902 recorded in
+#                 tests/scripts/test_fallback_verify_config.py's
+#                 POST_CAP_ORCHESTRATOR_GREEN_SECS (a different table, kept a
+#                 separate home per that file's own RAISE-TOGETHER rule).
+#                 Kept here rather than omitted so assertions (a)/(d)/(e)/(f)
+#                 below are exercised for this module like every other — only
+#                 (b) and (c) are excepted.
+#
+# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE, save two entries. The concurrent
 # arm of the sweep was a 6-WAY wave (the six modules this task closed) for
 # every entry EXCEPT `shared`, whose W was RE-MEASURED under a real NINE-WAY
 # gather (task 5131, see its entry above) — production's own gather width.
@@ -213,7 +252,10 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # fully-concurrent cost, not a reproduction of it. See the same note in each
 # of those five yamls' provenance blocks for what bounds the gap; shared's own
 # provenance block records the nine-way gather directly, so no such note
-# applies there.
+# applies there. Nor does it apply to `orchestrator`, whose figure did not come
+# from that sweep AT ALL — it is a fleet census of production verify runs (see
+# its entry above), so the 6-way/9-way distinction is simply not the axis its
+# error bar lies on.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 296.88,
     'escalation': 354.56,
@@ -221,6 +263,70 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,
+    'orchestrator': 5288.0,
+}
+
+# Single, EXPLICIT, documented exception to assertions (b) and (c) below —
+# not a loophole for weakening them generally. Modelled on
+# MODULE_BUDGET_EXCLUSIONS: a dict keyed by prefix so the justification lives
+# AT THE DEFINITION SITE next to the module it excuses.
+#
+# `orchestrator` is RULED BY LEO (esc-4211-6, 2026-09-07 option B, unstuck
+# 2026-09-11 option C, recorded on task 3353; split out as task 5422) to
+# carry a per-module budget of 7200s, which deliberately does NOT narrow
+# below the repo-root whole-fleet ceiling — the opposite of every other
+# module's per-module budget. That is the remedy for false infra_timeouts
+# on healthy branches (green runs have reached ~5288s, past the 3600s
+# ceiling in force when the ruling was made), so assertion (c) — strictly
+# below the fleet ceiling — cannot be satisfied here without re-creating
+# the defect the ruling exists to remove. Assertion (b) would also reject
+# it: min_budget(5288.0) demands ~10500s, sizing against an unsharded,
+# still-growing suite — exactly the moving-target problem
+# MODULE_BUDGET_EXCLUSIONS declined to chase while task 3353 owned it.
+#
+# AT the ceiling or ABOVE it is the OPERATOR's choice, not this module's,
+# which is why the excepted branch below compares with `>=` and not `>`.
+# The ruling set 7200 against a 3600s fleet ceiling; commit 36c4c71eb4
+# (Leo, 2026-09-12) then raised the FLEET ceiling 3600 -> 7200 as a stopgap
+# — dark-factory-orchestrator.yaml says in as many words that "7200 is the
+# figure already ruled as task 3353 scope B" — so the two coincide TODAY.
+# That same operator note carries the revert condition, "when ... the
+# module declares its own budget, put these back to 3600/5400", which is
+# this very declaration, after which they separate again. A `>` here is
+# red today and a `==` red after the revert; `>=` is the relation the
+# RULING implies in both worlds, and it is the ruling this dict excepts
+# against. Same lesson as commit e9d1055ed8: a guard must not pin an
+# operator-tunable live yaml value.
+#
+# INTERIM, AND NOT YET D-DERIVED (Leo's ruling D16', 2026-09-08): 7200 is an
+# operator estimate — ~1.6x headroom over the ~4400s loaded extrapolation
+# from task 4176's contended run — not a measured distribution. Task 3353's
+# scope D (p50/p90/max under load, with PSI and runqueue) refines it later;
+# this exception's NUMBER is expected to change with that refinement, not
+# this exception's EXISTENCE, which is why the exception is keyed on the
+# module rather than on today's figure.
+#
+# WHAT THE EXCEPTION DOES NOT BUY. It drops (b)'s ~2x min_budget MULTIPLE,
+# not the measurement floor underneath it. The excepted branch asserts the
+# declared budget is at or above the fleet ceiling AND still clears
+# MEASURED_MODULE_SUITE_WORST_SECS[prefix] — so this dict cannot be used to
+# park a budget inside the band where green runs have already been observed
+# to land, which is the failure mode the ruling exists to remove and the one
+# an "except (b) and (c) entirely" reading would silently re-open.
+#
+# Do NOT widen this dict for any other module: every other declared budget
+# still narrows below the fleet ceiling and is still held to (b) and (c) in
+# full.
+RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
+    'orchestrator': (
+        "esc-4211-6 (2026-09-07 option B / 2026-09-11 option C), Leo's ruling "
+        "D16' (2026-09-08): verify_command_timeout_secs=7200 is a deliberate, "
+        'documented INTERIM exception to assertions (b) and (c) — a budget '
+        'that does not narrow below the fleet ceiling, to stop false '
+        'infra_timeouts on a suite whose green runs already exceed the 3600s '
+        "ceiling the ruling was made against — and is NOT yet D-derived. Task "
+        '3353 scope D refines it with a measured distribution.'
+    ),
 }
 
 # One real tracked file under each module prefix, used to drive the production
@@ -235,6 +341,7 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'dashboard': 'dashboard/src/dashboard/__init__.py',
     'sampler': 'sampler/src/sampler/__init__.py',
     'cockpit': 'cockpit/src/cockpit/__init__.py',
+    'orchestrator': 'orchestrator/src/orchestrator/__init__.py',
 }
 
 
@@ -268,8 +375,13 @@ def test_module_carries_its_own_measured_verify_budget(
         ``_resolve_verify_timeout``'s cascade an unset module cold knob falls
         through to ``config.verify_cold_command_timeout_secs``, NOT to the
         module's warm budget. This is exactly the misreading the sibling guard
-        was written to make un-silent, and it is folded in here so six modules
-        get it for the cost of one assertion.
+        was written to make un-silent, and it is folded in here so every
+        parametrized module gets it for the cost of one assertion. Note what
+        that means for ``orchestrator`` specifically, whose warm budget is the
+        one sized ABOVE the root ceiling: its cold verify resolves to the ROOT
+        cold ceiling, which is BELOW its own warm budget. That is deliberate
+        and WARM-ONLY BY DESIGN — the full statement, including what it leaves
+        live, is in ``orchestrator/orchestrator.yaml``'s provenance block.
 
     SCOPE, STATED HONESTLY — this guard's advertised reach must equal its real
     reach, because a guard that overstates itself is the same defect wearing a
@@ -293,6 +405,19 @@ def test_module_carries_its_own_measured_verify_budget(
       introduced precisely because a hand-coded pair had already rotted, and
       dropping (b) for cheap modules would make the parametrization
       non-uniform.
+    * ASSERTIONS (b) AND (c) HAVE ONE RULED, DOCUMENTED EXCEPTION: `orchestrator`
+      (see ``RULED_INTERIM_BUDGET_EXCEPTIONS``). Its budget deliberately does
+      NOT narrow below the fleet ceiling, and is an operator estimate rather
+      than derived from ``min_budget``, per Leo's ruling esc-4211-6 — so this
+      test asserts the RULING's own shape for that one module instead of
+      (b)/(c), and every other assertion ((a), (d), (e), (f)) still runs
+      unchanged for it. THE EXCEPTION IS NOT A
+      FREE PASS: the replacement is TWO assertions, not none — the budget must
+      sit AT OR ABOVE the fleet ceiling AND still clear the module's own worst
+      recorded green run. Only (b)'s ~2x multiple is dropped, and only because
+      the ruling rejected it as a moving target; the measurement floor itself
+      survives, which is what stops a later edit from lowering the budget back
+      into the band where green runs have already been observed.
     """
     worst = MEASURED_MODULE_SUITE_WORST_SECS[prefix]
     discovered = discover_module_configs()
@@ -316,32 +441,88 @@ def test_module_carries_its_own_measured_verify_budget(
         f'the fleet ceiling (~an hour), not in minutes'
     )
 
-    # (b) Measurement-derived floor. VACUOUS where min_budget degenerates to
-    # 0 (any suite under ~50s) — see the docstring; not silently so.
-    floor = min_budget(worst)
-    assert mc.verify_command_timeout_secs >= floor, (
-        f'{prefix} verify_command_timeout_secs='
-        f'{mc.verify_command_timeout_secs} is below the {floor}s floor derived '
-        f'from its worst measured run ({worst}s, CONTENDED — see '
-        f'.task/measurements.md and the module yaml\'s provenance block). A '
-        f'budget under the floor would manufacture infra_timeout on the honest '
-        f'green path — the exact defect task 3350 exists to remove, '
-        f'reintroduced one level down'
-    )
-
-    # (c) Strictly tighter than the repo-root ceiling: a real narrowing. The
-    # repo-root config arrives from the directory-wide `root_config` fixture,
-    # which reads it through the PRODUCTION loader — see its docstring in
-    # tests/scripts/conftest.py for why the ORCH_CONFIG_PATH anchoring is
-    # load-bearing rather than hygiene.
+    # (b)/(c) are held in full for every module EXCEPT one ruled, documented
+    # exception — see RULED_INTERIM_BUDGET_EXCEPTIONS and the docstring's
+    # scope note. Do not widen this branch to cover any other prefix.
+    ruled_exception = RULED_INTERIM_BUDGET_EXCEPTIONS.get(prefix)
     root_warm = root_config.verify_command_timeout_secs
-    assert mc.verify_command_timeout_secs < root_warm, (
-        f'{prefix} verify_command_timeout_secs='
-        f'{mc.verify_command_timeout_secs} is not strictly below the repo-root '
-        f'verify_command_timeout_secs={root_warm} (task 3473). A per-module '
-        f'budget at or above the global one is a relabelling, not a narrowing: '
-        f'it surfaces a hang no sooner than the whole-fleet ceiling would'
-    )
+
+    if ruled_exception is None:
+        # (b) Measurement-derived floor. VACUOUS where min_budget degenerates
+        # to 0 (any suite under ~50s) — see the docstring; not silently so.
+        floor = min_budget(worst)
+        assert mc.verify_command_timeout_secs >= floor, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} is below the {floor}s floor derived '
+            f'from its worst measured run ({worst}s, CONTENDED — see '
+            f'.task/measurements.md and the module yaml\'s provenance block). A '
+            f'budget under the floor would manufacture infra_timeout on the honest '
+            f'green path — the exact defect task 3350 exists to remove, '
+            f'reintroduced one level down'
+        )
+
+        # (c) Strictly tighter than the repo-root ceiling: a real narrowing.
+        # The repo-root config arrives from the directory-wide `root_config`
+        # fixture, which reads it through the PRODUCTION loader — see its
+        # docstring in tests/scripts/conftest.py for why the ORCH_CONFIG_PATH
+        # anchoring is load-bearing rather than hygiene.
+        assert mc.verify_command_timeout_secs < root_warm, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} is not strictly below the repo-root '
+            f'verify_command_timeout_secs={root_warm} (task 3473). A per-module '
+            f'budget at or above the global one is a relabelling, not a narrowing: '
+            f'it surfaces a hang no sooner than the whole-fleet ceiling would'
+        )
+    else:
+        # RULED EXCEPTION (see RULED_INTERIM_BUDGET_EXCEPTIONS for the full
+        # reason, including why this comparison is `>=` and not `>`): this
+        # module's budget deliberately does NOT narrow below the fleet ceiling
+        # — the opposite of (c) — and is an operator estimate rather than
+        # min_budget(worst) — the opposite of (b). Assert the ruling's own
+        # shape instead of skipping outright, so this branch still checks
+        # something. root_warm is operator-tunable and currently sits ON this
+        # module's ruled figure; the floor that actually holds the budget up
+        # is the measurement assertion below, not this one.
+        assert mc.verify_command_timeout_secs >= root_warm, (
+            f'{prefix} is listed in RULED_INTERIM_BUDGET_EXCEPTIONS '
+            f'({ruled_exception}) as a budget that deliberately does NOT '
+            f'narrow below the repo-root ceiling, but its declared '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs} is '
+            f'below verify_command_timeout_secs={root_warm}. Either the ruling '
+            f'no longer applies — remove this prefix from '
+            f'RULED_INTERIM_BUDGET_EXCEPTIONS so (b)/(c) apply in full — or '
+            f'{prefix}/orchestrator.yaml regressed'
+        )
+
+        # ...AND IT STILL CLEARS THIS MODULE'S OWN WORST RECORDED GREEN RUN.
+        # The exception drops (b)'s ~2x min_budget multiple — which the ruling
+        # rejected as a moving target against an unsharded, still-growing
+        # suite — but it deliberately does NOT drop the measurement floor
+        # altogether. Without this line the only surviving floor would be
+        # root_warm — an operator-tunable value that has sat INSIDE the band
+        # where green runs have already been observed to land, and is due to
+        # again under commit 36c4c71eb4's own revert condition: at the 3600s
+        # ceiling this exception was ruled against, green runs of
+        # 5288/5269/5196/5093/4991/4708s were already clearing it (see the
+        # MEASURED_MODULE_SUITE_WORST_SECS caveat for the census). A future
+        # edit lowering the budget to, say, 3700 would then keep this guard
+        # green while re-manufacturing the exact false infra_timeout the
+        # ruling exists to remove. This is also what makes this module's W
+        # entry load-bearing rather than decorative: everywhere else in the
+        # excepted branch, `worst` reaches only assertion (a)'s message.
+        assert mc.verify_command_timeout_secs > worst, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} does not clear its own worst '
+            f'recorded GREEN run ({worst}s). Its RULED_INTERIM_BUDGET_EXCEPTIONS '
+            f'entry ({ruled_exception}) excuses it from (b)\'s ~2x '
+            f'min_budget({worst})={min_budget(worst)}s floor, NOT from clearing '
+            f'the measurement itself: a budget at or under a run that has '
+            f'already completed green manufactures infra_timeout on the honest '
+            f'green path, which is the precise defect the ruling exists to '
+            f'remove. Do not lower the budget to satisfy this — RE-MEASURE (see '
+            f'the MEASURED_MODULE_SUITE_WORST_SECS caveat for how) and raise '
+            f'both together'
+        )
 
     # (d) The REAL precedence mechanism honours it, warm.
     resolved = verify._resolve_verify_timeout(root_config, mc, is_cold=False)
@@ -373,7 +554,7 @@ def test_module_carries_its_own_measured_verify_budget(
         f'{prefix}/orchestrator.yaml now declares '
         f'verify_cold_command_timeout_secs='
         f'{mc.verify_cold_command_timeout_secs} (task 3473 deliberately left '
-        f'this UNSET: none of these six modules has a build step whose cold '
+        f'this UNSET: none of these modules has a build step whose cold '
         f'cost would justify a separate cold budget). If that was set '
         f'intentionally, this assertion and the module yaml\'s cold-cascade '
         f'note must be updated together, not just this line'
@@ -401,8 +582,9 @@ def test_module_carries_its_own_measured_verify_budget(
 # production walk must still resolve. Same purpose as
 # KNOWN_PER_MODULE_CONFIG_NAMES in test_fallback_verify_config.py — if discovery
 # silently regresses, the coverage loop below would pass VACUOUSLY on a shrunken
-# set, so it is asserted rather than trusted. Includes the six this task closed
-# plus the two sibling tasks 3350/3458 closed and the one excluded below.
+# set, so it is asserted rather than trusted. Includes the six task 3473 closed,
+# the two sibling tasks 3350/3458 closed, and `orchestrator` — excluded below
+# until task 5422 closed it, and covered like every other prefix since.
 KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
     {
         'shared',
@@ -470,42 +652,14 @@ MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
 # That is documentation, not an enforced property — see the coverage guard's
 # docstring for why no in-file assertion could enforce it.
 #
-# THIS IS THE ONE REMAINING GAP in the repo-root yaml's claim that "tight
-# timeouts surface hangs ... on the PER-MODULE budgets". Nine of ten configs
-# now declare their own; this is the tenth. Recorded here so the guard REPORTS
-# that gap on every run rather than hiding it.
-MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
-    'orchestrator': (
-        'Owned by task 3353, which is still pending. Deliberately not fixed by '
-        'task 3473 to avoid scope creep onto files 3473 does not lock. The '
-        'exclusion is TECHNICALLY correct, not merely deferential: orchestrator '
-        'is the dominant fleet segment — the largest entry by far in '
-        'MEASURED_FLEET_SEGMENT_SECS — and task 3353 '
-        "has since been rewritten to \"split or shard the orchestrator test "
-        'suite\" — so a budget declared now against an unsharded figure '
-        "would be invalidated by 3353's own change rather than merely refined "
-        'by it. TASK 4902 RE-MEASURED that segment on 2026-08-28 and it had '
-        'risen materially above the single task-3062 run this entry used to '
-        'quote. NO FIGURE IS RESTATED HERE, deliberately: the value, its date, '
-        'its sample and its percentile spread live ONCE — in '
-        'MEASURED_FLEET_SEGMENT_SECS, MEASURED_FLEET_SEGMENT_PROVENANCE and '
-        'POST_CAP_ORCHESTRATOR_GREEN_SECS in '
-        'tests/scripts/test_fallback_verify_config.py. Read them there. A number '
-        'copied into this justification would be one more copy to raise in '
-        'lockstep, and the one that used to sit here went stale exactly that '
-        'way. The re-measurement makes the deferral MORE justified, not less: '
-        'the segment rose sharply in 28 days and its run-to-run spread is now '
-        'far wider than the ~18%-apart same-day pair task 3062 recorded '
-        '(attempt-2 / esc-3062-3), so a budget sized against the unsharded '
-        'suite is chasing a moving target — one whose observed green maximum '
-        'has already consumed the full warm ceiling as a false infra_timeout. '
-        'DELETION CONDITION (unchanged, and NOT satisfied by 4902, which '
-        're-measured only and declared no budget): once '
-        'orchestrator/orchestrator.yaml declares '
-        'its own verify_command_timeout_secs, delete this entry — the coverage '
-        'guard then covers it automatically with no further edit.'
-    ),
-}
+# EMPTY as of task 5422: `orchestrator` was the one remaining gap in the
+# repo-root yaml's claim that "tight timeouts surface hangs ... on the
+# PER-MODULE budgets", and its deletion condition — orchestrator/
+# orchestrator.yaml declaring its own verify_command_timeout_secs — is now
+# met (7200, RULED BY LEO, esc-4211-6; see that yaml's own comment and
+# RULED_INTERIM_BUDGET_EXCEPTIONS below). The coverage guard now covers every
+# discovered module config with no further edit here.
+MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {}
 
 
 def test_every_discovered_module_config_declares_its_own_verify_budget(
@@ -514,7 +668,7 @@ def test_every_discovered_module_config_declares_its_own_verify_budget(
     """Every module config defining a test_command must declare a warm budget.
 
     THE ANTI-DRIFT HALF of this file, and the generalisation task 3473 exists
-    to make. The parametrized guard above covers exactly the six modules whose
+    to make. The parametrized guard above covers exactly the modules whose
     figures are in ``MEASURED_MODULE_SUITE_WORST_SECS``; nothing there notices
     a NEWLY-REGISTERED module config landing with no budget at all. This
     walks what discovery actually registers, so a new subproject is covered
@@ -541,10 +695,17 @@ def test_every_discovered_module_config_declares_its_own_verify_budget(
     literals cannot verify a task exists (``task 0`` would satisfy it), which
     would make the check read as enforcement while enforcing nothing.
 
-    THE GUARD REPORTS THE REMAINING GAP RATHER THAN HIDING IT. Exactly one
-    entry is excluded today (``orchestrator``, task 3353), and that is the one
-    place where the repo-root yaml's "tight timeouts live on the per-module
-    budgets" claim is still false.
+    THERE IS NO REMAINING GAP TO REPORT (task 5422). ``MODULE_BUDGET_EXCLUSIONS``
+    is EMPTY and every discovered module config declares its own warm budget, so
+    the repo-root yaml's "tight timeouts live on the per-module budgets" claim is
+    now true of all of them. This paragraph used to read "THE GUARD REPORTS THE
+    REMAINING GAP RATHER THAN HIDING IT. Exactly one entry is excluded today
+    (``orchestrator``, task 3353), and that is the one place where [that] claim
+    is still false" — CORRECTED IN PLACE rather than deleted, because the
+    mechanism it describes is still live: this dict remains the place a FUTURE
+    gap gets REPORTED rather than hidden, and the assertions below still enforce
+    that on whatever lands in it next. An empty dict is the claim's satisfied
+    state, not its retirement.
 
     AND THE CARVE-OUT EXPIRES ON ITS OWN TERMS. Each entry states a deletion
     condition; this test enforces it, by asserting an excluded module still
