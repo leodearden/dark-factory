@@ -343,6 +343,32 @@ def flag_asserts_stranded(flag: Any) -> bool:
 
 
 
+def _is_usable_task_id(component: str) -> bool:
+    """Return True iff *component* could name a real task.
+
+    Judges only what it can: a component that parses as an integer must be
+    POSITIVE, since task numbering starts at 1 and ``0``/``-5`` are junk an LLM
+    produced rather than a task to look up.  Anything NON-numeric passes
+    untouched — cross-project ids are spelled ``'project:id'`` and subtask ids
+    carry a dot, and this screen has no business ruling on shapes it does not
+    understand.
+
+    That asymmetry is the point.  The two errors are not symmetric: admitting a
+    junk component costs two backend lookups that miss, inside the cycle's
+    corroboration budget, while wrongly rejecting a real one leaves a preserved
+    specimen unprotected — the harm this whole module exists to prevent.  So the
+    screen rejects only what it can positively identify as impossible.
+
+    Pure, sync, no I/O.
+    """
+    if not component:
+        return False
+    try:
+        return int(component) > 0
+    except ValueError:
+        return True
+
+
 def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
     """Every task id *flag* names, in order, deduped; ``()`` when none is usable.
 
@@ -361,22 +387,29 @@ def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
 
     Accepts the two value shapes ``items_flagged`` actually carries: a ``str``
     (split on ``','``) and an ``int`` straight off a task dict.  Everything else
-    — ``None``, a list, a nested dict, a ``bool``, a non-positive int — is NOT a
-    task id and yields ``()``, so a malformed value can never be stringified
-    into a backend query.
+    — ``None``, a list, a nested dict, a ``bool`` — is NOT a task id and yields
+    ``()``, so a malformed value can never be stringified into a backend query.
+
+    Every component is screened by :func:`_is_usable_task_id`, the SAME rule for
+    both shapes.  An earlier spelling rejected a non-positive ``int`` while
+    accepting the string ``'-5'`` — an invariant enforced on one input shape and
+    not the other, which leaves the next reader unable to tell which rule is the
+    real one.
 
     Pure, sync, no I/O.
     """
     task_id = flag.get('task_id')
-    if isinstance(task_id, int) and not isinstance(task_id, bool) and task_id > 0:
-        return (str(task_id),)
+    if isinstance(task_id, bool):
+        return ()
+    if isinstance(task_id, int):
+        task_id = str(task_id)
     if not isinstance(task_id, str):
         return ()
     seen: set[str] = set()
     components: list[str] = []
     for part in task_id.split(','):
         component = part.strip()
-        if component and component not in seen:
+        if _is_usable_task_id(component) and component not in seen:
             seen.add(component)
             components.append(component)
     return tuple(components)

@@ -947,10 +947,15 @@ class TestBoundedScopeAndReadEconomy:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'task_id', [None, '', 0, [], {'nested': 'dict'}],
+        'task_id', [None, '', 0, -5, '0', '-5', [], {'nested': 'dict'}],
     )
     async def test_unusable_task_id_is_kept_without_reads(self, task_id):
-        """(f) A flag with no resolvable task is kept, never a junk backend query."""
+        """(f) A flag with no resolvable task is kept, never a junk backend query.
+
+        An int and its string spelling are screened by the same rule: an
+        invariant enforced on one input shape and not the other leaves the next
+        reader unable to tell which is the real one.
+        """
         memory_service = _make_memory_service()
         flag = _stranded_flag(task_id=task_id)
 
@@ -1634,6 +1639,48 @@ class TestCompositeFlagTaskIds:
 
         assert result.kept_flags == []
         assert result.suppressed_by_task == {'3105': 1}
+
+    @pytest.mark.asyncio
+    async def test_a_junk_component_costs_only_itself(self):
+        """The usability screen runs per COMPONENT, not per flag.
+
+        Screening the whole flag on one bad component would be the destructive
+        direction: the specimen's own id is right there beside it.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flag = _stranded_flag(task_id='0,3105,-1')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+        queried = [
+            call.kwargs['filters']['task_id']
+            for call in memory_service.get_memories_by_metadata.await_args_list
+        ]
+        assert queried == ['3105']
+
+    @pytest.mark.asyncio
+    async def test_a_non_numeric_component_is_not_screened_out(self):
+        """The screen rules only on shapes it understands.
+
+        Cross-project ids are spelled ``'project:id'``; rejecting one would
+        leave a real specimen unprotected, which is the harm, not the cost.
+        """
+        memory_service = _make_memory_service()
+        flag = _stranded_flag(task_id='dark_factory:3105,3105.1')
+
+        await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        queried = [
+            call.kwargs['filters']['task_id']
+            for call in memory_service.get_memories_by_metadata.await_args_list
+        ]
+        assert sorted(queried) == ['3105.1', 'dark_factory:3105']
 
     @pytest.mark.asyncio
     async def test_counters_key_on_the_component_not_the_composite(self):
