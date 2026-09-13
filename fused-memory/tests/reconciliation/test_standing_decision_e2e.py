@@ -23,6 +23,13 @@ ONE row seeded through the BACKFILL'S OWN WRITE PATH — which is precisely the
 claim η certifies: *the backfilled row drives both hooks*, not *a hand-seeded
 row does*.
 
+That claim is enforced rather than asserted: this module LOADS
+``scripts/backfill_entity_standing_decision.py`` and drives its ``run_backfill``
+to seed the fixture. Nothing about the migration — the authorization label, the
+evidence set, its citation order, the project — is transcribed here, because a
+transcribed copy would let the certified claim decay to "a hand-seeded row
+does" while the suite stayed green.
+
 The Hook-A leg is also genuinely new coverage rather than a restatement: γ's
 own tests drive the STRONG (stamped) match, while the motivating incident's
 flag carried no stamps at all and cited the entity uuid in free text. This gate
@@ -35,10 +42,12 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import load_script_module
 
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation import cli_stage_runner
@@ -50,33 +59,59 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STANDING_DECISION_TTL_DAYS,
     STATE_ACTIVE,
 )
-from fused_memory.reconciliation.standing_decision_writer import (
-    write_entity_standing_decision,
-)
 from fused_memory.server.recon_report import ReconReportState
 from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 
-#: reify's 'orchestrator' node — the entity ``b0057f3d`` decided about.
+#: The migration under certification. ``scripts/`` is not a package, so it is
+#: loaded through the shared helper — the same module object
+#: ``tests/test_backfill_entity_standing_decision.py`` holds.
+_mod = load_script_module(
+    Path(__file__).parents[2] / 'scripts' / 'backfill_entity_standing_decision.py',
+    mod_name='backfill_entity_standing_decision',
+)
+
+PROJECT_ID = _mod.PROJECT_ID
+AUTHORIZED_BY = _mod.AUTHORIZED_BY
+
+#: reify's 'orchestrator' node — the entity ``b0057f3d`` decided about. Spelled
+#: HERE rather than read from the script because the script deliberately pins
+#: no copy of it: it DERIVES the entity from the fetched source record. This is
+#: fixture data, not a transcription.
 ENTITY_UUID = 'f02a32ea-0efd-4865-94b4-97a412d8ffda'
 ENTITY_NAME = 'orchestrator'
-PROJECT_ID = 'reify'
 
-#: The evidence the migration cites: the source record, the demoted correction,
-#: the prose-cited human-authored record, and the opening escalation.
-EVIDENCE_REFS = [
-    {'type': 'mem0', 'id': 'b0057f3d-dc53-4cf8-9d1f-9959bd0897bd'},
-    {'type': 'mem0', 'id': 'baf8ca57-9f36-431b-a9b9-17c82fadd22d'},
-    {'type': 'mem0', 'id': 'ef1f1b1b-219c-40fb-a933-53631646df96'},
-    {'type': 'escalation', 'id': 'esc-2867-1'},
+#: The one other reify record on this entity the migration demotes (measured
+#: 2026-09-13), and the kind it carries — the member of the script's
+#: demoted-kinds allowlist that is not the source's. The unpack doubles as the
+#: assertion that the allowlist still holds exactly those two.
+CORRECTION_ID = 'baf8ca57-9f36-431b-a9b9-17c82fadd22d'
+(CORRECTION_KIND,) = _mod.DEMOTED_AD_HOC_KINDS - {_mod.SOURCE_KIND}
+
+#: The entity-scoped scroll the migration plans from. Two records, because the
+#: selection PREDICATE is the unit suite's subject, not this gate's.
+ENTITY_SCROLL = [
+    {
+        'id': _mod.SOURCE_MEMORY_ID,
+        'metadata': {'kind': _mod.SOURCE_KIND, 'entity_uuid': ENTITY_UUID},
+    },
+    {
+        'id': CORRECTION_ID,
+        'metadata': {'kind': CORRECTION_KIND, 'entity_uuid': ENTITY_UUID},
+    },
 ]
 
-AUTHORIZED_BY = 'backfill_entity_standing_decision (task 2900 η)'
+#: The provenance the row cites: the source, the demoted correction, the
+#: prose-cited human-authored record and the opening escalation — BUILT by the
+#: script's own planner off the scroll above, never listed by hand.
+EVIDENCE_REFS = _mod.build_evidence_refs(
+    _mod.select_evidence_only_targets(ENTITY_SCROLL, ENTITY_UUID)
+)
 
 #: The prose-cited record whose author is ``claude-interactive`` — exactly β's
 #: arm-1 human-authorship predicate. Resolvable here, so the seeded row's
 #: provenance would satisfy the evidence gate on its own merits even though the
 #: migration takes the operator bypass.
-HUMAN_EVIDENCE_ID = 'ef1f1b1b-219c-40fb-a933-53631646df96'
+(HUMAN_EVIDENCE_ID,) = _mod.HUMAN_EVIDENCE_MEMORY_IDS
 
 #: β samples this at decision time; ζ's growth sweep later compares against it.
 SEEDED_EDGE_COUNT = 11
@@ -88,8 +123,22 @@ SEEDED_EDGE_COUNT = 11
 FALLBACK_FLAG_TYPE = 'graphiti_entity_conflation_unresolved'
 
 
-async def _resolve_evidence_record(_project_id: str, memory_id: str) -> dict | None:
-    """Stand in for the three live reify mem0 records the row cites."""
+async def _resolve_reify_record(_project_id: str, memory_id: str) -> dict | None:
+    """Stand in for the live reify mem0 records this run reads.
+
+    One payload set serves both readers: the migration's own source fetch,
+    which validates ``kind`` and derives the entity from ``entity_uuid``, and
+    β's evidence resolution, which reads ``agent_id``.
+    """
+    if memory_id == _mod.SOURCE_MEMORY_ID:
+        return {
+            'id': memory_id,
+            'metadata': {
+                'kind': _mod.SOURCE_KIND,
+                'entity_uuid': ENTITY_UUID,
+                'agent_id': 'reconciliation-stage-1',
+            },
+        }
     if memory_id not in {ref['id'] for ref in EVIDENCE_REFS}:
         return None
     agent_id = (
@@ -107,7 +156,9 @@ def make_memory_service(ledger) -> AsyncMock:
     service.graphiti.get_valid_edges_for_node = AsyncMock(
         return_value=[{'uuid': f'edge-{n}'} for n in range(SEEDED_EDGE_COUNT)]
     )
-    service.get_memory_by_id = AsyncMock(side_effect=_resolve_evidence_record)
+    service.get_memory_by_id = AsyncMock(side_effect=_resolve_reify_record)
+    service.get_memories_by_metadata = AsyncMock(return_value=list(ENTITY_SCROLL))
+    service.update_memory = AsyncMock(return_value={'status': 'updated'})
     service.get_entity = AsyncMock(
         return_value={
             'nodes': [{'uuid': ENTITY_UUID, 'name': ENTITY_NAME}],
@@ -126,25 +177,26 @@ async def make_ledger(tmp_path, name: str = 'reconciliation.db') -> ReconLedgerS
 
 @pytest_asyncio.fixture
 async def backfilled_decision(tmp_path):
-    """The migration's own write path, run once: ``(ledger, service)``.
+    """The migration itself, RUN once against a real ledger: ``(ledger, service)``.
 
-    Seeded through β's ``write_entity_standing_decision(..., authorized_by=...)``
-    — the EXACT call ``scripts/backfill_entity_standing_decision.py`` makes —
-    rather than α's raw ``upsert_entity_standing_decision``. That is what lets
-    the legs below claim "the BACKFILLED row drives both hooks": a hand-rolled
-    upsert would demonstrate only that some row does.
+    ``run_backfill(service, apply=True)`` is the script's whole write leg — it
+    fetches and validates the source, derives the entity, plans, and writes the
+    row through β with its own authorization label and evidence. Seeding this
+    way rather than re-spelling the β call is what lets the legs below claim
+    "the BACKFILLED row drives both hooks": a hand-copied call would go on
+    passing after the migration's label, evidence set or ordering changed,
+    certifying a row the script no longer writes.
+
+    ``main()``'s two run-wide refusals — the store-mutation probe and the
+    live-target gate — are deliberately outside this path. They gate an
+    operator's ``--apply``, not the write leg, and
+    ``tests/test_backfill_entity_standing_decision.py`` is their home.
     """
     ledger = await make_ledger(tmp_path)
     service = make_memory_service(ledger)
     try:
-        await write_entity_standing_decision(
-            service,
-            project_id=PROJECT_ID,
-            entity_uuid=ENTITY_UUID,
-            grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
-            evidence=[dict(ref) for ref in EVIDENCE_REFS],
-            authorized_by=AUTHORIZED_BY,
-        )
+        report = await _mod.run_backfill(service, apply=True)
+        assert report['ledger'] == 'written', report
         yield ledger, service
     finally:
         await ledger.close()
