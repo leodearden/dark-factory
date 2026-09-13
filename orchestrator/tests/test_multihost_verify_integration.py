@@ -61,7 +61,7 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, passes
+from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, passes
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
     HEAVY_BARRIER_TEST_TIMEOUT,
@@ -1275,6 +1275,23 @@ async def _until(predicate, *, what: str, timeout: float = _LANE_SETTLE_TIMEOUT)
     await wait_responsive(_poll(), timeout=timeout, label=what)
 
 
+def _live_tasks_started_since(before: set[asyncio.Task]) -> set[asyncio.Task]:
+    """Still-running tasks created since *before* -- minus the waiter asking.
+
+    ``asyncio.current_task()`` is excluded because the caller polls this from
+    inside ``_until``, whose own poll coroutine is itself a task created after
+    *before* was captured: counting it would make the set permanently
+    non-empty and the wait unsatisfiable.  The enclosing test's task is already
+    in *before* (``all_tasks()`` includes the running one), so nothing else
+    needs excluding.
+    """
+    current = asyncio.current_task()
+    return {
+        task for task in asyncio.all_tasks()
+        if task not in before and task is not current and not task.done()
+    }
+
+
 async def _submitted(
     git_ops: GitOps, config: OrchestratorConfig, task_id: str, filename: str, content: str,
 ) -> MergeRequest:
@@ -1346,6 +1363,10 @@ class _HostEscalationQueue:
     def __init__(self) -> None:
         self.submitted: list[Any] = []
         self.resolved: list[tuple[str, str]] = []
+        #: Every dedup consultation -- i.e. every time an alarm site reached
+        #: the point of deciding whether to file.  Counting these is what lets
+        #: a dedup test distinguish "suppressed N times" from "never retried".
+        self.open_l1_checks = 0
         self._seq = 0
 
     def make_id(self, task_id: str) -> str:
@@ -1362,6 +1383,7 @@ class _HostEscalationQueue:
         ]
 
     def has_open_l1(self, task_id: str) -> bool:
+        self.open_l1_checks += 1
         return bool(self._open_l1s(task_id))
 
     def submit(self, esc: Any) -> None:
@@ -1405,6 +1427,7 @@ class _FlakyRemoteRunner:
         self.verify_gate = verify_gate
         self.verified: list[str] = []
         self.health_calls = 0
+        self.entered = False
 
     async def health(self) -> bool:
         self.health_calls += 1
@@ -1590,6 +1613,227 @@ class TestUnreachableHostCapstone:
             second_gate.set()
             assert (await wait_responsive(req_c.result, label='C lands after re-admission')).status == 'done'
             assert (await wait_responsive(req_d.result, label='D lands after re-admission')).status == 'done'
+
+    @staticmethod
+    def _tuned_config(
+        base: OrchestratorConfig, *, after_n: int, after_secs: float,
+    ) -> OrchestratorConfig:
+        """*base* with the two unreachability thresholds re-tuned."""
+        return base.model_copy(update={
+            'verify_host_unreachable_escalate_after_n': after_n,
+            'verify_host_unreachable_escalate_after_secs': after_secs,
+        })
+
+    async def test_one_ru_below_the_streak_threshold_does_not_alarm(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """THRESHOLD: at escalate_after_n=2, ONE RU event records but stays quiet.
+
+        The capstone above runs at a threshold of 1, where `len(alarms) == 1`
+        is unfalsifiable for this property -- one event cannot distinguish a
+        respected threshold from an ignored one.  Here the host is recorded and
+        quarantined exactly as before (that is the first RU's own job, and it
+        is NOT gated on the threshold), and the L1 is withheld because the
+        streak has not reached 2.  A threshold read as "alarm on every RU"
+        fires here.
+        """
+        gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={'ru-a': VerifyScript(result=passes().result, release=gate)})
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+        config = self._tuned_config(host_config, after_n=2, after_secs=0.0)
+
+        async with _lane_with_remote(
+            host_git_ops, config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a, req_b = await self._strand_the_laptop(
+                lane, queue, host_git_ops, config, verifier, gate,
+            )
+
+            row = _host_row(lane, 'leo-laptop')
+            assert row['quarantine_class'] == 'ru' and row['streak'] == 1, (
+                'the first RU must still RECORD and quarantine -- only the '
+                f'ALARM waits for the streak: {row!r}'
+            )
+            assert escalations.of_category('verify_host_unreachable') == [], (
+                'streak 1 of 2 must not alarm; the threshold was ignored: '
+                f'{escalations.submitted!r}'
+            )
+
+            assert (await wait_responsive(req_a.result, label='A lands')).status == 'done'
+            assert (await wait_responsive(req_b.result, label='B lands')).status == 'done'
+
+    async def test_repeated_alarm_opportunities_still_produce_exactly_one_l1(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """DEDUP: many alarm opportunities in one downtime episode -> ONE L1.
+
+        The time-based arm re-evaluates on EVERY failed reprobe sweep, so an
+        unreachable host offers the alarm a fresh opportunity several times a
+        second here.  Exactly one open L1 per host per downtime episode is the
+        contract; without the ``has_open_l1`` dedup this would file one per
+        sweep and bury the operator.  Counting alarms against a number of
+        opportunities the test itself OBSERVES (health_calls) is what makes the
+        `== 1` falsifiable.
+        """
+        gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={'ru-a': VerifyScript(result=passes().result, release=gate)})
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+        config = self._tuned_config(host_config, after_n=1, after_secs=0.001)
+
+        async with _lane_with_remote(
+            host_git_ops, config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a, req_b = await self._strand_the_laptop(
+                lane, queue, host_git_ops, config, verifier, gate,
+            )
+            await wait_responsive(req_a.result, label='A lands')
+            await wait_responsive(req_b.result, label='B lands')
+
+            checks = escalations.open_l1_checks
+            await _until(
+                lambda: escalations.open_l1_checks >= checks + 5,
+                what='five more alarm attempts to reach the dedup',
+            )
+
+            alarms = escalations.of_category('verify_host_unreachable')
+            assert len(alarms) == 1, (
+                f'the alarm site was re-entered {escalations.open_l1_checks} '
+                f'times over one downtime episode; the dedup must hold it at '
+                f'one open L1: {alarms!r}'
+            )
+            assert alarms[0].level == 1 and alarms[0].severity == 'blocking'
+
+    async def test_a_cancel_against_a_down_host_parks_the_slot_and_reprobe_unparks_it(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """The PARKED-slot strand: caught in flight, legible, and self-healing.
+
+        The OTHER way a host leaves the pool.  A verify is already running on
+        the laptop when it goes down, so the cancel RPC fails and every
+        ``probe_clean`` poll fails with it -- ``cancel_and_release`` then leaves
+        the slot PARKED, the correct fail-closed state (a stale verify may
+        still be churning there) but one that writes only the slot, never the
+        quarantine set.  That is the shape that stranded the laptop silently in
+        the reify 2026-07-25 incident: non-acquirable, and invisible to a
+        sweep that looked for quarantine membership.
+
+        Three things are asserted that the RU capstone above cannot see: the
+        slot really is PARKED (not merely quarantined), the census SAYS
+        ``'parked'`` so an operator can tell the two strands apart, and one
+        reprobe sweep un-PARKs it -- which needs ``probe_clean`` to come back
+        clean, not just ``health``.
+        """
+        gate = asyncio.Event()
+        verify_gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={
+            'park-a': VerifyScript(result=fails(
+                category='test_failure', summary='head fails, cascading its successors',
+            ).result, release=gate),
+        })
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        # Reachable to begin with: the strand needs a verify caught IN FLIGHT,
+        # which an already-down host never grants.
+        laptop = _FlakyRemoteRunner(reachable=True, verify_gate=verify_gate)
+
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=verifier, escalation_queue=escalations, event_store=events,
+        ) as (lane, queue):
+            req_a = await _submitted(host_git_ops, host_config, 'park-a', 'park_a.py', 'a = 1\n')
+            await queue.put(req_a)
+            await _until(lambda: 'park-a' in verifier.verified, what="the local anchor's verify to enter")
+            req_b = await _submitted(host_git_ops, host_config, 'park-b', 'park_b.py', 'b = 2\n')
+            await queue.put(req_b)
+            await _until(
+                lambda: laptop.entered,
+                what="the laptop's verify to be caught in flight",
+            )
+
+            # The host dies UNDER the running verify, then its sole waiter
+            # walks away -- so the lane cancels a verify it can no longer reach.
+            laptop.reachable = False
+            gate.set()
+            # The RECORD, not the PARK, is the settled state: `cancel_and_release`
+            # parks the slot on the failed cancel and only then polls
+            # `probe_clean` to exhaustion, so the slot reads 'parked' for the
+            # whole probe loop -- seconds before the strand is detected. Waiting
+            # on the park alone would sample the middle of that loop.
+            await _until(
+                lambda: _host_row(lane, 'leo-laptop').get('quarantine_class') == 'ru',
+                what='the failed cancel to be recorded as an RU-class strand',
+            )
+
+            row = _host_row(lane, 'leo-laptop')
+            assert row['slot_state'] == 'parked', (
+                'the slot must stay PARKED: the cancel RPC failed, so a stale '
+                f'verify may still be running there and freeing it could '
+                f'double-dispatch onto a busy host: {row!r}'
+            )
+            assert row['streak'] >= 1 and row['unavailable_since'] is not None, row
+
+            # RECOVERY -- and it must take BOTH probes: a PARKED slot is only
+            # safe to free once the host also reports no stale verify running.
+            laptop.reachable = True
+            verify_gate.set()
+            await _until(
+                lambda: _host_row(lane, 'leo-laptop').get('slot_state') == 'free',
+                what='the reprobe sweep to un-PARK the recovered laptop',
+            )
+            row = _host_row(lane, 'leo-laptop')
+            assert row['quarantined'] is False and row['quarantine_class'] is None, row
+            assert events.events_of(EventType.verify_host_recovered), events.events
+
+            # The queue never stalled: both requests resolve rather than
+            # hanging on a host the lane can no longer reach.
+            assert (await wait_responsive(
+                req_a.result, label='A resolves past the PARK',
+            )).status != 'done'
+
+    async def test_stop_leaves_no_lane_background_task_running(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """``stop()`` takes the lane's background loops down with it.
+
+        The reprobe loop is one asyncio task per lane, started by ``run()`` and
+        cancelled by ``stop()``.  A regression that stops cancelling it leaks
+        one live task per lane stop and announces itself only as an unasserted
+        "Task was destroyed but it is pending" warning at interpreter exit.
+        Observed as the absence of any surviving task this block created --
+        which covers the reprobe loop without naming it, so the assertion
+        survives the loop being renamed, merged into another, or joined by a
+        second one.
+        """
+        before = asyncio.all_tasks()
+
+        # Deliberately NOT `_lane_with_remote`: that injects `_ShortSleepClock`,
+        # which caps the reprobe loop's sleep at 20 ms, so the loop would fall
+        # out of its own `while self._running` within a tick of stop() whether
+        # or not anything cancelled it. On the production clock that sleep is
+        # the full interval, so a lost cancel keeps the task alive well past
+        # this wait -- which is what makes the assertion below bite.
+        async with _running_lane(host_git_ops, verifier=FakeVerifier()) as (lane, queue):
+            req = await _submitted(
+                host_git_ops, host_config, 'stopclean', 'stopclean.py', 's = 1\n',
+            )
+            await queue.put(req)
+            assert (await wait_responsive(
+                req.result, label='the lane is fully up and merging',
+            )).status == 'done'
+
+        # The context manager already awaited stop() and reaped run(); one more
+        # scheduling turn lets any cancellation it issued be delivered.
+        await _until(
+            lambda: not _live_tasks_started_since(before),
+            what='every task this lane started to finish after stop()',
+            timeout=_LANE_STOP_TIMEOUT,
+        )
 
     async def test_a_raising_health_probe_never_crashes_the_lane(
         self, host_git_ops: GitOps, host_config: OrchestratorConfig,
