@@ -2533,3 +2533,97 @@ class TestDryRunTranscriptArchival:
             f'holds .credentials.json and was unconditionally cleaned up before '
             f'the archival hook was inserted ahead of teardown; found: {leftover}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-5: the investigation prompt carries the task's own text
+# ---------------------------------------------------------------------------
+
+_TASK_DOC = {
+    'id': '42',
+    'title': 'Rebase the verify lane',
+    'description': 'The lane drifted from main and verify now fails on import.',
+    'details': 'Repro: run verify against main tip.',
+    'metadata': {
+        'files': ['orchestrator/src/orchestrator/workflow.py'],
+        'model_overrides': {'unblock_auto': {'model': 'opus'}},
+    },
+}
+
+
+class _TaskDocScheduler:
+    """Scheduler fake whose ``get_task`` returns a FULL task document.
+
+    ``_RecordingScheduler`` returns only ``{'metadata': ...}`` — enough for
+    route resolution, which is all the fetch was ever used for.  Set
+    *get_task_error* to model a fused-memory hiccup on the fetch.
+    """
+
+    def __init__(self, task_doc=None, *, get_task_error=None):
+        self._task_doc = task_doc if task_doc is not None else _TASK_DOC
+        self._get_task_error = get_task_error
+        self.update_task = AsyncMock(return_value=True)
+
+    async def get_task(self, task_id):
+        if self._get_task_error is not None:
+            raise self._get_task_error
+        return dict(self._task_doc)
+
+
+async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
+    """Run one investigation and return the prompt handed to the agent."""
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output={
+        'proposal_text': 'Rebase on main and rerun verify',
+        'risk_label': 'low',
+        'files_referenced': [],
+    })
+    mock_invoke = AsyncMock(return_value=agent_result)
+    with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+        await run_dry_run_unblock(
+            task_id='42',
+            worktree=str(tmp_path),
+            reason='verify exhausted',
+            detail='All 5 attempts timed out',
+            scheduler=scheduler,
+            mcp=MagicMock(),
+            config=_make_config(),
+        )
+    return mock_invoke.call_args.kwargs['prompt']
+
+
+class TestPromptCarriesTaskContext:
+    """The investigator was asked to judge a block it could not read.
+
+    The prompt carried only the block reason and a clipped detail — never the
+    task's own title, description or details, and never the declared file
+    footprint that SKILL.md's `human-review-required` trigger ("outside the
+    architect's declared file scope") must be judged against.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_task_title_description_and_details(self, tmp_path):
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert 'Rebase the verify lane' in prompt, prompt
+        assert 'The lane drifted from main and verify now fails on import.' in prompt, prompt
+        assert 'Repro: run verify against main tip.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_declared_file_footprint(self, tmp_path):
+        """The list the `human-review-required` scope-creep trigger is judged against."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert 'orchestrator/src/orchestrator/workflow.py' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_still_carries_the_four_original_fields(self, tmp_path):
+        """The fix is additive — it must not regress what the prompt already had."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert '42' in prompt, prompt
+        assert str(tmp_path) in prompt, prompt
+        assert 'verify exhausted' in prompt, prompt
+        assert 'All 5 attempts timed out' in prompt, prompt
+        assert 'Investigate and emit your structured proposal.' in prompt, prompt
