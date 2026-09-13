@@ -43,8 +43,10 @@ explicit ``@pytest.mark.asyncio``.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
-from _fm_helpers import backend_with_fake_graphiti
+from _fm_helpers import FakeGraphitiClient, backend_with_fake_graphiti
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 
 from fused_memory.backends import graphiti_client
@@ -129,3 +131,82 @@ class TestFreshUuidIsRejectedLoudly:
             f'{caught.value.__cause__!r}.'
         )
         assert str(caught.value.__cause__) == upstream_message
+
+
+class TestGuardFailsOpen:
+    """The guard may only claim the failure it can actually prove.
+
+    ``uuid is not None`` is NOT sufficient grounds to relabel an upstream
+    not-found as "your uuid does not exist": graphiti_core also raises
+    NodeNotFoundError from entity/edge resolution AFTER the episode loaded
+    fine, and attaching the LOAD-not-CREATE explanation to that would be an
+    actively misleading diagnosis.  Anything the guard cannot prove is about
+    the caller's own uuid must propagate untouched — degrading to exactly
+    today's behaviour rather than to a confident wrong claim.
+    """
+
+    @staticmethod
+    def _backend_raising(mock_config, exc: BaseException):
+        """A backend whose fake client raises *exc* from every add_episode.
+
+        Subclassing the promoted fake — rather than adding a raises= knob to
+        it — keeps this fail-open probing local to the module that needs it;
+        the shared double stays a faithful model of upstream's contract.
+        """
+
+        class _RaisingFake(FakeGraphitiClient):
+            async def add_episode(self, **kwargs):  # type: ignore[override]
+                raise exc
+
+        backend, _fake = backend_with_fake_graphiti(mock_config)
+        raising = _RaisingFake()
+        backend.client = raising
+        backend._client_for = MagicMock(return_value=raising)
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_not_found_naming_a_different_node_propagates_untouched(self, mock_config):
+        backend = self._backend_raising(
+            mock_config, GraphitiCoreNodeNotFoundError('some-unrelated-node-uuid')
+        )
+
+        with pytest.raises(GraphitiCoreNodeNotFoundError) as caught:
+            await backend.add_episode(name='n', content='c', group_id=GROUP, uuid=FRESH)
+
+        assert not isinstance(caught.value, graphiti_client.NodeNotFoundError), (
+            f'A not-found about a DIFFERENT node must not be relabelled as '
+            f'"your uuid does not exist"; got {str(caught.value)!r}.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_reworded_upstream_message_propagates_untouched(self, mock_config):
+        class _RewordedNotFound(GraphitiCoreNodeNotFoundError):
+            def __str__(self) -> str:
+                return f'episodic node {FRESH} could not be located'
+
+        backend = self._backend_raising(mock_config, _RewordedNotFound(FRESH))
+
+        with pytest.raises(GraphitiCoreNodeNotFoundError) as caught:
+            await backend.add_episode(name='n', content='c', group_id=GROUP, uuid=FRESH)
+
+        # Still OUR uuid — but the guard can no longer prove it, so it must
+        # decline to claim it. An upstream reword degrades to today's
+        # behaviour, never to a wrong explanation.
+        assert not isinstance(caught.value, graphiti_client.NodeNotFoundError), (
+            f'A reworded upstream message must fail OPEN; got '
+            f'{str(caught.value)!r}.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_uuid_none_never_translates(self, mock_config):
+        backend = self._backend_raising(
+            mock_config, GraphitiCoreNodeNotFoundError('anything')
+        )
+
+        with pytest.raises(GraphitiCoreNodeNotFoundError) as caught:
+            await backend.add_episode(name='n', content='c', group_id=GROUP)
+
+        assert not isinstance(caught.value, graphiti_client.NodeNotFoundError), (
+            f'Nothing on the uuid=None production path may be reinterpreted '
+            f'by this guard; got {str(caught.value)!r}.'
+        )
