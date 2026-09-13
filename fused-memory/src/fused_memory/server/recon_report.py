@@ -711,6 +711,40 @@ class ReconReportState:
     # Persistence (task 2716)
     # ------------------------------------------------------------------
 
+    def _reachable_run_entries(self, run_id: str) -> list[_ReportEntry]:
+        """Every entry of *run_id* a mutation can still REACH, identity-deduped.
+
+        The union of this run's ``_state`` entries and the distinct entries
+        behind ``_run_finding_index[run_id]``.  The two differ because
+        :meth:`tick` evicts a completed entry from ``_state`` at its own TTL
+        but deliberately keeps it in ``_run_finding_index`` until the whole RUN
+        quiesces (see that method's docstring), so its findings stay citable —
+        and supersedable — from a still-live sibling stage.
+
+        The invariant, named once here so the two scopes cannot drift apart:
+        an entry a mutation can reach through :meth:`_resolve_finding` is an
+        entry :meth:`_persist_run` must WRITE and :meth:`_purge_finding` must
+        SWEEP.  Before task 4653 both walked ``_state`` alone, so every
+        mutation of an evicted-but-indexed finding — the whole ``cite_*``
+        family as well as the ``supersedes`` stamp — was applied in memory and
+        then silently dropped on the way to the store.
+
+        Deliberately NOT for READS.  :meth:`get_assembled_report` stays
+        ``_state``-scoped on purpose: an evicted stage dropping out of the
+        assembled report is that method's intended semantics, and widening it
+        with this helper would change what the report CONTAINS — far beyond
+        aligning write reach with mutation reach.
+        """
+        entries = [
+            entry for (rid, _stage), entry in self._state.items() if rid == run_id
+        ]
+        seen = {id(entry) for entry in entries}
+        for entry in self._run_finding_index.get(run_id, {}).values():
+            if id(entry) not in seen:
+                seen.add(id(entry))
+                entries.append(entry)
+        return entries
+
     def _persist_run(self, run_id: str) -> None:
         """Write every ``(run_id, *)`` entry through to the store.  No-op if
         ``self._store is None``.
@@ -722,6 +756,14 @@ class ReconReportState:
         folds purge the losing finding from ITS owning entry) — upserting the
         whole run is trivially correct where "persist only what changed" would
         need fragile per-method reasoning about which stage's row to write.
+
+        The entries written are :meth:`_reachable_run_entries`, NOT the run's
+        ``_state`` rows.  Task 4653's supersession stamp is what forced that
+        reach to widen: its target is routinely an earlier stage that completed
+        and then aged out of ``_state`` while the run stayed live, so writing
+        only ``_state`` dropped the stamp — and, identically, every ``cite_*``
+        citation recorded on an evicted entry's finding.  See that helper for
+        the invariant binding mutation reach and write reach together.
 
         For each entry, computes its OWNED slice of the two run-level fold
         anchors (``_run_cited_task_index`` / the derived-signature entries in
@@ -746,9 +788,8 @@ class ReconReportState:
         active_stage = self._active.get(run_id)
         updated_at = self._clock()
         rows: list[dict[str, Any]] = []
-        for (rid, stage), entry in self._state.items():
-            if rid != run_id:
-                continue
+        for entry in self._reachable_run_entries(run_id):
+            rid, stage = entry.run_id, entry.stage
             # Serialize each entry independently so a single un-serializable
             # entry is skipped-and-logged without dropping the rest of the run.
             # This loop touches ONLY in-memory state (never the store), so the
@@ -1439,8 +1480,11 @@ class ReconReportState:
         # task-4653: stamp-late.  The new finding now exists, so the forward
         # pointer we write onto the target resolves.  _resolve_finding is
         # run-scoped and cross-stage, so a later stage can retire an earlier
-        # stage's claim; _persist_run below upserts EVERY entry of the run, so
-        # the stamp on the earlier stage's row is durably written.
+        # stage's claim — including one whose entry has already aged out of
+        # _state, which is the ORDINARY case rather than a corner.  _persist_run
+        # below writes every entry the run can still REACH
+        # (_reachable_run_entries), not just its _state rows, so the stamp on
+        # the earlier stage's row is durable either way.
         if supersedes_target is not None:
             if supersedes_target.superseded_by is not None:
                 logger.info(
