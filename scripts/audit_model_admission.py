@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -455,4 +455,106 @@ def scan_scoped_cap(
         scoped_hits=tuple(scoped),
         unscoped_cap_hit_count=unscoped,
         restarts=tuple(restarts),
+    )
+
+
+@dataclass(frozen=True)
+class SpendInWindow:
+    """The model's spend over one window, against its configured ceiling (check 5)."""
+
+    window_start: str
+    window_end: str
+    total_usd: float
+    invocation_count: int
+    ceiling_usd: float
+    headroom_usd: float
+    at_or_over_ceiling: bool
+
+
+def spend_in_window(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    window_start: datetime,
+    window_end: datetime,
+    ceiling_usd: float,
+) -> SpendInWindow:
+    """Sum *model*'s cost over the HALF-OPEN window ``[window_start, window_end)``.
+
+    Half-open, on ``completed_at``: a row exactly at the start is in, a row
+    exactly at the end is out.  Stated because the report's trailing-24h figure
+    is only reproducible if the convention is fixed, and because task 5441
+    re-runs this over a wider window and diffs the two.
+
+    ``at_or_over_ceiling`` is at-or-ABOVE — spend exactly equal to the ceiling
+    counts as exhausted, matching ``routing.py::_model_rejection_reason``, which
+    rejects on ``spend >= ceiling``.
+    """
+    total, count = conn.execute(
+        'SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*) FROM invocations '
+        'WHERE model = ? AND completed_at >= ? AND completed_at < ?',
+        (model, _iso(window_start), _iso(window_end)),
+    ).fetchone()
+    return SpendInWindow(
+        window_start=_iso(window_start),
+        window_end=_iso(window_end),
+        total_usd=total,
+        invocation_count=count,
+        ceiling_usd=ceiling_usd,
+        headroom_usd=ceiling_usd - total,
+        at_or_over_ceiling=total >= ceiling_usd,
+    )
+
+
+@dataclass(frozen=True)
+class RoleUsage:
+    """One role's run count and spend on the model."""
+
+    role: str
+    count: int
+    total_usd: float
+
+
+@dataclass(frozen=True)
+class RoleContainment:
+    """Which roles actually ran on the model, against the roles admitted (check 6)."""
+
+    expected_roles: tuple[str, ...]
+    by_role: tuple[RoleUsage, ...]
+    unexpected_roles: tuple[str, ...]
+
+
+def roles_on_model(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    since: datetime,
+    expected_roles: Sequence[str],
+) -> RoleContainment:
+    """Group *model*'s runs by role and compare against *expected_roles*.
+
+    An expected-vs-observed comparison rather than a bare GROUP BY, so a
+    containment regression fails LOUDLY on a later run instead of depending on
+    someone eyeballing a table.  ``by_role`` is seeded from *expected_roles*
+    first, so an admitted role that never ran renders as a visible zero — "the
+    merger never ran on this model at all" is the loudest finding this check can
+    make, and an omitted row would render it as silence.
+    """
+    observed = {
+        role: (count, total)
+        for role, count, total in conn.execute(
+            'SELECT role, COUNT(*), COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+            'WHERE model = ? AND completed_at >= ? GROUP BY role ORDER BY role',
+            (model, _iso(since)),
+        )
+    }
+    ordered = list(expected_roles) + [r for r in observed if r not in expected_roles]
+    return RoleContainment(
+        expected_roles=tuple(expected_roles),
+        by_role=tuple(
+            RoleUsage(role=role, count=observed.get(role, (0, 0.0))[0],
+                      total_usd=observed.get(role, (0, 0.0))[1])
+            for role in ordered
+        ),
+        unexpected_roles=tuple(r for r in observed if r not in expected_roles),
     )
