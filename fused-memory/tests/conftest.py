@@ -187,6 +187,38 @@ def _isolate_fm_config(monkeypatch):
     monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
 
 
+@pytest.fixture
+def code_default_config(monkeypatch, tmp_path):
+    """Resolve ``FusedMemoryConfig()`` from the SCHEMA alone, on request.
+
+    Opt-in counterpart to the autouse ``_isolate_fm_config`` above.  That
+    fixture deliberately keeps the tracked ``fused-memory/config/config.yaml``
+    loaded, because that is what every currently-green test was written
+    against — but it therefore leaves no way to ask what a field's CODE
+    default is.  Pointing ``CONFIG_PATH`` at a guaranteed-absent file makes
+    ``fused_memory.config.schema::YamlSettingsSource.__call__`` skip the YAML
+    layer (its ``.exists()`` is False), so only the schema's own defaults
+    remain.
+
+    Request it explicitly, or via ``@pytest.mark.usefixtures``; NEVER autouse.
+    It runs after the autouse pin and deliberately overrides it, so making it
+    autouse would strip the YAML from the whole suite.
+
+    THE MEASUREMENT THAT SIZES BOTH FIXTURES — taken at eb04f1d1c8, the whole
+    suite with the YAML layer removed (``FM_CONFIG_PATH`` temporarily
+    re-pointed at an absent file, less the two assertions in this branch that
+    exist to pin the file's PRESENCE and so cannot survive its removal):
+    ``1 failed, 19783 passed, 3 skipped`` in 265.69s.  The single failure is
+    ``test_referent_repair.py::TestTheStormGateProjectRoot::test_the_taskmaster_project_root_is_never_used_as_a_fallback``
+    — the trap this task exists because of.  Exactly one test in ~19.8k reads
+    a value that only the ambient file supplies, which is why a CWD-dependent
+    config could sit under this suite unnoticed.  Mirrors
+    ``orchestrator/tests/conftest.py::code_default_config``, whose absent-file
+    trick this copies.
+    """
+    monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _reap_leaked_ticket_workers():
     """Drain any orphaned TaskInterceptor._curator_worker task at every
