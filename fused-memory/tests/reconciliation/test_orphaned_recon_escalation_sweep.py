@@ -959,6 +959,142 @@ class TestSweepOrphanedReconEscalations:
         queue.resolve.assert_not_called()
 
 
+class TestFailOpenCensusIsTreatedAsFailure:
+    """An empty-but-SUCCESSFUL census read is proof of failure, not evidence.
+
+    ``backends/sqlite_task_backend.py::get_statuses_fresh`` never raises: it
+    "fails open to ``{}`` on any error" — a non-existent DB file, a permission
+    error, a disk I/O failure, a corrupt file, an exhausted 5000ms WAL
+    ``busy_timeout`` under write contention — and only logs a warning.  So the
+    raise/except ladder in ``_project_status_census`` never fires for the
+    production backend, and without the guard under test here a failed read
+    arrives as a clean ``{}``, renders EVERY record ``'missing'``, and hands
+    the whole pending queue to the sole closer.
+
+    The discriminator that makes emptiness provably a failure:
+    ``list_tags`` is ``SELECT DISTINCT tag FROM tasks``, so a tag it returns
+    has at least one task row by construction.  An empty per-tag census for a
+    tag ``list_tags`` just reported therefore cannot be ground truth.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_single_tag_census_is_an_error_not_a_missing_subject(self):
+        """THE LOAD-BEARING CASE — a fail-open read must classify nothing.
+
+        Note the double is ``return_value={}``, NOT ``side_effect=Exception``:
+        that is exactly the shape the real backend presents, and the shape the
+        existing fail-safe tests do not exercise.
+        """
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['missing'] == 0, (
+            'an empty census is a failed read, never evidence of absence'
+        )
+        assert stats['terminal'] == 0
+        assert stats['flags'] == []
+
+    @pytest.mark.asyncio
+    async def test_one_empty_tag_of_several_fails_the_whole_project(self):
+        """A PARTIAL census must be indistinguishable from a failed one.
+
+        A subject absent from the tag that read cleanly could be ``blocked``
+        in the tag that did not, so classifying against the readable half is
+        the single-tag false ``missing`` in a new disguise.
+        """
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done'}, 'feature-x': {}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['terminal'] == 0, (
+            'a terminal-looking row in the readable tag is not enough when '
+            'another tag failed open'
+        )
+        assert stats['missing'] == 0
+        assert stats['flags'] == []
+
+    @pytest.mark.asyncio
+    async def test_empty_tag_list_with_empty_untagged_read_is_an_error(self):
+        """The fallback branch gets the same guard as the per-tag loop.
+
+        This helper is only ever reached for a project that has at least one
+        pending reapable record naming it, and a store with zero task rows in
+        any tag cannot have produced a gate-backlog escalation naming a
+        ``blocked`` subject — so an all-empty census there is far likelier an
+        unreadable or not-yet-created DB than ground truth.
+        """
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({DARK_ROOT: {}}, tags_by_root={DARK_ROOT: []})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['missing'] == 0
+        assert stats['flags'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_populated_census_still_classifies_every_shape(self):
+        """The guard must not disable ``missing`` detection altogether.
+
+        A subject genuinely absent from a POPULATED cross-tag census is still
+        a reapable orphan — that is the whole (b) half of the derivation rule.
+        """
+        absent = make_escalation(task_id='652', esc_id='esc-652-1')
+        terminal = make_escalation(task_id='650', esc_id='esc-650-1')
+        live = make_escalation(task_id='651', esc_id='esc-651-1')
+        queue = make_queue([absent, terminal, live])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done', '651': 'blocked'}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['errors'] == 0
+        assert stats['missing'] == 1
+        assert stats['terminal'] == 1
+        assert stats['live'] == 1
+        assert {f['task_id'] for f in stats['flags']} == {'650', '652'}
+
+    @pytest.mark.asyncio
+    async def test_a_fail_open_project_does_not_corrupt_a_healthy_sibling(self):
+        """Error scoping: one unreadable store never suppresses another's records."""
+        broken = make_escalation(
+            task_id='5943', esc_id='esc-5943-1', project_id='reify',
+        )
+        healthy = make_escalation(
+            task_id='650', esc_id='esc-650-1', project_id='dark_factory',
+        )
+        queue = make_queue([broken, healthy])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done'}},
+            REIFY_ROOT: {'master': {}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['missing'] == 0
+        assert stats['terminal'] == 1
+        assert {f['task_id'] for f in stats['flags']} == {'650'}
+
+
 _STAT_KEYS = (
     'orphaned_recon_escalations_scanned',
     'orphaned_recon_escalations_terminal',

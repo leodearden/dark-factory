@@ -255,6 +255,37 @@ class TestDeriveOrphanedReconEscalations:
         assert report['missing'] == 0
 
     @pytest.mark.asyncio
+    async def test_a_fail_open_census_reaps_nothing_under_apply(self, seeded_queue):
+        """THE IRREVERSIBLE PATH — an empty census must close nothing.
+
+        ``backends/sqlite_task_backend.py::get_statuses_fresh`` "fails open to
+        ``{}`` on any error" and never raises, so an unreadable store arrives
+        here as a clean empty census.  Unguarded, ``classify_orphan`` renders
+        every pending record ``'missing'`` and ``--apply`` closes the entire
+        queue — irreversibly, against no evidence at all.  ``list_tags`` is
+        ``SELECT DISTINCT tag FROM tasks``, so the tag it just returned has at
+        least one row and this emptiness is provably a failed read.
+        """
+        _, queue_dir, _ = seeded_queue
+        taskmaster = _make_taskmaster({DARK_ROOT: {'master': {}}})
+        before_pending = {e.id for e in EscalationQueue(queue_dir).get_pending()}
+
+        report = await _mod.run(
+            queue_dir=queue_dir, project_roots=PROJECT_ROOTS,
+            apply=True, taskmaster=taskmaster,
+        )
+
+        assert report['errors'] > 0
+        assert report['reapable_ids'] == []
+        assert report['reaped'] == 0
+        assert report['missing'] == 0, (
+            'a failed read is never evidence that a subject has no row'
+        )
+        assert {
+            e.id for e in EscalationQueue(queue_dir).get_pending()
+        } == before_pending, 'no record may leave pending on a failed census'
+
+    @pytest.mark.asyncio
     async def test_apply_closes_exactly_the_reapable_records(
         self, seeded_queue, taskmaster,
     ):
