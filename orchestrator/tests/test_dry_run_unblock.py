@@ -2660,14 +2660,20 @@ class TestPromptCarriesTaskContext:
         """Loud over silent: the investigator must be able to tell "this task
         has no description" from "we could not fetch it".
 
-        The marker phrase is asserted with its spaces intact — `tmp_path`
-        embeds the test's own name and is interpolated into the prompt as
-        `Worktree:`, so a single bare word can pass spuriously.
+        Matched against the module's own marker constant rather than a guessed
+        substring: `tmp_path` embeds the test's own name and is interpolated
+        into the prompt as `Worktree:`, so a single bare word ('unavailable')
+        passes spuriously against the temp directory.
         """
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
         scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
         prompt = await _capture_investigation_prompt(tmp_path, scheduler)
 
-        assert 'task record unavailable' in prompt.lower(), prompt
+        assert _TASK_UNAVAILABLE_MARKER in prompt, prompt
+        # The marker must actually say so — guards it being edited to nothing.
+        assert 'unavailable' in _TASK_UNAVAILABLE_MARKER.lower()
+        assert 'scope' in _TASK_UNAVAILABLE_MARKER.lower()
         # Still a well-formed prompt — degradation is additive, not destructive.
         assert 'Investigate and emit your structured proposal.' in prompt, prompt
         assert 'verify exhausted' in prompt, prompt

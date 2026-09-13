@@ -161,6 +161,29 @@ def _failure_diagnostics(result: Any) -> dict[str, Any]:
     }
 
 
+_TASK_TEXT_FIELD_CHARS = 4000
+"""Per-field cap on rendered task text in the investigation prompt.
+
+Generous enough that ordinary task text survives whole — unlike the 160/120-
+char clips the block `detail` already suffers — but bounded, so one oversized
+task record cannot crowd out the rest of the prompt.
+"""
+
+_TASK_UNAVAILABLE_MARKER = (
+    '**Task record:** unavailable — the task fetch failed, so this '
+    'investigation is running WITHOUT the task\'s title, description, details '
+    'or declared file scope. Judge scope creep conservatively.'
+)
+
+
+def _clip(value: str, label: str) -> str:
+    """Cap one rendered field, marking the clip the way the repo marks clips."""
+    text = str(value)
+    if len(text) <= _TASK_TEXT_FIELD_CHARS:
+        return text
+    return text[:_TASK_TEXT_FIELD_CHARS] + f'\n\n... [{label} truncated] ...'
+
+
 def _task_context_block(task: dict[str, Any] | None) -> str:
     """Render the blocked task's own text for the investigation prompt.
 
@@ -178,7 +201,7 @@ def _task_context_block(task: dict[str, Any] | None) -> str:
     trigger.  It cannot apply that rule with no scope to compare against.
     """
     if not task:
-        return ''
+        return _TASK_UNAVAILABLE_MARKER
     lines = []
     for label, value in (
         ('Title', task.get('title')),
@@ -186,10 +209,13 @@ def _task_context_block(task: dict[str, Any] | None) -> str:
         ('Details', task.get('details')),
     ):
         if value:
-            lines.append(f'**{label}:** {value}')
+            lines.append(f'**{label}:** {_clip(value, label.lower())}')
     files = (task.get('metadata') or {}).get('files')
     if files:
-        lines.append(f'**Declared files:** {", ".join(str(f) for f in files)}')
+        lines.append(
+            f'**Declared files:** '
+            f'{_clip(", ".join(str(f) for f in files), "declared files")}',
+        )
     return '\n'.join(lines)
 
 
