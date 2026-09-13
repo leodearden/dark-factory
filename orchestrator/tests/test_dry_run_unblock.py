@@ -2677,3 +2677,118 @@ class TestPromptCarriesTaskContext:
         # Still a well-formed prompt — degradation is additive, not destructive.
         assert 'Investigate and emit your structured proposal.' in prompt, prompt
         assert 'verify exhausted' in prompt, prompt
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-9: the task-fetch fallback is loud, and visible on the entry
+# ---------------------------------------------------------------------------
+
+def _persisted_entry(scheduler):
+    """The proposal entry from the ``append=True`` persist call.
+
+    Filtered rather than read off the last call: route resolution mirrors
+    ``metadata.routing`` through a SECOND ``update_task``, and the trim write
+    is a third — see ``_assert_one_proposal_persist``.
+    """
+    persists = [
+        c for c in scheduler.update_task.call_args_list
+        if c.kwargs.get('append') is True
+    ]
+    assert len(persists) == 1, (
+        f'expected exactly one persist call; got {scheduler.update_task.call_args_list}'
+    )
+    return persists[0].args[1]['dry_run_proposals'][0]
+
+
+async def _run_with_scheduler(tmp_path, scheduler) -> None:
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output={
+        'proposal_text': 'Rebase on main and rerun verify',
+        'risk_label': 'low',
+        'files_referenced': [],
+    })
+    with patch('orchestrator.dry_run_unblock.invoke_agent',
+               new=AsyncMock(return_value=agent_result)):
+        await run_dry_run_unblock(
+            task_id='42',
+            worktree=str(tmp_path),
+            reason='verify exhausted',
+            detail='All 5 attempts timed out',
+            scheduler=scheduler,
+            mcp=MagicMock(),
+            config=_make_config(),
+        )
+
+
+class TestTaskFetchFallbackIsLoud:
+    """A failed task fetch used to be swallowed by a bare `except Exception`.
+
+    It silently dropped BOTH the task text and the task's
+    `model_overrides['unblock_auto']` routing pin, with no log at any level
+    and nothing on the persisted entry — so an operator reviewing
+    `metadata.dry_run_proposals[-1]` could not tell a degraded investigation
+    from a healthy one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raising_fetch_warns(self, tmp_path, caplog):
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'Expected one WARNING naming the failed task fetch; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+        message = matching[0].getMessage()
+        assert '42' in message, message
+        assert 'fused-memory down' in message, message
+
+    @pytest.mark.asyncio
+    async def test_raising_fetch_stamps_the_flag_on_the_entry(self, tmp_path):
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        entry = _persisted_entry(scheduler)
+        assert entry['task_context_unavailable'] is True, entry
+
+    @pytest.mark.asyncio
+    async def test_non_awaitable_get_task_also_warns_and_stamps(self, tmp_path, caplog):
+        """The MagicMock-scheduler shape used across this suite.
+
+        Its `get_task` is not awaitable, so awaiting it raises TypeError — this
+        shape has been taking the silent fallback path all along.
+        """
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        assert any(
+            r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+            for r in caplog.records
+        ), f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        assert _persisted_entry(scheduler)['task_context_unavailable'] is True
+
+    @pytest.mark.asyncio
+    async def test_healthy_path_carries_the_flag_as_false(self, tmp_path):
+        """SHAPE PARITY — always present, never absent, matching the convention
+        `_failure_diagnostics` already sets. A consumer must never have to
+        distinguish 'absent key' from 'old entry' from 'healthy'."""
+        scheduler = _TaskDocScheduler()
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        entry = _persisted_entry(scheduler)
+        assert 'task_context_unavailable' in entry, entry
+        assert entry['task_context_unavailable'] is False, entry
