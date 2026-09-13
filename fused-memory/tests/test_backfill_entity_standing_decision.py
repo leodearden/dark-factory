@@ -25,6 +25,13 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.memory_metadata import (
+    EXPERIMENTAL_KEY_PREFIX,
+    classify_unknown_keys,
+)
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+)
 from fused_memory.utils.validation import is_full_uuid
 
 SCRIPT_PATH = (
@@ -260,3 +267,109 @@ class TestSelectEvidenceOnlyTargets:
 
     def test_empty_corpus_selects_nothing(self) -> None:
         assert _mod.select_evidence_only_targets([], ENTITY_UUID) == []
+
+
+# ---------------------------------------------------------------------------
+# The two pure builders — evidence refs, and the Open-Question-6 stamp
+# ---------------------------------------------------------------------------
+
+
+class TestBuildEvidenceRefs:
+    """Every cited id reaches β verbatim, exactly once, source first."""
+
+    @staticmethod
+    def _refs() -> list[dict]:
+        return _mod.build_evidence_refs(EXPECTED_STAMP_TARGETS, ENTITY_UUID)
+
+    def test_cites_every_stamp_target_and_every_pinned_human_record(self) -> None:
+        mem0_ids = [
+            ref['id'] for ref in self._refs() if ref['type'] == 'mem0'
+        ]
+        assert set(mem0_ids) == {
+            *EXPECTED_STAMP_TARGETS,
+            *_mod.HUMAN_EVIDENCE_MEMORY_IDS,
+        }
+
+    def test_cites_the_opening_escalation_as_a_foreign_ref(self) -> None:
+        escalation_refs = [
+            ref for ref in self._refs() if ref['type'] == 'escalation'
+        ]
+        assert escalation_refs == [
+            {'type': 'escalation', 'id': _mod.ESCALATION_EVIDENCE_ID}
+        ]
+
+    def test_the_source_record_is_cited_first(self) -> None:
+        """The row's provenance reads as "this record, plus its corroboration"."""
+        assert self._refs()[0] == {'type': 'mem0', 'id': _mod.SOURCE_MEMORY_ID}
+
+    def test_no_id_is_cited_twice(self) -> None:
+        ids = [ref['id'] for ref in self._refs()]
+        assert len(ids) == len(set(ids))
+
+    def test_refs_are_bare_and_unresolved(self) -> None:
+        """β's ``resolve_evidence_refs`` owns ``locally_resolved`` (INV-5).
+
+        A builder that pre-stamped resolution would be a second, un-run opinion
+        about whether an id exists.
+        """
+        assert all(set(ref) == {'type', 'id'} for ref in self._refs())
+
+    def test_an_empty_stamp_plan_still_cites_the_pinned_evidence(self) -> None:
+        """An idempotent re-run stamps nothing, but the row's provenance must not
+        shrink to depend on what a previous run happened to leave unstamped."""
+        refs = _mod.build_evidence_refs([], ENTITY_UUID)
+        ids = {ref['id'] for ref in refs}
+        assert _mod.SOURCE_MEMORY_ID in ids
+        assert set(_mod.HUMAN_EVIDENCE_MEMORY_IDS) <= ids
+        assert _mod.ESCALATION_EVIDENCE_ID in ids
+
+
+class TestBuildEvidenceOnlyPatch:
+    """PRD Open Question 6: four flat Tier-C scalar keys."""
+
+    MIGRATED_AT = '2026-09-13T12:00:00+00:00'
+
+    @classmethod
+    def _patch(cls) -> dict:
+        return _mod.build_evidence_only_patch(
+            entity_uuid=ENTITY_UUID,
+            grounds=_mod.GROUNDS,
+            migrated_at=cls.MIGRATED_AT,
+        )
+
+    def test_carries_exactly_the_four_decided_keys(self) -> None:
+        assert set(self._patch()) == {
+            'x_standing_decision_status',
+            'x_standing_decision_entity_uuid',
+            'x_standing_decision_grounds',
+            'x_standing_decision_migrated_at',
+        }
+
+    def test_status_marks_the_record_evidence_only(self) -> None:
+        assert self._patch()['x_standing_decision_status'] == 'evidence_only'
+
+    def test_grounds_and_entity_are_carried_as_separate_fields(self) -> None:
+        """NOT δ's joined ``f'{uuid}:{grounds}'`` id — structured data, not a
+        meaningful string, and no second site re-deriving that join."""
+        patch = self._patch()
+        assert patch['x_standing_decision_entity_uuid'] == ENTITY_UUID
+        assert patch['x_standing_decision_grounds'] == GROUNDS_STRUCTURAL_SIZE_CONFLATION
+
+    def test_migrated_at_is_echoed_verbatim(self) -> None:
+        assert self._patch()['x_standing_decision_migrated_at'] == self.MIGRATED_AT
+
+    def test_every_key_carries_the_experimental_prefix(self) -> None:
+        assert all(
+            key.startswith(EXPERIMENTAL_KEY_PREFIX) for key in self._patch()
+        )
+
+    def test_every_value_is_a_queryable_scalar_string(self) -> None:
+        """Flat scalars, never one nested dict: Qdrant payload filters do
+        exact-match on scalars, so an operator can enumerate every demoted
+        record with ``get_memories_by_metadata(reify, {...: 'evidence_only'})``.
+        """
+        assert all(isinstance(value, str) for value in self._patch().values())
+
+    def test_the_stamp_adds_no_unknown_key_census_line(self) -> None:
+        """Checked against the REAL validator, not by eyeballing the prefixes."""
+        assert classify_unknown_keys(self._patch()) == []
