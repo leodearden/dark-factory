@@ -539,6 +539,34 @@ def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
         ) from exc
 
 
+@dataclasses.dataclass(frozen=True)
+class FileCognitive:
+    """Both cognitive projections of ONE complexipy measurement of one file."""
+
+    total: int
+    per_function: dict[str, int]
+
+
+def file_cognitive_measures(path: Path) -> FileCognitive:
+    """Measure *path* with complexipy ONCE and derive both projections from it.
+
+    The two projections are two VIEWS of a single ``FileComplexity``, so this
+    is where the derivation lives and ``cognitive_complexity`` /
+    ``file_cognitive_total`` are its named halves. Deliberately NOT a cache:
+    a memo keyed on a path would return the file as it WAS, would retain every
+    result for the life of a process the merge lane runs on every verify leg,
+    and would need a carve-out to keep ``_file_complexity``'s MetricsError from
+    being swallowed. One call site needs no cache to make one call.
+    """
+    result = _file_complexity(path)
+    return FileCognitive(
+        total=int(result.complexity),
+        per_function={
+            function.name: function.complexity for function in result.functions
+        },
+    )
+
+
 def cognitive_complexity(path: Path) -> dict[str, int]:
     """Per-function cognitive complexity of *path*, keyed by complexipy qualname.
 
@@ -546,8 +574,7 @@ def cognitive_complexity(path: Path) -> dict[str, int]:
     post-processing. A module with no functions yields an empty map -- that is a
     real measurement, not a skipped one.
     """
-    result = _file_complexity(path)
-    return {function.name: function.complexity for function in result.functions}
+    return file_cognitive_measures(path).per_function
 
 
 def file_cognitive_total(path: Path) -> int:
@@ -556,7 +583,7 @@ def file_cognitive_total(path: Path) -> int:
     Reported and ratcheted alongside the per-function map, because the file
     total also counts module-level control flow that belongs to no function.
     """
-    return int(_file_complexity(path).complexity)
+    return file_cognitive_measures(path).total
 
 
 def maintainability_index(source: str, *, path: str) -> float:
