@@ -1042,17 +1042,18 @@ class CockpitApp(App):
 
         A LOCAL clipboard helper (wl-copy/xclip/xsel, via
         cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard) is tried
-        first; OSC 52 is the fallback for when no local helper can reach a
-        clipboard, which is the over-SSH case. Task 2517 shipped the OSC 52
-        leg alone, and that is a measured total no-op on Konsole 23.08.5:
-        the operator pressed 'y', nothing reached the clipboard, and nothing
-        said so (task 5448).
+        first, and OSC 52 is only the fallback for when no local helper can
+        reach a clipboard -- the over-SSH case. OSC 52 alone reached no
+        clipboard at all on the operator's terminal; that module's docstring
+        carries the incident account (task 5448).
 
-        Both outcomes toast, and the toast names the mechanism that ran --
-        without one, a future capability regression is again invisible at
-        the moment of use. cockpit/src/cockpit/clipboard.py::copy_feedback
-        owns that wording and the fallback decision; this method owns only
-        the policy around them.
+        This method owns three things and nothing else: the highlighted-row
+        lookup, the guard around the injected seam, and the two side effects
+        cockpit/src/cockpit/clipboard.py::copy_feedback asks for. Which
+        mechanism the toast names, its severity, and whether OSC 52 still
+        runs are all copy_feedback's call. Both outcomes DO toast -- without
+        that, a future capability regression is again invisible at the
+        moment of use.
 
         Strictly READ-ONLY: never calls set_manual_boost/
         update_decision_state, preserving the pure-consumer write-

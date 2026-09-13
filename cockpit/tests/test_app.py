@@ -1553,13 +1553,12 @@ class TestCopyAction:
     """'y' hands the highlighted row's payload to the clipboard seam.
 
     These tests previously asserted on `app._clipboard`, Textual's private
-    record of the last copy_to_clipboard call. That was the false green task
-    5448 re-opened 2517 to fix: Textual sets that attribute BEFORE writing
-    the OSC 52 escape and regardless of whether the terminal understands it,
-    so the assertion passed against a copy that reached no clipboard on
-    Konsole 23.08.5. The replacement asserts on the injected seam (here) and
-    on Textual's PUBLIC copy_to_clipboard/notify (TestCopyFallbackAndFeedback
-    below) -- never a private attribute.
+    record of the last copy_to_clipboard call -- the false green task 5448
+    re-opened 2517 to fix (cockpit/src/cockpit/clipboard.py's module
+    docstring says why that attribute cannot answer the question). The
+    replacement asserts on the injected seam (here) and on Textual's PUBLIC
+    copy_to_clipboard/notify (TestCopyFallbackAndFeedback below) -- never a
+    private attribute.
     """
 
     @pytest.mark.timeout(10)
@@ -1715,17 +1714,23 @@ class RecordingOsc52:
 
 
 class RecordingNotify:
-    """Spy for Textual's PUBLIC App.notify; records (message, severity) per toast.
+    """Spy for Textual's PUBLIC App.notify; records (message, severity, title) per toast.
 
     Takes **kwargs rather than notify's exact keyword list so a Textual
-    release adding a parameter widens this spy for free.
+    release adding a parameter widens this spy for free. The message is
+    recorded because it is the deliverable: the operator being told what
+    happened and through which mechanism. Its WORDING is pinned once, in
+    test_clipboard.py::TestCopyFeedback; what these tests pin is that
+    action_copy forwards that exact string rather than some other one.
     """
 
     def __init__(self):
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, str | None]] = []
 
     def __call__(self, message, **kwargs):
-        self.calls.append((message, kwargs.get('severity', 'information')))
+        self.calls.append(
+            (message, kwargs.get('severity', 'information'), kwargs.get('title'))
+        )
 
 
 class ExplodingCopyRunner:
@@ -1778,19 +1783,26 @@ class TestCopyFallbackAndFeedback:
     async def test_a_successful_local_copy_skips_osc52_and_toasts_information(
         self, tmp_path, monkeypatch
     ):
-        """A local helper took the payload -- no wasted escape write, and a success toast."""
+        """A local helper took the payload -- no wasted escape write, and a success toast.
+
+        The toast must carry copy_feedback's own message, naming the
+        mechanism that ran: a regression passing the payload (or a message
+        with the helper name dropped) would otherwise leave every test in
+        this class green while telling the operator nothing useful.
+        """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
-        from cockpit.clipboard import CopyAttempt, CopyOutcome
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
 
         _write_copyable_decision(tmp_path)
 
+        attempt = CopyAttempt(CopyOutcome.COPIED, ('xclip',))
         app = CockpitApp(
             fleet_root=tmp_path,
             backend=FakeBackend(),
             poll_interval=0.05,
-            copy_runner=RecordingCopyRunner(CopyAttempt(CopyOutcome.COPIED, ('xclip',))),
+            copy_runner=RecordingCopyRunner(attempt),
         )
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -1804,20 +1816,23 @@ class TestCopyFallbackAndFeedback:
             await pilot.pause()
 
             assert osc52.texts == []
-            assert len(notifications.calls) == 1
-            assert notifications.calls[0][1] == 'information'
+            assert notifications.calls == [
+                (copy_feedback(attempt).message, 'information', 'Copy')
+            ]
+            assert 'xclip' in notifications.calls[0][0]
 
     @pytest.mark.timeout(10)
     async def test_no_local_helper_falls_back_to_osc52_and_warns(self, tmp_path, monkeypatch):
         """The over-SSH case: the same payload goes out as OSC 52, and the toast says so."""
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
-        from cockpit.clipboard import CopyAttempt, CopyOutcome
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
 
         _write_copyable_decision(tmp_path)
 
-        copy_runner = RecordingCopyRunner(CopyAttempt(CopyOutcome.NO_HELPER))
+        attempt = CopyAttempt(CopyOutcome.NO_HELPER)
+        copy_runner = RecordingCopyRunner(attempt)
         app = CockpitApp(
             fleet_root=tmp_path,
             backend=FakeBackend(),
@@ -1837,7 +1852,10 @@ class TestCopyFallbackAndFeedback:
 
             assert osc52.texts == copy_runner.payloads
             assert len(notifications.calls) == 1
-            assert notifications.calls[0][1] == 'warning'
+            message, severity, _title = notifications.calls[0]
+            assert severity == 'warning'
+            assert message == copy_feedback(attempt).message
+            assert 'OSC 52' in message
 
     @pytest.mark.timeout(10)
     async def test_a_raising_copy_runner_still_falls_back_and_warns(self, tmp_path, monkeypatch):
@@ -1849,6 +1867,7 @@ class TestCopyFallbackAndFeedback:
         """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
 
         _write_copyable_decision(tmp_path)
@@ -1874,7 +1893,12 @@ class TestCopyFallbackAndFeedback:
             assert copy_runner.payloads
             assert osc52.texts == copy_runner.payloads
             assert len(notifications.calls) == 1
-            assert notifications.calls[0][1] == 'warning'
+            message, severity, _title = notifications.calls[0]
+            assert severity == 'warning'
+            # The guard degrades to a HELPER_FAILED carrying no argv, so the
+            # toast reads as prose rather than naming a helper that never ran.
+            assert message == copy_feedback(CopyAttempt(CopyOutcome.HELPER_FAILED)).message
+            assert 'OSC 52' in message
 
     @pytest.mark.timeout(10)
     async def test_empty_queue_neither_falls_back_nor_toasts(self, tmp_path, monkeypatch):
