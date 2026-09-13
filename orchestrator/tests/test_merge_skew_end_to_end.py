@@ -144,7 +144,7 @@ def _make_config(
 
     Passing ``escalate_preexisting_main_break=True`` restores the SHIPPED
     default (``config.py``) so this harness still touches the configuration an
-    orchestrator actually runs in at least once -- see
+    orchestrator actually runs in at least once — see
     :class:`TestShippedMainHealthConfiguration`.
     """
     return OrchestratorConfig(
@@ -169,7 +169,7 @@ def _make_git_ops(
     and the real repo, never from this.  ``''`` is ``get_main_sha``'s own
     documented error return, and handing it to the DEFERRED main-health probe
     stops that probe at ``verify_failure_is_preexisting_on_main``'s ``if not
-    main_sha`` early return -- which is how
+    main_sha`` early return — which is how
     :class:`TestShippedMainHealthConfiguration` can let the probe really spawn
     without paying for a probe build.
     """
