@@ -50,6 +50,7 @@ import pytest
 from _graphiti_fake import FakeGraphitiClient, backend_with_fake_graphiti
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 
+import fused_memory.services.durable_queue as dq_module
 from fused_memory.backends import graphiti_client
 
 # Never stored by the fake, so its ``uuid=`` branch raises the genuine
@@ -151,6 +152,38 @@ class TestFreshUuidIsRejectedLoudly:
             f'{caught.value.__cause__!r}.'
         )
         assert str(caught.value.__cause__) == upstream_message
+
+    @pytest.mark.asyncio
+    async def test_the_translated_message_stays_retryable_for_the_durable_queue(
+        self, backend_and_fake
+    ):
+        """The seam's cross-module claim, fed through the real parser.
+
+        ``durable_queue.py::_classify_failure`` dead-letters an item on attempt
+        1 (task 3586) when a not-found message names that item's OWN payload
+        uuid — a judgement it reaches by PARSING the message, since that module
+        deliberately does not import graphiti_core.  Replacing upstream's
+        message therefore silently decides the retry policy of any queued write
+        that carries it, and the comment at the translation site asserts the
+        answer (falls open to ordinary retry) without mechanising it.
+
+        Behavioural, not a wording pin: every rewording that keeps the message
+        unparseable stays green, and only one that made it parseable — flipping
+        a queued add_episode from retryable to permanently dead-lettered —
+        turns this red.
+        """
+        backend, _fake = backend_and_fake
+
+        with pytest.raises(graphiti_client.NodeNotFoundError) as caught:
+            await backend.add_episode(name='n', content='c', group_id=GROUP, uuid=FRESH)
+
+        parsed = dq_module._parse_not_found_uuid(str(caught.value))
+        assert parsed is None, (
+            f'The translated message must not read as graphiti_core\'s own '
+            f'not-found shape, or a queued write failing this way would be '
+            f'dead-lettered on attempt 1 instead of retried; it parsed as '
+            f'{parsed!r} from {str(caught.value)!r}.'
+        )
 
 
 class TestGuardFailsOpen:

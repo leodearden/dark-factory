@@ -1547,7 +1547,10 @@ class GraphitiBackend:
             # durable_queue.py::_NOT_FOUND_MESSAGE_RE, so inside a queued write
             # it would fall open to ordinary retry rather than task 3586's
             # ('permanent', 1) rule — moot today, since post-3561 an add_episode
-            # payload cannot carry a uuid at all.
+            # payload cannot carry a uuid at all. Enforced, not merely claimed:
+            # tests/test_graphiti_add_episode_uuid_param.py::
+            # test_the_translated_message_stays_retryable_for_the_durable_queue
+            # feeds this message through durable_queue's real parser.
             if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
                 raise
             raise NodeNotFoundError(
