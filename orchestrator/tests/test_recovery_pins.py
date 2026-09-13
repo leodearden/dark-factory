@@ -29,6 +29,7 @@ from orchestrator.recovery_pins import (
     records_pin_blocked_done_flip,
     records_pin_blocked_recovery,
     records_pin_recovery,
+    records_would_duplicate_a_handoff,
 )
 from orchestrator.task_ground_truth import EscalationRef
 
@@ -451,3 +452,85 @@ class TestTheTwoBlockedPredicatesDivergeOnExactlyOneRow:
         assert records_pin_blocked_done_flip(_TID, None, live_claimant=False) is (
             records_pin_blocked_recovery(_TID, None, live_claimant=False)
         )
+
+
+# ---------------------------------------------------------------------------
+# REVIEW FINDING 1 — the DEDUP's own question.
+#
+# The re-file dedup guard asks something no pin predicate answers: "is there
+# already an open record that some handler OWNS?"  If yes, re-filing stacks a
+# duplicate; if no, the re-file the resolver ordered must proceed.
+#
+# `bool(open_escalations)` gets this wrong in the direction that SWALLOWS work:
+# since task eta made `_shape` pin-class-aware, an info-only strand reaches
+# `_RECOVERY` row (g) and the table returns RE_FILE_ESCALATION — then the bare
+# truthiness guard counts that same info record and returns None.  Nothing pins
+# the task, nothing re-files, and nothing is emitted.
+#
+# It is NOT `pins` either: a dead-filer L0 is still a record sitting on the
+# task, and part 4 of this task promotes it, so stacking a second L1 over it
+# WOULD duplicate.  That is the row where the two differ.
+# ---------------------------------------------------------------------------
+
+
+class TestRecordsWouldDuplicateAHandoff:
+    """"Is there already an open record with an owner?" — the dedup question."""
+
+    def test_empty_would_not_duplicate(self) -> None:
+        assert records_would_duplicate_a_handoff(
+            _TID, [], live_claimant=False,
+        ) is False
+
+    def test_info_only_would_not_duplicate(self) -> None:
+        """An annotation has no consumer, so re-filing over it stacks nothing.
+
+        This is the case the bare truthiness guard swallowed.
+        """
+        assert records_would_duplicate_a_handoff(
+            _TID, [_ref('design_concern', level=0, severity='info')],
+            live_claimant=False,
+        ) is False
+
+    def test_a_blocking_l1_would_duplicate(self) -> None:
+        assert records_would_duplicate_a_handoff(
+            _TID, [_ref('task_failure')], live_claimant=False,
+        ) is True
+
+    def test_a_dead_filer_l0_would_duplicate(self) -> None:
+        """THE ROW WHERE THIS DIFFERS FROM `pins`.
+
+        A dead L0 does not PIN — recovery proceeds past it.  But it is still a
+        record sitting on the task, and part 4 of this task promotes it to L1,
+        so a second L1 filed now would be the duplicate this guard exists to
+        prevent.
+        """
+        records = [_ref('task_failure', level=0)]
+        assert records_would_duplicate_a_handoff(
+            _TID, records, live_claimant=False,
+        ) is True
+        assert records_pin_recovery(_TID, records, live_claimant=False) is False
+
+    def test_store_unavailable_would_duplicate(self) -> None:
+        """Fail safe: you cannot tell what you would be stacking."""
+        assert records_would_duplicate_a_handoff(
+            _TID, None, live_claimant=False,
+        ) is True
+
+    @pytest.mark.parametrize(
+        ('label', 'records'),
+        [
+            ('empty', []),
+            ('info-only', [_ref('design_concern', level=0, severity='info')]),
+            ('blocking-l1', [_ref('task_failure')]),
+            ('dead-filer-l0', [_ref('task_failure', level=0)]),
+        ],
+        ids=lambda v: v if isinstance(v, str) else '',
+    )
+    def test_it_is_not_pins(self, label: str, records: list) -> None:
+        """Enumerated, so the dedup can never quietly become a pin check."""
+        dedup = records_would_duplicate_a_handoff(_TID, records, live_claimant=False)
+        pins = records_pin_recovery(_TID, records, live_claimant=False)
+        if label == 'dead-filer-l0':
+            assert dedup is True and pins is False
+        else:
+            assert dedup is pins

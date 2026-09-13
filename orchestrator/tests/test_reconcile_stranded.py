@@ -4773,3 +4773,128 @@ class TestApplierHasNoLocalOpenEscalationTruthiness:
             # `return None` — not a veto arm with an emission.
             assert lines[offenders[0]].strip() == 'return None', lines[offenders[0]]
 
+
+
+# ---------------------------------------------------------------------------
+# REVIEW FINDING 1 — the dedup guard must stop swallowing a re-file the
+# rewired resolver legitimately ORDERS, and must never hold silently.
+#
+# Task eta made `_shape`'s escalation element pin-class-aware, so an info-only
+# strand now keys `vetoes_done_flip=False`, hits `_RECOVERY` row (g) and the
+# table returns RE_FILE_ESCALATION (pre-eta it keyed True and fell to the LEAVE
+# default).  The applier's `if report.open_escalations:` then counts that same
+# info record and returns None: nothing pins the task, nothing re-files, and
+# because the chokepoint only emits for LEAVE the disposition is never
+# described either — an unowned, unreported hold.
+#
+# Spec §7.6 ("orphaned parks get re-owned ... instead of leaving a permanently
+# silent hold") and §7.3 ("every veto/LEAVE emits ... never a bare
+# `return None`").
+# ---------------------------------------------------------------------------
+
+
+def _gone_no_marker_blocked(harness: Harness, tid: str) -> None:
+    """Wire *tid* as a stranded BLOCKED task whose branch is GONE_NO_MARKER."""
+    harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+
+
+def _pending_ids(harness: Harness, tid: str) -> list[tuple[str, int, str]]:
+    rows = harness._escalation_queue.get_by_task(tid, status='pending')  # type: ignore[union-attr]
+    return sorted((e.id, e.level, e.category) for e in rows)
+
+
+@pytest.mark.asyncio
+class TestDedupGuardDoesNotSwallowAnOrderedReFile:
+    """The regression cell the suite lacked: row (g) reached past an annotation."""
+
+    async def test_an_info_only_blocked_strand_is_re_filed(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """Row (g) ORDERED a re-file; the dedup must not veto it.
+
+        An info annotation has no consumer, so there is no handoff for the
+        fresh L1 to duplicate — which is the only thing this guard exists to
+        prevent.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _gone_no_marker_blocked(harness, '7')
+        probe = _submit_open(
+            harness, tmp_path, '7',
+            severity='info', category='design_concern', level=0,
+        )
+
+        await harness._reconcile_one_stranded('7', 'blocked', mid_run=False)
+
+        after = _pending_ids(harness, '7')
+        assert (probe.id, 0, 'design_concern') in after, 'the annotation is untouched'
+        assert any(
+            level == 1 and category == 'stranded_blocked' for _, level, category in after
+        ), f'row (g) ordered a re-file and nothing filed one: {after}'
+
+    async def test_a_pinning_l1_still_dedups_and_now_speaks(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """When the guard DOES fire, the hold must be DESCRIBED (spec §7.3).
+
+        The chokepoint above cannot cover this one: `action` here is
+        RE_FILE_ESCALATION, not LEAVE, so a bare `return None` leaves an
+        operator with no row at all for a task the sweep decided to hold.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _off_main_in_progress(harness, '8')
+        harness.scheduler.get_statuses.return_value = ({'8': 'blocked'}, None)
+        seeded = _submit_open(
+            harness, tmp_path, '8', category='stranded_blocked', level=1,
+        )
+
+        with patch(
+            'orchestrator.harness.detect_verified_green', AsyncMock(return_value=None),
+        ), patch.object(
+            harness, '_emit_recovery_disposition',
+            wraps=harness._emit_recovery_disposition,
+        ) as spy:
+            result = await harness._reconcile_one_stranded('8', 'blocked', mid_run=False)
+
+        assert result is None
+        assert _pending_ids(harness, '8') == [
+            (seeded.id, 1, 'stranded_blocked'),
+        ], 'must not stack a second stranded_blocked L1'
+        assert spy.call_count == 1, (
+            'the hold must be emitted exactly once — never a bare return None, '
+            'and never doubled by the tail arm'
+        )
+        from orchestrator.recovery_emission import LeaveReason
+
+        assert spy.call_args.kwargs['reason'] == LeaveReason.escalation_pinned
+
+    async def test_a_dead_filer_l0_still_dedups_and_speaks(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """A dead L0 is not a PIN but IS a record with an owner-to-be.
+
+        Part 4 of this task promotes it to L1, so a second L1 filed now would
+        be exactly the duplicate this guard prevents.  Asserted so the
+        dead-L0 dedup is a checked decision rather than a side effect of
+        whichever predicate the site happened to call.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _off_main_in_progress(harness, '9')
+        harness.scheduler.get_statuses.return_value = ({'9': 'blocked'}, None)
+        seeded = _submit_open(
+            harness, tmp_path, '9', category='stranded_blocked', level=0,
+        )
+
+        with patch(
+            'orchestrator.harness.detect_verified_green', AsyncMock(return_value=None),
+        ), patch.object(
+            harness, '_emit_recovery_disposition',
+            wraps=harness._emit_recovery_disposition,
+        ) as spy:
+            result = await harness._reconcile_one_stranded('9', 'blocked', mid_run=False)
+
+        assert result is None
+        assert _pending_ids(harness, '9') == [(seeded.id, 0, 'stranded_blocked')]
+        assert spy.call_count == 1
