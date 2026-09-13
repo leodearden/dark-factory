@@ -38,7 +38,12 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from shared.psi import parse_pressure_file, read_pressure
+from shared.psi import (
+    RunqueueReading,
+    parse_pressure_file,
+    read_pressure,
+    read_runqueue_ratio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +55,17 @@ __all__ = [
     'sum_verify_rss',
     'collect_process_metrics',
     'discover_pressure_cgroups',
+    'collect_load_metrics',
 ]
+
+# The cgroup v2 unified-hierarchy mountpoint. A DEFAULT for the injected
+# ``cgroup_root`` seam, in the same shape as ``_default_fd9_exists`` below —
+# not a second source of truth: every caller that cares injects its own, and
+# every test does. shared.psi holds the same literal privately for its own
+# defaults and exposes no public constant to borrow (it is α's file, out of
+# this task's scope), so the two defaults coexist rather than one importing a
+# private from the other.
+_CGROUP_ROOT = Path('/sys/fs/cgroup')
 
 _USER_MANAGER_PREFIX = 'user@'
 _DF_LEAF_GLOB = '*/df-*.slice'
@@ -164,6 +179,44 @@ def collect_psi(
 # ---------------------------------------------------------------------------
 # Process-metric counters (pure, take injected process iterables)
 # ---------------------------------------------------------------------------
+
+
+def collect_load_metrics(
+    *,
+    read_runqueue: Callable[..., RunqueueReading] = read_runqueue_ratio,
+    own_cgroup_path: str | None = None,
+    cgroup_root: Path = _CGROUP_ROOT,
+) -> dict[str, float]:
+    """Return the runqueue and per-cgroup own-pressure metrics for one tick.
+
+    PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4. Shaped exactly like
+    ``collect_psi``: pure over its injected seams, with the live defaults as a
+    thin shell.
+
+    Runqueue (PRD detail A). ``runqueue_read_ok`` is emitted on EVERY tick as
+    1.0/0.0, and ``runqueue_ratio`` only when the read succeeded. It is a
+    metric of its own rather than a log line because after D1
+    ``runqueue_ratio`` is the sole LIVE CPU arm: β's recorded G7 waiver on
+    storm-escape-required rests on being able to count how often that arm was
+    readable at all, and a log line is not countable from the corpus ε1/ε2
+    calibrate against. α degrades an unreadable /proc/stat to
+    ``RunqueueReading(0.0, False)`` — a fail-open VALUE, not a reading — so
+    persisting that 0.0 as a ratio would write a fabricated "completely idle
+    host" row, re-introducing the defect task 1817 fixed in this module.
+
+    Args:
+        read_runqueue: α's ``read_runqueue_ratio`` by default; no /proc/stat
+            reader is written here (INV-5).
+        own_cgroup_path: The sampler's own ``0::`` kernel path. ``None`` asks
+            α's ``resolve_own_cgroup`` for the live one, so there is no second
+            /proc/self/cgroup reader either.
+        cgroup_root: Where the unified hierarchy is mounted.
+    """
+    runqueue = read_runqueue()
+    out: dict[str, float] = {'runqueue_read_ok': float(runqueue.read_ok)}
+    if runqueue.read_ok:
+        out['runqueue_ratio'] = float(runqueue.ratio)
+    return out
 
 
 def _is_occt_gated(proc: Any) -> bool:
