@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1135,6 +1136,19 @@ class _LiveHarness:
         """The JSON artifact ``main`` printed."""
         return json.loads(capsys.readouterr().out.split('\nDRY RUN')[0])
 
+    def tree(self) -> list[tuple[str, int]]:
+        """Every path under the configured ``data_dir``, with its size.
+
+        Stronger than checking ``db_path`` alone: ``connect_daemon`` opens WAL,
+        which leaves ``-wal``/``-shm`` sidecars beside the database while a
+        connection is held. Sizes are included because a rehearsal that
+        rewrote a file in place would otherwise pass a bare path census.
+        """
+        return sorted(
+            (str(path.relative_to(self.data_dir)), path.stat().st_size)
+            for path in self.data_dir.rglob('*')
+        )
+
     def rows(self) -> list:
         """What the run actually left in the ledger, read back independently."""
         async def _read():
@@ -1335,6 +1349,87 @@ class TestARehearsalNeverArmsTheGate:
             EXPECTED_STAMP_TARGETS
         )
         assert {row['outcome'] for row in report['records']} == {'would_stamp'}
+
+
+#: The three target shapes a rehearsal has to behave identically well on.
+TARGET_SHAPES = [
+    _mod.LedgerTargetState.LIVE,
+    _mod.LedgerTargetState.MISSING,
+    _mod.LedgerTargetState.NO_SCHEMA,
+]
+
+
+class TestTheDryRunBannerIsTrue:
+    """``DRY RUN — nothing was modified.`` is printed unconditionally, so it
+    has to be TRUE unconditionally.
+
+    Read literally — which is how an operator reads it — the banner claims
+    nothing under the configured ``data_dir`` changed. That is a stronger claim
+    than "no row was persisted", and the gap is where the self-disarming bug
+    lived: the rehearsal created a database and still printed this line.
+    """
+
+    @pytest.mark.parametrize('shape', TARGET_SHAPES)
+    def test_the_configured_data_dir_is_byte_identical_afterwards(
+        self, shape, tmp_path, monkeypatch, capsys
+    ) -> None:
+        harness = _LiveHarness(tmp_path, target=shape)
+        before = harness.tree()
+        assert harness.run(monkeypatch, []) == 0
+        assert harness.tree() == before
+
+    @pytest.mark.parametrize('shape', TARGET_SHAPES)
+    def test_the_banner_is_printed_on_every_shape(
+        self, shape, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The leg above is only a claim about the banner if the banner is
+        actually there to be claimed."""
+        _LiveHarness(tmp_path, target=shape).run(monkeypatch, [])
+        assert 'DRY RUN — nothing was modified.' in capsys.readouterr().out
+
+
+class TestARehearsalSurfacesAMisconfiguredTarget:
+    """A rehearsal against a dead target WARNS; it does not merely report.
+
+    The rehearsal exists to let an operator discover a misconfigured target
+    before the real run, and the gate exempts it for exactly that reason. A
+    report field satisfies that only for an operator who already suspects the
+    problem and knows which field to read — so the shape that actually gets
+    noticed, the ``stderr`` log, has to carry it.
+    """
+
+    @pytest.mark.parametrize(
+        'shape',
+        [_mod.LedgerTargetState.MISSING, _mod.LedgerTargetState.NO_SCHEMA],
+    )
+    def test_a_dead_target_warns_naming_the_resolved_path(
+        self, shape, tmp_path, monkeypatch, capsys, caplog
+    ) -> None:
+        harness = _LiveHarness(tmp_path, target=shape)
+        with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+            assert harness.run(monkeypatch, []) == 0
+        capsys.readouterr()
+        warnings = [
+            record for record in caplog.records if record.levelno >= logging.WARNING
+        ]
+        assert warnings, f'no warning for a {shape} target'
+        message = '\n'.join(record.getMessage() for record in warnings)
+        # The RESOLVED path, because the configured value is relative and says
+        # nothing about which directory was actually consulted.
+        assert str(harness.db_path.resolve()) in message
+        assert str(shape) in message
+
+    def test_a_live_target_warns_about_nothing(
+        self, tmp_path, monkeypatch, capsys, caplog
+    ) -> None:
+        """Kept quiet on the good path so the signal stays worth reading."""
+        harness = _LiveHarness(tmp_path, target=_mod.LedgerTargetState.LIVE)
+        with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+            assert harness.run(monkeypatch, []) == 0
+        capsys.readouterr()
+        assert [
+            record for record in caplog.records if record.levelno >= logging.WARNING
+        ] == []
 
 
 class TestMainReportNamesItsTarget:
