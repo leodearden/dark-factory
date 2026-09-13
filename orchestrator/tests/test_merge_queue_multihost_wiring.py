@@ -1113,8 +1113,22 @@ class TestRunDriftCheck:
 
         assert es.types().count('verdict_parity_ok') >= 1
 
-    async def test_agree_throwaway_worktree_created_and_cleaned(self, tmp_path):
-        """A throwaway worktree is created and cleaned up."""
+    async def test_throwaway_is_created_runs_the_local_full_gate_and_is_cleaned(
+        self, tmp_path,
+    ):
+        """The throwaway checkout is created, verified in, and cleaned up.
+
+        The middle statement is the one with teeth: the drift check's LOCAL
+        trust anchor is the LocalRunner the allocator builds from
+        ``_run_drift_check``'s own factory, and this pins what that runner was
+        built over — the throwaway checkout, not the merge worktree — and what
+        it dispatches — the FULL gate (``task_files=None``), not the scoped
+        spec whose verdict the drift check exists to re-check (task 2886 fix
+        1b, the entire reason it re-dispatches instead of reusing that
+        verdict).  Read off the runner's public ``run_merge_verify`` call into
+        its injected scoped-verify callable, so nothing reaches into the
+        runner it built.
+        """
         from orchestrator.merge_queue import _run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
@@ -1122,13 +1136,29 @@ class TestRunDriftCheck:
         git_ops = _make_drift_git_ops(tmp_path)
         _local, _remote, allocator = self._drift_legs()
 
-        await _run_drift_check(
-            git_ops, req, 'abc123', None, None, set(),
-            allocator=allocator,
-        )
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        with patch('orchestrator.merge_queue.run_scoped_verification', new=run_scoped):
+            await _run_drift_check(
+                git_ops, req, 'abc123', None, None, set(),
+                allocator=allocator,
+            )
 
         git_ops.create_throwaway_verify_worktree.assert_called_once_with('abc123')
         git_ops.cleanup_merge_worktree.assert_called_once()
+
+        throwaway = git_ops.create_throwaway_verify_worktree.return_value
+        assert run_scoped.await_args is not None, (
+            'the local trust anchor never verified anything — the allocator '
+            'never built it from the drift check factory'
+        )
+        assert run_scoped.await_args.args[0] == throwaway, (
+            'the local leg must verify in the THROWAWAY checkout '
+            f'({throwaway}), not in {run_scoped.await_args.args[0]}'
+        )
+        assert run_scoped.await_args.kwargs['task_files'] is None, (
+            'the drift check must re-dispatch the FULL gate (task 2886 fix 1b); '
+            f'got the scoped spec {run_scoped.await_args.kwargs["task_files"]!r}'
+        )
 
     async def test_diverge_submits_escalation_and_quarantines(self, tmp_path):
         """When local passes but remote fails (divergence), escalation submitted + remote quarantined."""
