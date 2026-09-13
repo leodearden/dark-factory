@@ -615,14 +615,31 @@ class DurableWriteQueue:
         """Report a permanently-abandoned write to the ``on_dead_letter`` hook.
 
         Shares ``_notify_terminal``'s post-commit, outside-the-semaphore
-        discipline for the same reasons, and diverges from it on exactly one
-        point.
+        discipline for the same two reasons — the queue's correctness must
+        never depend on a hook, and a hook's own work must not hold a slot in a
+        pool shared across every group — and DIVERGES from it on exactly one
+        point, deliberately: there is no ``or not write_op_id`` guard here.
+
+        That guard is right for the journal write-back, which has nothing to
+        join an outcome back to without a key. It is wrong for an alarm, which
+        needs no join key at all — and inheriting it would silently exempt
+        every ``mem0_classify_and_add`` (one per extracted fact per episode)
+        and every ``replay_from_store`` from the only push signal they have.
+        Those deaths currently reach nothing but a WARNING log.
+
+        A raising hook is logged and swallowed. Unlike the journal write-back,
+        a raise here would not merely lose one record: it escapes
+        ``_process_item`` into ``_worker_loop``, which has no handler, so the
+        worker task dies and the group stops draining. A failed alarm must cost
+        the operator a heads-up, never the queue.
         """
         if self._on_dead_letter is None:
             return
         try:
             payload: dict[str, Any] | None = item.parsed_payload()
         except (ValueError, TypeError):
+            # A payload that will not parse still has to raise the alarm — the
+            # unparseable payload is itself part of what went wrong.
             payload = None
         event = DeadLetterEvent(
             item_id=item.id,
@@ -633,9 +650,17 @@ class DurableWriteQueue:
             error=error,
             write_op_id=write_op_id,
             payload=payload,
+            # Structured, so the consumer never re-parses POST_EXECUTE_DEAD_PREFIX.
             post_execute=post_execute,
         )
-        await self._on_dead_letter(event)
+        try:
+            await self._on_dead_letter(event)
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): on_dead_letter hook failed; the '
+                'dead-letter is committed but was NOT escalated',
+                item.id, item.operation, item.group_id, exc_info=True,
+            )
 
     async def _mark_completed(self, item: QueueItem) -> None:
         assert self._db is not None
