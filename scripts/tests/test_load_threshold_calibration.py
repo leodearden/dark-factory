@@ -766,3 +766,153 @@ def test_the_defaults_command_uses_no_sync(tmp_path: Path):
     assert '--no-sync' in command, command
     assert '--frozen' in command, command
     assert '--project' in command and 'orchestrator' in command, command
+
+
+# ── the --report-dir / --no-report / --commit trio ──────────────────────────
+
+
+def make_repo(tmp_path: Path) -> Path:
+    """A throwaway git repo. Never the real checkout, and never `git stash`."""
+    repo = tmp_path / 'repo'
+    (repo / 'plans').mkdir(parents=True)
+    for args in (
+        ['init', '-q', '-b', 'main'],
+        ['config', 'user.email', 'test@example.invalid'],
+        ['config', 'user.name', 'Test'],
+        ['config', 'commit.gpgsign', 'false'],
+    ):
+        subprocess.run(['git', '-C', str(repo), *args], check=True,
+                       capture_output=True)
+    (repo / 'seed.txt').write_text('seed\n')
+    subprocess.run(['git', '-C', str(repo), 'add', '--', 'seed.txt'],
+                   check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-q', '-m', 'seed',
+                    '--no-verify'], check=True, capture_output=True)
+    return repo
+
+
+def git_out(repo: Path, *args: str) -> str:
+    return subprocess.run(['git', '-C', str(repo), *args], check=True,
+                          capture_output=True, text=True).stdout
+
+
+def test_the_report_is_written_with_a_dated_name_and_announced_on_stderr(
+    tmp_path: Path
+):
+    module = load_script()
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    report_dir = tmp_path / 'plans'
+    report_dir.mkdir()
+
+    rc = module.main(['--db', str(db), '--report-dir', str(report_dir)])
+
+    assert rc == 0
+    written = list(report_dir.glob('load-threshold-calibration-*.md'))
+    assert len(written) == 1, written
+    assert written[0].name.count('-') == 5, written[0].name
+    assert written[0].read_text().startswith('# Load-threshold calibration')
+
+
+def test_the_filename_heading_and_commit_subject_share_one_clock_read(tmp_path: Path):
+    """One `datetime.now(UTC)`, reused — not three reads that can straddle
+    midnight and produce a report whose name, heading and commit disagree."""
+    repo = make_repo(tmp_path)
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    module = load_script()
+
+    module.main(['--db', str(db), '--report-dir', str(repo / 'plans'), '--commit'])
+
+    written, = (repo / 'plans').glob('load-threshold-calibration-*.md')
+    date = written.stem.rsplit('-', 3)[-3:]
+    date_str = '-'.join(date)
+    assert date_str in written.read_text().splitlines()[0]
+    assert date_str in git_out(repo, 'log', '-1', '--pretty=%s')
+
+
+def test_no_report_prints_everything_but_writes_no_file(tmp_path: Path):
+    """print-only, never compute-less."""
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0, 3.0]})
+    report_dir = tmp_path / 'plans'
+    report_dir.mkdir()
+
+    result = run_script('--db', str(db), '--report-dir', str(report_dir),
+                        '--no-report')
+
+    assert result.returncode == 0, result.stderr
+    assert list(report_dir.iterdir()) == []
+    assert '# Load-threshold calibration' in result.stdout
+    assert trailing_json(result.stdout)['percentiles']
+
+
+def test_commit_touches_exactly_the_report_and_nothing_else(tmp_path: Path):
+    """What `git commit --only` buys, and why a bare `git commit` is wrong.
+
+    An unrelated DIRTY file and an unrelated STAGED file are left in the repo;
+    a bare commit would sweep the staged one in. Under the merge worker and
+    the startup reconciler, doing that to the real checkout is a live hazard,
+    not a stylistic preference.
+    """
+    repo = make_repo(tmp_path)
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    module = load_script()
+
+    (repo / 'seed.txt').write_text('dirtied\n')
+    (repo / 'other.txt').write_text('staged but unrelated\n')
+    subprocess.run(['git', '-C', str(repo), 'add', '--', 'other.txt'],
+                   check=True, capture_output=True)
+
+    module.main(['--db', str(db), '--report-dir', str(repo / 'plans'), '--commit'])
+
+    touched = git_out(repo, 'show', '--name-only', '--pretty=', 'HEAD').split()
+    assert len(touched) == 1, touched
+    assert touched[0].startswith('plans/load-threshold-calibration-'), touched
+    # The unrelated work is still exactly where it was left.
+    assert 'other.txt' in git_out(repo, 'diff', '--cached', '--name-only')
+    assert 'seed.txt' in git_out(repo, 'diff', '--name-only')
+
+
+def test_the_commit_subject_names_the_generating_script(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    module = load_script()
+
+    module.main(['--db', str(db), '--report-dir', str(repo / 'plans'), '--commit'])
+
+    subject = git_out(repo, 'log', '-1', '--pretty=%s')
+    assert 'scripts/load-threshold-calibration.py' in subject, subject
+
+
+def test_no_report_with_commit_commits_nothing(tmp_path: Path):
+    """--commit nests inside the not-no-report branch, pinned rather than
+    left accidental."""
+    repo = make_repo(tmp_path)
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    module = load_script()
+    before = git_out(repo, 'rev-parse', 'HEAD').strip()
+
+    rc = module.main([
+        '--db', str(db), '--report-dir', str(repo / 'plans'),
+        '--no-report', '--commit',
+    ])
+
+    assert rc == 0
+    assert git_out(repo, 'rev-parse', 'HEAD').strip() == before
+    assert list((repo / 'plans').iterdir()) == []
+
+
+def test_a_failing_commit_does_not_take_the_report_down_with_it(tmp_path: Path):
+    """The analysis is the deliverable; committing it is a convenience.
+
+    ε1/ε2 classify a non-zero rc as an INFRA FAULT with no gate, so a git
+    failure must not turn a delivered calibration into a born-at-L2 page.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    not_a_repo = tmp_path / 'not-a-repo' / 'plans'
+    not_a_repo.mkdir(parents=True)
+
+    result = run_script('--db', str(db), '--report-dir', str(not_a_repo), '--commit')
+
+    assert result.returncode == 0, result.stderr
+    assert list(not_a_repo.glob('load-threshold-calibration-*.md')), 'report still written'
+    payload = trailing_json(result.stdout)
+    assert 'report_commit_failed' in payload['degradations'], payload
