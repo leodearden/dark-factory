@@ -257,3 +257,132 @@ class TestUnexpectedMetricNames:
     def test_empty_input_is_accepted(self):
         """A degraded collection group hands run_tick {} — never an error."""
         assert self._unexpected() == set()
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-11: run_tick's third collection group
+# ---------------------------------------------------------------------------
+
+FAKE_LOAD_METRICS = {
+    'runqueue_ratio': 4.0625,
+    'runqueue_read_ok': 1.0,
+    'own_cpu_some10:orchestrator-reify.service': 1.77,
+    'own_read_ok:orchestrator-reify.service': 1.0,
+}
+
+
+def _rows(db_path: Path, metric: str) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            'SELECT ts, value, window_mean, window_max FROM samples'
+            ' WHERE metric = ? ORDER BY ts',
+            (metric,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+class TestRunTickLoadGroup:
+    """Load metrics are SAMPLER-windowed, unlike the kernel-windowed PSI rows."""
+
+    def test_load_rows_carry_populated_windows_while_psi_rows_stay_null(
+        self, tmp_path: Path
+    ):
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+
+        run_tick(
+            store,
+            1_000_000,
+            psi=FAKE_PSI,
+            process_metrics=FAKE_PROCESS_METRICS,
+            load_metrics=FAKE_LOAD_METRICS,
+        )
+
+        for metric in FAKE_LOAD_METRICS:
+            (_ts, _value, window_mean, window_max), = _rows(db_path, metric)
+            assert window_mean is not None, f'{metric} window_mean is NULL'
+            assert window_max is not None, f'{metric} window_max is NULL'
+        (_ts, _v, psi_mean, psi_max), = _rows(db_path, 'psi_cpu_some_avg10')
+        assert psi_mean is None and psi_max is None
+
+    def test_second_tick_window_reflects_both_samples(self, tmp_path: Path):
+        """Proves the row went through store.trailing_window, not a NULL write."""
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+
+        run_tick(
+            store, 1_000_000, psi={}, process_metrics={},
+            load_metrics={'runqueue_ratio': 2.0},
+        )
+        run_tick(
+            store, 1_000_005, psi={}, process_metrics={},
+            load_metrics={'runqueue_ratio': 6.0},
+        )
+
+        _first, (_ts, value, window_mean, window_max) = _rows(db_path, 'runqueue_ratio')
+        assert value == pytest.approx(6.0)
+        assert window_mean == pytest.approx(4.0)
+        assert window_max == pytest.approx(6.0)
+
+    def test_dynamic_keys_round_trip_into_the_metric_column_verbatim(
+        self, tmp_path: Path
+    ):
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        metric = 'own_cpu_some10:orchestrator-reify.service'
+
+        run_tick(
+            store, 1_000_000, psi={}, process_metrics={},
+            load_metrics={metric: 1.77},
+        )
+
+        (_ts, value, _mean, _max), = _rows(db_path, metric)
+        assert value == pytest.approx(1.77)
+
+    def test_unexpected_load_key_raises_naming_it(self, tmp_path: Path):
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+
+        with pytest.raises(AssertionError, match='runqueu_ratio'):
+            run_tick(
+                store, 1_000_000, psi={}, process_metrics={},
+                load_metrics={'runqueu_ratio': 1.0},
+            )
+
+    def test_degraded_load_group_writes_zero_load_rows(self, tmp_path: Path):
+        """{} is the degraded group's value — zero rows, not a fabricated 0.0."""
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+
+        run_tick(
+            store, 1_000_000,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            total = conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
+            loadish = conn.execute(
+                "SELECT COUNT(*) FROM samples"
+                " WHERE metric LIKE 'runqueue%' OR metric LIKE 'own_%'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert loadish == 0
+        assert total == 9, 'the other two groups must still write their rows'
