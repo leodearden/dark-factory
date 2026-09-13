@@ -218,6 +218,18 @@ async def _make_lane(repo: Path, git_ops: GitOps, script_body: str) -> Path:
     return lane
 
 
+async def _seed(git_ops: GitOps, lane: Path, *args: str, **kwargs: object) -> int:
+    """Drive one seed run.
+
+    The single place in this module that names ``GitOps._seed_warm_lane``.
+    That method is the unit under test and has no public alias, so the
+    coupling is unavoidable -- but it is confined to one line here rather
+    than repeated at every call site.
+    """
+    return await git_ops._seed_warm_lane(lane, *args, **kwargs)  # type: ignore[arg-type]
+
+
+
 @pytest.mark.asyncio
 class TestSeedLaneLockReentrancy:
     async def test_fresh_checkout_seed_does_not_self_refuse_on_own_lane_lock(
@@ -230,7 +242,7 @@ class TestSeedLaneLockReentrancy:
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LOCKING_SEED_SCRIPT)
 
-        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
 
         assert rc == 0, (
             f'seed must succeed while DF holds the outer lane lock, got rc={rc}. '
@@ -251,7 +263,7 @@ class TestSeedLaneLockReentrancy:
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LEGACY_SEED_SCRIPT)
 
-        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
 
         assert rc == 0, (
             f'a pre-5354 seed script must still seed cleanly, got rc={rc} '
@@ -272,7 +284,7 @@ class TestSeedLaneLockReentrancy:
         lane = await _make_lane(seed_repo, git_ops, _LOCKING_SEED_SCRIPT)
 
         # Nobody holds the lock -> the script's own flock -n succeeds.
-        rc = await git_ops._seed_warm_lane(
+        rc = await _seed(git_ops, 
             lane, '--fresh-checkout', take_lane_lock=False,
         )
         assert rc == 0, f'unlocked seed should succeed, got rc={rc}'
@@ -286,7 +298,7 @@ class TestSeedLaneLockReentrancy:
         )
         try:
             await asyncio.sleep(0.5)
-            rc_locked = await git_ops._seed_warm_lane(
+            rc_locked = await _seed(git_ops, 
                 lane, '--fresh-checkout', take_lane_lock=False,
             )
         finally:
@@ -393,7 +405,7 @@ class TestDistinctLockRefusalRcPlumbing:
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _ARGV_RECORDING_SEED_SCRIPT)
 
-        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
 
         assert rc == 0, f'seed must succeed, got rc={rc}'
         assert '--distinct-lock-refusal-rc' in _recorded_argv(lane), (
@@ -411,7 +423,7 @@ class TestDistinctLockRefusalRcPlumbing:
             seed_repo, git_ops, _LEGACY_ARGV_RECORDING_SEED_SCRIPT,
         )
 
-        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
 
         assert rc == 0, (
             f'a pre-5568 seed script must still seed cleanly, got rc={rc} '
@@ -437,13 +449,13 @@ class TestDistinctLockRefusalRcPlumbing:
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _ARGV_RECORDING_SEED_SCRIPT)
 
-        rc_held = await git_ops._seed_warm_lane(
+        rc_held = await _seed(git_ops, 
             lane, '--fresh-checkout', take_lane_lock=True,
         )
         assert rc_held == 0, f'take_lane_lock=True seed failed: rc={rc_held}'
         assert '--distinct-lock-refusal-rc' in _recorded_argv(lane)
 
-        rc_free = await git_ops._seed_warm_lane(
+        rc_free = await _seed(git_ops, 
             lane, '--fresh-checkout', take_lane_lock=False,
         )
         assert rc_free == 0, f'take_lane_lock=False seed failed: rc={rc_free}'
