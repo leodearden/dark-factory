@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from datetime import datetime
-from enum import StrEnum
 from pathlib import Path
 
 from orchestrator.session_registry import DecisionRecord, SessionRecord
@@ -131,17 +130,6 @@ def _linked_session(session_id: str | None, sessions: Sequence[SessionRecord]) -
 _NO_SELECTION_PLACEHOLDER = '(no session selected)'
 
 
-class DetailSource(StrEnum):
-    """Which record kind a DetailPane is currently showing.
-
-    A StrEnum rather than a bare 'session'/'decision' string, mirroring
-    session_registry's own Status/DecisionState convention.
-    """
-
-    SESSION = 'session'
-    DECISION = 'decision'
-
-
 class DetailPane(Static):
     """Renders one record's full detail -- a session's or a decision's.
 
@@ -153,10 +141,12 @@ class DetailPane(Static):
     callers/tests can read back what's currently shown without parsing the
     rendered widget.
 
-    `source` is the read-back of which kind was last rendered. It is what
-    cockpit/src/cockpit/app.py::CockpitApp's rebuild-time re-sync arbitrates
-    on: a registry rebuild refreshes whichever pane kind currently owns the
-    detail, and only an operator cursor move transfers that ownership.
+    The pane deliberately holds no notion of WHICH TABLE put a record
+    here: the decision queue's own session rows render through show_record
+    exactly as the session table's do, so the rendered kind cannot tell the
+    two apart. That arbitration lives in
+    cockpit/src/cockpit/app.py::DetailOwner, keyed on the table whose cursor
+    last moved.
     """
 
     DEFAULT_CSS = """
@@ -171,7 +161,6 @@ class DetailPane(Static):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.rendered_text = _NO_SELECTION_PLACEHOLDER
-        self.source = DetailSource.SESSION
 
     def show_record(
         self,
@@ -185,7 +174,6 @@ class DetailPane(Static):
             if record is not None
             else _NO_SELECTION_PLACEHOLDER
         )
-        self.source = DetailSource.SESSION
         self.update(self.rendered_text)
 
     def show_decision(
@@ -201,5 +189,4 @@ class DetailPane(Static):
         exactly one empty-state path.
         """
         self.rendered_text = render_decision_detail(decision, sessions, now)
-        self.source = DetailSource.DECISION
         self.update(self.rendered_text)
