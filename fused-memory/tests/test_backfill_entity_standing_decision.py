@@ -44,6 +44,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
 )
 from fused_memory.reconciliation.standing_decision_writer import (
     EVIDENCE_TYPE_OPERATOR_AUTHORIZATION,
+    LedgerUnavailable,
 )
 from fused_memory.utils.validation import is_full_uuid
 
@@ -674,3 +675,117 @@ class TestRunBackfillApply:
         second.update_memory.assert_not_awaited()
         assert report['ledger'] == 'already_migrated'
         assert report['records'] == []
+
+
+# ---------------------------------------------------------------------------
+# Failure ordering — no original is ever marked superseded by a missing row
+# ---------------------------------------------------------------------------
+
+
+class TestLedgerWriteFailsBeforeAnyStamp:
+    """β raises rather than returning a status, and the raise must land BEFORE
+    the stamp loop begins."""
+
+    @pytest.mark.asyncio
+    async def test_an_unwired_ledger_aborts_with_no_stamp(self) -> None:
+        service = _memory_service(None)
+        with pytest.raises(LedgerUnavailable):
+            await _mod.run_backfill(service, apply=True)
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_edge_sample_aborts_with_no_stamp(self, ledger) -> None:
+        """β lets a sampling failure propagate rather than persist a bogus count
+        that would corrupt ζ's growth sweep — so no row exists to be cited."""
+        service = _memory_service(ledger)
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=RuntimeError('graphiti unreachable')
+        )
+        with pytest.raises(RuntimeError, match='graphiti unreachable'):
+            await _mod.run_backfill(service, apply=True)
+        assert await _rows(ledger) == []
+        service.update_memory.assert_not_awaited()
+
+
+class TestStampFailureNeverRollsBackTheRow:
+    """The row is authoritative; the stamps are advisory. A stamp that does not
+    land is reported, not repaired by destroying the row."""
+
+    @staticmethod
+    def _refusing_service(ledger_obj, failing_id: str):
+        """``update_memory`` REFUSES *failing_id* by RETURNING an error envelope
+        — which is how it reports a not-found, rather than raising."""
+        service = _memory_service(ledger_obj)
+
+        async def _update(**kwargs):
+            if kwargs['memory_id'] == failing_id:
+                return {
+                    'error': 'memory not found',
+                    'error_type': 'MemoryNotFound',
+                }
+            return {'status': 'updated', 'store': 'mem0'}
+
+        service.update_memory = AsyncMock(side_effect=_update)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_the_row_survives_a_refused_stamp(self, ledger) -> None:
+        service = self._refusing_service(ledger, CORRECTION_ID)
+        report = await _mod.run_backfill(service, apply=True)
+        assert report['ledger'] == 'written'
+        assert len(await _rows(ledger)) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_reported_with_its_error_type(self, ledger) -> None:
+        report = await _mod.run_backfill(
+            self._refusing_service(ledger, CORRECTION_ID), apply=True
+        )
+        outcomes = {row['memory_id']: row for row in report['records']}
+        assert outcomes[CORRECTION_ID]['outcome'] == 'stamp_error'
+        assert outcomes[CORRECTION_ID]['error_type'] == 'MemoryNotFound'
+
+    @pytest.mark.asyncio
+    async def test_the_other_stamp_still_lands(self, ledger) -> None:
+        """Per-record isolation: one refusal must not abandon the rest."""
+        report = await _mod.run_backfill(
+            self._refusing_service(ledger, CORRECTION_ID), apply=True
+        )
+        outcomes = {row['memory_id']: row['outcome'] for row in report['records']}
+        assert outcomes[SOURCE_ID] == 'stamped'
+
+    @pytest.mark.asyncio
+    async def test_a_raising_update_is_also_captured_per_record(self, ledger) -> None:
+        """``update_memory`` has TWO failure shapes; a vocabulary rejection
+        RAISES where a not-found returns an envelope."""
+        service = _memory_service(ledger)
+        service.update_memory = AsyncMock(side_effect=ValueError('nope'))
+        report = await _mod.run_backfill(service, apply=True)
+        assert len(await _rows(ledger)) == 1
+        assert {row['outcome'] for row in report['records']} == {'stamp_error'}
+        assert {row['error_type'] for row in report['records']} == {'ValueError'}
+
+    @pytest.mark.asyncio
+    async def test_a_partial_outcome_exits_non_zero(self, ledger) -> None:
+        """An operator must not read a half-stamped corpus as a clean run."""
+        report = await _mod.run_backfill(
+            self._refusing_service(ledger, CORRECTION_ID), apply=True
+        )
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_exits_zero(self, ledger) -> None:
+        report = await _mod.run_backfill(_memory_service(ledger), apply=True)
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_re_run_completes_the_stamp_that_failed(self, ledger) -> None:
+        """Both legs are independently idempotent, so the repair is a re-run —
+        which is the whole reason the row is not rolled back."""
+        await _mod.run_backfill(
+            self._refusing_service(ledger, CORRECTION_ID), apply=True
+        )
+        retry = _memory_service(ledger, scroll=_scroll_with(SOURCE_ID))
+        report = await _mod.run_backfill(retry, apply=True)
+        assert report['ledger'] == 'already_migrated'
+        assert report['records'] == [{'memory_id': CORRECTION_ID, 'outcome': 'stamped'}]
+        assert len(await _rows(ledger)) == 1
