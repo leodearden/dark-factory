@@ -27,11 +27,14 @@ pastes the output cannot drift from the query that produced it.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import re
 import sqlite3
+import sys
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,10 @@ from typing import Any
 # worktree has no store of its own and a worktree-relative default would never
 # resolve.  The live store exists only in the main checkout.
 DEFAULT_RUNS_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
+
+# A trailing-window spec: N hours or N days, N a positive integer. Anchored so
+# '24' and '24x' are both rejected rather than silently truncated to 24.
+_WINDOW_RE = re.compile(r'^(\d+)([hd])$')
 
 # orchestrator/src/orchestrator/routing.py::_model_rejection_reason returns
 # exactly these three; resolve_route namespaces each as "<layer>:<reason>"
@@ -558,3 +565,282 @@ def roles_on_model(
         ),
         unexpected_roles=tuple(r for r in observed if r not in expected_roles),
     )
+
+
+@dataclass(frozen=True)
+class AuditResult:
+    """Every measurement the report renders, frozen against one store read."""
+
+    model: str
+    since: str
+    window_start: str
+    window_end: str
+    expected_roles: tuple[str, ...]
+    routing: RoutingScan
+    invocations: tuple[InvocationRecord, ...]
+    scoped_cap: ScopedCapScan
+    spend: SpendInWindow
+    containment: RoleContainment
+
+    @property
+    def tier_escalations(self) -> tuple[RoutingSelection, ...]:
+        """Selections made at retry tier 1 or above — the retry-ladder question.
+
+        Derived rather than stored: it is a VIEW of ``routing.selections``, and
+        storing it too would let the two disagree.
+        """
+        return tuple(
+            s for s in self.routing.selections
+            if s.routing_tier is not None and s.routing_tier >= 1
+        )
+
+
+def audit(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    since: datetime,
+    expected_roles: Sequence[str],
+    window: tuple[datetime, datetime],
+    ceiling_usd: float,
+    wall_clock_limits: dict[str, int] | None = None,
+) -> AuditResult:
+    """Run all five scans against one connection and freeze the results.
+
+    *since* anchors the "has anything happened since the admission?" sections;
+    *window* is the separate, usually shorter, half-open span the spend-versus-
+    ceiling section is computed over (the ceiling is a trailing-24h rule, while
+    the admission may be weeks old).  Keeping them separate is why the report
+    can label each section with the window it actually used.
+    """
+    return AuditResult(
+        model=model,
+        since=_iso(since),
+        window_start=_iso(window[0]),
+        window_end=_iso(window[1]),
+        expected_roles=tuple(expected_roles),
+        routing=scan_routing_decisions(conn, model=model, since=since),
+        invocations=scan_invocations(
+            conn, model=model, since=since, wall_clock_limits=wall_clock_limits,
+        ),
+        scoped_cap=scan_scoped_cap(conn, model=model, since=since),
+        spend=spend_in_window(
+            conn, model=model, window_start=window[0],
+            window_end=window[1], ceiling_usd=ceiling_usd,
+        ),
+        containment=roles_on_model(
+            conn, model=model, since=since, expected_roles=expected_roles,
+        ),
+    )
+
+
+def render_json(result: AuditResult) -> str:
+    """Emit *result* as one JSON object, one key per rendered section."""
+    return json.dumps({
+        'meta': {
+            'model': result.model,
+            'since': result.since,
+            'window_start': result.window_start,
+            'window_end': result.window_end,
+            'expected_roles': list(result.expected_roles),
+        },
+        'routing_decisions': asdict(result.routing),
+        'invocations': [asdict(r) for r in result.invocations],
+        'steward_tier_escalation': {
+            'exercised': bool(result.tier_escalations),
+            'dispatches': [asdict(s) for s in result.tier_escalations],
+        },
+        'scoped_cap': asdict(result.scoped_cap),
+        'spend': asdict(result.spend),
+        'role_containment': asdict(result.containment),
+    }, indent=2)
+
+
+def _table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
+    """A markdown table, or a single italic line when there are no rows.
+
+    The empty case is spelled out rather than emitted as a headed table with no
+    body, because an empty table reads as a rendering glitch while "none" reads
+    as a measurement.
+    """
+    body = [f"| {' | '.join(str(cell) for cell in row)} |" for row in rows]
+    if not body:
+        return ['_none_']
+    return [
+        f"| {' | '.join(header)} |",
+        f"|{'|'.join('---' for _ in header)}|",
+        *body,
+    ]
+
+
+def render_markdown(result: AuditResult) -> str:
+    """Render the six sections, each labelled with the window it was computed over.
+
+    Every number here comes from the frozen *result*; nothing is recomputed, so
+    a report that pastes this output cannot disagree with the queries that
+    produced it.
+    """
+    model, since = result.model, result.since
+    out: list[str] = []
+
+    out += [f'### 1. Routing decisions for `{model}` since {since}', '']
+    out += _table(
+        ['timestamp', 'task', 'role', 'source_layer', 'rule_id', 'tier'],
+        [(s.timestamp, s.task_id or '-', s.role, s.source_layer, s.rule_id or '-',
+          s.routing_tier) for s in result.routing.selections],
+    )
+    out += ['', f'Rejections naming a model, any role, since {since}:', '']
+    out += _table(
+        ['timestamp', 'task', 'role', 'resolved to', 'reasons'],
+        [(r.timestamp, r.task_id or '-', r.role, r.resolved_model, ', '.join(r.reasons))
+         for r in result.routing.rejections],
+    )
+    out += ['', f'Unparseable payloads skipped: {result.routing.skipped_rows}', '']
+
+    out += [f'### 2. Invocations on `{model}` and how they ended, since {since}', '']
+    out += _table(
+        ['task', 'project', 'role', 'account', 'cost $', 'turns', 'ok',
+         'model @end', 'duration ms', 'at/over wall clock', 'merge'],
+        [(r.task_id or '-', r.project_id, r.role, r.account_name, f'{r.cost_usd:.2f}',
+          '-' if r.turns is None else r.turns, r.succeeded,
+          r.end_event_model or '-', r.duration_ms, r.at_or_over_wall_clock,
+          _merge_cell(r.merge_outcome)) for r in result.invocations],
+    )
+    out += ['']
+
+    out += [f'### 3. Dispatches at retry tier >= 1 since {since}', '']
+    if result.tier_escalations:
+        out += _table(
+            ['timestamp', 'task', 'role', 'tier', 'rule_id'],
+            [(s.timestamp, s.task_id or '-', s.role, s.routing_tier, s.rule_id or '-')
+             for s in result.tier_escalations],
+        )
+    else:
+        out += [f'_Not yet exercised: no dispatch resolved to `{model}` at tier >= 1 '
+                f'since {since}. Absence of a tier-escalated dispatch is not a '
+                f'failure of the rule; it means the rule has not been reached._']
+    out += ['']
+
+    out += [f'### 4. Scoped cap posture for `{model}` since {since}', '']
+    out += _table(
+        ['created_at', 'account', 'reason'],
+        [(h.created_at, h.account_name, h.reason) for h in result.scoped_cap.scoped_hits],
+    )
+    out += ['', f'Account-level (unscoped) cap hits in the same period: '
+                f'{result.scoped_cap.unscoped_cap_hit_count}', '',
+            'Service restarts since then (only an orchestrator restart reloads a '
+            'restart-tier leaf):', '']
+    out += _table(
+        ['timestamp', 'service', 'reason'],
+        [(r.timestamp, r.service, r.reason or '-') for r in result.scoped_cap.restarts],
+    )
+    out += ['']
+
+    spend = result.spend
+    out += [f'### 5. Spend on `{model}` over [{spend.window_start}, {spend.window_end})', '']
+    out += _table(
+        ['invocations', 'total $', 'ceiling $', 'headroom $', 'at/over ceiling'],
+        [(spend.invocation_count, f'{spend.total_usd:.2f}', f'{spend.ceiling_usd:.2f}',
+          f'{spend.headroom_usd:.2f}', spend.at_or_over_ceiling)],
+    )
+    out += ['']
+
+    containment = result.containment
+    out += [f'### 6. Roles observed on `{model}` since {since}', '',
+            f'Admitted roles: {", ".join(containment.expected_roles)}', '']
+    out += _table(
+        ['role', 'invocations', 'total $', 'admitted'],
+        [(u.role, u.count, f'{u.total_usd:.2f}', u.role in containment.expected_roles)
+         for u in containment.by_role],
+    )
+    out += ['', f'Roles outside the admitted set: '
+                f'{", ".join(containment.unexpected_roles) or "none"}', '']
+    return '\n'.join(out)
+
+
+def _merge_cell(outcome: MergeOutcome | None) -> str:
+    if outcome is None:
+        return '-'
+    detail = outcome.merge_sha or outcome.reason or ''
+    return f'{outcome.state} ({detail})' if detail else outcome.state
+
+
+def _parse_window(spec: str) -> timedelta:
+    """Parse a `<N>h` / `<N>d` trailing-window spec.
+
+    Anchored: '24' and '24x' must both be rejected rather than silently
+    truncated to 24 hours.
+    """
+    match = _WINDOW_RE.match(spec)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f'bad --window {spec!r}: expected <N>h or <N>d, e.g. 24h or 14d.'
+        )
+    size = int(match.group(1))
+    return timedelta(hours=size) if match.group(2) == 'h' else timedelta(days=size)
+
+
+def _parse_moment(spec: str) -> datetime:
+    """Parse an ISO-8601 instant, reading a naive one as UTC.
+
+    Naive-means-UTC rather than naive-means-local: the store is UTC throughout,
+    and silently shifting a hand-typed bound by the host's offset would move
+    the window without saying so.
+    """
+    try:
+        parsed = datetime.fromisoformat(spec)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f'bad ISO-8601 instant {spec!r}: {exc}') from exc
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description='Audit whether an admitted model is actually being dispatched, '
+                    'and whether its ceiling and scoped cap are behaving. '
+                    'Strictly read-only.',
+    )
+    parser.add_argument('--model', required=True, help='the model string to audit')
+    parser.add_argument(
+        '--expect-roles', required=True,
+        help='comma-separated roles the model was admitted for, e.g. merger,steward',
+    )
+    parser.add_argument(
+        '--since', required=True, type=_parse_moment,
+        help='ISO-8601 instant the admission was applied; anchors sections 1-4 and 6',
+    )
+    parser.add_argument(
+        '--window', default='24h', type=_parse_window,
+        help='trailing window for the spend-vs-ceiling section (default: 24h)',
+    )
+    parser.add_argument(
+        '--ceiling', default=0.0, type=float,
+        help='per-model daily ceiling in USD to measure spend against',
+    )
+    parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
+    parser.add_argument('--format', default='markdown', choices=('markdown', 'json'))
+    args = parser.parse_args(argv)
+
+    window_end = datetime.now(UTC)
+    conn = _connect_ro(args.runs_db)
+    try:
+        result = audit(
+            conn,
+            model=args.model,
+            since=args.since,
+            expected_roles=tuple(
+                r.strip() for r in args.expect_roles.split(',') if r.strip()
+            ),
+            window=(window_end - args.window, window_end),
+            ceiling_usd=args.ceiling,
+        )
+    finally:
+        conn.close()
+
+    render = render_json if args.format == 'json' else render_markdown
+    print(render(result))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
