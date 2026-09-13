@@ -312,22 +312,56 @@ def load_psi_admission_block(path: Path, side: str) -> tuple[dict | None, list[s
     return block, []
 
 
-def configured_thresholds(path: Path) -> tuple[dict[str, float], list[str]]:
-    """The arm thresholds this project has actually configured, if any.
+def arm_thresholds(block: dict | None) -> dict[str, float]:
+    """The arm thresholds a parsed block actually sets.
 
     Reported beside each ladder so the report always evaluates the value in
-    force, not only the hypotheticals. The loader's degradations are returned
-    rather than swallowed: a report that said "configured value: none" while
-    listing no reason would send its reader looking for one.
+    force, not only the hypotheticals. Non-arm leaves (``enabled``,
+    ``min_inflight_floor``) and non-numeric values are skipped; ``bool`` is
+    excluded explicitly because in Python it IS an int, and `enabled: true`
+    would otherwise read as the threshold 1.
     """
-    block, degradations = load_psi_admission_block(path, 'local')
     if block is None:
-        return {}, degradations
+        return {}
     return {
-        arm: value for arm, value in block.items()
+        arm: float(value) for arm, value in block.items()
         if arm in ARM_METRIC_SELECTORS and isinstance(value, (int, float))
         and not isinstance(value, bool)
-    }, degradations
+    }
+
+
+def compare_blocks(local: dict | None, peer: dict | None) -> dict | None:
+    """Compare two parsed ``psi_admission`` mappings; ``None`` if either is absent.
+
+    Returns ``{'drift': [{leaf, local, peer}], 'local_only': [...],
+    'peer_only': [...]}``.
+
+    Over PARSED MAPPINGS, never text (INV-10): key order, indentation,
+    comments, `4.00` against `4.0`, `7.0e1` against `70.0` and `yes` against
+    `true` are all yaml SPELLINGS of the same value, and a textual diff would
+    report every one of them as drift and bury the one that matters.
+
+    ``None`` in means ``None`` out. An absent block is NOT an empty match: a
+    project with no ``psi_admission`` at all would otherwise report perfect
+    agreement with one that has six leaves. An actually-empty block on both
+    sides is a real comparison that happens to find nothing.
+
+    A ONE-SIDED LEAF is reported separately from a value mismatch — "the two
+    projects disagree about this number" and "only one project has this knob"
+    call for different operator actions.
+    """
+    if local is None or peer is None:
+        return None
+    shared_leaves = sorted(set(local) & set(peer))
+    return {
+        'drift': [
+            {'leaf': leaf, 'local': local[leaf], 'peer': peer[leaf]}
+            for leaf in shared_leaves
+            if local[leaf] != peer[leaf]
+        ],
+        'local_only': sorted(set(local) - set(peer)),
+        'peer_only': sorted(set(peer) - set(local)),
+    }
 
 
 def _arm_for(metric: str, specs: list[ArmSpec]) -> str | None:
@@ -384,8 +418,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     percentiles = percentile_table({m: [v for _, v in pts] for m, pts in series.items()})
     holds = hold_table(series, specs)
-    configured, config_degradations = configured_thresholds(args.config)
-    degradations += config_degradations
+    local_block, local_degradations = load_psi_admission_block(args.config, 'local')
+    peer_block, peer_degradations = load_psi_admission_block(args.peer_config, 'peer')
+    degradations += local_degradations + peer_degradations
+    configured = arm_thresholds(local_block)
+    drift = compare_blocks(local_block, peer_block)
 
     lines = [
         f'# Load-threshold calibration — cut {now.isoformat(timespec="minutes")}',
@@ -434,6 +471,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         lines.append('')
 
+    lines += ['', '## Config drift against the peer project', '',
+              f'Local: `{args.config}`  ·  Peer: `{args.peer_config}`', '']
+    if drift is None:
+        lines.append(
+            'NOT COMPARED — at least one side has no `psi_admission` block. See '
+            'the degradations below; this is a one-sided run, not a match.')
+    elif not (drift['drift'] or drift['local_only'] or drift['peer_only']):
+        lines.append('No drift: both blocks set the same leaves to the same values.')
+    else:
+        for entry in drift['drift']:
+            lines.append(
+                f"- `{entry['leaf']}`: local `{entry['local']}` vs peer `{entry['peer']}`")
+        for leaf in drift['local_only']:
+            lines.append(f'- `{leaf}`: set locally only')
+        for leaf in drift['peer_only']:
+            lines.append(f'- `{leaf}`: set by the peer only')
+
     lines += ['', '## Degradations', '']
     lines += [f'- {d}' for d in degradations] or ['_None._']
 
@@ -451,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
         'percentiles': percentiles,
         'holds': holds,
         'configured': configured,
+        'drift': drift,
         'degradations': [d.split(':', 1)[0] for d in degradations],
         'degradation_details': degradations,
     }))

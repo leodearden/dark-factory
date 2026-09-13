@@ -394,7 +394,7 @@ _PEER_YAML_EQUIVALENT = """
 psi_admission:
     min_inflight_floor: 3        # reordered
     runqueue_ratio: 4.00         # 4.00, not 4.0
-    cpu_some_avg10: 7.0e1        # scientific spelling of 70.0
+    cpu_some_avg10: 7.0e+1       # scientific spelling of 70.0 (see below re: the +)
     enabled: yes                 # yaml's other spelling of true
 """
 
@@ -447,6 +447,24 @@ def test_int_and_float_spellings_of_the_same_number_are_not_drift():
     module = load_script()
 
     assert module.compare_blocks({'x': 15}, {'x': 15.0})['drift'] == []
+
+
+def test_a_numeric_looking_string_is_reported_as_drift_not_silently_coerced():
+    """Deliberate, and it rests on a MEASURED PyYAML quirk.
+
+    PyYAML implements YAML 1.1, whose float regex requires a SIGN in the
+    exponent: `7.0e+1` parses as 70.0 but `7.0e1` parses as the STRING
+    '7.0e1'. So a config author can write what looks like a number and get a
+    string. The drift check reports that as drift rather than coercing it,
+    because the two files genuinely do differ and the operator should see it —
+    coercing would mean interpreting a meaningful string, and would hide a
+    real config-authoring mistake behind a clean report.
+    """
+    module = load_script()
+
+    result = module.compare_blocks({'x': 70.0}, {'x': '7.0e1'})
+
+    assert result['drift'] == [{'leaf': 'x', 'local': 70.0, 'peer': '7.0e1'}]
 
 
 def test_an_absent_block_is_never_treated_as_an_empty_match():
