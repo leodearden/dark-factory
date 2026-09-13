@@ -30,7 +30,11 @@ from _orch_helpers import make_placeholder_future
 from test_verify_merge_flake_suppression import _module_config
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
-from orchestrator.merge_queue import GroupMergeRequest, MergeRequest
+from orchestrator.merge_queue import (
+    GroupMergeRequest,
+    MergeRequest,
+    patch_content_contained,
+)
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
 from orchestrator.merge_queue_store import (
@@ -690,6 +694,14 @@ class TestRecoverPendingMergesRegistryDedup:
         registry = InFlightMergeRegistry()
         git_ops = self._make_git_ops(  # DIVERGENT
             full_branch='task/5326', project_root=not_a_repo,
+        )
+        # The fail-open branch is the INPUT this test classifies on, and it is
+        # environmental (it needs `git cherry` to find no repo above
+        # *not_a_repo*).  Assert it up front so a TMPDIR inside a git checkout
+        # fails here, naming the cause, instead of surfacing as a confusing
+        # SUPERSET/SUBSET mismatch further down.
+        assert await patch_content_contained('Y', 'X', git_ops) is False, (
+            'fail-open precondition not met — is TMPDIR inside a git repo?'
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
 

@@ -1776,9 +1776,10 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
 class TestBoundaryTableWorkflow:
     """PRD §8 row 10: soft-cancel detach at the workflow seam.
 
-    Extends TestSubmitToMergeQueueSoftCancelDetaches with:
-    - The remaining-MCP-waiter-completes assertion (P resolves to 'done')
-    - The re-attach-coalesces assertion (entry waiter count back to 2)
+    Covers, at the ``_submit_to_merge_queue`` seam: the workflow waiter
+    detaching on soft-cancel, the mcp-source primary surviving that detach,
+    re-attach coalescing on retry, and the remaining MCP waiter still
+    completing once the entry resolves.
     """
 
     def _make_wf_with_peer(self, tmp_path, real_queue, registry, *, tip: str):
@@ -1837,7 +1838,7 @@ class TestBoundaryTableWorkflow:
         (2) Workflow outcome is REQUEUED.
         (3) On retry, re-attach coalesces (entry waiter count = 2, no enqueue).
         (4) Resolve P to 'done' — the remaining MCP waiter P is still done.
-        Extends TestSubmitToMergeQueueSoftCancelDetaches with (3) and (4).
+        (1) and (2) pin the detach itself; (3) and (4) pin what must survive it.
         """
         import asyncio
 

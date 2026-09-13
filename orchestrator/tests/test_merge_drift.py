@@ -16,9 +16,11 @@ mirroring task β's test_merge_gates.py:
    ``orchestrator.merge_queue.<name>``.  A moved function must resolve a
    monkeypatched-or-staying sibling via a function-local deferred import so
    those patches stay effective even though the function body now lives in
-   this module.  Each ``TestReachBackRouting`` test below patches BOTH
-   namespaces (merge_drift-local naive vs. merge_queue reach-back target)
-   with CONTRASTING behaviour.
+   this module.  ``TestDriftCheckFullGateSpecNoDerivation`` below carries
+   that coverage: its ``build_merge_verify_spec`` spy records a call only
+   when ``_run_drift_check`` resolves the name through
+   ``orchestrator.merge_queue``, so a naive merge_drift-local resolution
+   leaves ``spec_calls`` empty and the test fails on its first assertion.
 
    Correction to this module's own extraction-time docstring: reading the
    extracted ``_run_drift_check`` body confirms it does NOT call
@@ -195,7 +197,7 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n(
     req.config.enabled_verify_runners = ['laptop']
     req.config.verify_drift_check_every_n_lands = 0
 
-    state_path = _drift_state_path(tmp_path)
+    state_path = tmp_path / 'drift_check_state.json'
     worker = _build_drift_worker(state_path)
 
     await _maybe_run_drift_check(worker, git_ops, req, 'commit-sha')
@@ -204,16 +206,6 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n(
         'land count must not advance on the disabled path'
     )
     assert len(worker._drift_check_tasks) == 0, 'no drift-check task should be scheduled'
-
-
-def _drift_state_path(root: Path) -> Path:
-    """The drift-check state path production derives from a project root.
-
-    Byte-identical to what ``merge_queue.py::SpeculativeMergeWorker.__init__``
-    computes, so a test asserting on this file is asserting on the same path
-    the worker really writes.
-    """
-    return root / 'data' / 'orchestrator' / 'drift_check_state.json'
 
 
 def _build_drift_worker(state_path: Path) -> MagicMock:
@@ -471,11 +463,11 @@ def test_merge_queue_reexports_identical_objects() -> None:
 # Deliberately uses a REAL git repo + REAL throwaway worktree (not the
 # MagicMock git_ops the reach-back tests above use) so `lane_lock_path(wt)`
 # names a real file and the flock contention is genuine — a mocked git_ops
-# cannot exercise a real lock.  The pool half is built the way the existing
-# TestReachBackRouting tests build it: a real HostAllocator plus a fake remote,
-# which is what gets DriftDetector.check past its `local is None or remote is
-# None` INCONCLUSIVE early-return and into the LocalRunner that reaches back to
-# the patched `orchestrator.merge_queue.run_scoped_verification`.
+# cannot exercise a real lock.  The pool half is built the way
+# TestDriftCheckFullGateSpecNoDerivation builds it: a real HostAllocator plus a
+# fake remote, which is what gets DriftDetector.check past its `local is None
+# or remote is None` INCONCLUSIVE early-return and into the LocalRunner that
+# reaches back to the patched `orchestrator.merge_queue.run_scoped_verification`.
 # ---------------------------------------------------------------------------
 
 
