@@ -1024,3 +1024,85 @@ class TestArmMetricStemParity:
         # ...and one arm where the identity rule DOES hold, so the mapping is
         # not merely a systematic rewrite either.
         assert ARM_METRIC_STEMS['runqueue_ratio'] == 'runqueue_ratio'
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-25: the arm-table LOCKSTEP guard (decision 7)
+# ---------------------------------------------------------------------------
+
+
+class TestCalibrationScriptArmTableLockstep:
+    """One fact, two processes that cannot import each other, one reconciler.
+
+    scripts/load-threshold-calibration.py runs under the system python3 at
+    gate time and cannot import sampler.metrics, so it necessarily carries its
+    own copy of the arm-to-metric correspondence. This test is what keeps the
+    two copies equal.
+
+    It lives in the SAMPLER suite because that is where both `sampler` and
+    `shared` import reliably; scripts/tests runs under `--project shared`,
+    where a probe showed sibling workspace members can be absent from the venv.
+    """
+
+    @staticmethod
+    def _load_calibration_script():
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parents[2]
+        script = repo_root / 'scripts' / 'load-threshold-calibration.py'
+        spec = importlib.util.spec_from_file_location(
+            'load_threshold_calibration', script
+        )
+        assert spec is not None, f'Could not build spec from {script}'
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        return module
+
+    def test_the_script_exposes_a_public_arm_to_selector_mapping(self):
+        module = self._load_calibration_script()
+
+        assert hasattr(module, 'ARM_METRIC_SELECTORS'), (
+            'scripts/load-threshold-calibration.py must expose its arm table as one '
+            'public module-level mapping, not as selectors inlined at their use sites '
+            '— otherwise there is nothing for the lockstep test below to compare.'
+        )
+        for arm, spec in module.ARM_METRIC_SELECTORS.items():
+            assert hasattr(spec, 'selector'), (
+                f'ARM_METRIC_SELECTORS[{arm!r}] must be a spec carrying a named '
+                '`selector`, so the ladder and unit label can live beside it without '
+                f'the lockstep projection depending on tuple order; got {spec!r}'
+            )
+
+    def test_the_two_arm_tables_are_equal_in_both_directions(self):
+        from sampler.metrics import ARM_METRIC_STEMS
+
+        module = self._load_calibration_script()
+        # Projected through the NAMED field rather than a position, so the
+        # script's spec can carry its ladder and unit label beside the
+        # selector without this test having to know their order.
+        script_stems = {
+            arm: spec.selector for arm, spec in module.ARM_METRIC_SELECTORS.items()
+        }
+
+        assert script_stems == ARM_METRIC_STEMS, (
+            'DRIFT ALARM, not a bug in either file alone.\n'
+            'sampler/src/sampler/metrics.py::ARM_METRIC_STEMS and '
+            'scripts/load-threshold-calibration.py::ARM_METRIC_SELECTORS disagree.\n'
+            f'  sampler: {ARM_METRIC_STEMS}\n'
+            f'  script:  {script_stems}\n'
+            'The SAMPLER owns the metric vocabulary — it is what writes the rows — so '
+            'edit the script to match it, unless the sampler is what changed. They '
+            'cannot be merged into one home: the script runs under the system python3 '
+            'at gate time and cannot import sampler.'
+        )
+
+    def test_loading_the_script_needs_no_first_party_package(self):
+        """The property that makes this lockstep test possible at all."""
+        module = self._load_calibration_script()
+
+        for name in ('shared', 'sampler', 'orchestrator', 'yaml'):
+            assert not hasattr(module, name), (
+                f'{name} is bound at module level in the calibration script; it must '
+                'stay stdlib-only so it loads under the system python3 at gate time.'
+            )
