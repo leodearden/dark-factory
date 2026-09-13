@@ -104,6 +104,7 @@ def run_tick(
     *,
     psi: dict[str, float],
     process_metrics: dict[str, float],
+    load_metrics: dict[str, float],
 ) -> None:
     """Write one tick's worth of samples to the store.
 
@@ -113,6 +114,16 @@ def run_tick(
         psi:             Dict of 6 PSI avg10 values keyed as psi_*_avg10.
         process_metrics: Dict of 3 non-PSI values (occt_queue_depth,
                          verify_concurrency, verify_rss_total_bytes).
+        load_metrics:    Dict of the runqueue and per-cgroup own-pressure
+                         values (runqueue_ratio, runqueue_read_ok, and one
+                         own_cpu_some10:<leaf> + own_read_ok:<leaf> pair per
+                         cgroup leaf discovered this tick).
+
+    Each group is passed separately, and a degraded one arrives as ``{}``.
+    They are kept apart because they read unrelated kernel surfaces and so
+    fail independently — folding the load group into process_metrics would
+    put two failure domains behind one except and silently widen what a
+    single failure erases.
     """
     # Guard against unexpected/misspelled metric keys that would silently
     # persist without matching any consumer. A PARTIAL dict is always legal —
@@ -124,15 +135,22 @@ def run_tick(
         process_metrics, exact=_PROCESS_METRICS, stems=_NO_STEMS
     )
     assert not unexpected_process, f'unexpected process metric keys: {unexpected_process}'
+    unexpected_load = unexpected_metric_names(
+        load_metrics, exact=_LOAD_METRICS, stems=_LOAD_STEMS
+    )
+    assert not unexpected_load, f'unexpected load metric keys: {unexpected_load}'
 
     # 1. Write PSI rows (NULL windows — PSI is already kernel-windowed)
     for metric, value in psi.items():
         store.insert_sample(now, metric, value, window_mean=None, window_max=None)
 
-    # 2. Write non-PSI rows with DB-backed trailing windows
-    for metric, value in process_metrics.items():
+    # 2. Write non-PSI rows with DB-backed trailing windows. The load group
+    #    shares this path: its write MODE is the same (sampler-windowed), and
+    #    it differs from the process group along exactly one axis — the stem
+    #    set its names are validated against.
+    for metric, value in {**process_metrics, **load_metrics}.items():
         window_mean, window_max = store.trailing_window(metric, value)
         store.insert_sample(now, metric, value, window_mean=window_mean, window_max=window_max)
 
-    # 3. Enforce 24-hour retention (delete-by-age, cheap + index-backed)
+    # 3. Enforce retention (delete-by-age, interval-gated inside the store)
     store.cleanup_old(now)

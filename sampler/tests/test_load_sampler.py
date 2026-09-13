@@ -40,7 +40,10 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(store, now, psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS)
+        run_tick(
+            store, now,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         count = conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
@@ -54,7 +57,10 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(store, now, psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS)
+        run_tick(
+            store, now,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         distinct = conn.execute(
@@ -71,7 +77,10 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(store, now, psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS)
+        run_tick(
+            store, now,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         psi_rows = conn.execute(
@@ -92,7 +101,10 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(store, now, psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS)
+        run_tick(
+            store, now,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         proc_rows = conn.execute(
@@ -114,7 +126,10 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(store, now, psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS)
+        run_tick(
+            store, now,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         row = conn.execute(
@@ -137,7 +152,10 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
 
         # First tick
-        run_tick(store, 1_000_000, psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS)
+        run_tick(
+            store, 1_000_000,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
 
         # Second tick with different process metrics
         second_metrics = {
@@ -145,7 +163,10 @@ class TestRunTick:
             'verify_concurrency': 4.0,
             'verify_rss_total_bytes': 2_097_152.0,
         }
-        run_tick(store, 1_000_005, psi=FAKE_PSI, process_metrics=second_metrics)
+        run_tick(
+            store, 1_000_005,
+            psi=FAKE_PSI, process_metrics=second_metrics, load_metrics={},
+        )
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         row = conn.execute(
@@ -172,7 +193,10 @@ class TestRunTick:
         store.insert_sample(very_old_ts, 'psi_cpu_some_avg10', 0.0)
 
         now = 1_000_000
-        run_tick(store, now, psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS)
+        run_tick(
+            store, now,
+            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
+        )
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         old_row = conn.execute(

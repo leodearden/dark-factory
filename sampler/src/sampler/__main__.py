@@ -71,7 +71,10 @@ def main() -> None:
         logger.exception('Failed to collect process metrics; writing PSI metrics only')
         process_metrics = {}
 
-    run_tick(store, now, psi=psi, process_metrics=process_metrics)
+    # load_metrics is {} until step-18 wires collect_load_metrics in with its
+    # own degrade point. {} is the honest value meanwhile: it writes zero load
+    # rows, which is exactly what this process collects today.
+    run_tick(store, now, psi=psi, process_metrics=process_metrics, load_metrics={})
     store.maybe_vacuum(now)
 
     logger.info(
