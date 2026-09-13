@@ -832,6 +832,113 @@ class TestResolveLedgerDbPath:
         )
 
 
+def _initialized_ledger_db(db_path: Path) -> Path:
+    """Build a REAL ledger at *db_path* the way a deployment's is — α's own DDL.
+
+    A ``touch()`` will not stand in for this, and that is precisely what the
+    verdict below exists to say: an empty file IS a valid empty SQLite
+    database, so only the SCHEMA distinguishes a deployment's ledger from a
+    stray file sitting at the resolved path.
+    """
+    async def _build() -> None:
+        store = ReconLedgerStore(db_path)
+        await store.initialize()
+        await store.close()
+
+    asyncio.run(_build())
+    return db_path
+
+
+class TestClassifyLedgerTarget:
+    """One read-only probe of the target file, four named verdicts.
+
+    Every leg below was MEASURED against sqlite 3.50.4 on 2026-09-13 before it
+    was asserted. The two that look like implementation detail are the ones
+    that decide the classifier's shape:
+
+    * a MISSING path and a DIRECTORY both raise ``sqlite3.OperationalError``
+      from the read-only open (``'unable to open database file'`` and
+      ``'disk I/O error'`` respectively on this build). The exception TYPE
+      cannot tell them apart and the message text is a build detail, so the
+      classifier consults ``db_path.exists()`` FIRST and only then interprets
+      an open failure;
+    * an empty file opens CLEANLY and reports an empty ``sqlite_master``. So
+      ``exists()`` alone — the shape the gate had before this pass — cannot
+      tell a stray file from a real ledger.
+    """
+
+    def test_a_real_initialized_ledger_is_live(self, tmp_path: Path) -> None:
+        db_path = _initialized_ledger_db(tmp_path / _mod.LEDGER_DB_FILENAME)
+        assert _mod.classify_ledger_target(db_path) is _mod.LedgerTargetState.LIVE
+
+    def test_an_absent_path_is_missing(self, tmp_path: Path) -> None:
+        assert _mod.classify_ledger_target(
+            tmp_path / 'nowhere' / _mod.LEDGER_DB_FILENAME
+        ) is _mod.LedgerTargetState.MISSING
+
+    def test_classifying_an_absent_path_creates_nothing(self, tmp_path: Path) -> None:
+        """The probe opens ``mode=ro``, which cannot create the file. This is
+        what lets the verdict be taken BEFORE the dry run decides whether to
+        attach a real ledger at all — a classifier that created what it
+        classified would arm the very gate it reports on."""
+        missing = tmp_path / 'nowhere' / _mod.LEDGER_DB_FILENAME
+        _mod.classify_ledger_target(missing)
+        assert not missing.exists()
+        assert not missing.parent.exists()
+
+    def test_a_bare_touched_file_has_no_schema(self, tmp_path: Path) -> None:
+        """The stray-file shape: something is there, but α's table is not, so
+        no running server has ever opened it as its ledger."""
+        empty = tmp_path / _mod.LEDGER_DB_FILENAME
+        empty.touch()
+        assert _mod.classify_ledger_target(empty) is _mod.LedgerTargetState.NO_SCHEMA
+
+    def test_a_directory_at_the_target_is_undetermined(self, tmp_path: Path) -> None:
+        """It EXISTS, so it is not MISSING; it cannot be read, so the probe
+        cannot prove the target unread either."""
+        a_dir = tmp_path / _mod.LEDGER_DB_FILENAME
+        a_dir.mkdir()
+        assert _mod.classify_ledger_target(a_dir) is (
+            _mod.LedgerTargetState.UNDETERMINED
+        )
+
+    def test_a_non_sqlite_file_is_undetermined(self, tmp_path: Path) -> None:
+        garbage = tmp_path / _mod.LEDGER_DB_FILENAME
+        garbage.write_bytes(b'not a database, just bytes' * 16)
+        assert _mod.classify_ledger_target(garbage) is (
+            _mod.LedgerTargetState.UNDETERMINED
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_ledger_a_running_server_holds_open_is_still_live(
+        self, tmp_path: Path
+    ) -> None:
+        """The case the real migration actually runs against, and the reason the
+        probe is read-only rather than an open-for-write reachability test: the
+        server has this db OPEN in WAL mode throughout. A probe that could not
+        read a busy ledger would invent a brand-new way to block the one-shot
+        run it exists to protect."""
+        db_path = tmp_path / _mod.LEDGER_DB_FILENAME
+        store = ReconLedgerStore(db_path)
+        await store.initialize()
+        try:
+            assert _mod.classify_ledger_target(db_path) is (
+                _mod.LedgerTargetState.LIVE
+            )
+        finally:
+            await store.close()
+
+    def test_the_verdicts_are_a_closed_named_vocabulary(self) -> None:
+        """A verdict is carried into the JSON report, so it is a ``StrEnum``
+        (the house shape, cf. ``models/reconciliation.py``) rather than a bare
+        string: closed at the type level, and still JSON-serializable."""
+        assert issubclass(_mod.LedgerTargetState, str)
+        assert {member.value for member in _mod.LedgerTargetState} == {
+            'live', 'missing', 'no_schema', 'undetermined',
+        }
+        assert json.dumps(_mod.LedgerTargetState.LIVE) == '"live"'
+
+
 class TestAssertLedgerTargetLive:
     """Both ways to write a valid row nothing reads are refused, loudly."""
 
