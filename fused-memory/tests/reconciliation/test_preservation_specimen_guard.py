@@ -722,11 +722,16 @@ class TestGraphitiCitationIsBoundToTheTaskQueried:
         memory_service.get_entity = AsyncMock(
             return_value={'nodes': [{'uuid': 'n-9', 'name': 'Task 3105'}], 'edges': []},
         )
+        flag = _stranded_flag('5231')
 
         result = await filter_preservation_specimen_flags(
-            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag('5231')],
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
         )
 
+        # The harm this test is named for is 5231 BORROWING 3105's citation, so
+        # the kept-flag assertion is the load-bearing one; a resolved-negative
+        # verdict that still dropped the flag would be the worse outcome.
+        assert result.kept_flags == [flag]
         assert result.unresolved_task_ids == ()
 
     @pytest.mark.asyncio
@@ -1379,7 +1384,11 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         )
 
         assert escalated == []
-        assert len(self._pending(queue, '3105')) == 1
+        pending = self._pending(queue, '3105')
+        assert len(pending) == 1
+        # The counter IS the regression: one pending record with dedupe_count
+        # still 0 is exactly what the has_open_l1 skip produced.
+        assert pending[0].dedupe_count == 1
 
     @pytest.mark.asyncio
     async def test_two_tasks_storming_each_file_once(self, queue):
@@ -1625,6 +1634,10 @@ class TestCompositeFlagTaskIds:
 
         assert result.kept_flags == []
         assert result.suppressed_by_task == {'3105': 1}
+        # 5080's read failed, but nothing was left unprotected by it, so the
+        # cycle is NOT reported degraded — this is the assertion that covers
+        # the `if t in kept_task_ids` filter.
+        assert result.unresolved_task_ids == ()
 
     @pytest.mark.asyncio
     async def test_unreadable_component_of_an_uncorroborated_flag_is_disclosed(self):
