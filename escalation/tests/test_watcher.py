@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from escalation.models import Escalation
-from escalation.watcher import _initial_scan, _send_ntfy
+from escalation.watcher import _emit, _initial_scan, _send_ntfy
 
 
 @pytest.fixture
@@ -141,6 +141,102 @@ class TestSendNtfy:
             assert req.get_header('Title') == '[URGENT] Task 99: risk_identified'
             assert req.get_header('Priority') == 'urgent'
             assert req.get_header('Tags') == 'rotating_light'
+
+
+class TestEmitNtfyFailure:
+    """A dropped push must be countable, and must cost the operator nothing else.
+
+    `_emit` reported an ntfy failure with a bare `print(..., file=sys.stderr)`
+    — watcher.py was the one module in the package with no logger, so the
+    failure never reached the stream the watcher's other failures travel, and
+    carried no marker an operator or skill agent could grep for.  Because
+    `_emit` runs at most once per process (both call sites `sys.exit(0)` on
+    the next line), the only countable unit is the marker line itself,
+    aggregated across the re-arm loop's stderr.
+    """
+
+    @staticmethod
+    def _failing_ntfy():
+        return patch(
+            'escalation.watcher._send_ntfy',
+            side_effect=RuntimeError('simulated ntfy outage'),
+        )
+
+    def test_failure_logs_the_marker_at_error(self, blocking_escalation: Escalation, caplog):
+        """(a) ERROR on escalation.watcher, carrying marker + id + cause."""
+        with self._failing_ntfy(), caplog.at_level(logging.ERROR, logger='escalation.watcher'):
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno >= logging.ERROR
+            and 'WATCHER_NTFY_OUTCOME: FAILED' in r.getMessage()
+        ]
+        assert matching, (
+            'Expected an ERROR carrying the WATCHER_NTFY_OUTCOME marker; got: '
+            f'{[(r.name, r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+        message = matching[0].getMessage()
+        assert matching[0].name == 'escalation.watcher', (
+            f'Marker logged on the wrong logger: {matching[0].name!r}'
+        )
+        assert blocking_escalation.id in message, (
+            f'Marker must name the escalation whose push was dropped: {message!r}'
+        )
+        assert 'simulated ntfy outage' in message, (
+            f'Marker must carry the underlying cause: {message!r}'
+        )
+
+    def test_failure_writes_nothing_to_stderr_directly(
+        self, blocking_escalation: Escalation, capsys,
+    ):
+        """(b) The failure travels the logging stream, not a bare print."""
+        with self._failing_ntfy():
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        assert capsys.readouterr().err == '', (
+            'The failure must go through logging, not a bare print to stderr'
+        )
+
+    def test_stdout_still_carries_the_escalation_json(
+        self, blocking_escalation: Escalation, capsys,
+    ):
+        """(c) A dropped push never costs the operator the queue item.
+
+        stdout must also stay PURE JSON: the skill tells agents to parse it
+        without `2>&1`, so a diagnostic leaking there would break every
+        consumer.
+        """
+        with self._failing_ntfy():
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed['id'] == blocking_escalation.id, f'Unexpected stdout payload: {parsed}'
+        assert parsed['summary'] == blocking_escalation.summary
+
+    def test_failure_does_not_raise(self, blocking_escalation: Escalation):
+        """(d) The push is best-effort — its failure never propagates."""
+        with self._failing_ntfy():
+            _emit(blocking_escalation, 'https://ntfy.sh/t')  # must not raise
+
+    def test_successful_push_logs_no_error(self, blocking_escalation: Escalation, caplog):
+        """(d) A working push raises no false outage signal.
+
+        Only a FAILED line is emitted, never a SENT companion: the logging
+        stream's last-resort handler is WARNING-level, so a success marker
+        would be invisible by default and an operator could not tell
+        "succeeded" from "logging not configured".
+        """
+        with patch('escalation.watcher._send_ntfy'), caplog.at_level(logging.DEBUG):
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            f'A successful push must log no ERROR; got: '
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+        assert not [
+            r for r in caplog.records if 'WATCHER_NTFY_OUTCOME' in r.getMessage()
+        ], 'The marker must mean a DROPPED push and nothing else'
 
 
 def _write_esc(queue_dir, esc: Escalation) -> None:
