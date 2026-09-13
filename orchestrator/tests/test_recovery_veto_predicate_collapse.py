@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import textwrap
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -46,24 +47,23 @@ _RECORD_COLLECTIONS = frozenset({
     'pending', 'escalations', 'open_records',
 })
 
-#: THE ALLOWLIST.  Each entry is a carve-out this task decided to KEEP separate,
-#: keyed on the enclosing function plus a source excerpt — never on a line
-#: number, which would rot on the next edit above it.
+#: THE ALLOWLIST — carve-outs that ask a genuinely different question and so
+#: keep a bare truthiness test.  EMPTY is the healthy state: every entry is a
+#: site that reads, to a grep, exactly like the copies task eta deleted.
 #:
-#: `comment_marker` is the text the site must carry in-code, so a later reader
-#: (and this test) finds the carve-out DOCUMENTED rather than merely tolerated.
-_ALLOWLIST = (
+#: Keyed on `module` + `function` + `body`, where `body` is the tuple of
+#: `ast.unparse`d statements the guard's `if` actually executes.  Deliberately
+#: EXECUTABLE STRUCTURE, never prose: an earlier version keyed on a source
+#: excerpt and required a comment marker, which meant a comment rewrite could
+#: turn this guard into a false-offender report, and a function-name-only key
+#: could silently allowlist a NEW bare test elsewhere in the same 700-line
+#: function.  The rationale for each carve-out belongs in the source comment at
+#: the site, once — not duplicated into an assertion here.
+_ALLOWLIST: tuple[dict, ...] = (
     {
         'module': 'harness.py',
         'function': '_reconcile_one_stranded',
-        'why': (
-            'the re-file DEDUP guard: it asks "would I be stacking a SECOND '
-            'record?", for which ANY open record — info or dead-L0 included — '
-            'is the right answer.  It is reached only AFTER the shared '
-            'predicate has already let the caller through.'
-        ),
-        'excerpt': 'Re-filing would stack a SECOND stranded_blocked L1',
-        'comment_marker': 'task 3541',
+        'body': ('return None',),
     },
 )
 
@@ -88,42 +88,59 @@ def _enclosing_function(tree: ast.AST, target: ast.If) -> str:
     return best
 
 
-def _bare_collection_tests(name: str) -> list[tuple[int, str, str]]:
+class _BareTest(NamedTuple):
+    """One ``if <a-collection-of-records>:`` found in a scanned module."""
+
+    lineno: int
+    function: str
+    rendered: str
+    #: The ``ast.unparse``d statements the guard executes — the structural key
+    #: `_ALLOWLIST` matches on, so a carve-out survives a comment rewrite and
+    #: a NEW bare test in the same function is still reported.
+    body: tuple[str, ...]
+
+
+def _bare_collection_tests(name: str) -> list[_BareTest]:
     """Every ``if <a-collection-of-records>:`` in *name*.
 
-    Returns ``(lineno, function, rendered_test)``.  Deliberately narrow: only a
-    BARE truthiness test counts.  A `not ...`, a comparison, or a call to the
-    shared predicate is a considered answer, not a re-derivation.
+    Deliberately narrow: only a BARE truthiness test counts.  A `not ...`, a
+    comparison, or a call to the shared predicate is a considered answer, not a
+    re-derivation.
     """
-    source = _module_source(name)
-    tree = ast.parse(source)
+    tree = ast.parse(_module_source(name))
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
         test = node.test
         if isinstance(test, ast.Attribute) and test.attr in _RECORD_COLLECTIONS:
-            rendered = f'{ast.unparse(test)}'
+            rendered = ast.unparse(test)
         elif isinstance(test, ast.Name) and test.id in _RECORD_COLLECTIONS:
             rendered = test.id
         else:
             continue
-        found.append((node.lineno, _enclosing_function(tree, node), rendered))
+        found.append(_BareTest(
+            node.lineno,
+            _enclosing_function(tree, node),
+            rendered,
+            tuple(ast.unparse(stmt) for stmt in node.body),
+        ))
     return found
 
 
-def _source_around(name: str, lineno: int, *, before: int = 25) -> str:
-    lines = _module_source(name).splitlines()
-    return '\n'.join(lines[max(0, lineno - 1 - before):lineno])
+def _is_allowlisted(
+    module: str, function: str, body: tuple[str, ...],
+    *, allowlist: tuple[dict, ...] = _ALLOWLIST,
+) -> dict | None:
+    """The matching carve-out entry, or ``None``.
 
-
-def _is_allowlisted(module: str, function: str, lineno: int) -> dict | None:
-    context = _source_around(module, lineno)
-    for entry in _ALLOWLIST:
+    Matches on what the guard DOES, not on what a comment beside it says.
+    """
+    for entry in allowlist:
         if (
             entry['module'] == module
             and entry['function'] == function
-            and entry['excerpt'] in context
+            and tuple(entry['body']) == body
         ):
             return entry
     return None
@@ -140,67 +157,57 @@ class TestNoSiteReDerivesTheVetoLocally:
     def test_every_bare_collection_test_is_an_allowlisted_carve_out(self) -> None:
         offenders = []
         for module in _SCANNED:
-            for lineno, function, rendered in _bare_collection_tests(module):
-                if _is_allowlisted(module, function, lineno) is None:
-                    offenders.append(f'{module}:{lineno} in {function}(): if {rendered}:')
+            for found in _bare_collection_tests(module):
+                if _is_allowlisted(module, found.function, found.body) is None:
+                    offenders.append(
+                        f'{module}:{found.lineno} in {found.function}(): '
+                        f'if {found.rendered}:'
+                    )
 
         assert not offenders, (
             'a recovery/redispatch site re-derives the escalation-pin '
             'predicate locally instead of consuming '
             'orchestrator.recovery_pins (INV-5, PRD D3, spec E7). '
             'New site(s):\n  ' + '\n  '.join(offenders) + '\n'
-            'Consume records_pin_recovery / records_pin_blocked_recovery (or '
+            'Consume the shared predicates in orchestrator.recovery_pins (or '
             'the report-shaped adapters in task_ground_truth), or add an '
             'entry to _ALLOWLIST in this file explaining why this site asks a '
             'genuinely different question.'
         )
 
-    @pytest.mark.parametrize('entry', _ALLOWLIST, ids=lambda e: e['function'])
-    def test_every_allowlist_entry_still_exists(self, entry: dict) -> None:
-        """An allowlist that outlives its site silently stops guarding."""
-        matches = [
-            (lineno, function)
-            for lineno, function, _ in _bare_collection_tests(entry['module'])
-            if function == entry['function']
-            and _is_allowlisted(entry['module'], function, lineno) is entry
-        ]
-        assert len(matches) == 1, (
-            f"allowlist entry for {entry['module']}::{entry['function']} matches "
-            f'{len(matches)} sites — remove it if the carve-out is gone, or '
-            f'tighten its excerpt if it now matches more than one'
-        )
+    def test_every_allowlist_entry_still_matches_exactly_one_site(self) -> None:
+        """An allowlist that outlives its site silently stops guarding.
 
-    @pytest.mark.parametrize('entry', _ALLOWLIST, ids=lambda e: e['function'])
-    def test_every_carve_out_names_this_tasks_decision_in_code(
-        self, entry: dict,
-    ) -> None:
-        """DOCUMENTED, not merely tolerated.
-
-        Without the in-code note this site reads to a grep exactly like the
-        copies eta deleted, and the next reader has to re-derive whether it was
-        missed work or a decision.
+        Loops internally rather than parametrizing, so it degrades to a
+        passing no-op when the allowlist is empty — which is the healthy state
+        — instead of erroring on an empty parameter set.
         """
-        lineno = _bare_collection_tests(entry['module'])[0][0]
-        for ln, function, _ in _bare_collection_tests(entry['module']):
-            if function == entry['function']:
-                lineno = ln
-                break
-        context = _source_around(entry['module'], lineno)
-        assert entry['comment_marker'] in context, (
-            f"{entry['module']}::{entry['function']}'s carve-out must name task "
-            f"3541's decision in-code, so a reader finds it decided rather "
-            f'than missed.  Reason on record: {entry["why"]}'
-        )
+        for entry in _ALLOWLIST:
+            matches = [
+                found.lineno
+                for found in _bare_collection_tests(entry['module'])
+                if _is_allowlisted(entry['module'], found.function, found.body)
+                is entry
+            ]
+            assert len(matches) == 1, (
+                f"allowlist entry for {entry['module']}::{entry['function']} "
+                f'matches {len(matches)} sites (lines {matches}) — remove it '
+                f'if the carve-out is gone, or tighten its body shape if it '
+                f'now matches more than one'
+            )
 
 
-class TestTheArchiveInclusiveGateCheckIsDocumented:
+class TestTheGateCheckStaysArchiveInclusive:
     """PRD D3's OTHER named carve-out — a call, so the AST scan cannot see it.
 
     The deterministic gate check asks "did a human already ACT?", which is why
-    it is archive-inclusive (a RESOLVED record counts) where every pin
-    predicate reads only OPEN records.  It is not a `bool(open)` copy, so it
-    would never trip the guard above — which is exactly why its carve-out has
-    to be asserted separately rather than assumed covered.
+    its read is archive-INCLUSIVE (a RESOLVED record counts) where every pin
+    predicate reads only OPEN records.  That `status`-less read is the
+    BEHAVIOUR that makes it a different question; narrowing it to
+    `status='pending'` would make a human-resolved gate look like a fresh
+    strand.  The rationale lives in the source comment at the site — asserting
+    that prose here would duplicate it and pin wording task 5222 must be free
+    to edit.
     """
 
     #: The gate check's OWN call — the two-argument, `status`-less form.
@@ -218,31 +225,6 @@ class TestTheArchiveInclusiveGateCheckIsDocumented:
             'gate look like a fresh strand'
         )
 
-    def test_the_gate_check_names_this_tasks_decision(self) -> None:
-        source = _module_source('harness.py')
-        index = source.index(self._MARKER)
-        window = source[max(0, index - 2500):index]
-        assert 'task 3541' in window or '3541' in window, (
-            "the gate check must carry a comment naming task 3541's decision "
-            'that it STAYS separate, and pointing at the producer-side '
-            'boundary (workflow.py::_is_gating_escalation, owned by task 5222)'
-        )
-
-    def test_the_producer_side_boundary_is_recorded_harness_side(self) -> None:
-        """task 5222's ownership is documented WITHOUT reaching into workflow.py.
-
-        The 2026-09-08 amendment dropped `workflow.py` from this task's scope:
-        a comment there would assert a permanence 5222 is chartered to
-        overturn, and would conflict textually with 5222's own edit.  The
-        boundary is stated here instead.
-        """
-        source = _module_source('harness.py')
-        index = source.index(self._MARKER)
-        window = source[max(0, index - 2500):index]
-        assert '_is_gating_escalation' in window and '5222' in window, (
-            'the harness-side carve-out comment is where this task records '
-            'that the producer-side predicate stays untouched and who owns it'
-        )
 
 
 class TestEveryModuleReachesTheSharedClassifier:
@@ -311,3 +293,45 @@ class TestTheGuardItselfCannotSilentlyStopGuarding:
     def test_the_scanned_modules_all_parse(self) -> None:
         for module in _SCANNED:
             assert ast.parse(_module_source(module)) is not None
+
+    #: A carve-out that does NOT exist in the tree — the mechanism has to stay
+    #: covered once the real allowlist empties, or the next genuine carve-out
+    #: would be added to an untested matcher.
+    _SYNTHETIC = (
+        {'module': 'harness.py', 'function': '_fake', 'body': ('return None',)},
+    )
+
+    def test_the_matcher_accepts_an_entry_whose_body_shape_agrees(self) -> None:
+        assert _is_allowlisted(
+            'harness.py', '_fake', ('return None',), allowlist=self._SYNTHETIC,
+        ) is self._SYNTHETIC[0]
+
+    @pytest.mark.parametrize(
+        ('module', 'function', 'body'),
+        [
+            pytest.param('scheduler.py', '_fake', ('return None',), id='wrong-module'),
+            pytest.param('harness.py', '_other', ('return None',), id='wrong-function'),
+            pytest.param('harness.py', '_fake', ('continue',), id='different-body'),
+            pytest.param(
+                'harness.py', '_fake', ('return None', 'x = 1'), id='body-grew',
+            ),
+        ],
+    )
+    def test_the_matcher_rejects_everything_else(
+        self, module: str, function: str, body: tuple[str, ...],
+    ) -> None:
+        """Structural, not fuzzy.
+
+        `body-grew` is the case a prose key could never catch: a new statement
+        inside an allowlisted guard is a DIFFERENT guard, and must be reported
+        rather than inherited.
+        """
+        assert _is_allowlisted(
+            module, function, body, allowlist=self._SYNTHETIC,
+        ) is None
+
+    def test_an_empty_allowlist_matches_nothing(self) -> None:
+        """The healthy end state still exercises the matcher."""
+        assert _is_allowlisted(
+            'harness.py', '_fake', ('return None',), allowlist=(),
+        ) is None

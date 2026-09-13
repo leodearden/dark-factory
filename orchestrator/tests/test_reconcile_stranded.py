@@ -4735,16 +4735,12 @@ class TestApplierHasNoLocalOpenEscalationTruthiness:
     """The grep-provable half, scoped to this one method.
 
     `_reconcile_one_stranded` may test `report.open_escalations` for truthiness
-    in exactly ONE place — the re-file DEDUP guard, which asks a DIFFERENT
-    question ("would I be stacking a second record?") for which any open
-    record, info or dead-L0 included, is the right answer.  The allowlist names
-    it by its own source so the carve-out is asserted, not assumed.
+    in at most ONE place — the re-file DEDUP guard, which asks a DIFFERENT
+    question ("would I be stacking a second record?").  Asserted STRUCTURALLY:
+    the survivor's body must be a bare `return None`, never a veto arm.  The
+    carve-out's rationale lives in the source comment at the site, once; a
+    duplicate of it here would pin wording rather than behaviour.
     """
-
-    #: A source fragment unique to the one permitted site (task 3541's
-    #: design decision).  Matched on TEXT, never on a line number, so it does
-    #: not rot as the file drifts.
-    _DEDUP_GUARD_MARKER = 'Re-filing would stack a SECOND stranded_blocked L1'
 
     @staticmethod
     def _method_source() -> str:
@@ -4777,9 +4773,3 @@ class TestApplierHasNoLocalOpenEscalationTruthiness:
             # `return None` — not a veto arm with an emission.
             assert lines[offenders[0]].strip() == 'return None', lines[offenders[0]]
 
-    def test_the_dedup_carve_out_is_documented_in_code(self) -> None:
-        source = self._method_source()
-        assert self._DEDUP_GUARD_MARKER in source, (
-            'the one permitted bare truthiness test must keep its comment '
-            'explaining that it is a dedup, not a veto'
-        )
