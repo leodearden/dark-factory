@@ -745,19 +745,27 @@ class TestHeartbeatLoopReapWiring:
         worker.PERIODIC_REAP_MIN_AGE_SECS = _GRACE
         orphan = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
 
+        # Before/after around the loop, in the shape of the sibling at
+        # TestReapOrphanedMergeWorktreesCore. Both readings are taken while
+        # the worker is RUNNING, because the audit short-circuits to [] once
+        # stop() has cleared _running — a post-stop reading would be
+        # unfalsifiable. The BEFORE reading is taken pre-start so it cannot
+        # race the heartbeat's first reap.
+        before = worker.worktree_ledger_violations(now=_NOW)
+        assert len(before) == 1, f'expected exactly one violation, got: {before!r}'
+
         worker_task = asyncio.create_task(worker.run())
         try:
             await _wait_until(
                 lambda: not orphan.exists(),
                 what='the running worker to reap the aged orphan',
             )
+            assert worker.worktree_ledger_violations(now=_NOW) == [], (
+                'the loop-driven sweep must clear the violation it just reaped'
+            )
         finally:
             await worker.stop()
             await worker_task
-
-        assert worker.worktree_ledger_violations(now=_NOW) == [], (
-            'the audit must read clean once the loop-driven sweep has run'
-        )
 
     async def test_heartbeat_loop_survives_raising_reap(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
