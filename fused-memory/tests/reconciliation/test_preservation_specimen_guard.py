@@ -35,6 +35,7 @@ from fused_memory.reconciliation import preservation_specimen_guard
 from fused_memory.reconciliation.preservation_specimen_guard import (
     CATEGORY_PRESERVATION_SPECIMEN_STORM,
     MEM0_KIND_INVESTIGATION_OUTCOME,
+    PRESERVATION_CORROBORATION_BUDGET_SECONDS,
     PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     PRESERVATION_TOKEN_FAMILY,
     STRANDED_FLAG_TOKEN_FAMILY,
@@ -1304,6 +1305,130 @@ def _suppression_result(count=None, *, extra=None, unresolved=()):
         citations_by_task={t: 'a8fd36a8-46db-4ca8-a21c-554c38a918ee' for t in by_task},
         unresolved_task_ids=tuple(unresolved),
     )
+
+
+class TestCorroborationBudget:
+    """The per-cycle deadline that keeps the guard off Stage 1's critical path.
+
+    The guard's cost is per-CANDIDATE: an ordinary stranded task has no
+    ``investigation_outcome`` row and no ``'Task <id>'`` node, so it misses
+    channel 1 and then costs ``get_entity``'s two semantic searches — and the
+    population of such tasks peaks during exactly the fleet-wide stall where
+    Stage 1 must still finish.  Overrun must degrade like any other unreadable
+    verdict: flags KEPT, tasks disclosed, never a silent "no citation".
+    """
+
+    @staticmethod
+    def _slow_memory_service(delay=10.0):
+        """Both channels answer, but far too slowly to fit the budget."""
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(delay)
+            return []
+
+        memory_service = MagicMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_hang)
+        memory_service.get_entity = AsyncMock(side_effect=_hang)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_a_hung_read_does_not_outlast_the_budget(self, caplog):
+        """One unbounded backend call cannot stall the cycle on its own."""
+        flag = _stranded_flag()
+
+        with caplog.at_level(logging.WARNING):
+            result = await filter_preservation_specimen_flags(
+                memory_service=self._slow_memory_service(),
+                project_id=PROJECT,
+                flags=[flag],
+                budget_seconds=0.05,
+            )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+        assert result.unresolved_task_ids == ('3105',)
+        assert any(
+            'timed out' in r.message and '3105' in str(r.args) for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_remaining_candidates_are_skipped_and_disclosed(self, caplog):
+        """An exhausted budget skips the rest — but says so, per INV-11.
+
+        A skipped task was never looked up, so recording it as "no citation"
+        would be a verdict the guard did not earn.
+        """
+        flags = [_stranded_flag(task_id=tid) for tid in ('4101', '4102', '4103')]
+        memory_service = self._slow_memory_service()
+
+        with caplog.at_level(logging.WARNING):
+            result = await filter_preservation_specimen_flags(
+                memory_service=memory_service,
+                project_id=PROJECT,
+                flags=flags,
+                budget_seconds=0.05,
+            )
+
+        assert result.kept_flags == flags
+        assert result.unresolved_task_ids == ('4101', '4102', '4103')
+        assert result.suppressed_by_task == {}
+        # The saving the deadline exists for, and the assertion that separates
+        # skipping from merely timing each remaining candidate out in turn: the
+        # first candidate consumed the budget and the other two were never
+        # queried at all.
+        assert memory_service.get_memories_by_metadata.await_count == 1
+        assert any('budget of' in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_cycle_never_pays_the_deadline(self):
+        """The default budget must be invisible when the backends answer.
+
+        A deadline that trimmed a healthy cycle would trade the guard's whole
+        purpose for latency it does not control.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flags = [_stranded_flag()] + [
+            _stranded_flag(task_id=str(4100 + i)) for i in range(20)
+        ]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.unresolved_task_ids == ()
+        assert result.suppressed_by_task == {'3105': 1}
+        assert len(result.kept_flags) == 20
+
+    @pytest.mark.asyncio
+    async def test_a_corroborated_task_before_the_overrun_still_suppresses(self):
+        """The deadline costs the candidates it could not reach, not the batch."""
+        async def _scroll(project_id, filters):
+            if filters['task_id'] == '3105':
+                return [LIVE_MEM0_ROW]
+            await asyncio.sleep(10.0)
+            return []
+
+        memory_service = MagicMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+        memory_service.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+        specimen = _stranded_flag()
+        other = _stranded_flag(task_id='9999')
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[specimen, other],
+            budget_seconds=0.05,
+        )
+
+        # '3105' sorts first and answers instantly; '9999' then eats the budget.
+        assert result.kept_flags == [other]
+        assert result.suppressed_by_task == {'3105': 1}
+        assert result.unresolved_task_ids == ('9999',)
+
+    def test_the_default_budget_is_a_circuit_breaker_not_a_target(self):
+        """Generous enough that Stage 1's own LLM calls still dominate a cycle."""
+        assert PRESERVATION_CORROBORATION_BUDGET_SECONDS >= 10.0
 
 
 class TestMaybeEscalatePreservationSuppressionStorm:

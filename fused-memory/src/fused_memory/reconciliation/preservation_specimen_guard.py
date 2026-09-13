@@ -122,6 +122,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'CATEGORY_PRESERVATION_SPECIMEN_STORM',
     'MEM0_KIND_INVESTIGATION_OUTCOME',
+    'PRESERVATION_CORROBORATION_BUDGET_SECONDS',
     'PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE',
     'PRESERVATION_TOKEN_FAMILY',
     'STRANDED_ACTION_TARGET_FAMILY',
@@ -215,6 +216,31 @@ _STRANDED_ACTION_FIELDS: tuple[str, ...] = ('suggested_action', 'description')
 #: suppression class.  INV-5 asks that a fact have one home, not that every
 #: constant share one file.
 PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE: int = 5
+
+#: Wall-clock ceiling on ONE cycle's corroboration, in seconds.
+#:
+#: The guard's cost is per-CANDIDATE, not per-cycle (see
+#: :func:`_corroborate_preservation`'s cost note): each genuinely stranded task
+#: with no preservation record costs two semantic Graphiti searches, and the
+#: candidate population peaks during a fleet-wide stall — the cycle where Stage
+#: 1 finishing promptly matters most.  Without a ceiling the guard's
+#: contribution to Stage 1's critical path grows with the size of the incident
+#: it is running inside.
+#:
+#: A DEADLINE, deliberately, rather than a cap on the number of candidates.  A
+#: count cap bites a healthy cycle that merely has many stranded tasks — denying
+#: those specimens protection for no reason — and, since candidates are visited
+#: in a stable order, it would deny the SAME tasks protection every cycle.  A
+#: deadline never bites when the backends are answering: it costs a verdict only
+#: in the case it exists for, a cycle already too slow to finish.
+#:
+#: Generous on purpose.  Stage 1's own LLM calls dominate a cycle, so this is a
+#: circuit breaker and not a performance target; a value tight enough to trim a
+#: healthy cycle would trade the guard's whole purpose for latency it does not
+#: control.  Exhaustion is never silent — the un-corroborated tasks keep their
+#: flags and are disclosed through ``unresolved_task_ids`` like any other
+#: unreadable verdict.
+PRESERVATION_CORROBORATION_BUDGET_SECONDS: float = 30.0
 
 #: Escalation category for BOTH records this module files, single-sourced here
 #: rather than spelled at each use site.  ``Escalation.category`` is free-form
@@ -370,11 +396,12 @@ class PreservationSuppressionResult:
       Graphiti uuid each suppression actually relied on.  A suppression is never
       anonymous: without this, "one flag suppressed" gives an operator no way to
       check whether the citation is real, current, or over-broad.
-    - ``unresolved_task_ids`` — tasks whose corroboration could NOT be read this
-      cycle.  Their flags were KEPT (see the fail-open policy in
-      :func:`filter_preservation_specimen_flags`), and this field is what stops
-      that keep from being byte-identical to a clean "no citation exists"
-      (INV-11).
+    - ``unresolved_task_ids`` — tasks this cycle reached no verdict on: a
+      channel read failed, or the cycle's corroboration budget ran out before
+      they were looked up at all.  Their flags were KEPT (see the fail-open
+      policy in :func:`filter_preservation_specimen_flags`), and this field is
+      what stops that keep from being byte-identical to a clean "no citation
+      exists" (INV-11).
     """
 
     kept_flags: list[dict[str, Any]]
@@ -599,9 +626,19 @@ async def _corroborate_preservation(
     preservation fact is recorded, whereas an ``investigation_outcome`` row only
     exists after some stage has ALREADY investigated a flag — so channel 2 is
     what protects a newly documented specimen on its first cycle, precisely the
-    window tasks 5080 and 5104 were filed in.  Channel 1 runs first because its
-    metadata filter is the cheaper and more authoritative signal, which makes
-    the fallback free on the common path.
+    window the two destructive gate tasks were filed in.  Channel 1 runs first
+    because its metadata filter is the cheaper and more authoritative signal.
+
+    THE FALLBACK IS FREE ON THE RARE PATH, NOT THE COMMON ONE.  The common
+    candidate is the OPPOSITE of a specimen — an ordinary stranded task with no
+    ``investigation_outcome`` row at all — so channel 1 misses and channel 2
+    always runs for it.  And ``get_entity`` skips its semantic work only on an
+    exact name hit: a task with no ``'Task <id>'`` node falls through to
+    ``search_nodes`` PLUS ``graphiti.search``, i.e. two embedding searches.  So
+    the steady-state cost is two semantic searches per genuinely stranded task,
+    and a fleet-wide stall — when Stage 1 most needs to finish — is exactly when
+    that population is largest.  :func:`filter_preservation_specimen_flags`
+    bounds it with a per-cycle deadline rather than paying it unbounded.
 
     Each channel is guarded independently, so one being down never costs the
     other its verdict.  A failed read logs WARNING naming the project, task and
@@ -704,6 +741,7 @@ async def filter_preservation_specimen_flags(
     project_id: str,
     flags: list[dict[str, Any]] | None,
     *,
+    budget_seconds: float = PRESERVATION_CORROBORATION_BUDGET_SECONDS,
     log: logging.Logger = logger,
 ) -> PreservationSuppressionResult:
     """Drop stranded-class recon flags for tasks documented as preserved specimens.
@@ -723,10 +761,19 @@ async def filter_preservation_specimen_flags(
     An empty candidate set short-circuits before any I/O, so a cycle with
     nothing in this class — the overwhelming majority — costs zero backend
     calls.  The corroboration loop is sequential rather than an
-    ``asyncio.gather``: the candidate population is tiny, and a serial loop
-    keeps per-task error attribution exact (the reason
-    ``curator_gate_resolution_sweep`` gives for its own), which is what lets a
-    failure name the task it belongs to.
+    ``asyncio.gather`` because a serial loop keeps per-task error attribution
+    exact (the reason ``curator_gate_resolution_sweep`` gives for its own),
+    which is what lets a failure name the task it belongs to.
+
+    **Bounded by a deadline, not by an assumption.**  A candidate that is NOT a
+    specimen — the common one — costs two semantic Graphiti searches, and the
+    population is largest exactly during the fleet-wide stall where Stage 1 must
+    still finish, so the serial loop is given
+    :data:`PRESERVATION_CORROBORATION_BUDGET_SECONDS` of wall clock for the
+    whole cycle and each corroboration is capped at whatever remains.  Overrun
+    is treated as one more unreadable verdict: the remaining candidates keep
+    their flags and are named in ``unresolved_task_ids``, so a guard that could
+    not keep up says so instead of quietly protecting nothing.
 
     **Fail OPEN on the drop, but never silently.**  A read failure NEVER
     suppresses: it keeps the flag and names the task in ``unresolved_task_ids``.
@@ -767,10 +814,39 @@ async def filter_preservation_specimen_flags(
 
     verdicts: dict[str, _Corroboration] = {}
     unresolved: list[str] = []
-    for task_id in candidates:
-        verdict = await _corroborate_preservation(
-            memory_service, project_id, task_id, log=log,
-        )
+    loop_clock = asyncio.get_running_loop()
+    deadline = loop_clock.time() + budget_seconds
+    for position, task_id in enumerate(candidates):
+        remaining = deadline - loop_clock.time()
+        if remaining <= 0:
+            # Skipped, not answered.  These tasks join the unreadable set for
+            # the same INV-11 reason a failed read does: nothing was looked up,
+            # so "no citation" would be a claim the guard did not earn.
+            log.warning(
+                'preservation_specimen_guard: corroboration budget of %.1fs exhausted '
+                'after %d of %d candidate(s) in project %s — %d task(s) left '
+                'uncorroborated, flags kept',
+                budget_seconds, position, len(candidates), project_id,
+                len(candidates) - position,
+            )
+            unresolved.extend(candidates[position:])
+            break
+        try:
+            # The per-call cap is the REMAINING budget, so one hung backend read
+            # cannot outlast the cycle's ceiling on its own; _corroborate_
+            # preservation re-raises CancelledError, which is what lets wait_for
+            # convert the cancellation into the TimeoutError caught here.
+            verdict = await asyncio.wait_for(
+                _corroborate_preservation(memory_service, project_id, task_id, log=log),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            log.warning(
+                'preservation_specimen_guard: corroboration timed out after %.1fs for '
+                'task %s in project %s — verdict unresolved, flag kept',
+                remaining, task_id, project_id,
+            )
+            verdict = _Corroboration(citation=None, degraded=True)
         verdicts[task_id] = verdict
         if verdict.citation is None and verdict.degraded:
             unresolved.append(task_id)
@@ -905,8 +981,9 @@ async def maybe_escalate_preservation_suppression_storm(
        one cycle is a signal it is over-broad or stale, and the guard's whole
        job is dropping findings, so this is the escape that stops it doing so
        unaccountably.
-    2. **Unreadable corroboration** — one record for the cycle when
-       ``result.unresolved_task_ids`` is non-empty.  The guard fails OPEN, so a
+    2. **Unresolved corroboration** — one record for the cycle when
+       ``result.unresolved_task_ids`` is non-empty (a channel read failed, or
+       the cycle's corroboration budget ran out first).  The guard fails OPEN, so a
        subsystem whose reads are all failing otherwise degrades in total
        silence: every stranded recommendation flows on, the suppressed stat
        reads 0, and nothing distinguishes that from a healthy quiet cycle.
@@ -982,7 +1059,7 @@ async def maybe_escalate_preservation_suppression_storm(
             project_id,
             UNRESOLVED_CORROBORATION_SUBJECT,
             _UNRESOLVED_FINDING_CATEGORY,
-            f'Preservation corroboration unreadable for '
+            f'Preservation corroboration unresolved for '
             f'{len(result.unresolved_task_ids)} task(s) this cycle — stranded '
             f'findings are flowing through unfiltered',
             '\n'.join([
@@ -992,7 +1069,8 @@ async def maybe_escalate_preservation_suppression_storm(
                 'The guard fails OPEN on the drop, so these tasks\' flags were '
                 'KEPT. That is correct, but it means a preserved specimen is '
                 'currently unprotected: check Qdrant/FalkorDB health and the '
-                'WARNING log lines from this module naming the failing channel.',
+                'WARNING log lines from this module, which name either the '
+                'failing channel or an exhausted per-cycle corroboration budget.',
             ]),
             config,
             log,
