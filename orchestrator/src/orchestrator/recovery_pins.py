@@ -25,6 +25,23 @@ IMPORT-PURE — ``escalation.pins`` plus stdlib, and nothing from
 ``orchestrator/tests/test_recovery_pins.py::TestNoOrchestratorCycle`` enforces
 this by parsing the source.
 
+WHICH ANSWER EACH SITE ASKS FOR.  ``classify_pins`` returns ONE classification
+answering TWO questions, and the difference is a dead-filer L0: ``PinReport.pins``
+calls it non-pinning (its handoff has no consumer left, so recovery proceeds),
+``PinReport.vetoes_done_flip`` still counts it (PRD D3 — a done-flip is
+TERMINAL, and completing a task past an unconsumed handoff is a phantom-done).
+So, readable from this module alone:
+
+* recovery / redispatch / re-file dedup -> ``.pins``, via
+  :func:`records_pin_recovery` and :func:`records_pin_blocked_recovery`.
+  Consumed by the harness in-progress applier, the EXISTS_OFF_MAIN blocked-arm
+  upgrade, the CONVERT scoping clause, the deterministic-recon dedup and
+  ``Scheduler._phase_redispatch_stranded_blocked``.
+* MARK_DONE -> ``.vetoes_done_flip``, via :func:`records_pin_blocked_done_flip`
+  here and ``task_ground_truth._vetoes_done_flip`` at the resolver.  Consumed
+  by the ON_MAIN blocked-arm clause, the ``_RECOVERY`` table's escalation
+  element, and the already-landed dispatch gate.
+
 The precedence chain that decides a record's pin class is documented once, in
 ``escalation/src/escalation/pins.py``; this module deliberately does not
 restate it.  Neither does it restate the store-correctness contract, but it
@@ -46,6 +63,7 @@ if TYPE_CHECKING:
 __all__ = [
     'MERGE_REMEDIABLE_ESC_CATEGORIES',
     'only_merge_remediable',
+    'records_pin_blocked_done_flip',
     'records_pin_blocked_recovery',
     'records_pin_recovery',
 ]
@@ -155,6 +173,10 @@ def records_pin_blocked_recovery(
     judgement about record categories, and a failed read produced no categories
     to judge — ``only_merge_remediable(())`` would be vacuously True and
     silently relax a strand nobody can see.
+
+    NOT the predicate for a done-flip — see
+    :func:`records_pin_blocked_done_flip`, its deliberately-more-conservative
+    twin.
     """
     if records is None:
         return True
@@ -164,3 +186,39 @@ def records_pin_blocked_recovery(
         live_claimant=live_claimant,
         live_claimant_id=live_claimant_id,
     ) and not only_merge_remediable(records)
+
+
+def records_pin_blocked_done_flip(
+    task_id: str,
+    records: Sequence[PinRecord] | None,
+    *,
+    live_claimant: bool,
+    live_claimant_id: str | None = None,
+) -> bool:
+    """Do *records* forbid flipping a BLOCKED task to done?
+
+    :func:`records_pin_blocked_recovery`'s deliberately-more-conservative twin.
+    Same merge-remediable relaxation, same ``records is None`` ordering and the
+    same rationale for it — but built on ``vetoes_done_flip`` rather than
+    ``pins``, so the two differ on EXACTLY ONE input class: a dead-filer L0.
+
+    That asymmetry is PRD D3 ("Done-flip vetoes stay maximally conservative:
+    any non-info open record still vetoes MARK_DONE") and spec
+    ``docs/task-escalation-state-spec.md`` §6 demand 3, not a local judgement.
+    A dead L0 has no consumer LEFT, which is why recovery may proceed past it —
+    conversion and re-dispatch are recoverable.  A done-flip is TERMINAL, so
+    proceeding past the same record phantom-completes the task; the record gets
+    an owner later, when the orphan-L0 reaper promotes it to L1.
+
+    The divergence is pinned as an enumerated set in
+    ``orchestrator/tests/test_recovery_pins.py`` so neither predicate can
+    widen it silently.
+    """
+    if records is None:
+        return True
+    return classify_pins(
+        task_id,
+        records,
+        live_claimant=live_claimant,
+        live_claimant_id=live_claimant_id,
+    ).vetoes_done_flip and not only_merge_remediable(records)

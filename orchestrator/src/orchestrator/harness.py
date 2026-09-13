@@ -153,6 +153,7 @@ from orchestrator.task_ground_truth import (
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_pins_blocked_done_flip,
     report_pins_blocked_recovery,
     report_pins_recovery,
 )
@@ -5871,31 +5872,37 @@ class Harness:
         # (_branch_is_degenerate below) — rather than a change to θ1's
         # reviewed table (design decision, task 2243; esc-2243-4).
         #
-        # The open-escalation clause is the SHARED blocked-recovery predicate
-        # (task 3541), not the former `not report.open_escalations`: a task
-        # whose branch landed while it was still blocked is often held by the
-        # reaper's OWN stranded_blocked — the escalation that ASKED for this
-        # landing — and letting it veto the self-heal pins the task blocked
-        # forever after its work is already on main (PRD leaf δ).
+        # THIS CLAUSE ALONE ASKS THE DONE-FLIP QUESTION.  Its outcome is
+        # MARK_DONE_WITH_PROVENANCE — terminal — so it consumes
+        # `report_pins_blocked_done_flip`, built on
+        # `classify_pins(...).vetoes_done_flip`.  Its twin below
+        # (EXISTS_OFF_MAIN -> RE_FILE_ESCALATION), the CONVERT scoping clause
+        # and `Scheduler._phase_redispatch_stranded_blocked` all ask the OTHER
+        # question and share `report_pins_blocked_recovery` /
+        # `records_pin_blocked_recovery`.
         #
-        # `report_pins_blocked_recovery` composes TWO relaxations that used to
-        # be one: `escalation.pins`' pin CLASS (an info annotation never pins;
-        # a dead-filer L0 has no consumer left — and `report.live_claimant is
-        # None` above is exactly what makes link 4 conclusive here) with this
-        # package's CATEGORY policy (`recovery_pins.only_merge_remediable`).
-        # `Scheduler._phase_redispatch_stranded_blocked` consumes the IDENTICAL
-        # function, which is what unifies the drift E7 catalogued — before
-        # 3541 the relaxation was a private Harness staticmethod the scheduler
-        # could not reach, so it kept its own bare `bool(rows)`.
+        # The two predicates carry the SAME merge-remediable relaxation and
+        # differ on exactly one input class — a dead-filer L0.  Recovery may
+        # proceed past one: its handoff has no consumer left, and conversion or
+        # a re-file is recoverable.  A DONE-FLIP may not: it is terminal, so
+        # completing a task past an unconsumed handoff is the phantom-done D4
+        # had just closed at the dispatch gate, and PRD D3 / spec §6 demand 3
+        # say so directly ("any non-info open record still vetoes MARK_DONE").
+        # The dead L0 is not stranded forever either — part 4 of this task, the
+        # orphan-L0 reaper, promotes it to L1 and gives it an owner.
         #
-        # Any non-remediable (human-concern) handoff still pins and leaves the
-        # task alone, and an empty list still relaxes, so every other task
-        # classifies exactly as before.
+        # The relaxation itself is unchanged and is why this clause exists at
+        # all (PRD leaf δ): a task whose branch landed while it was still
+        # blocked is usually held by the reaper's OWN stranded_blocked — the
+        # record that ASKED for this landing — and letting it veto the
+        # self-heal pins the task blocked forever after its work is on main.
+        # Any human-concern handoff still pins, and an empty list still
+        # relaxes, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and not report_pins_blocked_recovery(report)
+            and not report_pins_blocked_done_flip(report)
             and report.branch_state.kind in (
                 BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
             )
@@ -5912,8 +5919,9 @@ class Harness:
         # MARK_DONE upgrade above — rather than a change to θ1's reviewed
         # table (design decision, task 2243; esc-2243-5).
         #
-        # Same SHARED predicate as the clause above (task 3541), for the same
-        # reason and with the same two composed relaxations: this is the branch
+        # The RECOVERY predicate, NOT the done-flip one the clause above uses:
+        # a re-file or an auto-merge is recoverable, so a dead-filer L0 does not
+        # hold it (task 3541).  Otherwise identical in spirit: this is the branch
         # shape a verified-green-but-never-merged task is in, and the
         # escalation holding it is usually the reaper's OWN stranded_blocked —
         # filed to REQUEST exactly the merge the verified-green gate below

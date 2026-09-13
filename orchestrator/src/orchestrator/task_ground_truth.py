@@ -95,7 +95,11 @@ from shared.task_statuses import TaskStatus
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import LeaveReason, render_shape
-from orchestrator.recovery_pins import records_pin_blocked_recovery, records_pin_recovery
+from orchestrator.recovery_pins import (
+    records_pin_blocked_done_flip,
+    records_pin_blocked_recovery,
+    records_pin_recovery,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -121,6 +125,7 @@ __all__ = [
     'classify_recovery',
     'leave_reason',
     'recovery_shape_str',
+    'report_pins_blocked_done_flip',
     'report_pins_blocked_recovery',
     'report_pins_recovery',
 ]
@@ -1178,6 +1183,21 @@ def report_pins_blocked_recovery(report: TruthReport) -> bool:
     See :func:`orchestrator.recovery_pins.records_pin_blocked_recovery`.
     """
     return records_pin_blocked_recovery(
+        '',
+        report.open_escalations,
+        live_claimant=report.live_claimant is not None,
+        live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_pins_blocked_done_flip(report: TruthReport) -> bool:
+    """Do *report*'s open records forbid flipping a BLOCKED task to done?
+
+    :func:`report_pins_blocked_recovery`'s deliberately-more-conservative twin;
+    they differ on exactly one input class.  See
+    :func:`orchestrator.recovery_pins.records_pin_blocked_done_flip`.
+    """
+    return records_pin_blocked_done_flip(
         '',
         report.open_escalations,
         live_claimant=report.live_claimant is not None,
