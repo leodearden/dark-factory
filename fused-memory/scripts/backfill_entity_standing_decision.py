@@ -251,7 +251,7 @@ EVIDENCE_TYPE_MEM0 = 'mem0'
 EVIDENCE_TYPE_ESCALATION = 'escalation'
 
 
-def build_evidence_refs(stamp_ids: list[str], entity_uuid: str) -> list[dict[str, str]]:
+def build_evidence_refs(stamp_ids: list[str]) -> list[dict[str, str]]:
     """Assemble the row's cited provenance: bare ``{type, id}`` refs.
 
     Deliberately resolves NOTHING. β's ``resolve_evidence_refs`` is what stamps
@@ -271,18 +271,17 @@ def build_evidence_refs(stamp_ids: list[str], entity_uuid: str) -> list[dict[str
     stamp targets at all: the row's provenance is a property of the decision,
     not of how much work a previous run happened to leave undone.
 
+    No ref names the decided entity, and none needs to: the ledger row holds
+    it in its own indexed column, which is the field γ/δ actually query on. A
+    copy inside a ref would be a second home for a value nothing reads there.
+
     Args:
         stamp_ids: The evidence-only stamp targets from
             :func:`select_evidence_only_targets`.
-        entity_uuid: The decided entity, naming which decision this provenance
-            belongs to. No ref embeds it: the ledger row carries the entity in
-            its own indexed column, which is the field γ/δ query on, so
-            repeating it inside a ref would be a second copy nothing reads.
 
     Returns:
         Bare refs in citation order, each id appearing exactly once.
     """
-    del entity_uuid  # see Args — the row's own column is the entity's home.
     ordered: list[str] = [SOURCE_MEMORY_ID, *stamp_ids, *HUMAN_EVIDENCE_MEMORY_IDS]
     seen: set[str] = set()
     refs: list[dict[str, str]] = []
@@ -440,7 +439,7 @@ def plan_backfill(
         stamp_targets=tuple(
             memory_id for memory_id in selected if memory_id not in stamped_ids
         ),
-        evidence_refs=tuple(build_evidence_refs(selected, entity_uuid)),
+        evidence_refs=tuple(build_evidence_refs(selected)),
     )
 
 

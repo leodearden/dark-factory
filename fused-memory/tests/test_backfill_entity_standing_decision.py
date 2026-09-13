@@ -293,7 +293,7 @@ class TestBuildEvidenceRefs:
 
     @staticmethod
     def _refs() -> list[dict]:
-        return _mod.build_evidence_refs(EXPECTED_STAMP_TARGETS, ENTITY_UUID)
+        return _mod.build_evidence_refs(EXPECTED_STAMP_TARGETS)
 
     def test_cites_every_stamp_target_and_every_pinned_human_record(self) -> None:
         mem0_ids = [
@@ -331,7 +331,7 @@ class TestBuildEvidenceRefs:
     def test_an_empty_stamp_plan_still_cites_the_pinned_evidence(self) -> None:
         """An idempotent re-run stamps nothing, but the row's provenance must not
         shrink to depend on what a previous run happened to leave unstamped."""
-        refs = _mod.build_evidence_refs([], ENTITY_UUID)
+        refs = _mod.build_evidence_refs([])
         ids = {ref['id'] for ref in refs}
         assert _mod.SOURCE_MEMORY_ID in ids
         assert set(_mod.HUMAN_EVIDENCE_MEMORY_IDS) <= ids
@@ -438,7 +438,7 @@ class TestPlanBackfill:
         assert plan.needs_ledger_write is True
         assert plan.stamp_targets == tuple(EXPECTED_STAMP_TARGETS)
         assert plan.evidence_refs == tuple(
-            _mod.build_evidence_refs(EXPECTED_STAMP_TARGETS, ENTITY_UUID)
+            _mod.build_evidence_refs(EXPECTED_STAMP_TARGETS)
         )
 
     def test_a_fully_migrated_corpus_plans_nothing(self) -> None:
