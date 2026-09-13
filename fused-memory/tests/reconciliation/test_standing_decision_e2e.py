@@ -378,3 +378,67 @@ class TestOneCycleSuppressesAndAnnotates:
         assert [
             f['standing_decision_id'] for f in assembled['flagged_items']
         ] == [expected_id]
+
+
+# ---------------------------------------------------------------------------
+# Never-drop: the SAME entity, with and without an active decision
+# ---------------------------------------------------------------------------
+
+
+class TestNeverDropsAFinding:
+    """PRD boundary row 7 — "same cycle ± active decision".
+
+    A standing decision changes what a finding SAYS, never whether it EXISTS.
+    δ's own never-drop test compares two DIFFERENT entities (one decided, one
+    not); comparing the SAME entity ± an active row is the stricter reading and
+    rules out a per-entity confound that the two-entity comparison cannot: here
+    the entity, its name, the finding and the citation are byte-identical
+    across both runs, so the annotation is the ONLY thing that can differ.
+    """
+
+    @staticmethod
+    async def _cite(service) -> tuple[dict, list[dict]]:
+        """Run the identical finding flow once: ``(citation, findings)``."""
+        state, run_id, finding_id = state_with_finding(service)
+        citation = await state.cite_entity(run_id, finding_id, ENTITY_NAME)
+        return citation, state.get_findings_for_run(run_id)
+
+    @pytest.mark.asyncio
+    async def test_the_finding_survives_either_way(
+        self, backfilled_decision, tmp_path
+    ) -> None:
+        decided_ledger, decided_service = backfilled_decision
+        undecided_ledger = await make_ledger(tmp_path, name='undecided.db')
+        try:
+            # The two ledgers really do differ — otherwise "identical counts"
+            # would be comparing a decision against itself.
+            assert await undecided_ledger.list_entity_standing_decisions(
+                PROJECT_ID
+            ) == []
+            assert len(
+                await decided_ledger.list_entity_standing_decisions(PROJECT_ID)
+            ) == 1
+
+            decided_citation, decided_findings = await self._cite(decided_service)
+            undecided_citation, undecided_findings = await self._cite(
+                make_memory_service(undecided_ledger)
+            )
+        finally:
+            await undecided_ledger.close()
+
+        # NEVER-DROP: the same count of findings reaches the channel Stage 2
+        # polls, whether or not the cited entity is under a standing decision.
+        assert len(decided_findings) == len(undecided_findings) == 1
+
+        # The citation contract is intact on both sides.
+        assert decided_citation['entity_uuid'] == undecided_citation['entity_uuid']
+        assert decided_citation['canonical_name'] == (
+            undecided_citation['canonical_name']
+        )
+
+        # ...and the ANNOTATION is the only difference.
+        expected_id = f'{ENTITY_UUID}:{GROUNDS_STRUCTURAL_SIZE_CONFLATION}'
+        assert decided_findings[0]['standing_decision_id'] == expected_id
+        assert undecided_findings[0]['standing_decision_id'] is None
+        assert 'standing_decision' in decided_citation
+        assert 'standing_decision' not in undecided_citation
