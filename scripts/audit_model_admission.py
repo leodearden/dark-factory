@@ -204,3 +204,150 @@ def scan_routing_decisions(
         rejections=tuple(rejections),
         skipped_rows=skipped,
     )
+
+
+# timeouts.merger, from orchestrator/src/orchestrator/defaults.yaml::timeouts.
+# Passed IN rather than read from config: scripts/tests/ imports no first-party
+# package (dark-factory-orchestrator.yaml:111-112), so importing orchestrator
+# config here would break test collection outright. Stated as seconds because
+# that is the unit the config states it in.
+DEFAULT_WALL_CLOCK_LIMITS_SECS: dict[str, int] = {'merger': 600}
+
+
+@dataclass(frozen=True)
+class MergeOutcome:
+    """How the merge this invocation was working on ultimately finished."""
+
+    timestamp: str
+    state: str
+    merge_sha: str | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class InvocationRecord:
+    """One run of the target model, with what the invocations table cannot say.
+
+    ``end_event_model`` is the model string as the `invocation_end` event
+    records it — an independent second witness to the `invocations.model`
+    column, which is what makes "is this a lineage alias or the literal string?"
+    answerable rather than assumed.
+
+    ``at_or_over_wall_clock`` is None, not False, for a role with no configured
+    limit: False would assert "ran under the limit" for a limit we do not know.
+    """
+
+    task_id: str | None
+    project_id: str
+    role: str
+    account_name: str
+    cost_usd: float
+    duration_ms: int
+    capped: bool
+    started_at: str
+    completed_at: str
+    turns: int | None
+    succeeded: bool | None
+    end_event_model: str | None
+    merge_outcome: MergeOutcome | None
+    at_or_over_wall_clock: bool | None
+
+
+def _events_by_task(
+    conn: sqlite3.Connection, event_type: str, since: datetime
+) -> dict[str | None, list[tuple[str, str, dict[str, Any]]]]:
+    """Load *event_type* rows at or after *since* as {task_id: [(ts, role, payload)]}.
+
+    One pass, grouped in Python.  A per-invocation correlated subquery against a
+    181 MB store would be the obvious alternative and is why this is spelled
+    out: the whole scan is two table reads regardless of how many runs match.
+    Rows stay in (timestamp, id) order within each task, so callers can take
+    "the first at or after X" or "the last" by position.
+    """
+    cursor = conn.execute(
+        'SELECT timestamp, task_id, role, data FROM events '
+        'WHERE event_type = ? AND timestamp >= ? ORDER BY timestamp, id',
+        (event_type, _iso(since)),
+    )
+    grouped: dict[str | None, list[tuple[str, str, dict[str, Any]]]] = {}
+    for timestamp, task_id, role, raw in cursor:
+        payload = _loads_object(raw)
+        if payload is None:
+            continue
+        grouped.setdefault(task_id, []).append((timestamp, role or '', payload))
+    return grouped
+
+
+def scan_invocations(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    since: datetime,
+    wall_clock_limits: dict[str, int] | None = None,
+) -> tuple[InvocationRecord, ...]:
+    """Every run of *model* completed at or after *since*, with its outcome.
+
+    Two enrichments the `invocations` table cannot supply on its own:
+
+    TURNS, from the matching `invocation_end` event — `invocations` has no turns
+    column, so this join is the only way to answer the question at all.  Matched
+    on task_id + role, taking the first such event at or after the invocation's
+    ``started_at``.
+
+    MERGE OUTCOME, for merger runs, from the task's LAST `merge_finalized` at or
+    after ``started_at``.  Last, not first: a post-merge verification failure
+    blocks a task and is retried to done, and reporting the first would read as
+    the merger having failed to resolve a merge it did resolve.  Matched on
+    task_id ALONE — the producer leaves these events' `role` column empty.
+    """
+    limits = DEFAULT_WALL_CLOCK_LIMITS_SECS if wall_clock_limits is None else wall_clock_limits
+    ends = _events_by_task(conn, 'invocation_end', since)
+    merges = _events_by_task(conn, 'merge_finalized', since)
+    cursor = conn.execute(
+        'SELECT task_id, project_id, role, account_name, cost_usd, duration_ms, '
+        'capped, started_at, completed_at FROM invocations '
+        'WHERE model = ? AND completed_at >= ? ORDER BY completed_at, id',
+        (model, _iso(since)),
+    )
+    records = []
+    for (task_id, project_id, role, account_name, cost_usd, duration_ms,
+         capped, started_at, completed_at) in cursor:
+        end = next(
+            (payload for timestamp, event_role, payload in ends.get(task_id, ())
+             if event_role == role and timestamp >= started_at),
+            None,
+        )
+        merge = None
+        if role == 'merger':
+            finalized = [
+                (timestamp, payload) for timestamp, _, payload in merges.get(task_id, ())
+                if timestamp >= started_at
+            ]
+            if finalized:
+                timestamp, payload = finalized[-1]
+                merge = MergeOutcome(
+                    timestamp=timestamp,
+                    state=payload.get('state') or '',
+                    merge_sha=payload.get('merge_sha'),
+                    reason=payload.get('reason'),
+                )
+        limit_secs = limits.get(role)
+        records.append(InvocationRecord(
+            task_id=task_id,
+            project_id=project_id,
+            role=role,
+            account_name=account_name,
+            cost_usd=cost_usd,
+            duration_ms=duration_ms,
+            capped=bool(capped),
+            started_at=started_at,
+            completed_at=completed_at,
+            turns=end.get('turns') if end else None,
+            succeeded=end.get('success') if end else None,
+            end_event_model=end.get('model') if end else None,
+            merge_outcome=merge,
+            at_or_over_wall_clock=(
+                None if limit_secs is None else duration_ms >= limit_secs * 1000
+            ),
+        ))
+    return tuple(records)
