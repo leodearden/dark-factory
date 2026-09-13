@@ -10,7 +10,8 @@ When a single-task merge future resolves with
 
 Mirrors :mod:`test_workflow_merge_thrash`'s minimal-mock TaskWorkflow harness.
 The merge outcome is delivered from the QUEUE side (see
-:func:`_merge_queue_resolving_with`) so the real enqueue chain still runs.
+:class:`_merge_queue_doubles.ResolvingMergeQueue`) so the real enqueue chain
+still runs.
 """
 
 from __future__ import annotations
@@ -22,11 +23,12 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_queue_doubles import ResolvingMergeQueue
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.merge_queue import MergeOutcome, MergeRequest
+from orchestrator.merge_queue import MergeOutcome
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -81,26 +83,6 @@ def _make(*, task_id: str = '99') -> _Fixture:
     return _Fixture(wf=wf)
 
 
-def _merge_queue_resolving_with(outcome: MergeOutcome) -> MagicMock:
-    """A ``wf.merge_queue`` double that resolves every enqueued request with *outcome*.
-
-    Resolving from the QUEUE side stands in only for the WORKER that would pick
-    the request up. The real ``register_and_enqueue_merge_request`` ->
-    ``enqueue_merge_request`` chain still runs — in-flight registry handling, the
-    ``merge_queued`` event and the ``merge_finalized`` done-callback all behave as
-    in production — where monkeypatching ``enqueue_merge_request`` replaced that
-    whole chain one level below the call site (task 5027 γ4).
-    """
-    queue = MagicMock()
-
-    async def _put(req: MergeRequest) -> None:
-        req.result.set_result(outcome)
-
-    queue.put = AsyncMock(side_effect=_put)
-    queue.qsize = MagicMock(return_value=0)
-    return queue
-
-
 _SUPERSEDED = MergeOutcome('superseded', superseded_by='mr-x', merge_sha='s')
 
 
@@ -123,7 +105,7 @@ async def test_superseded_outcome_parks_as_merge_deferred(
     wf = f.wf
     wf.worktree = tmp_path / 'wt'
     wf.worktree.mkdir(parents=True, exist_ok=True)
-    wf.merge_queue = _merge_queue_resolving_with(_SUPERSEDED)
+    wf.merge_queue = ResolvingMergeQueue(_SUPERSEDED)
     wf.plan = {'files': []}
     # event_store=None proves the handler is None-safe without a separate test.
     wf.event_store = None
@@ -136,7 +118,9 @@ async def test_superseded_outcome_parks_as_merge_deferred(
     )
     # The outcome really did come back through the queue, so the real
     # register_and_enqueue_merge_request chain ran rather than being replaced.
-    cast(AsyncMock, wf.merge_queue.put).assert_awaited_once()
+    assert wf.merge_queue.qsize() == 1, (
+        f'Expected exactly one enqueued MergeRequest, got {wf.merge_queue.qsize()}'
+    )
     # (b) set_task_status was called with 'merge-deferred' and NEVER with 'done'.
     set_task_status_mock = cast(AsyncMock, wf.scheduler.set_task_status)
     set_task_status_mock.assert_any_await('99', 'merge-deferred')
@@ -145,10 +129,14 @@ async def test_superseded_outcome_parks_as_merge_deferred(
         for call in set_task_status_mock.await_args_list
     ), 'set_task_status must never be called with "done" on a superseded outcome'
     # (c) The failure path was not taken — no _mark_blocked, no escalation, and
-    #     no thrash-counter pollution. Both facts follow from (a): the blocked
-    #     tail is the sole writer of _last_merge_block_reason inside
-    #     _submit_to_merge_queue (workflow.py:11157) and the sole caller of
-    #     _mark_blocked, and it returns BLOCKED, which (a) excludes.
+    #     no thrash-counter pollution. Both facts follow from (a). Every
+    #     _mark_blocked call site inside
+    #     orchestrator/src/orchestrator/workflow.py::TaskWorkflow._submit_to_merge_queue
+    #     is a `return await`, and _mark_blocked never returns MERGE_DEFERRED
+    #     (its early WorkflowOutcome(self.state.value) return is gated on
+    #     machine.is_terminal(), i.e. DONE/CANCELLED), so an outcome of
+    #     MERGE_DEFERRED excludes all of them; the blocked tail is also the only
+    #     writer of _last_merge_block_reason in that method.
     # (d) clear_requeue_count was called — prevents stranded retry counter
     #     (mirrors _enter_merge_deferred; a regression dropping this call must fail).
     cast(MagicMock, wf.scheduler.clear_requeue_count).assert_called_once_with('99')
@@ -176,7 +164,7 @@ async def test_superseded_emits_event_and_log_naming_superseded_by(
     wf = f.wf
     wf.worktree = tmp_path / 'wt'
     wf.worktree.mkdir(parents=True, exist_ok=True)
-    wf.merge_queue = _merge_queue_resolving_with(_SUPERSEDED)
+    wf.merge_queue = ResolvingMergeQueue(_SUPERSEDED)
     wf.plan = {'files': []}
     # Wire up a mock event_store so we can inspect emit() calls.
     wf.event_store = MagicMock()

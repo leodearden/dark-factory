@@ -452,10 +452,10 @@ class TestFinalizingHeadLifecycle:
     async def test_finalizing_head_set_during_await_cleared_after(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """The finalizing head is discoverable via ``_finalizing_head_entry()``
-        during `await entry.verify_task` and disappears once the entry
-        retires (task 2435 kappa-b: derived from ``_live_items``, not the
-        deleted ``_finalizing_head`` field).
+        """The finalizing head is visible as ``snapshot()['head_of_line']``
+        during `await entry.verify_task`, and returns to None once the entry
+        retires (task 2435 kappa-b: that section is derived from the live
+        registry, not from the deleted ``_finalizing_head`` field).
         """
         gate = asyncio.Event()
 

@@ -25,6 +25,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_queue_doubles import ResolvingMergeQueue
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 from _workflow_helpers import _bind_landed_row
 from escalation.models import Escalation  # noqa: F401 — keeps fixture parity
@@ -33,7 +34,12 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
-from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,36 +55,20 @@ def _preset_cancel_event() -> asyncio.Event:
 
     ``_await_cancellable`` races the request future against this event, so
     presetting it is the public way to make the cancel arm win — the request
-    future is left pending by ``_ResolvingMergeQueue(outcome=None)``.
+    future is left pending by ``ResolvingMergeQueue(outcome=None)``.
     """
     event = asyncio.Event()
     event.set()
     return event
 
 
-class _ResolvingMergeQueue(asyncio.Queue):
-    """A real ``asyncio.Queue`` that also plays the part of the merge WORKER.
-
-    Each request put on it is genuinely enqueued — ``qsize``/``get_nowait``
-    assertions still read the real item — and its ``result`` future is then
-    resolved with *outcome*, exactly as the worker would. That is what lets the
-    workflow reach its outcome through the real ``_await_cancellable`` / future
-    contract instead of having that method replaced (task 5027 γ4).
-
-    ``outcome=None`` leaves the future pending. Two cases need that: a test
-    asserting the trigger does NOT fire (nothing is ever enqueued), and the
-    soft-cancel test, where ``_await_cancellable`` must let the cancel event win
-    the race it holds against the request future.
-    """
-
-    def __init__(self, outcome: MergeOutcome | None = None) -> None:
-        super().__init__()
-        self.outcome = outcome
-
-    async def put(self, item: Any) -> None:
-        await super().put(item)
-        if self.outcome is not None and not item.result.done():
-            item.result.set_result(self.outcome)
+#: What the fixtures whose trigger must NOT fire hand their queue. Nothing is
+#: enqueued on their green path, so it goes unused — but a regression that DOES
+#: fire resolves at once and reds on ``result is None``, where a never-resolving
+#: queue would instead hang in ``_await_cancellable`` (which races only the
+#: request future and an unset cancel event, with no timeout) until
+#: pytest-timeout killed the xdist worker 300 seconds later.
+_FAST_FAIL_OUTCOME = MergeOutcome('done', merge_sha='deadbeef')
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +149,7 @@ def _make(
     esc_queue.submit = MagicMock()
     esc_queue.get_by_task = MagicMock(return_value=[])
 
-    merge_queue: asyncio.Queue = _ResolvingMergeQueue(merge_outcome)
+    merge_queue: asyncio.Queue = ResolvingMergeQueue(merge_outcome)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -329,6 +319,7 @@ async def test_partial_train_does_not_fire():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=_FAST_FAIL_OUTCOME,
     )
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -389,6 +380,7 @@ async def test_non_tip_member_does_not_fire():
         task_id='101',
         metadata={'train': {'id': 'T1', 'order': 0}},
         tasks_by_train_return=members,
+        merge_outcome=_FAST_FAIL_OUTCOME,
     )
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -507,6 +499,15 @@ async def test_soft_cancel_delegates_to_handle_soft_cancel():
         await f.wf._maybe_enqueue_group_merge()
 
     assert excinfo.value.kind == 'soft'
+    # Escaping UNCAUGHT is the contract, and it has a public projection:
+    # _finalise_cancellation — run()'s catch site, and the only caller of
+    # _handle_soft_cancel — enters CANCELLED before delegating, so a phase
+    # still short of CANCELLED proves this layer did not handle the cancel
+    # itself and then re-raise.
+    assert f.wf.state is not WorkflowState.CANCELLED, (
+        f'Expected the cancel to propagate uncaught, but the workflow already '
+        f'finalised it locally: state={f.wf.state!r}'
+    )
 
 
 # ---------------------------------------------------------------------------
