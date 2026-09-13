@@ -16,7 +16,9 @@ rather than hand-editing if the writer's schema moves.
 """
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
+import audit_model_admission
 import pytest
 
 RUNS_DB_SCHEMA = """
@@ -200,3 +202,183 @@ def _account_event(
         (account_name, event_type, project_id, run_id, _payload(details), created_at),
     )
     conn.commit()
+
+
+# --- scan_routing_decisions: the resolver-decision surface (checks 1 and 3) ---
+
+FABLE = 'claude-fable-5-1'
+APPLY = datetime(2026, 9, 12, 6, 43, 16, tzinfo=UTC)
+
+
+def _at(**offset):
+    """An ISO-8601 timestamp *offset* from the D6 apply time, spelled as the store does."""
+    return (APPLY + timedelta(**offset)).isoformat()
+
+
+def _routing_payload(
+    *,
+    role,
+    model,
+    source_layer='config',
+    rule_id=None,
+    rejected=(),
+    routing_tier=0,
+):
+    """The exact 11-key `routing_decision` payload the producer emits.
+
+    Key set taken from orchestrator/src/orchestrator/workflow.py::
+    _record_routing_decision and corroborated against a live row, so a
+    producer-side key rename shows up here as a failing test rather than as a
+    silently empty audit section.
+    """
+    return {
+        'role': role,
+        'model': model,
+        'effort': 'max',
+        'budget_usd': 8.0,
+        'max_turns': 100,
+        'source_layer': source_layer,
+        'rule_id': rule_id,
+        'rejected': list(rejected),
+        'routing_tier': routing_tier,
+        'decided_at': _at(),
+        'inputs_digest': 'a86343567ef2a2d8',
+    }
+
+
+def test_config_layer_selection_is_reported_with_its_source_layer(runs_db):
+    _event(
+        runs_db, _at(hours=2), 'routing_decision', task_id='4377', role='merger',
+        data=_routing_payload(role='merger', model=FABLE),
+    )
+
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert len(scan.selections) == 1
+    selected = scan.selections[0]
+    assert selected.role == 'merger'
+    assert selected.task_id == '4377'
+    assert selected.source_layer == 'config'
+    assert selected.rule_id is None
+    assert selected.routing_tier == 0
+    assert scan.rejections == ()
+
+
+def test_policy_rule_selection_carries_the_rule_id_and_routing_tier(runs_db):
+    """Check 3: "did rule steward-retry-fable match?" is answerable only from these two."""
+    _event(
+        runs_db, _at(days=1), 'routing_decision', task_id='4211', role='steward',
+        data=_routing_payload(
+            role='steward', model=FABLE, source_layer='policy_rule',
+            rule_id='steward-retry-fable', routing_tier=1,
+        ),
+    )
+
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert [(s.role, s.rule_id, s.routing_tier) for s in scan.selections] == [
+        ('steward', 'steward-retry-fable', 1)
+    ]
+
+
+def test_a_rejection_on_a_decision_that_resolved_elsewhere_is_still_reported(runs_db):
+    """A rejection is recorded on a decision that resolved to a DIFFERENT model.
+
+    Filtering to rows where the target was selected would therefore miss every
+    rejection there is — which is the whole of check 1.
+    """
+    _event(
+        runs_db, _at(hours=3), 'routing_decision', task_id='4500', role='implementer',
+        data=_routing_payload(
+            role='implementer', model='opus', source_layer='role_default',
+            rejected=['config:model-not-in-allowlist'],
+        ),
+    )
+
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.selections == ()
+    assert len(scan.rejections) == 1
+    rejection = scan.rejections[0]
+    assert rejection.role == 'implementer'
+    assert rejection.resolved_model == 'opus'
+    assert rejection.reasons == ('config:model-not-in-allowlist',)
+
+
+@pytest.mark.parametrize(
+    'entry',
+    [
+        'config:model-not-in-allowlist',
+        'policy_rule:model-ceiling-exhausted',
+        'metadata_override:model-capacity-exhausted',
+    ],
+)
+def test_each_known_rejection_reason_is_recognised_behind_its_layer_prefix(runs_db, entry):
+    _event(
+        runs_db, _at(hours=4), 'routing_decision', task_id='4501', role='merger',
+        data=_routing_payload(role='merger', model='opus', rejected=[entry]),
+    )
+
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert [r.reasons for r in scan.rejections] == [(entry,)]
+
+
+def test_model_not_in_ladder_is_not_a_model_rejection(runs_db):
+    """`policy_rule:model-not-in-ladder` means no candidate was ever formed.
+
+    routing.py::resolve_route appends it when a '+N' spec cannot be resolved
+    against the ladder, BEFORE any model is validated — so it is not evidence
+    that a model was attempted and refused.
+    """
+    _event(
+        runs_db, _at(hours=5), 'routing_decision', task_id='4502', role='debugger',
+        data=_routing_payload(
+            role='debugger', model='opus', rejected=['policy_rule:model-not-in-ladder'],
+        ),
+    )
+
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.rejections == ()
+
+
+def test_decisions_before_since_are_excluded_from_both_halves(runs_db):
+    _event(
+        runs_db, _at(hours=-1), 'routing_decision', task_id='4300', role='merger',
+        data=_routing_payload(role='merger', model=FABLE),
+    )
+    _event(
+        runs_db, _at(hours=-1), 'routing_decision', task_id='4301', role='merger',
+        data=_routing_payload(
+            role='merger', model='opus', rejected=['config:model-not-in-allowlist'],
+        ),
+    )
+
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.selections == ()
+    assert scan.rejections == ()
+
+
+def test_an_empty_table_yields_empty_halves_rather_than_raising(runs_db):
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.selections == ()
+    assert scan.rejections == ()
+    assert scan.skipped_rows == 0
+
+
+def test_a_malformed_payload_is_skipped_and_counted_rather_than_raised(runs_db):
+    """A 181 MB live store must not be abortable by one bad row — but a
+    dropped row has to stay visible, so it is counted rather than swallowed."""
+    _event(runs_db, _at(hours=6), 'routing_decision', task_id='4503', data='not json{')
+    _event(
+        runs_db, _at(hours=7), 'routing_decision', task_id='4504', role='merger',
+        data=_routing_payload(role='merger', model=FABLE),
+    )
+
+    scan = audit_model_admission.scan_routing_decisions(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.skipped_rows == 1
+    assert [s.task_id for s in scan.selections] == ['4504']
