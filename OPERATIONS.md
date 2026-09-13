@@ -1392,11 +1392,19 @@ for the 03:30 job; the section below for the 05:00 one.
 `consume_redispatch_requests` drain that used to hold that slot were retired by
 task 5247 (Leo's 2026-09-09 ruling): the sweep's `gate_closure` predicate was a
 second, opposite-policy owner of the stranded-blocked population, and over the
-15 retained journal runs it cancelled 7 reify tasks as collateral. Its units,
-wrapper, consumer and installer are deleted, and the user timer is removed from
-this machine. That population is now owned solely by the orchestrator
-scheduler's `_phase_redispatch_stranded_blocked` and the harness
-deterministic-recon sweep.
+15 retained journal runs it cancelled 7 reify tasks as collateral. Its tracked
+units, wrapper, consumer and installer are deleted; the timer is **disabled**
+on this machine, but its unit files are **still installed** at
+`~/.config/systemd/user/reify-closure-staleness-sweep.{service,timer}` — the
+retirement ran sandboxed and could not remove them (esc-5247-1 carries the
+`rm` + `systemctl --user daemon-reload` an operator should run to finish the
+job). Until that runs, `systemctl --user enable --now
+reify-closure-staleness-sweep.timer` still re-arms the unit; its `ExecStart`
+names the deleted wrapper, so once this retirement is on main it fails
+`203/EXEC` nightly rather than sweeping anything. That population is now owned
+by the orchestrator scheduler's `_phase_redispatch_stranded_blocked`, the
+harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
+reconciliation.
 
 ### Nightly canonical/topic coverage census (05:00)
 
