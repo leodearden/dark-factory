@@ -247,3 +247,45 @@ class TestRenderDecisionDetail:
             rendered = render_decision_detail(_make_decision(options=empty), [], now)
 
             assert 'options:' not in rendered
+
+
+class TestDetailPaneSource:
+    """The widget's two mutators and the `source` read-back CockpitApp arbitrates on."""
+
+    def test_show_decision_renders_render_decision_detail_verbatim(self):
+        from cockpit.panes.detail_pane import DetailPane, render_decision_detail
+
+        decision = _make_decision(task_id='2085', escalation_id='esc-99')
+        session = _make_record()
+        now = datetime(2026, 7, 7, 0, 5, 0, tzinfo=UTC)
+        pane = DetailPane()
+
+        pane.show_decision(decision, [session], now)
+
+        assert pane.rendered_text == render_decision_detail(decision, [session], now)
+
+    def test_show_decision_marks_the_pane_as_showing_a_decision(self):
+        from cockpit.panes.detail_pane import DetailPane, DetailSource
+
+        pane = DetailPane()
+
+        pane.show_decision(_make_decision(), [], datetime(2026, 7, 7, tzinfo=UTC))
+
+        assert pane.source is DetailSource.DECISION
+
+    def test_a_fresh_pane_and_every_show_record_path_are_session_sourced(self):
+        from cockpit.panes.detail_pane import DetailPane, DetailSource
+
+        now = datetime(2026, 7, 7, tzinfo=UTC)
+        record = _make_record()
+        pane = DetailPane()
+
+        assert pane.source is DetailSource.SESSION
+
+        pane.show_decision(_make_decision(), [], now)
+        pane.show_record(record, [record], now)
+        assert pane.source is DetailSource.SESSION
+
+        pane.show_decision(_make_decision(), [], now)
+        pane.show_record(None, [], now)
+        assert pane.source is DetailSource.SESSION
