@@ -356,6 +356,9 @@ async def run_dry_run_unblock(
 
     config_dir: TaskConfigDir | None = None
     preserve_config_dir = False
+    # Initialised before the try: the stamp site below runs on EVERY path,
+    # including an exception raised ahead of the task fetch.
+    task_context_unavailable = False
     try:
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background
@@ -368,10 +371,20 @@ async def run_dry_run_unblock(
 
         # Fetched ONCE, above the prompt build, so the single fetch serves both
         # the prompt's task-context block and the route resolution below.
+        # A failure degrades this investigation in two ways that are invisible
+        # at the call site — no task text in the prompt, and the task's
+        # model_overrides['unblock_auto'] routing pin silently dropped — so it
+        # is both logged and recorded on the entry rather than swallowed.
         try:
             task_doc = await scheduler.get_task(task_id)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                'dry_run_unblock: task fetch failed for task %s — investigating '
+                'without task text and with routing overrides dropped: %s',
+                task_id, exc,
+            )
             task_doc = None
+            task_context_unavailable = True
         md = (task_doc or {}).get('metadata') or {}
 
         system_prompt = _load_skill_system_prompt()
@@ -691,6 +704,12 @@ async def run_dry_run_unblock(
             task_id, entry.get('status'),
         )
     entry.update(record.to_dict())
+    # Same single stamp point, same guarantee: outside DRY_RUN_PROPOSAL_SCHEMA
+    # (additionalProperties:False), so the investigating agent cannot forge it.
+    # Always present — False on the healthy path — matching the shape-parity
+    # convention _failure_diagnostics sets, so a consumer never has to
+    # distinguish an absent key from an old entry from a healthy one.
+    entry['task_context_unavailable'] = task_context_unavailable
 
     try:
         await scheduler.update_task(
