@@ -375,3 +375,189 @@ def test_the_human_report_carries_the_unit_label(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert 'runnable threads per CPU' in result.stdout, result.stdout
+
+
+# ── the two-yaml drift check (detail C) ─────────────────────────────────────
+
+_LOCAL_YAML = """
+psi_admission:
+  enabled: true
+  # a comment that must not affect the comparison
+  cpu_some_avg10: 70.0
+  runqueue_ratio: 4.0
+  min_inflight_floor: 3
+"""
+
+# Same leaves, same values — different key ORDER, indentation, comments and
+# float spellings. Must compare as NO drift.
+_PEER_YAML_EQUIVALENT = """
+psi_admission:
+    min_inflight_floor: 3        # reordered
+    runqueue_ratio: 4.00         # 4.00, not 4.0
+    cpu_some_avg10: 7.0e1        # scientific spelling of 70.0
+    enabled: yes                 # yaml's other spelling of true
+"""
+
+
+def write_yaml(path: Path, text: str) -> Path:
+    path.write_text(text)
+    return path
+
+
+def test_formatting_differences_are_not_drift(tmp_path: Path):
+    """The comparison is over PARSED MAPPINGS, never text (INV-10)."""
+    module = load_script()
+    local, _ = module.load_psi_admission_block(
+        write_yaml(tmp_path / 'local.yaml', _LOCAL_YAML), 'local')
+    peer, _ = module.load_psi_admission_block(
+        write_yaml(tmp_path / 'peer.yaml', _PEER_YAML_EQUIVALENT), 'peer')
+
+    result = module.compare_blocks(local, peer)
+
+    assert result['drift'] == [], result
+    assert result['local_only'] == []
+    assert result['peer_only'] == []
+
+
+def test_a_differing_value_is_reported_naming_both_sides():
+    module = load_script()
+
+    result = module.compare_blocks(
+        {'cpu_some_avg10': 70.0}, {'cpu_some_avg10': 85.0})
+
+    assert result['drift'] == [
+        {'leaf': 'cpu_some_avg10', 'local': 70.0, 'peer': 85.0}
+    ], result
+
+
+def test_a_one_sided_leaf_is_distinct_from_a_value_mismatch():
+    module = load_script()
+
+    result = module.compare_blocks(
+        {'cpu_some_avg10': 70.0, 'min_inflight_floor': 3},
+        {'cpu_some_avg10': 70.0, 'runqueue_ratio': 4.0},
+    )
+
+    assert result['drift'] == []
+    assert result['local_only'] == ['min_inflight_floor']
+    assert result['peer_only'] == ['runqueue_ratio']
+
+
+def test_int_and_float_spellings_of_the_same_number_are_not_drift():
+    module = load_script()
+
+    assert module.compare_blocks({'x': 15}, {'x': 15.0})['drift'] == []
+
+
+def test_an_absent_block_is_never_treated_as_an_empty_match():
+    """None means "not configured"; {} means "configured empty"."""
+    module = load_script()
+
+    assert module.compare_blocks(None, {'cpu_some_avg10': 70.0}) is None
+    assert module.compare_blocks({'cpu_some_avg10': 70.0}, None) is None
+    assert module.compare_blocks(None, None) is None
+    # An actually-empty block on both sides IS a comparison, and finds nothing.
+    assert module.compare_blocks({}, {})['drift'] == []
+
+
+@pytest.mark.parametrize(
+    ('setup', 'expected'),
+    [
+        pytest.param(lambda p: p / 'absent.yaml', 'peer_config_missing', id='missing'),
+        pytest.param(
+            lambda p: write_yaml(p / 'bad.yaml', 'psi_admission: [not, a, mapping\n'),
+            'peer_config_unparseable', id='unparseable'),
+        pytest.param(
+            lambda p: write_yaml(p / 'noblock.yaml', 'other_key: 1\n'),
+            'peer_psi_admission_absent', id='no-block'),
+        pytest.param(
+            lambda p: write_yaml(p / 'scalar.yaml', 'just-a-string\n'),
+            'peer_config_unparseable', id='not-a-mapping'),
+    ],
+)
+def test_every_peer_failure_mode_is_its_own_named_degradation(
+    tmp_path: Path, setup, expected
+):
+    module = load_script()
+
+    block, degradations = module.load_psi_admission_block(setup(tmp_path), 'peer')
+
+    assert block is None
+    assert [d.split(':', 1)[0] for d in degradations] == [expected], degradations
+
+
+def test_the_local_side_gets_the_same_treatment(tmp_path: Path):
+    """Measured true on main TODAY: dark-factory-orchestrator.yaml has no
+    psi_admission block (γ unlanded) while reify's already carries one, so the
+    first real run IS one-sided and must say so rather than report a match."""
+    module = load_script()
+
+    block, degradations = module.load_psi_admission_block(
+        write_yaml(tmp_path / 'local.yaml', 'other_key: 1\n'), 'local')
+
+    assert block is None
+    assert [d.split(':', 1)[0] for d in degradations] == ['local_psi_admission_absent']
+
+
+def test_missing_pyyaml_is_a_named_degradation_not_an_import_crash(
+    tmp_path: Path, monkeypatch
+):
+    module = load_script()
+    monkeypatch.setitem(sys.modules, 'yaml', None)
+
+    block, degradations = module.load_psi_admission_block(
+        write_yaml(tmp_path / 'local.yaml', _LOCAL_YAML), 'local')
+
+    assert block is None
+    assert [d.split(':', 1)[0] for d in degradations] == ['pyyaml_absent'], degradations
+
+
+def test_a_one_sided_run_reports_the_degradation_and_still_exits_zero(tmp_path: Path):
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    local = write_yaml(tmp_path / 'local.yaml', _LOCAL_YAML)
+
+    result = run_script(
+        '--db', str(db), '--config', str(local),
+        '--peer-config', str(tmp_path / 'absent.yaml'), '--no-report')
+
+    assert result.returncode == 0, result.stderr
+    payload = trailing_json(result.stdout)
+    assert 'peer_config_missing' in payload['degradations'], payload
+    assert payload['drift'] is None, 'a one-sided comparison must not report a match'
+
+
+def test_a_two_sided_run_reports_structured_drift(tmp_path: Path):
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    local = write_yaml(tmp_path / 'local.yaml', _LOCAL_YAML)
+    peer = write_yaml(tmp_path / 'peer.yaml', """
+psi_admission:
+  enabled: true
+  cpu_some_avg10: 85.0
+  min_inflight_floor: 3
+""")
+
+    result = run_script(
+        '--db', str(db), '--config', str(local),
+        '--peer-config', str(peer), '--no-report')
+
+    assert result.returncode == 0, result.stderr
+    payload = trailing_json(result.stdout)
+    assert payload['drift']['drift'] == [
+        {'leaf': 'cpu_some_avg10', 'local': 70.0, 'peer': 85.0}
+    ], payload['drift']
+    assert payload['drift']['local_only'] == ['runqueue_ratio']
+
+
+def test_smoke_against_the_two_real_committed_configs(tmp_path: Path):
+    """Exits 0 and names whatever degradation is true, pinning neither
+    project's current values — those are operator decisions that change."""
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+
+    result = run_script(
+        '--db', str(db),
+        '--config', str(REPO_ROOT / 'dark-factory-orchestrator.yaml'),
+        '--no-report')
+
+    assert result.returncode == 0, result.stderr
+    payload = trailing_json(result.stdout)
+    assert isinstance(payload['degradations'], list)
