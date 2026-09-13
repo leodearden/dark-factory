@@ -29,12 +29,28 @@ from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.stranded_verified_green import (
     VerifiedGreenMatch,
     merge_request_marker_is_fresh,
     submit_verified_green_merge_request,
 )
 from orchestrator.task_ground_truth import EscalationRef
+
+
+async def _reconcile_stranded(
+    harness: Harness, tid: str, status: str, *, mid_run: bool = False,
+    tally: RecoverySweepTally | None = None,
+) -> str | None:
+    """Drive ONE stranded-task reconciliation.
+
+    The suite's coupling to this private driver lives here and nowhere else,
+    so a signature change costs one edit instead of one per test.
+    """
+    return await harness._reconcile_one_stranded(
+        tid, status, mid_run=mid_run, tally=tally,
+    )
+
 
 
 @pytest.fixture(autouse=True)
@@ -174,8 +190,7 @@ class _FakeGitOps:
     """Minimal stand-in exposing exactly the surface detect_verified_green uses."""
 
     def __init__(
-        self,
-        worktree_base: Path,
+        self, worktree_base: Path,
         records: dict[str, LaneRecord],
         branch_shas: dict[str, str],
         *,
@@ -367,8 +382,7 @@ class TestDetectVerifiedGreen:
         from orchestrator.stranded_verified_green import detect_verified_green
 
         git_ops, event_store, resolver, _ = _build_env(
-            tmp_path,
-            steps=[{'id': 's1', 'status': 'done'}, {'id': 's2', 'status': 'pending'}],
+            tmp_path, steps=[{'id': 's1', 'status': 'done'}, {'id': 's2', 'status': 'pending'}],
         )
         assert await detect_verified_green(
             _TID, git_ops=git_ops, event_store=event_store, worktree_resolver=resolver,
@@ -1464,8 +1478,7 @@ class TestSubmitVerifiedGreenMergeRequest:
     """The shared build→callback→enqueue→stamp submit helper."""
 
     async def _submit(
-        self,
-        tmp_path: Path,
+        self, tmp_path: Path,
         *,
         source: str = 'architect-desync',
         marker_key: str = 'architect_merge_request',
@@ -1644,11 +1657,11 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
         the task sits blocked behind a record that never pinned anything.
         """
         tid = _TID
-        self._arm(harness, tmp_path, tid, 'info_on_main')
+        queue = self._arm(harness, tmp_path, tid, 'info_on_main')
         _wire_on_main_mark_done(harness, tid, tmp_path)
-        _seed_info(harness._escalation_queue, tid, 'task_failure')
+        _seed_info(queue, tid, 'task_failure')
 
-        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+        await _reconcile_stranded(harness, tid, 'blocked')
 
         assert _done_provenance(harness, tid) is not None
 
@@ -1662,11 +1675,11 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
         and holding the task for it helps nobody.
         """
         tid = _TID
-        self._arm(harness, tmp_path, tid, 'deadl0_on_main')
+        queue = self._arm(harness, tmp_path, tid, 'deadl0_on_main')
         _wire_on_main_mark_done(harness, tid, tmp_path)
-        _seed_pending(harness._escalation_queue, tid, 'task_failure', level=0)
+        _seed_pending(queue, tid, 'task_failure', level=0)
 
-        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+        await _reconcile_stranded(harness, tid, 'blocked')
 
         assert _done_provenance(harness, tid) is not None
 
@@ -1675,11 +1688,11 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
     ) -> None:
         """The relaxation is preserved verbatim: an L1 is a live handoff."""
         tid = _TID
-        self._arm(harness, tmp_path, tid, 'l1_on_main')
+        queue = self._arm(harness, tmp_path, tid, 'l1_on_main')
         _wire_on_main_mark_done(harness, tid, tmp_path)
-        _seed_pending(harness._escalation_queue, tid, 'task_failure', level=1)
+        _seed_pending(queue, tid, 'task_failure', level=1)
 
-        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+        await _reconcile_stranded(harness, tid, 'blocked')
 
         assert _done_provenance(harness, tid) is None
 
@@ -1737,7 +1750,7 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
         _seed_pending(queue, tid, 'stranded_blocked', level=1)
         _seed_info(queue, tid, 'stranded_blocked')
 
-        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+        await _reconcile_stranded(harness, tid, 'blocked')
 
         assert _done_provenance(harness, tid) is not None
 
@@ -1761,7 +1774,7 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
         _seed_pending(queue, tid, 'stranded_blocked', level=1)
         _seed_info(queue, tid, 'design_concern')
 
-        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+        await _reconcile_stranded(harness, tid, 'blocked')
 
         assert _done_provenance(harness, tid) is None
 
@@ -1782,6 +1795,6 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
         harness._loop = asyncio.get_running_loop()
         _wire_on_main_mark_done(harness, tid, tmp_path)
 
-        await harness._reconcile_one_stranded(tid, 'blocked', mid_run=False)
+        await _reconcile_stranded(harness, tid, 'blocked')
 
         assert _done_provenance(harness, tid) is not None

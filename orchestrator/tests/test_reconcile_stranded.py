@@ -25,7 +25,23 @@ from orchestrator.delivered_checks import (
 )
 from orchestrator.harness import Harness, _pid_alive
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.warm_lane_pool import WarmLanePool
+
+
+async def _reconcile_stranded(
+    harness: Harness, tid: str, status: str, *, mid_run: bool = False,
+    tally: RecoverySweepTally | None = None,
+) -> str | None:
+    """Drive ONE stranded-task reconciliation.
+
+    The suite's coupling to this private driver lives here and nowhere else,
+    so a signature change costs one edit instead of one per test.
+    """
+    return await harness._reconcile_one_stranded(
+        tid, status, mid_run=mid_run, tally=tally,
+    )
+
 
 
 @pytest.fixture(autouse=True)
@@ -397,8 +413,7 @@ class TestReconcileOneStrandedEffectPresentGuard:
 
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
-            recovered_sha,
-        )
+            recovered_sha, )
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'pending',
         )
@@ -437,8 +452,7 @@ class TestReconcileOneStrandedEffectPresentGuard:
             },
         )
         harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
-            marker_sha,
-        )
+            marker_sha, )
         assert result == 1
 
     async def test_marker_effect_absent_in_progress_reverts_instead_of_marking_done(
@@ -463,8 +477,7 @@ class TestReconcileOneStrandedEffectPresentGuard:
 
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
-            marker_sha,
-        )
+            marker_sha, )
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'pending',
         )
@@ -1110,10 +1123,8 @@ class TestReconcileStrandedInProgress:
         ],
     )
     async def test_vestigial_worktree_lock_is_inert_and_unlinked(
-        self,
-        harness: Harness,
-        lock_contents,
-        task_id,
+        self, harness: Harness,
+        lock_contents, task_id,
     ):
         """The worktree's ``.task/plan.lock`` cannot influence the sweep, and
         does not survive a revert.
@@ -2151,8 +2162,7 @@ class TestReconcileStrandedInProgress:
                 '64': 'review',
                 '65': 'deferred',
             },
-            None,
-        )
+            None, )
 
         await harness._reconcile_stranded_in_progress()
 
@@ -2178,8 +2188,7 @@ class TestReconcileStrandedInProgress:
                 '84': 'review',
                 '85': 'deferred',
             },
-            None,
-        )
+            None, )
 
         await harness._reconcile_stranded_in_progress()
 
@@ -2197,61 +2206,52 @@ class TestReconcileStrandedInProgress:
         [
             pytest.param(
                 'is_ancestor',
-                True,
-                None,
+                True, None,
                 'branch-already-on-main',
                 {
                     'kind': 'found_on_main',
                     'commit': 'deadbeef' + 'a' * 32,
                     'note': 'reconcile: branch already on main when stranded in-progress',
                 },
-                False,
-                id='is_ancestor-branch-success',
+                False, id='is_ancestor-branch-success',
             ),
             pytest.param(
                 'marker',
-                False,
-                'cafebabe' + 'd' * 32,
+                False, 'cafebabe' + 'd' * 32,
                 'branch-deleted-marker-found',
                 {
                     'kind': 'found_on_main',
                     'commit': 'cafebabe' + 'd' * 32,
                     'note': 'reconcile: branch deleted but merge marker found on main',
                 },
-                False,
-                id='marker-branch-success',
+                False, id='marker-branch-success',
             ),
             pytest.param(
                 'is_ancestor',
-                True,
-                None,
+                True, None,
                 'branch-already-on-main',
                 {
                     'kind': 'found_on_main',
                     'commit': 'deadbeef' + 'a' * 32,
                     'note': 'reconcile: branch already on main when stranded in-progress',
                 },
-                True,
-                id='is_ancestor-branch-cleanup-fails',
+                True, id='is_ancestor-branch-cleanup-fails',
             ),
             pytest.param(
                 'marker',
-                False,
-                'cafebabe' + 'd' * 32,
+                False, 'cafebabe' + 'd' * 32,
                 'branch-deleted-marker-found',
                 {
                     'kind': 'found_on_main',
                     'commit': 'cafebabe' + 'd' * 32,
                     'note': 'reconcile: branch deleted but merge marker found on main',
                 },
-                True,
-                id='marker-branch-cleanup-fails',
+                True, id='marker-branch-cleanup-fails',
             ),
         ],
     )
     async def test_done_branch_side_effects(
-        self,
-        harness: Harness,
+        self, harness: Harness,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
         scenario: str,
@@ -2339,23 +2339,20 @@ class TestReconcileStrandedInProgress:
         [
             pytest.param(
                 'is_ancestor',
-                True,
-                None,
+                True, None,
                 'deadbeef' + 'a' * 32,
                 id='is_ancestor-branch',
             ),
             pytest.param(
                 'marker',
-                False,
-                'cafebabe' + 'd' * 32,
+                False, 'cafebabe' + 'd' * 32,
                 'cafebabe' + 'd' * 32,
                 id='marker-branch',
             ),
         ],
     )
     async def test_absent_worktree_dir_skips_cleanup(
-        self,
-        harness: Harness,
+        self, harness: Harness,
         scenario: str,
         is_ancestor_val: bool,
         marker_sha_val: str | None,
@@ -2556,8 +2553,7 @@ async def test_terminal_and_pending_statuses_ignored(harness: Harness):
             '25': 'in-progress',  # orphan-revert candidate
             '26': 'deferred',
         },
-        None,
-    )
+        None, )
     # No worktree for task 25 (orphan)
 
     await harness._reconcile_stranded_in_progress()
@@ -4226,8 +4222,8 @@ class TestWithheldTrainMemberHasRecoveryEdge:
         Pinned HERE (not only in ``test_skips_merge_deferred_status``) because
         the four train seams' recovery design depends on this specific fact.
         """
-        result = await harness._reconcile_one_stranded(
-            _WEDGE_MID, 'merge-deferred', mid_run=False,
+        result = await _reconcile_stranded(
+            harness, _WEDGE_MID, 'merge-deferred', mid_run=False,
         )
 
         assert result is None
@@ -4540,7 +4536,7 @@ def _submit_open(
 
 def _off_main_in_progress(harness: Harness, tid: str) -> None:
     """Wire *tid* as a stranded in-progress task whose branch is EXISTS_OFF_MAIN."""
-    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
+    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
     harness.git_ops.is_ancestor = AsyncMock(return_value=False)
     harness.git_ops.resolve_branch_sha = AsyncMock(return_value='b' * 40)
     harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
@@ -4566,12 +4562,12 @@ class TestInProgressApplierConsumesTheSharedPredicate:
         _off_main_in_progress(harness, '3541')
         _submit_open(harness, tmp_path, '3541')
 
-        result = await harness._reconcile_one_stranded(
-            '3541', 'in-progress', mid_run=False,
+        result = await _reconcile_stranded(
+            harness, '3541', 'in-progress', mid_run=False,
         )
 
         assert result is None
-        harness.scheduler.set_task_status.assert_not_called()
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_info_only_strand_is_reverted_to_pending(
         self, harness: Harness, tmp_path: Path,
@@ -4588,12 +4584,12 @@ class TestInProgressApplierConsumesTheSharedPredicate:
         _off_main_in_progress(harness, '3542')
         _submit_open(harness, tmp_path, '3542', severity='info', level=0)
 
-        result = await harness._reconcile_one_stranded(
-            '3542', 'in-progress', mid_run=False,
+        result = await _reconcile_stranded(
+            harness, '3542', 'in-progress', mid_run=False,
         )
 
         assert result == 'reverted'
-        harness.scheduler.set_task_status.assert_awaited_once_with('3542', 'pending')
+        harness.scheduler.set_task_status.assert_awaited_once_with('3542', 'pending')  # type: ignore[attr-defined]
 
     async def test_dead_l0_strand_is_still_held(
         self, harness: Harness, tmp_path: Path,
@@ -4608,12 +4604,12 @@ class TestInProgressApplierConsumesTheSharedPredicate:
         _off_main_in_progress(harness, '3543')
         _submit_open(harness, tmp_path, '3543', level=0)
 
-        result = await harness._reconcile_one_stranded(
-            '3543', 'in-progress', mid_run=False,
+        result = await _reconcile_stranded(
+            harness, '3543', 'in-progress', mid_run=False,
         )
 
         assert result is None
-        harness.scheduler.set_task_status.assert_not_called()
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_pinned_hold_emits_exactly_one_recovery_row(
         self, harness: Harness, tmp_path: Path,
@@ -4662,12 +4658,12 @@ class TestMidRunPlanLockExceptionSurvives:
         _off_main_in_progress(harness, '3545')
         self._stage_live_plan_lock(harness, '3545')
 
-        result = await harness._reconcile_one_stranded(
-            '3545', 'in-progress', mid_run=True,
+        result = await _reconcile_stranded(
+            harness, '3545', 'in-progress', mid_run=True,
         )
 
         assert result == 'reverted'
-        harness.scheduler.set_task_status.assert_awaited_once_with('3545', 'pending')
+        harness.scheduler.set_task_status.assert_awaited_once_with('3545', 'pending')  # type: ignore[attr-defined]
 
     async def test_mid_run_plan_lock_claimant_with_a_pinning_record_holds(
         self, harness: Harness, tmp_path: Path,
@@ -4676,12 +4672,12 @@ class TestMidRunPlanLockExceptionSurvives:
         _submit_open(harness, tmp_path, '3546')
         self._stage_live_plan_lock(harness, '3546')
 
-        result = await harness._reconcile_one_stranded(
-            '3546', 'in-progress', mid_run=True,
+        result = await _reconcile_stranded(
+            harness, '3546', 'in-progress', mid_run=True,
         )
 
         assert result is None
-        harness.scheduler.set_task_status.assert_not_called()
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_mid_run_plan_lock_claimant_with_an_info_record_reverts(
         self, harness: Harness, tmp_path: Path,
@@ -4700,12 +4696,12 @@ class TestMidRunPlanLockExceptionSurvives:
         _submit_open(harness, tmp_path, '3547', severity='info', level=0)
         self._stage_live_plan_lock(harness, '3547')
 
-        result = await harness._reconcile_one_stranded(
-            '3547', 'in-progress', mid_run=True,
+        result = await _reconcile_stranded(
+            harness, '3547', 'in-progress', mid_run=True,
         )
 
         assert result == 'reverted'
-        harness.scheduler.set_task_status.assert_awaited_once_with('3547', 'pending')
+        harness.scheduler.set_task_status.assert_awaited_once_with('3547', 'pending')  # type: ignore[attr-defined]
 
     async def test_mid_run_plan_lock_claimant_with_a_dead_l0_still_holds(
         self, harness: Harness, tmp_path: Path,
@@ -4720,12 +4716,12 @@ class TestMidRunPlanLockExceptionSurvives:
         _submit_open(harness, tmp_path, '3548', level=0)
         self._stage_live_plan_lock(harness, '3548')
 
-        result = await harness._reconcile_one_stranded(
-            '3548', 'in-progress', mid_run=True,
+        result = await _reconcile_stranded(
+            harness, '3548', 'in-progress', mid_run=True,
         )
 
         assert result is None
-        harness.scheduler.set_task_status.assert_not_called()
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
 
 class TestApplierHasNoLocalOpenEscalationTruthiness:

@@ -1361,8 +1361,15 @@ _FILER_ID = 'run-old/sess-old/pid=111'
 _LIVE_ID = 'run-new/sess-new/pid=222'
 
 
+def _bound_queue(harness: Harness) -> EscalationQueue:
+    """The queue the `harness` fixture bound, narrowed from `... | None`."""
+    queue = harness._escalation_queue
+    assert queue is not None
+    return queue
+
+
 def _submit_aged_blocking(
-    queue: EscalationQueue,
+    harness: Harness,
     task_id: str,
     seconds_ago: float,
     *,
@@ -1374,7 +1381,11 @@ def _submit_aged_blocking(
     `_submit_aged`'s default `severity='info'` buckets NON_PINNING at link 1,
     which is neither `dead_l0` nor `queue_handoff` — correct for the tests that
     use it, and deliberately outside the new promotion arm.
+
+    Takes the HARNESS rather than the queue so the `harness` fixture's binding
+    is resolved in one place instead of at every call site.
     """
+    queue = _bound_queue(harness)
     ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
     esc = Escalation(
         id=queue.make_id(task_id),
@@ -1419,7 +1430,7 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
         handoff died long ago.
         """
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID,
         )
         harness._escalation_events['T1'] = MagicMock()
@@ -1432,7 +1443,7 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
     ) -> None:
         """A genuinely live handoff — the consumer is still there to consume it."""
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID,
         )
         _make_live(harness, 'T1', claimant_run_id=_FILER_ID)
@@ -1460,7 +1471,7 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
         stays a QUEUE_HANDOFF and the reaper behaves exactly as it does today.
         """
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=filed_by,
         )
         _make_live(harness, 'T1', claimant_run_id=live_id)
@@ -1472,7 +1483,7 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
     ) -> None:
         """UNCHANGED, and still free: the common case pays no `get_task`."""
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID,
         )
         getter = AsyncMock(return_value={'status': 'in-progress', 'metadata': {}})
@@ -1486,7 +1497,7 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
     ) -> None:
         """The gates moved BELOW the age check, so cheap filters stay cheap."""
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 1.0,
+            harness, 'T1', 1.0,
             filing_claimant_run_id=_FILER_ID,
         )
         getter = _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
@@ -1499,7 +1510,7 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
     ) -> None:
         """The divergence branch reuses the row this arm already fetched."""
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID,
         )
         getter = _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
@@ -1526,7 +1537,7 @@ class TestInfoSeverityL0IsUntouchedByThisArm:
         self, harness: Harness,
     ) -> None:
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID, severity='info',
         )
         _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
@@ -1539,7 +1550,7 @@ class TestInfoSeverityL0IsUntouchedByThisArm:
         self, harness: Harness,
     ) -> None:
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID, severity='info',
         )
 
@@ -1554,7 +1565,7 @@ class TestPromotedRecordStillCarriesTheReapersIdentity:
         self, harness: Harness,
     ) -> None:
         _submit_aged_blocking(
-            harness._escalation_queue, 'T1', 120.0,
+            harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID,
         )
         harness._escalation_events['T1'] = MagicMock()
@@ -1563,7 +1574,7 @@ class TestPromotedRecordStillCarriesTheReapersIdentity:
         assert await harness._reap_orphan_l0_escalations() == 1
 
         promoted = [
-            e for e in harness._escalation_queue.get_pending() if e.level == 1
+            e for e in _bound_queue(harness).get_pending() if e.level == 1
         ]
         assert len(promoted) == 1
         assert promoted[0].filing_claimant_run_id == harness._filing_claimant_run_id
