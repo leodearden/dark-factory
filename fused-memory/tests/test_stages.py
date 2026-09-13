@@ -16578,6 +16578,11 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
 
         The dropped flag's stage1_flag_marker must survive, so recurrence
         history is intact for when the preservation citation is retired.
+
+        Enforced by ORDER, not by a signature exclusion: the guard runs above
+        the acknowledgment snapshot, so a suppressed flag is never an
+        acknowledgment candidate.  This test is what fails if that order is
+        ever reversed without adding the exclusion Hook A carries.
         """
         stage = self._make_stage(mock_deps)
         self._corroborating_memory(stage)

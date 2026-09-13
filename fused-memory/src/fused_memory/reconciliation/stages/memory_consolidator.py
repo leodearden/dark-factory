@@ -346,10 +346,8 @@ class MemoryConsolidator(BaseStage):
         # success and the stats stay at their pre-inited 0.
         report.stats['preservation_specimen_suppressed'] = 0
         report.stats['preservation_specimen_unresolved'] = 0
-        preservation_suppressed_signatures: set = set()
         preservation_result = None
         try:
-            _pre_preservation_flags = list(report.items_flagged or [])
             preservation_result = await filter_preservation_specimen_flags(
                 memory_service=self.memory,
                 project_id=self.project_id,
@@ -365,20 +363,12 @@ class MemoryConsolidator(BaseStage):
             report.stats['preservation_specimen_unresolved'] = len(
                 preservation_result.unresolved_task_ids
             )
-            # Suppression is NOT resolution: these signatures are excluded from
-            # acknowledge_resolved_flags below so the persisted stage1_flag_marker
-            # (and thus recurrence history) survives until the preservation
-            # citation is retired.
-            _preservation_kept_signatures = {
-                sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-            }
-            preservation_suppressed_signatures = {
-                sig for f in _pre_preservation_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None and sig not in _preservation_kept_signatures
-            }
+            # Suppression is NOT resolution — but unlike Hook A below, that needs
+            # no signature bookkeeping here: this guard runs ABOVE the
+            # acknowledgment snapshot (_pre_filter_flags), so a flag it drops is
+            # already gone before acknowledgment candidates are computed and can
+            # never be reclaimed as resolved.  Enforced by position, not by
+            # exclusion; the snapshot comment below names the same dependency.
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -514,6 +504,11 @@ class MemoryConsolidator(BaseStage):
             # suppression means the issue is intentionally hidden, not resolved, so
             # acknowledging it would erase recurrence history for when the
             # suppression is later lifted.
+            # Taken BELOW the preservation-specimen guard (task 4223) on purpose:
+            # that guard's drops are a suppression, not a resolution, and their
+            # absence from this snapshot is what keeps their stage1_flag_marker
+            # alive.  Moving this above the guard would need the same explicit
+            # signature exclusion Hook A does below.
             _pre_filter_flags = list(report.items_flagged)
 
             # ── Stale count-snapshot correction filter (task-1786): drop false ────
@@ -759,10 +754,6 @@ class MemoryConsolidator(BaseStage):
             # acknowledge_resolved_flags so the persisted stage1_flag_marker (and thus
             # recurrence history) survives until the standing decision is lifted.
             suppressed_signatures |= esd_suppressed_signatures
-            # Same reasoning for the preservation-specimen guard (task 4223): a
-            # specimen's stranded flag is HIDDEN, not resolved, so its marker must
-            # survive for when the preservation citation is retired.
-            suppressed_signatures |= preservation_suppressed_signatures
             # ── Deletion guard: drop absence-type flags that cannot be confirmed absent ──
             # filter_false_absence_flags is fail-closed: keeps an absence-asserting flag
             # ONLY when get_task POSITIVELY confirms the task does not exist.  Present or
