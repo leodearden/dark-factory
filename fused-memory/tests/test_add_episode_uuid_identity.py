@@ -19,11 +19,11 @@ Every graphiti mock in the suite is a permissive ``AsyncMock(return_value=None)`
 (test_memory_service.py, test_temporal_context.py, test_temporal_guards.py,
 test_journaling_integration.py, test_e2e_durable_queue.py).  A mock that accepts
 any ``uuid=`` can never surface a load-or-raise contract.  The missing seam is
-``_fm_helpers.FakeGraphitiClient``, a STATEFUL fake with a real episodic store
-that raises on an unknown uuid, reached here through
-``_fm_helpers.backend_with_fake_graphiti``.  It lives in the shared helper
-module rather than here because ``test_graphiti_add_episode_uuid_param.py``
-(task 3568) needs the same seam to exercise the backend-side guard.
+``_graphiti_fake.FakeGraphitiClient``, a STATEFUL fake with a real episodic
+store that raises on an unknown uuid, reached here through
+``_graphiti_fake.backend_with_fake_graphiti``.  It lives in its own module
+rather than here because ``test_graphiti_add_episode_uuid_param.py`` (task
+3568) needs the same seam to exercise the backend-side guard.
 
 The fake also encodes the two traps this fix must not fall into:
 
@@ -56,10 +56,10 @@ import pytest_asyncio
 from _fm_helpers import (
     FALKOR_HOST,
     FALKOR_PORT,
-    backend_with_fake_graphiti,
     falkor_skipif,
     unique_graph_name,
 )
+from _graphiti_fake import backend_with_fake_graphiti
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.services.memory_service import MemoryService

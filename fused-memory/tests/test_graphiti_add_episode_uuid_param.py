@@ -31,7 +31,7 @@ believing ``uuid=`` means "create under this id":
   * the uuid DOES resolve -> upstream adopts the stored node and silently
     discards the ``content`` just handed to it.
 
-The seam is ``_fm_helpers.FakeGraphitiClient`` (promoted from task 3561's
+The seam is ``_graphiti_fake.FakeGraphitiClient`` (promoted from task 3561's
 test_add_episode_uuid_identity.py): a stateful fake that raises the REAL
 ``graphiti_core.errors.NodeNotFoundError`` for an unknown uuid and returns the
 stored node for a known one.  Every permissive ``AsyncMock`` in the suite
@@ -47,7 +47,7 @@ import logging
 from unittest.mock import MagicMock
 
 import pytest
-from _fm_helpers import FakeGraphitiClient, backend_with_fake_graphiti
+from _graphiti_fake import FakeGraphitiClient, backend_with_fake_graphiti
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 
 from fused_memory.backends import graphiti_client
