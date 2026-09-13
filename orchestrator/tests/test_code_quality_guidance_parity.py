@@ -10,15 +10,22 @@ preamble records that a restated copy went stale once already, task 3802).
 This module is what keeps the inline copy provably DERIVED rather than a
 second source.
 
-WHAT THIS ASSERTS, AND NOTHING ELSE: the 14 bold HEADLINE TOKENS of a numbered
-markdown list under the literal heading ``## The fourteen heuristics``, parsed
-by ONE parser from BOTH sides and compared as an ordered list. It asserts
-nothing whatever about the prose around them — the doc's agreed readings and
-the prompt's surrounding instructions can both be rewritten word for word and
-this module stays green (``TestHeadlineParser`` demonstrates that executably
-rather than by assertion). It is an ordered list EQUALITY, not a substring
-pin, so renaming, reordering, adding or dropping a headline on either side
-fails loudly and names the divergence.
+WHAT THIS ASSERTS — three things, and no sentence of prose on either side.
+(1) The 14 bold HEADLINE TOKENS of a numbered markdown list under the literal
+heading ``## The fourteen heuristics``, parsed by ONE parser from BOTH sides and
+compared as an ordered list EQUALITY rather than as a substring pin, so
+renaming, reordering, adding or dropping a headline on either side fails loudly
+and names the divergence. (2) Four STRUCTURAL anchors over the rest of the
+block: two section headings and the two stances' bold item labels. (3) The
+splice contract — which roles carry ``CODE_QUALITY_GUIDANCE``, how many times,
+and into which half of the reviewer's prompt.
+
+What it does NOT assert is any sentence of prose, on either side. The doc's
+agreed readings and the prompt's surrounding instructions can both be rewritten
+word for word and this module stays green, and the items INSIDE the block's
+sections are deliberately unpinned for the reason recorded above
+``_SECTION_ANCHORS``. ``TestHeadlineParser`` demonstrates the headline half's
+can-fail executably rather than by assertion.
 
 TASK 5192 — open when this landed — is adjudicating whether prompt-PROSE drift
 guards earn their edit friction. This guard is over a STRUCTURED numbered list,
@@ -70,45 +77,41 @@ _ANCHOR = HEADLINE_SECTION_HEADING
 _CODE_QUALITY_ROLES = frozenset({'architect', 'deep_reviewer', 'reviewer_comprehensive'})
 
 # ---------------------------------------------------------------------------
-# Anchors for the content half. Short NOUN PHRASES and structural HEADINGS, never
-# connective prose: a prose pin passes on prose reworded to say the opposite and
-# fails on a legitimate tightening, so it only taxes future prompt edits (the
-# standing rule of _role_splice_contract.py, and the lesson
-# test_roles_scope_boundary.py records from the two literal pins deleted in
-# commit d794419730). Every anchor below names a distinct MANDATED ITEM whose
-# absence is a real loss of guidance; the sentences carrying them can be
-# rewritten freely.
+# Anchors for the content half — MEASUREMENT RECORD, read this before adding one.
+#
+# Only SECTION HEADINGS and BOLD ITEM LABELS are pinned. The items INSIDE those
+# sections — the five interface-design smells, the four do-not-steer-by entries,
+# and the cite-by-name instruction — are deliberately NOT pinned. All of them
+# remain MANDATED content of CODE_QUALITY_GUIDANCE; what was removed is a test
+# pin, never the prompt text it pinned. Do not add the pins back.
+#
+# WHY, measured in both directions against this block's own prose: rewording
+# "monkeypatching a private name by dotted path" to "patching private names via
+# their import path" is benign and would redden the suite, while turning "report
+# a reach-back import as an interface-design finding" into "do NOT report a
+# reach-back import as an interface-design finding" INVERTS the instruction and
+# leaves every fragment anchor green. A fragment pin therefore fails on a
+# legitimate tightening and passes on prose reworded to say the opposite — no
+# correctness content in either direction, only a tax on future prompt edits.
+# That is the standing rule of _role_splice_contract.py; two pins of this exact
+# family were deleted from test_roles_wait_pattern.py under the task 3607
+# review, and test_roles_scope_boundary.py records the same lesson from commit
+# d794419730.
+#
+# The anchors that survive are STRUCTURAL — they name the block's shape, not a
+# sentence in it, so every sentence inside can be rewritten freely. Do not soften
+# them into a looser regex, a case-insensitive match or a substring-of-substrings
+# check, and do not "strengthen" them into a regex either: _role_splice_contract.py
+# forbids both directions for the same reason.
 # ---------------------------------------------------------------------------
 
-_STANCE_ANCHORS = (
+#: The mandated sections of the block, plus the two stances' item labels.
+_SECTION_ANCHORS = (
     '## Two stances',
     '**Comments.**',
     '**Tests.**',
-)
-
-#: The five symptoms the tests stance must name, one anchor each.
-_INTERFACE_SMELL_ANCHORS = (
-    'dotted path',           # monkeypatching a private name by dotted path
-    'private attribute',     # reading a private attribute from a test
-    'reach-back import',
-    'function-local import',  # placed to break an import cycle
-    're-export shim',
-)
-
-#: ...and the verdict they carry: findings about the interface, not style nits.
-_INTERFACE_SMELL_VERDICT_ANCHOR = 'interface-design finding'
-
-#: The four things a reviewer must not steer by, one anchor each.
-_DO_NOT_STEER_BY_ANCHORS = (
     '## Do not steer by',
-    'Raw line count',
-    'Average complexity',
-    'autouse stubs',
-    'test-to-code ratio',
 )
-
-#: The instruction that makes the heuristics usable rather than decorative.
-_CITE_BY_NAME_ANCHOR = 'Name the heuristic you are applying'
 
 #: Substrings that would break one of the existing all-roles prompt scanners if
 #: a later edit to this one constant introduced them.
@@ -347,36 +350,14 @@ def contract(resolved_prompts) -> SpliceContract:
 class TestStancesAndCarrierSet:
     """The rest of what the block must carry, and where it may and may not land."""
 
-    # -- content: the two stances -------------------------------------------
+    # -- content: the mandated sections --------------------------------------
 
     @pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
-    @pytest.mark.parametrize('anchor', _STANCE_ANCHORS)
-    def test_both_stances_are_present(self, role_name, anchor, resolved_prompts):
-        assert anchor in resolved_prompts[role_name]
-
-    @pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
-    @pytest.mark.parametrize('anchor', _INTERFACE_SMELL_ANCHORS)
-    def test_each_interface_design_smell_is_named(self, role_name, anchor, resolved_prompts):
-        assert anchor in resolved_prompts[role_name]
-
-    @pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
-    def test_the_smells_are_reported_as_interface_findings_not_style_nits(
-        self, role_name, resolved_prompts,
+    @pytest.mark.parametrize('anchor', _SECTION_ANCHORS)
+    def test_each_mandated_section_is_structurally_present(
+        self, role_name, anchor, resolved_prompts,
     ):
-        # Without this the five anchors above could all be present in a section
-        # that told the reviewer to ignore them.
-        assert _INTERFACE_SMELL_VERDICT_ANCHOR in resolved_prompts[role_name]
-
-    # -- content: what not to steer by, and how to cite ---------------------
-
-    @pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
-    @pytest.mark.parametrize('anchor', _DO_NOT_STEER_BY_ANCHORS)
-    def test_each_do_not_steer_by_item_is_named(self, role_name, anchor, resolved_prompts):
         assert anchor in resolved_prompts[role_name]
-
-    @pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
-    def test_cite_the_heuristic_by_name_is_instructed(self, role_name, resolved_prompts):
-        assert _CITE_BY_NAME_ANCHOR in resolved_prompts[role_name]
 
     # -- the splice contract ------------------------------------------------
 
