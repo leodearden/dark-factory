@@ -4603,23 +4603,30 @@ class TestHonestResponseContract:
 
         assert result.get('level') == 2, f"No persisted level echoed: {result}"
 
-    # -- Fail-open: a bookkeeping read must never lose a filing -------------
+    # -- A bookkeeping read must never lose a filing, nor confirm one ------
 
     @pytest.mark.asyncio
-    async def test_unreadable_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read returning None falls back to 'queued' rather than raising."""
+    async def test_absent_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read returning None reports 'accepted_unpersisted', not 'queued'.
+
+        The filing is never lost — the id still comes back — but an
+        unconfirmed write is no longer reported in the words that mean a
+        confirmed one (task 5368).
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         queue.get = lambda escalation_id: None  # type: ignore[method-assign]
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result
 
     @pytest.mark.asyncio
-    async def test_raising_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read that RAISES falls back to 'queued' and does not propagate."""
+    async def test_raising_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read that RAISES reports 'accepted_unpersisted' and does not propagate."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
@@ -4630,5 +4637,7 @@ class TestHonestResponseContract:
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result

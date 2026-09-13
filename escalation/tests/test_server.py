@@ -7081,8 +7081,8 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
     escalate_blocker's docstring says "``level`` echoes the level actually
     persisted, so a caller that passed ``level=1`` can confirm it landed".  A
     caller written to that contract (``result['level'] == 1``) must not hit a
-    KeyError on any branch — least of all the degraded fail-open branch, which
-    exists precisely to survive the race where a re-read is unavailable.
+    KeyError on any branch — least of all the degraded unpersisted branch,
+    which is reached in exactly the race where a re-read is unavailable.
     """
 
     @pytest.mark.asyncio
@@ -7096,12 +7096,13 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         assert result.get('level') == 1, f'Expected level echo on queued, got: {result}'
 
     @pytest.mark.asyncio
-    async def test_fail_open_branch_still_echoes_level(self, tmp_path: Path):
+    async def test_unpersisted_branch_still_echoes_level(self, tmp_path: Path):
         """A post-write re-read that RAISES still yields a response carrying level.
 
-        This is the degraded path the fail-open exists for: the filing must be
-        reported as queued rather than lost, and the contract-following caller
-        must still be able to read ``level``.
+        The degraded path reports ``accepted_unpersisted`` rather than laundering
+        an unconfirmed write into a 'queued' confirmation (task 5368) — but the
+        contract-following caller must still be able to read ``level``, which is
+        the invariant this test has always been about.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
@@ -7117,9 +7118,11 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         finally:
             queue.get = real_get  # type: ignore[method-assign]
 
-        assert result.get('status') == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result.get('status') == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert result.get('level') == 1, (
-            f'The fail-open branch must still echo the level written, got: {result}'
+            f'The unpersisted branch must still echo the level written, got: {result}'
         )
 
     @pytest.mark.asyncio

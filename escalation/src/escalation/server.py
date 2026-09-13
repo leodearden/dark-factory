@@ -1163,9 +1163,12 @@ def create_server(
           e.g. a concurrent sweep won the race): ``{'id', 'status',
           'resolution', 'resolved_by', 'level'}``.  Task 3236: both this
           function's L2 branch and dedupe.submit_or_dedupe report OBSERVED
-          post-write state rather than write intent, and fail open to
-          ``'queued'`` — carrying ``esc.level`` — when the re-read is
-          unavailable.
+          post-write state rather than write intent.
+        - Unpersisted: ``{'id', 'status': 'accepted_unpersisted',
+          'persist_check', 'level'}`` when the post-write re-read is
+          unavailable — the write was accepted but nothing is guaranteed on
+          disk for L1 or L2 to drain, so the filer must keep driving its
+          blocked task rather than standing down (task 5368).
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                             'parent_id': parent_id, 'child_id': esc.id,
                             'level': esc.level}``
@@ -1180,8 +1183,8 @@ def create_server(
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc_id = queue.submit(esc)
             # Task 3236: this branch does NOT route through dedupe, so it needs
-            # the observed-state response separately.  Fail-open to 'queued'
-            # (still carrying esc.level, so the 'level' echo is never missing).
+            # the observed-state response separately (still carrying esc.level,
+            # so the 'level' echo is never missing).
             return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
 
@@ -1569,6 +1572,13 @@ def create_server(
           with the record's REAL status — the response reports observed
           post-write state, never write intent (task 3236).
           Callers needing the full record can call get_escalation(id).
+        - Unpersisted (task 5368): ``{id, status: 'accepted_unpersisted',
+          persist_check, level}``.  A post-write re-read could not confirm the
+          write, so nothing is guaranteed on disk for a drain to find.
+          ``persist_check`` is ``'absent'`` (not on disk) or ``'unreadable'``
+          (the read failed, so its state is unknown).  This path carries no
+          ``action`` key — that is only on the blocker path — so an info filer
+          simply carries on, as it already does on every other branch.
         """
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -1665,8 +1675,8 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
-        Response shape always includes ``action='terminate_cleanly'`` and
-        ``level`` (on EVERY branch, including the fail-open one) plus:
+        Response shape always includes ``action`` and ``level`` (on EVERY
+        branch, including the degraded one) plus:
         - Queued:        ``{id, status, level, action}``  where status='queued'
         - Deduped:       ``{id, status, parent_id, child_id, level, action}``
           (L2 escalations are never deduped — they always produce 'queued')
@@ -1675,12 +1685,24 @@ def create_server(
           sweep won the race): ``{id, status, resolution, resolved_by, level,
           action}`` with the record's REAL status.  Task 3236: the response
           reports observed post-write state, never write intent — a
-          ``status='queued'`` reply now means the record really was pending
+          ``status='queued'`` reply means the record really was pending
           after the write.  ``level`` echoes the level actually persisted
           (falling back to the level written when a post-write re-read is
           unavailable), so a caller that passed ``level=1`` can confirm it
           landed without risking a ``KeyError`` on a degraded path.
           Callers needing the full record can call get_escalation(id).
+        - Unpersisted (task 5368): ``{id, status: 'accepted_unpersisted',
+          persist_check, level, action: 'keep_driving'}``.  The write was
+          accepted but a post-write re-read could not confirm it, so NOTHING
+          is guaranteed on disk for L1 or L2 to drain.  DO NOT terminate on
+          this branch — that would remove the task from every recovery path
+          in exchange for an escalation no handler will ever see.  Keep
+          driving the blocked task and re-file on your next iteration; the
+          dedupe gate collapses a repeat filing into one record, which is why
+          no out-of-band retry is attempted here.  ``persist_check`` is
+          ``'absent'`` (the record is not on disk) or ``'unreadable'`` (the
+          read failed, so its state is unknown).  ``action`` is
+          ``'terminate_cleanly'`` on every OTHER branch above.
         """
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -1725,7 +1747,15 @@ def create_server(
             level=level,
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
-        return {**result, 'action': 'terminate_cleanly'}
+        # The instruction must follow the observed state, not the intent to
+        # file.  When persistence is unconfirmed there may be nothing on disk
+        # for L1 or L2 to drain, so standing the filer down would strand its
+        # task in silence (task 5368).
+        action = (
+            'keep_driving' if result.get('status') == 'accepted_unpersisted'
+            else 'terminate_cleanly'
+        )
+        return {**result, 'action': action}
 
     # --- Handler-side tools ---
 

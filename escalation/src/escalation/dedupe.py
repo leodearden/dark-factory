@@ -556,9 +556,12 @@ def submit_or_dedupe(
     - Auto-resolved/dismissed (the record was NOT pending after the write —
       e.g. a concurrent sweep won the race): ``{'id', 'status', 'resolution',
       'resolved_by', 'level'}``.  See ``queue.observed_submit_response``: the
-      response reports observed post-write state, never write intent, and
-      fails open to ``'queued'`` (still carrying ``level``) if the re-read is
-      unavailable.
+      response reports observed post-write state, never write intent.
+    - Unpersisted: ``{'id', 'status': 'accepted_unpersisted', 'persist_check',
+      'level'}`` when the post-write re-read is unavailable — the write was
+      accepted but nothing is guaranteed on disk for L1 or L2 to drain, so the
+      filer must keep driving its blocked task rather than standing down
+      (task 5368).  ``persist_check`` is ``'absent'`` or ``'unreadable'``.
     - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                         'parent_id': parent_id, 'child_id': esc.id,
                         'level': esc.level}``
