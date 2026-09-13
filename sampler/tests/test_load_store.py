@@ -537,7 +537,11 @@ class TestCleanupIsIntervalGated:
             with pytest.raises(sqlite3.Error):
                 store.cleanup_old(now)
         finally:
-            db_path.chmod(0o644)
+            # The -wal and -shm sidecars inherit the main file's mode when
+            # SQLite recreates them, so restoring only db.sqlite would leave
+            # the store readonly and the recovery leg below meaningless.
+            for path in tmp_path.glob('db.sqlite*'):
+                path.chmod(0o644)
 
         assert store.should_cleanup(now) is True, (
             'a failed prune must leave the store still due, not stamped'
