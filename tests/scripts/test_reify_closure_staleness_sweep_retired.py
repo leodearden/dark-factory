@@ -50,7 +50,48 @@ RETIRED_TOKENS = ('consume_redispatch_requests', 'reify-closure-staleness-sweep'
 # also silence a real offender.
 SELF_RELPATH = pathlib.Path(__file__).resolve().relative_to(REPO_ROOT).as_posix()
 
-CODE_TREE_PATHSPECS = ('scripts', 'tests')
+# Files permitted to keep a retired token UNCONDITIONALLY, each with the reason
+# it is exempt. Shaped after test_atomic_write_regrowth.py::_ALLOWED_RENAMERS:
+# an addition here is a deliberate act carrying a written justification, not
+# silent growth.
+ALLOWED_UNCONDITIONALLY = {
+    SELF_RELPATH: (
+        'the guard itself — every absence assertion above necessarily names a '
+        'retired path, so this module can never clear its own sweep'
+    ),
+    'plans/module-tagger-debris-census.json': (
+        'FROZEN historical census record — task 3102\'s merge snapshot, with '
+        'metadata_files as measured 2026-07-30. Rewriting it would falsify a '
+        'past measurement, so it is allowlisted rather than edited'
+    ),
+}
+
+# Docs permitted to keep a retired token ONLY as a record of the retirement.
+# The allowlist alone would not be enough here: "describes the retirement" has
+# to be CHECKABLE, or this degrades into pinning doc prose. So each surviving
+# mention must sit within RETIREMENT_MARKER_WINDOW lines of a marker token — a
+# line still reading as live operator instructions fails, a line recording the
+# retirement passes. Nothing beyond that single marker is asserted: not
+# sentence wording, not headings, not any other prose.
+ALLOWED_AS_RETIREMENT_RECORD = {
+    'OPERATIONS.md': 'the operator runbook records the job as retired',
+    'docs/prds/recurring-deterministic-tasks.md': (
+        'the PRD records that its named seed job was retired'
+    ),
+    'docs/prds/recurring-deterministic-tasks.capability-manifest.md': (
+        'the capability manifest records the substrate change'
+    ),
+    'docs/prds/claimant-invariant-enforcement.md': (
+        'the PRD marks the retired site and discharges its G7 waiver IN '
+        'PLACE — the waiver text is deliberately kept, not deleted'
+    ),
+    'docs/prds/claimant-invariant-enforcement.capability-manifest.yaml': (
+        'the sidecar marks the retired example in its binding prose'
+    ),
+}
+
+RETIREMENT_MARKERS = ('task 5247', 'retired')
+RETIREMENT_MARKER_WINDOW = 3
 
 _RETIRED_MESSAGE = (
     "task 5247: {path} is part of the retired nightly reify closure-staleness "
@@ -210,45 +251,76 @@ def _tracked_files(*pathspecs):
     return [entry for entry in completed.stdout.split('\0') if entry]
 
 
-def _offending_lines(relpaths):
-    """Sorted ``path:line`` citations of every surviving retired-wiring token."""
-    offenders = []
-    for relpath in relpaths:
-        if relpath == SELF_RELPATH:
-            continue
-        p = REPO_ROOT / relpath
-        if not p.is_file():
-            continue
-        text = p.read_text(encoding='utf-8', errors='replace')
-        if not any(token in text for token in RETIRED_TOKENS):
-            continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if any(token in line for token in RETIRED_TOKENS):
-                offenders.append(f'{relpath}:{lineno}')
-    return sorted(offenders)
+def _mentioning_lines(relpath):
+    """1-indexed line numbers of every retired-token mention, plus the lines."""
+    p = REPO_ROOT / relpath
+    if not p.is_file():
+        return [], []
+    lines = p.read_text(encoding='utf-8', errors='replace').splitlines()
+    hits = [
+        lineno
+        for lineno, line in enumerate(lines, start=1)
+        if any(token in line for token in RETIRED_TOKENS)
+    ]
+    return hits, lines
+
+
+def _corpus():
+    """The tracked corpus, or a pytest.skip when this is not a git checkout."""
+    tracked = _tracked_files()
+    if tracked is None:
+        pytest.skip('not a git checkout (git ls-files failed)')
+    return tracked
 
 
 def test_reference_sweep_is_not_vacuous():
-    """An empty corpus would pass the sweep silently — the fail-soft to prevent."""
-    tracked = _tracked_files(*CODE_TREE_PATHSPECS)
-    if tracked is None:
-        pytest.skip('not a git checkout (git ls-files failed)')
-    assert tracked, (
-        'task 5247: git ls-files returned an empty corpus for '
-        f'{CODE_TREE_PATHSPECS}, so the reference sweep below would pass '
-        'without checking anything'
+    """An empty corpus would pass the sweeps silently — the fail-soft to prevent."""
+    assert _corpus(), (
+        'task 5247: git ls-files returned an empty tracked corpus, so the '
+        'reference sweeps below would pass without checking anything'
     )
 
 
-def test_code_tree_carries_no_reference_to_the_retired_wiring():
-    """No tracked file under scripts/ or tests/ still cites the retired wiring."""
-    tracked = _tracked_files(*CODE_TREE_PATHSPECS)
-    if tracked is None:
-        pytest.skip('not a git checkout (git ls-files failed)')
-    offenders = _offending_lines(tracked)
+def test_tree_carries_no_reference_to_the_retired_wiring():
+    """No tracked file outside the documented allowlists still cites the wiring.
+
+    This is the executable form of the task's acceptance grep, over the whole
+    tracked tree.
+    """
+    offenders = []
+    for relpath in _corpus():
+        if relpath in ALLOWED_UNCONDITIONALLY or relpath in ALLOWED_AS_RETIREMENT_RECORD:
+            continue
+        hits, _ = _mentioning_lines(relpath)
+        offenders.extend(f'{relpath}:{lineno}' for lineno in hits)
     assert not offenders, (
         'task 5247: the nightly reify closure-staleness sweep wiring is '
-        'retired, but these tracked code-tree lines still name it — repoint '
-        'each at a surviving precedent rather than leaving a comment pointing '
-        'at a deleted file:\n  ' + '\n  '.join(offenders)
+        'retired, but these tracked lines still name it — repoint each at a '
+        'surviving precedent, or add the file to one of this module\'s '
+        'allowlists WITH a written reason:\n  ' + '\n  '.join(sorted(offenders))
+    )
+
+
+def test_retirement_record_docs_describe_only_the_retirement():
+    """Every surviving doc mention sits beside a retirement marker.
+
+    Structural, not prose-pinning: a mention that still reads as live operator
+    instructions for a running job has no marker near it and fails here.
+    """
+    offenders = []
+    for relpath in sorted(ALLOWED_AS_RETIREMENT_RECORD):
+        hits, lines = _mentioning_lines(relpath)
+        for lineno in hits:
+            window = lines[
+                max(0, lineno - 1 - RETIREMENT_MARKER_WINDOW):
+                lineno + RETIREMENT_MARKER_WINDOW
+            ]
+            haystack = '\n'.join(window).lower()
+            if not any(marker in haystack for marker in RETIREMENT_MARKERS):
+                offenders.append(f'{relpath}:{lineno}: {lines[lineno - 1].strip()}')
+    assert not offenders, (
+        'task 5247: these doc lines still name the retired wiring without a '
+        f'retirement marker ({" / ".join(RETIREMENT_MARKERS)}) within '
+        f'{RETIREMENT_MARKER_WINDOW} lines, so they still read as a live '
+        'description of a running job:\n  ' + '\n  '.join(offenders)
     )
