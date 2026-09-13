@@ -20,6 +20,7 @@ they are what makes the kind half of the selection predicate load-bearing.
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,9 @@ from fused_memory.memory_metadata import (
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    STATE_ACTIVE,
+    STATE_EXPIRED,
+    STATE_REVOKED,
 )
 from fused_memory.utils.validation import is_full_uuid
 
@@ -373,3 +377,95 @@ class TestBuildEvidenceOnlyPatch:
     def test_the_stamp_adds_no_unknown_key_census_line(self) -> None:
         """Checked against the REAL validator, not by eyeballing the prefixes."""
         assert classify_unknown_keys(self._patch()) == []
+
+
+# ---------------------------------------------------------------------------
+# plan_backfill — the whole decision surface, unit-testable without a store
+# ---------------------------------------------------------------------------
+
+
+def _stamped(record: dict) -> dict:
+    """The same record after a previous run's evidence-only stamp."""
+    patched = {**record, 'metadata': {**record['metadata']}}
+    patched['metadata'][_mod.EVIDENCE_ONLY_STATUS_KEY] = _mod.EVIDENCE_ONLY_STATUS
+    return patched
+
+
+def _scroll_with(*stamped_ids: str) -> list[dict]:
+    """The live scroll, with *stamped_ids* already carrying the stamp."""
+    return [
+        _stamped(record) if record.get('id') in stamped_ids else record
+        for record in LIVE_ENTITY_SCROLL
+    ]
+
+
+class _Row:
+    """The fields ``plan_backfill`` reads off an existing ledger row."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        self.entity_uuid = ENTITY_UUID
+        self.flag_type = GROUNDS_STRUCTURAL_SIZE_CONFLATION
+
+
+class TestIsAlreadyStamped:
+    def test_keys_on_the_status_field(self) -> None:
+        assert not _mod.is_already_stamped(SOURCE_RECORD)
+        assert _mod.is_already_stamped(_stamped(SOURCE_RECORD))
+
+    def test_a_malformed_record_is_not_stamped(self) -> None:
+        assert not _mod.is_already_stamped({'id': 'x'})
+        assert not _mod.is_already_stamped({'id': 'x', 'metadata': None})
+
+
+class TestPlanBackfill:
+    """Four corpus/ledger states, one frozen plan each."""
+
+    def test_fresh_corpus_plans_the_row_and_both_stamps(self) -> None:
+        plan = _mod.plan_backfill(SOURCE_RECORD, LIVE_ENTITY_SCROLL, None)
+        assert plan.entity_uuid == ENTITY_UUID
+        assert plan.grounds == GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        assert plan.needs_ledger_write is True
+        assert plan.stamp_targets == tuple(EXPECTED_STAMP_TARGETS)
+        assert plan.evidence_refs == tuple(
+            _mod.build_evidence_refs(EXPECTED_STAMP_TARGETS, ENTITY_UUID)
+        )
+
+    def test_a_fully_migrated_corpus_plans_nothing(self) -> None:
+        """Idempotent re-run: an ACTIVE row plus both originals stamped."""
+        plan = _mod.plan_backfill(
+            SOURCE_RECORD,
+            _scroll_with(*EXPECTED_STAMP_TARGETS),
+            _Row(STATE_ACTIVE),
+        )
+        assert plan.needs_ledger_write is False
+        assert plan.stamp_targets == ()
+
+    def test_a_partially_stamped_corpus_completes_only_what_is_missing(self) -> None:
+        plan = _mod.plan_backfill(
+            SOURCE_RECORD, _scroll_with(SOURCE_ID), _Row(STATE_ACTIVE)
+        )
+        assert plan.needs_ledger_write is False
+        assert plan.stamp_targets == (CORRECTION_ID,)
+
+    @pytest.mark.parametrize('state', [STATE_EXPIRED, STATE_REVOKED])
+    def test_a_lapsed_row_is_re_established_not_silently_skipped(
+        self, state: str
+    ) -> None:
+        """``get_active_entity_standing_decision`` gates on ``state='active'``,
+        so a TTL-expired or revoked row leaves γ/δ blind — the migration must
+        write again rather than read "a row exists" as "the work is done"."""
+        plan = _mod.plan_backfill(
+            SOURCE_RECORD, _scroll_with(*EXPECTED_STAMP_TARGETS), _Row(state)
+        )
+        assert plan.needs_ledger_write is True
+
+    def test_the_plan_is_frozen(self) -> None:
+        """Nothing between planning and applying may edit the decision."""
+        plan = _mod.plan_backfill(SOURCE_RECORD, LIVE_ENTITY_SCROLL, None)
+        with pytest.raises(FrozenInstanceError):
+            plan.needs_ledger_write = False
+
+    def test_an_invalid_source_stops_the_plan(self) -> None:
+        with pytest.raises(_mod.BackfillSourceInvalid):
+            _mod.plan_backfill(None, LIVE_ENTITY_SCROLL, None)
