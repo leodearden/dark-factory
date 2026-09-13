@@ -65,19 +65,22 @@ GROUP = 'grp-3568'
 CANONICAL_GROUP = 'grp_3568'
 
 
-def _discard_warnings(caplog) -> list[str]:
-    """WARNINGs about a discarded episode body, by the fact they state.
+def _seam_warnings(caplog) -> list[str]:
+    """Every WARNING the backend module emitted, selected by EMITTER not prose.
 
-    Selected on 'content' + 'stored' rather than on record count, so an
-    unrelated warning from elsewhere in the backend cannot make a
-    no-warning assertion fail for the wrong reason.
+    A filter keyed on the message's WORDING would let a reword of the
+    production warning quietly empty this list — leaving the two "this path
+    stays silent" assertions below vacuous while they stayed green, which is
+    the failure mode this selector exists to avoid.  An emitter cannot drift
+    silently: ``test_a_warning_names_the_uuid_and_the_discarded_content``
+    requires this same call to be NON-empty, so a selector that stopped
+    matching anything fails loudly there before it can hollow out the
+    negatives.
     """
     return [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.WARNING
-        and 'content' in r.getMessage().lower()
-        and 'stored' in r.getMessage().lower()
+        if r.levelno >= logging.WARNING and r.name == graphiti_client.logger.name
     ]
 
 
@@ -286,19 +289,22 @@ class TestResolvingUuidDiscardsContentLoudly:
                 name='n', content='replacement text', group_id=GROUP, uuid=stored_uuid
             )
 
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        matching = [r for r in warnings if stored_uuid in r.getMessage()]
+        emitted = _seam_warnings(caplog)
+        matching = [m for m in emitted if stored_uuid in m]
         assert matching, (
             f'A resolving uuid= silently discards content — that must warn, '
-            f'naming the uuid. Warnings seen: {[r.getMessage() for r in warnings]}.'
+            f'naming the uuid. Warnings seen: {emitted}.'
         )
-        message = matching[0].getMessage().lower()
+        message = matching[0].lower()
         assert 'content' in message, (
-            f'The warning must name what was lost; got {matching[0].getMessage()!r}.'
+            f'The warning must name what was lost; got {matching[0]!r}.'
         )
-        assert 'not' in message and 'stored' in message, (
-            f'The warning must say the content was NOT stored; got '
-            f'{matching[0].getMessage()!r}.'
+        # The remedy, not a restatement of the loss: 'uuid=None' is the token
+        # that tells the caller what to do instead, and the only token in this
+        # message that no other warning from this module carries.
+        assert 'uuid=none' in message, (
+            f'The warning must name the remedy — pass uuid=None — and not '
+            f'merely report the loss; got {matching[0]!r}.'
         )
 
     @pytest.mark.asyncio
@@ -308,9 +314,9 @@ class TestResolvingUuidDiscardsContentLoudly:
         with caplog.at_level(logging.WARNING, logger=graphiti_client.logger.name):
             await backend.add_episode(name='n', content='c', group_id=GROUP)
 
-        assert not _discard_warnings(caplog), (
+        assert _seam_warnings(caplog) == [], (
             f'The uuid=None production path must gain no log noise; got '
-            f'{_discard_warnings(caplog)}.'
+            f'{_seam_warnings(caplog)}.'
         )
 
     @pytest.mark.asyncio
@@ -325,6 +331,6 @@ class TestResolvingUuidDiscardsContentLoudly:
 
         # A caller offering nothing to store is not making the
         # create-with-this-id mistake, so there is nothing to warn about.
-        assert not _discard_warnings(caplog), (
-            f'An empty content= must not be nagged; got {_discard_warnings(caplog)}.'
+        assert _seam_warnings(caplog) == [], (
+            f'An empty content= must not be nagged; got {_seam_warnings(caplog)}.'
         )
