@@ -40,12 +40,16 @@ import re
 from pathlib import Path
 
 import pytest
+from _orch_helpers import make_prompt_resolution_workflow
 from code_quality_headlines import (
     DOC_PATH,
     HEADLINE_SECTION_HEADING,
     doc_headlines,
     numbered_headlines,
 )
+from shared.prompt_artifact import PromptArtifactStore
+
+from orchestrator.agents.roles import ROLES
 
 # orchestrator/tests/test_code_quality_guidance_parity.py -> parents[0]=tests,
 # parents[1]=orchestrator, parents[2]=repo root. Same idiom as
@@ -53,6 +57,13 @@ from code_quality_headlines import (
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _ANCHOR = HEADLINE_SECTION_HEADING
+
+#: The roles that judge or design code, and so are given the heuristics inline.
+_CODE_QUALITY_ROLES = frozenset({'architect', 'deep_reviewer', 'reviewer_comprehensive'})
+
+#: Any allowed executor model: nothing is pinned for any of them, so the value
+#: only has to be a real resolve() key, not a particular one.
+_MODEL = 'opus'
 
 # Structurally real synthetics: a numbered bold item BEFORE the anchor and one
 # AFTER the section's terminating ``## `` heading, both of which must be
@@ -185,3 +196,58 @@ class TestDocHeadlines:
         doc.write_text(_WELL_FORMED, encoding='utf-8')
         assert doc_headlines(doc) == numbered_headlines(_WELL_FORMED, _ANCHOR)
 
+
+
+@pytest.fixture(scope='module')
+def resolved_prompts(tmp_path_factory) -> dict[str, str]:
+    """Every role's system prompt as PRODUCTION renders it.
+
+    Resolved through the single production chokepoint
+    ``TaskWorkflow._resolve_role_system_prompt``, which is what the task
+    requires: reading ``roles.py`` source, or even ``role.system_prompt``,
+    proves only that the text was typed — not that it survived ``str.format``
+    interpolation and ``compose_prompt`` assembly. Both production branches are
+    exercised with no per-role branching here (``prompt_spec`` set -> the
+    artifact store; ``prompt_spec is None`` -> ``system_prompt`` verbatim).
+
+    Module-scoped, and built from ``tmp_path_factory`` rather than at import
+    time, because resolution needs a real project root and artifacts root. It
+    is still constructed exactly once for the module, which is what the
+    consuming ``SpliceContract`` needs.
+    """
+    root = tmp_path_factory.mktemp('prompt_resolution')
+    workflow = make_prompt_resolution_workflow(
+        tmp_path=root, prompt_store=PromptArtifactStore(root / 'artifacts'),
+    )
+    return {
+        name: workflow._resolve_role_system_prompt(role, _MODEL)
+        for name, role in ROLES.items()
+    }
+
+
+@pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
+class TestFourteenHeuristicsReachTheRolePrompts:
+    """The wired half: the real doc against the real, production-rendered prompts.
+
+    The assertion is deliberately an ordered list EQUALITY over ONE shared
+    anchor parsed by ONE shared parser, not a substring pin. That is what keeps
+    ``docs/code-quality.md`` the single point of truth (INV-9, heuristic 11)
+    with the prompt derived from it: a headline renamed, reordered, added or
+    dropped on EITHER side fails and names the divergence, while rewording any
+    prose on either side is a no-op.
+
+    Only this TEST reads ``docs/code-quality.md``. No runtime code path does, so
+    an orchestrator operating a project whose checkout lacks the doc is
+    unaffected — the prompt carries the headlines inline.
+    """
+
+    def test_prompt_headlines_equal_the_doc_headlines(self, role_name, resolved_prompts):
+        assert (
+            numbered_headlines(resolved_prompts[role_name], HEADLINE_SECTION_HEADING)
+            == doc_headlines()
+        )
+
+    def test_there_are_exactly_fourteen_of_them(self, role_name, resolved_prompts):
+        # Separate from the equality above so a doc edit that deleted items from
+        # BOTH sides cannot pass vacuously.
+        assert len(numbered_headlines(resolved_prompts[role_name], HEADLINE_SECTION_HEADING)) == 14
