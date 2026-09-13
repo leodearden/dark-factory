@@ -50,6 +50,12 @@ CORRECTION_ID = 'baf8ca57-9f36-431b-a9b9-17c82fadd22d'
 OFF_ENTITY_CORRECTION_ID = '12c3a5ce-1a0e-4c6b-9d3c-6b5a2e0f7a41'
 OFF_ENTITY_UUID = '6643a9a7-5e58-4e1e-8e4f-3f1c2d9b7a10'
 
+#: The two records PRD decision 5 demotes, in the order the selector must
+#: return them. Spelled as ``sorted(...)`` rather than hand-transcribed: the
+#: contract is "deterministic, independent of scroll order", and a literal pair
+#: would assert a particular lexicographic accident instead.
+EXPECTED_STAMP_TARGETS = sorted([SOURCE_ID, CORRECTION_ID])
+
 
 def _record(memory_id: str, kind: str | None, entity_uuid: str | None) -> dict:
     """One mem0 record envelope as ``get_memories_by_metadata`` returns it."""
@@ -190,7 +196,7 @@ class TestSelectEvidenceOnlyTargets:
     def test_selects_exactly_the_two_unratified_ad_hoc_records(self) -> None:
         assert _mod.select_evidence_only_targets(
             LIVE_ENTITY_SCROLL, ENTITY_UUID
-        ) == [CORRECTION_ID, SOURCE_ID]
+        ) == EXPECTED_STAMP_TARGETS
 
     def test_order_is_deterministic_across_input_orderings(self) -> None:
         """Two runs over the same corpus must plan the same stamps in the same
@@ -250,7 +256,7 @@ class TestSelectEvidenceOnlyTargets:
         selected = _mod.select_evidence_only_targets(
             [*LIVE_ENTITY_SCROLL, malformed], ENTITY_UUID
         )
-        assert selected == [CORRECTION_ID, SOURCE_ID]
+        assert selected == EXPECTED_STAMP_TARGETS
 
     def test_empty_corpus_selects_nothing(self) -> None:
         assert _mod.select_evidence_only_targets([], ENTITY_UUID) == []

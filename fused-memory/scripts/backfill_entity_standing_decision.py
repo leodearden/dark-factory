@@ -169,3 +169,53 @@ def resolve_source_entity_uuid(record: Any) -> str:
             'undashed spelling would write a row no hook can ever find.'
         )
     return entity_uuid
+
+
+def select_evidence_only_targets(
+    records: list[Any], entity_uuid: str
+) -> list[str]:
+    """Pick the mem0 records to stamp evidence-only, from a live scroll.
+
+    The predicate is a CONJUNCTION, and both halves are load-bearing:
+
+    * **kind ∈** :data:`DEMOTED_AD_HOC_KINDS`. The entity-scoped scroll also
+      returns two ``stage1_flag_suppression`` records carrying the same
+      ``entity_uuid``, and that kind is RATIFIED and machine-read —
+      ``flag_dedup.filter_suppressed`` consumes it. Demoting those would be a
+      live behaviour change, not a bookkeeping stamp, so entity scope alone
+      cannot gate the write.
+    * **entity_uuid == the source's**. Measured 2026-09-13: reify holds five
+      ``stage1_finding_correction`` records and only one concerns this entity.
+      Kind alone would stamp four records about entities this decision says
+      nothing about.
+
+    SELECTED, never a hardcoded id list, for the same measurement: the research
+    doc's second pinned id (``12c3a5ce``) turned out to belong to a different
+    entity, so a list transcribed at decompose time would have stamped the
+    wrong record. A live predicate re-derives the truth on every run.
+
+    Malformed records — no ``metadata``, no ``kind``, no ``entity_uuid``, no
+    ``id`` — are EXCLUDED rather than raising: this scroll is a live corpus, and
+    one unexpected neighbour must not be able to abort a migration that has
+    nothing to do with it. Exclusion is the safe direction (an unstamped
+    original is recoverable by a re-run; a wrongly-stamped one is not).
+
+    Args:
+        records: The mem0 records returned by an entity-scoped metadata scroll.
+        entity_uuid: The source record's entity, from
+            :func:`resolve_source_entity_uuid`.
+
+    Returns:
+        The matching memory ids, SORTED — the migration's stamp order, and its
+        report's row order, must not depend on the order Qdrant happened to
+        return.
+    """
+    return sorted(
+        record['id']
+        for record in records
+        if isinstance(record, dict)
+        and isinstance(record.get('id'), str)
+        and isinstance(record.get('metadata'), dict)
+        and record['metadata'].get('kind') in DEMOTED_AD_HOC_KINDS
+        and record['metadata'].get('entity_uuid') == entity_uuid
+    )
