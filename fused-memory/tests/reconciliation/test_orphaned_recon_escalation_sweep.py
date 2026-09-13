@@ -333,6 +333,68 @@ class TestClassifyOrphan:
         assert classify_orphan(esc, {650: 'done'}) == 'terminal'  # type: ignore[dict-item]
 
 
+class TestClassifyOrphanAmbiguity:
+    """A census value may carry SEVERAL statuses for one id — then nothing is known.
+
+    Task ids are per-tag, not global: the schema is ``PRIMARY KEY (tag, id)``
+    with a per-tag ``id_counters`` high-water mark
+    (``backends/sqlite_task_backend.py``), so tag ``master`` and tag
+    ``feature-x`` each number tasks from 1 and OVERLAPPING IDS ARE THE NORM.
+    An escalation record carries no tag — only ``project_id:`` is parseable
+    out of its detail block — so a collision cannot be disambiguated and must
+    not be silently resolved to whichever tag was read last.
+    """
+
+    def test_a_sole_terminal_status_in_a_set_classifies_terminal(self):
+        esc = make_escalation(task_id='650')
+
+        assert classify_orphan(esc, {'650': {'done'}}) == 'terminal'
+
+    def test_a_sole_live_status_in_a_set_classifies_live(self):
+        esc = make_escalation(task_id='650')
+
+        assert classify_orphan(esc, {'650': {'blocked'}}) == 'live'
+
+    def test_differing_statuses_classify_ambiguous(self):
+        """Blocked in one tag, done in another: the subject is unidentifiable."""
+        esc = make_escalation(task_id='650')
+
+        assert classify_orphan(esc, {'650': {'done', 'blocked'}}) == 'ambiguous'
+
+    def test_two_different_terminal_statuses_are_still_ambiguous(self):
+        """``done`` here and ``cancelled`` there are still two different tasks.
+
+        Do not special-case "every candidate is terminal" into a reap: the
+        record names ONE subject and we cannot tell which of the two it is,
+        so the evidence handed to the closer would be fabricated even where
+        the verdict happened to coincide.
+        """
+        esc = make_escalation(task_id='650')
+
+        assert classify_orphan(esc, {'650': {'done', 'cancelled'}}) == 'ambiguous'
+
+    def test_the_legacy_flat_string_shape_still_classifies(self):
+        """A bare ``{id: status}`` map keeps its meaning — every earlier case relies on it."""
+        esc = make_escalation(task_id='650')
+
+        assert classify_orphan(esc, {'650': 'done'}) == 'terminal'
+        assert classify_orphan(esc, {'650': 'cancelled'}) == 'terminal'
+        assert classify_orphan(esc, {'650': 'blocked'}) == 'live'
+
+    def test_a_bare_status_string_is_not_iterated_character_wise(self):
+        """Normalisation must test ``isinstance(value, str)`` FIRST.
+
+        A ``str`` is itself iterable, so treating the value as a collection
+        explodes ``'done'`` into ``{'d','o','n','e'}`` — four distinct
+        "statuses" — and mis-classifies every legacy flat map as ambiguous,
+        silently reducing recall to zero.
+        """
+        esc = make_escalation(task_id='650')
+
+        assert classify_orphan(esc, {'650': 'done'}) != 'ambiguous'
+        assert classify_orphan(esc, {'650': 'blocked'}) != 'ambiguous'
+
+
 def assert_conforms_to_finding_schema(flag: dict) -> None:
     """Assert *flag* satisfies ``FINDING_ITEM_SCHEMA`` (cli_stage_runner.py).
 
@@ -527,7 +589,10 @@ class TestBuildOrphanedEscalationFlag:
         assert HUMAN_OPERATOR in flag['description']
         assert GATE_BACKLOG not in flag['description']
 
-    @pytest.mark.parametrize('classification', ['live', 'unresolvable', '', None, 'terminal '])
+    @pytest.mark.parametrize(
+        'classification',
+        ['live', 'ambiguous', 'unresolvable', '', None, 'terminal '],
+    )
     def test_non_flaggable_classification_raises_value_error(self, classification):
         """Only 'terminal'/'missing' are flaggable — a wiring mistake must be loud.
 
@@ -831,7 +896,7 @@ class TestSweepOrphanedReconEscalations:
 
         assert stats == {
             'flags': [], 'scanned': 0, 'terminal': 0, 'missing': 0,
-            'live': 0, 'unresolvable': 0, 'errors': 1,
+            'live': 0, 'ambiguous': 0, 'unresolvable': 0, 'errors': 1,
         }
 
     @pytest.mark.asyncio
@@ -943,7 +1008,7 @@ class TestSweepOrphanedReconEscalations:
 
         assert stats == {
             'flags': [], 'scanned': 0, 'terminal': 0, 'missing': 0,
-            'live': 0, 'unresolvable': 0, 'errors': 0,
+            'live': 0, 'ambiguous': 0, 'unresolvable': 0, 'errors': 0,
         }
         taskmaster.list_tags.assert_not_awaited()
         taskmaster.get_statuses_fresh.assert_not_awaited()
@@ -1095,11 +1160,102 @@ class TestFailOpenCensusIsTreatedAsFailure:
         assert {f['task_id'] for f in stats['flags']} == {'650'}
 
 
+class TestCrossTagIdCollision:
+    """An id living in two tags with differing statuses must never be reaped.
+
+    ``PRIMARY KEY (tag, id)`` plus a per-tag ``id_counters`` high-water mark
+    (``backends/sqlite_task_backend.py``) means every tag numbers its tasks
+    from 1, so the same id in two tags is the NORM rather than a coincidence.
+    Merging the tags into one flat map is last-tag-wins, and a record carries
+    no tag to disambiguate with — so subject 650 ``blocked`` in ``master``
+    alongside an unrelated 650 ``done`` in ``feature-x`` would classify
+    ``'terminal'`` on false evidence, and ``--apply`` would close a live
+    record.  That is the exact false positive the cross-tag census was added
+    to prevent, arriving through the code path added to prevent it.
+    """
+
+    @pytest.mark.parametrize(
+        'tag_order', [('master', 'feature-x'), ('feature-x', 'master')],
+    )
+    @pytest.mark.asyncio
+    async def test_a_colliding_id_is_ambiguous_in_either_tag_order(self, tag_order):
+        """ORDERING INDEPENDENCE IS THE PROPERTY UNDER TEST.
+
+        Run both ways round so the test cannot pass merely because the safe
+        tag happened to be read last — which is precisely how the defect hid.
+        """
+        per_tag = {'master': {'650': 'blocked'}, 'feature-x': {'650': 'done'}}
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({DARK_ROOT: {t: per_tag[t] for t in tag_order}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['ambiguous'] == 1
+        assert stats['terminal'] == 0
+        assert stats['missing'] == 0
+        assert stats['live'] == 0
+        assert stats['flags'] == [], 'an unidentifiable subject reaches no closer'
+
+    @pytest.mark.asyncio
+    async def test_a_concordant_terminal_duplicate_is_still_reapable(self):
+        """The same id, the same status, in two tags — recall must not shrink.
+
+        An id appearing twice is ambiguous only when the statuses DIFFER;
+        downgrading a concordant duplicate would quietly stop reaping records
+        in any project that ever grew a second tag.
+        """
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done'}, 'feature-x': {'650': 'done'}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['terminal'] == 1
+        assert stats['ambiguous'] == 0
+        assert [f['task_id'] for f in stats['flags']] == ['650']
+        assert 'done' in stats['flags'][0]['description'], (
+            'the evidence prose must name the resolved status, not a set'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_concordant_live_duplicate_stays_live(self):
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'blocked'}, 'feature-x': {'650': 'blocked'}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['live'] == 1
+        assert stats['ambiguous'] == 0
+        assert stats['flags'] == []
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_is_zero_on_a_scenario_without_a_collision(self):
+        """The new bucket is always present, so no caller needs ``.get(..., 0)``."""
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['ambiguous'] == 0
+
+
 _STAT_KEYS = (
     'orphaned_recon_escalations_scanned',
     'orphaned_recon_escalations_terminal',
     'orphaned_recon_escalations_missing',
     'orphaned_recon_escalations_live',
+    'orphaned_recon_escalations_ambiguous',
     'orphaned_recon_escalations_unresolvable',
     'orphaned_recon_escalations_errors',
     'orphaned_recon_escalations_flags_emitted',
@@ -1159,14 +1315,14 @@ async def _run_stage(stage, *, base_flags=None, dedup_mock=None):
 class TestMemoryConsolidatorOrphanedEscalationWiring:
     """``MemoryConsolidator.run()`` must surface the sweep's flags and stats.
 
-    The seven stats are always present so a reader never needs a
+    The eight stats are always present so a reader never needs a
     ``.get(..., 0)`` fallback, and can tell a degraded cycle (``errors > 0``)
     apart from a clean cycle that found nothing.
     """
 
     @pytest.mark.asyncio
     async def test_terminal_subject_flag_and_stats_reach_the_report(self):
-        """A full cycle appends the flag and publishes all seven counts."""
+        """A full cycle appends the flag and publishes all eight counts."""
         queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
         taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
         stage = _make_consolidator(escalation_queue=queue, taskmaster=taskmaster)
@@ -1183,6 +1339,7 @@ class TestMemoryConsolidatorOrphanedEscalationWiring:
         assert report.stats['orphaned_recon_escalations_terminal'] == 1
         assert report.stats['orphaned_recon_escalations_missing'] == 0
         assert report.stats['orphaned_recon_escalations_live'] == 0
+        assert report.stats['orphaned_recon_escalations_ambiguous'] == 0
         assert report.stats['orphaned_recon_escalations_unresolvable'] == 0
         assert report.stats['orphaned_recon_escalations_errors'] == 0
         assert report.stats['orphaned_recon_escalations_flags_emitted'] == 1

@@ -286,6 +286,38 @@ class TestDeriveOrphanedReconEscalations:
         } == before_pending, 'no record may leave pending on a failed census'
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply_mode', [False, True])
+    async def test_a_cross_tag_id_collision_is_never_reaped(self, tmp_path, apply_mode):
+        """THE IRREVERSIBLE PATH — an unidentifiable subject must stay pending.
+
+        Ids are per-tag (``PRIMARY KEY (tag, id)`` with a per-tag
+        ``id_counters`` high-water mark in
+        ``backends/sqlite_task_backend.py``), so the same id in two tags is
+        the norm.  A record carries no tag, so subject 777 ``blocked`` in
+        ``master`` alongside an unrelated 777 ``done`` in ``feature-x`` cannot
+        be resolved — and a last-tag-wins merge would close the live record.
+        """
+        queue = EscalationQueue(tmp_path)
+        _submit(queue, '777')
+        taskmaster = _make_taskmaster({
+            DARK_ROOT: {
+                'master': {'777': 'blocked'},
+                'feature-x': {'777': 'done'},
+            },
+        })
+
+        report = await _mod.run(
+            queue_dir=tmp_path, project_roots=PROJECT_ROOTS,
+            apply=apply_mode, taskmaster=taskmaster,
+        )
+
+        assert report['ambiguous'] == 1
+        assert report['reapable_ids'] == []
+        assert report['terminal'] == 0
+        assert report['reaped'] == 0
+        assert {e.id for e in EscalationQueue(tmp_path).get_pending()} == {'esc-777-1'}
+
+    @pytest.mark.asyncio
     async def test_apply_closes_exactly_the_reapable_records(
         self, seeded_queue, taskmaster,
     ):
@@ -361,7 +393,7 @@ class TestDeriveOrphanedReconEscalations:
 
         for key in (
             'dry_run', 'queue_dir', 'scanned', 'terminal', 'missing', 'live',
-            'unresolvable', 'errors', 'reaped', 'reapable_ids',
+            'ambiguous', 'unresolvable', 'errors', 'reaped', 'reapable_ids',
         ):
             assert key in report, f'{key} must be present in both modes'
         assert report['queue_dir'] == str(queue_dir)
