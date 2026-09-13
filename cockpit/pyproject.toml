@@ -62,5 +62,28 @@ docstring-code-format = true
 markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
 ]
-addopts = "-m 'not smoke'"
+# PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy
+# fused-memory/pyproject.toml verbatim (`-n auto --dist loadgroup -m 'not
+# integration'` there), so every parallel module in this workspace reads as one
+# family with only the marker differing.
+# `-n auto`, never a literal `-n 8`: pytest-xdist resolves `auto` through
+# PYTEST_XDIST_AUTO_NUM_WORKERS, which dark-factory-orchestrator.yaml pins in
+# its `verify_env` block and verify._resolve_verify_env injects for EVERY verify
+# role. This module declares no verify_env of its own, so nothing shadows that
+# pin — one knob governs every parallel module and the A/B cut of the worker
+# count moves them together.
+# `--dist loadgroup` travels with `-n` rather than leaving xdist at its default
+# `load`: it is what makes @pytest.mark.xdist_group a guarantee rather than a
+# hint. orchestrator's `--max-worker-restart=0` is deliberately NOT copied; see
+# tests/scripts/test_merge_gate_parallelism_config.py::
+# test_parallel_member_addopts_do_not_copy_max_worker_restart.
+# THE `-m` TERM SURVIVES, and stays ONE flat `not X`: smoke tests drive real
+# X11/tmux against the live host DISPLAY and are opt-in only
+# (tests/test_smoke_marker_config.py proves that behaviourally), `-m` is a
+# single argparse option so a second one would silently replace this, and
+# tests/scripts/test_pytest_workspace_collection.py::_FLAT_DESELECT_RE rejects
+# any richer expression rather than approximating it.
+# MEASURED at `-n 8 --dist loadgroup` on the 5408 tree: 346 passed in 18.76s,
+# exit 0.
+addopts = "-n auto --dist loadgroup -m 'not smoke'"
 asyncio_mode = "auto"

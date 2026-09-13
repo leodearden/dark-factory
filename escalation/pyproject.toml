@@ -57,10 +57,42 @@ orchestrator = { workspace = true }
 # reds a SHIFTING VICTIM rather than the starved test. 300 is INTERIM and
 # judgement-picked, not measured.
 # signal method is load-bearing: thread method can't interrupt a blocking
-# syscall in the main thread. escalation runs no pytest-xdist so signal is
-# always safe here. UNCHANGED by the 60→300 raise, deliberately.
+# syscall in the main thread. UNCHANGED by the 60→300 raise, deliberately, and
+# UNCHANGED by task 5408's addopts below.
+# THE PREMISE THIS USED TO GIVE IS CORRECTED, not softened. It read "escalation
+# runs no pytest-xdist so signal is always safe here", and that was false twice
+# over. It was ALREADY false before 5408: verify.py injects
+# `-n <verify_admission_pytest_n>` for roles task/background, so this suite has
+# been running 8-way on task-role verify all along, with signal, staying green.
+# 5408's `-n auto --dist loadgroup` then made it false on its face.
+# WHAT SURVIVES IS A MEASUREMENT: at `-n 8 --dist loadgroup` on the 5408 tree
+# this suite ran 1721 passed / 2 xfailed in 32.33s, exit 0, signal unchanged.
+# NOT flipped to `thread`, deliberately. fused-memory/pyproject.toml records the
+# opposite experience ("signal proved unreliable under pytest-xdist workers in
+# practice"), and the same block explains why the flip is a real trade rather
+# than a free upgrade: pytest-timeout's thread handler ends in `os._exit(1)`,
+# killing the whole xdist worker, and near end-of-suite the controller can
+# deadlock waiting for a completion signal that never arrives. Changing it on no
+# measurement, inside a config-only task, would be unmeasured scope creep; the
+# open question is filed as follow-up instead.
 timeout = 300
 timeout_method = "signal"
+
+# PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy
+# fused-memory/pyproject.toml verbatim, so every parallel module in this
+# workspace reads as one family rather than as independently-invented variants.
+# `-n auto`, never a literal `-n 8`: pytest-xdist resolves `auto` through
+# PYTEST_XDIST_AUTO_NUM_WORKERS, which dark-factory-orchestrator.yaml pins in
+# its `verify_env` block and verify._resolve_verify_env injects for EVERY verify
+# role. This module declares no verify_env of its own, so nothing shadows that
+# pin — one knob governs every parallel module and the A/B cut of the worker
+# count moves them together.
+# `--dist loadgroup` travels with `-n` rather than leaving xdist at its default
+# `load`: it is what makes @pytest.mark.xdist_group a guarantee rather than a
+# hint. orchestrator's `--max-worker-restart=0` is deliberately NOT copied; see
+# tests/scripts/test_merge_gate_parallelism_config.py::
+# test_parallel_member_addopts_do_not_copy_max_worker_restart.
+addopts = "-n auto --dist loadgroup"
 
 [tool.pyright]
 include = ["src", "tests"]

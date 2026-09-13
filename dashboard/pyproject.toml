@@ -60,6 +60,24 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy
+# fused-memory/pyproject.toml verbatim, so every parallel module in this
+# workspace reads as one family rather than as independently-invented variants.
+# `-n auto`, never a literal `-n 8`: pytest-xdist resolves `auto` through
+# PYTEST_XDIST_AUTO_NUM_WORKERS, which dark-factory-orchestrator.yaml pins in
+# its `verify_env` block and verify._resolve_verify_env injects for EVERY
+# verify role. This module declares no verify_env of its own, so nothing
+# shadows that pin — one knob governs every parallel module and the A/B cut of
+# the worker count moves them together. A numeral here would opt this module
+# out of it.
+# `--dist loadgroup` travels with `-n` rather than leaving xdist at its default
+# `load`: it is what makes @pytest.mark.xdist_group a guarantee rather than a
+# hint, which is how a suite keeps its order-sensitive and resource-sharing
+# tests honest once it has workers.
+# orchestrator's `--max-worker-restart=0` is deliberately NOT copied across;
+# see tests/scripts/test_merge_gate_parallelism_config.py::
+# test_parallel_member_addopts_do_not_copy_max_worker_restart for why.
+addopts = "-n auto --dist loadgroup"
 # Default per-test wall-clock cap (pytest-timeout, already a dev dependency).
 # Task 3431 / esc-3216-2: observed one run of
 # tests/test_app.py::test_performance_returns_performance spend 178.5s in
@@ -80,9 +98,27 @@ asyncio_mode = "auto"
 # SHIFTING VICTIM rather than the starved test). 300 is INTERIM and
 # judgement-picked, not measured.
 timeout = 300
-# dashboard runs no pytest-xdist, so signal is safe and is the only method
-# that interrupts a blocking main-thread wait (thread mode can't — mirrors
-# escalation/pyproject.toml). Residual risk: signal only raises in the main
+# signal is KEPT under xdist (task 5408), and the premise this comment used to
+# give for it — "dashboard runs no pytest-xdist, so signal is safe" — is
+# corrected rather than softened, because it is false twice over. It was
+# ALREADY false before 5408: verify.py injects
+# `-n <verify_admission_pytest_n>` for roles task/background, so this suite has
+# been running 8-way on task-role verify all along, with signal, staying green.
+# 5408's `-n auto --dist loadgroup` above then made it false on its face.
+# WHAT SURVIVES IS A MEASUREMENT, not the premise: at `-n 8 --dist loadgroup`
+# on the 5408 tree this suite ran 2299 passed / 1 xfailed in 75.02s, exit 0,
+# with signal unchanged. signal remains the only method that interrupts a
+# blocking main-thread wait (thread mode can't — mirrors
+# escalation/pyproject.toml).
+# NOT flipped to `thread`, deliberately. fused-memory/pyproject.toml records the
+# opposite experience ("signal proved unreliable under pytest-xdist workers in
+# practice"), and that same block explains why the flip is a real trade rather
+# than a free upgrade: pytest-timeout's thread handler ends in `os._exit(1)`,
+# which kills the whole xdist worker, and near end-of-suite the controller can
+# deadlock waiting for a completion signal that never arrives. Changing it on no
+# measurement, inside a config-only task, would be unmeasured scope creep; the
+# open question is filed as follow-up instead.
+# Residual risk: signal only raises in the main
 # thread, and aiosqlite's connection worker is a non-daemon thread
 # (aiosqlite/core.py: `Thread(target=_connection_worker_thread, ...)`), so a
 # sufficiently wedged worker can still block interpreter shutdown even after
