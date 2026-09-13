@@ -44,6 +44,7 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -133,6 +134,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help='where the markdown report is written (default: %(default)s)')
     ap.add_argument('--no-report', action='store_true',
                     help='print only; write no report file')
+    ap.add_argument('--uv-bin', type=Path, default=DEFAULT_UV_BIN,
+                    help='uv binary used to ask the live model for its code '
+                         'defaults (default: %(default)s)')
     ap.add_argument('--commit', action='store_true',
                     help='git commit --only the written report (for the scheduled run)')
     args = ap.parse_args(argv)
@@ -330,6 +334,104 @@ def arm_thresholds(block: dict | None) -> dict[str, float]:
     }
 
 
+_DEFAULTS_DUMP = (
+    'import json;'
+    ' from orchestrator.config import PsiAdmissionConfig as C;'
+    ' print(json.dumps({k: f.default for k, f in C.model_fields.items()},'
+    ' default=str))'
+)
+DEFAULT_UV_BIN = Path('/home/leo/.local/bin/uv')
+_DEFAULTS_TIMEOUT_SECONDS = 120
+
+
+def default_defaults_command(uv_bin: Path) -> list[str]:
+    """The command that asks the live model for its own defaults.
+
+    `--no-sync` is LOAD-BEARING, not cosmetic: a plain `uv run --project
+    shared` was measured REMOVING orchestrator from the shared root venv, and
+    this script may run while orchestrators are live. `--frozen` additionally
+    pins the lockfile.
+
+    The defaults are FETCHED rather than imported or ast-parsed. Imported is
+    impossible — at gate time this runs under the system python3, which has no
+    `orchestrator`. An ast walk over orchestrator/config.py would be an ad-hoc
+    parser of source (heuristic 12) that breaks silently on a `Field()`
+    respelling. So the script asks the authoritative object, via the one tool
+    that IS on the inherited PATH.
+    """
+    return [
+        str(uv_bin), 'run', '--frozen', '--no-sync',
+        '--project', 'orchestrator', 'python', '-c', _DEFAULTS_DUMP,
+    ]
+
+
+def fetch_code_defaults(
+    *, command: list[str], cwd: Path
+) -> tuple[dict | None, list[str]]:
+    """Run *command* and parse its JSON stdout as the shipped code defaults.
+
+    Any failure — the binary absent, a non-zero exit, unparseable output, a
+    timeout — returns ``(None, [code_defaults_unavailable: <reason>])``. The
+    reason is carried so an operator can tell "uv is not installed" from "the
+    model moved"; nothing is ever assumed in place of a real answer.
+    """
+    try:
+        proc = subprocess.run(
+            command, cwd=str(cwd), capture_output=True, text=True,
+            timeout=_DEFAULTS_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f'code_defaults_unavailable: {exc}']
+    if proc.returncode != 0:
+        return None, [
+            f'code_defaults_unavailable: {command[0]} exited {proc.returncode} '
+            f'({proc.stderr.strip()[:200]})'
+        ]
+    try:
+        parsed = json.loads(proc.stdout)
+    except ValueError as exc:
+        return None, [f'code_defaults_unavailable: unparseable output ({exc})']
+    if not isinstance(parsed, dict):
+        return None, ['code_defaults_unavailable: output is not a JSON object']
+    return parsed, []
+
+
+def compare_to_code_defaults(block: dict | None, defaults: dict | None) -> dict | None:
+    """Which of *block*'s arm leaves merely restate the shipped code default.
+
+    PRD §6.2 writes three of the memory/io thresholds at values that are
+    ALREADY the shipped code defaults, giving one fact three homes with no
+    reconciler (INV-9). This is the report line that says so. It stays a
+    REPORT line: the script never edits either yaml and never removes a leaf.
+
+    The numbers themselves are deliberately not written here, not even as
+    prose: a docstring copy goes stale exactly as silently as a code copy,
+    and ``test_the_script_never_states_an_arms_own_default_value`` scans this
+    file's lines for precisely that.
+
+    ``defaults`` is required and has no fallback — a built-in copy here would
+    make this script the fourth home of the very fact the check exists to
+    police, and would go on reporting against its own stale numbers long after
+    the model changed.
+
+    A leaf the defaults mapping does not know is ``unknown_to_schema``, not a
+    silent drop: measured today, PsiAdmissionConfig has no ``runqueue_ratio``
+    field (β unlanded), and "this arm is not in the model yet" is a distinct
+    fact from both "restates the default" and "differs from it".
+    """
+    if block is None or defaults is None:
+        return None
+    restates, unknown = [], []
+    for leaf, value in block.items():
+        if leaf not in ARM_METRIC_SELECTORS:
+            continue
+        if leaf not in defaults:
+            unknown.append(leaf)
+        elif value == defaults[leaf]:
+            restates.append(leaf)
+    return {'restates_default': sorted(restates), 'unknown_to_schema': sorted(unknown)}
+
+
 def compare_blocks(local: dict | None, peer: dict | None) -> dict | None:
     """Compare two parsed ``psi_admission`` mappings; ``None`` if either is absent.
 
@@ -423,6 +525,13 @@ def main(argv: list[str] | None = None) -> int:
     degradations += local_degradations + peer_degradations
     configured = arm_thresholds(local_block)
     drift = compare_blocks(local_block, peer_block)
+    code_defaults, defaults_degradations = fetch_code_defaults(
+        command=default_defaults_command(args.uv_bin), cwd=args.config.parent)
+    degradations += defaults_degradations
+    restatements = {
+        'local': compare_to_code_defaults(local_block, code_defaults),
+        'peer': compare_to_code_defaults(peer_block, code_defaults),
+    }
 
     lines = [
         f'# Load-threshold calibration — cut {now.isoformat(timespec="minutes")}',
@@ -488,6 +597,21 @@ def main(argv: list[str] | None = None) -> int:
         for leaf in drift['peer_only']:
             lines.append(f'- `{leaf}`: set by the peer only')
 
+    lines += ['', '## Leaves that merely restate the shipped code default', '',
+              'PRD §6.2 writes three values that are already the code defaults, so '
+              'one fact gains three homes with no reconciler (INV-9). This section '
+              'names them; it never edits either file.', '']
+    for side, verdict in restatements.items():
+        if verdict is None:
+            lines.append(f'- **{side}**: not compared (see degradations).')
+            continue
+        lines.append(
+            f"- **{side}**: restates the default: "
+            f"{', '.join(f'`{leaf}`' for leaf in verdict['restates_default']) or 'none'}"
+            f"; not in the model's schema: "
+            f"{', '.join(f'`{leaf}`' for leaf in verdict['unknown_to_schema']) or 'none'}"
+        )
+
     lines += ['', '## Degradations', '']
     lines += [f'- {d}' for d in degradations] or ['_None._']
 
@@ -506,6 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         'holds': holds,
         'configured': configured,
         'drift': drift,
+        'restates_code_default': restatements,
         'degradations': [d.split(':', 1)[0] for d in degradations],
         'degradation_details': degradations,
     }))
