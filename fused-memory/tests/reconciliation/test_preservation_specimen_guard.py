@@ -340,6 +340,18 @@ LIVE_GRAPHITI_ENTITY = {
     ],
 }
 
+#: ``get_entity``'s degraded-fallback superset dict, verbatim from
+#: ``services/memory_service.py::_graphiti_degraded_entity_result``.  A
+#: rate-limit/quota error does NOT propagate out of ``get_entity`` — it is
+#: absorbed and THIS is returned instead, whose empty ``nodes``/``edges`` are
+#: byte-identical to a genuine "this task has no preservation fact".
+LIVE_DEGRADED_ENTITY_RESULT = {
+    'nodes': [],
+    'edges': [],
+    'degraded': True,
+    'failed_stores': ['graphiti'],
+}
+
 PROJECT = 'dark_factory'
 
 GUARD_LOGGER = 'fused_memory.reconciliation.preservation_specimen_guard'
@@ -978,6 +990,165 @@ class TestDegradedCorroborationReads:
         assert result.kept_flags == [broken]
         assert result.suppressed_by_task == {'3105': 1}
         assert result.unresolved_task_ids == ('4102',)
+
+    # ── The third outcome: a channel that degrades by RETURNING ──────────────
+    #
+    # ``try``/``except`` is not full coverage of the Graphiti channel.  On a
+    # rate-limit/quota error ``get_entity`` does not raise: ``_degrade_or_reraise``
+    # absorbs it and returns a superset dict with empty ``nodes``/``edges``.
+    # That reads as a clean "no preservation fact for this task" — the exact
+    # silent fail-soft INV-11 forbids, arriving through the success path.
+
+    @pytest.mark.asyncio
+    async def test_degraded_entity_result_is_unresolved_not_a_clean_negative(self):
+        """(a) The degraded superset dict leaves the verdict UNRESOLVED."""
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(return_value=LIVE_DEGRADED_ENTITY_RESULT)
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert result.unresolved_task_ids == ('3105',)
+
+    @pytest.mark.asyncio
+    async def test_degraded_entity_result_logs_a_warning_naming_the_channel(self):
+        """(b) Audible in the log stream, at parity with a raising channel."""
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(return_value=LIVE_DEGRADED_ENTITY_RESULT)
+
+        with caplog_at_warning() as records:
+            await filter_preservation_specimen_flags(
+                memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+            )
+
+        blob = '\n'.join(records)
+        assert '3105' in blob
+        assert PROJECT in blob
+        assert 'graphiti' in blob.lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'entity',
+        [
+            {'nodes': [], 'edges': [], 'degraded': False, 'failed_stores': []},
+            {'nodes': [], 'edges': []},
+        ],
+        ids=['falsy-degradation-keys', 'no-degradation-keys'],
+    )
+    async def test_a_genuine_negative_is_never_reported_as_degraded(self, entity):
+        """(c) No false positives: a clean cycle must read as a clean cycle.
+
+        Over-reporting degradation is not free — ``unresolved_task_ids`` drives
+        an escalation, so a predicate that fired on every negative would turn
+        the disclosure channel into noise and get it ignored.
+        """
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(return_value=entity)
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.unresolved_task_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_failed_stores_alone_is_degraded(self):
+        """(d) Either marker alone suffices — redundant enforcement (heuristic 10).
+
+        The two keys are written together today, so requiring both would make
+        the guard depend on a coincidence of the producer rather than on what
+        either key MEANS.
+        """
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(
+            return_value={'nodes': [], 'edges': [], 'failed_stores': ['graphiti']},
+        )
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.unresolved_task_ids == ('3105',)
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_result_is_not_evidence_in_the_suppress_direction(self):
+        """(e) The screen runs BEFORE the citation matcher, not after it.
+
+        A degraded read is not evidence in EITHER direction, so content that
+        arrives alongside the degradation markers cannot buy a drop — which is
+        what forces the pre-screen rather than a post-hoc check of an
+        already-computed citation.
+        """
+        memory_service = _make_memory_service()
+        memory_service.get_entity = AsyncMock(
+            return_value={
+                'nodes': [],
+                'edges': [
+                    {'uuid': 'a8fd36a8-46db-4ca8-a21c-554c38a918ee',
+                     'fact': LIVE_GRAPHITI_EDGE_FACT},
+                ],
+                'degraded': True,
+                'failed_stores': ['graphiti'],
+            },
+        )
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+        assert result.unresolved_task_ids == ('3105',)
+
+    @pytest.mark.asyncio
+    async def test_a_mem0_citation_lands_before_graphiti_can_degrade(self):
+        """(f) A resolved verdict on channel 1 never consults channel 2."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        memory_service.get_entity = AsyncMock(return_value=LIVE_DEGRADED_ENTITY_RESULT)
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert result.kept_flags == []
+        assert result.suppressed_by_task == {'3105': 1}
+        assert result.unresolved_task_ids == ()
+        assert memory_service.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_raising_mem0_plus_degraded_graphiti_discloses_once(self):
+        """(g) Two degraded channels are still ONE unresolved task."""
+        memory_service = _make_memory_service(mem0_error=TimeoutError('down'))
+        memory_service.get_entity = AsyncMock(return_value=LIVE_DEGRADED_ENTITY_RESULT)
+        flag = _stranded_flag()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.unresolved_task_ids == ('3105',)
+
+    @pytest.mark.parametrize(
+        'entity', [None, 'not a mapping', {}, {'nodes': None, 'edges': None}],
+    )
+    def test_is_degraded_entity_result_is_total_over_malformed_input(self, entity):
+        """The predicate reads a raw backend result, so it must not raise.
+
+        Same corpus as ``test_total_over_malformed_graphiti_results``, asserted
+        one level down: those cases must keep reading as genuine negatives.
+        """
+        assert preservation_specimen_guard._is_degraded_entity_result(entity) is False
 
 
 def _suppression_result(count=None, *, extra=None, unresolved=()):
