@@ -7526,6 +7526,62 @@ class TestGetStatusScoping:
         )
 
 
+class TestGetStatusSurfacesDeadByOperation:
+    """`get_status()['queue']` must carry the per-operation dead breakdown.
+
+    This is the health-probe half of the dead-letter signal: the escalation
+    pushes, this confirms. `get_status` assigns `get_stats(group_id=project_id)`
+    straight through, so a REAL queue is used here rather than the fixture's
+    mocked `get_stats` — mocking the return value would assert only that a dict
+    survives the assignment, which was already true before this key existed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queue_section_carries_dead_by_operation(self, service, tmp_path):
+        """A dead `add_episode` shows up attributed, scoped to the project."""
+        from _fm_helpers import poll_until
+
+        from fused_memory.services.durable_queue import DurableWriteQueue
+
+        async def always_fail(op, payload):
+            raise RuntimeError('forced fail')
+
+        queue = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await queue.initialize()
+        service.durable_queue = queue
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        try:
+            await queue.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'ep', 'group_id': 'proj1', 'name': 'ep'},
+            )
+
+            async def _has_a_dead_row():
+                stats = await queue.get_stats(group_id='proj1')
+                return stats['counts'].get('dead', 0) >= 1
+
+            await poll_until(_has_a_dead_row, timeout=5.0, interval=0.05)
+
+            result = await service.get_status(project_id='proj1')
+
+            assert result['queue']['dead_by_operation'] == {'add_episode': 1}, (
+                'get_status must pass the per-operation breakdown through; got '
+                f'{result["queue"].get("dead_by_operation")!r}'
+            )
+        finally:
+            await queue.close()
+
+
 # ---------------------------------------------------------------------------
 # Step 9: TRACK B.2 restore hook RED tests
 # ---------------------------------------------------------------------------

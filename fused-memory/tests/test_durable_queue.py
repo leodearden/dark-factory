@@ -2271,3 +2271,164 @@ class TestDeadLetterHook:
         assert [r['status'] for r in rows] == ['dead', 'dead'], (
             'a failing alarm must not disturb the committed terminal state'
         )
+
+
+class TestDeadByOperation:
+    """`get_stats()['dead_by_operation']` — the PULL surface for option (b).
+
+    The `durable_write_dead_letter` escalation is the PUSH alarm; this counter
+    is its health-probe confirmation, not a substitute for it. `counts['dead']`
+    alone is aggregate: it says writes were permanently abandoned but not WHICH
+    operation is dying, so an operator cannot separate a NodeNotFoundError
+    storm on `add_episode` from an unrelated failure of `add_memory_graphiti`.
+
+    Both probes the task names — `MemoryService.get_status` and the
+    `get_queue_stats` MCP tool — assign this dict straight through, so the
+    attribution reaches both of them from here.
+    """
+
+    @staticmethod
+    def _failing_queue(tmp_path):
+        async def always_fail(op, payload):
+            raise RuntimeError('forced fail')
+
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_attributes_deaths_to_the_operation(self, tmp_path):
+        """Each dead row is counted under its own operation name."""
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            for i in range(2):
+                await q.enqueue(
+                    group_id='proj_a', operation='add_episode',
+                    payload={'content': f'ep{i}', 'group_id': 'proj_a', 'name': f'ep{i}'},
+                )
+            await q.enqueue(
+                group_id='proj_a', operation='add_memory_graphiti',
+                payload={'content': 'mem', 'group_id': 'proj_a'},
+            )
+            await _poll_until_dead(q, expected_dead=3)
+
+            stats = await q.get_stats()
+
+            assert stats['dead_by_operation'] == {
+                'add_episode': 2,
+                'add_memory_graphiti': 1,
+            }, (
+                'dead_by_operation must attribute each death to its operation; '
+                f'got {stats.get("dead_by_operation")!r}'
+            )
+            # The aggregate stays the sum, so the two surfaces cannot disagree.
+            assert stats['counts'].get('dead', 0) == sum(
+                stats['dead_by_operation'].values()
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_counts_only_dead_rows(self, tmp_path):
+        """An operation that COMPLETED must not appear — this counts deaths,
+        not traffic. A probe reading it as throughput would page on success."""
+        async def fail_the_marked(op, payload):
+            if payload.get('fail'):
+                raise RuntimeError('nope')
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=fail_the_marked,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj_a', operation='add_episode',
+                payload={'content': 'good', 'group_id': 'proj_a', 'name': 'good'},
+            )
+            await q.enqueue(
+                group_id='proj_a', operation='add_memory_graphiti',
+                payload={'content': 'bad', 'group_id': 'proj_a', 'fail': True},
+            )
+            await _poll_until_dead(q, expected_dead=1)
+
+            stats = await q.get_stats()
+
+            assert stats['dead_by_operation'] == {'add_memory_graphiti': 1}, (
+                'only status=dead rows may be counted; the completed '
+                f'add_episode must be absent. Got {stats.get("dead_by_operation")!r}'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_is_empty_mapping_never_absent(self, tmp_path):
+        """With no deaths the key is present and `{}` — never missing.
+
+        A probe must never have to distinguish "no deaths" from "an older
+        server that does not report this", which is exactly the ambiguity that
+        let 28 permanently-failed writes read as healthy.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            stats = await q.get_stats()
+            assert 'dead_by_operation' in stats, (
+                f'key must always be present; got keys {sorted(stats)}'
+            )
+            assert stats['dead_by_operation'] == {}
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_scoped_by_group_id(self, tmp_path):
+        """`group_id=` scopes the breakdown, matching how `counts` and
+        `oldest_pending_age_seconds` are already scoped — otherwise a
+        per-project probe would report another project's deaths."""
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj_a', operation='add_episode',
+                payload={'content': 'a0', 'group_id': 'proj_a', 'name': 'a0'},
+            )
+            for i in range(2):
+                await q.enqueue(
+                    group_id='proj_b', operation='add_memory_graphiti',
+                    payload={'content': f'b{i}', 'group_id': 'proj_b'},
+                )
+            await _poll_until_dead(q, expected_dead=3)
+
+            stats_a = await q.get_stats(group_id='proj_a')
+            stats_b = await q.get_stats(group_id='proj_b')
+            stats_c = await q.get_stats(group_id='proj_c')
+
+            assert stats_a['dead_by_operation'] == {'add_episode': 1}
+            assert stats_b['dead_by_operation'] == {'add_memory_graphiti': 2}
+            assert stats_c['dead_by_operation'] == {}, (
+                'a project with no rows at all reports an empty mapping, not '
+                f'the global breakdown. Got {stats_c.get("dead_by_operation")!r}'
+            )
+        finally:
+            await q.close()
