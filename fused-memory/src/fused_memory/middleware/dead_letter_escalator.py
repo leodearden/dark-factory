@@ -91,6 +91,29 @@ _FINDING_CATEGORY = 'queue_dead_letter'
 # content it records, so the two records truncate the same way.
 _PREVIEW_CHARS = 200
 
+# What the CALLER was synchronously told, keyed on the durable-queue operation
+# name. This is what makes the record say not merely "a write died" but "a
+# caller acted on a success that will never be true" — the difference between
+# an alarm an operator can triage and one they cannot.
+_REPORTED_TO_CALLER = {
+    'add_episode': (
+        "add_episode returned status='queued' and an episode_id, so the caller "
+        'was told the write had been durably accepted and would land'
+    ),
+}
+
+_REPORTED_TO_CALLER_DEFAULT = (
+    'no synchronous success was reported to any caller for this operation'
+)
+
+
+def _reported_to_caller(operation: str, caller_reference: str | None) -> str:
+    """The one-line statement of what the caller was promised."""
+    claim = _REPORTED_TO_CALLER.get(operation, _REPORTED_TO_CALLER_DEFAULT)
+    if caller_reference:
+        return f'{claim} (id handed to the caller: {caller_reference})'
+    return claim
+
 
 def _error_class(error: str | None) -> str:
     """The exception CLASS name out of a queue-reported error string.
@@ -127,6 +150,7 @@ def emit_dead_letter_escalation(
     post_execute,
     content_preview,
     write_op_id,
+    caller_reference=None,
 ):
     """File (or fold into) a ``durable_write_dead_letter`` escalation.
 
@@ -156,6 +180,9 @@ def emit_dead_letter_escalation(
             the lost content once the queue row is swept.
         write_op_id: The ``write_ops`` join key, or None for an operation that
             carries none (``mem0_classify_and_add``, ``replay_from_store``).
+        caller_reference: The id the caller was HANDED and is still holding
+            (``add_episode``'s correlation id), so an operator can tie this
+            alarm back to the call that was told the write had succeeded.
 
     Returns the escalation id — freshly filed, or the pending parent's id when
     this death folded into it — or ``None`` when nothing was filed (the
@@ -228,6 +255,7 @@ def emit_dead_letter_escalation(
         f'post_execute={post_execute}',
         f'error={error!r}',
         f'content_preview={preview!r}',
+        f'reported_to_caller={_reported_to_caller(operation, caller_reference)!r}',
         '',
         f'A durably-queued {operation!r} write for project {project_id!r} '
         f'exhausted its attempts and was PERMANENTLY ABANDONED after '
