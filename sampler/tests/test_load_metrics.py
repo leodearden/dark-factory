@@ -933,3 +933,94 @@ class TestCollectLoadMetricsOwnPressure:
             'sampler.metrics must not contain a pressure-line pattern of its own; '
             'shared.psi.parse_pressure_file is the single parser (INV-5).'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-7: PRD §6.4 / boundary row 11 — sampler-to-gate vocabulary parity
+# ---------------------------------------------------------------------------
+
+
+class TestArmMetricStemParity:
+    """Every gate ARM has a recorded sampler stem, and every stem is emitted.
+
+    The gate decides on arms; the sampler records metrics; ε1/ε2 calibrate one
+    against the other. If those two vocabularies drift the calibration
+    silently measures the wrong thing, so the correspondence gets an explicit
+    home (sampler.metrics.ARM_METRIC_STEMS) and this test.
+
+    The arm side is read from the LIVE artifact, shared.psi._ARMS, not from a
+    transcribed list (INV-10) — a private name deliberately, because it IS the
+    saturation truth table and a copy of it here would be the drift this test
+    exists to catch.
+    """
+
+    @staticmethod
+    def _arm_fields():
+        from shared.psi import _ARMS
+
+        return {arm.field for arm in _ARMS}
+
+    def test_every_arm_has_a_stem(self):
+        from sampler.metrics import ARM_METRIC_STEMS
+
+        missing = self._arm_fields() - set(ARM_METRIC_STEMS)
+        assert not missing, (
+            f'shared.psi._ARMS has arms the sampler records no metric for: {missing}. '
+            'Add them to sampler.metrics.ARM_METRIC_STEMS and emit them, or the '
+            'gate will hold on a signal the calibration corpus cannot see.'
+        )
+
+    def test_no_stem_is_orphaned(self):
+        from sampler.metrics import ARM_METRIC_STEMS
+
+        orphans = set(ARM_METRIC_STEMS) - self._arm_fields()
+        assert not orphans, (
+            f'ARM_METRIC_STEMS names keys that are not arms of shared.psi._ARMS: '
+            f'{orphans}. The mapping must not grow a dead key.'
+        )
+
+    def test_psi_stems_are_actually_emitted_by_collect_psi(self):
+        from sampler.metrics import ARM_METRIC_STEMS, collect_psi
+
+        mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+        emitted = set(collect_psi(read=lambda name: mapping[name]))
+
+        psi_stems = {
+            stem for stem in ARM_METRIC_STEMS.values() if stem.startswith('psi_')
+        }
+        assert psi_stems, 'expected the four host-PSI arms to map to psi_* stems'
+        assert psi_stems <= emitted, f'psi stems not emitted: {psi_stems - emitted}'
+
+    def test_runqueue_stem_is_emitted_as_an_exact_key(self, tmp_path):
+        from sampler.metrics import ARM_METRIC_STEMS
+
+        tree = live_topology(tmp_path)
+        emitted = set(_collect(tree))
+
+        assert ARM_METRIC_STEMS['runqueue_ratio'] in emitted
+
+    def test_own_cpu_stem_is_emitted_as_a_colon_prefix(self, tmp_path):
+        from sampler.metrics import ARM_METRIC_STEMS
+
+        tree = live_topology(tmp_path)
+        emitted = set(_collect(tree))
+
+        stem = ARM_METRIC_STEMS['own_cpu_some_avg10']
+        assert any(key.startswith(f'{stem}:') for key in emitted), (
+            f'no emitted key carries the stem {stem!r}; emitted: {sorted(emitted)}'
+        )
+
+    def test_stems_are_not_mechanically_derivable_from_arm_names(self):
+        """Why the mapping needs an explicit home rather than a naming rule.
+
+        Two of the six arms break any rule you could write: the four host arms
+        gain a ``psi_`` prefix, and ``own_cpu_some_avg10`` maps to
+        ``own_cpu_some10`` — ``avg10`` against ``10``.
+        """
+        from sampler.metrics import ARM_METRIC_STEMS
+
+        assert ARM_METRIC_STEMS['own_cpu_some_avg10'] != 'own_cpu_some_avg10'
+        assert ARM_METRIC_STEMS['cpu_some_avg10'] != 'cpu_some_avg10'
+        # ...and one arm where the identity rule DOES hold, so the mapping is
+        # not merely a systematic rewrite either.
+        assert ARM_METRIC_STEMS['runqueue_ratio'] == 'runqueue_ratio'
