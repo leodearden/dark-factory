@@ -13446,3 +13446,56 @@ class TestListChildIds:
         service.mem0.delete.assert_not_awaited()
         journal.log_write_op.assert_not_awaited()
         buffer.push.assert_not_awaited()
+
+
+class TestQueueGroupIdToProjectId:
+    """`_project_id_from_queue_group_id`: the queue's group_id -> a project_id.
+
+    The dead-letter alarm needs a `project_root`, which resolves from a
+    `project_id` through the injected `_known_projects` map. The item PAYLOAD
+    cannot supply one uniformly — `add_episode`'s carries `project_id`,
+    `add_memory_graphiti`'s does not — but `group_id` is present on EVERY queue
+    item and is derivable: `Scope.graphiti_group_id` IS the project_id, and
+    `_dual_write_callback` writes `f'mem0_{project_id}'`.
+    """
+
+    def test_a_graphiti_group_id_is_the_project_id(self, service):
+        service.set_known_projects({'dark_factory': '/root/df'})
+        assert service._project_id_from_queue_group_id('dark_factory') == 'dark_factory'
+
+    def test_a_mem0_group_id_has_its_prefix_stripped(self, service):
+        service.set_known_projects({'dark_factory': '/root/df'})
+        assert (
+            service._project_id_from_queue_group_id('mem0_dark_factory')
+            == 'dark_factory'
+        )
+
+    def test_an_exact_registry_match_outranks_the_prefix_strip(self, service):
+        """The load-bearing ambiguity.
+
+        A project literally NAMED `mem0_thing` has a Graphiti group_id of
+        `mem0_thing`, which is indistinguishable by shape from the Mem0 group
+        of a project named `thing`. An exact match against the injected
+        registry is the only evidence that settles it, so it wins.
+        """
+        service.set_known_projects({'mem0_thing': '/root/mem0_thing'})
+        assert service._project_id_from_queue_group_id('mem0_thing') == 'mem0_thing'
+
+    def test_the_prefix_strip_applies_when_only_the_stripped_form_is_known(
+        self, service,
+    ):
+        service.set_known_projects({'thing': '/root/thing'})
+        assert service._project_id_from_queue_group_id('mem0_thing') == 'thing'
+
+    def test_an_unknown_group_id_is_returned_unchanged(self, service):
+        """So the caller reaches its documented unresolvable-root WARNING
+        rather than silently filing into the wrong project."""
+        service.set_known_projects({'thing': '/root/thing'})
+        assert service._project_id_from_queue_group_id('nobody') == 'nobody'
+
+    def test_an_unknown_mem0_group_id_still_strips(self, service):
+        """The map may be empty or stale, and a prefix the codebase itself
+        writes is better evidence than nothing."""
+        service.set_known_projects({})
+        assert service._project_id_from_queue_group_id('mem0_ghost') == 'ghost'
+        assert service._project_id_from_queue_group_id('ghost') == 'ghost'
