@@ -361,12 +361,18 @@ class TestTheRecordIsSelfSufficientForTriage:
         """Bounded to the house 200 chars — the same bound `log_write_op` uses
         for `params={'content': content[:200]}`. An escalation queue an
         operator reads must not grow a full episode body per entry."""
-        content = 'A' * 200 + 'B' * 300
+        # A distinctive tail marker rather than a repeated letter: the fixed
+        # prose below the header block contains ordinary English, so a
+        # single-character negative assertion is satisfied by any word using
+        # it ('ABANDONED' defeats `'B' not in detail`).
+        content = 'A' * 200 + 'TAIL_MARKER_' * 25
         _emit(tmp_path, content_preview=content)
         detail = _filed(tmp_path)[0]['detail']
 
         assert f"content_preview={('A' * 200)!r}" in detail, detail
-        assert 'B' not in detail, 'the tail beyond 200 chars must be dropped'
+        assert 'TAIL_MARKER' not in detail, (
+            'the tail beyond 200 chars must be dropped'
+        )
 
     def test_the_summary_names_the_operation_and_the_project(self, tmp_path):
         """So the queue LIST is legible without opening the record."""
