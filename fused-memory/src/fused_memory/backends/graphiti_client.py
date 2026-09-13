@@ -1487,19 +1487,31 @@ class GraphitiBackend:
             source_description = f'[temporal:{temporal_context}] {source_description}'
         if unverified_claim:
             source_description = f'[unverified_claim] {source_description}'
-        return await asyncio.wait_for(
-            client.add_episode(
-                name=name,
-                episode_body=content,
-                source=source,
-                group_id=group_id,
-                source_description=source_description,
-                reference_time=ref_time,
-                entity_types=entity_types,
-                uuid=uuid,
-            ),
-            timeout=self._write_timeout,
-        )
+        try:
+            return await asyncio.wait_for(
+                client.add_episode(
+                    name=name,
+                    episode_body=content,
+                    source=source,
+                    group_id=group_id,
+                    source_description=source_description,
+                    reference_time=ref_time,
+                    entity_types=entity_types,
+                    uuid=uuid,
+                ),
+                timeout=self._write_timeout,
+            )
+        except GraphitiCoreNodeNotFoundError as exc:
+            if uuid is None:
+                raise
+            raise NodeNotFoundError(
+                f'Episodic node not found in group {group_id}: {uuid} — a '
+                f'non-None uuid= selects graphiti_core\'s LOAD branch '
+                f'(EpisodicNode.get_by_uuid), so it can only name an episode '
+                f'that ALREADY exists, never one to create under that id. To '
+                f'create a NEW episode pass uuid=None and read the minted uuid '
+                f'off result.episode.uuid.'
+            ) from exc
 
     @_canonicalize_group_args
     async def search(
