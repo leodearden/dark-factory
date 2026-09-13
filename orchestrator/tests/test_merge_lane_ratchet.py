@@ -2071,7 +2071,7 @@ class TestCheckCli:
         assert 'lines' in err
 
     def test_check_is_clean_against_the_committed_baseline(
-        self, capsys: pytest.CaptureFixture[str]
+        self, no_private_tree_scan: None, capsys: pytest.CaptureFixture[str]
     ) -> None:
         # No stub and no --baseline: the exact invocation the twenty downstream
         # PRD tasks will run. RED until the baseline is generated and committed.
