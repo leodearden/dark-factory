@@ -87,6 +87,12 @@ def render_decision_detail(
     which is why the pane exists). Question last so a long or multi-line
     question scrolls off the bottom rather than pushing the ids out of view.
     Pure -- no clock read (now is injected), no writes.
+
+    The linked session resolves decision.session_id against *sessions* by
+    session_slug. An UNRESOLVED session_id is the expected shape today, not
+    a bug in this renderer: session_id carries a C8 watcher's lease token
+    rather than a session_slug (task 4237). It is therefore rendered raw and
+    marked unresolved, so an operator can tell a broken link from no link.
     """
     lines = [
         f'decision_id: {decision.id}',
@@ -96,9 +102,20 @@ def render_decision_detail(
         f'severity: {decision.severity}',
         f'state: {decision.state}',
         f'filed: {decision.filed_at} ({format_age(decision.filed_at, now)})',
+        f'session: {_linked_session(decision.session_id, sessions)}',
         f'question: {decision.text}',
     ]
     return '\n'.join(lines)
+
+
+def _linked_session(session_id: str | None, sessions: Sequence[SessionRecord]) -> str:
+    """Render *session_id* as a linked-session value -- see render_decision_detail."""
+    if not session_id:
+        return '(none)'
+    session = next((s for s in sessions if s.session_slug == session_id), None)
+    if session is None:
+        return f'{session_id} (unresolved)'
+    return session.session_slug
 
 
 _NO_SELECTION_PLACEHOLDER = '(no session selected)'
