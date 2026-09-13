@@ -144,10 +144,14 @@ lock_depth: 12
 # ``pytest tests/scripts/ scripts/tests/`` — the same two-directory form,
 # in the same order, as this segment — so a scripts/** diff is gated on
 # BOTH directories by its owning module config, under FULL_SUITE and under
-# merge-role merge_verify_breadth="full" alike. The two are kept spelled
-# identically deliberately, so this path and that one cannot drift into
+# merge-role merge_verify_breadth="full" alike. The two TARGET LISTS are kept
+# spelled identically deliberately, so this path and that one cannot drift into
 # different notions of "the scripts suites"; if you widen one, widen the
-# other. That coupling is GATED, not merely asserted here —
+# other. Their FLAGS are not coupled and never were — that module config carries
+# --tb=short/-q/--import-mode=importlib this segment does not, and task 5408
+# added `-n auto --dist loadgroup` there without parallelising this fallback
+# chain (doing so would need every member in it to declare pytest-xdist, which
+# is the same reason the uniform `-n` cap above stays rejected). That coupling is GATED, not merely asserted here —
 # tests/scripts/test_scripts_module_config.py::
 # test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites reads
 # this segment through the production config loader and fails if either side

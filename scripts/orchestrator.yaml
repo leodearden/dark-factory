@@ -41,7 +41,32 @@
 # per cockpit/tests/test_root_config_smoke_deselection.py::_addopts_without_marker_filter
 # — belongs to _serial_pytest_str and is tracked separately; it would make this
 # flag redundant but not wrong.
-test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300 --import-mode=importlib"
+#
+# Pin -n auto --dist loadgroup HERE and not in the root pyproject.toml's addopts
+# (task 5408). scripts/ has no pyproject.toml of its own, so this command's
+# rootdir — and therefore its inifile — resolves to the REPO ROOT (confirmed: a
+# collect-only of this command reported `5335/5345 tests collected (10
+# deselected)`, and only the root addopts' -m can deselect anything there). That
+# inifile is NOT this leg's private config: it equally governs a bare root-bound
+# `pytest`, a `-c pyproject.toml` run and any argument set spanning two
+# subprojects, including members that declare no pytest-xdist, where pytest
+# would exit 4 with "unrecognized arguments: -n". The single place that defines
+# this verify leg is this test_command, so this is the SPOT. Both halves are
+# gated by tests/scripts/test_merge_gate_parallelism_config.py::
+# test_scripts_leg_carries_the_parallel_flags_on_its_test_command and
+# ::test_root_addopts_never_leaks_the_parallel_flags.
+# `auto` rather than a literal: pytest-xdist resolves it through
+# PYTEST_XDIST_AUTO_NUM_WORKERS, which dark-factory-orchestrator.yaml pins in
+# verify_env and verify._resolve_verify_env injects for every verify role, so one
+# knob governs every parallel module and the A/B cut moves them together.
+# MEASURED on the 5408 tree at `-n 8 --dist loadgroup`: 5333 passed / 2 skipped
+# in 117.71s, exit 0, against the 394-490s serial runs recorded below.
+# shared — the --project this command selects — gains "pytest-xdist>=3.5.0" in
+# its dev group for this, since that is the environment uv resolves the plugin
+# from. shared's OWN addopts stays serial deliberately (it measured FASTER
+# serial); see tests/scripts/test_merge_gate_parallelism_config.py::
+# RULED_SERIAL_MEMBERS.
+test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300 --import-mode=importlib -n auto --dist loadgroup"
 
 # COVERAGE GAP CLOSED (task 3460, opened and recorded by task 3445). Kept as a
 # closure record rather than deleted, because the reason this is a UNION and
@@ -87,11 +112,16 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # every scripts/ production diff, a swap would STOP running those tests for
 # exactly the diffs they cover — trading one coverage gap for another. Coverage
 # must be MONOTONE in the diff, the same principle task 3294 encoded when it
-# moved the floor above the collectable-test branch. The target ORDER and
+# moved the floor above the collectable-test branch. The TARGET order and
 # spelling copy the repo-root fleet chain's trailing segment
 # (`pytest tests/scripts/ scripts/tests/`, task 3384 / commit 1eaaf26ab9)
 # verbatim, so the fallback path and this module config cannot drift into two
-# different notions of "the scripts suites".
+# different notions of "the scripts suites". The FLAGS deliberately DIVERGE and
+# always have — this command carries --tb=short/-q/--import-mode=importlib that
+# the chain does not, and task 5408 added -n auto --dist loadgroup here without
+# parallelising the fleet fallback. What is coupled is which SUITES run, never
+# how they are invoked: the gate below compares the set of target directories
+# and nothing else.
 #
 # BOTH of those claims are GATED, not merely asserted here — a
 # documented-but-ungated invariant is the same defect class this task closed.
