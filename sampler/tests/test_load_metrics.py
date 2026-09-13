@@ -545,3 +545,152 @@ class TestParserRehomedToShared:
             'psi_io_full_avg10',
         }
         assert set(result.keys()) == expected_keys
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-1: discover_pressure_cgroups — the anchored per-leaf search
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverPressureCgroups:
+    """PRD §6.4: one row per df-*.slice present, ELSE per orchestrator-*.service."""
+
+    def test_df_topology_returns_every_leaf_sorted(self, tmp_path):
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = df_topology(tmp_path, 'reify', 'dark_factory')
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        # Named by the LEAF DIRECTORY name, and sorted so the emitted metric
+        # set is stable tick to tick rather than filesystem-order dependent.
+        assert [name for name, _ in found] == [
+            'df-dark_factory.slice',
+            'df-reify.slice',
+        ]
+        for name, pressure_path in found:
+            assert pressure_path.name == 'cpu.pressure'
+            assert pressure_path.parent.name == name
+            assert pressure_path.read_text().startswith('some avg10=')
+
+    def test_live_topology_returns_all_seven_orchestrator_leaves(self, tmp_path):
+        """The ELSE branch of PRD §6.4 — and the branch that is LIVE today.
+
+        Measured on this host 2026-09-13: zero df-*.slice (task 3394 has not
+        landed) and seven orchestrator-*.service leaves.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = live_topology(tmp_path)
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        assert [name for name, _ in found] == sorted(LIVE_ORCHESTRATOR_LEAVES)
+        assert len(found) == 7
+
+    def test_df_wins_outright_when_both_topologies_exist(self, tmp_path):
+        """df-*.slice is preferred, not unioned — the PRD says ELSE, not AND."""
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = build_cgroup_tree(
+            tmp_path,
+            groups={
+                DF_PARENT: {'df-dark_factory.slice': pressure_text(some=1.5)},
+                APP_PARENT: {
+                    leaf: pressure_text(some=2.5) for leaf in LIVE_ORCHESTRATOR_LEAVES
+                },
+            },
+        )
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        assert [name for name, _ in found] == ['df-dark_factory.slice']
+
+    def test_search_is_anchored_at_the_user_manager_segment(self, tmp_path):
+        """A df-*.slice outside the own cgroup's user@NNN subtree is invisible.
+
+        This is what makes the search cost 0.30 ms instead of the 32.7 ms a
+        recursive rglob from the cgroup root measured on this host — and it is
+        also a correctness property: another user's slices are not ours.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = build_cgroup_tree(
+            tmp_path,
+            groups={APP_PARENT: {leaf: pressure_text(some=0.5) for leaf in LIVE_ORCHESTRATOR_LEAVES}},
+            outside={
+                'df-someone_else.slice': pressure_text(some=9.0),
+                'orchestrator-someone-else.service': pressure_text(some=9.0),
+            },
+        )
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        names = [name for name, _ in found]
+        assert 'df-someone_else.slice' not in names
+        assert 'orchestrator-someone-else.service' not in names
+        assert names == sorted(LIVE_ORCHESTRATOR_LEAVES)
+
+    def test_outside_only_tree_finds_nothing_at_all(self, tmp_path):
+        """With every candidate planted outside the anchor, the result is empty.
+
+        Pins that discovery never falls back to walking the whole cgroup root:
+        a search that did would return both planted leaves here.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = build_cgroup_tree(
+            tmp_path,
+            groups={},
+            outside={'df-someone_else.slice': pressure_text(some=9.0)},
+        )
+
+        assert discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        ) == []
+
+    @pytest.mark.parametrize(
+        'own_cgroup_path',
+        [
+            pytest.param('/system.slice/some-daemon.service', id='no-user-manager-segment'),
+            pytest.param('', id='alpha-resolution-failure-value'),
+        ],
+    )
+    def test_unanchorable_own_cgroup_yields_empty_without_raising(
+        self, tmp_path, own_cgroup_path
+    ):
+        """``''`` is α's OwnCgroup('', None) failure value — it must not raise."""
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = live_topology(tmp_path)
+
+        assert discover_pressure_cgroups(
+            own_cgroup_path=own_cgroup_path, cgroup_root=tree.cgroup_root
+        ) == []
+
+    def test_fixture_kernel_path_agrees_with_alphas_resolver(self, tmp_path):
+        """The fixture's 0:: text and its directory layout are the same tree.
+
+        Drives α's own seam (shared.psi.resolve_own_cgroup) over the fixture's
+        proc_cgroup_path and asserts it produces the own_cgroup_path discovery
+        is given, so the two halves of the fixture cannot drift apart.
+        """
+        from shared.psi import resolve_own_cgroup
+
+        tree = live_topology(tmp_path)
+        resolve_own_cgroup.cache_clear()
+        own = resolve_own_cgroup(
+            None, proc_cgroup_path=tree.proc_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        assert own.path == tree.own_cgroup_path
+        assert own.pressure_path is not None
+        assert own.pressure_path.read_text().startswith('some avg10=')
