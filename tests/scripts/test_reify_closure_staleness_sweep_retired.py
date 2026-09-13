@@ -79,9 +79,6 @@ ALLOWED_AS_RETIREMENT_RECORD = {
     'docs/prds/recurring-deterministic-tasks.md': (
         'the PRD records that its named seed job was retired'
     ),
-    'docs/prds/recurring-deterministic-tasks.capability-manifest.md': (
-        'the capability manifest records the substrate change'
-    ),
     'docs/prds/claimant-invariant-enforcement.md': (
         'the PRD marks the retired site and discharges its G7 waiver IN '
         'PLACE — the waiver text is deliberately kept, not deleted'
@@ -207,7 +204,18 @@ def test_hard_constraint_harness_deterministic_recon_sweep_preserved():
 
 
 def test_hard_constraint_stage2_reconciliation_preserved():
-    """HARD CONSTRAINT: fused-memory's Stage 2 reconciliation survives."""
+    """HARD CONSTRAINT: fused-memory's Stage 2 stranded handling survives.
+
+    Named symbols rather than bare file existence, matching the two siblings
+    above: a file-presence check cannot tell "Stage 2 preserved" from "file
+    still there, stranded handling gutted". These two ARE the duty — Stage 2
+    may act on a stranded finding only when no live signal is present
+    (``reconciliation/prompts/stage2.py``, the ``Live-Workflow Signals``
+    rules), and this pair is what decides that: the renderer forwards each
+    active task's status/task_kind so a blocked task with no per-task evidence
+    stops asserting liveness, and the corroboration verdict is what stops a
+    post-redeploy task from being reported live and blocking remediation.
+    """
     p = (
         REPO_ROOT
         / "fused-memory"
@@ -217,8 +225,14 @@ def test_hard_constraint_stage2_reconciliation_preserved():
         / "stages"
         / "task_knowledge_sync.py"
     )
-    assert p.is_file(), _HARD_CONSTRAINT_MESSAGE.format(
-        what=f"{p} (Stage 2: Task-Knowledge Sync)"
+    text = p.read_text() if p.is_file() else ""
+    missing = [
+        symbol
+        for symbol in ("_render_live_workflow_section", "corroboration_for_task")
+        if symbol not in text
+    ]
+    assert p.is_file() and not missing, _HARD_CONSTRAINT_MESSAGE.format(
+        what=f"{p}::{{{', '.join(missing) or 'Stage 2: Task-Knowledge Sync'}}}"
     )
 
 
@@ -249,18 +263,38 @@ def _tracked_files(*pathspecs):
     return [entry for entry in completed.stdout.split('\0') if entry]
 
 
-def _mentioning_lines(relpath):
-    """1-indexed line numbers of every retired-token mention, plus the lines."""
-    p = REPO_ROOT / relpath
-    if not p.is_file():
-        return [], []
-    lines = p.read_text(encoding='utf-8', errors='replace').splitlines()
-    hits = [
-        lineno
-        for lineno, line in enumerate(lines, start=1)
-        if any(token in line for token in RETIRED_TOKENS)
-    ]
-    return hits, lines
+def _token_hits():
+    """``{relpath: [lineno, ...]}`` for every tracked line naming a retired token.
+
+    One ``git grep`` rather than a ``read_text()`` per tracked file: the corpus
+    is ~3k files / 16MB, which costs ~2.5s to read in Python against ~0.06s for
+    git, and it grows with the repo. ``-F`` keeps the tokens literal, ``-I``
+    skips binaries, and ``-z`` NUL-terminates BOTH the path and the line number
+    so neither a colon in a path nor one in the matched text can be misparsed.
+    git greps tracked working-tree files, which is the same corpus (and the
+    same reason for it) as :func:`_tracked_files`.
+
+    Returns None when this is not a git checkout. rc 1 means "no matches" —
+    the GREEN case for the sweep below, not a failure.
+    """
+    argv = ['git', 'grep', '-n', '-I', '-z', '-F']
+    for token in RETIRED_TOKENS:
+        argv.extend(['-e', token])
+    try:
+        completed = subprocess.run(
+            [*argv, '--'], cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode not in (0, 1):
+        return None
+    hits = {}
+    for record in completed.stdout.split('\n'):
+        relpath, _, rest = record.partition('\0')
+        lineno, _, _ = rest.partition('\0')
+        if lineno.isdigit():
+            hits.setdefault(relpath, []).append(int(lineno))
+    return hits
 
 
 def _corpus():
@@ -269,6 +303,14 @@ def _corpus():
     if tracked is None:
         pytest.skip('not a git checkout (git ls-files failed)')
     return tracked
+
+
+def _hits():
+    """The retired-token hit map, or a pytest.skip when this is not a checkout."""
+    hits = _token_hits()
+    if hits is None:
+        pytest.skip('not a git checkout (git grep failed)')
+    return hits
 
 
 def test_reference_sweep_is_not_vacuous():
@@ -285,15 +327,47 @@ def test_tree_carries_no_reference_to_the_retired_wiring():
     This is the executable form of the task's acceptance grep, over the whole
     tracked tree.
     """
-    offenders = []
-    for relpath in _corpus():
-        if relpath in ALLOWED_UNCONDITIONALLY or relpath in ALLOWED_AS_RETIREMENT_RECORD:
-            continue
-        hits, _ = _mentioning_lines(relpath)
-        offenders.extend(f'{relpath}:{lineno}' for lineno in hits)
+    offenders = [
+        f'{relpath}:{lineno}'
+        for relpath, linenos in _hits().items()
+        if relpath not in ALLOWED_UNCONDITIONALLY
+        and relpath not in ALLOWED_AS_RETIREMENT_RECORD
+        for lineno in linenos
+    ]
     assert not offenders, (
         'task 5247: the nightly reify closure-staleness sweep wiring is '
         'retired, but these tracked lines still name it — repoint each at a '
         'surviving precedent, or add the file to one of this module\'s '
         'allowlists WITH a written reason:\n  ' + '\n  '.join(sorted(offenders))
+    )
+
+
+
+def test_allowlist_entries_still_mention_the_retired_wiring():
+    """Neither allowlist keeps a key that no longer names the retired wiring.
+
+    The other half of the ``test_atomic_write_regrowth.py::_ALLOWED_RENAMERS``
+    pattern this module is shaped after, whose stale-entry check is a HARD
+    assert kept rather than downgraded. Without it, a file whose retired-token
+    mentions are all later removed keeps its exemption forever — and is then
+    silently free to reintroduce a reference to the wiring, with the sweep
+    above still passing.
+
+    Requiring the guard's own path to be among the hits also proves the ``git
+    grep`` in :func:`_token_hits` searched something: an empty hit map is the
+    sweep's green case, so nothing else would notice it matching nothing.
+    """
+    tracked = set(_corpus())
+    hits = _hits()
+    stale = []
+    for relpath in sorted({*ALLOWED_UNCONDITIONALLY, *ALLOWED_AS_RETIREMENT_RECORD}):
+        if relpath not in tracked:
+            stale.append(f'{relpath} — no longer a tracked file')
+        elif not hits.get(relpath):
+            stale.append(f'{relpath} — no longer mentions the retired wiring')
+    assert not stale, (
+        'task 5247: these allowlist entries no longer mention the retired '
+        'wiring — delete each entry, so the file goes back under the sweep '
+        'above and cannot silently reacquire a reference:\n  '
+        + '\n  '.join(stale)
     )
