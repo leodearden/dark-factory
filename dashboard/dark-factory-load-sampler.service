@@ -9,7 +9,15 @@ Type=oneshot
 # differs.  Alternatively set DARK_FACTORY_ROOT=<repo-root> in an
 # EnvironmentFile= to override the DB path without editing this unit.
 WorkingDirectory=%h/src/dark-factory
-ExecStart=%h/.local/bin/uv run --project sampler python -m sampler
+# --no-sync is load-bearing, not cosmetic.  There is ONE shared root .venv per
+# checkout with every workspace member installed editable into it, and a plain
+# `uv run --project <member>` was measured UNINSTALLING a sibling from it.  At
+# this unit's 5s cadence that is 17,280 env re-syncs a day against the main
+# checkout's venv -- i.e. it would intermittently break running orchestrators
+# and verify runs.  --frozen additionally pins the lockfile, so a genuinely
+# unsynced venv now fails loudly in the journal instead of silently repairing
+# itself by damaging the venv.
+ExecStart=%h/.local/bin/uv run --frozen --no-sync --project sampler python -m sampler
 
 # Logging goes to journalctl --user -u dark-factory-load-sampler
 StandardOutput=journal
