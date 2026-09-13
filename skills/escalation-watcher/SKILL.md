@@ -755,7 +755,12 @@ mechanical gate to check whether the at-block-time dry-run investigation found a
 > tag was wrong).
 
 Parse the JSON output: `verdict` (`fresh`|`drift`|`abort`), `reason`, `cap_remaining`,
-`already_attempted`, `head_sha`, `main_sha`, `age_seconds`.
+`already_attempted`, `head_sha`, `main_sha`, `age_seconds`, `age_state`.
+
+`age_state` (`parsed`|`unparseable`|`absent`|`no_clock`) says WHY `age_seconds` is `null`
+when it is. Any value other than `parsed` yields `verdict == "abort"` — the gate never
+certifies a proposal fresh without a parsed `investigated_at` — so the `abort` row in the
+table below already handles it and no extra branch is needed.
 
 **Decision table:**
 
