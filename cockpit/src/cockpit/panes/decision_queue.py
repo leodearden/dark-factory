@@ -193,6 +193,19 @@ class QueueItem:
     handling: bool
     escalation_id: str | None
 
+    @property
+    def session_slug(self) -> str | None:
+        """The session slug encoded in *key*, or None for a decision item.
+
+        The sole decoder of the 'session:<slug>' key encoding _session_key
+        writes, so that knowledge lives in exactly one place (SPOT).
+        Fail-soft (PRD §2): a key with no ':' prefix degrades to the key
+        itself rather than raising.
+        """
+        if self.kind != 'session':
+            return None
+        return self.key.split(':', 1)[1] if ':' in self.key else self.key
+
 
 _ID_PLACEHOLDER = '(none)'
 
@@ -234,7 +247,7 @@ def format_copy_payload(item: QueueItem) -> str:
     escalation_id degrades to a placeholder, never the literal string
     'None'. The trailing id line is derived from item.kind/item.key --
     'decision_id: <id>' for a decision, or 'session: <slug>' for a
-    session (slug = item.key after its 'session:' prefix). The question
+    session (see QueueItem.session_slug). The question
     line is defensively capped (_cap_for_clipboard) so a pathologically
     long question can't silently vanish on a terminal that drops rather
     than truncates an over-long OSC 52 payload. One payload serves both
@@ -244,8 +257,7 @@ def format_copy_payload(item: QueueItem) -> str:
     _cap_for_clipboard's comment).
     """
     if item.kind == 'session':
-        slug = item.key.split(':', 1)[1] if ':' in item.key else item.key
-        id_line = f'session: {slug}'
+        id_line = f'session: {item.session_slug}'
     else:
         id_line = f'decision_id: {item.decision_id}'
     question = _cap_for_clipboard(item.question or _QUESTION_PLACEHOLDER)

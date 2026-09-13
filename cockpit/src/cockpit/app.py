@@ -1246,29 +1246,49 @@ class CockpitApp(App):
             return
         self._backend_for(target.kind).focus(target)
 
-    def _sync_detail_pane(self, slug: str | None) -> None:
+    def _show_session_detail(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
 
         Looked up against self._records -- the ordered set from the most
         recent scan -- so this always reflects current data, not whatever
-        object identity a stale event might carry. Also remembers *slug* for
-        _persist_ui_config, since on_unmount runs after the DataTable itself
-        has already been torn down and can no longer be queried.
+        object identity a stale event might carry.
+
+        The render half alone, with no _selected_slug bookkeeping, so the
+        decision queue's own session rows can reuse it without writing the
+        session TABLE's restore seam -- see _sync_queue_detail.
         """
-        self._selected_slug = slug
         record = next((r for r in self._records if r.session_slug == slug), None)
         detail = self.query_one('#detail', DetailPane)
         detail.show_record(record, self._records, self._now_fn())
 
+    def _sync_detail_pane(self, slug: str | None) -> None:
+        """Render *slug*'s record into the detail pane AND remember it as the selection.
+
+        The session table's path: the render (_show_session_detail) plus
+        remembering *slug* for _persist_ui_config, since on_unmount runs
+        after the DataTable itself has already been torn down and can no
+        longer be queried.
+        """
+        self._selected_slug = slug
+        self._show_session_detail(slug)
+
     def _sync_queue_detail(self, key: str | None) -> None:
-        """Render the DecisionQueue row *key*'s backing decision into the detail pane.
+        """Render the DecisionQueue row *key* into the detail pane.
 
         Resolves *key* the way every other queue action does -- key ->
-        QueueItem (self._queue_items_by_key) -> DecisionRecord -- so the
-        pane sees the same item identity as focus/boost/copy, with no
-        second index. Takes the true DecisionRecord rather than the
-        QueueItem: the record carries severity/state and the real filed_at,
-        which the queue's deferred overlay may have shifted.
+        QueueItem (self._queue_items_by_key) -- so the pane sees the same
+        item identity as focus/boost/copy, with no second index. Both row
+        kinds render: a session row reuses the session render, since the
+        queue truncates its question exactly as it truncates a decision's.
+        A decision row resolves on to its DecisionRecord and renders THAT
+        rather than the QueueItem, because severity/state and the true
+        filed_at live only on the record (the queue's deferred overlay may
+        have shifted the item's).
+
+        Never writes _selected_slug -- that is the session TABLE's restore
+        seam (cockpit-ui.json), and a decision has no session slug to
+        restore to, so the queue renders through _show_session_detail
+        rather than _sync_detail_pane.
 
         Fail-soft (PRD §2): an empty queue, a key with no QueueItem, or an
         item whose backing record is gone leaves the pane as it is rather
@@ -1277,7 +1297,12 @@ class CockpitApp(App):
         if key is None:
             return
         item = self._queue_items_by_key.get(key)
-        if item is None or item.decision_id is None:
+        if item is None:
+            return
+        if item.kind == 'session':
+            self._show_session_detail(item.session_slug)
+            return
+        if item.decision_id is None:
             return
         decision = self._decision_by_id(item.decision_id)
         if decision is None:
