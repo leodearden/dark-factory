@@ -1,19 +1,26 @@
 """cockpit.panes.detail_pane — pure detail rendering + the DetailPane widget.
 
-render_detail composes a single record's full detail (title, status, age,
-ids, question, parent/children, result-file tail) as plain text. Fail-soft
-throughout (PRD §2): a missing/unreadable result file degrades to a
-placeholder rather than raising, and a record with no question/children
-still renders.
+Two explicitly-typed render entry points, one per record kind the cockpit
+shows: render_detail for a SessionRecord (title, status, age, ids,
+question, parent/children, result-file tail) and render_decision_detail
+for a DecisionRecord (ids, severity/state, age, options, full question).
+Neither is a union over the other -- each reads only its own record's
+fields, so a call site is type-checked against the kind it actually holds.
+
+Fail-soft throughout (PRD §2): a missing/unreadable result file degrades
+to a placeholder rather than raising, a record with no question/children
+still renders, and an absent id renders as a placeholder rather than the
+literal string 'None'.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from orchestrator.session_registry import SessionRecord
+from orchestrator.session_registry import DecisionRecord, SessionRecord
 from textual.widgets import Static
 
 from cockpit.panes.session_table import format_age, format_title, state_glyph
@@ -64,6 +71,33 @@ def render_detail(record: SessionRecord, all_records: list[SessionRecord], now: 
         lines.append(f'question: {record.question.text}')
     lines.append('--- result ---')
     lines.append(result_file_tail(record.result_file))
+    return '\n'.join(lines)
+
+
+def render_decision_detail(
+    decision: DecisionRecord, sessions: Sequence[SessionRecord], now: datetime
+) -> str:
+    """Render *decision*'s full detail as plain text.
+
+    The sibling of render_detail for the other record kind, not a widening
+    of it: composes the decision's identity (id, project, task/escalation
+    ids), its severity/state, and its filed timestamp with the age
+    format_age gives the queue row, then the question text LAST -- verbatim,
+    neither collapsed nor truncated (unlike decision_queue._one_line_question,
+    which is why the pane exists). Question last so a long or multi-line
+    question scrolls off the bottom rather than pushing the ids out of view.
+    Pure -- no clock read (now is injected), no writes.
+    """
+    lines = [
+        f'decision_id: {decision.id}',
+        f'project: {decision.project}',
+        f'task_id: {decision.task_id}',
+        f'escalation_id: {decision.escalation_id}',
+        f'severity: {decision.severity}',
+        f'state: {decision.state}',
+        f'filed: {decision.filed_at} ({format_age(decision.filed_at, now)})',
+        f'question: {decision.text}',
+    ]
     return '\n'.join(lines)
 
 
