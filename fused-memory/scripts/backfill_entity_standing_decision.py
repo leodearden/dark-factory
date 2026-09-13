@@ -1037,7 +1037,13 @@ def main(argv: list[str] | None = None) -> int:
             await memory.initialize()
             if store is not None:
                 await store.initialize()
-            memory.set_recon_ledger(store if store is not None else _AbsentLedger())
+            # ``_AbsentLedger`` is deliberately NOT a ``ReconLedgerStore`` (see its
+            # docstring), so the setter's annotation rejects it. Suppressed at this
+            # one call site rather than widened on ``MemoryService``, which would
+            # license every OTHER caller to wire a partial ledger — the stand-in is
+            # sound only because ``run_backfill`` consults exactly one method.
+            ledger = store if store is not None else _AbsentLedger()
+            memory.set_recon_ledger(ledger)  # pyright: ignore[reportArgumentType]
             report = await run_backfill(memory, apply=args.apply)
             # Which file, what was at it, and whether anything reads it —
             # carried in the ARTIFACT, on every run. A report that named none of
