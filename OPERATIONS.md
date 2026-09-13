@@ -1158,6 +1158,27 @@ Both staleness and the coordinator invoke the same
 once: the script is the sole on-disk writer of the shared clock, and only on
 its all-units-verified-fresh exit-0 path.
 
+**What a clock file contains.** The stamp is
+`{ts, iso, source, pytest_session}`. `ts` (integer epoch) is the only field
+any reader extracts; `iso` is the same instant rendered for a human. The two
+provenance fields are for triage:
+
+- `source` — which writer stamped it, `restart-all-orchestrators.sh` or
+  `orchestrator-watchdog.py`.
+- `pytest_session` — empty for every genuine deploy. It is non-empty ONLY
+  when a pytest session was an ancestor of the write, i.e. a test suite
+  falsified a real clock. A non-empty value in a clock file on this machine
+  means the 8h staleness backstop was disarmed by a test, not by a deploy.
+
+**Triage: a deploy-clock message in a verify or merge-lane run.** A
+`DeployClockRedeployWarning` means a real redeploy stamped a protected clock
+while that run was in flight — the branch is not at fault and no action is
+needed. A run that still ERRORs at teardown with `falsified a REAL deploy
+clock` is either a genuine test-side falsification or an unattributable
+(provenance-free) write; the message's `Attribution:` line names which.
+`df_pytest_isolation.py::deploy_clock_change_report` is the authority on both
+verdicts and on why the two are told apart the way they are.
+
 **Drain behavior is NOT defined once, and the two tiers CAN both redeploy
 inside one 8-hour window.** Two corrections measured 2026-08-24/25:
 
