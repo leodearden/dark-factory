@@ -81,6 +81,27 @@ the predicate convention; stdout is human/log triage plus one machine
   - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
     on its own code so it is never mistaken for "offenders found" (1) by
     a caller branching on exit code alone.
+  - Exit 3: the project task store does not exist — ``--project-root``
+    names a path with no ``.taskmaster/tasks/tasks.db`` (a task worktree,
+    typically). Reserved because ``SqliteTaskBackend.get_tasks``
+    auto-creates that db and returns ``{"tasks": []}`` for ANY
+    ``project_root`` without raising, so the alternative is 0 tasks, 0
+    offenders and exit 0: a false all-clear on a check whose exit 0 means
+    "check passed". See
+    ``fused_memory/utils/target_store_preflight.py`` — the normative copy
+    of the policy, the measurement behind it, and the remedy.
+
+    Not folded into 1, unlike the unconfigured-backend case that shares
+    that rung: ``parse_since``'s ValueError is raised where main() can see
+    it, but this one arrives from deep inside ``_run()``, and an uncaught
+    exception exits **1** — colliding with the "gating offenders found" /
+    "backend not configured" rung above, which is exactly the confusion
+    the reservation buys out. Fail-closed for a machine consumer either
+    way: ``deterministic_runner.py::DeterministicRunner._run_predicate``
+    branches on ``rc != 0`` alone, so 3 blocks identically to 1 and can
+    never read as "passed". The reader the reservation actually serves is
+    the L2 resolver hand-running this script from PRD label ι's RUNBOOK,
+    who reads the code directly.
 
 Trailing JSON summary
 ---------------------
@@ -155,12 +176,18 @@ from typing import Any
 # closing line) and ships inside the very package this script lives in. The
 # sibling audit script (audit_found_on_main_provenance.py) imports both at
 # module level from this same directory, as do the other two task-store
-# scripts for the guard. The deferred imports exist for a DIFFERENT reason:
-# they are either sys.path[0]-sensitive (the sibling script) or heavyweight,
-# and the test suite importlib-loads this module in isolation.
+# scripts for the guard. `TargetStoreMissing` comes along with the guard
+# because main() needs it in scope to map the refusal onto exit 3, and one
+# import beats a second one at a different altitude for a single name. The
+# deferred imports exist for a DIFFERENT reason: they are either
+# sys.path[0]-sensitive (the sibling script) or heavyweight, and the test
+# suite importlib-loads this module in isolation.
 from shared.task_metadata import parse_metadata
 
-from fused_memory.utils.target_store_preflight import assert_task_store_exists
+from fused_memory.utils.target_store_preflight import (
+    TargetStoreMissing,
+    assert_task_store_exists,
+)
 
 logger = logging.getLogger('check_found_on_main_spurious_rate')
 
@@ -610,7 +637,17 @@ def main() -> int:
         print(f'error: invalid --since {args.since!r}: {exc}', file=sys.stderr)
         return 2
 
-    return asyncio.run(_run(args, since))
+    # The store guard's twin of the mapping above, written to the same
+    # template and scoped just as tightly: _run() raises the typed refusal,
+    # main() owns the ladder. To stderr, never stdout — the LAST stdout line
+    # is the machine-read counts object (module docstring "Trailing JSON
+    # summary") and a refusal prints no counts, so keeping the message off
+    # stdout means it can never be mistaken for a verdict payload.
+    try:
+        return asyncio.run(_run(args, since))
+    except TargetStoreMissing as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 3
 
 
 if __name__ == '__main__':
