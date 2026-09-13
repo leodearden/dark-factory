@@ -30,7 +30,7 @@ returns False) because they sweep the WHOLE tree, so a mid-edit or deliberately
 malformed fixture file must not redden a guard about something else. This
 instrument inverts that polarity for its own named cluster: an Appendix A file
 the script cannot parse is not noise, it IS the finding (INV-11, no silent
-fail-soft). The 559-file test sweep keeps the siblings' per-file fail-soft
+fail-soft). The whole-test-tree sweep keeps the siblings' per-file fail-soft
 polarity, but every skipped file lands in ``enumeration.unreadable`` and the
 ratchet refuses to compare a partial enumeration at all -- so a degraded sweep
 can never masquerade as a clean tree.
@@ -47,52 +47,33 @@ from pathlib import Path
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This module AST-parses the Appendix A cluster (23 CLUSTER_PATHS entries, 25
-# resolved files) plus every *.py under orchestrator/tests/ (573 today, 559 at
-# authorship time), and runs complexipy over the cluster.
+# This module AST-parses the Appendix A cluster (23 CLUSTER_PATHS entries, two
+# of them globs) plus every *.py under orchestrator/tests/, and runs complexipy
+# over the cluster. All of that is ONE measurement per session, taken by the
+# module-scoped `live_measurement` fixture below.
 #
-# RUNTIME, measured rather than estimated. An earlier version of this comment
-# claimed "MEASURED end to end at 35-65s"; that estimate was wrong, and task
-# 5101 exists because it was wrong. The module measured 146.79s and 250.72s on
-# one UNCHANGED tree (esc-5021-1), and 237.09s re-measured here before the fix.
+# WALL CLOCK ON THIS HOST IS NOT A RELIABLE MEASURE of this module: repeated
+# runs over ONE unchanged tree spread as widely as the effect of task 5101,
+# which cut the work here fourfold. So every guard added by that task counts
+# WORK -- ast.parse / Path.read_text / complexipy calls -- and none asserts
+# elapsed time; see `no_private_tree_scan` and
+# TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once. The
+# before/after measurement history is recorded once, dated, in
+# plans/merge-lane-quality-prd.md Open Question 7; per-run seconds restated here
+# would only drift.
 #
-# WHAT TASK 5101 CHANGED, stated as work rather than seconds, because work is
-# what is deterministic here: the module took FOUR full sweeps of the 573-file
-# test tree where ONE was available, and measured each of the 25 resolved
-# cluster files with complexipy TWICE. It now takes one sweep and one
-# measurement per file. Both are held by counting guards -- see
-# `no_private_tree_scan` and
-# TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once --
-# so a regrown sweep fails immediately instead of silently re-adding the cost.
-#
-# The load-independent size of that win, taken WITHIN the single BEFORE run so
-# every item saw the same load: the three folded items cost 46.78s + 32.88s +
-# 26.41s = 106.07s of that run's 237.09s, i.e. 45% of the module, and now all
-# three fall below pytest's 0.005s reporting floor.
-#
-# Whole-module wall clock AFTER, all on the same unchanged tree: 62.45s, 90.60s
-# and 113.87s over three runs. Every sample is reported rather than the
-# flattering one, because the spread between them is as large as the effect --
-# which is the point of the next paragraph.
-#
-# WALL CLOCK ON THIS HOST IS NOT A RELIABLE MEASURE of this module: a four-run
-# A/B of `--check` over ONE unchanged tree read 19.1s, 46.0s, 25.6s, 33.2s and
-# 43.4s. That is why every guard added by task 5101 counts WORK (ast.parse /
-# Path.read_text calls) and never elapsed time, and why none of them asserts a
-# runtime ceiling.
-#
-# A HIGH RUNTIME HERE DOES NOT INDICATE A WRONG COMPLEXIPY VERSION. 6.2.0 was
-# correctly resolved throughout every one of those runs and require_complexipy()
-# passed each time; a wrong version fails immediately and by name, before any
-# measurement. Do not read slowness as a version signal.
+# A HIGH RUNTIME HERE IS NOT A COMPLEXIPY VERSION SIGNAL. An earlier version of
+# this comment estimated "MEASURED end to end at 35-65s" and the module then ran
+# several times that, with 6.2.0 correctly resolved and require_complexipy()
+# passing on every one of those runs. A wrong version fails immediately and by
+# name, before any measurement.
 #
 # The 60s ini default would be a coin flip, and pytest-timeout's thread method
 # enforces it by os._exit()ing the xdist worker -- which with
 # --max-worker-restart=0 truncates the whole session and reports against an
 # innocent test (esc-3980-1). See WHOLE_TREE_SCAN_TEST_TIMEOUT in
-# _orch_helpers.py. That mark is PER ITEM and the slowest single item has
-# always sat far below it (36.22s before the fix, 7.15s after), so it was never
-# the thing at risk here.
+# _orch_helpers.py. That mark is PER ITEM and the slowest single item has always
+# sat far below it, so it was never the thing at risk here.
 #
 # NOTE this mark is deliberate and NOT compelled by the family guard
 # test_whole_tree_scan_timeout_guard.py: its ``_scans_whole_tree_py`` detector
@@ -103,12 +84,11 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 #
 # The xdist_group pins the WHOLE module to one worker. Without it, --dist
 # loadgroup distributes these items individually and every worker that draws one
-# pays build_report over again -- 25 complexipy runs plus a 573-file AST sweep,
-# measured at 27.19s of a 62.45s module and 55.46s of a 113.87s one -- for a
-# single cached result. Grouped,
-# the module takes that cost exactly ONCE (module-scoped `live_measurement`
-# below) while running in parallel with the rest of the suite. `xdist_group` is a registered marker; see
-# test_marker_registration_drift.py's allowlist.
+# pays build_report over again -- a complexipy pass over the cluster plus a
+# whole-tree AST sweep -- for a single cached result. Grouped, the module takes
+# that cost exactly ONCE (module-scoped `live_measurement` below) while running
+# in parallel with the rest of the suite. `xdist_group` is a registered marker;
+# see test_marker_registration_drift.py's allowlist.
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group('merge_lane_ratchet'),
@@ -139,15 +119,12 @@ class LiveMeasurement:
 def live_measurement() -> LiveMeasurement:
     """THE single real measurement this module takes, instrumented.
 
-    build_report is the module's whole remaining cost: 25 complexipy runs over
-    the cluster and a 573-file orchestrator/tests AST sweep, measured at 27.19s
-    of the module's 62.45s and 55.46s of a slower run's 113.87s. (It measured 72.7s when this module was authored,
-    of which 13.0s was complexipy -- halved by task 5101, since build_report
-    then measured every cluster file twice.) EVERY test that needs live numbers
-    shares this one result: task 5101 folded on the last three stragglers, and
-    `no_private_tree_scan` is what keeps them folded. The module's xdist_group
-    keeps them on one worker so the cost is paid once per session rather than
-    once per worker.
+    build_report is the module's whole remaining cost: one complexipy run per
+    cluster file and one AST sweep of orchestrator/tests. EVERY test that needs
+    live numbers shares this one result -- task 5101 folded on the last three
+    stragglers, and `no_private_tree_scan` is what keeps them folded. The
+    module's xdist_group keeps them on one worker so the cost is paid once per
+    session rather than once per worker.
 
     The recording wrapper RECORDS AND DELEGATES, so the report is a real
     measurement and the call list is real work rather than a simulation of it.
@@ -181,11 +158,10 @@ def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
     Task 4520's discipline verbatim (shared/tests/test_tree_scan_sharing.py::
     _WorkCounter): count WORK, never wall-clock. An `assert elapsed < N` guard
-    on this host would be a new flake planted by an anti-flake task -- a
-    four-run A/B of `--check` over ONE unchanged tree read 19.1s, 46.0s, 25.6s,
-    33.2s and 43.4s. Zero parses is also the sharper claim: it proves the test
-    CONSUMED the shared measurement, where a fast wall clock only proves the
-    box was quiet.
+    on this host would be a new flake planted by an anti-flake task -- repeated
+    `--check` runs over ONE unchanged tree spread more than twofold. Zero work
+    is also the sharper claim: it proves the test CONSUMED the shared
+    measurement, where a fast wall clock only proves the box was quiet.
 
     The counters RECORD AND DELEGATE -- never raise, never stub -- so the test
     still exercises real behaviour and a regrown sweep reads as a count.
@@ -1420,7 +1396,7 @@ class TestBuildReport:
         # build_report wants two cognitive projections per cluster file, and
         # used to fetch each from its own `_file_complexity` call -- 50 runs
         # over the 25 files CLUSTER_PATHS' 23 entries resolve to (two are
-        # globs), measured at 13.0s of the 72.7s total.
+        # globs), half of them redundant.
         #
         # A MULTISET equality, not a length check: `len(recorded) == len(files)`
         # stays green when one file is measured twice and another is skipped,
@@ -2034,9 +2010,9 @@ def stub_measurement(monkeypatch: pytest.MonkeyPatch, live_report: dict) -> dict
 
     The CLI's own job is dispatch, rendering and the exit ladder; build_report
     is already pinned by TestBuildReport against the real tree. Re-measuring
-    once per CLI test would add ~7 x build_report (27.19s in the fastest run
-    measured) to every orchestrator verify leg to re-prove something already
-    proven -- several times what the whole module now costs.
+    once per CLI test would add ~7 x build_report to every orchestrator verify
+    leg to re-prove something already proven -- several times what the whole
+    module now costs.
 
     It hands back the module's REAL live measurement, not a synthetic one, so a
     CLI test using this fixture still compares live numbers.
@@ -2140,7 +2116,7 @@ class TestCheckCli:
         # MEASUREMENT is TestBuildReport's, and the live-tree-versus-committed-
         # baseline RATCHET is test_merge_lane_ratchet_holds'. Both run against
         # this same tree and this same baseline, so the second unstubbed
-        # `build_report` here bought nothing but 46.78s.
+        # `build_report` here bought nothing but a repeat of the whole sweep.
         #
         # The stub replaces `build_report` ONLY, so the baseline read is real
         # -- which is what makes `no_private_tree_scan` a live check that the

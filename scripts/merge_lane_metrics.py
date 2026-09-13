@@ -216,7 +216,7 @@ def _parse(source: str, *, path: str) -> ast.Module:
     """Parse *source*, translating a SyntaxError into a named MetricsError.
 
     INV-11: an unparseable CLUSTER file is the finding, never a skipped measure.
-    Callers sweeping files OUTSIDE the cluster (the 559-file test tree) catch
+    Callers sweeping files OUTSIDE the cluster (the whole test tree) catch
     this and record the path in ``Enumeration.unreadable`` instead.
     """
     try:

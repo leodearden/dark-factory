@@ -574,12 +574,15 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    in-flight merges only; in-flight task agents are still soft-cancelled.
 7. **σ gains a runtime ceiling** (Leo, 2026-09-06): the ratchet module must complete
    in ≤ 60s wall on an idle box. α measured 147–251s per run (esc-5021-1); a
-   single full measurement is 72.7s, and the module then re-walks the 559-file
-   test tree twice more and recomputes radon MI five times. The fix is one
-   measurement per session and one complexipy invocation, with the CLI tests on a
-   fixture tree — never a "skip when nothing changed" gate (INV-10/INV-11) and
-   never a narrower domain. Until σ lands the per-verify-leg tax is accepted as
-   measured. Task 5048's details carry the constraints.
+   single full measurement is 72.7s, of which 13s is 22 separate complexipy
+   subprocesses, and the module then re-walks the 559-file test tree twice more
+   and recomputes radon MI five times. The fix is one measurement per session and
+   one complexipy invocation, with the CLI tests on a fixture tree — never a
+   "skip when nothing changed" gate (INV-10/INV-11) and never a narrower domain.
+   Until σ lands the per-verify-leg tax is accepted as measured. Task 5048's
+   details carry the constraints.
+   [Left as written: two of this paragraph's claims were disproven on
+   2026-09-13 and are corrected immediately below, not edited here.]
 
    **Corrected and partly discharged by task 5101** (2026-09-13). Two factual
    corrections to the paragraph above, both measured on the branch:
@@ -607,7 +610,9 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    the `no_private_tree_scan` fixture) rather than by discipline.
 
    Measured on one unchanged tree: 215 items in **237.09s** before; 219 items in
-   **62.45s, 90.60s and 113.87s** over three runs after. Every AFTER sample is
+   **62.45s, 90.60s and 113.87s** over three runs after, and 218 items in
+   **76.79s** once the review amendments had deduped one item and collapsed a
+   third double-measure of merge_queue.py (`--check` alone: 27.66s). Every AFTER sample is
    reported rather than the flattering one, because the spread between them is
    as large as the effect. The load-independent figure, taken WITHIN the single
    BEFORE run so every item saw the same load: the three folded items cost
