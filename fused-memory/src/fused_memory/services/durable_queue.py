@@ -848,13 +848,29 @@ class DurableWriteQueue:
         return count
 
     async def get_stats(self, group_id: str | None = None) -> dict[str, Any]:
-        """Return counts by status and oldest pending age.
+        """Return counts by status, oldest pending age, and dead-by-operation.
+
+        ``dead_by_operation`` maps operation name -> count over ``status='dead'``
+        rows only.  A nonzero entry means writes of that operation have been
+        PERMANENTLY abandoned: the queue exhausted their attempts and gave up,
+        after the caller was already told the write had been accepted.  It is
+        always present, and ``{}`` when nothing is dead — a probe must never
+        have to distinguish "no deaths" from "an older server".
+
+        This counter is the health-probe CONFIRMATION, not the primary alarm.
+        The push signal is the ``durable_write_dead_letter`` escalation
+        (``middleware/dead_letter_escalator.py::emit_dead_letter_escalation``),
+        which survives cleanup; this reads the live ``write_queue`` table, so
+        it returns to zero once :mcp-tool:`delete_dead_letters` sweeps the rows.
+        ``counts['dead']`` is the same population without the attribution, so
+        the two always sum consistently.
 
         Args:
-            group_id: When given, restrict counts and oldest-pending age to
-                rows whose ``group_id`` matches.  Default ``None`` returns
-                unscoped (global) statistics — preserving the behaviour
-                required by :mcp-tool:`get_queue_stats` and the dashboard.
+            group_id: When given, restrict counts, oldest-pending age and the
+                dead-by-operation breakdown to rows whose ``group_id``
+                matches.  Default ``None`` returns unscoped (global)
+                statistics — preserving the behaviour required by
+                :mcp-tool:`get_queue_stats` and the dashboard.
         """
         assert self._db is not None
 
@@ -893,9 +909,33 @@ class DurableWriteQueue:
             if min_created is not None:
                 oldest_pending_age = time.time() - min_created
 
+        # No new index: idx_wq_status_group is on (status, group_id,
+        # next_retry_at), so both spellings below seek the status='dead'
+        # prefix — and the scoped one seeks (status, group_id). An index is
+        # not free on a live DB; see write_journal.py's idx_wo_created note,
+        # where adding one measured ~47 s of one-time startup DDL.
+        if group_id is not None:
+            cursor = await self._db.execute(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' AND group_id = ? GROUP BY operation",
+                (group_id,),
+            )
+        else:
+            cursor = await self._db.execute(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' GROUP BY operation"
+            )
+        rows = await cursor.fetchall()
+        dead_by_operation = {
+            row[0] if isinstance(row, tuple) else row['operation']:
+            row[1] if isinstance(row, tuple) else row['cnt']
+            for row in rows
+        }
+
         return {
             'counts': counts,
             'oldest_pending_age_seconds': oldest_pending_age,
+            'dead_by_operation': dead_by_operation,
         }
 
     async def delete_dead(
