@@ -69,7 +69,22 @@ def probe_dir() -> Iterator[Path]:
 
 
 def _collect(probe_dir: Path, *extra_args: str) -> str:
-    """Run `pytest --collect-only` bound to cockpit's real pyproject.toml; return stdout."""
+    """Run `pytest --collect-only` bound to cockpit's real pyproject.toml.
+
+    Returns combined stdout+stderr. `-n0` overrides cockpit's `-n auto` addopts
+    to keep collection serial without disabling the xdist plugin outright
+    (`-p no:xdist` would conflict with the surviving `-n auto` and make pytest
+    exit with "unrecognized arguments: -n").
+
+    BOTH are load-bearing since task 5408 put `-n auto --dist loadgroup` in
+    cockpit's addopts, and the shape is mirrored from the sibling that already
+    faced this, fused-memory/tests/test_integration_marker_config.py::_collect.
+    Without them, an environment where the plugin is missing exits 4 writing
+    `unrecognized arguments: -n` to STDERR, this helper returns an empty string,
+    and `'test_marked_smoke' not in output` passes VACUOUSLY while the sibling
+    assertion below fails with a message about collection that says nothing
+    about the real cause.
+    """
     test_file = probe_dir / 'test_probe.py'
     test_file.write_text(_PROBE_SRC)
     result = subprocess.run(
@@ -81,6 +96,7 @@ def _collect(probe_dir: Path, *extra_args: str) -> str:
             '-q',
             '-p',
             'no:cacheprovider',
+            '-n0',
             '-c',
             str(COCKPIT_PYPROJECT),
             *extra_args,
@@ -91,7 +107,7 @@ def _collect(probe_dir: Path, *extra_args: str) -> str:
         timeout=30,
         cwd=str(COCKPIT_DIR),
     )
-    return result.stdout
+    return result.stdout + result.stderr
 
 
 class TestSmokeMarkerDeselection:
