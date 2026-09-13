@@ -41,6 +41,7 @@ import copy
 import dataclasses
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,59 @@ def live_measurement() -> LiveMeasurement:
 def live_report(live_measurement: LiveMeasurement) -> dict:
     """The report half of `live_measurement` -- what every live-number test reads."""
     return live_measurement.report
+
+
+@pytest.fixture()
+def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Forbid the requesting test from sweeping the test tree a second time.
+
+    Task 4520's discipline verbatim (shared/tests/test_tree_scan_sharing.py::
+    _WorkCounter): count WORK, never wall-clock. An `assert elapsed < N` guard
+    on this host would be a new flake planted by an anti-flake task -- a
+    four-run A/B of `--check` over ONE unchanged tree read 19.1s, 46.0s, 25.6s,
+    33.2s and 43.4s. Zero parses is also the sharper claim: it proves the test
+    CONSUMED the shared measurement, where a fast wall clock only proves the
+    box was quiet.
+
+    The counters RECORD AND DELEGATE -- never raise, never stub -- so the test
+    still exercises real behaviour and a regrown sweep reads as a count.
+
+    Reads are scoped to `*.py` under orchestrator/tests because the claim is
+    "this test swept no tree of its own", not "this test opened no file":
+    `main(['--check'])` legitimately reads the baseline .json, which lives in
+    the swept directory and must not trip the guard.
+    """
+    swept = _REPO_ROOT / 'orchestrator' / 'tests'
+    parses: list[str] = []
+    reads: list[str] = []
+    real_parse = metrics.ast.parse
+    real_read_text = metrics.Path.read_text
+
+    def counting_parse(source, filename='<unknown>', *args, **kwargs):
+        parses.append(str(filename))
+        return real_parse(source, filename, *args, **kwargs)
+
+    def counting_read_text(self_path: Path, *args, **kwargs):
+        if self_path.suffix == '.py' and swept in self_path.parents:
+            reads.append(str(self_path))
+        return real_read_text(self_path, *args, **kwargs)
+
+    monkeypatch.setattr(metrics.ast, 'parse', counting_parse)
+    monkeypatch.setattr(metrics.Path, 'read_text', counting_read_text)
+    yield
+    _SWEPT_ONCE = (
+        'The orchestrator/tests tree is swept exactly ONCE per session, by the '
+        'module-scoped `live_report` fixture. Derive this anchor from that '
+        'report instead of re-walking the tree.'
+    )
+    assert parses == [], (
+        f'This test parsed {len(parses)} file(s) of its own '
+        f'(first: {parses[:3]}). {_SWEPT_ONCE}'
+    )
+    assert reads == [], (
+        f'This test read {len(reads)} test-tree *.py file(s) of its own '
+        f'(first: {reads[:3]}). {_SWEPT_ONCE}'
+    )
 
 # The 18 orchestrator/src literal paths of PRD Appendix A, verbatim. git_ops.py
 # is listed separately below because Appendix A adds it under a different rule
@@ -986,7 +1040,7 @@ class TestPatchTargets:
             metrics.patch_targets('def (:\n', path='broken.py')
         assert 'broken.py' in str(excinfo.value)
 
-    def test_real_tree_union_anchor(self) -> None:
+    def test_real_tree_union_anchor(self, no_private_tree_scan: None) -> None:
         # Anti-vacuity: the PRD Background table's "79 distinct names"; the
         # string-path form alone measures 78 on this tree.
         #
@@ -1123,7 +1177,7 @@ class TestTestFileMeasures:
         assert measures is not None
         assert measures['patch_targets'] == ['a', 'z']
 
-    def test_real_tree_anchors(self) -> None:
+    def test_real_tree_anchors(self, no_private_tree_scan: None) -> None:
         # Anti-vacuity: >= 150 lane-importing files (measured 167) and a
         # cluster-wide private-read total > 5000 (measured 9,355).
         lane_files = 0
