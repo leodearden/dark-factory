@@ -38,6 +38,7 @@ can never masquerade as a clean tree.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -85,17 +86,48 @@ import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: 
 _REPO_ROOT = Path(__file__).parents[2]
 
 
+@dataclasses.dataclass(frozen=True)
+class LiveMeasurement:
+    """The one real ``build_report``, and the complexipy work taking it cost."""
+
+    report: dict
+    complexipy_calls: tuple[Path, ...]
+
+
 @pytest.fixture(scope='module')
-def live_report() -> dict:
-    """THE single real measurement this module takes.
+def live_measurement() -> LiveMeasurement:
+    """THE single real measurement this module takes, instrumented.
 
     build_report measures 72.7s on an idle 32-core box: 22 complexipy runs over
     the cluster (13.0s), the cluster AST/tokenize sweep (4.1s) and the 559-file
     orchestrator/tests AST sweep (38.6s). Every test that needs live numbers
     shares this one result, and the module's xdist_group keeps them on one
     worker so it is paid once per session rather than once per worker.
+
+    The recording wrapper RECORDS AND DELEGATES, so the report is a real
+    measurement and the call list is real work rather than a simulation of it.
+    `test_each_cluster_file_is_measured_by_complexipy_once` reads that list, so
+    the per-file-once guarantee costs no measurement of its own. The builtin
+    `monkeypatch` fixture is function-scoped and cannot be requested here,
+    hence `pytest.MonkeyPatch.context()`.
     """
-    return metrics.build_report(_REPO_ROOT)
+    calls: list[Path] = []
+    original = metrics._file_complexity
+
+    def recording(path: Path):
+        calls.append(path)
+        return original(path)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(metrics, '_file_complexity', recording)
+        report = metrics.build_report(_REPO_ROOT)
+    return LiveMeasurement(report=report, complexipy_calls=tuple(calls))
+
+
+@pytest.fixture(scope='module')
+def live_report(live_measurement: LiveMeasurement) -> dict:
+    """The report half of `live_measurement` -- what every live-number test reads."""
+    return live_measurement.report
 
 # The 18 orchestrator/src literal paths of PRD Appendix A, verbatim. git_ops.py
 # is listed separately below because Appendix A adds it under a different rule
@@ -656,8 +688,8 @@ class TestCognitiveComplexity:
     ) -> None:
         # The file total and the per-function map are two VIEWS of one
         # complexipy result, not two measurements. build_report asked each
-        # cluster path for both and so paid complexipy 44 times over 22 files;
-        # this counter is what forbids that shape from growing back.
+        # cluster file for both and so paid complexipy 50 times over the 25
+        # resolved files; this counter forbids that shape from growing back.
         #
         # The counter RECORDS AND DELEGATES rather than stubbing, so the
         # equalities below are still checked against a real measurement.
@@ -1277,6 +1309,23 @@ class TestBuildReport:
     def test_cluster_cognitive_total_anchor(self, report: dict) -> None:
         # Anti-vacuity: measured 4,607 on this tree.
         assert metrics.derive_totals(report)['cognitive'] >= 4000
+
+    def test_each_cluster_file_is_measured_by_complexipy_once(
+        self, live_measurement: LiveMeasurement
+    ) -> None:
+        # build_report wants two cognitive projections per cluster file, and
+        # used to fetch each from its own `_file_complexity` call -- 50 runs
+        # over the 25 files CLUSTER_PATHS' 23 entries resolve to (two are
+        # globs), measured at 13.0s of the 72.7s total.
+        #
+        # A MULTISET equality, not a length check: `len(recorded) == len(files)`
+        # stays green when one file is measured twice and another is skipped,
+        # which is precisely the shape a regrown second call site would have.
+        cluster = sorted(_REPO_ROOT / relpath for relpath in live_measurement.report['files'])
+        # Anti-vacuity: an empty cluster would satisfy the equality below
+        # without witnessing a single measurement.
+        assert len(cluster) >= 20, len(cluster)
+        assert sorted(live_measurement.complexipy_calls) == cluster
 
 
 # ---------------------------------------------------------------------------
