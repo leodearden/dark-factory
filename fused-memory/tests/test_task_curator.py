@@ -4538,27 +4538,33 @@ class TestCuratorBlocklistDisabledOrMissing:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# The SHIPPED blocklist, resolved relative to this test file — the one thing
+# every regression-pin below consults. Declared once so a move of the YAML is
+# a single edit, not one per pin class.
+_SHIPPED_BLOCKLIST_PATH = (
+    Path(__file__).parent.parent / "config" / "cancelled_premise_blocklist.yaml"
+)
+
+
+def _load_shipped_blocklist():
+    """Load the shipped blocklist, asserting it parsed to something non-empty
+    (a YAML the loader cannot read degrades to [], which would otherwise make
+    every pin below pass vacuously)."""
+    from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+    entries = load_blocklist(_SHIPPED_BLOCKLIST_PATH)
+    assert entries, f"Shipped blocklist is empty — path: {_SHIPPED_BLOCKLIST_PATH}"
+    return entries
+
+
 class TestCancelledPremiseBlocklistPinsFixCRegression:
     """Regression-pin: the SHIPPED blocklist catches the 1376/1432 hallucination."""
 
-    # Path to the shipped YAML, resolved relative to this test file.
-    BLOCKLIST_PATH = (
-        __import__("pathlib").Path(__file__).parent.parent
-        / "config"
-        / "cancelled_premise_blocklist.yaml"
-    )
     ENTRY_NAME = "fixc_flag_marker_search_then_delete"
-
-    def _load(self):
-        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
-        entries = load_blocklist(self.BLOCKLIST_PATH)
-        assert entries, f"Shipped blocklist is empty — path: {self.BLOCKLIST_PATH}"
-        return entries
 
     def test_fixture_1_task1376_style_matches(self):
         """Task-1376-style title + fixc_flags_deleted_not_found in description → match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         candidate = CandidateTask(
             title="Convert FIX C relay-flag deletion in task_knowledge_sync.py: search-then-delete",
@@ -4577,7 +4583,7 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
     def test_fixture_2_task1432_style_with_stage1_marker_matches(self):
         """Task-1432-style title + stage1_flag_marker in description → match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         candidate = CandidateTask(
             title="FIX C: convert flag-marker search-then-delete in knowledge sync",
@@ -4596,7 +4602,7 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
     def test_fixture_3_paraphrased_title_matches(self):
         """Paraphrased title variant + any description substring → match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         candidate = CandidateTask(
             title="Refactor FIX C stale-flag deletion from delete-by-id to search-then-delete",
@@ -4615,7 +4621,7 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
     def test_control_unrelated_fixc_task_does_not_match(self):
         """Control: a legitimate FIX C task without the fictional premise → no match."""
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
 
         # This touches FIX C but doesn't mention search-then-delete or fictional metrics
         candidate = CandidateTask(
@@ -4648,12 +4654,6 @@ class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
     subject area fileable, which the three control fixtures below pin.
     """
 
-    # Path to the shipped YAML, resolved relative to this test file.
-    BLOCKLIST_PATH = (
-        __import__("pathlib").Path(__file__).parent.parent
-        / "config"
-        / "cancelled_premise_blocklist.yaml"
-    )
     ENTRY_NAME = "verify_summary_glob_jsondecodeerror_refuted"
 
     # The refuted framing, spelled as the codebook entry and the census
@@ -4687,13 +4687,14 @@ class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
 
     # Every phrasing the entry's `description_substrings` must cover, so a
     # fixture claiming to isolate one can prove the other two are absent.
-    DESCRIPTION_PHRASINGS = ("scripts.summary.json", "JSONDecodeError", "cannot access")
-
-    def _load(self):
-        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
-        entries = load_blocklist(self.BLOCKLIST_PATH)
-        assert entries, f"Shipped blocklist is empty — path: {self.BLOCKLIST_PATH}"
-        return entries
+    # Each is an ANCHORED spelling: the gate needs only one of them, so a
+    # generic member would make the entry a title-only forever-drop (pinned by
+    # test_control_generic_description_does_not_match_on_the_title_alone).
+    DESCRIPTION_PHRASINGS = (
+        "scripts.summary.json",
+        "JSONDecodeError: Expecting value",
+        "cannot access '.task/verify/",
+    )
 
     def _match(self, title, description):
         """Run the SHIPPED blocklist over one candidate.
@@ -4703,7 +4704,7 @@ class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
         consulted rather than only what was expected.
         """
         from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
-        entries = self._load()
+        entries = _load_shipped_blocklist()
         candidate = CandidateTask(title=title, description=description)
         return match_candidate(candidate, entries), [e.name for e in entries]
 
@@ -4735,13 +4736,13 @@ class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
                 "command list.",
             ),
             (
-                "JSONDecodeError",
+                "JSONDecodeError: Expecting value",
                 "Artifact discovery under the verify directory surfaced "
                 "json.decoder.JSONDecodeError: Expecting value: line 1 column 1 "
                 "(char 0) rather than a direct not-found signal.",
             ),
             (
-                "cannot access",
+                "cannot access '.task/verify/",
                 "ls: cannot access '.task/verify/*.summary.json': No such file or "
                 "directory — the chained parse then read empty stdin.",
             ),
@@ -4779,13 +4780,35 @@ class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
             "Suppress the refuted task-5120 premise: blocklist entry + codebook "
             "amendment FIRST, cancel 5120 LAST (esc-5120-2, Leo ruled b)",
             "description_substrings: AT LEAST ONE must appear. Include the "
-            "scripts.summary.json path substring, plus the JSONDecodeError text "
-            "and the \"cannot access\" glob-miss text, so the census generator's "
-            "own phrasings are all covered.",
+            "scripts.summary.json path substring, plus the anchored "
+            "\"JSONDecodeError: Expecting value\" exception text and the "
+            "\"cannot access '.task/verify/\" glob-miss text, so the census "
+            "generator's own phrasings are all covered.",
         )
         assert hit is None, (
             "This remediation task must stay fileable, but the blocklist matched "
             f"it via entry {hit.name!r}. Entries: {names}"
+        )
+
+    def test_control_generic_description_does_not_match_on_the_title_alone(self):
+        """ANCHOR SAFETY: the description gate must add real discrimination.
+
+        A genuine future defect in verify-artifact globbing would clear the
+        title triple, so if the description members were generic — bare
+        "cannot access" is the text of any failed ``ls`` — this entry would be
+        a permanent title-only forever-drop, refusing that defect without an
+        LLM call. This fixture carries the generic forms of all three phrasings
+        and none of the anchored ones.
+        """
+        hit, names = self._match(
+            self.CENSUS_TITLE,
+            "ls: cannot access 'data/verify-logs/*.json': No such file or "
+            "directory, so the glob found nothing and the downstream parse "
+            "raised JSONDecodeError instead of a not-found signal.",
+        )
+        assert hit is None, (
+            "A generic description must not clear the gate on the title alone, "
+            f"but the blocklist matched via entry {hit.name!r}. Entries: {names}"
         )
 
     def test_control_archive_gap_task_5199_does_not_match(self):

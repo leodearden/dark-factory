@@ -67,6 +67,15 @@
     GAP defect). Both must stay fileable; both are pinned as controls in
     fused-memory/tests/test_task_curator.py::TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise.
 
+    Each description substring below is an ANCHORED spelling of one of the
+    three phrasings the census generator emits — the artifact path, the
+    exception, the glob miss. They are anchored deliberately: because the gate
+    needs only ONE of them, a generic member (bare "cannot access", the text
+    of any failed ls) would make the whole entry a title-only forever-drop and
+    refuse a genuine future verify-artifact-globbing defect without an LLM
+    call. Anchoring keeps each phrasing covered while leaving the description
+    gate real discrimination, per this file's own guidance above.
+
     Any future recurrence must be dropped without an LLM call.
   title_substrings:
     - "verify"
@@ -74,5 +83,5 @@
     - "jsondecodeerror"
   description_substrings:
     - "scripts.summary.json"
-    - "JSONDecodeError"
-    - "cannot access"
+    - "JSONDecodeError: Expecting value"
+    - "cannot access '.task/verify/"
