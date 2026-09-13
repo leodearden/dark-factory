@@ -50,6 +50,7 @@ from textual.css.query import NoMatches
 from textual.widgets import DataTable
 
 from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
+from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback, copy_to_system_clipboard
 from cockpit.panes.decision_queue import (
     DecisionQueue,
     QueueItem,
@@ -191,6 +192,7 @@ class CockpitApp(App):
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
         spawn_script: Path | str | None = None,
+        copy_runner: Callable[[str], CopyAttempt] | None = None,
         priorities: Priorities | None = None,
         **kwargs,
     ) -> None:
@@ -206,6 +208,7 @@ class CockpitApp(App):
         }
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
+        self._copy_runner = copy_runner if copy_runner is not None else copy_to_system_clipboard
         self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
         # Logged at DEBUG (not WARNING -- this is routine, not a fault) so a
         # deployment that sets $CLAUDE_FLEET_ROOT can confirm which
@@ -1035,9 +1038,23 @@ class CockpitApp(App):
         work in the running cockpit -- this is the in-app replacement.
         Mirrors action_drop/action_defer's highlighted-row lookup exactly
         (fail-soft: no highlighted row, or a key not present in the
-        last-built queue, no-ops). Delegates to Textual's own
-        App.copy_to_clipboard, which writes an OSC 52 escape sequence --
-        terminal-native, works over SSH, no xclip/wl-copy subprocess.
+        last-built queue, no-ops).
+
+        A LOCAL clipboard helper (wl-copy/xclip/xsel, via
+        cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard) is tried
+        first, and OSC 52 is only the fallback for when no local helper can
+        reach a clipboard -- the over-SSH case. OSC 52 alone reached no
+        clipboard at all on the operator's terminal; that module's docstring
+        carries the incident account (task 5448).
+
+        This method owns three things and nothing else: the highlighted-row
+        lookup, the guard around the injected seam, and the two side effects
+        cockpit/src/cockpit/clipboard.py::copy_feedback asks for. Which
+        mechanism the toast names, its severity, and whether OSC 52 still
+        runs are all copy_feedback's call. Both outcomes DO toast -- without
+        that, a future capability regression is again invisible at the
+        moment of use.
+
         Strictly READ-ONLY: never calls set_manual_boost/
         update_decision_state, preserving the pure-consumer write-
         discipline invariant (see TestCopyAction).
@@ -1049,7 +1066,19 @@ class CockpitApp(App):
         item = self._queue_items_by_key.get(key)
         if item is None:
             return
-        self.copy_to_clipboard(format_copy_payload(item))
+        payload = format_copy_payload(item)
+        try:
+            attempt = self._copy_runner(payload)
+        except Exception:
+            # copy_runner is caller-injectable, so a keypress handler must
+            # not depend on the bundled implementation's never-raise promise
+            # being kept by whatever was passed in (PRD §2).
+            _log.exception('action_copy: copy runner failed for %r', key)
+            attempt = CopyAttempt(CopyOutcome.HELPER_FAILED)
+        feedback = copy_feedback(attempt)
+        if feedback.write_osc52:
+            self.copy_to_clipboard(payload)
+        self.notify(feedback.message, title='Copy', severity=feedback.severity)
 
     def action_new_session(self) -> None:
         """'n' -- push the spawn bar's project/role/prompt picker (PRD §9 C5b).

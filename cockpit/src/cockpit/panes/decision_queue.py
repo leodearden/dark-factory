@@ -196,12 +196,18 @@ class QueueItem:
 
 _ID_PLACEHOLDER = '(none)'
 
-# Some terminals silently DROP an over-long OSC 52 clipboard write rather
-# than truncating it (App.copy_to_clipboard's caller in app.py), so an
-# unbounded question could otherwise land on the clipboard as nothing at
-# all with no operator-visible feedback (task 2517 amendment). Sized
-# generously above any realistic question length and comfortably under the
-# payload limits reported by common terminals.
+# Bounds the clipboard payload on BOTH copy legs, because there is only one
+# payload: cockpit/src/cockpit/app.py::CockpitApp.action_copy formats it once,
+# before it knows which leg will run. Only the OSC 52 leg needs the cap --
+# some terminals silently DROP an over-long OSC 52 write rather than
+# truncating it, so an unbounded question could land on the clipboard as
+# nothing at all (task 2517 amendment). The local-helper leg
+# (cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard, task 5448) has
+# no payload limit and still receives the truncated question: a truncation it
+# does not need, paid so that whichever leg runs puts byte-identical text on
+# the clipboard. Sized generously above any realistic question length and
+# comfortably under the payload limits reported by common terminals, so the
+# unnecessary truncation is unreachable for a real question anyway.
 _COPY_QUESTION_MAX_CHARS = 4000
 
 
@@ -230,8 +236,12 @@ def format_copy_payload(item: QueueItem) -> str:
     'decision_id: <id>' for a decision, or 'session: <slug>' for a
     session (slug = item.key after its 'session:' prefix). The question
     line is defensively capped (_cap_for_clipboard) so a pathologically
-    long question can't silently vanish from the clipboard on a terminal
-    that drops rather than truncates an over-long OSC 52 payload.
+    long question can't silently vanish on a terminal that drops rather
+    than truncates an over-long OSC 52 payload. One payload serves both
+    copy legs, so the cap applies even when the local helper --
+    cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard, which has
+    no payload limit of its own -- is the leg that takes it (see
+    _cap_for_clipboard's comment).
     """
     if item.kind == 'session':
         slug = item.key.split(':', 1)[1] if ':' in item.key else item.key

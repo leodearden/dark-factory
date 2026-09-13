@@ -339,7 +339,9 @@ class TestFormatCopyPayload:
         over-long OSC 52 clipboard write, so an unbounded question could
         otherwise land on the clipboard as nothing at all with no
         operator-visible feedback (task 2517 amendment: reviewer_comprehensive
-        robustness suggestion)."""
+        robustness suggestion). Only the OSC 52 leg needs that cap, but the
+        payload is formatted once for both legs, so it is unconditional here
+        -- see _cap_for_clipboard's comment (task 5448)."""
         from cockpit.panes.decision_queue import _COPY_QUESTION_MAX_CHARS, format_copy_payload
 
         long_question = 'x' * (_COPY_QUESTION_MAX_CHARS + 500)
