@@ -3597,3 +3597,81 @@ class TestDecisionQueueDetail:
             assert 'Which host should the worker bind to?' in detail.rendered_text
             assert '7002' in detail.rendered_text
             assert app._selected_slug == 'session-other'
+
+    @pytest.mark.timeout(10)
+    async def test_a_registry_rebuild_does_not_yank_the_pane_off_a_decision(self, tmp_path):
+        """Without this the fix is invisible on a live fleet: the first changed
+        poll tick reverts the pane to session detail mid-read. A rebuild that
+        shifts the session cursor's INDEX re-posts SessionTable RowHighlighted,
+        and _rebuild_session_table additionally re-syncs the pane itself.
+
+        A rebuild refreshes whichever pane kind currently owns the detail; only
+        an operator cursor move transfers that ownership. The session table's
+        own restore seam stays a function of the session table alone, rebuild
+        or not.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config
+
+        for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
+            sr.write_record(
+                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                root=tmp_path,
+            )
+
+        long_question = (
+            'Should the reaper close this decision against the other escalation '
+            'queue, or leave it open for the watcher to re-file it?'
+        )
+        first = sr.DecisionRecord(
+            id='dec-first', project='df', text='Short one?',
+            filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+        )
+        target = sr.DecisionRecord(
+            id='dec-second', project='df', text=long_question,
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        for decision in (first, target):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            assert queue.select_key('decision:dec-second')
+            await pilot.pause()
+            assert long_question in detail.rendered_text
+            assert table.highlighted_slug() == 'session-a'
+
+            # an awaiting-input session order_sessions ranks first, so the
+            # highlighted session row's INDEX genuinely shifts on rebuild
+            sr.write_record(
+                _make_record(
+                    session_slug='session-new',
+                    status=sr.Status.AWAITING_INPUT,
+                    start_ts='2026-07-06T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.get_row_index('session-a') != 0
+
+            # (a) the operator is still reading the decision they highlighted
+            assert long_question in detail.rendered_text
+
+            # (b) cockpit-ui.json's restore seam still tracks the session table
+            assert table.highlighted_slug() == 'session-a'
+            assert app._selected_slug == 'session-a'
+
+        assert load_ui_config(tmp_path).selected_slug == 'session-a'
