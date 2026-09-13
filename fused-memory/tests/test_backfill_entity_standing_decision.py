@@ -1060,7 +1060,7 @@ class _LiveHarness:
         tmp_path: Path,
         *,
         ledger_enabled: bool = True,
-        create_db: bool = True,
+        target: str = _mod.LedgerTargetState.LIVE,
         update_response: dict | None = None,
     ) -> None:
         self.trace: list[str] = []
@@ -1068,15 +1068,20 @@ class _LiveHarness:
         self.services: list[AsyncMock] = []
         self.stamps: list[dict] = []
         self.ledger_enabled = ledger_enabled
+        self.target = target
         self.update_response = update_response or {'status': 'updated'}
         self.data_dir = tmp_path / 'data' / 'reconciliation'
         self.data_dir.mkdir(parents=True)
         self.db_path = self.data_dir / _mod.LEDGER_DB_FILENAME
-        if create_db:
+        if target == _mod.LedgerTargetState.LIVE:
             # A REAL ledger, carrying α's schema — the shape an operator aiming
-            # at a running deployment actually has. A bare ``touch()`` is the
-            # OTHER shape (a stray file), and the gate now tells them apart.
+            # at a running deployment actually has.
             _initialized_ledger_db(self.db_path)
+        elif target == _mod.LedgerTargetState.NO_SCHEMA:
+            # A stray or never-seeded file. Distinct from MISSING because the
+            # path is OCCUPIED, and distinct from LIVE because no server has
+            # ever opened it — the shape existence alone cannot see.
+            self.db_path.touch()
 
     def _make_config(self) -> SimpleNamespace:
         self.trace.append('config')
@@ -1207,7 +1212,7 @@ class TestMainRefusesADeadLedgerTarget:
     def test_a_missing_ledger_file_refuses_instead_of_creating_one(
         self, tmp_path, monkeypatch
     ) -> None:
-        harness = _LiveHarness(tmp_path, create_db=False)
+        harness = _LiveHarness(tmp_path, target=_mod.LedgerTargetState.MISSING)
         with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
             harness.run(monkeypatch, ['--apply'])
         assert str(harness.db_path) in str(excinfo.value)
@@ -1227,7 +1232,7 @@ class TestMainRefusesADeadLedgerTarget:
     ) -> None:
         """Capability first, then destination: a process that may not mutate at
         all should hear that, not a complaint about which file it aimed at."""
-        harness = _LiveHarness(tmp_path, create_db=False)
+        harness = _LiveHarness(tmp_path, target=_mod.LedgerTargetState.MISSING)
         with pytest.raises(StoreMutationUnavailable):
             harness.run(
                 monkeypatch,
@@ -1241,9 +1246,95 @@ class TestMainRefusesADeadLedgerTarget:
     ) -> None:
         """A rehearsal against a dead target is exactly how an operator DISCOVERS
         it, so the report must still be produced."""
-        harness = _LiveHarness(tmp_path, ledger_enabled=False, create_db=False)
+        harness = _LiveHarness(
+            tmp_path,
+            ledger_enabled=False,
+            target=_mod.LedgerTargetState.MISSING,
+        )
         assert harness.run(monkeypatch, []) == 0
         assert harness.report(capsys)['ledger'] == 'would_write'
+
+
+class TestARehearsalNeverArmsTheGate:
+    """A dry run must not create the ledger whose absence the gate refuses.
+
+    The gate is only as good as the state it reads, and before this pass the
+    rehearsal it deliberately exempts CREATED that state: ``_run_live`` built a
+    ``ReconLedgerStore`` unconditionally, and ``initialize()`` does
+    ``mkdir(parents=True)`` plus ``CREATE TABLE IF NOT EXISTS``. So the
+    documented sequence — rehearse, read the report, then ``--apply`` — walked
+    an operator through disarming the protection between the two runs, and the
+    second run wrote the ACTIVE row into a ledger nothing reads and exited 0.
+    Self-disarming is the whole defect: each run is individually correct.
+    """
+
+    @staticmethod
+    def _shapes() -> list[str]:
+        return [
+            _mod.LedgerTargetState.LIVE,
+            _mod.LedgerTargetState.MISSING,
+            _mod.LedgerTargetState.NO_SCHEMA,
+        ]
+
+    def test_a_dry_run_against_a_missing_target_creates_no_ledger(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        harness = _LiveHarness(tmp_path, target=_mod.LedgerTargetState.MISSING)
+        assert harness.run(monkeypatch, []) == 0
+        # BEFORE any read-back: ``rows()`` initializes a store of its own.
+        assert not harness.db_path.exists()
+        assert harness.report(capsys)['ledger'] == 'would_write'
+
+    def test_a_rehearsal_then_an_apply_is_still_refused(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The exact operator sequence the script's own docstring prescribes.
+
+        Measured on this branch before the fix: the dry run left
+        ``db_path.exists() == True``, and the ``--apply`` that followed returned
+        0 with ``ledger == 'written'`` and one persisted row — into a database
+        the rehearsal had just manufactured.
+        """
+        harness = _LiveHarness(tmp_path, target=_mod.LedgerTargetState.MISSING)
+        assert harness.run(monkeypatch, []) == 0
+        capsys.readouterr()
+        with pytest.raises(_mod.LedgerTargetUnusable):
+            harness.run(monkeypatch, ['--apply'])
+        assert harness.rows() == []
+
+    def test_a_rehearsal_does_not_seed_a_stray_file_either(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """One level up from the missing-file case, and not fixed by fixing it:
+        ``initialize()`` runs ``CREATE TABLE IF NOT EXISTS``, so a rehearsal
+        aimed at a stray empty file would ADD α's schema to it and turn a
+        refused NO_SCHEMA target into an accepted LIVE one."""
+        harness = _LiveHarness(tmp_path, target=_mod.LedgerTargetState.NO_SCHEMA)
+        assert harness.run(monkeypatch, []) == 0
+        capsys.readouterr()
+        assert _mod.classify_ledger_target(harness.db_path) is (
+            _mod.LedgerTargetState.NO_SCHEMA
+        )
+        with pytest.raises(_mod.LedgerTargetUnusable):
+            harness.run(monkeypatch, ['--apply'])
+        assert harness.rows() == []
+
+    @pytest.mark.parametrize('shape', _shapes())
+    def test_the_rehearsal_still_reports_in_full_on_every_shape(
+        self, shape, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The rehearsal being a working diagnostic is the entire reason the
+        gate exempts it, so a non-creating dry run must not become a crippled
+        one: the report is what an operator reads to plan the real run."""
+        harness = _LiveHarness(tmp_path, target=shape)
+        assert harness.run(monkeypatch, []) == 0
+        report = harness.report(capsys)
+        assert report['apply'] is False
+        assert report['ledger'] == 'would_write'
+        assert [row['memory_id'] for row in report['records']] == (
+            EXPECTED_STAMP_TARGETS
+        )
+        assert {row['outcome'] for row in report['records']} == {'would_stamp'}
 
 
 class TestMainReportNamesItsTarget:
