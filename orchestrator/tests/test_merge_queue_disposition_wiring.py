@@ -89,7 +89,7 @@ def _make_config(tmp_path: Path) -> OrchestratorConfig:
     )
 
 
-def _make_git_ops(tmp_path: Path) -> GitOps:
+def _make_git_ops(tmp_path: Path) -> MagicMock:
     git_ops = MagicMock(spec=GitOps)
     git_ops.project_root = tmp_path
     git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)

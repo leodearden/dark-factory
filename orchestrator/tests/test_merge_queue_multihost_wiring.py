@@ -232,8 +232,9 @@ class TestBuildRemoteRunnersDfCheckout:
             'the dispatcher root must be resolved once and shared, not '
             're-walked per runner'
         )
-        root = roots[0]
-        assert root is not None, 'the running checkout must resolve'
+        resolved = roots[0]
+        assert resolved is not None, 'the running checkout must resolve'
+        root = Path(resolved)
         assert (root / '.git').exists(), f'{root} is not a checkout root'
         assert Path(__file__).resolve().is_relative_to(root), (
             f'{root} is not the checkout this test is running from'
@@ -1091,7 +1092,7 @@ class TestRunDriftCheck:
         """
         local = _runner_double('local', is_local=True, result=local_result)
         remote = _runner_double('laptop', is_local=False, result=remote_result)
-        return local, remote, _TwoHostAllocator(local, remote)
+        return local, remote, cast(HostAllocator, _TwoHostAllocator(local, remote))
 
     async def test_agree_emits_verdict_parity_ok(self, tmp_path):
         """When local and remote agree, a verdict_parity_ok event is emitted."""
@@ -2111,7 +2112,13 @@ class TestAlarmVerifyWorktreeContention:
 # ``spec_warm`` so the warm ``_spec-``-lane RU case can be constructed).
 
 
-_DEFAULT_EQ = object()
+class _DefaultEscalationQueue:
+    """Sentinel for ``_make_ru_worker(escalation_queue=...)``: build a fresh
+    ``_FakeEscalationQueue``.  Distinct from ``None``, which is a meaningful
+    choice (the worker gets no sink at all)."""
+
+
+_DEFAULT_EQ = _DefaultEscalationQueue()
 
 
 def _make_ru_worker(*, escalate_after_n=2, escalation_queue=_DEFAULT_EQ):
@@ -2129,7 +2136,8 @@ def _make_ru_worker(*, escalate_after_n=2, escalation_queue=_DEFAULT_EQ):
     q: asyncio.Queue = asyncio.Queue()
     eq = (
         _FakeEscalationQueue(open_l1=False)
-        if escalation_queue is _DEFAULT_EQ else escalation_queue
+        if isinstance(escalation_queue, _DefaultEscalationQueue)
+        else escalation_queue
     )
     worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q, escalation_queue=eq)
     worker._unreachable_escalate_after_n = escalate_after_n
