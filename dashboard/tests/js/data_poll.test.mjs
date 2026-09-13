@@ -33,6 +33,14 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
+// The UI's own reader of the map data.js publishes. Imported so the recovery
+// test below can assert what an OPERATOR sees, not merely what the map holds
+// — a static import is safe here (unlike data.js, this module touches no
+// browser global at load; its window assignment is typeof-guarded).
+import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+
+const { staleNoticesForTab } = staleness;
+
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
 const EXPECTED_FUNCTION_NAMES = [
   'endpointsFor',
@@ -1189,6 +1197,59 @@ test('staleness: the last success instant survives a later failure', async () =>
   );
 });
 
+test('staleness: a recovered endpoint clears its failures AND its notice', async () => {
+  // THE MOST LIKELY FAILURE MODE of a staleness indicator is a banner that
+  // never clears once the endpoint comes back — an operator who has been
+  // taught the indicator lies stops reading it, which costs exactly what the
+  // 19.8h wedge cost. Failure -> recovery is also the one path
+  // publishStaleness + `st.failures = 0` is not covered on at the PUBLISHED
+  // map level the UI actually reads.
+  let fail = true;
+  const fetchImpl = url =>
+    (pollKey(url) === CURATOR_PATH && fail
+      ? Promise.reject(new Error('simulated curator failure'))
+      : Promise.resolve({ ok: true, json: async () => ({}) }));
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 1_000;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
+    await api.refreshDFData(undefined, opts);
+    t = Math.max(t + 1, state.get(CURATOR_PATH).nextAllowedAt);
+  }
+
+  const failing = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.equal(failing.failures, STALE_FAILURE_THRESHOLD);
+  assert.equal(
+    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }).length, 1,
+    'the tab must actually be reporting the endpoint stale before recovery is ' +
+      'asserted, or the clearing assertions below prove nothing',
+  );
+
+  fail = false;
+  await api.refreshDFData(undefined, opts);
+
+  const recovered = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.equal(
+    recovered.failures, 0,
+    `the published failure count stayed at ${recovered.failures} after a 200 — ` +
+      'the streak must reset on success, or the indicator is permanent',
+  );
+  assert.equal(
+    recovered.lastSuccessAt, t,
+    'the recovery instant must be recorded, or the age keeps growing from the ' +
+      'pre-outage success and the notice would return with a stale age',
+  );
+  assert.deepEqual(
+    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }),
+    [],
+    'the tab still renders a staleness notice for an endpoint that is serving 200s',
+  );
+});
+
 test('staleness: applyKey cannot clobber __stale (or __loaded)', () => {
   // No server payload may overwrite the map that reports the server is
   // failing. Two independent layers, both asserted:
@@ -1256,15 +1317,46 @@ test('staleness: past the threshold the per-attempt deadline drops to STALE_TIME
   );
 });
 
-test('staleness: an explicit deps.timeoutMs still wins over both defaults', () => {
-  // The reduced deadline is a DEFAULT selection, not an override: the timeout
-  // test above hands refreshOne an explicit timeoutMs: 30000 and asserts the
-  // armed deadline equals it, so `deps.timeoutMs ?? ...` must stay the
-  // outermost choice.
-  assert.match(
-    DATA_JS_SOURCE,
-    /deps\.timeoutMs\s*\?\?/,
-    'refreshOne must still prefer an explicitly injected deps.timeoutMs',
+test('staleness: an explicit deps.timeoutMs still wins over both defaults', async () => {
+  // The reduced deadline is a DEFAULT selection, not an override, so
+  // `deps.timeoutMs ?? ...` must stay the outermost choice EVEN past the
+  // threshold — where STALE_TIMEOUT_MS would otherwise be chosen.
+  //
+  // Asserted behaviourally. The earlier form matched /deps\.timeoutMs\s*\?\?/
+  // against DATA_JS_SOURCE, which is a raw readFileSync with no comment
+  // stripping — and data.js carries that exact text inside a COMMENT, so
+  // deleting the production expression left this test green. The very defect
+  // this task found (STALE_TIMEOUT_MS dead in every browser) was a
+  // source-looks-right/behaviour-wrong gap, which makes a source regex the
+  // wrong instrument for the one claim that is directly executable.
+  const armed = [];
+  const fetchImpl = () => Promise.reject(new Error('simulated failure'));
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = {
+    fetchImpl,
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: (fn, ms) => { armed.push(ms); return armed.length; },
+    clearTimeoutImpl: () => {},
+  };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
+    await api.refreshOne(CURATOR_PATH, [], state, deps);
+    t = state.get(CURATOR_PATH).nextAllowedAt;
+  }
+  assert.equal(state.get(CURATOR_PATH).failures, STALE_FAILURE_THRESHOLD);
+
+  const before = armed.length;
+  await api.refreshOne(CURATOR_PATH, [], state, { ...deps, timeoutMs: 1234 });
+  assert.equal(
+    armed[before], 1234,
+    `an explicitly injected deps.timeoutMs must win even past the threshold; ` +
+      `got ${armed[before]} (${STALE_TIMEOUT_MS} means the reduced default ` +
+      'overrode the caller, 30000 means the full default did)',
   );
 });
 
@@ -1365,8 +1457,20 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
   // (a clock, an RNG, fetch, the timer pair); `timeoutMs` is a POLICY value
   // the selection below it is supposed to choose, and pinning a policy in the
   // defaults is what silently disabled it.
-  const defaults = DATA_JS_SOURCE.match(/const DEFAULT_POLL_DEPS = \{[^}]*\}/);
+  // Matched to the TERMINATING `};` at line start, not to the first `}`. The
+  // `[^}]*` form matched the whole literal only because every value in it
+  // happens to be brace-free today: one block-bodied arrow (or any object
+  // value) would truncate the capture and silently make the fence below
+  // vacuous rather than fail it.
+  const defaults = DATA_JS_SOURCE.match(/const DEFAULT_POLL_DEPS = \{[\s\S]*?\n\};/);
   assert.ok(defaults, 'DEFAULT_POLL_DEPS must remain a greppable object literal');
+  for (const key of ['now', 'random', 'sleep', 'fetchImpl', 'setTimeoutImpl', 'clearTimeoutImpl']) {
+    assert.ok(
+      defaults[0].includes(key),
+      `the captured DEFAULT_POLL_DEPS block is missing ${key} — the match ` +
+        'truncated, so the timeoutMs fence below would be checking a fragment',
+    );
+  }
   assert.ok(
     !/timeoutMs/.test(defaults[0]),
     'DEFAULT_POLL_DEPS must NOT pin timeoutMs — doing so makes `deps.timeoutMs ?? ...` ' +

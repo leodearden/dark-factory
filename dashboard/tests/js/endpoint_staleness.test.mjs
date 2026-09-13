@@ -350,11 +350,51 @@ test("data.js's fallback threshold agrees with STALE_FAILURE_THRESHOLD", () => {
     `data.js falls back to ${fallback[1]} while this module exports ` +
       `${STALE_FAILURE_THRESHOLD} — the two must agree`,
   );
+});
 
-  // And the lazy read is the primary path, not dead code.
-  assert.match(
-    src,
-    /window\.DF_ENDPOINT_STALENESS/,
-    'data.js must prefer the loaded module\'s threshold over its fallback',
+test('data.js prefers THIS module\'s threshold over its own fallback', async () => {
+  // The fallback exists only for the harness; in the browser the loaded
+  // module's value must win, or a threshold raised here would leave data.js
+  // shortening deadlines on a different schedule than the UI reports
+  // staleness on.
+  //
+  // Asserted behaviourally. The earlier form matched
+  // /window\.DF_ENDPOINT_STALENESS/ against raw (non-comment-stripped) data.js
+  // source, and data.js names that global in a COMMENT explaining the lazy
+  // read — so deleting the real read left the assertion green while its
+  // message claimed the opposite.
+  const api = loadDataJs();
+  // Set AFTER the load, deliberately: loadDataJs installs a fresh
+  // globalThis.window, and LAZINESS is exactly the property under test. data.js
+  // is the FIRST classic script in index.html, so a module-scope read would be
+  // a hard load-order dependency on a script that has not run yet.
+  globalThis.window.DF_ENDPOINT_STALENESS = { STALE_FAILURE_THRESHOLD: 99 };
+
+  const armed = [];
+  const state = api.createPollState();
+  let t = 0;
+  const deps = {
+    fetchImpl: () => Promise.reject(new Error('simulated failure')),
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: (fn, ms) => { armed.push(ms); return armed.length; },
+    clearTimeoutImpl: () => {},
+  };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
+    await api.refreshOne(MERGE_PATH, [], state, deps);
+    t = state.get(MERGE_PATH).nextAllowedAt;
+  }
+  assert.equal(state.get(MERGE_PATH).failures, STALE_FAILURE_THRESHOLD);
+
+  const before = armed.length;
+  await api.refreshOne(MERGE_PATH, [], state, deps);
+  assert.equal(
+    armed[before], 30000,
+    `at ${STALE_FAILURE_THRESHOLD} failures against a published threshold of ` +
+      `99, the deadline must stay the full 30000 ms; got ${armed[before]} — ` +
+      'data.js took its own fallback instead of the loaded module\'s value, ' +
+      'so the two can drift apart silently in the browser',
   );
 });

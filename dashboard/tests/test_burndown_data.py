@@ -2543,6 +2543,15 @@ class TestCollectSnapshotExplicitRollback:
 # ---------------------------------------------------------------------------
 
 
+# The ~209 s paginated worst case measured for ONE root of this repo's size —
+# ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` sequential round trips at ~0.33-0.35 s each.
+# The measurement and its derivation live on ``burndown._SNAPSHOT_PAGE_SIZE``;
+# this is the test's own copy of the FLOOR it enforces, deliberately spelled
+# as a number rather than derived from ``_SNAPSHOT_PER_ROOT_BUDGET`` (deriving
+# the bound from the value under test would assert nothing).
+_MEASURED_PAGINATED_WORST_CASE = 209.0
+
+
 class TestCollectSnapshotPerRootBudget:
     """``collect_snapshot``'s Phase-2 fan-out is whole-operation bounded per root.
 
@@ -2715,21 +2724,32 @@ class TestCollectSnapshotPerRootBudget:
         from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET
 
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
+        one_cycle_half = app_module._SAMPLE_INTERVAL_SECONDS / 2
 
-        assert budget >= DEFAULT_WHOLE_OPERATION_BUDGET, (
-            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the shared route '
-            f'default ({DEFAULT_WHOLE_OPERATION_BUDGET}). A BACKGROUND root may '
-            'never get LESS time than a request-path one: the paginated '
-            'fallback alone costs ~209 s MEASURED for one root of this repo\'s '
-            'size (see _SNAPSHOT_PAGE_SIZE), so a route-sized bound would kill '
-            'every big root permanently in an append-only record.'
+        # BOTH bounds are the ones the derivation actually names. An earlier
+        # form of this test asserted `>= DEFAULT_WHOLE_OPERATION_BUDGET` (7.0)
+        # and `< _SAMPLE_INTERVAL_SECONDS` (600) — two orders of magnitude
+        # apart from the stated floor at one end and double the stated ceiling
+        # at the other — so a value of 10.0 passed while doing exactly the
+        # permanent-hole damage the docstring describes.
+        assert budget >= _MEASURED_PAGINATED_WORST_CASE, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the MEASURED '
+            f'~{_MEASURED_PAGINATED_WORST_CASE} s paginated worst case for one '
+            "root of this repo's size (see _SNAPSHOT_PAGE_SIZE). Anything below "
+            'it times out every big root on EVERY cycle, and because snapshots '
+            'is APPEND-ONLY and no later cycle backfills, that is a permanent '
+            'unexplained hole in the chart — not a degraded read. The shared '
+            f'route default ({DEFAULT_WHOLE_OPERATION_BUDGET}) is the value '
+            'this must NOT be confused with: a BACKGROUND root that walks '
+            'ceil(N/P) sequential pages is not a request-path one.'
         )
-        assert budget < app_module._SAMPLE_INTERVAL_SECONDS, (
-            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is not inside one collector '
-            f'cycle (_SAMPLE_INTERVAL_SECONDS = '
-            f'{app_module._SAMPLE_INTERVAL_SECONDS}). A root that cannot finish '
-            'inside one cycle can never finish at all, and a budget at or above '
-            'the interval lets cycle N still be running when cycle N+1 starts.'
+        assert budget <= one_cycle_half, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
+            f'cycle ({one_cycle_half} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{app_module._SAMPLE_INTERVAL_SECONDS} / 2). A root that cannot '
+            'finish inside one cycle can never finish at all, and the halving '
+            'is what guarantees cycle N is done before cycle N+1 starts even '
+            'when a root spends its whole budget.'
         )
 
 
