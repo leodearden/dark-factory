@@ -92,6 +92,11 @@ def _declared_addopts(member: str) -> str:
     NON-asserting, unlike :func:`_addopts`. The structural walk below reads
     every discovered module, and a module that declares no addopts at all is a
     legitimate answer there — it simply contributes no ``-n``.
+
+    *member* is a repo-relative directory, so ``'.'`` names the ROOT
+    pyproject.toml — which is what the non-leakage assertion reads, and which is
+    a genuinely different file from any member's rather than a special case of
+    one.
     """
     ini_options = _pyproject(member).get('tool', {}).get('pytest', {}).get('ini_options', {})
     return ini_options.get('addopts', '')
@@ -442,4 +447,184 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
         f'{DEFAULT_DEPENDENCY_GROUP} specifically: it is the group uv installs '
         'by default, so a declaration parked anywhere else never reaches the '
         'interpreter that runs the leg'
+    )
+
+
+# ---------------------------------------------------------------------------
+# The `scripts` leg, the non-leakage claim, and the ruled exclusions (task 5408)
+# ---------------------------------------------------------------------------
+
+# The module config that defines the `scripts` verify leg. It has no
+# pyproject.toml of its own, so its flags live on its test_command instead —
+# see `test_root_addopts_never_leaks_the_parallel_flags` for why that is the
+# SPOT rather than the root inifile.
+SCRIPTS_MODULE_PREFIX = 'scripts'
+
+# The members left SERIAL on purpose, each with the reason it was ruled out.
+# A table rather than prose, so a later "helpful" widening fails against a
+# message that states the reason instead of merely the expectation.
+RULED_SERIAL_MEMBERS = {
+    'shared': (
+        'measured FASTER serial on the task-5408 tree (44.9s serial vs 80.9s at '
+        '-n 8), and three of its suites — tests/test_proc_group.py, '
+        'tests/test_concurrency.py, tests/test_cli_invoke.py — need '
+        '@pytest.mark.xdist_group pins before they can be trusted across '
+        'workers. Parallelising it would cost wall-clock AND risk a flake, '
+        'which is why 5408 declared pytest-xdist for shared (the `scripts` leg '
+        "selects it) WITHOUT touching shared's own addopts"
+    ),
+}
+
+# The two modules that were already parallel before task 5408 and are NOT this
+# task's to re-spell. Task 3589 is the one that proposes replacing `auto` with a
+# literal `-n 8` here, and reconciling that against
+# dark-factory-orchestrator.yaml's verify_env pin is its whole subject.
+TASK_3589_MEMBERS = ('orchestrator', 'fused-memory')
+
+
+def _scripts_pytest_argv(module_configs: dict[str, ModuleConfig]) -> list[str]:
+    """pytest's OWN argv in the ``scripts`` module's test_command.
+
+    Post-anchor only, via ``vci.anchor_split``: the pre-anchor
+    ``uv run --project shared`` tokens are uv's, and reading the whole segment
+    would confuse an environment selector with one of pytest's own flags.
+    """
+    assert SCRIPTS_MODULE_PREFIX in module_configs, (
+        f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml is not discovered by the '
+        'production config._discover_module_configs walk, so there is no '
+        f'scripts verify leg to assert about. Discovered: '
+        f'{sorted(module_configs)}'
+    )
+    command = module_configs[SCRIPTS_MODULE_PREFIX].test_command
+    assert command, (
+        f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml declares no test_command, '
+        'so the assertions below would be satisfied for the wrong reason'
+    )
+    segment = vci.required_segment(
+        command, vci.PYTEST, label=f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml test_command'
+    )
+    return vci.anchor_split(
+        segment, vci.PYTEST, label=f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml test_command'
+    )[1]
+
+
+def test_scripts_leg_carries_the_parallel_flags_on_its_test_command(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """The ``scripts`` verify leg runs parallel, declared on its test_command.
+
+    ``scripts/`` has no pyproject.toml, so it is the one parallelised leg whose
+    flags cannot live in addopts. Its command runs from the worktree root over
+    ``tests/scripts/ scripts/tests/``, so pytest's rootdir — and therefore its
+    inifile — resolves to the REPO ROOT, not to anything scripts-specific. The
+    single place that defines this leg is its ``test_command``, so that is where
+    the flags belong (heuristic 11); the companion assertion in
+    ``test_root_addopts_never_leaks_the_parallel_flags`` is what makes the other
+    half of that claim checkable.
+
+    With this in place the structural invariant in
+    ``test_every_pytest_leg_running_workers_declares_the_plugin`` then requires
+    ``shared`` — the member this command's ``--project`` selects — to declare
+    pytest-xdist, even though ``shared``'s own suite stays serial.
+    """
+    argv = _scripts_pytest_argv(discover_module_configs())
+
+    assert _flag_value(argv, WORKERS_FLAG) == WORKERS_VALUE, (
+        f"{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml's test_command passes pytest "
+        f'{argv!r}, which does not carry `{WORKERS_FLAG} {WORKERS_VALUE}` '
+        '(task 5408). This leg is the slowest in the gate — MEASURED on the 5408 '
+        'tree at `-n 8 --dist loadgroup`: 5333 passed / 2 skipped in 117.71s, '
+        'against 394-490s serial. The flags go HERE and not in the root '
+        "pyproject.toml's addopts, because that inifile also governs every bare "
+        'root-bound pytest run'
+    )
+    assert _flag_value(argv, DIST_FLAG) == DIST_VALUE, (
+        f"{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml's test_command passes pytest "
+        f'{argv!r}, which does not carry `{DIST_FLAG} {DIST_VALUE}` (task 5408) — '
+        f'the grouping discipline that must travel with {WORKERS_FLAG} so '
+        '@pytest.mark.xdist_group is a guarantee rather than a hint'
+    )
+
+
+def test_root_addopts_never_leaks_the_parallel_flags() -> None:
+    """The ROOT pyproject.toml's addopts must carry neither ``-n`` nor ``--dist``.
+
+    THE SPOT CLAIM, MADE CHECKABLE. The root inifile is NOT the ``scripts``
+    module's private config even though that leg resolves its rootdir there: the
+    root pyproject's own comment records that it equally governs a bare
+    root-bound ``pytest``, a ``-c pyproject.toml`` run, and any argument set
+    spanning two subprojects. Confirmed empirically on the 5408 tree — a
+    collect-only of the live scripts command reported
+    ``5335/5345 tests collected (10 deselected)``, and only the root addopts'
+    ``-m 'not smoke and not integration and not warm_lane_bash'`` can deselect
+    anything there.
+
+    So putting the flags here would parallelise all of those as a side effect of
+    a change scoped to ONE verify leg — including runs in members that declare no
+    pytest-xdist, where pytest would exit 4. This assertion holds from the
+    start; it exists so a later widening fails loudly rather than passing as a
+    convenience.
+    """
+    tokens = shlex.split(_declared_addopts('.'))
+    offenders = [token for token in tokens if token in (WORKERS_FLAG, DIST_FLAG)]
+    assert not offenders, (
+        f"the ROOT pyproject.toml's addopts is {_declared_addopts('.')!r}, which "
+        f'carries {offenders!r} (task 5408). Those flags belong on '
+        f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml::test_command, the single '
+        'place that defines the scripts verify leg. This inifile is not that '
+        "leg's private config: it is also what a bare root-bound `pytest`, a "
+        '`-c pyproject.toml` run and any argument set spanning two subprojects '
+        'read, so parallelising here reaches every one of those — including '
+        'members that declare no pytest-xdist, where pytest exits 4 with '
+        f'`unrecognized arguments: {WORKERS_FLAG}`'
+    )
+
+
+@pytest.mark.parametrize('member', sorted(RULED_SERIAL_MEMBERS))
+def test_ruled_serial_members_stay_serial(member: str) -> None:
+    """A member ruled out of the parallel set stays out, with the reason attached.
+
+    An exclusion that is merely ABSENT is indistinguishable from an oversight,
+    and the next reader completing the set is doing the obvious thing. Pinning it
+    here is what makes the omission legible as a decision — and the failure
+    message carries the REASON, so whoever trips it argues with the measurement
+    rather than with the assertion.
+    """
+    tokens = shlex.split(_declared_addopts(member))
+    offenders = [token for token in tokens if token in (WORKERS_FLAG, DIST_FLAG)]
+    assert not offenders, (
+        f"{member}/pyproject.toml's addopts now carries {offenders!r}, but this "
+        f'member was RULED serial by task 5408, not overlooked: '
+        f'{RULED_SERIAL_MEMBERS[member]}. Re-measure before widening, and record '
+        'the measurement here rather than deleting this pin'
+    )
+
+
+@pytest.mark.parametrize('member', TASK_3589_MEMBERS)
+def test_the_already_parallel_members_still_resolve_through_the_shared_knob(
+    member: str,
+) -> None:
+    """orchestrator and fused-memory keep ``-n auto``; re-spelling it is task 3589's.
+
+    Both were parallel before task 5408 and neither is this task's to re-spell.
+    Task 3589 is the one that proposes a literal ``-n 8`` in these two addopts,
+    and reconciling that against ``dark-factory-orchestrator.yaml``'s
+    ``verify_env`` pin — deciding which layer is authoritative — is 3589's whole
+    subject, stated in that key's own comment block.
+
+    Pinned so the reconciliation is a deliberate edit here rather than a silent
+    divergence: today all five parallel modules resolve their worker count
+    through the same one knob, and the next A/B cut moves them together.
+    """
+    tokens = shlex.split(_declared_addopts(member))
+    workers = _flag_value(tokens, WORKERS_FLAG)
+    assert workers == WORKERS_VALUE, (
+        f'{member}/pyproject.toml declares {WORKERS_FLAG} {workers!r}, not '
+        f'{WORKERS_VALUE!r}. This member was already parallel before task 5408 '
+        'and 5408 deliberately left it alone — replacing `auto` with a literal '
+        'here is TASK 3589\'s, whose subject is reconciling that literal against '
+        "dark-factory-orchestrator.yaml's verify_env pin and stating which layer "
+        'is authoritative. If 3589 is what you are landing, update this pin in '
+        'that commit and say so; do not let the five parallel modules diverge '
+        'silently onto two different worker-count sources'
     )
