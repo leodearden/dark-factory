@@ -940,20 +940,40 @@ class TestClassifyLedgerTarget:
 
 
 class TestAssertLedgerTargetLive:
-    """Both ways to write a valid row nothing reads are refused, loudly."""
+    """Every way to write a valid row nothing reads is refused, loudly.
+
+    The gate CONSUMES a verdict rather than taking one, so each leg below
+    classifies the target shape it describes and hands the answer over — the
+    same one probe, same two consumers, that ``main`` performs.
+    """
 
     @staticmethod
     def _existing_db(tmp_path: Path) -> Path:
-        db_path = tmp_path / _mod.LEDGER_DB_FILENAME
-        db_path.touch()
-        return db_path
+        """A REAL ledger, not a ``touch()``ed file: the accept path now turns
+        on α's schema being there, which is the whole point of the verdict."""
+        return _initialized_ledger_db(tmp_path / _mod.LEDGER_DB_FILENAME)
 
-    def test_an_enabled_ledger_that_already_exists_is_accepted(
+    @staticmethod
+    def _assert_target(db_path: Path, *, enabled: bool = True) -> None:
+        _mod.assert_ledger_target_live(
+            state=_mod.classify_ledger_target(db_path),
+            db_path=db_path,
+            recon_ledger_enabled=enabled,
+        )
+
+    def test_a_seeded_ledger_is_accepted(self, tmp_path: Path) -> None:
+        self._assert_target(self._existing_db(tmp_path))
+
+    def test_an_unreadable_target_is_accepted_rather_than_refused(
         self, tmp_path: Path
     ) -> None:
-        _mod.assert_ledger_target_live(
-            db_path=self._existing_db(tmp_path), recon_ledger_enabled=True
-        )
+        """Fail-OPEN on UNDETERMINED. The gate must refuse whenever it can
+        PROVE the row would be unread; refusing on a probe that established
+        nothing would invent a new way to block the legitimate one-shot run,
+        with no remedy available inside the script."""
+        garbage = tmp_path / _mod.LEDGER_DB_FILENAME
+        garbage.write_bytes(b'not a database' * 16)
+        self._assert_target(garbage)
 
     def test_a_disabled_ledger_is_refused_even_though_the_file_is_there(
         self, tmp_path: Path
@@ -961,9 +981,7 @@ class TestAssertLedgerTargetLive:
         """``server/main.py`` wires ``set_recon_ledger`` only under the flag, so
         the row's only consumer is not attached at all."""
         with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
-            _mod.assert_ledger_target_live(
-                db_path=self._existing_db(tmp_path), recon_ledger_enabled=False
-            )
+            self._assert_target(self._existing_db(tmp_path), enabled=False)
         assert 'recon_ledger_enabled' in str(excinfo.value)
 
     def test_a_missing_ledger_is_refused_and_the_message_names_the_path(
@@ -973,11 +991,30 @@ class TestAssertLedgerTargetLive:
         success for a migration that is unlikely to be re-run."""
         missing = tmp_path / 'nowhere' / _mod.LEDGER_DB_FILENAME
         with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
-            _mod.assert_ledger_target_live(
-                db_path=missing, recon_ledger_enabled=True
-            )
+            self._assert_target(missing)
         assert str(missing) in str(excinfo.value)
         assert not missing.exists()
+
+    def test_a_stray_unseeded_file_is_refused_separately_from_a_missing_one(
+        self, tmp_path: Path
+    ) -> None:
+        """Same outcome — ``initialize()`` seeds the schema and the row lands
+        unread — but a DIFFERENT remedy: the path is occupied rather than
+        wrong, so the two refusals must not read alike. An operator told to
+        "re-run from the right directory" when they already are has nowhere to
+        go; the file needs deleting."""
+        stray = tmp_path / _mod.LEDGER_DB_FILENAME
+        stray.touch()
+        with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
+            self._assert_target(stray)
+        message = str(excinfo.value)
+        assert str(stray) in message
+        assert _mod.LEDGER_TABLE_NAME in message
+
+        missing = tmp_path / 'nowhere' / _mod.LEDGER_DB_FILENAME
+        with pytest.raises(_mod.LedgerTargetUnusable) as other:
+            self._assert_target(missing)
+        assert message != str(other.value)
 
     def test_a_disabled_ledger_is_reported_ahead_of_a_missing_file(
         self, tmp_path: Path
@@ -985,9 +1022,8 @@ class TestAssertLedgerTargetLive:
         """When both are wrong the flag is the actionable fact: the row would be
         unreadable wherever it landed, so the path is not the interesting one."""
         with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
-            _mod.assert_ledger_target_live(
-                db_path=tmp_path / _mod.LEDGER_DB_FILENAME,
-                recon_ledger_enabled=False,
+            self._assert_target(
+                tmp_path / _mod.LEDGER_DB_FILENAME, enabled=False
             )
         assert 'recon_ledger_enabled' in str(excinfo.value)
 
@@ -1037,10 +1073,10 @@ class _LiveHarness:
         self.data_dir.mkdir(parents=True)
         self.db_path = self.data_dir / _mod.LEDGER_DB_FILENAME
         if create_db:
-            # An empty file IS an empty SQLite database, so this is a ledger
-            # that exists without yet holding a schema — the shape an operator
-            # aiming at a real deployment has.
-            self.db_path.touch()
+            # A REAL ledger, carrying α's schema — the shape an operator aiming
+            # at a running deployment actually has. A bare ``touch()`` is the
+            # OTHER shape (a stray file), and the gate now tells them apart.
+            _initialized_ledger_db(self.db_path)
 
     def _make_config(self) -> SimpleNamespace:
         self.trace.append('config')

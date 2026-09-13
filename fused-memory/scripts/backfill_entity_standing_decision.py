@@ -65,9 +65,11 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -639,6 +641,43 @@ def resolve_exit_code(report: dict[str, Any]) -> int:
 LEDGER_DB_FILENAME = 'reconciliation.db'
 
 
+#: α's table inside that database. Spelled here rather than imported because
+#: ``recon_ledger`` has no constant for it (the name lives inside its
+#: ``TABLE_SQL`` literal) and because importing the module would defeat a probe
+#: whose whole job is to decide, without opening a backend, whether there is a
+#: ledger there at all. The duplication is one identifier, and a drift between
+#: the two shows up as this gate refusing a deployment that works — loud —
+#: never as it accepting one that does not.
+LEDGER_TABLE_NAME = 'recon_ledger'
+
+
+class LedgerTargetState(StrEnum):
+    """What a read-only probe established about the file at the target path.
+
+    Four verdicts rather than a boolean, because ``exists()`` answers the wrong
+    question: an empty file IS a valid empty SQLite database, so a stray file
+    at the resolved path is indistinguishable by existence alone from the
+    ledger a running server has open. Two consumers read the SAME verdict —
+    :func:`assert_ledger_target_live`, which refuses an ``--apply``, and
+    ``main``'s choice of ledger object, which decides whether there is anything
+    there to open — so the gate and the thing it guards cannot disagree about
+    what was at the path.
+    """
+
+    #: α's ``recon_ledger`` table is present: a database some deployment seeded.
+    LIVE = 'live'
+    #: Nothing at the resolved path. ``ReconLedgerStore.initialize()`` would
+    #: CREATE it, schema and all, and report a written row into it.
+    MISSING = 'missing'
+    #: A readable SQLite database with no ``recon_ledger`` table — a stray or
+    #: never-seeded file, which no server has ever opened as its ledger.
+    NO_SCHEMA = 'no_schema'
+    #: Something is there and the probe could not read it (a directory, a
+    #: non-SQLite file, a permission denial). Nothing was established either
+    #: way, which is why this verdict is ACCEPTED — see the gate below.
+    UNDETERMINED = 'undetermined'
+
+
 class LedgerTargetUnusable(RuntimeError):
     """``--apply`` was aimed at a ledger no running server would ever read.
 
@@ -668,36 +707,99 @@ def resolve_ledger_db_path(config: Any) -> Path:
     return (Path(config.reconciliation.data_dir) / LEDGER_DB_FILENAME).resolve()
 
 
+def classify_ledger_target(db_path: Path) -> LedgerTargetState:
+    """Name what is at *db_path*, having created and modified nothing.
+
+    The probe is a stdlib ``sqlite3`` open in ``mode=ro``, which CANNOT create
+    the file — the property that lets this run before anything else and lets a
+    dry run consult the answer without arming the gate it reports on. The
+    ``sqlite_master`` lookup for :data:`LEDGER_TABLE_NAME` is what separates a
+    seeded ledger from a stray file, since both merely *exist*.
+
+    ``db_path.exists()`` is consulted BEFORE any open error is interpreted, and
+    that order is load-bearing: measured against sqlite 3.50.4 on 2026-09-13, a
+    missing path and a directory both raise ``sqlite3.OperationalError`` from
+    the open (``'unable to open database file'`` and ``'disk I/O error'``
+    respectively — and the message text is a build detail, not a contract), so
+    the exception alone cannot tell "nothing is here" from "something is here I
+    cannot read". Those two want opposite treatment from the gate.
+
+    A busy ledger is LIVE: the real migration runs against a database the
+    server holds OPEN in WAL mode, measured to read cleanly through a
+    concurrent ``ReconLedgerStore``.
+
+    Returns:
+        The verdict. Never raises for a bad target — an unreadable one is
+        :attr:`LedgerTargetState.UNDETERMINED`, which the gate accepts.
+    """
+    if not db_path.exists():
+        return LedgerTargetState.MISSING
+    try:
+        connection = sqlite3.connect(f'{db_path.resolve().as_uri()}?mode=ro', uri=True)
+        try:
+            seeded = connection.execute(
+                'SELECT name FROM sqlite_master WHERE type = ? AND name = ?',
+                ('table', LEDGER_TABLE_NAME),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return LedgerTargetState.UNDETERMINED
+    return LedgerTargetState.LIVE if seeded else LedgerTargetState.NO_SCHEMA
+
+
 def assert_ledger_target_live(
-    *, db_path: Path, recon_ledger_enabled: bool
+    *,
+    state: LedgerTargetState,
+    db_path: Path,
+    recon_ledger_enabled: bool,
 ) -> None:
     """Refuse an ``--apply`` whose row would land where nothing reads it.
 
-    Two independent ways to write a perfectly valid ACTIVE row that γ's Hook-A
-    filter and δ's Hook-B annotation never see, both of which otherwise exit 0:
+    Three independent ways to write a perfectly valid ACTIVE row that γ's
+    Hook-A filter and δ's Hook-B annotation never see, every one of which
+    otherwise exits 0:
 
     * the deployment has the ledger switched OFF. ``server/main.py`` calls
       ``memory_service.set_recon_ledger`` only inside
       ``if config.reconciliation.recon_ledger_enabled``, so on such a host the
       row's only consumer is not wired at all;
-    * the run was launched from the wrong directory. ``data_dir`` is relative
-      to the CWD and ``ReconLedgerStore.initialize()`` does ``mkdir(parents=
-      True)`` plus ``CREATE TABLE IF NOT EXISTS`` — so a misdirected run does
-      not fail, it CREATES a fresh empty ledger and writes the row into that.
+    * the run was launched from the wrong directory (MISSING). ``data_dir`` is
+      relative to the CWD and ``ReconLedgerStore.initialize()`` does
+      ``mkdir(parents=True)`` plus ``CREATE TABLE IF NOT EXISTS`` — so a
+      misdirected run does not fail, it CREATES a fresh empty ledger and writes
+      the row into that;
+    * the resolved path holds a file that is not a seeded ledger (NO_SCHEMA).
+      Identical outcome to the case above and reached the same way, because
+      ``initialize()`` would add the schema to it — which is exactly why
+      existence was never the question worth asking.
 
     Checked in that order: a disabled ledger makes the row unreadable wherever
     it is written, so the path is not the interesting fact about such a run.
+
+    ASYMMETRIC BY DESIGN. Fail-CLOSED on a positively established defect
+    (MISSING, NO_SCHEMA) and fail-OPEN on :attr:`LedgerTargetState.
+    UNDETERMINED`. The failure this gate prevents is a run that succeeds while
+    having no effect, so it must refuse whenever it can PROVE the target is
+    unread; but refusing on every probe error would invent a brand-new way to
+    block the legitimate one-shot migration — on some sqlite build, some
+    filesystem, some permission shape nobody measured — and an operator facing
+    a gate that cannot be satisfied has no remedy inside the script at all.
+
+    Consumes a verdict rather than taking one, so the caller classifies ONCE
+    and hands the same snapshot here and to its choice of ledger object.
 
     Only ``--apply`` is gated. A dry run writes nothing and is exactly the
     rehearsal an operator should use to discover a misconfigured target, so
     refusing it would remove the diagnostic.
 
     Args:
+        state: The verdict from :func:`classify_ledger_target` for *db_path*.
         db_path: The absolute target from :func:`resolve_ledger_db_path`.
         recon_ledger_enabled: ``config.reconciliation.recon_ledger_enabled``.
 
     Raises:
-        LedgerTargetUnusable: On either defect. Nothing has been written.
+        LedgerTargetUnusable: On any of the three. Nothing has been written.
     """
     if not recon_ledger_enabled:
         raise LedgerTargetUnusable(
@@ -708,7 +810,7 @@ def assert_ledger_target_live(
             'flag for this deployment, confirm the server picked it up, and '
             're-run. Re-run without --apply to obtain the report meanwhile.'
         )
-    if not db_path.exists():
+    if state is LedgerTargetState.MISSING:
         raise LedgerTargetUnusable(
             f'Refusing --apply: no recon ledger exists at {str(db_path)!r}. '
             'reconciliation.data_dir is resolved against this process CWD '
@@ -718,6 +820,20 @@ def assert_ledger_target_live(
             "seeing nothing; hint: re-run from the fused-memory server's own "
             f'working directory — the one whose {LEDGER_DB_FILENAME} the '
             'server has open — or point --config at that deployment.'
+        )
+    if state is LedgerTargetState.NO_SCHEMA:
+        raise LedgerTargetUnusable(
+            f'Refusing --apply: the file at {str(db_path)!r} is a SQLite '
+            f'database with no {LEDGER_TABLE_NAME!r} table, so no fused-memory '
+            'server has ever opened it as its ledger — an --apply here would '
+            'seed the schema, write the ACTIVE row and exit 0 with nothing '
+            'reading it. This is a DIFFERENT defect from a wrong directory: '
+            'the path is occupied, by a stray or never-seeded file. Note that '
+            'every dry run of this script BEFORE task 2900 hardened it left '
+            'exactly such a file behind, so one here is likely litter from an '
+            f'earlier rehearsal; hint: delete {str(db_path)!r} if that is what '
+            "it is, and re-run from the fused-memory server's own working "
+            'directory — or point --config at that deployment.'
         )
 
 
@@ -807,11 +923,15 @@ def main(argv: list[str] | None = None) -> int:
         config = FusedMemoryConfig()
         db_path = resolve_ledger_db_path(config)
         ledger_enabled = bool(config.reconciliation.recon_ledger_enabled)
+        # ONE probe per run, taken before anything is constructed and shared by
+        # every consumer below, so the gate and the ledger object can never
+        # disagree about what was at the path.
+        state = classify_ledger_target(db_path)
         # Before MemoryService, which itself writes on initialize() — an
         # --apply aimed at a ledger nothing reads must touch no store at all.
         if args.apply:
             assert_ledger_target_live(
-                db_path=db_path, recon_ledger_enabled=ledger_enabled
+                state=state, db_path=db_path, recon_ledger_enabled=ledger_enabled
             )
 
         memory = MemoryService(config)
