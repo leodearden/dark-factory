@@ -180,3 +180,80 @@ class TestRunTick:
         ).fetchone()[0]
         conn.close()
         assert old_row == 0, 'Very old row should have been cleaned up'
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-9: the exact-or-stem metric-name guard (detail B)
+# ---------------------------------------------------------------------------
+
+
+class TestUnexpectedMetricNames:
+    """The guard's purpose is unchanged: a typo must still fail.
+
+    What changed is that it must now also admit names with a DYNAMIC tail —
+    ``own_cpu_some10:<cgroup-leaf>`` is generated per discovered cgroup, so no
+    fixed frozenset can ever list them. A stem set is the smallest extension
+    that admits the tail while keeping a misspelling rejected.
+    """
+
+    EXACT = frozenset({'runqueue_ratio', 'runqueue_read_ok'})
+    STEMS = frozenset({'own_cpu_some10', 'own_read_ok'})
+
+    def _unexpected(self, *names):
+        from sampler.sampler import unexpected_metric_names
+
+        return unexpected_metric_names(set(names), exact=self.EXACT, stems=self.STEMS)
+
+    def test_exact_name_accepted(self):
+        assert self._unexpected('runqueue_ratio', 'runqueue_read_ok') == set()
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            'own_cpu_some10:orchestrator-dark-factory.service',
+            'own_read_ok:df-dark_factory.slice',
+            'own_cpu_some10:df-reify.slice',
+        ],
+    )
+    def test_stem_with_a_tail_accepted(self, name):
+        assert self._unexpected(name) == set()
+
+    def test_bare_stem_without_a_tail_rejected(self):
+        """A stem is not itself a metric — nothing ever emits a bare one."""
+        assert self._unexpected('own_cpu_some10') == {'own_cpu_some10'}
+
+    def test_misspelled_stem_rejected(self):
+        assert self._unexpected('own_cpu_some_10:leaf') == {'own_cpu_some_10:leaf'}
+
+    def test_stem_with_an_empty_tail_rejected(self):
+        """``own_read_ok:`` names no cgroup, so it is evidence about nothing."""
+        assert self._unexpected('own_read_ok:') == {'own_read_ok:'}
+
+    def test_only_the_first_colon_splits_the_stem(self):
+        """A leaf name may itself contain ':' — the tail is everything after."""
+        assert self._unexpected('own_read_ok:weird:leaf.slice') == set()
+
+    def test_empty_stem_set_degenerates_to_exact_membership(self):
+        """PSI keeps its current strictness: no dynamic tail is possible there."""
+        from sampler.sampler import unexpected_metric_names
+
+        psi_exact = frozenset({'psi_cpu_some_avg10'})
+        assert unexpected_metric_names(
+            {'psi_cpu_some_avg10'}, exact=psi_exact, stems=frozenset()
+        ) == set()
+        assert unexpected_metric_names(
+            {'psi_cpu_some_avg10x'}, exact=psi_exact, stems=frozenset()
+        ) == {'psi_cpu_some_avg10x'}
+        # A colon name cannot sneak past an empty stem set either.
+        assert unexpected_metric_names(
+            {'psi_cpu_some_avg10:leaf'}, exact=psi_exact, stems=frozenset()
+        ) == {'psi_cpu_some_avg10:leaf'}
+
+    def test_every_offender_is_reported_not_just_the_first(self):
+        assert self._unexpected(
+            'runqueue_ratio', 'runqueu_ratio', 'own_read_ok:', 'own_read_ok:leaf'
+        ) == {'runqueu_ratio', 'own_read_ok:'}
+
+    def test_empty_input_is_accepted(self):
+        """A degraded collection group hands run_tick {} — never an error."""
+        assert self._unexpected() == set()
