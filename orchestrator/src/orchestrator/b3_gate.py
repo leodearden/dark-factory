@@ -42,6 +42,14 @@ FRESH = 'fresh'
 DRIFT = 'drift'
 ABORT = 'abort'
 
+# Closed domain for check_proposal's 'age_state' key — WHY a proposal's age is
+# or is not known.  Before task 5361 all four causes collapsed to a bare
+# 'age_seconds': None, indistinguishable to every consumer.
+AGE_PARSED = 'parsed'
+AGE_UNPARSEABLE = 'unparseable'
+AGE_ABSENT = 'absent'
+AGE_NO_CLOCK = 'no_clock'
+
 POST_MERGE_RED_MAIN_REASON_PREFIX = 'Post-merge unscoped type-check failed'
 """Prefix that identifies the post-merge-red-main fix-forward class.
 
@@ -288,6 +296,35 @@ def _run_git(args: list[str], cwd: str) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def _age_of(
+    entry: dict[str, Any] | None, now: datetime | None,
+) -> tuple[float | None, str]:
+    """Return ``(age_seconds, age_state)`` for a proposal entry's investigated_at.
+
+    The state names WHY an age is unavailable, so the four causes that used to
+    collapse into a single bare ``None`` stay distinguishable to a consumer:
+    no timestamp, no clock, an unreadable string, and a naive timestamp that
+    cannot be subtracted from an aware one.
+
+    Warns on the unparseable path rather than swallowing it — a producer
+    writing a timestamp this gate cannot read is a bug worth surfacing, and
+    siting the warning here means no caller can silently drop it.
+    """
+    investigated_at = (entry or {}).get('investigated_at')
+    if not investigated_at:
+        return None, AGE_ABSENT
+    if now is None:
+        return None, AGE_NO_CLOCK
+    try:
+        return (now - datetime.fromisoformat(investigated_at)).total_seconds(), AGE_PARSED
+    except Exception as exc:
+        logger.warning(
+            'check_proposal: unparseable investigated_at %r — treating age as '
+            'unknown: %s', investigated_at, exc,
+        )
+        return None, AGE_UNPARSEABLE
+
+
 def check_proposal(
     entry: dict[str, Any] | None,
     *,
@@ -342,7 +379,7 @@ def check_proposal(
       7. diff main_sha..main -- files_referenced non-empty -> drift (P2)
       8. else fresh
 
-    Keys: verdict, reason, head_sha, main_sha, age_seconds.
+    Keys: verdict, reason, head_sha, main_sha, age_seconds, age_state.
     The 'run_git' parameter defaults to _run_git; tests inject a fake.
     """
     if run_git is None:
@@ -356,26 +393,24 @@ def check_proposal(
             'head_sha': None,
             'main_sha': None,
             'age_seconds': None,
+            'age_state': AGE_ABSENT,
         }
 
     head_sha = entry.get('head_sha')
     main_sha = entry.get('main_sha')
 
+    # Parsed once per call and shared by every return path, so an unparseable
+    # timestamp warns exactly once no matter which verdict the entry lands on.
+    age_seconds, age_state = _age_of(entry, now)
+
     def _result(verdict, reason):
-        age = None
-        try:
-            investigated_at = entry.get('investigated_at')
-            if investigated_at and now is not None:
-                ts = datetime.fromisoformat(investigated_at)
-                age = (now - ts).total_seconds()
-        except Exception:
-            pass
         return {
             'verdict': verdict,
             'reason': reason,
             'head_sha': head_sha,
             'main_sha': main_sha,
-            'age_seconds': age,
+            'age_seconds': age_seconds,
+            'age_state': age_state,
         }
 
     # --- (1b) Post-merge red-main fix-forward class (dual-read) ---
