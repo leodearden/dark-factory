@@ -39,6 +39,16 @@ bounds the blast radius, and it is called here BEFORE the scan and BEFORE the
 first mutation. Running ``--apply`` from an agent sandbox is therefore expected
 to be refused, loudly, having changed nothing. The dry run works anywhere.
 
+An operator shell is necessary but NOT sufficient: the row has to land in the
+ledger file the running server actually has open. Both halves of that path —
+``CONFIG_PATH`` and ``reconciliation.data_dir`` — are relative to the process
+CWD, and ``ReconLedgerStore.initialize()`` creates what it does not find, so a
+misdirected ``--apply`` would otherwise report a written row and exit 0 having
+seeded a fresh empty db nothing reads. :func:`assert_ledger_target_live` is the
+refusal that closes that, and every report names its
+``ledger_db_path`` so a landed migration is distinguishable from a misdirected
+one after the fact.
+
 OPEN QUESTION 6 — the evidence-only stamping shape — IS RESOLVED HERE
 ---------------------------------------------------------------------
 The batch convention (see ``standing_decision_writer.py`` and
@@ -618,6 +628,99 @@ def resolve_exit_code(report: dict[str, Any]) -> int:
     ) else 0
 
 
+# ---------------------------------------------------------------------------
+# The live target — WHICH ledger this run would write, and whether it is read
+# ---------------------------------------------------------------------------
+
+#: The recon ledger's file inside ``reconciliation.data_dir``. α's
+#: ``recon_ledger`` table lives inside the journal's own database, and
+#: ``server/main.py`` opens this same name from that same directory — so this
+#: migration lands in THAT file or it lands nowhere that matters.
+LEDGER_DB_FILENAME = 'reconciliation.db'
+
+
+class LedgerTargetUnusable(RuntimeError):
+    """``--apply`` was aimed at a ledger no running server would ever read.
+
+    CALLER CONTRACT: on this exception the caller MUST NOT write the row.
+
+    Same fail-closed posture as ``StoreMutationUnavailable``, and raised for
+    the same reason: the failure being prevented is a run that SUCCEEDS —
+    ``{'ledger': 'written'}``, exit 0 — while having no effect on the
+    deployment it was run for. A one-shot migration is unlikely to be re-run,
+    so a silent no-effect success is worse than a crash.
+
+    Deliberately NOT a report-shaped refusal (see the placement rules in
+    ``utils/store_mutation_preflight``): an operator can reasonably read past a
+    handled outcome, and this is not one.
+    """
+
+
+def resolve_ledger_db_path(config: Any) -> Path:
+    """Absolutize the recon-ledger file this run would open.
+
+    ABSOLUTE, and resolved exactly once: ``reconciliation.data_dir`` defaults
+    to the relative ``./data/reconciliation``, so the bare configured value
+    names a different file from every directory. The absolute form is what the
+    refusal below quotes and what the report carries, so the artifact says
+    which file the run meant rather than which suffix it was configured with.
+    """
+    return (Path(config.reconciliation.data_dir) / LEDGER_DB_FILENAME).resolve()
+
+
+def assert_ledger_target_live(
+    *, db_path: Path, recon_ledger_enabled: bool
+) -> None:
+    """Refuse an ``--apply`` whose row would land where nothing reads it.
+
+    Two independent ways to write a perfectly valid ACTIVE row that γ's Hook-A
+    filter and δ's Hook-B annotation never see, both of which otherwise exit 0:
+
+    * the deployment has the ledger switched OFF. ``server/main.py`` calls
+      ``memory_service.set_recon_ledger`` only inside
+      ``if config.reconciliation.recon_ledger_enabled``, so on such a host the
+      row's only consumer is not wired at all;
+    * the run was launched from the wrong directory. ``data_dir`` is relative
+      to the CWD and ``ReconLedgerStore.initialize()`` does ``mkdir(parents=
+      True)`` plus ``CREATE TABLE IF NOT EXISTS`` — so a misdirected run does
+      not fail, it CREATES a fresh empty ledger and writes the row into that.
+
+    Checked in that order: a disabled ledger makes the row unreadable wherever
+    it is written, so the path is not the interesting fact about such a run.
+
+    Only ``--apply`` is gated. A dry run writes nothing and is exactly the
+    rehearsal an operator should use to discover a misconfigured target, so
+    refusing it would remove the diagnostic.
+
+    Args:
+        db_path: The absolute target from :func:`resolve_ledger_db_path`.
+        recon_ledger_enabled: ``config.reconciliation.recon_ledger_enabled``.
+
+    Raises:
+        LedgerTargetUnusable: On either defect. Nothing has been written.
+    """
+    if not recon_ledger_enabled:
+        raise LedgerTargetUnusable(
+            'Refusing --apply: reconciliation.recon_ledger_enabled is false in '
+            'this deployment, so server/main.py never wires the recon ledger '
+            'and neither γ suppression nor δ annotation would read the row '
+            f'this run would write into {str(db_path)!r}; hint: enable the '
+            'flag for this deployment, confirm the server picked it up, and '
+            're-run. Re-run without --apply to obtain the report meanwhile.'
+        )
+    if not db_path.exists():
+        raise LedgerTargetUnusable(
+            f'Refusing --apply: no recon ledger exists at {str(db_path)!r}. '
+            'reconciliation.data_dir is resolved against this process CWD '
+            f'({os.getcwd()!r}), so a run launched from the wrong directory '
+            'would not fail — it would CREATE an empty ledger there, write the '
+            'ACTIVE row into it and exit 0 while the running server kept '
+            "seeing nothing; hint: re-run from the fused-memory server's own "
+            f'working directory — the one whose {LEDGER_DB_FILENAME} the '
+            'server has open — or point --config at that deployment.'
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI. Dry run is the DEFAULT, and ``--apply`` is the only way past it."""
     parser = argparse.ArgumentParser(
@@ -631,8 +734,11 @@ def build_parser() -> argparse.ArgumentParser:
         '--apply', action='store_true',
         help='Commit the ledger row and the stamps. Without it the run is a '
              'full rehearsal that reads and decides everything but writes '
-             'nothing. Must be run from the fused-memory MCP server host: an '
-             'in-sandbox --apply is refused by the store-mutation preflight.',
+             'nothing. Must be run from the fused-memory MCP server host AND '
+             "from that server's own working directory: an in-sandbox --apply "
+             'is refused by the store-mutation preflight, and one aimed at a '
+             'ledger the server does not read is refused by '
+             'assert_ledger_target_live.',
     )
     parser.add_argument(
         '--json-out', default=None,
@@ -646,7 +752,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Build a live service, run the migration, print the report, exit graded."""
+    """Build a live service, run the migration, print the report, exit graded.
+
+    Owns BOTH of the run-wide refusals, in this order and both ahead of any
+    store contact: the store-mutation capability probe (may this process mutate
+    at all?) and :func:`assert_ledger_target_live` (would the row land where
+    anything reads it?). Neither belongs in :func:`run_backfill` — a
+    ``RuntimeError`` subclass raised there would be caught by ``_stamp_one``'s
+    per-record handler and re-reported as N ``stamp_error`` rows in a report
+    that otherwise reads as a completed sweep.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(levelname)s %(message)s',
@@ -690,15 +805,30 @@ def main(argv: list[str] | None = None) -> int:
         from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         config = FusedMemoryConfig()
+        db_path = resolve_ledger_db_path(config)
+        ledger_enabled = bool(config.reconciliation.recon_ledger_enabled)
+        # Before MemoryService, which itself writes on initialize() — an
+        # --apply aimed at a ledger nothing reads must touch no store at all.
+        if args.apply:
+            assert_ledger_target_live(
+                db_path=db_path, recon_ledger_enabled=ledger_enabled
+            )
+
         memory = MemoryService(config)
-        ledger = ReconLedgerStore(
-            Path(config.reconciliation.data_dir) / 'reconciliation.db'
-        )
+        ledger = ReconLedgerStore(db_path)
         try:
             await memory.initialize()
             await ledger.initialize()
             memory.set_recon_ledger(ledger)
-            return await run_backfill(memory, apply=args.apply)
+            report = await run_backfill(memory, apply=args.apply)
+            # Which file, and whether anything reads it — carried in the
+            # ARTIFACT, on every run. A report that names neither cannot tell a
+            # landed migration from one that seeded an empty db in the wrong
+            # directory, which is the outcome the gate above now forbids and
+            # the dry run must still be able to diagnose.
+            report['ledger_db_path'] = str(db_path)
+            report['recon_ledger_enabled'] = ledger_enabled
+            return report
         finally:
             await ledger.close()
             if hasattr(memory, 'close'):

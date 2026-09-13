@@ -20,10 +20,12 @@ they are what makes the kind half of the selection predicate load-bearing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -46,6 +48,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
     EVIDENCE_TYPE_OPERATOR_AUTHORIZATION,
     LedgerUnavailable,
 )
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 from fused_memory.utils.validation import is_full_uuid
 
 SCRIPT_PATH = (
@@ -789,3 +792,375 @@ class TestStampFailureNeverRollsBackTheRow:
         assert report['ledger'] == 'already_migrated'
         assert report['records'] == [{'memory_id': CORRECTION_ID, 'outcome': 'stamped'}]
         assert len(await _rows(ledger)) == 1
+
+
+# ---------------------------------------------------------------------------
+# The live target — WHICH ledger an --apply would write, and whether it is read
+# ---------------------------------------------------------------------------
+
+
+def _config(data_dir: Path, *, enabled: bool = True) -> SimpleNamespace:
+    """The two ``config.reconciliation`` leaves the target resolution reads."""
+    return SimpleNamespace(
+        reconciliation=SimpleNamespace(
+            data_dir=str(data_dir), recon_ledger_enabled=enabled
+        )
+    )
+
+
+class TestResolveLedgerDbPath:
+    """The target is absolutized once, from the configured data_dir."""
+
+    def test_names_the_ledger_file_inside_the_configured_data_dir(
+        self, tmp_path: Path
+    ) -> None:
+        assert _mod.resolve_ledger_db_path(_config(tmp_path)) == (
+            tmp_path / _mod.LEDGER_DB_FILENAME
+        )
+
+    def test_a_relative_data_dir_is_resolved_against_the_cwd(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The default ``./data/reconciliation`` names a DIFFERENT file from
+        every directory — which is the whole hazard, so the resolution must be
+        absolute and the report must be able to quote it."""
+        monkeypatch.chdir(tmp_path)
+        resolved = _mod.resolve_ledger_db_path(_config(Path('./data/reconciliation')))
+        assert resolved.is_absolute()
+        assert resolved == tmp_path / 'data' / 'reconciliation' / (
+            _mod.LEDGER_DB_FILENAME
+        )
+
+
+class TestAssertLedgerTargetLive:
+    """Both ways to write a valid row nothing reads are refused, loudly."""
+
+    @staticmethod
+    def _existing_db(tmp_path: Path) -> Path:
+        db_path = tmp_path / _mod.LEDGER_DB_FILENAME
+        db_path.touch()
+        return db_path
+
+    def test_an_enabled_ledger_that_already_exists_is_accepted(
+        self, tmp_path: Path
+    ) -> None:
+        _mod.assert_ledger_target_live(
+            db_path=self._existing_db(tmp_path), recon_ledger_enabled=True
+        )
+
+    def test_a_disabled_ledger_is_refused_even_though_the_file_is_there(
+        self, tmp_path: Path
+    ) -> None:
+        """``server/main.py`` wires ``set_recon_ledger`` only under the flag, so
+        the row's only consumer is not attached at all."""
+        with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
+            _mod.assert_ledger_target_live(
+                db_path=self._existing_db(tmp_path), recon_ledger_enabled=False
+            )
+        assert 'recon_ledger_enabled' in str(excinfo.value)
+
+    def test_a_missing_ledger_is_refused_and_the_message_names_the_path(
+        self, tmp_path: Path
+    ) -> None:
+        """``initialize()`` would otherwise CREATE it — a silent no-effect
+        success for a migration that is unlikely to be re-run."""
+        missing = tmp_path / 'nowhere' / _mod.LEDGER_DB_FILENAME
+        with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
+            _mod.assert_ledger_target_live(
+                db_path=missing, recon_ledger_enabled=True
+            )
+        assert str(missing) in str(excinfo.value)
+        assert not missing.exists()
+
+    def test_a_disabled_ledger_is_reported_ahead_of_a_missing_file(
+        self, tmp_path: Path
+    ) -> None:
+        """When both are wrong the flag is the actionable fact: the row would be
+        unreadable wherever it landed, so the path is not the interesting one."""
+        with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
+            _mod.assert_ledger_target_live(
+                db_path=tmp_path / _mod.LEDGER_DB_FILENAME,
+                recon_ledger_enabled=False,
+            )
+        assert 'recon_ledger_enabled' in str(excinfo.value)
+
+    def test_the_refusal_is_module_typed_and_fail_closed(self) -> None:
+        """A ``RuntimeError`` like ``StoreMutationUnavailable``, and for the same
+        reason — but its own type, so a caller can tell the two refusals apart."""
+        assert issubclass(_mod.LedgerTargetUnusable, RuntimeError)
+        assert not issubclass(_mod.LedgerTargetUnusable, StoreMutationUnavailable)
+
+
+# ---------------------------------------------------------------------------
+# main() — the two run-wide refusals, the artifact, and the graded exit
+# ---------------------------------------------------------------------------
+
+
+class _LiveHarness:
+    """Everything ``main()``'s live leg constructs, faked, with a call TRACE.
+
+    The trace is the point. Both run-wide refusals are claims about ORDER —
+    they must fire before any store is touched — and order is exactly what a
+    return-value assertion cannot see. ``StoreMutationUnavailable`` and
+    :class:`LedgerTargetUnusable` are both ``RuntimeError`` subclasses, so
+    either probe moved down into ``run_backfill`` would be swallowed by
+    ``_stamp_one``'s per-record ``except Exception`` and re-reported as N
+    ``stamp_error`` rows — with every other test in this module still green.
+
+    The recon ledger is the REAL ``ReconLedgerStore`` on a tmp db, so
+    :meth:`rows` reads back what the run actually persisted rather than what
+    it reported.
+    """
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        ledger_enabled: bool = True,
+        create_db: bool = True,
+        update_response: dict | None = None,
+    ) -> None:
+        self.trace: list[str] = []
+        self.operations: list[str] = []
+        self.services: list[AsyncMock] = []
+        self.stamps: list[dict] = []
+        self.ledger_enabled = ledger_enabled
+        self.update_response = update_response or {'status': 'updated'}
+        self.data_dir = tmp_path / 'data' / 'reconciliation'
+        self.data_dir.mkdir(parents=True)
+        self.db_path = self.data_dir / _mod.LEDGER_DB_FILENAME
+        if create_db:
+            # An empty file IS an empty SQLite database, so this is a ledger
+            # that exists without yet holding a schema — the shape an operator
+            # aiming at a real deployment has.
+            self.db_path.touch()
+
+    def _make_config(self) -> SimpleNamespace:
+        self.trace.append('config')
+        return _config(self.data_dir, enabled=self.ledger_enabled)
+
+    def _reader(self, value, label: str):
+        async def _read(*_args, **_kwargs):
+            self.trace.append(label)
+            return value
+        return _read
+
+    async def _stamp(self, **kwargs) -> dict:
+        self.trace.append('update_memory')
+        self.stamps.append(kwargs)
+        return dict(self.update_response)
+
+    def _make_service(self, _config_obj) -> AsyncMock:
+        self.trace.append('service_constructed')
+        service = _memory_service(None)
+        service.set_recon_ledger = lambda ledger: setattr(
+            service, 'recon_ledger', ledger
+        )
+        service.get_memory_by_id = AsyncMock(
+            side_effect=self._reader(SOURCE_RECORD, 'source_fetch')
+        )
+        service.get_memories_by_metadata = AsyncMock(
+            side_effect=self._reader(list(LIVE_ENTITY_SCROLL), 'scroll')
+        )
+        service.update_memory = AsyncMock(side_effect=self._stamp)
+        self.services.append(service)
+        return service
+
+    def run(self, monkeypatch, argv: list[str], *, probe_error=None) -> int:
+        """Install the fakes and drive the real ``main(argv)``."""
+        def _probe(*, operation: str) -> None:
+            self.trace.append('probe')
+            self.operations.append(operation)
+            if probe_error is not None:
+                raise probe_error
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _probe)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig', self._make_config
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', self._make_service
+        )
+        return _mod.main(argv)
+
+    def report(self, capsys) -> dict:
+        """The JSON artifact ``main`` printed."""
+        return json.loads(capsys.readouterr().out.split('\nDRY RUN')[0])
+
+    def rows(self) -> list:
+        """What the run actually left in the ledger, read back independently."""
+        async def _read():
+            store = ReconLedgerStore(self.db_path)
+            await store.initialize()
+            try:
+                return await store.list_entity_standing_decisions(_mod.PROJECT_ID)
+            finally:
+                await store.close()
+        return asyncio.run(_read())
+
+
+class TestMainStoreMutationPreflight:
+    """One probe per run, before the scan and before the first mutation."""
+
+    def test_apply_probes_exactly_once(self, tmp_path, monkeypatch, capsys) -> None:
+        harness = _LiveHarness(tmp_path)
+        assert harness.run(monkeypatch, ['--apply']) == 0
+        capsys.readouterr()
+        assert harness.trace.count('probe') == 1
+
+    def test_nothing_is_constructed_or_read_before_the_probe(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        harness = _LiveHarness(tmp_path)
+        harness.run(monkeypatch, ['--apply'])
+        capsys.readouterr()
+        assert harness.trace[0] == 'probe'
+        # ...and the run really did go on to touch the store, so the leg above
+        # is not passing on a trivially short trace.
+        assert {'service_constructed', 'source_fetch', 'scroll'} <= set(harness.trace)
+
+    def test_a_refused_probe_propagates_having_touched_nothing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        harness = _LiveHarness(tmp_path)
+        with pytest.raises(StoreMutationUnavailable):
+            harness.run(
+                monkeypatch,
+                ['--apply'],
+                probe_error=StoreMutationUnavailable('denied'),
+            )
+        assert harness.trace == ['probe']
+        assert harness.services == []
+        assert harness.stamps == []
+        assert harness.rows() == []
+
+    def test_the_probed_operation_names_this_script_and_the_flag(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """An operator reading the refusal must be able to tell WHICH operation
+        was refused — so the string is read from the script, not invented."""
+        harness = _LiveHarness(tmp_path)
+        harness.run(monkeypatch, ['--apply'])
+        capsys.readouterr()
+        (operation,) = harness.operations
+        assert SCRIPT_PATH.stem in operation
+        assert '--apply' in operation
+
+    def test_a_dry_run_never_probes(self, tmp_path, monkeypatch, capsys) -> None:
+        """The probe gates MUTATION. A rehearsal writes nothing, so gating it
+        would only deny an operator the report they need to plan the real run."""
+        harness = _LiveHarness(tmp_path)
+        assert harness.run(monkeypatch, []) == 0
+        capsys.readouterr()
+        assert 'probe' not in harness.trace
+        assert harness.operations == []
+        assert harness.stamps == []
+        assert harness.rows() == []
+
+
+class TestMainRefusesADeadLedgerTarget:
+    """``--apply`` stops before the store when the row would land unread."""
+
+    def test_a_missing_ledger_file_refuses_instead_of_creating_one(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        harness = _LiveHarness(tmp_path, create_db=False)
+        with pytest.raises(_mod.LedgerTargetUnusable) as excinfo:
+            harness.run(monkeypatch, ['--apply'])
+        assert str(harness.db_path) in str(excinfo.value)
+        assert not harness.db_path.exists()
+        assert harness.trace == ['probe', 'config']
+        assert harness.services == []
+
+    def test_a_switched_off_ledger_refuses(self, tmp_path, monkeypatch) -> None:
+        harness = _LiveHarness(tmp_path, ledger_enabled=False)
+        with pytest.raises(_mod.LedgerTargetUnusable):
+            harness.run(monkeypatch, ['--apply'])
+        assert harness.trace == ['probe', 'config']
+        assert harness.rows() == []
+
+    def test_the_refusal_follows_the_mutation_probe(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Capability first, then destination: a process that may not mutate at
+        all should hear that, not a complaint about which file it aimed at."""
+        harness = _LiveHarness(tmp_path, create_db=False)
+        with pytest.raises(StoreMutationUnavailable):
+            harness.run(
+                monkeypatch,
+                ['--apply'],
+                probe_error=StoreMutationUnavailable('denied'),
+            )
+        assert harness.trace == ['probe']
+
+    def test_a_dry_run_is_never_gated_on_the_target(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """A rehearsal against a dead target is exactly how an operator DISCOVERS
+        it, so the report must still be produced."""
+        harness = _LiveHarness(tmp_path, ledger_enabled=False, create_db=False)
+        assert harness.run(monkeypatch, []) == 0
+        assert harness.report(capsys)['ledger'] == 'would_write'
+
+
+class TestMainReportNamesItsTarget:
+    """The artifact says which ledger it wrote and whether anything reads it."""
+
+    def test_the_reported_path_is_absolute_and_is_the_file_that_was_written(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        harness = _LiveHarness(tmp_path)
+        harness.run(monkeypatch, ['--apply'])
+        reported = Path(harness.report(capsys)['ledger_db_path'])
+        assert reported.is_absolute()
+        assert reported == harness.db_path.resolve()
+        assert len(harness.rows()) == 1
+
+    def test_a_dry_run_names_the_target_too(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        harness = _LiveHarness(tmp_path)
+        harness.run(monkeypatch, [])
+        assert harness.report(capsys)['ledger_db_path'] == str(
+            harness.db_path.resolve()
+        )
+
+    def test_the_consumer_flag_is_echoed(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """So a report from a ``recon_ledger_enabled=False`` host cannot be read
+        as a landed migration."""
+        harness = _LiveHarness(tmp_path, ledger_enabled=False)
+        harness.run(monkeypatch, [])
+        assert harness.report(capsys)['recon_ledger_enabled'] is False
+
+
+class TestMainCliContract:
+    """``--json-out``, and the exit code an automated caller reads."""
+
+    def test_json_out_is_written_in_addition_to_stdout(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        harness = _LiveHarness(tmp_path)
+        out = tmp_path / 'report.json'
+        assert harness.run(monkeypatch, ['--json-out', str(out)]) == 0
+        written = out.read_text()
+        assert capsys.readouterr().out.startswith(written)
+        assert json.loads(written)['apply'] is False
+
+    def test_a_clean_apply_exits_zero(self, tmp_path, monkeypatch, capsys) -> None:
+        assert _LiveHarness(tmp_path).run(monkeypatch, ['--apply']) == 0
+        capsys.readouterr()
+
+    def test_a_refused_stamp_exits_non_zero(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """``update_memory`` REPORTS a refusal rather than raising it, and a
+        half-stamped corpus must not read as a completed migration."""
+        harness = _LiveHarness(
+            tmp_path, update_response={'error_type': 'MemoryNotFound', 'error': 'gone'}
+        )
+        assert harness.run(monkeypatch, ['--apply']) == 1
+        assert {row['outcome'] for row in harness.report(capsys)['records']} == {
+            'stamp_error'
+        }
