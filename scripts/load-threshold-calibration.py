@@ -47,24 +47,58 @@ import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 DEFAULT_PEER_CONFIG = Path('/home/leo/src/reify/dark-factory-orchestrator.yaml')
 DEFAULT_REPORT_DIR = Path('/home/leo/src/dark-factory/plans')
 PERCENTILES = (0.50, 0.90, 0.95, 0.99)
 
-# Arm name -> how this corpus records it. Duplicated from
+class ArmSpec(NamedTuple):
+    """Everything the report needs about one gate arm.
+
+    ``selector`` is the sampler metric recording this arm. ``is_stem`` says
+    whether it names a metric outright or a ':' prefix with one series per
+    cgroup leaf — the two are read differently and reported separately, never
+    pooled. ``ladder`` is the candidate thresholds to evaluate hold fractions
+    at. ``unit`` labels the numbers for the human reading the escalation.
+    """
+
+    selector: str
+    is_stem: bool
+    ladder: tuple[float, ...]
+    unit: str
+
+
+# Percentage-pressure arms share one ladder: a PSI avg10 is a percentage of
+# wall time stalled, so the same rungs mean the same thing for all of them.
+_PRESSURE_LADDER = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0)
+_PRESSURE_UNIT = '% of wall time stalled (PSI avg10)'
+
+# Arm name -> its ArmSpec. The `selector` half is duplicated from
 # sampler.metrics.ARM_METRIC_STEMS BY NECESSITY: that module cannot be
-# imported here (see the stdlib-only note above). The reconciler is the named
+# imported here, because at gate time this script runs under the system
+# python3 (see the stdlib-only note above). The reconciler is the named
 # lockstep test in sampler/tests/test_load_metrics.py, which loads this file by
-# path and asserts the two agree — so do NOT "de-duplicate" this with an
-# import, which would crash the gate.
+# path and asserts the two agree in both directions — so do NOT
+# "de-duplicate" this with an import, which would crash the gate.
 ARM_METRIC_SELECTORS = {
-    'mem_full_avg10': 'psi_mem_full_avg10',
-    'mem_some_avg10': 'psi_mem_some_avg10',
-    'io_some_avg10': 'psi_io_some_avg10',
-    'cpu_some_avg10': 'psi_cpu_some_avg10',
-    'runqueue_ratio': 'runqueue_ratio',
-    'own_cpu_some_avg10': 'own_cpu_some10',
+    'mem_full_avg10': ArmSpec(
+        'psi_mem_full_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+    'mem_some_avg10': ArmSpec(
+        'psi_mem_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+    'io_some_avg10': ArmSpec(
+        'psi_io_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+    'cpu_some_avg10': ArmSpec(
+        'psi_cpu_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+    # A RATIO, not a percentage: procs_running / len(sched_getaffinity(0)).
+    # 1.0 is "as many runnable threads as CPUs"; 4.0 is PRD D9's provisional.
+    'runqueue_ratio': ArmSpec(
+        'runqueue_ratio', False,
+        (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0),
+        'runnable threads per CPU (ratio)'),
+    # One series per cgroup leaf, so ':' — reported per leaf, never pooled.
+    'own_cpu_some_avg10': ArmSpec(
+        'own_cpu_some10', True, _PRESSURE_LADDER, _PRESSURE_UNIT),
 }
 
 
@@ -115,9 +149,10 @@ def read_series(db: Path, arm: str | None) -> tuple[dict[str, list[float]], list
     each kept as its OWN series — pooling them would average unrelated
     workloads into one meaningless number.
     """
-    selectors = (
+    specs = (
         [ARM_METRIC_SELECTORS[arm]] if arm else list(ARM_METRIC_SELECTORS.values())
     )
+    selectors = [spec.selector for spec in specs]
     try:
         con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     except sqlite3.Error as exc:
