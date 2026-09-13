@@ -742,9 +742,17 @@ class TestAcquireWarmVerifyWorktreeSpecRouting:
 
 
 async def _spec_lane_git_ops(
-    repo: Path, **git_config_extra: Any,
+    repo: Path,
+    *,
+    ops_cls: type[GitOps] = GitOps,
+    ops_kwargs: dict[str, Any] | None = None,
+    **git_config_extra: Any,
 ) -> tuple[GitOps, OrchestratorConfig]:
     """A GitOps over *repo* with the `_spec-` warm lane pool on, plus its config.
+
+    *ops_cls* / *ops_kwargs* let a scenario substitute a GitOps SUBCLASS that
+    scripts one public method (see ``_AdvanceFailingGitOps``); everything the
+    pool and the merge touch stays the real thing on real disk.
 
     Commits the recording seed script first: ``acquire_spec_lane`` seeds a lane
     by running ``scripts/seed-warm-lane.sh`` inside the worktree it creates and
@@ -755,7 +763,9 @@ async def _spec_lane_git_ops(
     """
     await _add_recording_seed_to_repo(repo)
     git_config = _make_spec_git_config(on=True, **git_config_extra)
-    git_ops = GitOps(git_config, repo, merge_spec_warm_lane_pool_size=2)
+    git_ops = ops_cls(
+        git_config, repo, merge_spec_warm_lane_pool_size=2, **(ops_kwargs or {}),
+    )
     # The scenarios create task worktrees before any lane is acquired, so
     # `.worktrees` EXISTS by then and acquire_spec_lane's unmounted-mountpoint
     # guard would refuse to create a lane under it and fall back COLD.  Marking
@@ -764,6 +774,75 @@ async def _spec_lane_git_ops(
     git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
     git_ops.mark_pool_storage_present()
     return git_ops, OrchestratorConfig(project_root=repo, git=git_config)
+
+
+class _AdvanceFailingGitOps(GitOps):
+    """Real ``GitOps`` whose ``advance_main`` reports a scripted verdict for ONE branch.
+
+    The terminal finalize paths (advance failed permanently, CAS retries
+    exhausted) are unreachable over a quiet single-writer test repo: nothing
+    else is racing main.  Subclassing overrides a PUBLIC method at the seam the
+    lane itself calls, so the merge, the worktree pool and the `_spec-` lanes
+    all stay genuinely on disk and only the advance VERDICT is scripted -- as
+    opposed to patching a lane-module symbol, which would freeze the lane's
+    internal resolution path (PRD γ decision: no patch targets).
+
+    *fail_branch* is the full branch name of the ONE request whose advance is
+    faulted, so the predecessor whose in-flight merge makes it speculative
+    still lands for real.
+    """
+
+    def __init__(
+        self, *args: Any, fail_branch: str, fail_with: AdvanceResult, **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.fail_branch = fail_branch
+        self.fail_with: AdvanceResult = fail_with
+        self.faulted_advances: list[str] = []
+
+    async def advance_main(
+        self,
+        merge_sha: str,
+        merge_worktree: Path | None = None,
+        branch: str | None = None,
+        **kwargs: Any,
+    ) -> AdvanceOutcome:
+        if branch == self.fail_branch:
+            self.faulted_advances.append(merge_sha)
+            return AdvanceOutcome(result=self.fail_with)
+        return await super().advance_main(merge_sha, merge_worktree, branch, **kwargs)
+
+
+async def _assert_lane_given_back(repo: Path, git_ops: GitOps, *, after: str) -> None:
+    """B's warm `_spec-` lane is FREE again and still a registered worktree.
+
+    The pool leak every terminal path must foreclose: a route that removes the
+    lane with ``cleanup_merge_worktree`` instead of handing it back with
+    ``release_spec_lane`` leaves WarmLanePool ASSIGNED forever, so the warm
+    slot is gone for the lifetime of the process.  *after* names the terminal
+    path under test, so a failure says which one leaked.
+    """
+    lane0 = git_ops.worktree_base / '_spec-0'
+    # Ordered so the message names the actual fault: a lane routed through
+    # cleanup_merge_worktree is GONE from disk, which would otherwise surface
+    # as the (true but misleading) "never ran warm" assertion below.
+    assert lane0.exists(), (
+        f'{after}: {lane0} was REMOVED from disk -- release_spec_lane hands a '
+        'pool member back, cleanup_merge_worktree destroys it, and this path '
+        'took the destroying one'
+    )
+    assert _lane_was_seeded(lane0), (
+        f'{after}: the speculative verify must have held the WARM lane {lane0}'
+    )
+    assert git_ops.spec_warm_lane_pool is not None
+    assert git_ops.spec_warm_lane_pool.state(lane0) == LaneState.FREE, (
+        f'{after}: must release {lane0} back to the pool; got '
+        f'{git_ops.spec_warm_lane_pool.state(lane0)!r} -- an ASSIGNED lane is a '
+        'permanent pool leak'
+    )
+    assert lane0.resolve() in await _registered_worktrees(repo), (
+        f'{after}: must RELEASE {lane0}, not remove it'
+    )
 
 
 def _lane_was_seeded(lane: Path) -> bool:
@@ -784,6 +863,7 @@ async def _run_spec_scenario(
     verifier: _SequencedVerifier,
     gate_a: asyncio.Event,
     escalation_queue: Any = None,
+    max_cas_retries: int | None = None,
     after_b_verify_entered: Callable[[MergeLane, MergeRequest], Awaitable[None]] | None = None,
 ) -> tuple[MergeRequest, MergeRequest]:
     """Land A, then verify B speculatively on a warm `_spec-` lane.
@@ -803,6 +883,10 @@ async def _run_spec_scenario(
         git_ops, queue, speculation_depth=2,
         verifier=verifier, escalation_queue=escalation_queue,
     )
+    if max_cas_retries is not None:
+        # A public class attribute production documents as the tests' knob,
+        # like VERIFY_ABANDON_POLL_SECS above.
+        lane.MAX_CAS_RETRIES = max_cas_retries
     wt_a = await _make_branch_with_file(git_ops, 'task/spec-a', 'spec_a.py', 'a = 1\n')
     wt_b = await _make_branch_with_file(git_ops, 'task/spec-b', 'spec_b.py', 'b = 2\n')
     req_a = _make_request('spec-a', 'task/spec-a', wt_a, config)
@@ -970,20 +1054,6 @@ class TestSpecLaneAbortReleasesLane:
     same way as the passing path: the lane is FREE again and still registered.
     """
 
-    async def _assert_lane_given_back(self, repo: Path, git_ops: GitOps) -> None:
-        lane0 = git_ops.worktree_base / '_spec-0'
-        assert _lane_was_seeded(lane0), (
-            f'the aborted verify must have held the WARM lane {lane0}'
-        )
-        assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool.state(lane0) == LaneState.FREE, (
-            f'an aborted speculative verify must release {lane0} back to the '
-            f'pool; got {git_ops.spec_warm_lane_pool.state(lane0)!r}'
-        )
-        assert lane0.resolve() in await _registered_worktrees(repo), (
-            f'the aborted verify must RELEASE {lane0}, not remove it'
-        )
-
     async def test_waiter_walking_away_releases_spec_lane(
         self, spec_git_repo: Path,
     ) -> None:
@@ -1013,7 +1083,9 @@ class TestSpecLaneAbortReleasesLane:
             spec_git_repo, git_ops, config, verifier=verifier, gate_a=gate_a,
             after_b_verify_entered=_cancel_b,
         )
-        await self._assert_lane_given_back(spec_git_repo, git_ops)
+        await _assert_lane_given_back(
+            spec_git_repo, git_ops, after='a DROPPED waiter mid-verify',
+        )
 
     async def test_operator_halt_releases_spec_lane(
         self, spec_git_repo: Path,
@@ -1049,7 +1121,110 @@ class TestSpecLaneAbortReleasesLane:
             spec_git_repo, git_ops, config, verifier=verifier, gate_a=gate_a,
             after_b_verify_entered=_halt,
         )
-        await self._assert_lane_given_back(spec_git_repo, git_ops)
+        await _assert_lane_given_back(
+            spec_git_repo, git_ops, after='an operator HALT mid-verify',
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: barrier waits on both requests
+class TestSpecLaneFinalizeTerminalRelease:
+    """A TERMINAL finalize gives the warm lane back too.
+
+    The abort class above covers the two triggers inside the verify poll loop.
+    These are the other shape: the verify PASSED, the request reached the CAS
+    advance, and the advance ended the request instead of landing it.  Each of
+    those exits calls ``_release_or_cleanup(merge_wt, spec_warm=...)`` on its
+    own line, so dropping one -- or swapping it for ``cleanup_merge_worktree``
+    -- permanently leaks the pool lane as ASSIGNED with the request itself
+    still resolving correctly.  Nothing else in the suite asserts the release
+    on these paths: ``test_merge_queue.py::TestReleaseOrCleanupDeregisters``
+    pins the chokepoint GIVEN a call, and
+    ``test_merge_queue_multihost_wiring.py``'s lane-release test pins only the
+    RUNNER_UNAVAILABLE site.
+
+    Driven with ``_AdvanceFailingGitOps``: over a quiet test repo nothing else
+    is writing main, so a permanent advance failure and an exhausted CAS
+    budget cannot be provoked by contention alone.
+    """
+
+    async def _drive_failing_advance(
+        self, repo: Path, fail_with: AdvanceResult,
+    ) -> MergeRequest:
+        """Land A, verify B warm, then fault B's advance with *fail_with*."""
+        git_ops, config = await _spec_lane_git_ops(
+            repo,
+            ops_cls=_AdvanceFailingGitOps,
+            ops_kwargs={'fail_branch': 'task/spec-b', 'fail_with': fail_with},
+        )
+        gate_a = asyncio.Event()
+        verifier = _SequencedVerifier(hangs_until(gate_a), passes(summary='ok'))
+
+        _, req_b = await _run_spec_scenario(
+            repo, git_ops, config, verifier=verifier, gate_a=gate_a,
+        )
+
+        assert cast(_AdvanceFailingGitOps, git_ops).faulted_advances, (
+            "B's advance was never attempted, so no terminal finalize path ran"
+        )
+        await _assert_lane_given_back(
+            repo, git_ops, after=f'a terminal finalize on advance={fail_with!r}',
+        )
+        return req_b
+
+    async def test_permanent_advance_failure_releases_spec_lane(
+        self, spec_git_repo: Path,
+    ) -> None:
+        """A non-CAS advance failure ends B, and hands its warm lane back.
+
+        ``not_descendant`` is permanent -- the merge commit can never become a
+        descendant of main -- so the finalize takes the ``result !=
+        'cas_failed'`` exit straight to ``_map_advance_failure``.  That exit
+        releases the lane on its own line, separately from every other one.
+        """
+        req_b = await self._drive_failing_advance(spec_git_repo, 'not_descendant')
+
+        assert req_b.result.done(), 'B must be resolved, not left pending'
+        outcome = req_b.result.result()
+        # The reason is _map_advance_failure's per-branch permanent arm,
+        # verbatim -- so the assertion names the exit that ran, not merely
+        # that some exit did.
+        assert outcome.status == 'blocked', outcome
+        assert 'advance_main failed (not_descendant)' in (outcome.reason or ''), outcome
+
+    async def test_cas_retry_exhaustion_releases_spec_lane(
+        self, spec_git_repo: Path,
+    ) -> None:
+        """An exhausted CAS retry budget ends B, and hands its warm lane back.
+
+        ``cas_failed`` is the TRANSIENT verdict, so this exit is only reached
+        once the retry budget runs out -- the scenario shortens it through the
+        public ``MAX_CAS_RETRIES`` class attribute rather than racing real
+        writers onto main, the same knob the abort scenarios use for
+        ``VERIFY_ABANDON_POLL_SECS``.
+        """
+        git_ops, config = await _spec_lane_git_ops(
+            spec_git_repo,
+            ops_cls=_AdvanceFailingGitOps,
+            ops_kwargs={'fail_branch': 'task/spec-b', 'fail_with': 'cas_failed'},
+        )
+        gate_a = asyncio.Event()
+        verifier = _SequencedVerifier(hangs_until(gate_a), passes(summary='ok'))
+
+        _, req_b = await _run_spec_scenario(
+            spec_git_repo, git_ops, config, verifier=verifier, gate_a=gate_a,
+            max_cas_retries=0,
+        )
+
+        assert req_b.result.done()
+        outcome = req_b.result.result()
+        assert outcome.status == 'blocked', (
+            f'an exhausted CAS budget must block the request; got {outcome!r}'
+        )
+        assert 'CAS retry limit exhausted' in (outcome.reason or ''), outcome
+        await _assert_lane_given_back(
+            spec_git_repo, git_ops, after='a terminal finalize on CAS exhaustion',
+        )
 
 
 @pytest.mark.asyncio
