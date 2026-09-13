@@ -382,3 +382,170 @@ def test_a_malformed_payload_is_skipped_and_counted_rather_than_raised(runs_db):
 
     assert scan.skipped_rows == 1
     assert [s.task_id for s in scan.selections] == ['4504']
+
+
+# --- scan_invocations: what actually RAN, and how it ended (check 2) ---
+
+
+def _invocation_end_payload(*, turns, model, success=True, account_name='max-b'):
+    """The `invocation_end` payload keys this audit reads, as the producer writes them."""
+    return {
+        'turns': turns,
+        'success': success,
+        'subtype': 'success' if success else 'error',
+        'model': model,
+        'account_name': account_name,
+        'input_tokens': 44,
+        'output_tokens': 17317,
+        'cache_read_tokens': 1785372,
+        'cache_create_tokens': 84011,
+        'transcript_turns': turns + 18,
+        'timed_out': False,
+        'ended_awaiting_background': False,
+    }
+
+
+def _merge_finalized_payload(*, branch, state, merge_sha=None, reason=None, generation=1):
+    """The `merge_finalized` payload keys this audit reads.
+
+    NOTE the producer leaves the event row's `role` column EMPTY on these, so
+    they can only be joined to an invocation by task_id.
+    """
+    return {
+        'request_id': f'mr-{branch}',
+        'branch': branch,
+        'state': state,
+        'snapshot_tip': None,
+        'merge_sha': merge_sha,
+        'superseded_by': None,
+        'generation': generation,
+        'reason': reason,
+        'landed_via_chain': None,
+    }
+
+
+def _fable_merger_run(conn, *, task_id, turns=45, duration_ms=120_000, cost_usd=6.08):
+    """Seed one Fable merger invocation plus its matching invocation_end."""
+    _invocation(
+        conn, model=FABLE, role='merger', task_id=task_id, account_name='max-b',
+        cost_usd=cost_usd, duration_ms=duration_ms,
+        started_at=_at(hours=2), completed_at=_at(hours=2, minutes=2),
+    )
+    _event(
+        conn, _at(hours=2, minutes=2), 'invocation_end', task_id=task_id, role='merger',
+        data=_invocation_end_payload(turns=turns, model=FABLE),
+    )
+
+
+def test_a_fable_merger_run_reports_its_turns_and_the_merge_it_resolved(runs_db):
+    _fable_merger_run(runs_db, task_id='4377')
+    _event(
+        runs_db, _at(hours=2, minutes=30), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(branch='4377', state='done', merge_sha='d411f107'),
+    )
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert len(rows) == 1
+    run = rows[0]
+    assert run.role == 'merger'
+    assert run.turns == 45
+    assert run.succeeded is True
+    assert run.end_event_model == FABLE
+    assert run.cost_usd == 6.08
+    assert run.merge_outcome.state == 'done'
+    assert run.merge_outcome.merge_sha == 'd411f107'
+
+
+def test_the_last_merge_finalized_wins_not_the_first(runs_db):
+    """A post-merge VERIFICATION failure blocks the task and is later retried to
+    done. Reading the first merge_finalized would report the Fable merger as
+    having failed to resolve the merge, which is a different claim entirely."""
+    _fable_merger_run(runs_db, task_id='4377')
+    _event(
+        runs_db, _at(hours=3), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(
+            branch='4377', state='blocked',
+            reason='Post-merge verification failed: pytest exited 1', generation=1,
+        ),
+    )
+    _event(
+        runs_db, _at(hours=20), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(
+            branch='4377', state='done', merge_sha='d411f107', generation=3,
+        ),
+    )
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert rows[0].merge_outcome.state == 'done'
+    assert rows[0].merge_outcome.merge_sha == 'd411f107'
+
+
+def test_an_invocation_with_no_matching_end_event_reports_turns_none(runs_db):
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='4900', duration_ms=5_000,
+        started_at=_at(hours=4), completed_at=_at(hours=4, minutes=1),
+    )
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert len(rows) == 1
+    assert rows[0].turns is None
+    assert rows[0].succeeded is None
+    assert rows[0].end_event_model is None
+
+
+@pytest.mark.parametrize(
+    ('role', 'duration_ms', 'expected'),
+    [
+        ('merger', 600_000, True),    # AT the limit counts as over — at-or-above
+        ('merger', 599_999, False),
+        ('steward', 900_000, None),   # no configured limit: unknown, not "under"
+    ],
+)
+def test_the_wall_clock_flag_is_at_or_above_and_unknown_without_a_limit(
+    runs_db, role, duration_ms, expected
+):
+    _invocation(
+        runs_db, model=FABLE, role=role, task_id='4901', duration_ms=duration_ms,
+        started_at=_at(hours=5), completed_at=_at(hours=5, minutes=10),
+    )
+
+    rows = audit_model_admission.scan_invocations(
+        runs_db, model=FABLE, since=APPLY, wall_clock_limits={'merger': 600},
+    )
+
+    assert rows[0].at_or_over_wall_clock is expected
+
+
+def test_a_zero_cost_row_survives_to_the_output(runs_db):
+    """The milestone task names "$0 cost rows for Fable" as an escalation
+    trigger, so a falsy cost must not be filtered out anywhere on the path."""
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='4902', cost_usd=0.0,
+        duration_ms=1_000, started_at=_at(hours=6), completed_at=_at(hours=6, minutes=1),
+    )
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert [(r.task_id, r.cost_usd) for r in rows] == [('4902', 0.0)]
+
+
+def test_rows_before_since_and_rows_on_other_models_are_excluded(runs_db):
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='4300',
+        started_at=_at(hours=-3), completed_at=_at(hours=-2),
+    )
+    _invocation(
+        runs_db, model='opus', role='merger', task_id='4903',
+        started_at=_at(hours=7), completed_at=_at(hours=8),
+    )
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='4904',
+        started_at=_at(hours=7), completed_at=_at(hours=8),
+    )
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert [r.task_id for r in rows] == ['4904']
