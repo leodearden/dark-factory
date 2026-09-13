@@ -38,10 +38,11 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # The two tokens the task's acceptance grep pins, matched EXACTLY. Deliberately
-# NOT loosened to a bare 'reify-closure-staleness': task 4681's pending
-# delivered_checks grep scripts/ for 'reify-closure-staleness-predicate', a
-# distinct and still-wanted string, and a loose pattern here would put this
-# guard in a fight with that task.
+# NOT loosened to a bare 'reify-closure-staleness', which is also the live
+# `metadata.recurrence` KEY exercised by shared/tests/test_task_metadata.py,
+# orchestrator/tests/test_deterministic_runner.py, fused-memory's deterministic
+# task guard tests and docs/task-authoring.md. Those are distinct, still-wanted
+# strings; a loose pattern here would make this guard fight live code.
 RETIRED_TOKENS = ('consume_redispatch_requests', 'reify-closure-staleness-sweep')
 
 # This module necessarily contains both tokens — every absence assertion above
