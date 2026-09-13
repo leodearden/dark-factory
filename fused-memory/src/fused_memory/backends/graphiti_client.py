@@ -1480,9 +1480,30 @@ class GraphitiBackend:
         compose rather than overwrite. This is the only channel that reaches
         the persisted episode: the harm being labelled is the EDGES extracted
         from it, not the tool response.
+
+        ``uuid`` means LOAD, never create-with-this-id (graphiti_core 0.28.2,
+        ``graphiti.py:906-920``): a non-None value selects
+        ``EpisodicNode.get_by_uuid``, so it can only name an episode that
+        ALREADY exists, and on that branch ``content`` is ignored in favour of
+        the stored episode body (warned about below). To create a NEW episode
+        pass ``uuid=None`` and read the minted uuid off ``result.episode.uuid``
+        — see ``services/memory_service.py::MemoryService._execute_graphiti_write``,
+        the only production caller, for why that identity is load-bearing.
+
+        Raises:
+            NodeNotFoundError: the module-local one, when a non-None ``uuid``
+                does not resolve. Chained from graphiti_core's own, whose
+                message names only the caller's own input.
         """
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
+        if uuid is not None and content:
+            logger.warning(
+                f'add_episode called with both uuid={uuid} and content in group '
+                f'{group_id}: the content will NOT be stored. A non-None uuid= '
+                f'selects graphiti_core\'s LOAD branch, which re-uses the stored '
+                f'episode body. Pass uuid=None to create a new episode.'
+            )
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
         if unverified_claim:
