@@ -2,14 +2,21 @@
 
 Purpose
 -------
-Collect 9 host-load metrics every tick and return them as a flat dict of
-``{metric_name: float}``.  The 9 metrics are:
+Collect the host-load metrics of one tick and return them as a flat dict of
+``{metric_name: float}``. The count is NOT fixed: it is 11 plus two per
+discovered cgroup leaf (25 on this host today, where seven leaves are
+present).
 
 PSI metrics (6) — kernel-windowed, no re-windowing, NULL DB windows:
     psi_{cpu,mem,io}_{some,full}_avg10
 
 Process metrics (3) — carry trailing window_mean/window_max in the DB:
     occt_queue_depth, verify_concurrency, verify_rss_total_bytes
+
+Load metrics (2 + 2 per cgroup leaf) — also carry trailing windows
+(PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4):
+    runqueue_ratio, runqueue_read_ok,
+    own_cpu_some10:<leaf>, own_read_ok:<leaf>
 
 Design decisions
 ----------------
@@ -43,6 +50,7 @@ from shared.psi import (
     parse_pressure_file,
     read_pressure,
     read_runqueue_ratio,
+    resolve_own_cgroup,
 )
 
 logger = logging.getLogger(__name__)
@@ -216,7 +224,47 @@ def collect_load_metrics(
     out: dict[str, float] = {'runqueue_read_ok': float(runqueue.read_ok)}
     if runqueue.read_ok:
         out['runqueue_ratio'] = float(runqueue.ratio)
+
+    if own_cgroup_path is None:
+        own_cgroup_path = resolve_own_cgroup(None, cgroup_root=str(cgroup_root)).path
+    leaves = discover_pressure_cgroups(
+        own_cgroup_path=own_cgroup_path, cgroup_root=cgroup_root
+    )
+    if not leaves:
+        logger.warning(
+            'no pressure cgroups discovered under the anchor derived from %r; '
+            'emitting no own_* rows rather than inventing a leaf name',
+            own_cgroup_path,
+        )
+    for leaf_name, pressure_path in leaves:
+        some_avg10 = _read_leaf_some_avg10(pressure_path)
+        out[f'own_read_ok:{leaf_name}'] = float(some_avg10 is not None)
+        if some_avg10 is not None:
+            out[f'own_cpu_some10:{leaf_name}'] = some_avg10
     return out
+
+
+def _read_leaf_some_avg10(pressure_path: Path) -> float | None:
+    """Return one cgroup's ``some avg10``, or ``None`` if it could not be read.
+
+    A cgroup cpu.pressure has the same some/full avg10 shape as
+    /proc/pressure/cpu, so the text goes straight to α's
+    ``parse_pressure_file`` and no second parser is written (INV-5). That
+    parser's ``None`` already means "unparseable", so an unreadable file is
+    collapsed onto the SAME sentinel and the two failure modes share one exit
+    — the shape α's own ``read_own_cgroup_pressure`` uses.
+
+    ``read_own_cgroup_pressure`` itself is deliberately not reused: it reads
+    the READING PROCESS's own cgroup, and this reads every sibling leaf.
+    """
+    try:
+        parsed = parse_pressure_file(pressure_path.read_text())
+    except OSError:
+        logger.debug('cgroup pressure unreadable: %s', pressure_path, exc_info=True)
+        return None
+    if parsed is None:
+        return None
+    return parsed['some_avg10']
 
 
 def _is_occt_gated(proc: Any) -> bool:

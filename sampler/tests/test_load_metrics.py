@@ -884,7 +884,7 @@ class TestCollectLoadMetricsOwnPressure:
         assert [k for k in result if k.startswith('own_')] == []
         # The runqueue half is unaffected — the two halves degrade separately.
         assert result['runqueue_read_ok'] == 1.0
-        warnings = [r.message % r.args for r in caplog.records if r.levelno == logging.WARNING]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any('user@1000.service' in msg for msg in warnings), (
             f'Expected a WARNING naming the attempted anchor; got: {warnings}'
         )
