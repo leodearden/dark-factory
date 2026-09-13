@@ -385,3 +385,185 @@ class TestThirtyDayRetention:
 
         assert _count_at(db_path, at_cutoff) == 1
         assert _count_at(db_path, one_second_older) == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-15: cleanup_old is interval-gated (decision 4)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupIsIntervalGated:
+    """Why this gate exists, pinned so it cannot be "simplified" away.
+
+    `DELETE FROM samples WHERE ts < ?` cannot use idx_samples_metric_ts(metric,
+    ts) — a leading-column index does not serve a bare-ts predicate — so every
+    call is a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
+    old enough to delete) costs 106.7 ms; extrapolated to the 12.96M-row
+    30-day steady state that is ~550 ms every 5 s, forever, to delete nothing.
+
+    Two fixes were measured. Adding idx_samples_ts makes the plan an index
+    SEARCH at ~0 ms but grew the probe file 33% (98 -> 130 MB, i.e. 1.62 ->
+    ~2.15 GB at 30 d). The interval gate amortises the same scan to once per
+    interval, where 550 ms is irrelevant, and costs zero bytes. The gate wins
+    on 530 MB and on reusing the should_vacuum/last_vacuum_ts machinery next
+    door; its only cost is up to one interval of over-retention, which is
+    meaningless for a calibration corpus. Doing both would make the index dead
+    weight, so exactly one is taken.
+    """
+
+    def test_the_delete_predicate_really_is_a_full_scan(self, tmp_path: Path):
+        """The measured fact the gate is the answer to — read off the schema."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        LoadSampleStore(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            plan = ' '.join(
+                str(row[3])
+                for row in conn.execute(
+                    'EXPLAIN QUERY PLAN DELETE FROM samples WHERE ts < ?', (0,)
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+        assert 'SCAN samples' in plan, plan
+        assert 'USING INDEX' not in plan, plan
+
+    def test_trailing_windows_query_is_index_backed_and_untouched(self, tmp_path: Path):
+        """The counterpart: this one IS served by the existing index."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        LoadSampleStore(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            plan = ' '.join(
+                str(row[3])
+                for row in conn.execute(
+                    'EXPLAIN QUERY PLAN SELECT value FROM samples'
+                    ' WHERE metric = ? ORDER BY ts DESC LIMIT ?',
+                    ('runqueue_ratio', 59),
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+        assert 'USING INDEX idx_samples_metric_ts' in plan, plan
+
+    def test_virgin_store_is_due_and_running_prunes_and_stamps(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        stale = now - THIRTY_DAYS - 60
+        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+
+        assert store.should_cleanup(now) is True
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, stale) == 0
+        assert store.should_cleanup(now) is False
+
+    def test_a_second_call_in_the_same_interval_does_not_re_scan(self, tmp_path: Path):
+        """Behavioural, not a mock call count: plant an over-age row AFTER."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        store.cleanup_old(now)
+
+        planted_after = now - THIRTY_DAYS - 60
+        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, planted_after) == 1, (
+            'the second call in the same interval must not have run the DELETE'
+        )
+
+    def test_one_interval_later_it_runs_again(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        store.cleanup_old(now)
+
+        planted_after = now - THIRTY_DAYS - 60
+        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        later = now + DAY
+        assert store.should_cleanup(later) is True
+        store.cleanup_old(later)
+
+        assert _count_at(db_path, planted_after) == 0
+
+    def test_interval_override_is_honoured(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        store.cleanup_old(now)
+
+        planted_after = now - THIRTY_DAYS - 60
+        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        store.cleanup_old(now + 60, interval_seconds=30)
+
+        assert _count_at(db_path, planted_after) == 0
+        assert store.should_cleanup(now + 60, interval_seconds=30) is False
+
+    def test_the_stamp_is_written_only_after_a_successful_prune(self, tmp_path: Path):
+        """Mirrors maybe_vacuum: a transient failure must not suppress retries.
+
+        A stamp written before the DELETE would silence cleanup for a whole
+        interval on one locked-database error, and the next window would then
+        be double-length.
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        stale = now - THIRTY_DAYS - 60
+        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(sqlite3.Error):
+                store.cleanup_old(now)
+        finally:
+            db_path.chmod(0o644)
+
+        assert store.should_cleanup(now) is True, (
+            'a failed prune must leave the store still due, not stamped'
+        )
+        store.cleanup_old(now)
+        assert _count_at(db_path, stale) == 0
+
+    def test_the_gate_reuses_the_vacuum_machinery_not_a_new_mechanism(
+        self, tmp_path: Path
+    ):
+        """Two meta keys side by side, and the two gates stay independent."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+
+        store.cleanup_old(now)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            keys = {row[0] for row in conn.execute('SELECT key FROM meta').fetchall()}
+        finally:
+            conn.close()
+        assert 'last_cleanup_ts' in keys
+        assert 'last_vacuum_ts' not in keys, (
+            'cleanup must not stamp the vacuum clock — the two gates are separate'
+        )
+        assert store.should_vacuum(now) is True
