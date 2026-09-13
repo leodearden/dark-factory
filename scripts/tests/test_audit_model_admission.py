@@ -668,3 +668,114 @@ def test_restarts_are_found_even_though_live_rows_carry_a_task_id(runs_db):
     scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
 
     assert [r.service for r in scan.restarts] == ['fused-memory']
+
+
+# --- spend_in_window (check 5) and roles_on_model (check 6) ---
+
+
+def _spend(runs_db, *, model=FABLE, ceiling_usd=150.0):
+    return audit_model_admission.spend_in_window(
+        runs_db, model=model, window_start=APPLY,
+        window_end=APPLY + timedelta(hours=24), ceiling_usd=ceiling_usd,
+    )
+
+
+def test_the_spend_window_is_half_open_at_the_start_and_the_end(runs_db):
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=6.08,
+        started_at=_at(), completed_at=_at(),  # exactly at window_start: INCLUDED
+    )
+    _invocation(
+        runs_db, model=FABLE, role='steward', task_id='b', cost_usd=3.86,
+        started_at=_at(hours=12), completed_at=_at(hours=12),
+    )
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='c', cost_usd=99.0,
+        started_at=_at(hours=24), completed_at=_at(hours=24),  # at window_end: EXCLUDED
+    )
+
+    spend = _spend(runs_db)
+
+    assert spend.invocation_count == 2
+    assert spend.total_usd == pytest.approx(9.94)
+
+
+def test_an_empty_window_totals_zero_rather_than_none(runs_db):
+    spend = _spend(runs_db)
+
+    assert spend.total_usd == 0.0
+    assert spend.invocation_count == 0
+    assert spend.headroom_usd == 150.0
+    assert spend.at_or_over_ceiling is False
+
+
+@pytest.mark.parametrize(
+    ('cost_usd', 'expected'),
+    [(150.0, True), (149.99, False)],
+)
+def test_the_ceiling_flag_is_at_or_above_not_strictly_above(runs_db, cost_usd, expected):
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=cost_usd,
+        started_at=_at(hours=1), completed_at=_at(hours=1),
+    )
+
+    spend = _spend(runs_db)
+
+    assert spend.at_or_over_ceiling is expected
+    assert spend.headroom_usd == pytest.approx(150.0 - cost_usd)
+
+
+def test_observed_roles_within_the_allowlist_leave_unexpected_empty(runs_db):
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=6.08,
+        started_at=_at(hours=1), completed_at=_at(hours=1),
+    )
+    _invocation(
+        runs_db, model=FABLE, role='steward', task_id='b', cost_usd=1.93,
+        started_at=_at(hours=2), completed_at=_at(hours=2),
+    )
+    _invocation(
+        runs_db, model=FABLE, role='steward', task_id='c', cost_usd=1.93,
+        started_at=_at(hours=3), completed_at=_at(hours=3),
+    )
+
+    containment = audit_model_admission.roles_on_model(
+        runs_db, model=FABLE, since=APPLY, expected_roles=('merger', 'steward'),
+    )
+
+    assert containment.unexpected_roles == ()
+    assert {r.role: (r.count, r.total_usd) for r in containment.by_role} == {
+        'merger': (1, pytest.approx(6.08)),
+        'steward': (2, pytest.approx(3.86)),
+    }
+
+
+def test_a_role_outside_the_allowlist_is_named_in_unexpected_roles(runs_db):
+    """The ladder-containment regression dark-factory-orchestrator.yaml's
+    L1241-1244 deviation exists to prevent: the retry ladder was left unchanged
+    so a "+1" retry-tier-up cannot route an implementer to Fable."""
+    _invocation(
+        runs_db, model=FABLE, role='implementer', task_id='a', cost_usd=4.0,
+        started_at=_at(hours=1), completed_at=_at(hours=1),
+    )
+
+    containment = audit_model_admission.roles_on_model(
+        runs_db, model=FABLE, since=APPLY, expected_roles=('merger', 'steward'),
+    )
+
+    assert containment.unexpected_roles == ('implementer',)
+
+
+def test_an_expected_role_with_no_runs_is_a_visible_zero_not_a_missing_line(runs_db):
+    """"The merger never ran on Fable at all" is the loudest possible check-6
+    finding, and an omitted row would render it as silence."""
+    _invocation(
+        runs_db, model=FABLE, role='steward', task_id='b', cost_usd=1.93,
+        started_at=_at(hours=2), completed_at=_at(hours=2),
+    )
+
+    containment = audit_model_admission.roles_on_model(
+        runs_db, model=FABLE, since=APPLY, expected_roles=('merger', 'steward'),
+    )
+
+    assert [(r.role, r.count) for r in containment.by_role] == [('merger', 0), ('steward', 1)]
