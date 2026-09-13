@@ -2046,10 +2046,13 @@ class ReconReportState:
         anywhere in this run (task-4653).  A dangling forward pointer is
         exactly the class of stale pointer this helper exists to prevent:
         left in place it would keep the superseded finding neutered forever,
-        pointing at a row that no longer exists.  The sweep is run-scoped
-        because a superseder routinely lives in a later stage's entry than
-        its target.  Doing it here covers BOTH removal paths for free, so
-        they cannot drift apart.
+        pointing at a row that no longer exists.  The sweep covers the run's
+        REACHABLE entries (:meth:`_reachable_run_entries`) — the same union
+        :meth:`_persist_run` writes — because a superseder routinely lives in
+        a later stage's entry than its target, and that target's stage has
+        routinely been EVICTED from ``_state`` by then while staying
+        resolvable and persisted.  Doing it here covers BOTH removal paths
+        for free, so they cannot drift apart.
 
         Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
         cited-task fold's retract path in :meth:`cite_task`, so the
@@ -2109,13 +2112,15 @@ class ReconReportState:
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
 
-        # task-4653: clear any forward pointer AT this finding.  The sweep is
-        # run-scoped, not entry-scoped: the superseder routinely lives in a
-        # later stage's entry than its target (see add_finding's supersedes),
-        # so walking only owning_entry would leave the pointer dangling.
-        for (r_id, _stage), other_entry in self._state.items():
-            if r_id != run_id:
-                continue
+        # task-4653: clear any forward pointer AT this finding.  The reach is
+        # the run's REACHABLE entries — the same union _persist_run writes, not
+        # just its _state rows.  Entry-scoped would be too narrow because the
+        # superseder routinely lives in a later stage's entry than its target
+        # (see add_finding's supersedes); _state-scoped would be too narrow
+        # because that target's stage has routinely been evicted by then, and
+        # an evicted stage's finding is still resolvable and still persisted,
+        # so a pointer at it is still live and still able to dangle.
+        for other_entry in self._reachable_run_entries(run_id):
             for other in other_entry.findings:
                 if other.superseded_by == finding.finding_id:
                     other.superseded_by = None
