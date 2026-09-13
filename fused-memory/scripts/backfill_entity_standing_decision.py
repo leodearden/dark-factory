@@ -50,10 +50,12 @@ shape and the reasoning.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    STATE_ACTIVE,
 )
 from fused_memory.utils.validation import is_full_uuid
 
@@ -327,3 +329,95 @@ def build_evidence_only_patch(
         EVIDENCE_ONLY_GROUNDS_KEY: grounds,
         EVIDENCE_ONLY_MIGRATED_AT_KEY: migrated_at,
     }
+
+
+@dataclass(frozen=True)
+class BackfillPlan:
+    """Everything this migration decided, before it touched anything.
+
+    Frozen: the plan is computed once from a snapshot of the corpus and the
+    ledger, then applied. Nothing between those two moments may edit it, so the
+    report a dry run prints is exactly the work an ``--apply`` run would do.
+
+    :param entity_uuid: The decided entity, derived from the source record.
+    :param grounds: The ledger row's grounds — always :data:`GROUNDS` today,
+        carried on the plan so the report and the write read the same value.
+    :param needs_ledger_write: Whether an ACTIVE row still has to be written.
+    :param stamp_targets: The originals still missing an evidence-only stamp.
+    :param evidence_refs: The bare provenance refs the row will cite.
+    """
+
+    entity_uuid: str
+    grounds: str
+    needs_ledger_write: bool
+    stamp_targets: tuple[str, ...]
+    evidence_refs: tuple[dict[str, str], ...]
+
+
+def is_already_stamped(record: Any) -> bool:
+    """True iff *record* carries this migration's evidence-only status.
+
+    Keys on :data:`EVIDENCE_ONLY_STATUS_KEY` alone rather than on all four
+    stamp fields: that key is what an operator's enumerating query filters on,
+    so it is the field whose presence MEANS demoted. A record carrying it is
+    not re-stamped, which is what makes the stamping leg idempotent.
+    """
+    metadata = record.get('metadata') if isinstance(record, dict) else None
+    if not isinstance(metadata, dict):
+        return False
+    return metadata.get(EVIDENCE_ONLY_STATUS_KEY) == EVIDENCE_ONLY_STATUS
+
+
+def plan_backfill(
+    source_record: Any, scrolled_records: list[Any], active_row: Any
+) -> BackfillPlan:
+    """Decide the whole migration from a snapshot. Pure, sync, no store.
+
+    Every live read is the caller's responsibility (:func:`run_backfill` owns
+    them), which is what leaves the entire decision surface directly
+    unit-testable — and what lets a dry run rehearse the real decision rather
+    than a simplified echo of it.
+
+    Both legs are INDEPENDENTLY idempotent, and the plan is where that lives:
+
+    * the ledger write is planned unless an ACTIVE row already exists. A row in
+      any OTHER state is planned again, deliberately: α's
+      ``get_active_entity_standing_decision`` gates on ``state='active'``, so a
+      TTL-expired or revoked row leaves γ/δ blind. Reading "a row exists" as
+      "the work is done" would silently leave a lapsed decision unenforced.
+    * a stamp is planned per record still missing :func:`is_already_stamped`.
+
+    So a re-run after a partial failure completes exactly what the first run
+    missed, and a re-run after a complete one plans nothing at all.
+
+    Args:
+        source_record: ``get_memory_by_id`` for :data:`SOURCE_MEMORY_ID`.
+        scrolled_records: The entity-scoped metadata scroll.
+        active_row: ``get_active_entity_standing_decision`` for this entity, or
+            ``None``. Any row whose ``state`` is not ``active`` is treated as
+            absent for the write decision.
+
+    Returns:
+        The frozen plan.
+
+    Raises:
+        BackfillSourceInvalid: Propagated from
+            :func:`resolve_source_entity_uuid` — an unusable source stops the
+            run before anything is planned.
+    """
+    entity_uuid = resolve_source_entity_uuid(source_record)
+    selected = select_evidence_only_targets(scrolled_records, entity_uuid)
+    stamped_ids = {
+        record['id']
+        for record in scrolled_records
+        if isinstance(record, dict) and is_already_stamped(record)
+    }
+    return BackfillPlan(
+        entity_uuid=entity_uuid,
+        grounds=GROUNDS,
+        needs_ledger_write=getattr(active_row, 'state', None) != STATE_ACTIVE,
+        stamp_targets=tuple(
+            memory_id for memory_id in selected if memory_id not in stamped_ids
+        ),
+        evidence_refs=tuple(build_evidence_refs(selected, entity_uuid)),
+    )
