@@ -63,6 +63,19 @@ def _record(memory_id: str, kind: str | None, entity_uuid: str | None) -> dict:
 
 SOURCE_RECORD = _record(SOURCE_ID, 'recurring_flag_standing_decision', ENTITY_UUID)
 
+#: The six records the entity-scoped scroll returned for ``f02a32ea`` on
+#: 2026-09-13, plus one ``stage1_finding_correction`` belonging to a DIFFERENT
+#: entity — the record the research doc's pinned id list would have stamped.
+LIVE_ENTITY_SCROLL = [
+    SOURCE_RECORD,
+    _record(CORRECTION_ID, 'stage1_finding_correction', ENTITY_UUID),
+    _record('39528550-6d0c-4a5f-8a55-9b2c1e7d4f03', 'flag_correction', ENTITY_UUID),
+    _record('a04ae6e8-3b71-4c2a-9f18-5d6e8c0a1b29', 'flag_correction', ENTITY_UUID),
+    _record('aa46fbad-0c2e-4e7b-8a19-2f7d5b3c6e84', 'stage1_flag_suppression', ENTITY_UUID),
+    _record('d79f6b28-4a13-45c9-b6e2-8c0f1a9d7e35', 'stage1_flag_suppression', ENTITY_UUID),
+    _record(OFF_ENTITY_CORRECTION_ID, 'stage1_finding_correction', OFF_ENTITY_UUID),
+]
+
 
 # ---------------------------------------------------------------------------
 # resolve_source_entity_uuid — the SPOT derivation, loudly validated
@@ -164,3 +177,80 @@ class TestPinnedConstants:
         assert [
             name for name, value in self._pinned_uuids() if value == ENTITY_UUID
         ] == []
+
+
+# ---------------------------------------------------------------------------
+# select_evidence_only_targets — both halves of the predicate are load-bearing
+# ---------------------------------------------------------------------------
+
+
+class TestSelectEvidenceOnlyTargets:
+    """Selection is (kind ∈ allowlist) AND (entity_uuid == the source's)."""
+
+    def test_selects_exactly_the_two_unratified_ad_hoc_records(self) -> None:
+        assert _mod.select_evidence_only_targets(
+            LIVE_ENTITY_SCROLL, ENTITY_UUID
+        ) == [CORRECTION_ID, SOURCE_ID]
+
+    def test_order_is_deterministic_across_input_orderings(self) -> None:
+        """Two runs over the same corpus must plan the same stamps in the same
+        order, whatever order the scroll happened to return."""
+        shuffled = list(reversed(LIVE_ENTITY_SCROLL))
+        assert _mod.select_evidence_only_targets(
+            shuffled, ENTITY_UUID
+        ) == _mod.select_evidence_only_targets(LIVE_ENTITY_SCROLL, ENTITY_UUID)
+
+    def test_ratified_machine_read_suppressions_are_excluded(self) -> None:
+        """``stage1_flag_suppression`` shares the entity uuid but is CONSUMED by
+        ``flag_dedup.filter_suppressed``.
+
+        Stamping those evidence-only would be a live behaviour change, not a
+        bookkeeping annotation — which is why the entity-scoped scroll alone is
+        not a safe stamp gate.
+        """
+        selected = _mod.select_evidence_only_targets(LIVE_ENTITY_SCROLL, ENTITY_UUID)
+        suppressions = [
+            record['id']
+            for record in LIVE_ENTITY_SCROLL
+            if record['metadata'].get('kind') == 'stage1_flag_suppression'
+        ]
+        assert len(suppressions) == 2
+        assert not set(suppressions) & set(selected)
+        assert 'stage1_flag_suppression' not in _mod.DEMOTED_AD_HOC_KINDS
+
+    def test_flag_corrections_are_excluded(self) -> None:
+        """``flag_correction`` is not one of the two kinds the PRD demotes."""
+        selected = _mod.select_evidence_only_targets(LIVE_ENTITY_SCROLL, ENTITY_UUID)
+        assert '39528550-6d0c-4a5f-8a55-9b2c1e7d4f03' not in selected
+        assert 'a04ae6e8-3b71-4c2a-9f18-5d6e8c0a1b29' not in selected
+
+    def test_off_entity_correction_is_excluded(self) -> None:
+        """A right-kind record about a DIFFERENT entity.
+
+        Measured 2026-09-13: reify now holds 5 ``stage1_finding_correction``
+        records (the research doc measured 2) and only ``baf8ca57`` concerns
+        this entity, so a pinned id list would stamp an unrelated record.
+        """
+        assert OFF_ENTITY_CORRECTION_ID not in _mod.select_evidence_only_targets(
+            LIVE_ENTITY_SCROLL, ENTITY_UUID
+        )
+
+    @pytest.mark.parametrize(
+        'malformed',
+        [
+            pytest.param({'id': 'no-metadata-at-all'}, id='no_metadata'),
+            pytest.param({'id': 'null-metadata', 'metadata': None}, id='null_metadata'),
+            pytest.param(_record('no-kind', None, ENTITY_UUID), id='no_kind'),
+            pytest.param(_record('no-entity', 'stage1_finding_correction', None), id='no_entity'),
+            pytest.param({'metadata': {'kind': 'stage1_finding_correction',
+                                       'entity_uuid': ENTITY_UUID}}, id='no_id'),
+        ],
+    )
+    def test_malformed_records_are_excluded_not_crashed_on(self, malformed: dict) -> None:
+        selected = _mod.select_evidence_only_targets(
+            [*LIVE_ENTITY_SCROLL, malformed], ENTITY_UUID
+        )
+        assert selected == [CORRECTION_ID, SOURCE_ID]
+
+    def test_empty_corpus_selects_nothing(self) -> None:
+        assert _mod.select_evidence_only_targets([], ENTITY_UUID) == []
