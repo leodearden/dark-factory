@@ -500,9 +500,10 @@ class TestGateFunctionsReachBack:
         )
         from orchestrator.merge_types import OutcomeKind
 
+        advanced_sha = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+        merged_tip = 'f0e1d2c3b4a5968778695a4b3c2d1e0f'
         ctx = self._make_ctx(
-            advanced_sha='a1b2c3d4e5f60718293a4b5c6d7e8f90',
-            resolved_merged_tip='f0e1d2c3b4a5968778695a4b3c2d1e0f',
+            advanced_sha=advanced_sha, resolved_merged_tip=merged_tip,
         )
         with patch(
             'orchestrator.merge_queue._check_post_merge_equivalence',
@@ -519,15 +520,14 @@ class TestGateFunctionsReachBack:
         # Branch tip FIRST, advanced main SECOND.  A correctness property,
         # not wording: the opposite order inverts the RCA.
         assert (
-            f'git diff {ctx.resolved_merged_tip[:12]} '
-            f'{ctx.advanced_sha[:12]}'
+            f'git diff {merged_tip[:12]} {advanced_sha[:12]}'
         ) in reason, reason
 
         assert '--follow' in reason, reason
         assert 'pkg/sub/mod.py' in reason, reason
 
         assert verdict.emit_subtype == OutcomeKind.post_merge_equivalence_failed
-        assert verdict.merge_sha == ctx.advanced_sha
+        assert verdict.merge_sha == advanced_sha
 
     async def test_run_pyright_gate_ok_when_clean(self) -> None:
         from orchestrator.merge_gates import _run_pyright_gate

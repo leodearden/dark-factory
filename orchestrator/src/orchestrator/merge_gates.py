@@ -530,14 +530,19 @@ async def _run_equivalence_gate(ctx: _PostAdvanceContext) -> GateVerdict:
         'branch HEAD and advanced main %s diverge in: %r',
         ctx.req.task_id, ctx.log_label, ctx.advanced_sha[:12], equiv_failed,
     )
+    tip12 = (ctx.resolved_merged_tip or '<branch-tip>')[:12]
     return GateVerdict.block(
         reason=(
             f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
             f'branch and main diverge in '
             f'{", ".join(equiv_failed)}. '
-            f'Conflict resolution likely dropped or rewrote '
-            f'work; review {ctx.advanced_sha[:12]} against the '
-            f'task branch tip.'
+            f'Conflict resolution may have dropped or rewritten work. '
+            f'Triage with `git diff {tip12} {ctx.advanced_sha[:12]} '
+            f'-- <path>` (that order): "+" lines are content that IS on '
+            f'main, "-" lines are content only the branch tip had. '
+            f'On a relocated path use `git log --follow <path>` — '
+            f'without --follow the history looks empty and the file '
+            f'reads as missing.'
         ),
         merge_sha=ctx.advanced_sha,
         emit_subtype=OutcomeKind.post_merge_equivalence_failed,
