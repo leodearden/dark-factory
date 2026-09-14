@@ -19,6 +19,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.services.memory_service import MemoryService
 
 
 @pytest_asyncio.fixture
@@ -1103,3 +1104,28 @@ class TestGetRunStageExecution:
         assert execution['stage_ran'] is None
         assert execution['status'] == 'running'
         assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
+
+
+class TestMemoryServiceReconJournalWiring:
+    """The service-side seam for the runs lookup (task 3731).
+
+    Mirrors the ``set_recon_ledger`` precedent in
+    ``tests/test_recon_ledger.py`` verbatim. The journal is a SEPARATE
+    availability signal from the ledger: ``server/main.py`` constructs it
+    unconditionally inside the reconciliation-init block while the ledger sits
+    behind ``recon_ledger_enabled``, so the presence payload has to report the
+    two independently.
+    """
+
+    def test_recon_journal_defaults_to_none(self, mock_config):
+        svc = MemoryService(mock_config)
+
+        assert svc.recon_journal is None
+
+    def test_set_recon_journal_wires_the_journal(self, mock_config, tmp_path):
+        svc = MemoryService(mock_config)
+        journal = ReconciliationJournal(tmp_path / 'test_recon')
+
+        svc.set_recon_journal(journal)
+
+        assert svc.recon_journal is journal
