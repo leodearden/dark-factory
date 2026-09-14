@@ -70,8 +70,17 @@ against the ReconLedgerStore `cycle_summary` row (the source of truth written by
 `write_cycle_summary` / `write_stage1_cycle_summary`), as opposed to \
 `count_memories_by_metadata`'s best-effort Mem0 mirror query. Returns \
 `{{'present': bool, 'ledger_available': bool, 'project_id': ..., 'run_id': ..., \
-'stage': ...}}`. `ledger_available: false` means the ledger is not wired — treat that \
-as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY cycle-summary \
+'stage': ..., 'remediation': bool|null, 'reason': str, 'expected': bool|null, \
+'run_lookup_available': bool, 'run_status': str|null}}`. \
+`present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
+`expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
+AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
+'stage_not_run'`) means the run never reached that stage, so no summary was ever owed. \
+`expected: null` (`reason: 'expired'`, `'run_unknown'` or `'ledger_unavailable'`) is \
+INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
+retention window, so the row would have been reaped whether or not it was ever written. \
+`run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
+decide whether to flag. Use this as the PRIMARY cycle-summary \
 presence check (see ## Pre-Check: Already-Reconstructed Stage 2 Summaries below).
 
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
@@ -612,10 +621,18 @@ finding): \
 stage='task_knowledge_sync')`
 - `ledger_available: true` and `present: true` → the Stage 2 summary is present. Do NOT \
 emit the missing-summary finding.
-- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
-ABSENT. Emit the missing-summary finding for this run.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+- `present: false` and `expected: true` (`reason: 'missing'`) → the run DID reach Stage \
+2 and is within the ledger's retention window, so the row is genuinely lost. Emit the \
+missing-summary finding for this run.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → the run never \
+reached Stage 2, so no summary was ever owed. Do NOT emit the finding and do NOT frame \
+it as a defect — this is ordinary, and it is what MOST absences turn out to be.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Fall through \
 to the FALLBACK below, using Path 1 + Path 2 keyed `stage='task_knowledge_sync'`.
+- `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
+decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
+well have run the stage and lost only the ledger write.
 
 **B. Stage 1's own prior-run summary** (presence audit only — the Stage 1 summary is \
 written deterministically by Python (`write_stage1_cycle_summary`) and is never \
@@ -625,11 +642,14 @@ informs your cycle report): \
 stage='memory_consolidator')`
 - `ledger_available: true` and `present: true` → your own prior-run summary is present. \
 No action needed.
-- `ledger_available: true` and `present: false` → your own prior-run summary is \
-genuinely absent. Note this in your cycle report — do NOT attempt to reconstruct it \
-yourself and do NOT emit a missing-summary finding for it; only the Stage-2 case (A) \
-above is actionable.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+- `present: false` and `expected: true` (`reason: 'missing'`) → your own prior-run \
+summary is genuinely absent. Note this in your cycle report — do NOT attempt to \
+reconstruct it yourself and do NOT emit a missing-summary finding for it; only the \
+Stage-2 case (A) above is actionable.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → that run never \
+reached Stage 1, so no summary was owed. Nothing to note.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Fall through \
 to the FALLBACK below, using Path 1 + Path 2 keyed `stage='memory_consolidator'`.
 
 ### FALLBACK (used ONLY when the corresponding ledger check above is inconclusive)

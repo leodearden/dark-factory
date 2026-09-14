@@ -63,8 +63,17 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
   `write_cycle_summary`), as opposed to `count_memories_by_metadata`'s best-effort Mem0 \
   mirror query. Returns `{{'present': bool, 'ledger_available': bool, 'project_id': ..., \
-  'run_id': ..., 'stage': ...}}`. `ledger_available: false` means the ledger is not wired \
-  — treat that as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY \
+  'run_id': ..., 'stage': ..., 'remediation': bool|null, 'reason': str, \
+  'expected': bool|null, 'run_lookup_available': bool, 'run_status': str|null}}`. \
+  `present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
+  `expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
+  AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
+  'stage_not_run'`) means the run never reached that stage, so no summary was ever owed. \
+  `expected: null` (`reason: 'expired'`, `'run_unknown'` or `'ledger_unavailable'`) is \
+  INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
+  retention window, so the row would have been reaped whether or not it was ever written. \
+  `run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
+  decide whether to flag. Use this as the PRIMARY \
   cycle-summary presence check (see Cycle-Summary Verification below).
 
 You do NOT have write or mutation tools.
@@ -202,16 +211,25 @@ stage='task_knowledge_sync')`
 
 - `ledger_available: true` and `present: true` → the summary is present. Do NOT report \
 it as missing.
-- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
-ABSENT. Report it as missing: `category='missing_knowledge'`, `actionable=true`, \
+- `present: false` and `expected: true` (`reason: 'missing'`) → the run DID reach Stage \
+2 and is within the ledger's retention window, so the row is genuinely lost. Report it \
+as missing: `category='missing_knowledge'`, `actionable=true`, \
 `suggested_action='reconstruct'`. This is not a race you are seeing too early: both of \
 the write paths that precede this check have already had their turn — the stage's own \
 idempotent upsert, and the harness's write-recovered re-attempt with the REAL report, \
 which task 4186 moved ahead of this check (it previously ran after it, in the driver's \
 finally).
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE (the ledger is \
-not wired, or the read failed). Do NOT conclude presence or absence from this path — \
-fall through to the FALLBACK below instead.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → the run never \
+reached Stage 2, so no summary was ever owed. This is NOT a gap: do not report it, and \
+do not describe it as data loss.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE (the row is past \
+retention, the run is unknown, the ledger is not wired, or the read failed). Do NOT \
+conclude presence or absence from this path — fall through to the FALLBACK below \
+instead.
+- `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
+decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
+well have run the stage and lost only the ledger write.
 
 **FALLBACK (used ONLY when the ledger check above is inconclusive)** — use BOTH \
 of the following paths — declare the summary missing ONLY if BOTH return nothing:

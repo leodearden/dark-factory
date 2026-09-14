@@ -51,8 +51,17 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
 `write_cycle_summary`), as opposed to `count_memories_by_metadata`'s best-effort Mem0 \
 mirror query. Returns `{{'present': bool, 'ledger_available': bool, 'project_id': ..., \
-'run_id': ..., 'stage': ...}}`. `ledger_available: false` means the ledger is not wired \
-— treat that as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY \
+'run_id': ..., 'stage': ..., 'remediation': bool|null, 'reason': str, \
+'expected': bool|null, 'run_lookup_available': bool, 'run_status': str|null}}`. \
+`present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
+`expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
+AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
+'stage_not_run'`) means the run never reached that stage, so no summary was ever owed. \
+`expected: null` (`reason: 'expired'`, `'run_unknown'` or `'ledger_unavailable'`) is \
+INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
+retention window, so the row would have been reaped whether or not it was ever written. \
+`run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
+decide whether to flag. Use this as the PRIMARY \
 cycle-summary presence authority before reconstructing a carry-forward finding (see \
 ## Re-Verify Reconstruction Writes Before Carry-Forward below).
 
@@ -368,11 +377,20 @@ EXISTS. The carry-forward finding is stale — do NOT reconstruct. Emit the find
 RESOLVED (or omit it) and note in your cycle report, e.g. "Stage 2 summary for \
 run_id=<reconstructed run's full UUID> already present per ledger — skipping \
 reconstruction."
-- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
-ABSENT. Proceed to reconstruct and re-verify exactly as described below.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Proceed to \
+- `present: false` and `expected: true` (`reason: 'missing'`) → the authoritative row \
+is genuinely lost. Proceed to reconstruct and re-verify exactly as described below.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → that run never \
+reached Stage 2. The carry-forward finding is stale: there was no Stage 2 work to \
+summarise, so do NOT reconstruct — doing so would fabricate a summary for work that \
+never happened. Emit the finding as RESOLVED (or omit it) and say so in your cycle \
+report.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Proceed to \
 reconstruct as below (unchanged behavior) — the post-write re-check remains your \
 fallback verification.
+- `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
+decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
+well have run the stage and lost only the ledger write.
 
 ### Reconstruction and post-write re-check (fallback verification, kept verbatim)
 When you reconstruct a memory to resolve a carry-forward finding flagged by Stage 1 or \
