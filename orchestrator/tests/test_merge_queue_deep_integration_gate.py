@@ -341,10 +341,9 @@ from _merge_lane_census import lanes_by_task, queued_in_lane
 # their spawn counts has been measured, and widening an unmeasured marker is the
 # guessing this task replaced. The asymmetry is a decision, not an oversight.
 from _orch_helpers import (
-    DEEP_GATE_SCENE_SPAWN_BUDGET,
     DEEP_GATE_SCENE_TEST_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    spawn_budget_violation,
+    deep_gate_spawn_budget_violation,
 )
 from shared.task_metadata import RetryLedger
 
@@ -4371,14 +4370,11 @@ class TestRow7KillSwitchByteIdentity:
     def _within_spawn_budget(self, request, monkeypatch):
         """Fail if this test costs more real git than its marker is sized for.
 
-        WHY THE MARKER NEEDS A GUARD AT ALL: ``DEEP_GATE_SCENE_TEST_TIMEOUT``
-        is derived from ``DEEP_GATE_SCENE_SPAWN_BUDGET``, so it stays correct
-        only while the scene stays inside that budget.  Without this fixture a
-        scene that grew heavier would re-create the under-sizing silently, and
-        the symptom returns as a bare xdist worker crash on someone else's
-        branch -- no assertion, no traceback.  Task 5028 moved this class's
-        counts within a single day, in an unrelated lane, with nothing in the
-        tree reporting it.
+        WHY THE MARKER NEEDS A GUARD AT ALL -- and why the budget rather than
+        a comment is what keeps it honest -- is argued once, at
+        ``_orch_helpers.py::DEEP_GATE_SCENE_TEST_TIMEOUT``.  Not restated here:
+        prose copies of a derivation are what drift.  This docstring covers
+        only what is local to the fixture and stated nowhere else.
 
         Counts BOTH asyncio spawn entry points, which is what the measurement
         behind the constants counted.  ``create_subprocess_exec`` is the one
@@ -4407,9 +4403,7 @@ class TestRow7KillSwitchByteIdentity:
         for seam in seams:
             monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
         yield
-        violation = spawn_budget_violation(
-            spawns, DEEP_GATE_SCENE_SPAWN_BUDGET, request.node.nodeid
-        )
+        violation = deep_gate_spawn_budget_violation(spawns, request.node.nodeid)
         assert violation is None, violation
 
     async def _sequence(

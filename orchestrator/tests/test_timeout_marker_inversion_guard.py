@@ -428,6 +428,64 @@ def _autouse_fixtures(node: ast.ClassDef) -> tuple[ast.FunctionDef | ast.AsyncFu
     )
 
 
+def _assert_enforced_call_names(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> frozenset[str]:
+    """Names *fn* CALLS whose result an ``assert`` in *fn* actually tests.
+
+    Strictly stronger than "the name appears somewhere in the body", and the
+    difference is the whole value of the pin that uses it (task 5333 reviewer
+    amendment).  A fixture that computes a verdict and drops the assert, or
+    that merely mentions the name in a keyword default, enforces NOTHING while
+    satisfying a bare ``ast.Name`` walk -- so a pin built on one would be
+    weaker than the claim it is there to carry.
+
+    TWO enforcing shapes are accepted, because both really do fail the test:
+    the call written inside the ``assert``'s own test, and the call bound to a
+    name that an ``assert``'s test then reads (what the Row 7 fixture does, so
+    its message can carry the verdict text).  The assert MESSAGE deliberately
+    does not count: a call evaluated only to build the text of a failure that
+    some other condition decides is not enforcement.
+
+    Intra-procedural and syntactic, so it does not chase reassignment or prove
+    a branch is live.  It pins the shape, not the semantics -- which is the
+    honest limit of an AST pin and is why it is paired with the real fixture
+    actually running.
+    """
+    asserted_names = {
+        name.id
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Assert)
+        for name in ast.walk(node.test)
+        if isinstance(name, ast.Name)
+    }
+
+    def _called_name(value: ast.expr | None) -> str | None:
+        return (
+            value.func.id
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            else None
+        )
+
+    enforced: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assert):
+            enforced.update(
+                call.func.id
+                for call in ast.walk(node.test)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            )
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            called = _called_name(node.value)
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if called is not None and any(
+                isinstance(target, ast.Name) and target.id in asserted_names
+                for target in targets
+            ):
+                enforced.add(called)
+    return frozenset(enforced)
+
+
 # ---------------------------------------------------------------------------
 # The REAL definitions behind _SANCTIONED_TIMEOUT_NAMES.
 #
@@ -941,7 +999,7 @@ class TestDeepGateSceneBudget:
         )
 
 class TestSpawnBudgetVerdict:
-    """``spawn_budget_violation`` -- the budget check as a pure verdict.
+    """``deep_gate_spawn_budget_violation`` -- the budget check as a pure verdict.
 
     Split out as a FUNCTION rather than written inline in the autouse fixture
     that calls it, so the fixture stays a thin wire and every branch below is
@@ -955,7 +1013,7 @@ class TestSpawnBudgetVerdict:
         budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
 
         for count in (1, 113, 234, budget):
-            assert _orch_helpers.spawn_budget_violation(count, budget, 'm.py::t') is None, (
+            assert _orch_helpers.deep_gate_spawn_budget_violation(count, 'm.py::t') is None, (
                 f'{count} spawns against a budget of {budget} was reported as '
                 'a violation. Only a count ABOVE the budget (or a zero count, '
                 'which means the counting seam saw no git at all) is one.'
@@ -971,7 +1029,7 @@ class TestSpawnBudgetVerdict:
         """
         budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
 
-        assert _orch_helpers.spawn_budget_violation(budget, budget, 'm.py::t') is None, (
+        assert _orch_helpers.deep_gate_spawn_budget_violation(budget, 'm.py::t') is None, (
             f'a count of exactly {budget} -- the budget itself -- was reported '
             'as a violation. DEEP_GATE_SCENE_TEST_TIMEOUT is derived from this '
             'exact number, so it is the one count that must pass.'
@@ -989,7 +1047,7 @@ class TestSpawnBudgetVerdict:
         count = budget + 1
         nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
 
-        message = _orch_helpers.spawn_budget_violation(count, budget, nodeid)
+        message = _orch_helpers.deep_gate_spawn_budget_violation(count, nodeid)
 
         assert message is not None, (
             f'{count} spawns against a budget of {budget} was not reported as '
@@ -1021,7 +1079,7 @@ class TestSpawnBudgetVerdict:
         budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
         nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
 
-        message = _orch_helpers.spawn_budget_violation(0, budget, nodeid)
+        message = _orch_helpers.deep_gate_spawn_budget_violation(0, nodeid)
 
         assert message is not None, (
             'a count of ZERO was accepted as within budget. It is arithmetically '
@@ -1032,7 +1090,7 @@ class TestSpawnBudgetVerdict:
         assert nodeid in message, (
             f'the zero-count message omits the node id.\n\ngot: {message}'
         )
-        assert message != _orch_helpers.spawn_budget_violation(budget + 1, budget, nodeid), (
+        assert message != _orch_helpers.deep_gate_spawn_budget_violation(budget + 1, nodeid), (
             'the zero-count message is identical to the over-budget message, so '
             'a reader cannot tell "this scene got heavier" (re-derive the '
             'constants) from "the counting seam broke" (fix the fixture). They '
@@ -1107,6 +1165,13 @@ class TestRow7SceneIsGuarded:
         that drifted out to module scope -- where it would silently apply to
         every class in the file, or to none -- does not read as coverage of
         this one.
+
+        ENFORCEMENT, not mention: the verdict must be CALLED and the call's
+        result must reach an ``assert`` (see `_assert_enforced_call_names`).
+        An earlier revision accepted the bare name anywhere in the fixture
+        body, which a fixture that computed the verdict and dropped the assert
+        would have satisfied while guarding nothing -- a pin weaker than the
+        claim it carries.
         """
         tree = _parse((_TESTS_DIR / _DEEP_GATE_MODULE).read_text(encoding='utf-8'))
         assert tree is not None, f'{_DEEP_GATE_MODULE} did not parse'
@@ -1119,25 +1184,104 @@ class TestRow7SceneIsGuarded:
             'measured cost and mean nothing detached from it.'
         )
 
+        verdict = 'deep_gate_spawn_budget_violation'
         guarded = [
             fixture.name
             for fixture in _autouse_fixtures(row7)
-            for node in ast.walk(fixture)
-            if isinstance(node, ast.Name) and node.id == 'spawn_budget_violation'
+            if verdict in _assert_enforced_call_names(fixture)
         ]
 
         assert guarded, (
             f'{_DEEP_GATE_MODULE}::{_ROW7_CLASS} binds no autouse fixture that '
-            'calls spawn_budget_violation.\n\n'
+            f'calls {verdict} AND asserts on the result.\n\n'
             'DEEP_GATE_SCENE_TEST_TIMEOUT is sized against '
             'DEEP_GATE_SCENE_SPAWN_BUDGET rather than against the raw '
             'measurement precisely so that the budget, not a comment, is what '
-            'keeps the marker honest. Without the fixture the marker is a '
-            'number that decays silently: task 5028 moved this scene\'s spawn '
-            'counts within a single day, in an unrelated lane, and nothing in '
-            'the tree reported it. Restore the fixture rather than widening '
-            'the marker further.'
+            'keeps the marker honest -- a marker with no enforced budget is a '
+            'number that decays silently. The argument for that coupling, and '
+            'the measured decay behind it, are in _orch_helpers.py::'
+            'DEEP_GATE_SCENE_TEST_TIMEOUT. Restore the fixture rather than '
+            'widening the marker further.'
         )
+
+
+# ---------------------------------------------------------------------------
+# _assert_enforced_call_names(fn) -- inline-fixture unit tests.
+#
+# Same rationale as the extractor tests below: against the real tree this
+# detector is green by construction, so its NEGATIVE cases -- the ones that
+# carry its entire value over a bare `ast.Name` walk -- would otherwise never
+# be exercised.  Each rejection below is a fixture shape that would pass the
+# weaker pin while enforcing nothing (task 5333 reviewer amendment).
+# ---------------------------------------------------------------------------
+
+
+def _enforced(body: str) -> frozenset[str]:
+    """``_assert_enforced_call_names`` over one dedented function snippet."""
+    fn = ast.parse(textwrap.dedent(body)).body[0]
+    assert isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef)
+    return _assert_enforced_call_names(fn)
+
+
+def test_enforced_reads_the_bind_then_assert_shape() -> None:
+    """The Row 7 fixture's own spelling: bind the verdict, assert on the name."""
+    assert 'verdict' in _enforced(
+        """
+        def _fixture():
+            result = verdict(7)
+            assert result is None, result
+        """
+    )
+
+
+def test_enforced_reads_the_call_written_inside_the_assert() -> None:
+    """The other honest spelling, where nothing is bound first."""
+    assert 'verdict' in _enforced(
+        """
+        def _fixture():
+            assert verdict(7) is None
+        """
+    )
+
+
+def test_enforced_rejects_a_verdict_computed_and_dropped() -> None:
+    """The exact regression this detector exists for.
+
+    A fixture that still CALLS the verdict but no longer asserts on it guards
+    nothing, while a bare-name walk reports it as covered.
+    """
+    assert 'verdict' not in _enforced(
+        """
+        def _fixture():
+            result = verdict(7)
+        """
+    )
+
+
+def test_enforced_rejects_a_bare_mention() -> None:
+    """A name that is never called -- a keyword default, an alias, a comment's
+    worth of code -- is not enforcement however prominently it appears."""
+    assert 'verdict' not in _enforced(
+        """
+        def _fixture(check=verdict):
+            handler = verdict
+            assert True
+        """
+    )
+
+
+def test_enforced_rejects_a_call_reached_only_by_the_assert_message() -> None:
+    """A verdict evaluated only to TEXT a different condition decides to raise.
+
+    The message is built after the test has already failed, so the call never
+    determines the outcome -- which is why only the assert's test is walked.
+    """
+    assert 'verdict' not in _enforced(
+        """
+        def _fixture():
+            assert spawns < 10, verdict(spawns)
+        """
+    )
 
 
 # ---------------------------------------------------------------------------

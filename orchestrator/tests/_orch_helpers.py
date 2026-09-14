@@ -265,12 +265,26 @@ DELIBERATE_TIGHT_BOUND_CEILING = 60
 # 2.13/3.10/4.71, load-per-core 6.6) -- the per-spawn price
 # `required_timeout_secs` below charges.
 #
+# A DELIBERATELY PESSIMISTIC CEILING, NOT AN ESTIMATE OF ANY CALLER'S SCENE
+# (task 5333 reviewer amendment).  4.71 is the SLOWEST of three single-spawn
+# samples taken from one workload; it is the price a caller pays so that a
+# marker derived from it cannot be too small.  Read as a prediction of what a
+# spawn costs it is wildly high -- measured against this file's own
+# DEEP_GATE_SCENE_* caller, whose per-spawn cost is quantified in that
+# constant's comment, it over-charges by two orders of magnitude.  That gap is
+# intended and is the whole point: these markers are BACKSTOPS that must never
+# fire on a healthy run, not budgets tuned to a scene's typical cost.  A
+# re-deriver who mistakes it for the latter will "correct" it downward and
+# re-create the very under-sizing it exists to prevent.
+#
 # WHY THAT PROVENANCE LICENSES REUSE BEYOND THE OFFLINE LANE (task 5333): the
 # figure is a worst case measured UNDER CONTENTION, at load-per-core 6.6, and
 # the TestRow7KillSwitchByteIdentity crashes it is now also used to size were
 # recorded at load-per-core 5.5-11 -- the same regime, BRACKETED rather than
 # extrapolated from.  A latency measured on an idle host would not transfer;
-# this one does.
+# this one does.  (That argument licenses the TRANSFER of the figure between
+# workloads.  It says nothing about the figure being tight for either of them,
+# which the paragraph above is careful not to claim.)
 #
 # MOVED HERE from test_offline_lane_integration.py by task 5333, which needed
 # the same arithmetic in test_merge_queue_deep_integration_gate.py -- a module
@@ -340,19 +354,54 @@ def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> floa
 # The sleep total is the load-bearing half of that: with no bounded waits at
 # all, this class is ~100% SUBPROCESS-SPAWN-BOUND, so its wall clock is its
 # spawn count multiplied by per-spawn latency -- and per-spawn latency is
-# exactly what host CPU oversubscription inflates.  That is why it dominated
-# the crash census (5 of 7 recorded events): at 234 spawns it is the heaviest
-# thing in that file, while sharing the same 300s marker as classes a third
-# its size.
+# exactly what host CPU oversubscription inflates.
+#
+# WHAT IS OBSERVED, AND WHAT IS ONLY HYPOTHESISED (task 5333 reviewer
+# amendment -- stated separately so a later reader does not inherit a guess as
+# a finding).  OBSERVED: this class is 5 of the 7 recorded crash-census
+# events; at 234 spawns it is the heaviest thing in that file; it shared an
+# identical 300s marker with classes a third its size; and every recorded run
+# of it, at every load, finished far under 300s (see the wall clocks below --
+# the largest is 22.81s for all three tests together).  HYPOTHESIS: that the
+# 300s marker is what fired in those crashes, via a load excursion larger than
+# any yet recorded.  NOT OBSERVED, and the gap matters: no recorded run shows
+# this class approaching 300s, so nothing here demonstrates the old marker
+# firing.  Another cause would fit the same census -- git_ops.py documents
+# EMFILE/ENOMEM paths on `create_subprocess_exec`, and a bare xdist worker
+# death looks identical from the outside whichever killed it.  A widened
+# marker is therefore a HEDGE against the timeout cause, not a proven repair;
+# the budget fixture below is what this change contributes unconditionally,
+# since it reports scene growth whatever the crash mechanism turns out to be.
+# If Row 7 crashes again with this marker in place, the timeout hypothesis is
+# falsified -- look at fd and memory limits next, and do not widen further.
 #
 # THE COUNTS ARE DETERMINISTIC AND THE WALL CLOCK IS NOT, which IS the
-# load-sensitivity these constants exist to absorb.  Four runs of the same
+# load-sensitivity these constants exist to absorb.  Five runs of the same
 # three tests, spawn count identical (460) in every one:
 #     8.06s and 17.72s at loadavg ~98 / 32 cores;
-#     19.03s and 22.81s at loadavg 145 then 304 / 32 cores.
+#     19.03s and 22.81s at loadavg 145 then 304 / 32 cores;
+#     18.12s at loadavg 247 / 32 cores, the run that also took the per-test
+#     split below (8.28s / 4.05s / 5.20s for the 234 / 113 / 113 tests).
 # A 2.8x spread with the work held fixed. Sizing this marker from wall clock
 # would have meant sizing it from whatever the host happened to be doing; the
 # spawn count is the stable quantity, so the marker is sized from THAT.
+#
+# 1260 IS ~150x THE HEAVIEST RECORDED RUN OF THE HEAVIEST TEST, and that is
+# deliberate rather than an arithmetic slip (task 5333 reviewer amendment).
+# Dividing the wall clocks above by 460 puts THIS scene's per-spawn cost at
+# 0.018-0.050s -- against the 4.71s `MEASURED_SPAWN_LATENCY_SECS` charges, a
+# ~100-270x over-charge.  The 4.71 is a worst-case SINGLE-spawn latency from a
+# different workload, i.e. a pessimistic ceiling and not an estimate of this
+# scene (see its own comment above); pricing 260 spawns at it assumes every
+# spawn simultaneously hits that worst case, which no recorded run comes near.
+# KEPT ANYWAY, on the tradeoff these markers are for: too LARGE costs at most
+# one wedged test burning 1260s of a 7200s verify budget before it reports --
+# bounded, attributed, and recoverable.  Too SMALL costs an `os._exit()`d
+# xdist worker with no assertion and no traceback, which is what made this
+# class's crashes cost ~38-minute merge cycles to diagnose.  Those are not
+# symmetric, so the sizing deliberately errs high.  The price of erring high
+# is real and is named here so the next re-deriver weighs it rather than
+# rediscovering it: do not read 1260 as a claim about what this class costs.
 #
 # BUDGET = 234 + 26 (~11% headroom) = 260.  Headroom rather than a snug fit
 # because an unrelated change adding a few spawns must not fail the run --
@@ -395,7 +444,7 @@ DEEP_GATE_SCENE_SPAWN_BUDGET = 260
 DEEP_GATE_SCENE_TEST_TIMEOUT = 1260
 
 
-def spawn_budget_violation(count: int, budget: int, nodeid: str) -> str | None:
+def deep_gate_spawn_budget_violation(count: int, nodeid: str) -> str | None:
     """Why *count* git spawns is an unacceptable cost for *nodeid*, or None.
 
     Returns the MESSAGE and never raises: the CALLER decides how to fail.
@@ -403,15 +452,25 @@ def spawn_budget_violation(count: int, budget: int, nodeid: str) -> str | None:
     only from the autouse fixture that uses it -- a budget check living
     inside a fixture teardown is exercised only on the path where it passes.
 
+    SCOPED TO :data:`DEEP_GATE_SCENE_SPAWN_BUDGET`, which it reads rather than
+    accepts (task 5333 reviewer amendment).  An earlier revision took the
+    budget as a parameter while its message named the DEEP_GATE_SCENE_*
+    constants as the pair to re-derive, so any second caller the general
+    signature invited would have been told to re-derive constants that had
+    nothing to do with it.  The narrow spelling makes the parameters and the
+    message agree about how wide this function is, and lets its unit tests pin
+    the REAL budget boundary instead of a synthetic one.
+
     TWO offences, kept distinct because their remedies differ.  A count ABOVE
-    *budget* means the scene got heavier and both constants need re-deriving.
-    A count of ZERO means the caller's counting seam saw no git at all, so
-    the budget is enforcing nothing -- and since zero is inside every budget,
-    nothing else here would catch it.
+    the budget means the scene got heavier and both constants need
+    re-deriving.  A count of ZERO means the caller's counting seam saw no git
+    at all, so the budget is enforcing nothing -- and since zero is inside
+    every budget, nothing else here would catch it.
 
     The derivation behind these numbers is NOT restated here; see
     :data:`DEEP_GATE_SCENE_TEST_TIMEOUT`'s comment above.
     """
+    budget = DEEP_GATE_SCENE_SPAWN_BUDGET
     if count == 0:
         return (
             f'{nodeid} made NO git subprocess calls, so its spawn budget of '
