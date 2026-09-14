@@ -1514,7 +1514,7 @@
     "orchestrator/tests/test_session_resume_integration_gate.py": {"patch_targets": [], "private_reads": 114},
     "orchestrator/tests/test_stranded_verified_green.py": {"patch_targets": [], "private_reads": 112},
     "orchestrator/tests/test_substrate_gate.py": {"patch_targets": [], "private_reads": 42},
-    "orchestrator/tests/test_suffix_conflict_tracker.py": {"patch_targets": [], "private_reads": 27},
+    "orchestrator/tests/test_suffix_conflict_tracker.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_supervision_composition_integration_gate.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_task_ground_truth.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_task_runtime.py": {"patch_targets": [], "private_reads": 1},
