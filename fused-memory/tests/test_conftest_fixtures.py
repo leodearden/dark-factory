@@ -30,6 +30,14 @@ from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 
+#: The config ``_isolate_fm_config`` is supposed to pin, derived HERE from this
+#: file's own location rather than read back from the conftest constant the
+#: fixture writes.  Reading the constant back would compare the pin against
+#: itself: a ``FM_CONFIG_PATH`` repointed at some other absolute file that
+#: happens to exist would satisfy that equality, and the absolute/exists
+#: assertions beside it, while silently resolving a different config.
+CANONICAL_CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+
 
 def _fused_memory_conftest():
     """The loaded fused-memory conftest, found by PATH rather than by name.
@@ -78,10 +86,14 @@ class TestIsolateFmConfig:
         against the process CWD and silently returns ``{}`` when it misses, so
         a regression to a CWD-derived pin would still satisfy an equality
         check run from ``fused-memory/`` and fail from anywhere else.
+
+        The equality half is sensitive to a wrong CONSTANT as well as to a
+        wrong fixture, because the expected path comes from
+        ``CANONICAL_CONFIG_PATH`` above and not from the conftest.
         """
         pinned = os.environ['CONFIG_PATH']
 
-        assert pinned == str(_fused_memory_conftest().FM_CONFIG_PATH)
+        assert Path(pinned).resolve() == CANONICAL_CONFIG_PATH.resolve()
         assert Path(pinned).is_absolute()
         assert Path(pinned).exists()
 
@@ -101,7 +113,7 @@ class TestIsolateFmConfig:
             local.setenv('CONFIG_PATH', str(local_config))
             assert os.environ['CONFIG_PATH'] == str(local_config)
 
-        assert os.environ['CONFIG_PATH'] == str(_fused_memory_conftest().FM_CONFIG_PATH)
+        assert Path(os.environ['CONFIG_PATH']).resolve() == CANONICAL_CONFIG_PATH.resolve()
 
 
 # ---------------------------------------------------------------------------

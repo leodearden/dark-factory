@@ -148,6 +148,22 @@ FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 #: survive in one subproject after being fixed in the other.
 _FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
 
+#: The variables the TRACKED config interpolates into its PATH-VALUED leaves:
+#: ``${PROJECT_ROOT:.}`` (``taskmaster.project_root``,
+#: ``reconciliation.explore_codebase_root``), ``${QUEUE_DATA_DIR:./data/queue}``
+#: and ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``.  A THIRD env
+#: surface, reached through the YAML's own interpolation rather than through
+#: pydantic's env layer, so the derived names above cannot see it: measured
+#: with ``CONFIG_PATH`` already pinned at the canonical file,
+#: ``PROJECT_ROOT=/pwned-by-env`` still rewrote both of its leaves, and this
+#: repo's operator scripts do export ``PROJECT_ROOT``
+#: (``scripts/memory-metadata-coverage-census.sh`` and two siblings).
+#: LISTED rather than derived, unlike the model fields: deriving the
+#: interpolation surface from the file would sweep in ``${OPENAI_API_KEY}`` and
+#: ``${FALKORDB_URI:...}``, which the config reads from the environment BY
+#: DESIGN.  Only path-valued names belong here.
+_FM_CONFIG_PATH_INTERPOLATIONS = ('PROJECT_ROOT', 'QUEUE_DATA_DIR', 'RECONCILIATION_DATA_DIR')
+
 
 def _reads_as_a_config_override(env_name):
     """Whether pydantic-settings would read *env_name* as a config field.
@@ -161,7 +177,11 @@ def _reads_as_a_config_override(env_name):
     ``FOO__TASKMASTER`` has the head ``foo``.  That narrowness is deliberate —
     unrelated fixtures and the uv/venv machinery legitimately need the ambient
     environment, so a blanket clear would trade one nondeterminism for a worse
-    one.
+    one.  It is also asserted rather than merely asserted-in-prose:
+    ``test_config_hermeticity.py::TestTheScrubStaysNarrow`` plants those
+    near-miss names ambiently and fails if a widened match deletes one, which
+    is the failure a reader would otherwise meet as a cascade in an unrelated
+    suite.
     """
     lowered = env_name.lower()
     return lowered in _FM_CONFIG_FIELDS or lowered.split('__', 1)[0] in _FM_CONFIG_FIELDS
@@ -195,11 +215,30 @@ def _isolate_fm_config(monkeypatch):
     the same from everywhere.  Tests that want pure schema defaults opt into
     ``code_default_config`` below.
 
-    Mirrors ``orchestrator/tests/conftest.py::_isolate_orch_config``, whose
-    docstring records the same reasoning for ``ORCH_CONFIG_PATH`` ("the
-    absolute path is also CWD-independent, so the config no longer depends on
-    running from ``orchestrator/``").  That hardening was applied
-    subproject-locally and never propagated; this is the propagation.
+    Mirrors the CONFIG-PATH half of
+    ``orchestrator/tests/conftest.py::_isolate_orch_config``, whose docstring
+    records the same reasoning for ``ORCH_CONFIG_PATH`` ("the absolute path is
+    also CWD-independent, so the config no longer depends on running from
+    ``orchestrator/``").  That hardening was applied subproject-locally and
+    never propagated; this is the propagation.
+
+    THE HALF DELIBERATELY NOT PROPAGATED.  ``_isolate_orch_config`` also pins
+    ``ORCH_PROJECT_ROOT`` at ``tmp_path`` — "the other load-bearing part" in
+    its own words — which rewrites the config's path leaves.  The tracked
+    fused-memory config's path leaves are RELATIVE: measured under this pin
+    they are ``taskmaster.project_root='.'``,
+    ``reconciliation.explore_codebase_root='.'``,
+    ``queue.data_dir='./data/queue'`` and
+    ``reconciliation.data_dir='./data/reconciliation'``.  So what this fixture
+    buys is that config RESOLUTION is CWD-independent — same layers, same
+    strings, from any CWD — while those four STRINGS still denote the
+    directory pytest was launched from.  Pointing them at tmp would change the
+    value ~19.8k currently-green tests read, which is the behaviour change this
+    task's zero-collateral design decision rules out; it is recorded in the RCA
+    and filed as a follow-up rather than done here.  What IS closed is the
+    ambient half of it: the variables that redirect those leaves are scrubbed
+    below, so the leaves denote the launching CWD and nothing else.
+    ``test_config_hermeticity.py`` states both halves executably.
 
     ``monkeypatch.setenv`` restores the pre-existing value at teardown, so this
     SUBSUMES the ``preserve_config_path`` fixture it replaced — one fixture
@@ -222,9 +261,15 @@ def _isolate_fm_config(monkeypatch):
     whole ``ORCH_`` prefix: so a variable added later cannot reintroduce the
     class.  The comprehension snapshots the names before the loop deletes any,
     since mutating ``os.environ`` while iterating it raises.
+    ``_FM_CONFIG_PATH_INTERPOLATIONS`` is the same treatment for the YAML's own
+    interpolation surface, which pydantic never sees and the derived names
+    therefore miss.
     """
     for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
         monkeypatch.delenv(inherited, raising=False)
+
+    for interpolated in _FM_CONFIG_PATH_INTERPOLATIONS:
+        monkeypatch.delenv(interpolated, raising=False)
 
     monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
 
