@@ -4227,11 +4227,39 @@ def create_mcp_server(
         (``task_knowledge_sync``) rows written under the same ``run_id``.
 
         Return shape: ``{'present': bool, 'ledger_available': bool,
-        'project_id': str, 'run_id': str, 'stage': str}``. When the ledger is
-        not wired (``ledger_available: False``), ``present`` is always
-        ``False`` and MUST be treated as inconclusive, not a definitive
+        'project_id': str, 'run_id': str, 'stage': str, 'remediation':
+        bool | None, 'reason': str, 'expected': bool | None,
+        'run_lookup_available': bool, 'run_status': str | None}``. When the
+        ledger is not wired (``ledger_available: False``), ``present`` is
+        always ``False`` and MUST be treated as inconclusive, not a definitive
         absence — mirrors ``write_cycle_summary`` returning ``False`` when
         unwired.
+
+        ``present: False`` alone does NOT mean a summary was lost — it
+        conflates four unrelated situations, and ``reason`` names which one:
+
+        - ``present`` — the row is there.
+        - ``missing`` — the stage ran, the run is within the retention
+          window, and no row exists. **This is the only genuine gap.**
+        - ``stage_not_run`` — the run never reached this stage, so there was
+          never anything to write. Not a defect; do not report it as one.
+        - ``expired`` — the run is older than the retention window, so the
+          row would have been reaped by ``ReconLedgerStore.gc()`` whether or
+          not it was ever written. Absence here carries no information.
+        - ``run_unknown`` / ``ledger_unavailable`` — nothing available to
+          answer with; inconclusive.
+
+        ``expected`` collapses that into the one gate to act on. **Conclude a
+        genuine gap ONLY when ``present`` is False AND ``expected`` is True.**
+        ``expected: False`` means there was nothing to write; ``expected:
+        None`` means the question is unanswerable, and the caller should fall
+        through to its existing best-effort fallback exactly as before.
+
+        ``run_status`` is DIAGNOSTIC ONLY — useful as evidence on a finding,
+        but never a gating condition. Gating on it looks right on the majority
+        case and is wrong: measured ``failed`` runs really did execute their
+        stage and lose the ledger write, so a status gate suppresses precisely
+        the real findings it appears to filter.
 
         This tool is intentionally read-only and is NOT included in any
         DISALLOW_* list, so it is auto-allowed in Stage 3's read-only

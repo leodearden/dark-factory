@@ -375,7 +375,10 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     'get_cycle_summary_presence': (
         'get_cycle_summary_presence(project_id, run_id, stage) -> '
         "{'present': bool, 'ledger_available': bool, 'project_id': ..., "
-        "'run_id': ..., 'stage': ...}"
+        "'run_id': ..., 'stage': ..., 'remediation': bool|None, "
+        "'reason': 'present'|'missing'|'stage_not_run'|'expired'|"
+        "'run_unknown'|'ledger_unavailable', 'expected': bool|None, "
+        "'run_lookup_available': bool, 'run_status': str|None}"
     ),
 }
 
