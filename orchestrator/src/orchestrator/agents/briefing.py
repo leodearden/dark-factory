@@ -623,6 +623,26 @@ class MemoryQueryOutcome:
     failed_stores: tuple[str, ...] = ()
 
 
+def _section_notices(spec: BriefingQuerySpec, outcome: MemoryQueryOutcome) -> list[str]:
+    """The lines a dispatch owes its reader about one query's health (D6).
+
+    Both notices name their section, because a reader looking at a block
+    with one section missing needs to know WHICH question went unanswered —
+    "memory degraded" alone leaves them unable to tell a missing convention
+    from a missing task history.
+    """
+    notices = []
+    if outcome.failure:
+        notices.append(MEMORY_SECTION_FAILURE_NOTICE.format(
+            section=spec.section_title, reason=outcome.failure,
+        ))
+    if outcome.failed_stores:
+        notices.append(MEMORY_DEGRADED_STORES_NOTICE.format(
+            section=spec.section_title, stores=', '.join(outcome.failed_stores),
+        ))
+    return notices
+
+
 def _failed_stores(payload_text: str) -> tuple[str, ...]:
     """Which stores the server reported failing on this query.
 
@@ -1785,15 +1805,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
                     caller_task_id=scope.task_id,
                 )
                 outcomes.append(outcome)
-                if outcome.failure:
-                    notices.append(MEMORY_SECTION_FAILURE_NOTICE.format(
-                        section=spec.section_title, reason=outcome.failure,
-                    ))
-                if outcome.failed_stores:
-                    notices.append(MEMORY_DEGRADED_STORES_NOTICE.format(
-                        section=spec.section_title,
-                        stores=', '.join(outcome.failed_stores),
-                    ))
+                notices.extend(_section_notices(spec, outcome))
 
                 blocks = [render_memory_results(outcome.text)] if outcome.text else []
                 if spec.slug == TASK_SEMANTIC.slug and scope.task_id:
@@ -1816,8 +1828,15 @@ Handle this escalation, then call `resolve_issue` with a summary.
         reasons = list(dict.fromkeys(failures + ([loop_failure] if loop_failure else [])))
         # An outage is "nothing worked", not "something didn't": one failed
         # query among two is a partial recall, already named section by
-        # section in `notices` above.
-        outage = bool(reasons) and (loop_failure is not None or len(failures) == queries_fired)
+        # section in `notices` above. Gated on `recalled_sections` as well as
+        # on the reasons, because the loop can break AFTER a section was
+        # genuinely recalled — and a dispatch that recalled something has not
+        # suffered an outage, however badly its remaining queries went.
+        outage = (
+            not recalled_sections
+            and bool(reasons)
+            and (loop_failure is not None or len(failures) == queries_fired)
+        )
         self._note_memory_outage(outage)
 
         # Compute (and log) the filtered-result summary BEFORE any early

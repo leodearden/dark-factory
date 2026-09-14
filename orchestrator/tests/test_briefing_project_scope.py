@@ -1214,6 +1214,31 @@ class TestOutageStreakEscape:
 
         assert self._errors(caplog) == []
 
+    async def test_a_dispatch_that_recalled_something_is_not_an_outage(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The loop can break AFTER a section was genuinely recalled — by a
+        filter or renderer surprise rather than a per-query fault. That
+        dispatch still has memory in its prompt, so it must not count toward
+        a streak that means "the memory service is gone"."""
+        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
+
+        async def half_broken(spec, query, **_kwargs):
+            if spec.slug == 'briefing-task-semantic':
+                raise RuntimeError('the renderer surprised us')
+            return MemoryQueryOutcome(text=json.dumps({'results': [
+                _result('1', 'A recalled fact.', source_store='mem0'),
+            ]}))
+
+        with caplog.at_level(logging.ERROR), patch.object(
+            briefing, '_scoped_search', new=AsyncMock(side_effect=half_broken),
+        ):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD + 1):
+                context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert 'A recalled fact.' in context
+        assert self._errors(caplog) == []
+
     async def test_the_per_dispatch_layer_still_reports_every_failure(
         self, briefing: BriefingAssembler, caplog,
     ):

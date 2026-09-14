@@ -120,9 +120,33 @@ class TestDeriveAreaTerms:
             'orchestrator/src/orchestrator/agents/briefing.py',
         ))
 
+        # Interleaved, not path-by-path: each file contributes its first
+        # word before any file contributes a second, so a term budget spent
+        # on the earliest-listed package cannot hide the rest of the
+        # footprint.
         assert derive_area_terms(scope) == (
-            'shared', 'briefing', 'queries', 'orchestrator', 'agents',
+            'shared', 'orchestrator', 'briefing', 'agents', 'queries',
         )
+
+    def test_every_declared_file_is_represented_within_the_budget(self):
+        from shared.briefing_queries import AREA_TERM_LIMIT
+
+        scope = BriefingScope(files=(
+            'shared/src/shared/briefing_queries.py',
+            'shared/tests/test_briefing_queries.py',
+            'shared/tests/silent_fallthrough_allowlist.py',
+            'orchestrator/src/orchestrator/agents/briefing.py',
+            'scripts/legibility/digest.py',
+        ))
+
+        terms = derive_area_terms(scope)
+
+        assert len(terms) <= AREA_TERM_LIMIT
+        for package in ('shared', 'orchestrator', 'scripts'):
+            assert package in terms, (
+                f'{package!r} is declared in the footprint but never reached '
+                f'the query: {terms}'
+            )
 
     def test_structural_path_noise_and_extensions_are_dropped(self):
         terms = derive_area_terms(BriefingScope(files=(

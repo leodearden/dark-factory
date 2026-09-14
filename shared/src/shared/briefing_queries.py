@@ -79,6 +79,25 @@ def _first_seen(words: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(words))
 
 
+def _breadth_first(per_path: list[list[str]]) -> tuple[str, ...]:
+    """Interleave each path's words so every file has a say before any repeats.
+
+    Measured on this very task's file list: read depth-first, the first three
+    paths (all under ``shared/``) filled the whole term budget and the query
+    never mentioned ``orchestrator`` or ``agents``, which is what the task is
+    mostly about. Taking each path's FIRST word, then each path's second, and
+    so on keeps a multi-package footprint legible inside
+    :data:`AREA_TERM_LIMIT` — and matches the shape of the phrasing the
+    retrieval probe actually measured.
+    """
+    return _first_seen(
+        words[index]
+        for index in range(max((len(words) for words in per_path), default=0))
+        for words in per_path
+        if index < len(words)
+    )
+
+
 def _string_tuple(value: Any) -> tuple[str, ...]:
     """Coerce a wire-read ``files`` value to a tuple of paths.
 
@@ -148,7 +167,7 @@ def derive_area_terms(scope: BriefingScope) -> tuple[str, ...]:
     landed (5/5 relevant conventions hits, cosine 0.564-0.584) per
     ``plans/metadata-modules-retirement-prd.md`` decision 4.
     """
-    terms = _first_seen(word for path in scope.files for word in _path_words(path))
+    terms = _breadth_first([_path_words(path) for path in scope.files])
     if not terms:
         terms = _first_seen(_words(scope.title))
     return terms[:AREA_TERM_LIMIT]
