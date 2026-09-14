@@ -16686,3 +16686,78 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         pending = queue.get_by_task('3105', status='pending', level=1)
         assert len(pending) == 1
         assert pending[0].category == 'reconciliation_preservation_specimen_storm'
+
+
+class TestTypedAbsenceReachesEveryPrompt:
+    """A widened payload nobody reads is a no-op (task 3731).
+
+    The service can now distinguish a genuine gap from a stage that never ran
+    and from a row the TTL reaped, but that only removes false findings if the
+    prompts consuming the presence check are gated on ``expected`` rather than
+    on bare ``present: false``. This is the producer/consumer coupling guard.
+
+    Token-level by design, matching the style
+    ``test_stage1_prompt_checks_ledger_for_stage2_summary`` documents: the
+    ``reason`` literals and the ``expected`` gate are machine-meaningful and
+    cannot occur incidentally, so harmless rewording does not break these while
+    a dropped branch does.
+    """
+
+    @staticmethod
+    def _prompts():
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage2 import (
+            build_stage2_system_prompt,
+        )
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        return {
+            'stage1': STAGE1_SYSTEM_PROMPT,
+            'stage2': build_stage2_system_prompt('dark_factory'),
+            'stage3': STAGE3_SYSTEM_PROMPT,
+        }
+
+    @pytest.mark.parametrize('reason', ['stage_not_run', 'expired', 'run_unknown'])
+    def test_every_reason_the_service_can_return_is_named(self, reason):
+        for name, prompt in self._prompts().items():
+            assert reason in prompt, (
+                f'{name} consumes get_cycle_summary_presence but never names '
+                f'reason={reason!r}. An unnamed reason is one the stage cannot '
+                f'act on, so the absence silently reads as a gap again.'
+            )
+
+    @pytest.mark.parametrize('token', ['expected: true', 'expected: false'])
+    def test_every_prompt_gates_on_expected(self, token):
+        """Asserts the VALUED token, not a bare 'expected' substring: the bare
+        word already occurs as ordinary prose in all three prompts ('expected
+        and routine', 'expected state'), so asserting it would pass vacuously
+        and pin nothing."""
+        for name, prompt in self._prompts().items():
+            assert token in prompt, (
+                f'{name} must gate its actionable branch on `{token}`, not on '
+                f'bare `present: false` — that conflation is the defect this '
+                f'task removes.'
+            )
+
+    def test_run_status_is_never_a_gating_condition(self):
+        """NEGATIVE guard. Three measured `failed` runs really did execute
+        Stage 2 and lose the ledger write, so gating on run_status suppresses
+        precisely the real findings it appears to filter. Wherever a prompt
+        mentions run_status at all, the diagnostic-only caveat must ride
+        along, so a later editor cannot quietly reintroduce status gating."""
+        for name, prompt in self._prompts().items():
+            if 'run_status' not in prompt:
+                continue
+            assert 'diagnostic' in prompt.lower(), (
+                f'{name} mentions run_status without the diagnostic-only '
+                f'caveat. run_status is evidence for a report line, never a '
+                f'condition that decides whether to flag.'
+            )
+
+    def test_fail_safe_anchors_are_retained(self):
+        """The fail-safe is WIDENED, never removed: this change only ever
+        removes false positives (PRD §8.3 monotonicity)."""
+        for name, prompt in self._prompts().items():
+            assert 'ledger_available' in prompt, f'{name} lost ledger_available'
+            assert 'AUTHORITATIVE' in prompt, f'{name} lost the AUTHORITATIVE anchor'
+            assert 'INCONCLUSIVE' in prompt, f'{name} lost the INCONCLUSIVE branch'
