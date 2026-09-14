@@ -515,3 +515,66 @@ class TestMainDegradesEachGroupIndependently:
         ]
         assert tick_lines, [r.getMessage() for r in caplog.records]
         assert any('runqueue_ratio' in line for line in tick_lines), tick_lines
+
+
+# ---------------------------------------------------------------------------
+# Review suggestion 1: a tick's write cost must not scale with its metric count
+# ---------------------------------------------------------------------------
+
+
+class TestTickCostIsFlatInTheMetricCount:
+    """run_tick must keep handing the store ONE tick, not N rows.
+
+    The store-level measurement and reasoning live on
+    ``LoadSampleStore.write_tick``; this is the end of the chain that stops
+    run_tick quietly going back to a per-row loop. The leaf count is what makes
+    it matter: ``discover_pressure_cgroups`` returns however many cgroup leaves
+    exist at collection time, so the row count per tick is unbounded here.
+    """
+
+    def _tick(self, store, now: int, leaves: int) -> None:
+        from sampler.sampler import run_tick
+
+        run_tick(
+            store,
+            now,
+            psi={'psi_cpu_some_avg10': 1.0},
+            process_metrics={'verify_concurrency': 2.0},
+            load_metrics={
+                'runqueue_ratio': 0.5,
+                **{f'own_cpu_some10:leaf{i}': float(i) for i in range(leaves)},
+            },
+        )
+
+    def test_one_leaf_and_a_hundred_leaves_cost_the_same_connections(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import sampler.store as store_module
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        # Prime the retention clock first. On a VIRGIN store the first tick
+        # also runs the interval-gated cleanup, which opens its own
+        # connections — comparing a cleanup tick against a steady-state one
+        # would measure the retention gate rather than the write path, and
+        # this test went red on exactly that before the priming tick existed.
+        self._tick(store, 999_995, leaves=1)
+
+        real_connect = store_module.sqlite3.connect
+        opened: list[int] = []
+        monkeypatch.setattr(
+            store_module.sqlite3,
+            'connect',
+            lambda *a, **kw: (opened.append(1), real_connect(*a, **kw))[1],
+        )
+
+        self._tick(store, 1_000_000, leaves=1)
+        few = len(opened)
+        opened.clear()
+        self._tick(store, 1_000_005, leaves=100)
+        many = len(opened)
+
+        assert few == many, (
+            f'a 4-metric tick opened {few} connections and a 103-metric tick '
+            f'opened {many}'
+        )

@@ -772,3 +772,198 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
             'a file that is mostly free pages was left uncompacted'
         )
         assert store.db_path.stat().st_size < size_before
+
+
+# ---------------------------------------------------------------------------
+# Review suggestion 1: one tick is one connection and one transaction
+# ---------------------------------------------------------------------------
+
+
+def _connect_spy(monkeypatch) -> list[str]:
+    """Accumulate one entry per connection the store opens.
+
+    The seam is the module's ``sqlite3`` attribute, as ``_vacuum_spy`` above
+    already uses. Counting CONNECTIONS rather than timing the tick is
+    deliberate: the cost being bought back is one connect + five durability
+    pragmas + one ``synchronous=FULL`` fsync per row, and a wall-clock
+    assertion would be flaky on a loaded host while measuring the same thing
+    indirectly.
+    """
+    import sampler.store as store_module
+
+    real_connect = store_module.sqlite3.connect
+    opened: list[str] = []
+
+    def counting_connect(*args, **kwargs):
+        opened.append(str(args[0]) if args else '')
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store_module.sqlite3, 'connect', counting_connect)
+    return opened
+
+
+class TestWriteTickIsOneConnectionAndOneTransaction:
+    """The per-row write path did not survive the 9 -> 25 metric widening.
+
+    MEASURED in this worktree against warmed stores on ext4 (200 ticks of
+    history), the two paths INTERLEAVED in one process so host noise hits both,
+    40 ticks each:
+
+      per-row writes, the 25-metric tick ......... 309.6 ms median (max 592.8)
+      the same 25 rows, one connection, one txn ..  13.2 ms median (max  34.6)
+
+    Every row took its own connection, its own five durability pragmas and its
+    own ``synchronous=FULL`` commit, and each non-PSI metric took a SECOND
+    connection for its trailing window: ~44 connections and ~25 fsyncs per
+    tick. At the paired timer's 5 s cadence that is 6.2% duty forever, on a
+    host that also runs seven orchestrators — the same order of magnitude as
+    the ~550 ms/tick cleanup scan this change goes to considerable lengths to
+    gate away. Batched it is 0.26%.
+
+    Atomicity comes with it, and it is not incidental: the corpus ε1/ε2
+    calibrate against is read tick-by-tick, and a crash between the PSI rows
+    and the windowed rows used to leave a half-written tick in it.
+    """
+
+    def _tick(self, store, now: int, leaves: int = 7) -> None:
+        store.write_tick(
+            now,
+            unwindowed={'psi_cpu_some_avg10': 1.0, 'psi_mem_full_avg10': 2.0},
+            windowed={
+                'verify_concurrency': 3.0,
+                **{f'own_cpu_some10:leaf{i}': float(i) for i in range(leaves)},
+            },
+        )
+
+    def test_a_tick_opens_one_connection(self, tmp_path: Path, monkeypatch):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        opened = _connect_spy(monkeypatch)
+
+        self._tick(store, 1_000_000)
+
+        assert len(opened) == 1, (
+            f'one tick opened {len(opened)} connections; the point of write_tick '
+            'is that it opens exactly one'
+        )
+
+    def test_the_cost_of_a_tick_does_not_scale_with_its_metric_count(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The property the measurement above is really about.
+
+        Pinning the ABSOLUTE connection count would go red on any unrelated
+        retention change; pinning that the count is INDEPENDENT of how many
+        metrics the tick carries is the thing that stops the regression, and it
+        is what a per-row loop can never satisfy — the cgroup leaf count is
+        discovered per tick and is not bounded by anything here.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+
+        opened = _connect_spy(monkeypatch)
+        self._tick(store, 1_000_000, leaves=1)
+        few = len(opened)
+
+        opened.clear()
+        self._tick(store, 1_000_005, leaves=100)
+        many = len(opened)
+
+        assert few == many, (
+            f'a 4-metric tick opened {few} connections and a 103-metric tick '
+            f'opened {many} — the write path still scales with metric count'
+        )
+
+    def test_a_tick_that_raises_partway_leaves_no_rows_at_all(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Atomicity: a half-written tick must never reach the corpus.
+
+        Under the per-row path the PSI rows were already committed by the time
+        a windowed metric failed, so the tick landed truncated and silently —
+        ε1/ε2 would read it as a tick on which those metrics were unreadable.
+        """
+        import sampler.store as store_module
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        calls: list[int] = []
+
+        def fmean_that_fails_on_the_second_metric(values):
+            calls.append(1)
+            if len(calls) >= 2:
+                raise RuntimeError('window computation failed mid-tick')
+            return sum(values) / len(values)
+
+        monkeypatch.setattr(
+            store_module.statistics, 'fmean', fmean_that_fails_on_the_second_metric
+        )
+
+        with pytest.raises(RuntimeError):
+            self._tick(store, 1_000_000)
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            rows = conn.execute(
+                'SELECT COUNT(*) FROM samples WHERE ts = ?', (1_000_000,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert rows == 0, f'a failed tick left {rows} rows behind'
+
+    def test_unwindowed_rows_keep_null_windows_and_windowed_rows_keep_theirs(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        store.write_tick(
+            1_000_000,
+            unwindowed={'psi_cpu_some_avg10': 1.5},
+            windowed={'verify_concurrency': 4.0},
+        )
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            rows = {
+                metric: (mean, mx)
+                for metric, mean, mx in conn.execute(
+                    'SELECT metric, window_mean, window_max FROM samples'
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        assert rows['psi_cpu_some_avg10'] == (None, None)
+        assert rows['verify_concurrency'] == (4.0, 4.0)
+
+    def test_the_batched_windows_agree_with_the_trailing_window_helper(
+        self, tmp_path: Path
+    ):
+        """One home for the window arithmetic, reconciled (heuristic 11).
+
+        ``write_tick`` computes the windows on its own connection rather than
+        calling the public helper, so this is the test that stops the two
+        drifting apart.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        for i in range(5):
+            store.insert_sample(1_000_000 + i, 'verify_concurrency', float(i))
+        expected = store.trailing_window('verify_concurrency', 99.0)
+
+        store.write_tick(
+            1_000_010, unwindowed={}, windowed={'verify_concurrency': 99.0}
+        )
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            got = conn.execute(
+                'SELECT window_mean, window_max FROM samples WHERE ts = ?',
+                (1_000_010,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert got == expected

@@ -6,10 +6,12 @@ fully unit-testable.
 
 Tick responsibilities
 ---------------------
-1. Write 6 PSI metrics with NULL window columns (kernel-windowed, no re-window).
-2. For each non-PSI metric: compute the trailing window from the DB, then
-   write the row with window_mean + window_max populated.
-3. Call cleanup_old to enforce the retention policy.
+1. Hand the store one whole tick: the 6 PSI metrics to be stored with NULL
+   window columns (kernel-windowed, no re-window), and every non-PSI metric to
+   be stored with its DB-backed trailing window. ``LoadSampleStore.write_tick``
+   does it on one connection in one transaction — see its docstring for the
+   measurement, and for why a half-written tick must never reach the corpus.
+2. Call cleanup_old to enforce the retention policy.
 
 Metric-name guard
 -----------------
@@ -140,17 +142,16 @@ def run_tick(
     )
     assert not unexpected_load, f'unexpected load metric keys: {unexpected_load}'
 
-    # 1. Write PSI rows (NULL windows — PSI is already kernel-windowed)
-    for metric, value in psi.items():
-        store.insert_sample(now, metric, value, window_mean=None, window_max=None)
+    # 1. Write the whole tick in one transaction. PSI rows carry NULL windows
+    #    (already kernel-windowed); the process and load groups share the
+    #    sampler-windowed path, because their write MODE is the same and they
+    #    differ along exactly one axis — the stem set their names are validated
+    #    against, above.
+    store.write_tick(
+        now,
+        unwindowed=psi,
+        windowed={**process_metrics, **load_metrics},
+    )
 
-    # 2. Write non-PSI rows with DB-backed trailing windows. The load group
-    #    shares this path: its write MODE is the same (sampler-windowed), and
-    #    it differs from the process group along exactly one axis — the stem
-    #    set its names are validated against.
-    for metric, value in {**process_metrics, **load_metrics}.items():
-        window_mean, window_max = store.trailing_window(metric, value)
-        store.insert_sample(now, metric, value, window_mean=window_mean, window_max=window_max)
-
-    # 3. Enforce retention (delete-by-age, interval-gated inside the store)
+    # 2. Enforce retention (delete-by-age, interval-gated inside the store)
     store.cleanup_old(now)
