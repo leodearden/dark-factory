@@ -2456,7 +2456,9 @@ class TestShapeOneProjectNarrowing:
             paged.append(kwargs)
             return rows
 
-        async def _fake_statuses(client, cfg, project_root):
+        async def _fake_statuses(client, cfg, project_root, **kwargs):
+            # **kwargs absorbs the Tasks-tab-local ``timeout``
+            # ``_shape_one_project`` threads into all three of its calls.
             return {r['id']: 'done' for r in rows}
 
         monkeypatch.setattr(at_mod, 'fetch_tasks', _fake_tasks)

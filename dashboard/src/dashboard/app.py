@@ -117,8 +117,9 @@ from dashboard.data.scheduler import get_scheduler_snapshot
 from dashboard.data.tasks import (
     _FETCH_TASKS_TTL_SECONDS,
     DEFAULT_WHOLE_OPERATION_BUDGET,
+    _CompleteRead,
     _fetch_tasks_cache,
-    _fetch_tasks_cache_key,
+    _TasksRead,
     fetch_tasks,
 )
 from dashboard.data.utils import safe_gather_result
@@ -948,7 +949,11 @@ async def _probe_mcp_fanout(
     global _mcp_probe, _mcp_fanout_last_ok
     loop = asyncio.get_running_loop()
 
-    key = _fetch_tasks_cache_key(str(config.project_root), None, None, 0, False)
+    # The SAME read record _fanout_probe_completion's own unnarrowed
+    # ``fetch_tasks(client, config, config.project_root)`` builds (task 5018
+    # made the cache key a structured record): whole tree, no status
+    # narrowing, one unpaginated request.
+    key = _TasksRead(str(config.project_root), None, _CompleteRead(None))
     if _fetch_tasks_cache.get_fresh(key) is not None:
         return 'ok'
 

@@ -104,15 +104,18 @@ async def _call_healthz(request: Request, *, hard_cap: float = 10.0) -> tuple[di
     return json.loads(bytes(resp.body)), resp.status_code, elapsed
 
 
-def _probe_key(config: DashboardConfig) -> str:
+def _probe_key(config: DashboardConfig):
     """The ``_fetch_tasks_cache`` key the probe's own ``fetch_tasks`` call uses.
 
-    Derived through ``_fetch_tasks_cache_key`` rather than spelled as a
-    literal: the key covers the narrowing arguments, not just the root, so a
+    Built from ``tasks``' own read record rather than spelled as a literal:
+    the key covers the narrowing arguments, not just the root, so a
     hand-written copy would silently stop matching if the probe's call shape
-    ever changed.
+    ever changed.  ``_CompleteRead(None)`` is what an unnarrowed, unchunked
+    ``fetch_tasks(client, config, project_root)`` mints.
     """
-    return tasks_module._fetch_tasks_cache_key(str(config.project_root), None, None, 0, False)
+    return tasks_module._TasksRead(
+        str(config.project_root), None, tasks_module._CompleteRead(None),
+    )
 
 
 @pytest.fixture
