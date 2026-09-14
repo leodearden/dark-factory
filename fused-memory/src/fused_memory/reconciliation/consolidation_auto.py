@@ -38,6 +38,7 @@ Two properties a reader must not get wrong
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -87,6 +88,7 @@ class AutoReasonCode(StrEnum):
     """
 
     already_gated = 'already_gated'
+    member_id_repeated = 'member_id_repeated'
     member_unreadable = 'member_unreadable'
     member_not_found = 'member_not_found'
     member_already_canonical = 'member_already_canonical'
@@ -276,6 +278,11 @@ def _metadata(record: object) -> Mapping[str, Any]:
     job is to RETURN a verdict. A predicate that throws on a malformed record is
     a predicate the caller cannot report on, which is exactly the case the
     ``member_unreadable`` code exists to make reportable.
+
+    This fallback is a FLOOR, not a pass. A record of any other shape is
+    separately refused as ``member_unreadable`` by :func:`_member_hazards`, so
+    scanning it as empty here can no longer carry a record the predicate never
+    read into a write-bearing verdict.
     """
     if not isinstance(record, Mapping):
         return {}
@@ -303,9 +310,10 @@ def _is_incumbent(record: object, topic: str) -> bool:
     One home for the definition, because three rules turn on it: the incumbent
     is STRIPPED rather than retained, it is exempt from the member-level
     canonical and banner hazards (one record must not produce two codes for one
-    fact), and it is the subject of the canonical-level hazards. A canonical of
-    a DIFFERENT topic is not an incumbent — that is the
-    ``member_already_canonical`` hazard.
+    fact), and it is the subject of the canonical-level hazards. Any OTHER
+    canonical — one stamped with a different topic, or one whose topic cannot be
+    read at all — is not an incumbent, and is the ``member_already_canonical``
+    hazard instead.
     """
     metadata = _metadata(record)
     return metadata.get('canonical') is True and metadata.get('topic') == topic
@@ -395,8 +403,51 @@ def _member_hazards(
     ``canonical_carries_correction``, which is a different fact about a
     different record — but reporting it here as well would make one problem look
     like two.
+
+    Two shapes the parameter annotations FORBID are nonetheless answered with a
+    verdict rather than an exception: an id the proposal names more than once,
+    and a record that is not a mapping at all. Neither is a live corpus state;
+    both are caller-contract violations that an aged ledger row or a mis-wired
+    caller can still put in front of us — the same argument the
+    ``no_retained_members`` guard makes one rung down, and the reason a
+    fail-closed predicate must refuse them rather than scan past them.
     """
     reasons: list[AutoReason] = []
+
+    # C1 (``server/consolidation.py::_repeated_id_members``) already refuses a
+    # repeated id at the emit boundary, and it is re-derived HERE for the reason
+    # `no_retained_members` re-derives C1's member count: the emit boundary is
+    # not the only door into this predicate. The consequences are durable, and
+    # `server/consolidation.py` enumerates them at length — a second
+    # `delete_memory` and a second `memory_deleted` event for one record, a
+    # tombstone rebuilt from a post-delete capture that necessarily missed, and
+    # `tombstones_written` / `tombstones_expected` both counting a repeat the
+    # ledger stores once.
+    #
+    # REFUSED rather than de-duplicated, for the reason C1 refuses rather than
+    # rewriting the caller's set: a silently shortened member list would make
+    # the executor's report describe a request nobody made. That is also why
+    # this is a hazard and not a second `stripped_ids` channel — a strip
+    # discloses a record the predicate CHOSE to exclude, and there is no
+    # principle by which it would choose between two identical slots.
+    repeated = tuple(
+        member_id
+        for member_id, count in Counter(proposal.member_ids).items()
+        if count > 1
+    )
+    if repeated:
+        reasons.append(
+            AutoReason(
+                code=AutoReasonCode.member_id_repeated,
+                ids=repeated,
+                detail=(
+                    f'the proposal names {", ".join(repeated)} more than once; a '
+                    'repeated member is deleted twice, claimed twice by the '
+                    'canonical it is folded into, and counted twice against a '
+                    'ledger that stores it once'
+                ),
+            ),
+        )
 
     for member_id in proposal.member_ids:
         record = members.get(member_id)
@@ -424,19 +475,53 @@ def _member_hazards(
             )
             continue
 
+        if not isinstance(record, Mapping):
+            # `_metadata` and `_content` fall back to `{}` and `''` for a record
+            # of any other shape, because a function whose whole job is to
+            # RETURN a verdict must not raise on a malformed one. Without this
+            # arm those same fallbacks make the garbage scan as a benign,
+            # unstamped, uncategorised member and carry it into a write-bearing
+            # PASS — trading a loud `TypeError` for a silent pass, which is
+            # worse than either. `member_unreadable` is the right code because
+            # it states the same fact: a record the predicate could not see.
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.member_unreadable,
+                    ids=(member_id,),
+                    detail=(
+                        f'the read for {member_id} answered with a '
+                        f'{type(record).__name__}, which is not a record this '
+                        'predicate can destructure; a record it cannot read is '
+                        'not a record that is fine'
+                    ),
+                ),
+            )
+            continue
+
         metadata = _metadata(record)
         topic = metadata.get('topic')
         foreign_topic = topic is not None and topic != proposal.topic
 
-        if metadata.get('canonical') is True and foreign_topic:
+        # The conjunct is `not _is_incumbent`, NOT `foreign_topic`: a record
+        # stamped `canonical: True` with NO topic key trips neither, and would
+        # otherwise be retained as an ordinary member for the executor to fold
+        # or re-stamp. `memory_metadata.validate_memory_metadata` does not
+        # prevent that shape — its `canonical_without_topic` check is
+        # warn-vs-reject driven by `memory_metadata.enforce`, which ships False
+        # (task 3626) — so it is a real corpus state, not a hypothetical. The
+        # incumbent stays exempt, so this code and the canonical-level codes
+        # remain disjoint.
+        if metadata.get('canonical') is True and not _is_incumbent(record, proposal.topic):
             reasons.append(
                 AutoReason(
                     code=AutoReasonCode.member_already_canonical,
                     ids=(member_id,),
                     detail=(
-                        f'{member_id} is the canonical of topic `{topic}`, not a '
-                        f'member of `{proposal.topic}`; folding it in would destroy '
-                        "that topic's index entry"
+                        f'{member_id} is stamped `canonical: true` with topic '
+                        f'{topic!r}, which is not `{proposal.topic}`; it indexes a '
+                        'topic this proposal is not about — or one that cannot be '
+                        "read at all — and folding it in would destroy that topic's "
+                        'index entry'
                     ),
                 ),
             )
@@ -567,39 +652,53 @@ def _canonical_hazards(
                 ),
             ),
         )
-    elif canonical_count > 1:
+    elif canonical_count not in (0, 1):
         # Canonical uniqueness ships in WARN mode (`memory_metadata.enforce` is
         # False, task 3626), so the count is probed rather than assumed.
+        #
+        # `not in (0, 1)` rather than `> 1`, so a NEGATIVE count — which no rung
+        # below can act on either — comes back as a VERDICT the caller can
+        # report on instead of falling through every rung to the terminal
+        # `AssertionError`. A predicate whose contract is to always RETURN must
+        # not raise on a nonsensical input; `_metadata`'s docstring states that
+        # same rule one level down, for a malformed record.
         reasons.append(
             AutoReason(
                 code=AutoReasonCode.multiple_canonicals,
                 detail=(
-                    f'topic `{proposal.topic}` already has {canonical_count} '
-                    'canonicals; which one is authoritative is not decidable here'
+                    f'topic `{proposal.topic}` reports {canonical_count} canonicals, '
+                    'not the 0 or 1 a consolidatable topic has; which record is '
+                    'authoritative is not decidable here'
                 ),
             ),
         )
-    elif canonical_count == 0 and incumbents:
+    elif len(incumbents) > canonical_count:
         # The same reasoning as the `None` arm, one case over. There the count
-        # was missing; here it is present and CONTRADICTED — it says the topic
-        # has no canonical while a member the proposal named IS that canonical.
-        # Zero is the MINT path, so trusting it would mint a second canonical
-        # for a topic whose incumbent is visible in this very member list.
+        # was missing; here it is present and CONTRADICTED — it reports FEWER
+        # canonicals for this topic than the proposal's own members are stamped
+        # as. Both write-bearing readings of the count are then wrong: zero is
+        # the MINT path, so a single named incumbent would have this predicate
+        # authorise a SECOND canonical for a topic whose incumbent is visible in
+        # the very member list it was handed; and one is the TAG-ONLY path, so
+        # two named incumbents would have it stamp members onto a topic whose
+        # uniqueness is already broken — the state the `multiple_canonicals` arm
+        # above refuses when the count is honest about it.
         #
         # Reachable WITHOUT a caller bug: `canonical_count` and the per-member
         # reads are two separate, non-atomic reads of the store. A count scoped
-        # differently, or taken before a canonical landed, disagrees with a
-        # record the caller can nonetheless see. Fail closed for the reason the
-        # `None` arm does — a count that cannot be trusted must never be read as
-        # zero, and here it demonstrably cannot be.
+        # differently, or taken before a canonical landed, disagrees with records
+        # the caller can nonetheless see. Fail closed for the reason the `None`
+        # arm does — a count that cannot be trusted must not be acted on, and
+        # here it demonstrably cannot be.
         named = ', '.join(incumbents)
         reasons.append(
             AutoReason(
                 code=AutoReasonCode.canonical_count_contradicted,
                 ids=incumbents,
                 detail=(
-                    f'topic `{proposal.topic}` is reported to have no canonical, but '
-                    f'{named} is stamped as its canonical; the count and the '
+                    f'topic `{proposal.topic}` is reported to have {canonical_count} '
+                    f'canonical, but {len(incumbents)} of the proposed members '
+                    f'({named}) are stamped as its canonical; the count and the '
                     'per-member reads disagree, so the canonical state of the topic '
                     'is not decidable here'
                 ),
@@ -717,7 +816,7 @@ def evaluate_auto_predicate(
        second filing.
     2. Hazards -> FAIL, collecting EVERY offender rather than stopping at the
        first, so one human sitting names every problem. Among them: a
-       *canonical_count* of zero CONTRADICTED by a named member that is this
+       *canonical_count* CONTRADICTED by the named members stamped as this
        topic's canonical — two non-atomic reads disagreeing, which leaves the
        topic's canonical state undecidable here — and a *proposal* whose
        declared ``category`` contradicts the one its members share, which would
@@ -745,6 +844,13 @@ def evaluate_auto_predicate(
     (``server/consolidation.py::validate_consolidate_args``) and are not
     re-derived here — one rule, one enforcement point (PRD D6). The predicate
     never even sees the claim.
+
+    Two C1 rules ARE re-derived, and the line between them is the COST OF BEING
+    WRONG. A benign shape code costs a caller one corrected retry; a repeated
+    member id (``member_id_repeated``) and an empty retained set
+    (``no_retained_members``) each reach the executor as a WRITE — a record
+    deleted twice, or a canonical minted over nothing. C1 is not the only door
+    into this predicate, so those two are refused here as well.
     """
     # Rung 1. Evaluated before the hazard arm on purpose: when a human already
     # holds the topic, what the members look like is not this function's
@@ -909,10 +1015,11 @@ def evaluate_auto_predicate(
         )
 
     # Unreachable: rung 2 refuses `canonical_count is None` as
-    # `canonical_count_unavailable` and `canonical_count > 1` as
-    # `multiple_canonicals`, so only 0 and 1 arrive here. Loud rather than a
-    # silent default — if either hazard is ever removed, this says so at the
-    # exact point the verdict would otherwise be invented.
+    # `canonical_count_unavailable` and EVERY value outside {0, 1} — negative
+    # ones included — as `multiple_canonicals`, so only 0 and 1 arrive here and
+    # both are answered above. Loud rather than a silent default: if either
+    # hazard is ever narrowed, this says so at the exact point the verdict would
+    # otherwise be invented.
     raise AssertionError(
         f'unreachable: canonical_count={canonical_count!r} for topic '
         f'`{proposal.topic}` should have been refused by the hazard arm as '

@@ -898,6 +898,30 @@ class TestMemberHazards:
             AutoReasonCode.member_carries_correction_banner,
         } <= set(_codes(verdict))
 
+    def test_a_canonical_with_no_readable_topic_is_still_a_canonical(self):
+        """`canonical: true` with NO topic key trips neither old conjunct.
+
+        MEASURED before the fix, with the rule scoped to canonical-AND-foreign-
+        topic: members {m1, X(canonical=True, no topic)} at canonical_count=0
+        -> PASS, retain_ids=('m1', 'X'). `_is_incumbent` rejects X (its topic is
+        not this one), so nothing stripped it either, and the executor would
+        fold or re-stamp an index entry nobody asked it to touch.
+
+        The shape is a corpus state the shape validator does not prevent:
+        `memory_metadata.validate_memory_metadata` has a
+        `canonical_without_topic` check, but warn-vs-reject is driven by
+        `memory_metadata.enforce`, which ships False (task 3626).
+        """
+        members = _members(_member('m1'), _member('X', canonical=True))
+
+        verdict = _judge(members, canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_already_canonical)
+        assert [r.ids for r in reasons] == [('X',)]
+        assert AutoReasonCode.member_different_topic not in _codes(verdict)
+        assert verdict.retain_ids == ()
+
 
 #: Slug fixtures whose token-Jaccard against COLLIDING_TOPIC is computed, not
 #: guessed: 0.6 exactly (the shipped threshold, so the boundary is testable),
@@ -1200,6 +1224,133 @@ class TestCountAndMemberSetContradictions:
         assert AutoReasonCode.already_consolidated in _codes(verdict)
         assert AutoReasonCode.no_retained_members not in _codes(verdict)
 
+    def test_two_named_incumbents_contradict_a_count_of_one(self):
+        """The contradiction is `len(incumbents) > count`, not `count == 0`.
+
+        MEASURED with the arm scoped to zero: members {C1(canonical, topic=T),
+        C2(canonical, topic=T), m1} at canonical_count=1 -> PASS_TAG_ONLY,
+        stripped=('C1', 'C2'), retain=('m1',) — a write-bearing pass that
+        stamps members onto a topic the predicate has just read TWO canonicals
+        for. The identical state reported honestly (count=2) fires
+        `multiple_canonicals`, and uniqueness ships in WARN mode (task 3626),
+        so two canonicals per topic is a real corpus state rather than a
+        hypothetical. Both readings of an under-reporting count are
+        write-bearing: zero mints a second canonical, one tags onto a broken
+        topic.
+        """
+        members = _members(
+            _member('m1'),
+            _member('C1', topic=TOPIC, canonical=True),
+            _member('C2', topic=TOPIC, canonical=True),
+        )
+
+        verdict = _judge(members, canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert verdict.outcome is not AutoOutcome.PASS_TAG_ONLY
+        contradictions = _reasons_for(verdict, AutoReasonCode.canonical_count_contradicted)
+        assert len(contradictions) == 1
+        assert contradictions[0].ids == ('C1', 'C2')
+        assert verdict.retain_ids == ()
+        assert verdict.stripped_ids == ()
+
+    def test_one_incumbent_agreeing_with_a_count_of_one_still_passes(self):
+        """The over-refusal guard for BOTH widened rules, on one fixture.
+
+        PRD B2's re-emission — one canonical, named in the member list, count
+        of one — is the majority verdict over time, so it must stay reachable.
+        `>` rather than `>=` is what keeps `canonical_count_contradicted` off
+        it, and `_is_incumbent` is what keeps the widened
+        `member_already_canonical` off it. Either rule over-firing here would
+        send every re-emission to a human and make PASS_TAG_ONLY unreachable.
+        """
+        members = _members(_member('m1'), _member('C', topic=TOPIC, canonical=True))
+
+        verdict = _judge(members, canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.PASS_TAG_ONLY
+        assert AutoReasonCode.canonical_count_contradicted not in _codes(verdict)
+        assert AutoReasonCode.member_already_canonical not in _codes(verdict)
+        assert verdict.stripped_ids == ('C',)
+        assert verdict.retain_ids == ('m1',)
+
+
+class TestCallerContractViolationsReturnAVerdict:
+    """Inputs the parameter annotations FORBID, answered rather than obeyed.
+
+    None of the three below is a live corpus state — each is a caller-contract
+    violation — and each MEASURED as something strictly worse than a refusal
+    before the fix: a silent write-bearing PASS for the first two, and a raised
+    `AssertionError` for the third. The module's stance is fail-closed and loud,
+    and a function whose whole contract is to RETURN a verdict the caller can
+    report on owes one for a nonsensical input too.
+    """
+
+    def test_a_record_that_is_not_a_mapping_is_unreadable(self):
+        """MEASURED: {'m1': <record>, 'm2': '<garbage>'}, count=0 -> PASS.
+
+        `_metadata` and `_content` fall back to `{}` and `''` for any other
+        shape, so the garbage scanned as a benign, unstamped, uncategorised
+        member: retain_ids=('m1', 'm2'), reasons=(). The executor was handed a
+        mint instruction naming a record the predicate never read, with not one
+        reason recorded — the defensive fallbacks trading a loud `TypeError`
+        for a silent pass, which is worse than either.
+        """
+        members: dict[str, Any] = _members(_member('m1'))
+        members['m2'] = '<garbage>'
+
+        verdict = _judge(members, proposal_ids=('m1', 'm2'), canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_unreadable)
+        assert [r.ids for r in reasons] == [('m2',)]
+        assert verdict.retain_ids == ()
+
+    def test_a_negative_canonical_count_refuses_instead_of_raising(self):
+        """MEASURED: canonical_count=-1 raised AssertionError, giving no verdict.
+
+        The hazard arm tested `canonical_count > 1`, so a negative count fell
+        through every rung to the terminal `unreachable` raise — whose comment
+        claimed only 0 and 1 could arrive there. A caller handed an exception
+        has nothing to report, and reporting is the whole deliverable.
+        """
+        members = _members(_member('m1'), _member('m2'))
+
+        verdict = _judge(members, canonical_count=-1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.multiple_canonicals in _codes(verdict)
+
+    def test_a_repeated_member_id_refuses(self):
+        """MEASURED: member_ids=('m1', 'm1') -> PASS, retain_ids=('m1', 'm1').
+
+        C1 refuses a repeat at the emit boundary (`_repeated_id_members`) for
+        consequences `server/consolidation.py` enumerates at length: a second
+        `delete_memory` and `memory_deleted` event for one record, a tombstone
+        rebuilt from a post-delete capture that necessarily missed, and
+        tombstone counts that overstate a ledger storing the row once.
+        Re-derived here for the reason `no_retained_members` is — the emit
+        boundary is not the only door — and REFUSED rather than
+        de-duplicated, so the executor's report never describes a request
+        nobody made.
+        """
+        members = _members(_member('m1'), _member('m2'))
+
+        verdict = _judge(members, proposal_ids=('m1', 'm1', 'm2'), canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_id_repeated)
+        assert [r.ids for r in reasons] == [('m1',)]
+        assert verdict.retain_ids == ()
+
+    def test_a_proposal_naming_each_member_once_is_not_a_repeat(self):
+        """The over-refusal guard: the ordinary proposal shape still passes."""
+        verdict = _judge(_members(_member('m1'), _member('m2')), canonical_count=0)
+
+        assert verdict.outcome is AutoOutcome.PASS
+        assert AutoReasonCode.member_id_repeated not in _codes(verdict)
+
+
 class TestProposalCategoryIsChecked:
     """The proposal's own declared category, measured against its members.
 
@@ -1415,6 +1566,9 @@ REASON_CODE_FIXTURES: dict[AutoReasonCode, Callable[[], AutoVerdict]] = {
     ),
     AutoReasonCode.no_retained_members: lambda: _judge(
         {}, proposal_ids=(), canonical_count=0,
+    ),
+    AutoReasonCode.member_id_repeated: lambda: _judge(
+        _members(_member('m1'), _member('m2')), proposal_ids=('m1', 'm1', 'm2'),
     ),
 }
 
