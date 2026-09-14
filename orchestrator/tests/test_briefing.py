@@ -13,12 +13,13 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT, BriefingAssembler
 from orchestrator.config import GitConfig, OrchestratorConfig
 
 
@@ -612,3 +613,140 @@ class TestReviewerPromptAmendmentScope:
         )
         assert '# Amendment Re-Review Scope' not in omitted
         assert omitted == explicit_none
+
+
+def _memory_reply(content: str = 'A recalled fact.') -> dict:
+    """A one-result ``search`` reply in the shape ``_mcp_search`` reads."""
+    return {
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps({'results': [{
+                'id': '1',
+                'content': content,
+                'category': 'preferences_and_norms',
+                'source_store': 'mem0',
+                'created_at': '2026-08-15T22:22:49+00:00',
+                'temporal': None,
+                'metadata': {},
+            }]})}],
+        },
+    }
+
+
+def _search_arguments(mcp_call_mock) -> list[dict]:
+    return [
+        call.args[2]['arguments']
+        for call in mcp_call_mock.await_args_list
+        if call.args[2].get('name') == 'search'
+    ]
+
+
+@pytest.mark.asyncio
+class TestPerRoleMemoryTable:
+    """Which roles get a memory block, and which deliberately do not (D7).
+
+    Task 3659. The merger is a mechanical role — read both sides of a
+    conflict, resolve, test — measured at 7 dispatches in 14 days, and had
+    only the generic block nobody could show helped it. The reviewer is the
+    single highest-volume role and had the same generic block, despite the
+    workflow holding the task id at every dispatch site.
+    """
+
+    async def test_the_merger_asks_memory_nothing(self, briefing: BriefingAssembler):
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_merger_prompt('CONFLICT TEXT', 'THE INTENT')
+
+        assert mcp.await_args_list == [], 'the merger fires no memory query at all'
+        assert '# Context' not in prompt
+        assert '## Conventions & Gotchas' not in prompt
+        assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) not in prompt
+        assert 'CONFLICT TEXT' in prompt and 'THE INTENT' in prompt
+
+    async def test_the_reviewer_gets_the_task_scoped_sections(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_memory_reply())
+        task = {
+            'id': '4242',
+            'title': 'Tighten the merge-lane park grace',
+            'metadata': {'files': ['orchestrator/src/orchestrator/merge_worker.py']},
+        }
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt(
+                'reviewer_comprehensive', 'DIFF', task=task,
+            )
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' in prompt
+        assert 'A recalled fact.' in prompt
+        arguments = _search_arguments(mcp)
+        assert arguments
+        for args in arguments:
+            assert args['caller_agent_id'] == 'claude-task-4242-reviewer'
+            assert args['caller_task_id'] == '4242'
+
+    async def test_the_reviewer_still_builds_without_a_task(
+        self, briefing: BriefingAssembler,
+    ):
+        """Existing callers pass no task; they must keep working, with the
+        generic conventions query and no task-scoped section."""
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_reviewer_prompt('reviewer_comprehensive', 'DIFF')
+
+        assert '## Conventions & Gotchas' in prompt
+        assert '## Task Context' not in prompt
+        arguments = _search_arguments(mcp)
+        assert len(arguments) == 1
+        assert arguments[0]['caller_agent_id'] == 'claude-reviewer'
+
+    async def test_the_steward_continuation_asks_memory_nothing(
+        self, briefing: BriefingAssembler,
+    ):
+        """Unchanged by this task: the steward session already holds the full
+        context from its initial briefing."""
+        mcp = AsyncMock(return_value=_memory_reply())
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            prompt = await briefing.build_steward_continuation_prompt(
+                {'id': '4242', 'title': 'A task'},
+                {'id': 'esc-4242-1', 'summary': 'Something blocked'},
+            )
+
+        assert mcp.await_args_list == []
+        assert 'esc-4242-1' in prompt
+
+
+class TestFormatTaskSurfaceIsPinned:
+    """The task-3254 hint-surface guard.
+
+    Task 3254 owns ``memory_hints`` delivery in this same method and has no
+    guard artifact on main, and none of task 3659's delivered checks pins
+    hint behaviour — so a rewrite that quietly reshaped what ``_format_task``
+    renders would land undetected. This pins the surface 3254 will extend,
+    byte for byte.
+    """
+
+    def test_the_rendered_surface_is_exactly_these_lines(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '3254',
+            'title': 'Deliver memory hints to dispatched agents',
+            'description': 'Wire metadata.memory_hints through to the briefing.',
+            'details': 'The channel is reconciliation-internal today.',
+            'metadata': {'files': ['orchestrator/src/orchestrator/agents/briefing.py']},
+            'dependencies': [{'id': '3659'}, '3212'],
+        }
+
+        assert briefing._format_task(task) == (
+            '**ID:** 3254\n'
+            '**Title:** Deliver memory hints to dispatched agents\n'
+            '**Description:** Wire metadata.memory_hints through to the briefing.\n'
+            '**Details:** The channel is reconciliation-internal today.\n'
+            '**Files:** orchestrator/src/orchestrator/agents/briefing.py\n'
+            '**Dependencies:** 3659, 3212'
+        )
