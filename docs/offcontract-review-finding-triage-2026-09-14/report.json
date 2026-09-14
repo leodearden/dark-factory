@@ -239,6 +239,151 @@
     }
   ],
   "gate": null,
-  "dispositions": [],
-  "findings": []
+  "dispositions": [
+    {
+      "id": "2896-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3031-integration-gap-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3031-correctness-1",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3041-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3041-architectural-coherence-1",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3064-efficiency-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3075-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3142-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3142-correctness-1",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3142-correctness-2",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3308-contract-drift-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3340-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3340-test-coverage-1",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3340-correctness-2",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3363-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3363-design-1",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3367-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3367-correctness-1",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3453-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3453-blast-radius-1",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3454-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3679-test-coverage-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    },
+    {
+      "id": "3757-correctness-0",
+      "disposition": null,
+      "note": null,
+      "followup_ticket": null
+    }
+  ],
+  "findings": [],
+  "disposition_key": {
+    "a": "already fixed incidentally — the defect was real and is gone from current main",
+    "b": "still a live defect on current main — one follow-up task filed, ticket recorded",
+    "c": "not actually a defect, or no longer applicable — the code it described has moved or the reading was wrong",
+    "deferred_by_gate": "not adjudicated, because the recorded gate decision stopped the triage; the note carries the gate's rationale"
+  }
 }
