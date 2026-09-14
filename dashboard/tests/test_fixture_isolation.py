@@ -198,3 +198,98 @@ class TestApplyIsolatedEnvNeutralizesAmbientKnownRoots:
                 f'{cfg.known_project_roots} — every entry gets a '
                 f"DbPool.get(root / 'data/orchestrator/runs.db')"
             )
+
+
+class TestHermeticFusedMemoryUrls:
+    """The endpoint the suite fans out at must be MEASURED dead, not assumed dead.
+
+    ``DASHBOARD_FUSED_MEMORY_URLS`` is the network axis of the same isolation
+    contract the classes above pin on the filesystem axis.  Left unset it falls
+    back to ``DEFAULT_FUSED_MEMORY_URLS = ('http://localhost:8002',)`` — the
+    operator's live shared fused-memory instance — so every app lifespan in
+    this suite fans ``_burndown_loop`` and ``_metrics_loop`` out at production.
+
+    Measurement, not a comment, because this suite has already been burned by
+    exactly that substitution: ``test_api_curator_cancel.py`` documented 8002
+    as "the same unreachable URL" while 8002 answered a 404 in 1.4ms, and
+    believing that comment is most likely why this gap survived as long as it
+    did.  A comment asserting a port is dead is the one form of evidence
+    already disproven here.
+
+    So the deadness is re-measured on every run.  If a port here becomes live,
+    the suite is NOT hermetic and every fan-out test is quietly talking to a
+    real service — going red is the correct outcome, and the fix is to pick
+    another dead port, never to relax the check.  Same stance as
+    ``_dashboard_helpers.build_dual_escalation_tree``'s containment assertion.
+    """
+
+    @staticmethod
+    def _endpoints():
+        """Return ``[(url, host, port), ...]`` for the hermetic constant."""
+        from urllib.parse import urlsplit
+
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        return [
+            (url, urlsplit(url).hostname, urlsplit(url).port)
+            for url in HERMETIC_FUSED_MEMORY_URLS
+        ]
+
+    def test_is_an_immutable_tuple_of_loopback_urls(self):
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        assert isinstance(HERMETIC_FUSED_MEMORY_URLS, tuple), (
+            'a tuple, like DEFAULT_FUSED_MEMORY_URLS it stands in for — a '
+            'mutable default is one test away from being edited for everyone'
+        )
+        assert HERMETIC_FUSED_MEMORY_URLS, 'the list must not be empty'
+        for url, host, port in self._endpoints():
+            assert host in ('127.0.0.1', '::1'), (
+                f'{url} must name a loopback literal: a hostname can resolve '
+                f'off-box, and one that resolves to ::1 first costs a second '
+                f'connect attempt before refusing — latency back in the very '
+                f'path this constant exists to make instant. Got host {host!r}'
+            )
+            assert port is not None, f'{url} must name an explicit port'
+
+    def test_shares_nothing_with_the_production_default(self):
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+
+        assert not set(HERMETIC_FUSED_MEMORY_URLS) & set(DEFAULT_FUSED_MEMORY_URLS), (
+            'the hermetic endpoint must not BE the production default — that '
+            'is the traffic it exists to stop'
+        )
+        for url, _host, _port in self._endpoints():
+            assert '8002' not in url, (
+                f'{url} names the operator\'s live fused-memory port; the '
+                f'whole point is to dial somewhere that answers nothing'
+            )
+
+    def test_every_port_genuinely_refuses_a_connection(self):
+        """The load-bearing one: re-measured every run, never assumed."""
+        import socket
+
+        for url, host, port in self._endpoints():
+            try:
+                with socket.create_connection((host, port), timeout=1.0):
+                    pass
+            except ConnectionRefusedError:
+                continue
+            except OSError as exc:
+                raise AssertionError(
+                    f'{url} neither answered nor refused ({exc!r}). The suite '
+                    f'needs an INSTANT refusal; anything else puts a stall back '
+                    f'into every app lifespan. Pick another dead port in '
+                    f'_dashboard_helpers.HERMETIC_FUSED_MEMORY_URLS rather than '
+                    f'relaxing this check.'
+                ) from exc
+            raise AssertionError(
+                f'{url} ACCEPTED a connection. Something is listening on port '
+                f'{port}, so this suite is not hermetic: every TestClient '
+                f'lifespan is fanning _burndown_loop and _metrics_loop out at '
+                f'a real service. Pick another dead port in '
+                f'_dashboard_helpers.HERMETIC_FUSED_MEMORY_URLS rather than '
+                f'relaxing this check.'
+            )
