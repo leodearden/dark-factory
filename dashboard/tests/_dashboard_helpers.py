@@ -62,6 +62,26 @@ def live_aiosqlite_worker_threads() -> list[threading.Thread]:
     return live
 
 
+# The fused-memory endpoint the whole suite fans out at, set by
+# apply_isolated_env below (its only consumer, hence its home here).
+#
+# PORT 9 (IANA discard) because it is PRIVILEGED: no unprivileged dev service
+# or test runner can bind it, unlike the 9000/9001 this suite uses elsewhere,
+# which real software does claim (php-fpm, SonarQube, Portainer).  Measured
+# refusing in 10.1ms on 2026-09-14 — and re-measured on every run by
+# test_fixture_isolation.py::TestHermeticFusedMemoryUrls, which is the
+# assertion that actually holds this up.  This sentence is not.
+#
+# 127.0.0.1 LITERAL, not ``localhost``: the name may resolve to ::1 first and
+# cost a whole second connect attempt before refusing, putting latency back
+# into the very path this exists to make instant.
+#
+# ONE url, not several.  The resolved list must stay length-1 like the default
+# it replaces, so _build_http_limits' endpoint count and every "there is
+# exactly one fused-memory URL" assumption in the suite are unchanged.
+HERMETIC_FUSED_MEMORY_URLS = ('http://127.0.0.1:9',)
+
+
 def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     """Point every DashboardConfig-derived path at *root* instead of the live checkout.
 
