@@ -1,0 +1,244 @@
+{
+  "sweep": "offcontract-review-finding-triage",
+  "task_id": "5430",
+  "origin_escalation": "esc-2896-10",
+  "question": "For each of the 23 medium-and-above reviewer findings that the off-contract verdict shape silently dropped, is it (a) already fixed incidentally, (b) still a live defect on current main, or (c) not actually a defect / no longer applicable?",
+  "answer": null,
+  "roster_frozen_at": "2026-09-14",
+  "roster_source": "Transcribed from task 5430's own description, which is the authoritative enumeration. Each id is <task>-<category>-<corpus index>. 22 of 23 resolve to a live issue record in the frozen corpus/ in this directory; 2896-correctness-0 does not, because that verdict was overwritten by a re-review on 2026-09-12 and its headline survives only in the task description. Severity and category are as emitted, never re-graded here.",
+  "roster": [
+    {
+      "id": "2896-correctness-0",
+      "task": "2896",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "Storm-escalation dedup is broken: filed with task_id='' but queried by entity_uuid",
+      "corpus_record": "absent (overwritten 2026-09-12)",
+      "location_as_emitted": null,
+      "disposition": null
+    },
+    {
+      "id": "3031-integration-gap-0",
+      "task": "3031",
+      "severity_as_emitted": "medium",
+      "category": "integration-gap",
+      "headline": "report_ready_to_merge is not in the architect's tool allowlist — the exit is unreachable in production",
+      "corpus_record": "corpus/3031.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/mcp/plan_tools.py:863",
+      "disposition": null
+    },
+    {
+      "id": "3031-correctness-1",
+      "task": "3031",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "The enqueue exit's 'blocked + no escalation is LEAVE-shaped' rationale is contradicted by the sweep's EXISTS_OFF_MAIN upgrade",
+      "corpus_record": "corpus/3031.json#/verdict/issues/1",
+      "location_as_emitted": "orchestrator/src/orchestrator/workflow.py:6090",
+      "disposition": null
+    },
+    {
+      "id": "3041-correctness-0",
+      "task": "3041",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "Tombstone coverage overclaimed as \"every recon path\"",
+      "corpus_record": "corpus/3041.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py:4",
+      "disposition": null
+    },
+    {
+      "id": "3041-architectural-coherence-1",
+      "task": "3041",
+      "severity_as_emitted": "medium",
+      "category": "architectural-coherence",
+      "headline": "New eviction order makes narrative reconstructions single-trim transient",
+      "corpus_record": "corpus/3041.json#/verdict/issues/1",
+      "location_as_emitted": "fused-memory/src/fused_memory/reconciliation/summary_pool.py:365",
+      "disposition": null
+    },
+    {
+      "id": "3064-efficiency-0",
+      "task": "3064",
+      "severity_as_emitted": "medium",
+      "category": "efficiency",
+      "headline": "get_statuses tool description grew 959 → 8,328 chars, loading ~2k tokens into every agent session",
+      "corpus_record": "corpus/3064.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/src/fused_memory/server/tools.py:3827",
+      "disposition": null
+    },
+    {
+      "id": "3075-correctness-0",
+      "task": "3075",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "The ASSIGNED preserve has no staleness bound and --disk-pressure cannot override it — a stuck record exempts a lane from reclaim permanently",
+      "corpus_record": "corpus/3075.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/scripts/warm-lane/warm-lane-gc.sh:694",
+      "disposition": null
+    },
+    {
+      "id": "3142-correctness-0",
+      "task": "3142",
+      "severity_as_emitted": "high",
+      "category": "correctness",
+      "headline": "filing_dispatch claims about a TASK are adjudicated as terminality, producing false 'mismatch' verdicts on ordinary 'filed task N' narration",
+      "corpus_record": "corpus/3142.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/src/fused_memory/services/completion_claim_gate.py:560",
+      "disposition": null
+    },
+    {
+      "id": "3142-correctness-1",
+      "task": "3142",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "PR/issue '#N' references are read as task refs, so 'Merged PR #4521' escalates against an unrelated task",
+      "corpus_record": "corpus/3142.json#/verdict/issues/1",
+      "location_as_emitted": "fused-memory/src/fused_memory/services/completion_claim_gate.py:520",
+      "disposition": null
+    },
+    {
+      "id": "3142-correctness-2",
+      "task": "3142",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "make_commit_probe() runs `git rev-parse --show-toplevel` synchronously on the event loop, defeating the to_thread wrapper directly below it",
+      "corpus_record": "corpus/3142.json#/verdict/issues/2",
+      "location_as_emitted": "fused-memory/src/fused_memory/server/tools.py:1697",
+      "disposition": null
+    },
+    {
+      "id": "3308-contract-drift-0",
+      "task": "3308",
+      "severity_as_emitted": "moderate",
+      "category": "contract-drift",
+      "headline": "Implementation deliberately supersedes two normative PRD Contract rows, but the PRD still states the old ones",
+      "corpus_record": "corpus/3308.json#/verdict/issues/0",
+      "location_as_emitted": "plans/dashboard-availability-prd.md:195",
+      "disposition": null
+    },
+    {
+      "id": "3340-correctness-0",
+      "task": "3340",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Streak escalation is one-shot for a persistent condition",
+      "corpus_record": "corpus/3340.json#/verdict/issues/0",
+      "location_as_emitted": "scripts/legibility/nightly.py:872",
+      "disposition": null
+    },
+    {
+      "id": "3340-test-coverage-1",
+      "task": "3340",
+      "severity_as_emitted": "medium",
+      "category": "test-coverage",
+      "headline": "Progress probe ships with no caller anywhere in the repo",
+      "corpus_record": "corpus/3340.json#/verdict/issues/1",
+      "location_as_emitted": "scripts/legibility/check_trickle_progress.py:1",
+      "disposition": null
+    },
+    {
+      "id": "3340-correctness-2",
+      "task": "3340",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Writer and reader resolve the path from different process envs",
+      "corpus_record": "corpus/3340.json#/verdict/issues/2",
+      "location_as_emitted": "scripts/legibility/trickle_state.py:180",
+      "disposition": null
+    },
+    {
+      "id": "3363-correctness-0",
+      "task": "3363",
+      "severity_as_emitted": "major",
+      "category": "correctness",
+      "headline": "Narrowing recovered_open silently drops the 'escalation open' badge for insufficient_data / grandfathered / unjudged rows",
+      "corpus_record": "corpus/3363.json#/verdict/issues/0",
+      "location_as_emitted": "dashboard/src/dashboard/data/memory_evals.py:805",
+      "disposition": null
+    },
+    {
+      "id": "3363-design-1",
+      "task": "3363",
+      "severity_as_emitted": "medium",
+      "category": "design",
+      "headline": "internal_error in _UNCACHEABLE_ISSUE_KINDS can permanently defeat the memory-evals cache — the failure mode this change rejects elsewhere",
+      "corpus_record": "corpus/3363.json#/verdict/issues/1",
+      "location_as_emitted": "dashboard/src/dashboard/data/memory_evals.py:199",
+      "disposition": null
+    },
+    {
+      "id": "3367-correctness-0",
+      "task": "3367",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Env-recovery gate checks `attempt.test.rc != 0` but not that the TEST leg is the ENV_TRANSIENT source",
+      "corpus_record": "corpus/3367.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/verify.py:4460",
+      "disposition": null
+    },
+    {
+      "id": "3367-correctness-1",
+      "task": "3367",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "A TYPE-leg ENV_TRANSIENT now outranks and masks a co-occurring genuine TEST_FAILURE",
+      "corpus_record": "corpus/3367.json#/verdict/issues/1",
+      "location_as_emitted": "orchestrator/src/orchestrator/verify_classify.py:583",
+      "disposition": null
+    },
+    {
+      "id": "3453-correctness-0",
+      "task": "3453",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "The registration-time canary is a FINDABILITY probe, not an importability probe — it cannot detect the exact failure mode the task measured",
+      "corpus_record": "corpus/3453.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/proc_supervision.py:797",
+      "disposition": null
+    },
+    {
+      "id": "3453-blast-radius-1",
+      "task": "3453",
+      "severity_as_emitted": "medium",
+      "category": "blast-radius",
+      "headline": "`--setenv=PYTHONPATH=` applies to the ENTIRE transient unit, not just the submit child — the deploy payload now runs with a PYTHONPATH it never had",
+      "corpus_record": "corpus/3453.json#/verdict/issues/1",
+      "location_as_emitted": "orchestrator/src/orchestrator/proc_supervision.py:847",
+      "disposition": null
+    },
+    {
+      "id": "3454-correctness-0",
+      "task": "3454",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "Documented-but-unfixed capacity marker gap makes the key probe fail misleadingly",
+      "corpus_record": "corpus/3454.json#/verdict/issues/0",
+      "location_as_emitted": "shared/tests/test_cli_invoke_integration.py:159",
+      "disposition": null
+    },
+    {
+      "id": "3679-test-coverage-0",
+      "task": "3679",
+      "severity_as_emitted": "medium",
+      "category": "test-coverage",
+      "headline": "Docstring cites a pin test that does not exist; the load-bearing ordering is entirely unpinned",
+      "corpus_record": "corpus/3679.json#/verdict/issues/0",
+      "location_as_emitted": "orchestrator/src/orchestrator/verify_classify.py:380",
+      "disposition": null
+    },
+    {
+      "id": "3757-correctness-0",
+      "task": "3757",
+      "severity_as_emitted": "medium",
+      "category": "correctness",
+      "headline": "A duplicate-uuid store row is still reported as `bad_manifest` — the exact mis-attribution this change eliminates elsewhere",
+      "corpus_record": "corpus/3757.json#/verdict/issues/0",
+      "location_as_emitted": "fused-memory/scripts/local_memory_models_eval/build_corpus.py:1306",
+      "disposition": null
+    }
+  ],
+  "gate": null,
+  "dispositions": [],
+  "findings": []
+}
