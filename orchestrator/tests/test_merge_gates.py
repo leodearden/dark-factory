@@ -473,6 +473,62 @@ class TestGateFunctionsReachBack:
         assert verdict.reason is not None
         assert verdict.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
 
+    async def test_equivalence_block_reason_invites_the_correct_triage(
+        self,
+    ) -> None:
+        """A confirmed drop must name the triage diff AND its direction.
+
+        The complement of the two gates' rename awareness (task 5342): a
+        block that SURVIVES rename resolution is a genuine candidate
+        drop, and the message is the only thing steering what the reader
+        does next.  In the measured esc-5694-5 incident it steered the
+        RCA to the opposite of the truth — it named no diff direction, so
+        the diff was read backwards, and it never mentioned ``--follow``,
+        without which a relocated path's history looks empty and the file
+        reads as missing.
+
+        Only load-bearing properties are pinned here, not prose:
+        ``startswith`` because ``unblock_types.py`` and ``workflow.py``
+        both dispatch on the prefix; the branch-tip-FIRST argument order
+        because reading it the other way inverts the meaning of every
+        ``+``/``-`` line; and the structured routing fields, so a reword
+        cannot silently change the verdict.
+        """
+        from orchestrator.merge_gates import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _run_equivalence_gate,
+        )
+        from orchestrator.merge_types import OutcomeKind
+
+        ctx = self._make_ctx(
+            advanced_sha='a1b2c3d4e5f60718293a4b5c6d7e8f90',
+            resolved_merged_tip='f0e1d2c3b4a5968778695a4b3c2d1e0f',
+        )
+        with patch(
+            'orchestrator.merge_queue._check_post_merge_equivalence',
+            AsyncMock(return_value=['pkg/sub/mod.py']),
+        ):
+            verdict = await _run_equivalence_gate(ctx)
+
+        assert verdict.passed is False
+        assert verdict.reason is not None
+        reason = verdict.reason
+
+        assert reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+        # Branch tip FIRST, advanced main SECOND.  A correctness property,
+        # not wording: the opposite order inverts the RCA.
+        assert (
+            f'git diff {ctx.resolved_merged_tip[:12]} '
+            f'{ctx.advanced_sha[:12]}'
+        ) in reason, reason
+
+        assert '--follow' in reason, reason
+        assert 'pkg/sub/mod.py' in reason, reason
+
+        assert verdict.emit_subtype == OutcomeKind.post_merge_equivalence_failed
+        assert verdict.merge_sha == ctx.advanced_sha
+
     async def test_run_pyright_gate_ok_when_clean(self) -> None:
         from orchestrator.merge_gates import _run_pyright_gate
 
