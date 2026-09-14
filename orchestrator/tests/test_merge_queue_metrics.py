@@ -1,46 +1,156 @@
 """Tests for ι=1894: retries-per-landing + drift-at-detection metrics.
 
 Covers:
-  step-01 RED  — Pure MergeMetrics accumulator (class not yet created)
-  step-03 RED  — snapshot() emits 'metrics' key from worker._merge_metrics
-  step-05 RED  — Worker wiring helpers _note_merge_started/_note_merge_landing/
-                 _note_merge_retry/_note_conflict_detected
-  amend        — Integration wiring: _finalize_inflight PASS path increments
-                 landings counter (call-site wiring coverage)
+  * ``MergeMetrics`` as a pure accumulator (landings, retries, drift window).
+  * The lane's public ``snapshot()['metrics']`` key: present on a fresh lane,
+    zero-valued before any work, and additive beside the pre-existing keys.
+  * The call-site wiring, driven end-to-end: a real merge that lands moves
+    ``landings_total``, and a real merge conflict records a drift sample.
+
+Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
+file's former drive mechanism. The wiring used to be exercised by calling the
+lane's private notifiers (``_note_merge_started``/``_note_merge_landing``/
+``_note_merge_retry``/``_note_conflict_detected``) and asserting on the
+private ``_merge_metrics``/``_drift_base`` they write, which pinned the
+implementation rather than the behaviour. Every lane-level test here now
+submits real requests on the public queue and reads only
+``MergeLane.snapshot()``; the accumulator's arithmetic stays where it belongs,
+in the ``MergeMetrics`` unit tests below.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from _merge_lane_fakes import FakeVerifier
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
-    InflightEntry,
-    MergeMetrics,
-    MergeRequest,
-    RealMergeItem,
-    SpeculativeMergeWorker,
-)
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_queue import MergeMetrics, MergeRequest
 from orchestrator.merge_types import QueuedBranch
 
+_STOP_TIMEOUT = 30.0
+
+
 # ---------------------------------------------------------------------------
-# Worker factory (mirrors test_merge_queue_main_health._make_git_ops pattern)
+# Fixtures (per-file duplication convention — see
+# test_merge_queue_permit_conservation.py)
 # ---------------------------------------------------------------------------
 
 
-def _make_bare_worker(tmp_path: Path | None = None) -> SpeculativeMergeWorker:
-    """Build a SpeculativeMergeWorker with a mocked GitOps (no real git repo)."""
+async def _setup_repo(repo: Path) -> None:
+    """Initialise a git repo with one commit on main."""
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+
+
+@pytest.fixture
+def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(git_config, git_repo)
+
+
+@pytest.fixture
+def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    """Single-host (no verify_runners) OrchestratorConfig."""
+    return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
+# ---------------------------------------------------------------------------
+# Lane helpers
+# ---------------------------------------------------------------------------
+
+
+def _bare_lane() -> Any:
+    """A lane over a mocked GitOps — enough to read snapshot(), never run."""
     git_ops = MagicMock(spec=GitOps)
-    git_ops.project_root = tmp_path  # None-safe: __init__ guards on this
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    git_ops.project_root = None  # None-safe: __init__ guards on this
+    return MergeLane(git_ops, asyncio.Queue(), verifier=FakeVerifier())
+
+
+async def _prepare(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    task_id: str,
+    filename: str,
+    content: str,
+) -> MergeRequest:
+    """Commit *filename* on a fresh branch off the CURRENT main, unsubmitted.
+
+    Preparing and submitting are separate so a test can branch two requests off
+    the same base (the add/add conflict below needs that) rather than always
+    branching off whatever has landed by then.
+    """
+    branch = f'task/{task_id}'
+    worktree = (await git_ops.create_worktree(branch)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    request = MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+    )
+    return request
+
+
+@contextlib.asynccontextmanager
+async def _running_lane(git_ops: GitOps):
+    """A running single-host lane whose scoped verify always passes.
+
+    Teardown goes through ``stop()`` -- the lane's own shutdown protocol, which
+    resolves in-flight request futures, drains its queues, cleans merge
+    worktrees and releases leases, and is internally bounded so it cannot hang.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    lane = MergeLane(git_ops, queue, verifier=FakeVerifier())
+    lane_task = asyncio.ensure_future(lane.run())
+    try:
+        yield lane, queue
+    finally:
+        # Exception, not BaseException: this must not swallow a CancelledError
+        # aimed at the enclosing test task (or a KeyboardInterrupt).
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(lane.stop(), timeout=_STOP_TIMEOUT)
+        lane_task.cancel()
+        await asyncio.gather(lane_task, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
-# step-01: MergeMetrics pure accumulator
+# MergeMetrics pure accumulator
 # ---------------------------------------------------------------------------
 
 
@@ -154,316 +264,109 @@ class TestMergeMetrics:
         assert snap['retries_per_landing'] is None
 
 
+
 # ---------------------------------------------------------------------------
-# step-03: snapshot() emits 'metrics' key
+# snapshot()'s 'metrics' key
 # ---------------------------------------------------------------------------
 
 
-class TestWorkerSnapshotMetricsKey:
-    """snapshot() must include a top-level 'metrics' key from _merge_metrics.
+class TestLaneSnapshotMetricsKey:
+    """``snapshot()`` carries a top-level 'metrics' key, additively."""
 
-    RED until step-04 GREEN adds _merge_metrics to __init__ and 'metrics' to
-    snapshot().
-    """
+    def test_snapshot_has_metrics_key(self) -> None:
+        assert 'metrics' in _bare_lane().snapshot()
 
-    def test_snapshot_has_metrics_key(self):
-        """snapshot() includes a 'metrics' key."""
-        worker = _make_bare_worker()
-        snap = worker.snapshot()
-        assert 'metrics' in snap
+    def test_snapshot_metrics_zero_state(self) -> None:
+        """A lane that has done no work reports no landings, retries or drift."""
+        metrics = _bare_lane().snapshot()['metrics']
 
-    def test_snapshot_metrics_matches_accumulator(self):
-        """snapshot()['metrics'] equals worker._merge_metrics.as_snapshot()."""
-        worker = _make_bare_worker()
-        # Drive the accumulator directly
-        worker._merge_metrics.record_landing()
-        worker._merge_metrics.record_landing()
-        worker._merge_metrics.record_retry()
-        worker._merge_metrics.record_drift(3)
-        snap = worker.snapshot()
-        expected = worker._merge_metrics.as_snapshot()
-        assert snap['metrics'] == expected
+        assert metrics['retries_per_landing'] is None
+        assert metrics['landings_total'] == 0
+        assert metrics['retries_total'] == 0
+        assert metrics['drift_at_detection']['count'] == 0
 
-    def test_snapshot_metrics_retries_per_landing_correct(self):
-        """snapshot()['metrics']['retries_per_landing'] is numerically correct."""
-        worker = _make_bare_worker()
-        worker._merge_metrics.record_landing()
-        worker._merge_metrics.record_landing()
-        worker._merge_metrics.record_retry()
-        worker._merge_metrics.record_retry()
-        worker._merge_metrics.record_retry()
-        snap = worker.snapshot()
-        assert snap['metrics']['retries_per_landing'] == pytest.approx(1.5)
-
-    def test_snapshot_metrics_drift_at_detection_correct(self):
-        """snapshot()['metrics']['drift_at_detection'] has correct fields."""
-        worker = _make_bare_worker()
-        worker._merge_metrics.record_drift(5)
-        snap = worker.snapshot()
-        dd = snap['metrics']['drift_at_detection']
-        assert dd['count'] == 1
-        assert dd['last'] == 5
-        assert dd['max'] == 5
-
-    def test_snapshot_metrics_zero_state(self):
-        """snapshot()['metrics'] on a fresh worker has None rpl and zero landings/retries."""
-        worker = _make_bare_worker()
-        snap = worker.snapshot()
-        m = snap['metrics']
-        assert m['retries_per_landing'] is None
-        assert m['landings_total'] == 0
-        assert m['retries_total'] == 0
-        assert m['drift_at_detection']['count'] == 0
-
-    def test_snapshot_backward_compat_keys_present(self):
+    def test_snapshot_backward_compat_keys_present(self) -> None:
         """Pre-existing snapshot keys are still present alongside 'metrics'."""
-        worker = _make_bare_worker()
-        snap = worker.snapshot()
+        snap = _bare_lane().snapshot()
+
         for key in ('entries', 'depth', 'head_of_line', 'suffix_conflict_graph'):
             assert key in snap, f"pre-existing key '{key}' missing from snapshot"
 
 
 # ---------------------------------------------------------------------------
-# step-05: worker wiring helpers
+# Call-site wiring, driven end-to-end
 # ---------------------------------------------------------------------------
-
-
-class TestWorkerWiringHelpers:
-    """Worker helper methods delegate to _merge_metrics and _drift_base.
-
-    RED until step-06 GREEN adds the four helper methods to SpeculativeMergeWorker.
-    """
-
-    def test_note_merge_started_stashes_main_position(self):
-        """_note_merge_started(rid) stores current main_position into _drift_base."""
-        worker = _make_bare_worker()
-        # Advance main_position via 2 landings, then start a request
-        worker._merge_metrics.record_landing()
-        worker._merge_metrics.record_landing()
-        worker._note_merge_started('req-abc')
-        assert worker._drift_base['req-abc'] == 2
-
-    def test_note_merge_started_at_zero(self):
-        """_note_merge_started stashes position 0 on a fresh worker."""
-        worker = _make_bare_worker()
-        worker._note_merge_started('req-zero')
-        assert worker._drift_base['req-zero'] == 0
-
-    def test_note_merge_landing_increments_landings_and_pops_drift_base(self):
-        """_note_merge_landing increments landings and pops _drift_base entry."""
-        worker = _make_bare_worker()
-        worker._note_merge_started('req-land')
-        assert 'req-land' in worker._drift_base
-
-        worker._note_merge_landing('req-land')
-
-        assert worker._merge_metrics.landings == 1
-        assert 'req-land' not in worker._drift_base
-
-    def test_note_merge_landing_pops_only_own_entry(self):
-        """_note_merge_landing only pops its own request_id from _drift_base."""
-        worker = _make_bare_worker()
-        worker._note_merge_started('req-a')
-        worker._note_merge_started('req-b')
-        worker._note_merge_landing('req-a')
-        assert 'req-b' in worker._drift_base
-        assert 'req-a' not in worker._drift_base
-
-    def test_note_merge_retry_increments_retries(self):
-        """_note_merge_retry() increments the retries counter."""
-        worker = _make_bare_worker()
-        assert worker._merge_metrics.retries == 0
-        worker._note_merge_retry()
-        assert worker._merge_metrics.retries == 1
-        worker._note_merge_retry()
-        assert worker._merge_metrics.retries == 2
-
-    def test_note_conflict_detected_records_drift_and_pops(self):
-        """_note_conflict_detected(rid) records drift = (main_position - base) and pops."""
-        worker = _make_bare_worker()
-        # Start req-c at position 0
-        worker._note_merge_started('req-c')
-        # Simulate 3 clean landings (main advances by 3)
-        worker._merge_metrics.record_landing()
-        worker._merge_metrics.record_landing()
-        worker._merge_metrics.record_landing()
-        # Detect conflict → drift should be 3 - 0 = 3
-        worker._note_conflict_detected('req-c')
-
-        snap = worker.snapshot()
-        dd = snap['metrics']['drift_at_detection']
-        assert dd['count'] == 1
-        assert dd['last'] == 3
-        assert 'req-c' not in worker._drift_base
-
-    def test_concrete_scenario_drift_equals_intervening_landings(self):
-        """Full scenario: start A at pos 0, land 3 times, conflict A → drift=3."""
-        worker = _make_bare_worker()
-        worker._note_merge_started('req-A')
-        # 3 clean landings by other requests
-        worker._note_merge_landing('req-X')
-        worker._note_merge_landing('req-Y')
-        worker._note_merge_landing('req-Z')
-        # conflict on req-A
-        worker._note_conflict_detected('req-A')
-        snap = worker.snapshot()
-        assert snap['metrics']['drift_at_detection']['last'] == 3
-
-    def test_note_conflict_detected_noop_when_not_started(self):
-        """_note_conflict_detected for unknown rid doesn't raise (defensive)."""
-        worker = _make_bare_worker()
-        # Should not raise even if req was never started
-        worker._note_conflict_detected('req-missing')
-
-    def test_drift_base_cleared_on_abandoned_drop(self):
-        """_drift_base entry is popped when the drop-on-detection branch fires.
-
-        Regression guard for the leak identified in review: _note_merge_started
-        is called before the _request_abandoned check; if the branch fires the
-        stash must be cleared so the dict doesn't grow unboundedly.
-        """
-        worker = _make_bare_worker()
-        worker._note_merge_started('req-drop')
-        assert 'req-drop' in worker._drift_base
-        # Manually pop (simulating what the amended drop-on-detection branch does)
-        # and verify the entry is gone — confirming the fix is testable.
-        worker._drift_base.pop('req-drop', None)
-        assert 'req-drop' not in worker._drift_base
-
-
-# ---------------------------------------------------------------------------
-# amend: integration-style wiring — _finalize_inflight PASS path
-# ---------------------------------------------------------------------------
-
-
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a bare git repo with one commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 @pytest.mark.asyncio
-class TestWiringIntegration:
-    """Integration-style tests: call-site wiring for the _note_merge_* helpers.
+class TestMetricsFromRealMerges:
+    """The metrics a REAL merge produces, read off the public snapshot.
 
-    These tests drive requests through _finalize_inflight (the CAS loop) and
-    assert that snapshot()['metrics'] reflects the landing/retry state, so a
-    regression that removes or misplaces a one-line call-site will make these
-    tests fail even if the helper unit tests remain green.
+    These replace the former private-notifier tests: a regression that removes
+    or misplaces a ``_note_merge_landing`` / ``_note_conflict_detected``
+    call-site fails here, and so does one that stops surfacing the counter --
+    neither is visible to a test that calls the notifier itself.
     """
 
-    def _make_git_config(self) -> GitConfig:
-        return GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-            push_after_advance=False,
-        )
-
-    def _make_mock_allocator(self) -> MagicMock:
-        alloc = MagicMock()
-        alloc.release = AsyncMock()
-        alloc.cancel_and_release = AsyncMock()
-        return alloc
-
-    async def _build_merged_item(
-        self,
-        git_ops: GitOps,
-        config: OrchestratorConfig,
-        branch: str,
-        filename: str,
-        content: str,
-    ) -> tuple[MergeRequest, RealMergeItem]:
-        """Create a branch with a committed file, merge it, return (req, item)."""
-        worktree = (await git_ops.create_worktree(branch)).path
-        (worktree / filename).write_text(content)
-        await git_ops.commit(worktree, f'Add {filename}')
-        merge_result = await git_ops.merge_to_main(worktree, branch)
-        assert merge_result.success and merge_result.merge_commit, (
-            f'merge_to_main failed: {merge_result!r}'
-        )
-        assert merge_result.merge_worktree is not None
-        base_sha = await git_ops.get_main_sha()
-        req = MergeRequest(
-            task_id=branch,
-            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
-            worktree=worktree,
-            pre_rebased=False,
-            task_files=None,
-            module_configs=[],
-            config=config,
-            result=asyncio.get_running_loop().create_future(),
-            lane='normal',
-        )
-        item = RealMergeItem(
-            request=req,
-            merge_result=merge_result,
-            merge_wt=merge_result.merge_worktree,
-            base_sha=base_sha,
-            speculative=False,
-        )
-        return req, item
-
-    def _make_pass_entry(self, item: RealMergeItem) -> InflightEntry:
-        """Build an InflightEntry representing a completed, passing verify."""
-        return InflightEntry(
-            item=item,
-            lease=None,
-            verify_task=None,
-            merge_wt=item.merge_wt,
-            was_speculative=False,
-            passthrough_outcome=None,
-            verify_result=None,
-            status=None,
-        )
-
-    async def test_finalize_inflight_pass_increments_landing_metric(
-        self, tmp_path: Path,
+    async def test_clean_landing_increments_landings_total(
+        self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """_finalize_inflight PASS path must wire _note_merge_landing.
+        """One request merged, verified and landed moves landings_total 0 -> 1."""
+        async with _running_lane(git_ops) as (lane, queue):
+            assert lane.snapshot()['metrics']['landings_total'] == 0
 
-        Drives a real merge request through _finalize_inflight with a mock
-        verify (always passes) and asserts snapshot()['metrics']['landings_total']
-        increments from 0 to 1.  A regression that removes the _note_merge_landing
-        call at the clean-landing branch will leave landings_total at 0.
+            request = await _prepare(
+                git_ops, config, 'metrics-land-a', 'land_a.py', 'x = 1\n',
+            )
+            await queue.put(request)
+            outcome = await wait_responsive(request.result, label='clean landing')
+            assert outcome.status == 'done', f'expected a clean landing, got {outcome!r}'
+
+            metrics = lane.snapshot()['metrics']
+            assert metrics['landings_total'] == 1, (
+                '_note_merge_landing wiring missing: landings_total did not increment'
+            )
+            assert metrics['retries_total'] == 0
+            assert metrics['retries_per_landing'] == 0.0
+
+    async def test_conflicting_merge_records_a_drift_sample(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """A real merge conflict records one drift sample.
+
+        The sample's VALUE is ``main_position - <position at merge-start>``,
+        which is 0 here by construction: this drive lands A before B is even
+        dequeued, so no landing intervenes between B's merge-start and its
+        conflict. The subtraction itself is covered by ``TestMergeMetrics``
+        (``record_drift`` + ``main_position``); what this test pins is the
+        wiring -- that a conflict reaches the drift recorder at all, and that
+        the sample surfaces on the snapshot.
         """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _setup_repo(repo)
+        async with _running_lane(git_ops) as (lane, queue):
+            # BOTH branches are cut from the same base, before either lands, so
+            # they each ADD clash.py -- an add/add conflict. Branching B after A
+            # landed would make B a clean modification of A's file instead.
+            first = await _prepare(
+                git_ops, config, 'metrics-drift-a', 'clash.py', 'x = 1\n',
+            )
+            second = await _prepare(
+                git_ops, config, 'metrics-drift-b', 'clash.py', 'x = 2\n',
+            )
 
-        git_config = self._make_git_config()
-        config = OrchestratorConfig(project_root=repo, git=git_config)
-        git_ops = GitOps(git_config, repo)
+            await queue.put(first)
+            outcome_first = await wait_responsive(first.result, label='item A lands')
+            assert outcome_first.status == 'done', f'expected A to land, got {outcome_first!r}'
+            assert lane.snapshot()['metrics']['drift_at_detection']['count'] == 0
 
-        req, item = await self._build_merged_item(
-            git_ops, config, 'task/metrics-wire-a', 'wire_a.py', 'x = 1\n',
-        )
+            await queue.put(second)
+            outcome_second = await wait_responsive(second.result, label='item B conflicts with A')
+            assert outcome_second.status == 'conflict', (
+                f'expected B to conflict with A, got {outcome_second!r}'
+            )
 
-        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
-        worker._host_allocator = self._make_mock_allocator()
-        worker._register_owned_merge_worktree(item.merge_wt)
-
-        entry = self._make_pass_entry(item)
-
-        # snapshot before: landings_total must be 0
-        assert worker.snapshot()['metrics']['landings_total'] == 0
-
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            AsyncMock(return_value=MagicMock(passed=True, summary='')),
-        ):
-            advanced = await worker._finalize_inflight(entry)
-
-        assert advanced is True, 'expected _finalize_inflight to return True (advanced)'
-        # snapshot after: landings_total must be 1 (wiring confirmed)
-        snap = worker.snapshot()
-        assert snap['metrics']['landings_total'] == 1, (
-            '_note_merge_landing wiring missing: landings_total did not increment'
-        )
-        assert snap['metrics']['retries_total'] == 0
+            drift = lane.snapshot()['metrics']['drift_at_detection']
+            assert drift['count'] == 1, (
+                '_note_conflict_detected wiring missing: the conflict recorded '
+                f'no drift sample ({drift!r})'
+            )
+            assert drift['last'] == 0
