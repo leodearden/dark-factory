@@ -375,6 +375,31 @@ def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> floa
 # If Row 7 crashes again with this marker in place, the timeout hypothesis is
 # falsified -- look at fd and memory limits next, and do not widen further.
 #
+# THAT FALSIFIER HAS NOW TRIGGERED ONCE (2026-09-15, task 5333 amendment pass,
+# recorded here because a hedge whose test has been run is worth more than one
+# still waiting for it).  OBSERVED, full `pytest tests/` at this marker:
+#   * 1 failed, 16975 passed, 16 skipped in 2484s -- the single failure being
+#     "worker 'gw2' crashed while running ...TestRow7KillSwitchByteIdentity::
+#     test_the_same_sequence_at_cap_six_moves_every_deep_field";
+#   * NO `+++ Timeout +++` banner anywhere in that log, which pytest-timeout
+#     writes before its `os._exit()`;
+#   * the same suite at the same marker had passed 21216 tests, rc=0, in this
+#     lane's own verify attempt-1 (2026-09-14T21:25, 2445s).  So: one crash in
+#     two full-suite runs, not a reproducible failure;
+#   * the shortfall between those counts is the crash's real cost -- under
+#     `--max-worker-restart=0` the dead worker is not replaced, so ~4200 tests
+#     assigned to it never ran, and the run reported green-ish anyway.
+# HYPOTHESIS (unproven, and now the LEADING one): the worker is not dying of
+# this timeout.  Reaching 1260s needs a ~150x slowdown on a test measured at
+# 8.28s, where the worst contention ever recorded here cost 2.8x, and no
+# timeout banner was emitted.  NOT INVESTIGATED: fd and memory ceilings at the
+# moment of death -- the next place to look, per the line above.
+# WHAT THIS DOES NOT OVERTURN: the marker is still correctly sized for what it
+# covers, and it is genuinely in force under verify -- measured directly, a
+# `@pytest.mark.timeout` marker overrides verify's CLI `--timeout=300`
+# (pytest-timeout resolves the marker first and falls back to ini/CLI only in
+# its absence).  What is in doubt is whether a timeout was ever the cause.
+#
 # THE COUNTS ARE DETERMINISTIC AND THE WALL CLOCK IS NOT, which IS the
 # load-sensitivity these constants exist to absorb.  Five runs of the same
 # three tests, spawn count identical (460) in every one:
@@ -390,7 +415,7 @@ def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> floa
 # deliberate rather than an arithmetic slip (task 5333 reviewer amendment).
 # Dividing the wall clocks above by 460 puts THIS scene's per-spawn cost at
 # 0.018-0.050s -- against the 4.71s `MEASURED_SPAWN_LATENCY_SECS` charges, a
-# ~100-270x over-charge.  The 4.71 is a worst-case SINGLE-spawn latency from a
+# 95-270x over-charge.  The 4.71 is a worst-case SINGLE-spawn latency from a
 # different workload, i.e. a pessimistic ceiling and not an estimate of this
 # scene (see its own comment above); pricing 260 spawns at it assumes every
 # spawn simultaneously hits that worst case, which no recorded run comes near.
