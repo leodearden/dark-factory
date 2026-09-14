@@ -36,12 +36,14 @@ and no caller depends on the session surviving one.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import httpx
 
@@ -638,6 +640,46 @@ async def first_success(
     return offline_result(errors)
 
 
+# Every live TTLCache, enrolled from __init__ so reap_detached_refreshes()
+# below can reach all of them without anyone enumerating the 8 module-level
+# instances spread over 4 modules (app.py, data/tasks.py, data/merge_queue.py,
+# data/scheduler.py). Enrolment is what makes shutdown coverage exhaustive by
+# construction: a ninth cache is reaped with no edit at its call site.
+#
+# WEAK, so the registry cannot become a leak of its own — a cache constructed
+# inside a test drops out when the test does. Module-level for the same reason
+# _failure_streaks above is: the state is genuinely per-process, and the
+# alternative (an explicit list in app.py's lifespan) trades one global for an
+# import edge onto every module that happens to own a cache.
+_live_caches: weakref.WeakSet[TTLCache[Any, Any]] = weakref.WeakSet()
+
+
+async def reap_detached_refreshes() -> int:
+    """Cancel every in-flight bypass refresh across all live caches; return the count.
+
+    The process-shutdown hook for :meth:`TTLCache.cancel_live_bypasses` —
+    called from the dashboard app's ``lifespan`` teardown. See that method
+    for why cancelling is correct here and nowhere else.
+
+    One WARNING when anything was actually reaped: a detached refresh
+    outliving its app lifespan is an anomaly worth a journal line, and at one
+    line per shutdown it needs no streak throttle (contrast
+    :meth:`TTLCache._note_lock_bypass`, which sits on a hot path).
+
+    The registry is snapshotted before the first ``await`` rather than
+    iterated lazily: it is a ``WeakSet``, so a collection during one of those
+    awaits would otherwise mutate the set mid-iteration.
+    """
+    total = 0
+    for cache in list(_live_caches):
+        total += await cache.cancel_live_bypasses()
+    if total:
+        logger.warning(
+            'reaped %d detached cache refresh(es) still in flight at shutdown', total
+        )
+    return total
+
+
 class TTLCache(Generic[V, K]):
     """Single-flight, short-TTL cache keyed by an arbitrary HASHABLE.
 
@@ -758,6 +800,20 @@ class TTLCache(Generic[V, K]):
     add eviction from outside (``_store`` is private), so the fix belongs
     here. Steady-state size is now "keys requested within the eviction
     horizon", regardless of how many distinct keys the caller has ever used.
+
+    **Shutdown is the ONE exception to abandon-don't-cancel.** Everywhere else
+    — :meth:`_evict_expired`'s ``dead_bypasses`` sweep, :meth:`clear`,
+    :meth:`_bypass_refresh`'s supersession — an abandoned bypass is
+    deliberately left running: it may still store a late value and heal the
+    key for whoever asks next, which is what lets a wedged key recover on its
+    own. That reasoning holds for exactly as long as a "next caller" can
+    exist. At process shutdown none can, while the task still pins a
+    connection on the shared httpx client — and, since these caches are
+    module-level and event loops are not, it can outlive the loop that
+    started it. :meth:`cancel_live_bypasses` (and its module-level fan-out
+    :func:`reap_detached_refreshes`) is therefore the single place a bypass is
+    ever cancelled, and is called only from the app's ``lifespan`` teardown.
+    Runtime behaviour is untouched.
     """
 
     # Multiple of the TTL after which an untouched entry is evicted. Entries
@@ -801,6 +857,7 @@ class TTLCache(Generic[V, K]):
         # task's own done-callback, and swept defensively by
         # _live_bypasses_for / _evict_expired.
         self._live_bypasses: dict[K, list[asyncio.Task[V]]] = {}
+        _live_caches.add(self)
 
     def get_fresh(self, key: K) -> V | None:
         """Return the cached value for *key* iff still within TTL, else None."""
@@ -1357,6 +1414,39 @@ class TTLCache(Generic[V, K]):
                 return await self._refresh_and_store(key, refresh, cache_ok)
             finally:
                 lock.release()
+
+    async def cancel_live_bypasses(self) -> int:
+        """Cancel and await every bypass refresh still in flight; return the count.
+
+        The shutdown-only exception to abandon-don't-cancel (see the class
+        docstring). Unlike :meth:`clear`, which merely stops TRACKING an
+        in-flight bypass and leaves it running, this ends it: the cancellation
+        is AWAITED, so by the time this returns the task has actually unwound
+        and released its connection rather than merely been asked to.
+
+        Reads the roster through :meth:`_live_bypasses_for` so its sweep
+        applies: a task that finished before its done-callback ran is dropped
+        rather than counted as reaped. Both maps are emptied first, so the
+        done-callbacks the cancellations trigger find nothing to unpick and
+        cannot mutate a roster being iterated.
+
+        Counts tasks, not keys — the caller wants to know how much work was
+        still outstanding, and a key may hold up to
+        ``_MAX_LIVE_BYPASSES_PER_KEY`` of it.
+        """
+        reapable = [
+            task
+            for key in list(self._live_bypasses)
+            for task in self._live_bypasses_for(key)
+        ]
+        self._bypass_tasks.clear()
+        self._live_bypasses.clear()
+        for task in reapable:
+            task.cancel()
+        for task in reapable:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        return len(reapable)
 
     def clear(self) -> None:
         """Reset the store, all per-key locks, and open bypass streaks (test/admin hook).
