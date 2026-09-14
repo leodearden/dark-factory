@@ -47,7 +47,7 @@ def _filed(root):
 
 def _emit(root, *, project_id=_PROJECT, operation='add_episode',
           group_id=_PROJECT, item_id=7, attempts=5,
-          error='NodeNotFoundError: node abc not found', post_execute=False,
+          error: str | None = 'NodeNotFoundError: node abc not found', post_execute=False,
           content_preview='an episode that never landed', write_op_id='W1'):
     return emit_dead_letter_escalation(
         str(root),
