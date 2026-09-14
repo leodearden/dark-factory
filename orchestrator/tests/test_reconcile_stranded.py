@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import time as _time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -52,6 +54,20 @@ def _bind_queue(harness: Harness, path: Path) -> EscalationQueue:
     queue = EscalationQueue(path)
     harness._escalation_queue = queue
     return queue
+
+
+@contextmanager
+def _spy_dispositions(harness: Harness) -> Iterator[MagicMock]:
+    """Wrap the recovery-disposition emitter and hand back the spy.
+
+    The suite's coupling to this private emitter lives here and nowhere else,
+    so a rename costs one edit instead of one per test.
+    """
+    with patch.object(
+        harness, '_emit_recovery_disposition',
+        wraps=harness._emit_recovery_disposition,
+    ) as spy:
+        yield spy
 
 
 @pytest.fixture(autouse=True)
@@ -2833,9 +2849,9 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
                 'metadata': {'reopen_at': '2026-07-15T00:00:00+00:00'},
             },
         )
-        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        queue = _bind_queue(harness, tmp_path / 'esc')
         harness._provenance_conflict_sink = ProvenanceConflictSink(
-            escalation_queue=harness._escalation_queue,
+            escalation_queue=queue,
         )
         harness.git_ops.release_lane_for_terminal_task = AsyncMock(  # type: ignore[attr-defined]
             return_value=False,
@@ -2869,9 +2885,9 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
                 'metadata': {'reopen_at': '2026-07-15T00:00:00+00:00'},
             },
         )
-        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        queue = _bind_queue(harness, tmp_path / 'esc')
         harness._provenance_conflict_sink = ProvenanceConflictSink(
-            escalation_queue=harness._escalation_queue,
+            escalation_queue=queue,
         )
         harness.git_ops.release_lane_for_terminal_task = AsyncMock(  # type: ignore[attr-defined]
             return_value=False,
@@ -2880,7 +2896,7 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
 
         await harness._reconcile_stranded_in_progress()
 
-        pending = harness._escalation_queue.get_by_task(tid, status='pending')
+        pending = queue.get_by_task(tid, status='pending')
         assert not any(e.category == 'reconcile_persistent_rejection' for e in pending), (
             'a stale-evidence rejection must not be escalated as a generic '
             'persistence-layer rejection (wrong escalation category)'
@@ -2892,7 +2908,7 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
 
         # Second full sweep, unchanged reopen_at.
         await harness._reconcile_stranded_in_progress()
-        pending_after = harness._escalation_queue.get_by_task(tid, status='pending')
+        pending_after = queue.get_by_task(tid, status='pending')
         conflicts_after = [e for e in pending_after if e.category == 'provenance_conflict']
         assert len(conflicts_after) == 1, (
             f'expected still exactly one pending L2 after a second sweep, '
@@ -4549,6 +4565,12 @@ def _off_main_in_progress(harness: Harness, tid: str) -> None:
     harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
 
 
+def _off_main_blocked(harness: Harness, tid: str) -> None:
+    """Wire *tid* as a stranded BLOCKED task whose branch is EXISTS_OFF_MAIN."""
+    _off_main_in_progress(harness, tid)
+    harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+
+
 @pytest.mark.asyncio
 class TestInProgressApplierConsumesTheSharedPredicate:
     """The applier's veto becomes the resolver's own answer (INV-5)."""
@@ -4626,9 +4648,7 @@ class TestInProgressApplierConsumesTheSharedPredicate:
         _off_main_in_progress(harness, '3544')
         _submit_open(harness, tmp_path, '3544')
 
-        with patch.object(
-            harness, '_emit_recovery_disposition', wraps=harness._emit_recovery_disposition,
-        ) as spy:
+        with _spy_dispositions(harness) as spy:
             await _reconcile_stranded(harness, '3544', 'in-progress')
 
         assert spy.call_count == 1, (
@@ -4826,7 +4846,7 @@ class TestDedupGuardDoesNotSwallowAnOrderedReFile:
             severity='info', category='design_concern', level=0,
         )
 
-        await harness._reconcile_one_stranded('7', 'blocked', mid_run=False)
+        await _reconcile_stranded(harness, '7', 'blocked')
 
         after = _pending_ids(harness, '7')
         assert (probe.id, 0, 'design_concern') in after, 'the annotation is untouched'
@@ -4844,19 +4864,15 @@ class TestDedupGuardDoesNotSwallowAnOrderedReFile:
         operator with no row at all for a task the sweep decided to hold.
         """
         harness.config.stranded_blocked_escalate_enabled = True
-        _off_main_in_progress(harness, '8')
-        harness.scheduler.get_statuses.return_value = ({'8': 'blocked'}, None)
+        _off_main_blocked(harness, '8')
         seeded = _submit_open(
             harness, tmp_path, '8', category='stranded_blocked', level=1,
         )
 
         with patch(
             'orchestrator.harness.detect_verified_green', AsyncMock(return_value=None),
-        ), patch.object(
-            harness, '_emit_recovery_disposition',
-            wraps=harness._emit_recovery_disposition,
-        ) as spy:
-            result = await harness._reconcile_one_stranded('8', 'blocked', mid_run=False)
+        ), _spy_dispositions(harness) as spy:
+            result = await _reconcile_stranded(harness, '8', 'blocked')
 
         assert result is None
         assert _pending_ids(harness, '8') == [
@@ -4881,19 +4897,15 @@ class TestDedupGuardDoesNotSwallowAnOrderedReFile:
         whichever predicate the site happened to call.
         """
         harness.config.stranded_blocked_escalate_enabled = True
-        _off_main_in_progress(harness, '9')
-        harness.scheduler.get_statuses.return_value = ({'9': 'blocked'}, None)
+        _off_main_blocked(harness, '9')
         seeded = _submit_open(
             harness, tmp_path, '9', category='stranded_blocked', level=0,
         )
 
         with patch(
             'orchestrator.harness.detect_verified_green', AsyncMock(return_value=None),
-        ), patch.object(
-            harness, '_emit_recovery_disposition',
-            wraps=harness._emit_recovery_disposition,
-        ) as spy:
-            result = await harness._reconcile_one_stranded('9', 'blocked', mid_run=False)
+        ), _spy_dispositions(harness) as spy:
+            result = await _reconcile_stranded(harness, '9', 'blocked')
 
         assert result is None
         assert _pending_ids(harness, '9') == [(seeded.id, 0, 'stranded_blocked')]

@@ -69,6 +69,24 @@ def _arm_escalation_queue(
     return queue
 
 
+async def _drain_background(harness: Harness) -> None:
+    """Await everything a sweep scheduled onto the harness's background set.
+
+    The suite's coupling to that private set lives here and nowhere else,
+    so a rename costs one edit instead of one per test.
+    """
+    await asyncio.gather(*list(harness._background_tasks))
+
+
+def _merge_queue_depth(harness: Harness) -> int:
+    """Depth of the harness's private merge queue.
+
+    Ditto — this is the suite's most-repeated internal read, so it gets the
+    same single-site treatment rather than one coupling per assertion.
+    """
+    return harness._merge_queue.qsize()
+
+
 @pytest.fixture(autouse=True)
 def _reset_merge_provenance():
     """MergeProvenance._outbox is a process-global — never leak a bound outbox
@@ -499,7 +517,7 @@ class TestMaybeSubmitStrandedVerifiedGreen:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         req = harness._merge_queue.get_nowait()
         assert req.branch.bare_id == _TID
         assert req.snapshot_tip == _TIP
@@ -548,7 +566,7 @@ class TestMaybeSubmitStrandedVerifiedGreen:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is False
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
 
     async def test_kill_switch_off_returns_false_without_detecting(
         self, harness: Harness, tmp_path: Path,
@@ -561,7 +579,7 @@ class TestMaybeSubmitStrandedVerifiedGreen:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is False
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
         detect.assert_not_awaited()
 
 
@@ -586,7 +604,7 @@ class TestStrandedVerifiedGreenRecordEscalation:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
         # Drain any coros scheduled by the resolve callback (there should be
         # none for the WORKFLOW_NONE/close_only path — mirrors the flip tests).
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         assert result is True
 
@@ -640,10 +658,10 @@ class TestReconcileStrandedDriverVerifiedGreen:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         # A MergeRequest was enqueued (merge-queue-direct submission).
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         # No pending stranded_blocked L1 remains — the record was auto-dismissed.
         assert queue.get_by_task(tid, status='pending') == []
         # The task was NOT re-pended.
@@ -676,7 +694,7 @@ class TestReconcileStrandedDriverVerifiedGreen:
         assert len(filed) == 1
         assert filed[0].category == 'stranded_blocked'
         assert filed[0].agent_role == 'harness-stranded-blocked-reaper'
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
 
 
 _OFF_MAIN_SHA = 'off' + 'a' * 37  # 40-char unmerged branch tip
@@ -741,11 +759,11 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         # The verified-green branch was submitted merge-queue-direct despite
         # the open stranded_blocked — the anti-synergy δ closes.
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         assert harness.event_store is not None
         rows = harness.event_store.fetch_events_by_type_all_runs(
             EventType.merge_queued, task_id=tid,
@@ -769,10 +787,10 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         # No auto-submit: the human-concern escalation holds the task.
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
         _asserted_no_repend(harness, tid)
         pending = queue.get_by_task(tid, status='pending')
         assert [e.id for e in pending] == [seeded]
@@ -799,9 +817,9 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
         _asserted_no_repend(harness, tid)
         pending = queue.get_by_task(tid, status='pending')
         assert [e.id for e in pending] == [seeded], (
@@ -873,7 +891,7 @@ class TestVerifiedGreenVetoRelaxOnMain:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         prov = _done_provenance(harness, tid)
         assert prov is not None, 'landed branch must self-heal to done'
@@ -893,7 +911,7 @@ class TestVerifiedGreenVetoRelaxOnMain:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         assert _done_provenance(harness, tid) is None, (
             'a human-concern escalation must still hold the task'
@@ -939,7 +957,7 @@ class TestStrandedVerifiedGreenIdempotency:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
         call = harness.scheduler.update_task.await_args  # type: ignore[attr-defined]
         assert call.args[0] == _TID
@@ -970,7 +988,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 0  # NO additional MergeRequest
+        assert _merge_queue_depth(harness) == 0  # NO additional MergeRequest
         harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]  # no re-stamp
         # No new escalation filed (neither a pending L1 nor a dismissed record).
         assert queue.get_by_task(_TID, status='pending') == []
@@ -992,7 +1010,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1  # re-submit
+        assert _merge_queue_depth(harness) == 1  # re-submit
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]  # marker re-stamped
 
     async def test_advanced_lane_tip_resubmits(
@@ -1012,7 +1030,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1  # re-submit for the new tip
+        assert _merge_queue_depth(harness) == 1  # re-submit for the new tip
         req = harness._merge_queue.get_nowait()
         assert req.snapshot_tip == new_tip
 
@@ -1032,7 +1050,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
 
     async def test_first_sweep_stamps_marker_via_driver(
         self, harness: Harness, tmp_path: Path,
@@ -1053,9 +1071,9 @@ class TestStrandedVerifiedGreenIdempotency:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
         marker = harness.scheduler.update_task.await_args.args[1][  # type: ignore[attr-defined]
             'stranded_merge_request'
@@ -1182,7 +1200,7 @@ class TestStrandedMergeFailedL2:
         # add_done_callback fires via call_soon; sleep(0) lets it run and
         # schedule _file_stranded_merge_failed onto _background_tasks.
         await asyncio.sleep(0)
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
     @pytest.mark.parametrize('status', _DURABLE_FAILURE_STATUSES)
     async def test_durable_failure_files_born_at_l2(
@@ -1321,9 +1339,9 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         # Record auto-dismissed → NO pending escalation left to block the flip.
         assert queue.get_by_task(tid, status='pending') == []
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
@@ -1361,7 +1379,7 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         harness.scheduler.set_task_status.assert_any_await(  # type: ignore[attr-defined]
             tid, 'done',
@@ -1683,9 +1701,9 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 1, (
+        assert _merge_queue_depth(harness) == 1, (
             'the off-main clause is not a done-flip, so it keeps the dead-L0 '
             'relaxation'
         )
@@ -1717,9 +1735,9 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 1, (
+        assert _merge_queue_depth(harness) == 1, (
             'the upgrade must fire: an info record is not a handoff'
         )
         assert seeded in {e.id for e in queue.get_by_task(tid, status='pending')}
@@ -1737,9 +1755,9 @@ class TestBlockedArmConsumesTheSharedPinPredicate:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
         _asserted_no_repend(harness, tid)
 
     async def test_a_remediable_pin_plus_an_info_of_the_same_class_still_relaxes(
