@@ -390,3 +390,278 @@ class TestLoadRecordsIsTotal:
 
         assert corpus.records == ()
         assert corpus.skipped == ()
+
+
+# The orchestrator module's declared test_command, as of this writing. Used
+# ONLY to shape the synthetic fixtures below — never as the value under test.
+# The census reads the real one out of `<root>/<prefix>/orchestrator.yaml`,
+# which is what `TestTheExpectedCommandHasOneHome` pins.
+_FULL_SUITE = (
+    'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300'
+)
+
+
+def _summary(*commands, **top):
+    """A summary.json payload. Top-level fields default to a LOUD lint leg.
+
+    Defaulting the top level to something LOUD and SHORT is deliberate: it is
+    the shape that catches a census reading the wrong place. See
+    `TestTheSelectorReadsTheCommandsArray`.
+    """
+    payload = {
+        'category': 'lint_error',
+        'cause_hint': '',
+        'rc': -9,
+        'timed_out': False,
+        'cmd': 'uv run --directory orchestrator ruff check src/',
+        'started_at': '2026-09-13T04:00:00+00:00',
+        'duration_secs': 4.5,
+        'commands': list(commands),
+    }
+    payload.update(top)
+    return payload
+
+
+def _leg(label='test', cmd=_FULL_SUITE, **overrides):
+    entry = {
+        'label': label,
+        'cmd': cmd,
+        'rc': 0,
+        'timed_out': False,
+        'started_at': '2026-09-13T04:00:00+00:00',
+        'duration_secs': 3300.0,
+        'segments': None,
+        'load': None,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _corpus_with(tmp_path, *commands, prefix='orchestrator', lane='3353', **top):
+    """A one-record synthetic root, plus the module yaml the selector reads."""
+    module_yaml = tmp_path / prefix / 'orchestrator.yaml'
+    module_yaml.parent.mkdir(parents=True, exist_ok=True)
+    module_yaml.write_text(f'test_command: "{_FULL_SUITE}"\n', encoding='utf-8')
+
+    path = _worktree_record(tmp_path, lane, f'attempt-1.{prefix}.summary.json')
+    path.write_text(json.dumps(_summary(*commands, **top)), encoding='utf-8')
+    return path
+
+
+class TestTheSelectorReadsTheCommandsArray:
+    """`commands[]`, never the top level — and the difference is not cosmetic.
+
+    `_build_summary_payload`'s own docstring states the rule: the top-level
+    rc/cmd/started_at/duration_secs come from "the loudest raw exit code", the
+    run with the highest rc with a NEGATIVE rc sorting above every non-negative
+    one. So on an attempt whose lint leg was killed, the top level describes
+    the LINT leg — a 4-second command — while the test leg that actually ran
+    the full suite for 55 minutes is only reachable inside `commands[]`.
+
+    Real evidence in the corpus, not a hypothetical: an attempt whose `test`
+    leg ran the verbatim full suite while its `lint`/`type` legs were
+    FILE-SCOPED. A per-module duration census reading the top level would have
+    censused the wrong command, at the wrong scope, and reported it as the
+    suite.
+    """
+
+    def test_the_test_legs_duration_is_reported_not_the_top_levels(self, tmp_path):
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        )
+
+        assert [leg.duration_secs for leg in selection.legs] == [3300.0]
+
+    def test_a_loud_top_level_does_not_mask_a_green_test_leg(self, tmp_path):
+        """The top level says rc=-9; the selected leg says rc=0. Both are true."""
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(tmp_path, _leg(rc=0))
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        )
+
+        assert [leg.rc for leg in selection.legs] == [0]
+
+
+class TestTheFullSuiteShapeFilter:
+    """Selection is by label AND by command SHAPE, each rejection counted."""
+
+    def _select(self, tmp_path, *commands):
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(tmp_path, *commands)
+        return select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        )
+
+    def test_the_verbatim_declared_command_is_selected(self, tmp_path):
+        selection = self._select(tmp_path, _leg())
+
+        assert len(selection.legs) == 1
+        assert selection.rejected == {}
+
+    def test_whitespace_only_differences_are_tolerated(self, tmp_path):
+        """A re-rendered command may differ in spacing and still be the suite."""
+        spaced = _FULL_SUITE.replace(' pytest ', '  pytest   ')
+        selection = self._select(tmp_path, _leg(cmd=spaced))
+
+        assert len(selection.legs) == 1
+
+    @pytest.mark.parametrize(
+        ('cmd', 'note'),
+        [
+            ('uv run --directory orchestrator pytest tests/test_foo.py -q', 'file-scoped'),
+            (
+                'uv run --directory orchestrator pytest tests/ --tb=short -q '
+                '--timeout=300 -k "psi"',
+                'k-narrowed',
+            ),
+            (
+                'uv run --directory orchestrator pytest tests/ --tb=short -q '
+                '--timeout=300 --lf',
+                'lf-narrowed',
+            ),
+        ],
+    )
+    def test_a_narrowed_run_is_rejected_with_a_reason(self, tmp_path, cmd, note):
+        """Their durations are not comparable to a full-suite run's — that is the
+        entire reason this filter exists."""
+        selection = self._select(tmp_path, _leg(cmd=cmd))
+
+        assert selection.legs == (), f'{note} run was admitted'
+        assert selection.rejected == {'command_mismatch': 1}
+
+    def test_a_segmented_entry_is_rejected_with_its_own_reason(self, tmp_path):
+        """A segmented leg's duration covers a DIFFERENT topology of the same
+        chain, so it is excluded — and counted separately from a plain command
+        mismatch, because it is a different fact about the corpus."""
+        selection = self._select(
+            tmp_path, _leg(segments=[{'index': 1, 'label': 'a'}]),
+        )
+
+        assert selection.legs == ()
+        assert selection.rejected == {'segmented': 1}
+
+    def test_a_non_test_leg_is_rejected(self, tmp_path):
+        selection = self._select(
+            tmp_path,
+            _leg(label='lint', cmd='uv run --directory orchestrator ruff check src/'),
+            _leg(label='type', cmd='uv run --directory orchestrator pyright src/'),
+        )
+
+        assert selection.legs == ()
+        assert selection.rejected == {'label_mismatch': 2}
+
+    def test_a_null_cmd_is_rejected_rather_than_compared(self, tmp_path):
+        """A skipped leg ran nothing, so there is no duration to census."""
+        selection = self._select(tmp_path, _leg(cmd=None, duration_secs=0.0))
+
+        assert selection.legs == ()
+        assert selection.rejected == {'no_cmd': 1}
+
+    def test_every_entry_is_either_selected_or_counted(self, tmp_path):
+        """The reconciliation property again, at the selector."""
+        selection = self._select(
+            tmp_path,
+            _leg(),
+            _leg(label='lint', cmd='uv run ruff check src/'),
+            _leg(cmd='uv run --directory orchestrator pytest tests/test_foo.py'),
+        )
+
+        assert len(selection.legs) + sum(selection.rejected.values()) == 3
+
+    def test_another_modules_record_is_rejected_on_prefix(self, tmp_path):
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(tmp_path, _leg())
+        other = _worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
+        other.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        )
+
+        assert len(selection.legs) == 1
+        assert selection.rejected == {'prefix_mismatch': 1}
+
+    def test_a_role_filter_excludes_other_lanes(self, tmp_path):
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(tmp_path, _leg())
+        merge = _worktree_record(
+            tmp_path, '_merge-abc123', 'attempt-1.orchestrator.summary.json',
+        )
+        merge.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator', role='task',
+        )
+
+        assert len(selection.legs) == 1
+        assert selection.rejected == {'role_mismatch': 1}
+
+
+class TestTheExpectedCommandHasOneHome:
+    """The comparison target is READ from the module's yaml, never pasted here.
+
+    A literal copy in the script would be a second home for a value that
+    already has one, and would rot silently the moment the yaml changed: the
+    census would reject every real record as a command mismatch and report n=0
+    — which reads exactly like "this module never ran the full suite".
+    """
+
+    def test_the_command_comes_from_the_modules_own_yaml(self, tmp_path):
+        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+
+        module_yaml = tmp_path / 'orchestrator' / 'orchestrator.yaml'
+        module_yaml.parent.mkdir(parents=True)
+        module_yaml.write_text('test_command: "pytest tests/ -q"\n', encoding='utf-8')
+
+        assert read_module_test_command(tmp_path, 'orchestrator') == 'pytest tests/ -q'
+
+    def test_a_changed_yaml_changes_what_is_selected(self, tmp_path):
+        """The property a pasted literal would break — asserted, not asserted about."""
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(tmp_path, _leg(cmd='pytest tests/ --brand-new-flag'))
+        (tmp_path / 'orchestrator' / 'orchestrator.yaml').write_text(
+            'test_command: "pytest tests/ --brand-new-flag"\n', encoding='utf-8',
+        )
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        )
+
+        assert len(selection.legs) == 1, (
+            'the selector must track the yaml, not a literal pasted into the script'
+        )
+
+    def test_an_absent_module_yaml_is_reported_not_guessed(self, tmp_path):
+        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+
+        assert read_module_test_command(tmp_path, 'nosuchmodule') is None
+
+    def test_a_yaml_without_a_test_command_is_reported_not_guessed(self, tmp_path):
+        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+
+        module_yaml = tmp_path / 'docs' / 'orchestrator.yaml'
+        module_yaml.parent.mkdir(parents=True)
+        module_yaml.write_text('lint_command: "ruff check ."\n', encoding='utf-8')
+
+        assert read_module_test_command(tmp_path, 'docs') is None
+
+    def test_an_unparseable_yaml_is_reported_not_guessed(self, tmp_path):
+        """Read-only and total: a broken config is a None, never a traceback."""
+        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+
+        module_yaml = tmp_path / 'broken' / 'orchestrator.yaml'
+        module_yaml.parent.mkdir(parents=True)
+        module_yaml.write_text('test_command: "unclosed\n  - [oops\n', encoding='utf-8')
+
+        assert read_module_test_command(tmp_path, 'broken') is None
