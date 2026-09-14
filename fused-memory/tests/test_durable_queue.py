@@ -2432,3 +2432,57 @@ class TestDeadByOperation:
             )
         finally:
             await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_projects_mem0_deaths_sit_in_its_mem0_group(self, tmp_path):
+        """A project occupies TWO groups, and a scoped probe sees only one.
+
+        `_dual_write_callback` enqueues each derived fact as
+        `mem0_classify_and_add` in group `mem0_{project_id}`, while the
+        project's Graphiti writes use a group_id that IS the project_id. So
+        the scoped call an operator reaches for after a
+        `durable_write_dead_letter` alarm confirms a dead `add_episode` but
+        reports nothing for a dead `mem0_classify_and_add` in that same
+        project — the push alarm fires per item whatever group it sat in.
+
+        Pinned rather than merely documented because the gap is silent: `{}`
+        reads as "no deaths", not as "not in this group". Unioning the two
+        groups is deliberately NOT the remedy — `counts` and the
+        oldest-pending age have always meant one group, and a breakdown that
+        outgrew `counts['dead']` would break their promised consistency.
+        """
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj_a', operation='add_episode',
+                payload={'content': 'a0', 'group_id': 'proj_a', 'name': 'a0'},
+            )
+            await q.enqueue(
+                group_id='mem0_proj_a', operation='mem0_classify_and_add',
+                payload={'fact_text': 'a derived fact', 'project_id': 'proj_a'},
+            )
+            await _poll_until_dead(q, expected_dead=2)
+
+            scoped = await q.get_stats(group_id='proj_a')
+            mem0_scoped = await q.get_stats(group_id='mem0_proj_a')
+            unscoped = await q.get_stats()
+
+            assert scoped['dead_by_operation'] == {'add_episode': 1}, (
+                "the project-scoped probe covers the project's Graphiti group "
+                f'only. Got {scoped.get("dead_by_operation")!r}'
+            )
+            assert mem0_scoped['dead_by_operation'] == {
+                'mem0_classify_and_add': 1,
+            }, mem0_scoped.get('dead_by_operation')
+            assert unscoped['dead_by_operation'] == {
+                'add_episode': 1,
+                'mem0_classify_and_add': 1,
+            }, 'the unscoped call is the one that sees both groups'
+            # The invariant the docstring promises, per scope.
+            for stats in (scoped, mem0_scoped, unscoped):
+                assert stats['counts'].get('dead', 0) == sum(
+                    stats['dead_by_operation'].values()
+                )
+        finally:
+            await q.close()
