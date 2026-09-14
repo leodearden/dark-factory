@@ -164,9 +164,13 @@ If you encounter a problem you cannot solve at your scope, you can escalate:
     but a post-write re-read could not confirm it landed, so there may be no record on
     disk for any handler to drain. Stopping here would remove your task from every
     recovery path in exchange for an escalation nobody will ever see. So do NOT stop:
-    keep driving the blocked task as best you can, and re-file on your next iteration.
-    The dedupe gate collapses a repeat filing into one record, so re-filing is safe and
-    is the intended recovery.
+    keep driving the blocked task as best you can, and re-file ONCE on your next
+    iteration — then terminate cleanly regardless of what that second filing returns.
+    Re-file exactly ONCE because the repeat is NOT generally folded: the dedupe gate
+    covers only `category='infra_issue'` inside a short (600s) window, and a
+    `critical`/`urgent` filing bypasses dedupe entirely — so on every other path each
+    repeat mints a NEW record, and on that one a NEW page to the human. One retry
+    buys a second chance at durability; a retry every iteration is a storm.
 
 Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
 risk_identified, infra_issue.

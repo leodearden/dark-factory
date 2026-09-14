@@ -1170,7 +1170,11 @@ def create_server(
           'persist_check', 'level'}`` when the post-write re-read is
           unavailable — the write was accepted but nothing is guaranteed on
           disk for L1 or L2 to drain, so the filer must keep driving its
-          blocked task rather than standing down (task 5368).
+          blocked task rather than standing down (task 5368).  The filer's
+          retry is bounded at ONE re-file by ``escalate_blocker``'s docstring
+          and the role prompt, not by this gate: the gate folds only
+          ``config.infra_dedupe_categories``, and the L2 branch above does not
+          consult it at all.
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                             'parent_id': parent_id, 'child_id': esc.id,
                             'level': esc.level}``
@@ -1625,8 +1629,9 @@ def create_server(
         ``action``: on ``'terminate_cleanly'`` commit any in-progress work, log your
         iteration, and STOP — do NOT retry, the handler will resolve the issue and you
         will be re-invoked.  On ``'keep_driving'`` nothing is confirmed on disk, so do
-        NOT stop: keep driving the task and re-file next iteration (see the Unpersisted
-        response shape below).
+        NOT stop: keep driving the task and re-file ONCE on your next iteration, then
+        terminate cleanly regardless (see the Unpersisted response shape below for why
+        the repeat is bounded at one).
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
@@ -1703,9 +1708,16 @@ def create_server(
           is guaranteed on disk for L1 or L2 to drain.  DO NOT terminate on
           this branch — that would remove the task from every recovery path
           in exchange for an escalation no handler will ever see.  Keep
-          driving the blocked task and re-file on your next iteration; the
-          dedupe gate collapses a repeat filing into one record, which is why
-          no out-of-band retry is attempted here.  ``persist_check`` is
+          driving the blocked task, re-file ONCE on the next iteration, then
+          terminate cleanly regardless — the repeat is NOT generally folded,
+          so the retry has to be bounded here rather than by the dedupe gate.
+          ``_submit_or_dedupe`` folds only the categories in this server's
+          ``DedupeConfig`` (stock: ``('infra_issue',)``, 600s window), and a
+          born-at-L2 severity bypasses dedupe altogether; on every other path
+          a repeat mints a NEW record, and on that one a NEW page to the
+          human.  Bounding at one retry is what stops a persistent re-read
+          outage from minting one record per agent iteration.
+          ``persist_check`` is
           ``'absent'`` (the record is not on disk) or ``'unreadable'`` (the
           read failed, so its state is unknown).  ``action`` is
           ``'terminate_cleanly'`` on every OTHER branch above.

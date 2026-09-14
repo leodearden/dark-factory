@@ -396,3 +396,113 @@ class TestFilerActionVocabulary:
         assert result['action'] in FILER_ACTIONS, (
             f'An action no agent has been told how to read: {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# What the `keep_driving` retry actually costs
+# ---------------------------------------------------------------------------
+
+
+class TestRepeatFilingIsNotGenerallyFolded:
+    """Why `keep_driving` bounds the retry at ONE re-file.
+
+    `keep_driving` tells a filer to keep working and re-file.  An earlier
+    revision justified that as unconditionally safe — "the dedupe gate
+    collapses a repeat filing into one record" — and left the loop unbounded.
+    These tests measure the gate instead of asserting the claim, and the
+    measurement is why the instruction now says ONCE:
+
+    - the stock server config folds ONLY `category='infra_issue'`
+      (`DedupeConfig()`), so five of the six documented blocker categories
+      never fold at all; and
+    - a born-at-L2 severity bypasses `_submit_or_dedupe`'s gate entirely — the
+      highest-cost route, where each repeat is another record addressed to a
+      human.
+
+    Note the inversion relative to what a "bounded recovery" test would look
+    like under the other fix: the bound lives in the prompt and the tool
+    docstring, not in the gate, so what is assertable HERE is the cost the
+    bound exists to cap — N re-files really do mint N records.  A future change
+    that made folding universal would fail these tests, which is the intended
+    signal: the prose would then be wrong in the opposite direction.
+    """
+
+    @staticmethod
+    def _pending_ids(queue: EscalationQueue) -> set[str]:
+        return {esc.id for esc in queue.get_pending()}
+
+    @pytest.mark.asyncio
+    async def test_non_infra_repeat_mints_a_second_record(self, tmp_path: Path):
+        """(a) A repeat `scope_violation` filing does NOT fold."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        kwargs = {**_COMMON_KWARGS, 'category': 'scope_violation'}
+
+        first = await _blocker(server, **kwargs)
+        second = await _blocker(server, **kwargs)
+
+        assert second['status'] != 'dedup_skipped', (
+            f'scope_violation is outside the stock DedupeConfig categories, so a '
+            f'repeat cannot fold: {second}'
+        )
+        assert first['id'] != second['id'], (
+            f'Two filings, one id — the gate folded a category it does not cover: '
+            f'{first} / {second}'
+        )
+        assert len(self._pending_ids(queue)) == 2, (
+            f'Expected two distinct pending records: {queue.get_pending()}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_born_at_l2_repeat_mints_a_second_record(self, tmp_path: Path):
+        """(b) The human-paging route is the one where a repeat costs the most.
+
+        `_submit_or_dedupe` returns before reaching the gate for
+        `severity in BORN_AT_L2_SEVERITIES`, so N re-files are N records — and
+        N pages.  This is exactly the path
+        `test_born_at_l2_bypass_also_keeps_driving` proves returns
+        `keep_driving`.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        kwargs = {
+            **_COMMON_KWARGS,
+            'agent_role': 'orchestrator-watcher-supervisor',
+            'severity': 'critical',
+        }
+
+        first = await _blocker(server, **kwargs)
+        second = await _blocker(server, **kwargs)
+
+        assert first['status'] == 'queued' and second['status'] == 'queued', (
+            f'Born-at-L2 filings never dedupe: {first} / {second}'
+        )
+        assert first['id'] != second['id'], (
+            f'A born-at-L2 repeat must mint its own record: {first} / {second}'
+        )
+        assert len(self._pending_ids(queue)) == 2, (
+            f'Expected two distinct pending L2 records: {queue.get_pending()}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_infra_issue_repeat_is_the_one_path_that_folds(self, tmp_path: Path):
+        """(c) The narrow truth the old claim over-generalised from.
+
+        Pins the positive case too, so "only infra_issue folds" is asserted
+        from both sides rather than inferred from two negatives.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        first = await _blocker(server, **_COMMON_KWARGS)
+        second = await _blocker(server, **_COMMON_KWARGS)
+
+        assert second['status'] == 'dedup_skipped', (
+            f'infra_issue inside the window is the one category the stock '
+            f'DedupeConfig folds: {second}'
+        )
+        assert second['parent_id'] == first['id'], f'Folded into a stranger: {second}'
+        assert len(self._pending_ids(queue)) == 1, (
+            f'A folded repeat must not leave a second pending record: '
+            f'{queue.get_pending()}'
+        )

@@ -561,7 +561,12 @@ def submit_or_dedupe(
       'level'}`` when the post-write re-read is unavailable — the write was
       accepted but nothing is guaranteed on disk for L1 or L2 to drain, so the
       filer must keep driving its blocked task rather than standing down
-      (task 5368).  ``persist_check`` is ``'absent'`` or ``'unreadable'``.
+      (task 5368).  That recovery is bounded at ONE re-file by
+      ``escalate_blocker``'s docstring and the role prompt, NOT by this gate:
+      a repeat only folds when its category is in
+      ``config.infra_dedupe_categories`` and it lands inside the window, so on
+      any other category each repeat mints a fresh record.
+      ``persist_check`` is ``'absent'`` or ``'unreadable'``.
     - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                         'parent_id': parent_id, 'child_id': esc.id,
                         'level': esc.level}``
