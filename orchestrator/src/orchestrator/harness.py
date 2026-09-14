@@ -9370,7 +9370,10 @@ class Harness:
                 reasons = self._session_resume_reasons(
                     recovered_session,
                     recovered_config_dir,
-                    archive_available=archive_present,
+                    archive_available=(
+                        archive_present
+                        and self.config.session_resume.restore_from_archive
+                    ),
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {

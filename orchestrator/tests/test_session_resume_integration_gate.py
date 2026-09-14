@@ -151,6 +151,12 @@ _DispatchCapture = namedtuple(
     '_DispatchCapture', ['resume_session_id', 'initial_plan', 'emits'],
 )
 
+#: What β adopted for one task: the ADOPT half of the two-way seam, as a value.
+#: Each field is None when β adopted nothing for that task, so "was it
+#: adopted?" is an ``is None`` check rather than a membership test against a
+#: harness dict.
+_Recovered = namedtuple('_Recovered', ['session', 'plan', 'config_dir'])
+
 
 def _attach_pool(harness: Harness, size: int = 2) -> WarmLanePool:
     """Attach a WarmLanePool on the harness's (reassigned) worktree_base so
@@ -313,6 +319,24 @@ def _session_resume_emits(harness: Harness) -> list[tuple]:
     return out
 
 
+async def _recover(harness: Harness, task_id: str) -> _Recovered:
+    """Drive REAL crash recovery and return what β adopted for *task_id*.
+
+    The ADOPT half of every two-way row here, bundled: recovery deposits its
+    result across three harness dicts, and a row that reads all three names the
+    same internals four or five times over. Reading them once, here, keeps the
+    seam's coupling to those names in one place — and hands the row a value it
+    can assert against by identity, which is what the two-way rows are actually
+    about.
+    """
+    await harness._recover_crashed_tasks()
+    return _Recovered(
+        session=harness._recovered_sessions.get(task_id),
+        plan=harness._recovered_plans.get(task_id),
+        config_dir=harness._recovered_session_config_dirs.get(task_id),
+    )
+
+
 async def _dispatch_capture(
     harness: Harness, task_id: str, *, task: dict | None = None,
 ) -> _DispatchCapture:
@@ -461,23 +485,20 @@ async def test_b1_warm_lane_adopts_then_injects_same_session(harness: Harness):
     _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
     harness.config.session_resume = SessionResumeConfig()
 
-    await harness._recover_crashed_tasks()
+    rec = await _recover(harness, task_id)
 
     # ── ADOPT side (β) ──
-    assert task_id in harness._recovered_sessions
-    assert harness._recovered_sessions[task_id]['session_id'] == session_id
-    assert task_id in harness._recovered_session_config_dirs
-    assert task_id in harness._recovered_plans
+    assert rec.session is not None
+    assert rec.session['session_id'] == session_id
+    assert rec.config_dir is not None
+    assert rec.plan is not None
     harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
-
-    adopted = harness._recovered_sessions[task_id]
-    recovered_plan = harness._recovered_plans[task_id]
 
     # ── INJECT side (γ) ──
     cap = await _dispatch_capture(harness, task_id)
-    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id is rec.session
     assert cap.resume_session_id['session_id'] == session_id
-    assert cap.initial_plan is recovered_plan
+    assert cap.initial_plan is rec.plan
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
 
 
@@ -1527,18 +1548,17 @@ async def test_b5_stale_sidecar_falls_back(harness: Harness):
     )
     harness.config.session_resume = SessionResumeConfig()
 
-    await harness._recover_crashed_tasks()
+    rec = await _recover(harness, task_id)
 
     # ── ADOPT side (β): session + plan + config-dir all recovered ──
-    assert task_id in harness._recovered_sessions
-    assert task_id in harness._recovered_plans
-    assert task_id in harness._recovered_session_config_dirs
-    recovered_plan = harness._recovered_plans[task_id]
+    assert rec.session is not None
+    assert rec.plan is not None
+    assert rec.config_dir is not None
 
     # ── INJECT side (γ): stale → fallback, plan kept, no --resume ──
     cap = await _dispatch_capture(harness, task_id)
     assert cap.resume_session_id is None
-    assert cap.initial_plan is recovered_plan
+    assert cap.initial_plan is rec.plan
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
@@ -1589,20 +1609,18 @@ async def test_delta_archive_backed_crash_shape_adopts_and_injects(harness: Harn
     harness.config.transcript_archive = TranscriptArchiveConfig()
     _seed_archived_transcript(harness.config.project_root, task_id, session_id)
 
-    await harness._recover_crashed_tasks()
+    rec = await _recover(harness, task_id)
 
     # ── ADOPT side (β): session + plan recovered, NO config dir stashed ──
-    assert task_id in harness._recovered_sessions
-    assert task_id in harness._recovered_plans
-    assert task_id not in harness._recovered_session_config_dirs
-    adopted = harness._recovered_sessions[task_id]
-    recovered_plan = harness._recovered_plans[task_id]
+    assert rec.session is not None
+    assert rec.plan is not None
+    assert rec.config_dir is None  # the crash shape this row exists to pin
 
     # ── INJECT side (γ+δ): the archive corroborates → resume injected ──
     cap = await _dispatch_capture(harness, task_id)
-    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id is rec.session
     assert cap.resume_session_id['session_id'] == session_id
-    assert cap.initial_plan is recovered_plan
+    assert cap.initial_plan is rec.plan
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
 
 
@@ -1633,12 +1651,11 @@ async def test_delta_b8_aged_past_freshness_with_archive_still_resumes(
         'backstop rather than the freshness demotion'
     )
 
-    await harness._recover_crashed_tasks()
-    adopted = harness._recovered_sessions[task_id]
+    rec = await _recover(harness, task_id)
 
     cap = await _dispatch_capture(harness, task_id)
 
-    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id is rec.session
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
 
 
@@ -1669,13 +1686,12 @@ async def test_delta_b9_aged_past_absolute_bound_falls_back_aged_out(
     harness.config.transcript_archive = TranscriptArchiveConfig()
     _seed_archived_transcript(harness.config.project_root, task_id, session_id)
 
-    await harness._recover_crashed_tasks()
-    recovered_plan = harness._recovered_plans[task_id]
+    rec = await _recover(harness, task_id)
 
     cap = await _dispatch_capture(harness, task_id)
 
     assert cap.resume_session_id is None
-    assert cap.initial_plan is recovered_plan  # I3: the age costs the resume, not the plan
+    assert cap.initial_plan is rec.plan  # I3: the age costs the resume, not the plan
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback

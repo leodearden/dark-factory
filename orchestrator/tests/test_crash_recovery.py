@@ -167,6 +167,29 @@ def _session_resume_emits(harness: Harness) -> list[tuple]:
     return out
 
 
+def _reasons_for(
+    harness: Harness,
+    session: object,
+    config_dir: str | None,
+    *,
+    archive_available: bool = False,
+) -> frozenset[str]:
+    """Call the eligibility predicate directly, off the ``_run_slot`` path.
+
+    The ONE place this suite names ``_session_resume_reasons``. The predicate is
+    module-internal, so every case routing through a single seam keeps the
+    coupling to that name at one line rather than one per case — a rename costs
+    an edit here instead of twenty.
+
+    ``archive_available`` defaults to False, the pre-δ answer, so a case that
+    says nothing about the archive reads as one whose outcome does not turn on
+    it; the δ cases below pass it explicitly.
+    """
+    return harness._session_resume_reasons(
+        session, config_dir, archive_available=archive_available
+    )
+
+
 async def _drive_session_slot(
     harness: Harness,
     task_id: str,
@@ -1929,7 +1952,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-both'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg), archive_available=False)
+        reasons = _reasons_for(harness, session, str(empty_cfg))
 
         assert reasons == frozenset({'stale', 'no_transcript'})
 
@@ -1946,7 +1969,7 @@ class TestSessionResumeReasons:
         }
         cfg_dir = _make_transcript(tmp_path, 'uuid-ok')
 
-        reasons = harness._session_resume_reasons(session, str(cfg_dir), archive_available=False)
+        reasons = _reasons_for(harness, session, str(cfg_dir))
 
         assert reasons == frozenset()
         assert not reasons  # the eligibility predicate itself
@@ -1963,7 +1986,7 @@ class TestSessionResumeReasons:
         gone = tmp_path / 'gone-three' / 'claude-config-x'
         assert not gone.exists()  # provably ENOENT → the 'reseeded' arm
 
-        reasons = harness._session_resume_reasons(session, str(gone), archive_available=False)
+        reasons = _reasons_for(harness, session, str(gone))
 
         assert reasons == frozenset({'stale', 'capped', 'reseeded'})
 
@@ -1986,7 +2009,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-dis'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg), archive_available=False)
+        reasons = _reasons_for(harness, session, str(empty_cfg))
 
         assert reasons == frozenset({'disabled'})
 
@@ -2000,21 +2023,21 @@ class TestSessionResumeReasons:
         harness.config.session_resume = SessionResumeConfig()
 
         cfg1 = _make_transcript(tmp_path, 'uuid-bad')
-        r1 = harness._session_resume_reasons(
+        r1 = _reasons_for(
+            harness,
             {'session_id': 'uuid-bad', 'role': 'r',
              'started_at': 'not-a-date', 'resume_count': 0},
             str(cfg1),
-        archive_available=False,
-    )
+        )
         assert 'stale' in r1
         assert 'no_transcript' not in r1
 
         cfg2 = _make_transcript(tmp_path, 'uuid-bad2')
-        r2 = harness._session_resume_reasons(
+        r2 = _reasons_for(
+            harness,
             {'session_id': 'uuid-bad2', 'role': 'r', 'resume_count': 0},  # no started_at
             str(cfg2),
-        archive_available=False,
-    )
+        )
         assert 'stale' in r2
         assert 'no_transcript' not in r2
 
@@ -2026,19 +2049,19 @@ class TestSessionResumeReasons:
         harness.config.session_resume = SessionResumeConfig()
         fresh = datetime.now(UTC).isoformat()
 
-        no_dir = harness._session_resume_reasons(
+        no_dir = _reasons_for(
+            harness,
             {'session_id': 'uuid-nocfg', 'role': 'r',
              'started_at': fresh, 'resume_count': 0},
             None,
-        archive_available=False,
-    )
+        )
         assert 'no_transcript' in no_dir
 
-        no_sid = harness._session_resume_reasons(
+        no_sid = _reasons_for(
+            harness,
             {'session_id': None, 'role': 'r', 'started_at': fresh, 'resume_count': 0},
             '/some/where',
-        archive_available=False,
-    )
+        )
         assert 'no_transcript' in no_sid
 
     def test_unreadable_config_dir_stays_no_transcript_and_never_raises(
@@ -2065,12 +2088,12 @@ class TestSessionResumeReasons:
         monkeypatch.setattr(Path, 'stat', fake_stat)
         harness.config.session_resume = SessionResumeConfig()
 
-        reasons = harness._session_resume_reasons(
+        reasons = _reasons_for(
+            harness,
             {'session_id': 'uuid-eacces', 'role': 'r',
              'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0},
             str(blocked),
-        archive_available=False,
-    )
+        )
 
         assert 'no_transcript' in reasons
         assert 'reseeded' not in reasons
@@ -2108,8 +2131,9 @@ class TestSessionResumeReasons:
 
         harness.config.session_resume = SessionResumeConfig()
 
-        reasons = harness._session_resume_reasons(
-            bad_session, str(tmp_path), archive_available=False
+        reasons = _reasons_for(
+            harness,
+            bad_session, str(tmp_path)
         )
 
         assert isinstance(reasons, frozenset)
@@ -2136,8 +2160,9 @@ class TestSessionResumeReasons:
         """
         harness.config.session_resume = SessionResumeConfig(enabled=False)
 
-        reasons = harness._session_resume_reasons(
-            ['a'], str(tmp_path), archive_available=False
+        reasons = _reasons_for(
+            harness,
+            ['a'], str(tmp_path)
         )
 
         assert reasons == frozenset({'disabled'})
@@ -2183,9 +2208,7 @@ class TestSessionResumeReasons:
             'the backstop instead of the freshness demotion'
         )
 
-        reasons = harness._session_resume_reasons(
-            session, None, archive_available=True
-        )
+        reasons = _reasons_for(harness, session, None, archive_available=True)
 
         assert reasons == frozenset()
         assert not reasons  # the eligibility predicate itself
@@ -2211,9 +2234,10 @@ class TestSessionResumeReasons:
             'resume_count': 0,
         }
 
-        reasons = harness._session_resume_reasons(
-            session, None, archive_available=False
-        )
+        # Explicit, though False is the helper's default: this row IS the
+        # archive variable held at False, so spelling it makes the contrast
+        # with (a) legible without cross-referencing the helper.
+        reasons = _reasons_for(harness, session, None, archive_available=False)
 
         assert reasons == frozenset({'stale', 'no_transcript'})
 
@@ -2235,9 +2259,7 @@ class TestSessionResumeReasons:
             'resume_count': 0,
         }
 
-        reasons = harness._session_resume_reasons(
-            session, None, archive_available=True
-        )
+        reasons = _reasons_for(harness, session, None, archive_available=True)
 
         assert reasons == frozenset()
 
@@ -2261,8 +2283,9 @@ class TestSessionResumeReasons:
         }
         cfg_dir = _make_transcript(tmp_path, 'uuid-live-only')
 
-        reasons = harness._session_resume_reasons(
-            session, str(cfg_dir), archive_available=False
+        reasons = _reasons_for(
+            harness,
+            session, str(cfg_dir)
         )
 
         assert reasons == frozenset()
@@ -2297,9 +2320,7 @@ class TestSessionResumeReasons:
         harness.config.session_resume = cfg
         session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
 
-        reasons = harness._session_resume_reasons(
-            session, None, archive_available=True
-        )
+        reasons = _reasons_for(harness, session, None, archive_available=True)
 
         assert 'aged_out' in reasons
         assert reasons  # ineligible, whatever else co-occurs
@@ -2314,14 +2335,16 @@ class TestSessionResumeReasons:
         cfg = SessionResumeConfig()
         harness.config.session_resume = cfg
 
-        at_bound = harness._session_resume_reasons(
+        at_bound = _reasons_for(
+            harness,
             self._aged(cfg, cfg.absolute_resume_age_secs),
             None,
             archive_available=True,
         )
         assert 'aged_out' in at_bound
 
-        below = harness._session_resume_reasons(
+        below = _reasons_for(
+            harness,
             self._aged(cfg, cfg.absolute_resume_age_secs - 3600),
             None,
             archive_available=True,
@@ -2339,9 +2362,7 @@ class TestSessionResumeReasons:
         session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
         session['resume_count'] = cfg.max_resumes_per_task
 
-        reasons = harness._session_resume_reasons(
-            session, None, archive_available=True
-        )
+        reasons = _reasons_for(harness, session, None, archive_available=True)
 
         assert 'aged_out' in reasons
         assert 'capped' in reasons
@@ -2377,9 +2398,7 @@ class TestSessionResumeReasons:
         if started_at is not None:
             session['started_at'] = started_at
 
-        reasons = harness._session_resume_reasons(
-            session, None, archive_available=True
-        )
+        reasons = _reasons_for(harness, session, None, archive_available=True)
 
         assert 'stale' in reasons, (
             'an undateable sidecar must stay ineligible however reachable it '
@@ -2403,10 +2422,10 @@ class TestSessionResumeReasons:
         cfg = SessionResumeConfig()
         harness.config.session_resume = cfg
 
-        reasons = harness._session_resume_reasons(
+        reasons = _reasons_for(
+            harness,
             self._aged(cfg, 2 * cfg.absolute_resume_age_secs),
             None,
-            archive_available=False,
         )
 
         assert 'stale' in reasons
