@@ -356,6 +356,51 @@ def _config(tmp_path: Path, *, commit_citation_pattern: str | None = None) -> An
     )
 
 
+def _task_declaring_checks() -> dict[str, Any]:
+    """A task record whose metadata declares a delivered check.
+
+    Non-empty is the whole point: ``_evidence_verdict`` forwards
+    ``metadata.delivered_checks or []``, and ``validate_landing_evidence``
+    guards its second accept path on that list being TRUTHY, so an empty
+    list leaves the path unreachable — today's behaviour for every task
+    that declares nothing.
+    """
+    return {
+        'metadata': {
+            'branch_base_sha': 'b' * 40,
+            'delivered_checks': [
+                {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': 'present'},
+            ],
+        },
+    }
+
+
+def _force_differential_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the three-leg delivered-checks differential confirm.
+
+    Patches the DEFINING module — ``validate_landing_evidence`` resolves
+    ``_delivered_checks_differential`` as a module global, and
+    ``_evidence_verdict``'s own import is per-call — so the REAL accept/reject
+    decision logic is exercised and only the leg-running subprocess work is
+    replaced.  The stub writes the same ``probe`` key the real function
+    writes on a confirmation
+    (``orchestrator/src/orchestrator/landing_evidence.py::_delivered_checks_differential``)
+    and takes ``**kwargs`` because the DISCOVERY arm passes an extra
+    ``anchor_is_branch_tip`` keyword the CANDIDATE arm does not.
+    """
+    async def _confirm(
+        git_ops: Any, effect_check_sha: str, delivered_checks: Any,
+        probe: dict[str, Any], **kwargs: Any,
+    ) -> bool:
+        probe['delivered_checks_legs'] = []
+        probe['delivered_checks_outcome'] = 'confirmed'
+        return True
+
+    monkeypatch.setattr(
+        'orchestrator.landing_evidence._delivered_checks_differential', _confirm,
+    )
+
+
 @pytest.mark.asyncio
 class TestProbeLanding:
     """The tier, called directly — no MCP server, no request_id."""
@@ -472,6 +517,141 @@ class TestProbeLanding:
         assert verdict.arm is GitAuthorityArm.marker
         assert verdict.evidence_sha == 'd' * 40
         assert verdict.merge_sha is None
+
+    # ---------------------------------------------------------------
+    # The delivered-checks rescue — the SECOND way ``merge_sha``'s
+    # guarantee can be weakened, and the one THIS module's own wiring
+    # made reachable for the first time.
+    #
+    # ``_evidence_verdict`` passes ``delivered_checks=`` into
+    # ``validate_landing_evidence``; it is the only production call site
+    # that has ever done so.  That activates the SECOND ACCEPT PATH which
+    # sits INSIDE the ``commit_effect_present_in_main(...) is False``
+    # branch in BOTH modes, so a ``found_on_main`` with a populated
+    # ``merge_sha`` can now name a landing whose effect is ABSENT at main
+    # HEAD — the task-1175 reverted-landing shape the FIX 1' guard exists
+    # to catch.
+    #
+    # The differential is forced through the DEFINING module
+    # (``orchestrator.landing_evidence``), the same way
+    # ``test_merge_status_git_authority.py``'s
+    # ``_record_validate_landing_evidence`` patches its own target, so the
+    # REAL ``validate_landing_evidence`` decision logic stays in the loop.
+    # That is the point: these pin that the second accept path is
+    # REACHABLE FROM HERE, which a stubbed-out ``validate_landing_evidence``
+    # returning a hand-built accepted verdict would not.
+    # ---------------------------------------------------------------
+
+    async def test_ancestor_arm_accept_rescued_by_delivered_checks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Effect ABSENT, accepted anyway — and the verdict says which.
+
+        Same git facts as
+        ``test_ancestor_effect_absent_is_landed_unconfirmed`` above; the
+        ONLY differences are a task that declares delivered_checks and a
+        differential that confirms.  Without
+        ``rescued_by_delivered_checks`` this verdict is byte-identical to
+        the fully-guarded accept two tests up, and a provenance writer
+        stamping ``merge_sha`` cannot tell a live landing from a reverted
+        one.
+        """
+        _force_differential_confirm(monkeypatch)
+
+        verdict = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False),
+            '907', orch_config=_config(tmp_path),
+            harness=_harness(task=_task_declaring_checks()),
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, (
+            'precondition: the differential must actually rescue the reject, '
+            'otherwise this pins nothing'
+        )
+        assert verdict.merge_sha == 'c' * 40
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.rescued_by_delivered_checks is True
+        assert verdict.citation_gate_skipped is False, (
+            'the two weakenings are INDEPENDENT — the citation gate ran and '
+            'passed here; only the effect-present guarantee was traded away'
+        )
+        assert verdict.merge_sha_fully_guarded is False
+
+    async def test_marker_arm_accept_rescued_by_delivered_checks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The CANDIDATE-mode half of the same rescue.
+
+        Both arms are pinned because the two ``_accept`` calls are at
+        different lines in different modes of ``validate_landing_evidence``
+        — a fix that carries the signal through one does not imply the
+        other.
+        """
+        _force_differential_confirm(monkeypatch)
+
+        verdict = await probe_landing(
+            _marker_git_ops(marker='d' * 40, effect_present=False), '908',
+            orch_config=_config(tmp_path),
+            harness=_harness(task=_task_declaring_checks()),
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, (
+            'precondition: the differential must actually rescue the reject'
+        )
+        assert verdict.merge_sha == 'd' * 40
+        assert verdict.arm is GitAuthorityArm.marker
+        assert verdict.rescued_by_delivered_checks is True
+        assert verdict.merge_sha_fully_guarded is False
+
+    async def test_declaring_checks_does_not_by_itself_set_the_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """NEGATIVE CONTROL: the flag reports the PROBE OUTCOME, not the
+        task's declaration.
+
+        Identical task metadata to the rescued case; the only change is
+        that the effect-present guard ACCEPTS, so the differential is never
+        consulted at all (``landing_evidence.py``'s consumer documents the
+        absent ``delivered_checks_outcome`` as "the survival check
+        accepted, so there was nothing to rescue").  A flag that merely
+        echoed ``metadata.delivered_checks`` would fail here — and would
+        wrongly warn about every capability task's fully-guarded landing.
+        """
+        _force_differential_confirm(monkeypatch)
+
+        verdict = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=True),
+            '909', orch_config=_config(tmp_path),
+            harness=_harness(task=_task_declaring_checks()),
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        assert verdict.merge_sha == 'c' * 40
+        assert verdict.rescued_by_delivered_checks is False
+        assert verdict.merge_sha_fully_guarded is True
+
+    async def test_citation_gate_opt_out_leaves_the_rescue_flag_clear(
+        self, tmp_path: Path
+    ) -> None:
+        """The two weakenings stay independent in the other direction too.
+
+        The opt-out path returns straight out of ``probe_landing`` without
+        reaching ``_evidence_verdict``, so no differential can have run —
+        claiming a rescue here would be a fabricated provenance fact.
+        """
+        verdict = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40, citation=None), '910',
+            orch_config=_config(tmp_path, commit_citation_pattern=''),
+            harness=_harness(task=_task_declaring_checks()),
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        assert verdict.citation_gate_skipped is True
+        assert verdict.rescued_by_delivered_checks is False
+        assert verdict.merge_sha_fully_guarded is False, (
+            'either weakening alone is enough to disqualify merge_sha from '
+            'being stamped as-is'
+        )
 
     @pytest.mark.parametrize(
         'git_ops,task,label',
@@ -625,6 +805,91 @@ class TestGitAuthorityVerdict:
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             verdict.merge_sha = 'x' * 40   # type: ignore[misc]
+
+    @pytest.mark.parametrize(
+        'verdict,expected,label',
+        [
+            (
+                GitAuthorityVerdict(
+                    outcome=GitAuthorityOutcome.found_on_main,
+                    merge_sha='c' * 40, arm=GitAuthorityArm.ancestor,
+                ),
+                True,
+                'found_on_main with neither weakening — the only stampable case',
+            ),
+            (
+                GitAuthorityVerdict(
+                    outcome=GitAuthorityOutcome.found_on_main,
+                    merge_sha='a' * 40, arm=GitAuthorityArm.ancestor,
+                    citation_gate_skipped=True,
+                ),
+                False,
+                'merge_sha is a raw branch tip, never discovered on main',
+            ),
+            (
+                GitAuthorityVerdict(
+                    outcome=GitAuthorityOutcome.found_on_main,
+                    merge_sha='c' * 40, arm=GitAuthorityArm.ancestor,
+                    rescued_by_delivered_checks=True,
+                ),
+                False,
+                "merge_sha is on main but its effect is absent at main HEAD",
+            ),
+            (
+                GitAuthorityVerdict(
+                    outcome=GitAuthorityOutcome.found_on_main,
+                    merge_sha='a' * 40, arm=GitAuthorityArm.ancestor,
+                    citation_gate_skipped=True, rescued_by_delivered_checks=True,
+                ),
+                False,
+                'both weakenings at once',
+            ),
+            (
+                GitAuthorityVerdict(
+                    outcome=GitAuthorityOutcome.landed_unconfirmed,
+                    arm=GitAuthorityArm.ancestor, evidence_sha='c' * 40,
+                ),
+                False,
+                'landed_unconfirmed — no merge_sha to stamp at all',
+            ),
+            (
+                GitAuthorityVerdict(outcome=GitAuthorityOutcome.no_signal),
+                False,
+                'no_signal — nothing established',
+            ),
+        ],
+        ids=[
+            'fully_guarded', 'citation_gate_skipped', 'rescued',
+            'both_weakenings', 'landed_unconfirmed', 'no_signal',
+        ],
+    )
+    def test_merge_sha_fully_guarded(
+        self, verdict: GitAuthorityVerdict, expected: bool, label: str
+    ) -> None:
+        """ONE question a provenance writer asks instead of enumerating
+        weakenings.
+
+        Pinned on hand-constructed verdicts so the property is independent
+        of probe plumbing: adding a THIRD weakening must change this one
+        expression, and this table is what fails if a future edit adds the
+        field but forgets to fold it in.  Non-``found_on_main`` outcomes are
+        False because there is no sha to stamp — NOT a claim that the branch
+        did not land.
+        """
+        assert verdict.merge_sha_fully_guarded is expected, label
+
+    def test_weakening_flags_default_to_the_fully_guarded_reading(self) -> None:
+        """Polarity pin: both flags mean A GUARANTEE WAS WEAKENED.
+
+        So a hand-constructed verdict — leaf eta's writer, task 4831's
+        mapper — is SAFE by default, and a future field spelled with the
+        opposite polarity (``effect_present_confirmed``) would make the
+        dataclass default assert the weakened case.
+        """
+        verdict = GitAuthorityVerdict(outcome=GitAuthorityOutcome.found_on_main)
+
+        assert verdict.citation_gate_skipped is False
+        assert verdict.rescued_by_delivered_checks is False
 
 
 def test_module_does_not_statically_import_orchestrator() -> None:
