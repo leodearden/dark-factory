@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 if TYPE_CHECKING:
+    from shared.psi import PsiSample
+
     from orchestrator.event_store import EventStore
 
 from shared.proc_group import terminate_process_group
@@ -8847,6 +8849,55 @@ class _RerunPolicy:
     log_group_not_confirmed: Callable[[str, _RerunObservation], None] | None = None
 
 
+def _load_sample(*, read: Callable[[], 'PsiSample'] = read_psi_sample) -> dict:
+    """Host load at THIS instant, as one flat JSON-native record.
+
+    Ruling D17 (task 3353) stamps this on every verify command, at its start
+    and at its end, so the production corpus is itself the load-vs-duration
+    measurement rather than something to be reproduced later on a quiet host.
+
+    Three keys: the host CPU ``some`` pressure over 10 s and 60 s, and the
+    runqueue ratio. Flat rather than nested, because the value is written
+    STRAIGHT into summary.json — anything needing its own serialisation step
+    would be a second place for the shape to drift.
+
+    A degraded component reads ``None``, never ``0.0`` — the convention
+    ``_psi_cpu_some10_or_none`` below already establishes and the flake ledger
+    already records in SQL. ``0.0`` is a real and common reading (an idle
+    host), so fabricating it for a failed read would make "we could not tell"
+    indistinguishable from "the host was quiet", in the one record whose
+    purpose is telling those apart. The read_ok flags are therefore NOT carried
+    as separate fields: ``read_ok`` is exactly ``value is not None``, and two
+    spellings of one fact can disagree.
+
+    Degradation is PER COMPONENT, because ``shared.psi`` reads the components
+    independently: a host-PSI failure must not discard a runqueue reading that
+    succeeded (INV-11).
+
+    Never raises into a caller (INV-1: a telemetry read may not change a
+    gate's verdict). The reader already fails open by value, so reaching the
+    handler means the telemetry path broke in a way it does not itself model —
+    WARNING, not DEBUG, since a column going quietly null is the
+    silent-degradation shape the tree-wide gate exists to catch.
+    """
+    try:
+        sample = read()
+    except Exception:
+        logger.warning(
+            '_load_sample: PSI read failed; recording an all-null load record '
+            'for this command',
+            exc_info=True,
+        )
+        return {'cpu_some10': None, 'cpu_some60': None, 'runqueue_ratio': None}
+    return {
+        'cpu_some10': sample.cpu_some10 if sample.read_ok else None,
+        'cpu_some60': sample.cpu_some60 if sample.read_ok else None,
+        'runqueue_ratio': (
+            sample.runqueue_ratio if sample.runqueue_read_ok else None
+        ),
+    }
+
+
 def _psi_cpu_some10_or_none() -> float | None:
     """Host CPU pressure at observation, or ``None`` when it is not knowable.
 
@@ -8854,6 +8905,15 @@ def _psi_cpu_some10_or_none() -> float | None:
     maps to ``None`` (NOT ``0.0``, which would read as "the host was idle").
     The ``except`` is belt to that braces: a TELEMETRY read must never change
     a gate's verdict, so it may not raise into the discriminator.
+
+    Deliberately NOT refactored to read its value off ``_load_sample`` above
+    (task 3353). The two are the same two invariants over the same reader, so
+    the duplicated try/except is tempting to collapse — but this one feeds the
+    flake discriminator's ``psi_cpu_some10`` column, which is an idempotency-
+    adjacent value in §8.3's ledger, and the refactor would buy nothing except
+    putting a second caller's WARNING text on that path. One reader, two thin
+    wrappers, each with a single caller, is the cheaper place to leave the
+    duplication.
     """
     try:
         sample = read_psi_sample()
