@@ -242,17 +242,25 @@ def test_load_schema_and_metrics_match_sampler() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_query_is_bounded_by_recency() -> None:
-    """_QUERY_SQL must carry a ts lower bound.
+def test_recency_slack_is_sized_for_the_sparkline_span() -> None:
+    """Pin the slack's SIZING, which no behavioural test can express.
 
-    Without it the query ranks every retained row before discarding all but 60
-    per metric, so its cost is linear in retention.  At the 30-day steady state
-    that measured 11,955 ms against 28.7 ms bounded, on a 5s-polled endpoint.
+    Once the bound exists, cost is linear in the SLACK rather than in
+    retention: measured 1h = 28.7 ms, 24h = 347 ms, 7d = 2,168 ms against a
+    4,665,600-row probe.  So the value has a floor (it must clear the
+    sparkline's span or a full sparkline gets truncated) and a ceiling (or the
+    bound stops paying for itself).  Both ends are real, and a value assertion
+    is the only way to state them.
+
+    The bound's BEHAVIOUR is deliberately not asserted here.  The two async
+    tests below cover it non-vacuously, and an earlier version of this test
+    grepped _QUERY_SQL for the substrings 'ts >=' and 'MAX(ts)' instead --
+    which pinned the SQL's SPELLING, not its behaviour.  That form went red on
+    a behaviour-preserving rewrite (`ts>=`, lowercase `max(ts)`, BETWEEN, a
+    CTE) while staying green for a bound applied to the wrong side.
     """
-    from dashboard.data.load import _QUERY_SQL, _RECENCY_SLACK_SECONDS
+    from dashboard.data.load import _RECENCY_SLACK_SECONDS
 
-    assert 'ts >=' in _QUERY_SQL
-    assert 'MAX(ts)' in _QUERY_SQL
     # Sparkline spans 60 samples x 5s tick = 300s; slack must clear that...
     assert _RECENCY_SLACK_SECONDS >= 300
     # ...but stay modest, since cost is linear in the slack (7d measured 2.2s).
