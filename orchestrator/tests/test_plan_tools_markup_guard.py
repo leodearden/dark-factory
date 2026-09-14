@@ -800,11 +800,10 @@ def _type_alternatives(schema: dict[str, Any]) -> set[str]:
     asserting what the schema MEANS rather than how the library formats it.
     """
     if isinstance(schema.get('anyOf'), list):
-        return {
-            branch.get('type')
-            for branch in schema['anyOf']
-            if isinstance(branch, dict) and isinstance(branch.get('type'), str)
-        }
+        branch_types = (
+            branch.get('type') for branch in schema['anyOf'] if isinstance(branch, dict)
+        )
+        return {name for name in branch_types if isinstance(name, str)}
     declared = schema.get('type')
     if isinstance(declared, list):
         return {name for name in declared if isinstance(name, str)}
