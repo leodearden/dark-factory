@@ -682,7 +682,7 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 26,
     'orchestrator/tests/test_merge_queue_resolve_release.py': 25,
-    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 18,
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 8,
     'orchestrator/tests/test_merge_queue_equivalence.py': 12,
     'orchestrator/tests/test_merge_queue_restart_hook.py': 12,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 4,
