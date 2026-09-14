@@ -5661,6 +5661,15 @@ async def run_verification(
         if pytest_n_capped:
             cmd = _with_pytest_numprocesses_str(cmd, config.verify_admission_pytest_n)
             assert cmd is not None  # None only when the input is None; guarded above
+        # Load stamp (task 3353, ruling D17): read the xdist facts off the
+        # RENDERED command — post `-n` cap, post junitxml, PRE the governance
+        # wrap below. The SAME ordering constraint those two already document,
+        # for the same reason: once governed, cmd is an opaque outer `<exec> --
+        # /bin/bash -c '...'` string that parse_config_command can no longer
+        # see as pytest, so the flag would read as absent on every merge run.
+        # Resolved ONCE here rather than at the CheckRun below, where `cmd` is
+        # already governed.
+        xdist = _xdist_workers(cmd, verify_env)
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
@@ -5674,6 +5683,11 @@ async def run_verification(
         async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
             started_at = datetime.now(UTC).isoformat()
             t0 = time.monotonic()
+            # INSIDE the admission slot, beside the clock it belongs to: the
+            # recorded load must be the load the command RAN under, not the
+            # load while it queued for a slot — which on a busy host is a
+            # different number, and the more flattering one.
+            load_start = _load_sample()
             # Pass use_cgroup_scope only when enabled so the default-off call
             # signature stays byte-identical (test doubles stub the legacy kwargs).
             _scope_kw: _ScopeKw = (
@@ -5912,6 +5926,18 @@ async def run_verification(
             started_at=started_at,
             duration_secs=time.monotonic() - t0,
             segments=segment_dicts,
+            # Paired with `duration_secs` deliberately: the same instant that
+            # closes the clock closes the load window, so the two describe the
+            # same interval.
+            #
+            # ONE assembly serves BOTH execution branches — unlike the `-n` cap
+            # above, which genuinely needs two sites. Not an oversight, and the
+            # difference is structural: the cap rewrites the COMMAND, and the
+            # segmented path builds its commands from `config_cmd` rather than
+            # `cmd`, so the rewrite misses them (the asymmetry task 3478
+            # removed). The stamp attaches to the CheckRun, and both branches
+            # return through this single construction.
+            load={'start': load_start, 'end': _load_sample(), 'xdist': xdist},
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
