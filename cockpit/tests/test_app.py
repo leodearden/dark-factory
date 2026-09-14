@@ -485,6 +485,57 @@ class TestSelectedSlugRestore:
             assert table.highlighted_slug() == 'target-1'
 
     @pytest.mark.timeout(10)
+    async def test_a_rebuild_that_moves_the_cursor_persists_the_new_slug_at_once(self, tmp_path):
+        """A hard kill must not restore the operator to a session that is gone.
+
+        The rebuild suppresses its own RowHighlighted reposts (see
+        _rebuild_session_table) and those reposts used to carry the
+        _persist_ui_config call, so the rebuild has to persist a cursor move it
+        causes itself. Read back from disk INSIDE the app's lifetime -- after
+        on_unmount the value is written either way, which is exactly the gap
+        this pins.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config
+
+        for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
+            sr.write_record(
+                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                root=tmp_path,
+            )
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            table.move_cursor(row=table.get_row_index('session-b'))
+            await pilot.pause()
+            assert load_ui_config(tmp_path).selected_slug == 'session-b'
+
+            # session-b exits, so filter_live_sessions drops it from the default
+            # view and the rebuild's cursor lands on a DIFFERENT slug -- a move
+            # no operator made, and no RowHighlighted now reports
+            sr.write_record(
+                _make_record(
+                    session_slug='session-b',
+                    status=sr.Status.EXITED,
+                    start_ts='2026-07-07T00:01:00+00:00',
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.highlighted_slug() == 'session-a'
+            assert app._selected_slug == 'session-a'
+            assert load_ui_config(tmp_path).selected_slug == 'session-a'
+
+    @pytest.mark.timeout(10)
     async def test_persisted_slug_that_no_longer_exists_degrades_to_row_zero(self, tmp_path):
         """A session selected before a restart may well have exited by the
         next launch; select_slug returns False rather than raising, so the
@@ -3879,10 +3930,15 @@ class TestDecisionQueueDetail:
             assert app._selected_slug == 'session-other'
 
     @pytest.mark.timeout(10)
-    async def test_a_queue_decision_row_survives_a_rebuild(self, tmp_path):
+    async def test_a_queue_decision_row_survives_and_refreshes_across_a_rebuild(self, tmp_path):
         """The decision-row counterpart of the test above, as a regression guard:
         a session-table reordering must not pull the pane off the queue's
         highlighted decision either. Already green -- it stays that way.
+
+        Asserted on REVISED text, like its session-row sibling: "the question is
+        still on screen" alone would also pass for a pane re-rendered from a
+        stale self._decisions, since an unchanged question is exactly what a
+        stale render shows.
         """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
@@ -3932,11 +3988,24 @@ class TestDecisionQueueDetail:
                 ),
                 root=tmp_path,
             )
+            # the decision itself is rewritten too -- text is a snapshot field
+            # (_DECISION_SNAPSHOT_FIELDS), so this alone would trigger the
+            # rebuild even without the session above
+            revised_question = long_question.replace('re-file it?', 're-file it, REVISED?')
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id='dec-second', project='df', text=revised_question,
+                    filed_at='2026-07-07T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
             app.refresh_registry()
             await pilot.pause()
 
             assert table.get_row_index('session-a') != 0
-            assert long_question in detail.rendered_text
+            # still the queue's decision, and re-rendered from the fresh scan
+            assert revised_question in detail.rendered_text
+            assert long_question not in detail.rendered_text
 
     @pytest.mark.timeout(10)
     async def test_the_queue_emptying_hands_the_pane_back_to_the_session_table(self, tmp_path):

@@ -482,8 +482,21 @@ class CockpitApp(App):
         gated: a rebuild refreshes the detail only while this table still
         owns the pane, never stealing it back from a queue row the
         operator moved to.
+
+        A CHANGED slug is persisted here and now, because the rebuild is
+        the one cursor move nothing else reports: suppressing the rebuild's
+        RowHighlighted reposts (see _rebuild_session_table) also suppressed
+        the _persist_ui_config call the handler made on their behalf, so
+        without this a cursor the rebuild moved itself -- the highlighted
+        session left the live view, say -- would live in memory only until
+        on_unmount, and a hard kill would restore the operator to a session
+        that is already gone. Gated on an actual change so the write stays
+        where it has always been (on a move), not on every poll tick.
         """
+        changed = slug != self._selected_slug
         self._selected_slug = slug
+        if changed:
+            self._persist_ui_config()
         if self._detail_owner is DetailOwner.SESSION_TABLE:
             self._show_session_detail(slug)
 
