@@ -221,16 +221,16 @@ which task 4186 moved ahead of this check (it previously ran after it, in the dr
 finally).
 - `present: false` and `expected: false` (`reason: 'stage_not_run'`) → the run ENDED \
 without reaching Stage 2, so no summary was ever owed. This is NOT a gap: do not report \
-it, and do not describe it as data loss. Only a run that has already terminated can \
-report this.
+it, and do not describe it as data loss. Only a SETTLED run — one that has terminated \
+and has not been picked up again by the adopt-and-resume pass — can report this.
 - `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
 `'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE (the row is past \
 retention, the run is unknown or still in flight, the ledger is not wired, or the read \
 failed). Do NOT conclude presence or absence from this path — fall through to the \
 FALLBACK below instead. **Expect this for the run you are running inside of**: the \
-`runs.stage_reports` column the tool types an absence from is persisted only once the \
-run terminates, so for the CURRENT run_id the tool can confirm a row is PRESENT but can \
-never confirm one is genuinely absent. The FALLBACK below therefore remains the \
+`runs.stage_reports` column the tool types an absence from is not a finished account of \
+a run until that run settles, so for the CURRENT run_id the tool can confirm a row is \
+PRESENT but can never confirm one is genuinely absent. The FALLBACK below therefore remains the \
 detection path for current-cycle loss, exactly as before this field existed.
 - `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
 decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \

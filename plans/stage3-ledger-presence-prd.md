@@ -159,8 +159,8 @@ evaluated top-down; `expected` is the gate consumers act on:
 |---|---|---|---|
 | 1 | `present` | row found | `True` |
 | 2 | `ledger_unavailable` | no ledger wired | `None` |
-| 3 | `run_unknown` | journal unwired, no `runs` row, read raised, `stage_reports` unparseable, or the run has not terminated yet | `None` |
-| 4 | `stage_not_run` | TERMINAL `runs` row present, `stage` absent from `stage_reports` | `False` |
+| 3 | `run_unknown` | journal unwired, no `runs` row, read raised, `stage_reports` unparseable, or the run has not settled yet | `None` |
+| 4 | `stage_not_run` | SETTLED `runs` row present, `stage` absent from `stage_reports` | `False` |
 | 5 | `expired` | run older than `CYCLE_SUMMARY_TTL_DAYS`, so any row would have been `gc()`'d | `None` |
 | 6 | `missing` | stage ran, within retention, no row | `True` |
 
@@ -170,19 +170,31 @@ only says the evidence was destroyed. Derived by joining `runs` through
 `ReconciliationJournal.get_run_stage_execution`, a four-column projection scoped
 to `(id, project_id)`.
 
-**`stage_reports` is only evidence once a run has TERMINATED.** `harness.py`
-accumulates `run.stage_reports` in memory and persists the whole blob ONCE —
-after the stage loop, from the success path, an error handler, or the terminal
-`finally` backstop, each of which also sets a terminal status. While a run is in
-flight the column reads `'{}'` however many stages have completed. Stage 3
-verifies the CURRENT run's cycle summaries from INSIDE that loop (`stages/base.py`
-hands it the live `run_id`), so reading an absent key there as "the stage never
-ran" would report every in-flight run as `stage_not_run` and suppress exactly the
-current-cycle data loss this check exists to catch. Ladder rung 4 therefore
-requires a terminal status; a non-terminal run falls to rung 3 (`run_unknown`)
-and the consumer's existing fallback. The gate is stated as the set of statuses
-that DO persist, so a future non-terminal status degrades to `run_unknown` rather
-than to a confident wrong answer.
+**`stage_reports` is only evidence once a run has SETTLED.** `harness.py`
+accumulates `run.stage_reports` in memory and persists the whole blob after the
+stage loop — from the success path, an error handler, or the terminal `finally`
+backstop, each of which completes the run in the same breath. A run on its first
+attempt therefore leaves the column reading `'{}'` however many stages have
+completed. Stage 3 verifies the CURRENT run's cycle summaries from INSIDE that
+loop (`stages/base.py` hands it the live `run_id`), so reading an absent key
+there as "the stage never ran" would report every in-flight run as
+`stage_not_run` and suppress exactly the current-cycle data loss this check
+exists to catch.
+
+A persisted status is necessary but **not sufficient**, because `interrupted` is
+the one terminal status a run can leave. `_resume_interrupted_runs` adopts
+exactly those runs, and `run_full_cycle` marks the adopted run running only on
+the in-memory object — `complete_run` is the sole writer of the column — so a run
+re-executing this very stage still reads back `interrupted` on disk. That pairing
+is worse than the empty first-attempt case: the stage key is absent precisely
+BECAUSE this attempt has not re-filed it yet, the shape most likely to be a
+genuine lost write. The adopt pass persists its `_resume` bookkeeping before
+adopting, so `get_run_stage_execution` returns that as a `resumed` flag and rung 4
+requires a persisted status AND, for `interrupted`, positive evidence the run was
+never adopted. Everything else falls to rung 3 (`run_unknown`) and the consumer's
+existing fallback. The gate is stated as the set of statuses that DO persist, so a
+future non-terminal status degrades to `run_unknown` rather than to a confident
+wrong answer.
 
 `run_status` is **DIAGNOSTIC ONLY — never gate on it.** Three measured `failed`
 runs really did execute Stage 2 and lose the ledger write, so a status gate

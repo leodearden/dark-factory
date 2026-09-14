@@ -315,6 +315,42 @@ class TestTypedAbsenceClassification:
             await journal.close()
 
     @pytest.mark.asyncio
+    async def test_adopted_resumed_run_is_inconclusive_not_stage_not_run(
+        self, mock_config, tmp_path,
+    ):
+        """The in-flight shape the ``running`` gate alone does NOT catch, and
+        the fleet redeploys every 8h so it recurs: the startup adopt-and-resume
+        pass (``harness.py::_resume_interrupted_runs``) marks the run running
+        only IN MEMORY — ``run_full_cycle`` sets ``run.status`` on the object
+        while the row stays ``'interrupted'`` on disk, and the only writer of
+        that column is ``complete_run``. So a resumed run re-running this very
+        stage reads back a TERMINAL status paired with the stale blob its
+        interrupted attempt flushed, which is positively misleading rather than
+        merely empty: the key is absent precisely because this attempt has not
+        re-filed it yet. Must stay inconclusive, or a lost ledger write during
+        a resumed cycle is suppressed exactly as it was before the fix."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-resumed', status='interrupted')
+            # The adopt pass persists its bookkeeping BEFORE resuming, and
+            # never touches the status column.
+            await journal.update_run_stage_reports(
+                'run-resumed', {'_resume': {'count': 1, 'last_stage': 'stage_1'}},
+            )
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-resumed', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+            assert result['run_status'] == 'interrupted'
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
     async def test_in_flight_run_is_inconclusive_not_stage_not_run(
         self, mock_config, tmp_path,
     ):

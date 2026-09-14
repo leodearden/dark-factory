@@ -8073,9 +8073,9 @@ class MemoryService:
         ledger_unavailable no ledger wired                           None
         run_unknown        journal unwired, no runs row, read
                            raised, stage_reports unparseable, or
-                           the run is still in flight and has not
-                           persisted stage_reports yet               None
-        stage_not_run      TERMINAL runs row present, stage absent
+                           the run is in flight and has not
+                           settled its stage_reports yet             None
+        stage_not_run      SETTLED runs row present, stage absent
                            from stage_reports                        False
         expired            run older than the retention window, so
                            any row would have been gc()'d            None
@@ -8086,13 +8086,15 @@ class MemoryService:
         fact from the never-reaped ``runs`` table and stays true regardless of
         TTL, whereas ``expired`` only says the evidence was destroyed.
 
-        ``stage_not_run`` is reachable only for a run in a TERMINAL status (see
-        ``_STAGE_REPORTS_PERSISTED_STATUSES``). An in-flight run's
-        ``stage_reports`` column is still ``'{}'``, so the absence of a stage
-        key there is not evidence — and Stage 3 checks the CURRENT run from
-        inside the still-running stage loop, which is the common case, not an
-        edge one. Such a run reports ``run_unknown``, sending the caller to its
-        existing fallback rather than declaring the stage never ran.
+        ``stage_not_run`` is reachable only for a run whose ``stage_reports``
+        have SETTLED (see ``_stage_reports_are_settled``). A run still executing
+        has not had the blob written yet, so the absence of a stage key there is
+        not evidence — and Stage 3 checks the CURRENT run from inside the
+        still-running stage loop, which is the common case, not an edge one.
+        Such a run reports ``run_unknown``, sending the caller to its existing
+        fallback rather than declaring the stage never ran. That covers the
+        adopt-and-resume case too, where the run is executing again behind a
+        disk status that still reads ``'interrupted'``.
 
         **The consumer rule is: flag a genuine gap ONLY when ``present`` is
         False AND ``expected`` is True.** ``expected=False`` means there was
@@ -8195,19 +8197,19 @@ class MemoryService:
             'run_status': run_status,
         }
 
-    #: Run statuses at which ``runs.stage_reports`` is known to be PERSISTED,
-    #: and so may be read as evidence that a stage did or did not run.
+    #: Run statuses at which ``runs.stage_reports`` is known to have been
+    #: PERSISTED, i.e. every status ``complete_run`` can write.
     #:
     #: ``reconciliation/harness.py`` mutates ``run.stage_reports`` in memory as
-    #: each stage returns and persists the whole blob ONCE, after the stage
-    #: loop — from the success path, the error handlers, or the terminal
-    #: ``finally`` backstop. Every one of those exits also sets a terminal
-    #: status, so the two are written together. While a run is still in flight
-    #: the column reads ``'{}'`` however many stages have completed, and Stage
-    #: 3 verifies the CURRENT run's cycle summaries from INSIDE that loop
-    #: (``stages/base.py`` hands it the live ``run_id``) — so a membership test
-    #: there would report every in-flight run as "stage never ran" and suppress
-    #: exactly the current-cycle data loss this check exists to catch.
+    #: each stage returns and persists the whole blob after the stage loop —
+    #: from the success path, the error handlers, or the terminal ``finally``
+    #: backstop, each of which completes the run in the same breath. A run on
+    #: its first attempt therefore leaves the column reading ``'{}'`` however
+    #: many stages have finished, and Stage 3 verifies the CURRENT run's cycle
+    #: summaries from INSIDE that loop (``stages/base.py`` hands it the live
+    #: ``run_id``) — so a membership test there would report every in-flight
+    #: run as "stage never ran" and suppress exactly the current-cycle data
+    #: loss this check exists to catch.
     #:
     #: Stated as the statuses that DO persist, not the one that does not, so a
     #: future non-terminal status degrades to the inconclusive ``run_unknown``
@@ -8221,6 +8223,37 @@ class MemoryService:
             RunStatus.interrupted.value,
         }
     )
+
+    @classmethod
+    def _stage_reports_are_settled(
+        cls, run_status: str | None, resumed: bool | None
+    ) -> bool:
+        """Is ``stage_reports`` a FINISHED account of the run, safe to read as
+        evidence that a stage did or did not execute?
+
+        A persisted status is necessary but not sufficient, because
+        ``'interrupted'`` is the one terminal status a run can leave: the
+        startup pass (``harness.py::_resume_interrupted_runs``) adopts exactly
+        those runs, and ``run_full_cycle`` marks the adopted run running only
+        on the in-memory object — ``complete_run`` is the sole writer of the
+        column, so a run re-executing this very stage still reads back
+        ``'interrupted'`` on disk. Pairing that terminal-looking status with
+        the stale blob its interrupted attempt flushed is worse than the empty
+        first-attempt case: the stage key is absent precisely BECAUSE this
+        attempt has not re-filed it yet, which is the shape most likely to be
+        a genuine lost write.
+
+        ``_resume`` bookkeeping is persisted before the adopt, so its presence
+        is the durable signal. A resumed run that has since reached any other
+        terminal status has been flushed by that run's own ``finally`` and is
+        settled again, which is why this narrows ``'interrupted'`` alone rather
+        than distrusting every run that was ever resumed.
+        """
+        if run_status not in cls._STAGE_REPORTS_PERSISTED_STATUSES:
+            return False
+        if run_status == RunStatus.interrupted.value:
+            return resumed is False
+        return True
 
     async def _classify_summary_absence(
         self,
@@ -8267,11 +8300,9 @@ class MemoryService:
         if execution['stage_ran'] is None:
             return 'run_unknown', None, run_status
         if execution['stage_ran'] is False:
-            if run_status not in self._STAGE_REPORTS_PERSISTED_STATUSES:
-                # The run has not reached a terminal state, so the harness has
-                # not yet written its trailing update_run_stage_reports and the
-                # column still reads '{}' no matter which stages have run.
-                # Absence of the key is therefore not evidence of anything.
+            if not self._stage_reports_are_settled(run_status, execution['resumed']):
+                # The blob is not a finished account of this run, so the
+                # absence of the key is not evidence of anything.
                 return 'run_unknown', None, run_status
             # Checked BEFORE retention: a positive fact from the never-reaped
             # runs table, true regardless of TTL.

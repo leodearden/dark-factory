@@ -1008,7 +1008,9 @@ class TestGetRunStageExecution:
         )
 
         assert execution is not None
-        assert set(execution) == {'status', 'stage_ran', 'started_at', 'completed_at'}
+        assert set(execution) == {
+            'status', 'stage_ran', 'resumed', 'started_at', 'completed_at',
+        }
         assert execution['stage_ran'] is True
         assert execution['status'] == 'interrupted'
         assert execution['started_at'] is not None
@@ -1054,6 +1056,64 @@ class TestGetRunStageExecution:
 
         assert execution is not None
         assert execution['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_resumed_reports_whether_the_run_was_adopted_for_resume(
+        self, journal
+    ):
+        """``status`` alone cannot tell a settled run from one that is running
+        again: ``harness.py::_resume_interrupted_runs`` adopts an interrupted
+        run and ``run_full_cycle`` marks it running only on the in-memory
+        object, leaving the column ``'interrupted'``. The adopt pass does
+        persist its ``_resume`` bookkeeping first, so that key is the one
+        durable signal that the blob may be a stale mid-flight snapshot, and
+        the projection surfaces it rather than making every caller re-parse
+        ``stage_reports`` to find out."""
+        settled = str(uuid.uuid4())
+        await self._start(journal, settled)
+        await journal.update_run_stage_reports(settled, {'_error': {'error': 'boom'}})
+
+        adopted = str(uuid.uuid4())
+        await self._start(journal, adopted)
+        await journal.update_run_stage_reports(
+            adopted, {'_resume': {'count': 1, 'last_stage': 'memory_consolidator'}},
+        )
+
+        settled_exec = await journal.get_run_stage_execution(
+            'test-project', settled, 'task_knowledge_sync'
+        )
+        adopted_exec = await journal.get_run_stage_execution(
+            'test-project', adopted, 'task_knowledge_sync'
+        )
+
+        assert settled_exec['resumed'] is False
+        assert adopted_exec['resumed'] is True
+        # The resume key is bookkeeping, never stage evidence, in both shapes.
+        assert settled_exec['stage_ran'] is False
+        assert adopted_exec['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stage_reports_leaves_resumed_indeterminate(
+        self, journal
+    ):
+        """A blob that does not parse cannot answer either question, and
+        ``resumed`` must not collapse to False there — that would read as
+        positive evidence the run was never adopted and hand a caller back the
+        confident answer the indeterminate ``stage_ran`` exists to withhold."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        db = journal._require_db()
+        await db.execute(
+            'UPDATE runs SET stage_reports = ? WHERE id = ?', ('["not", "a", "dict"]', run_id),
+        )
+        await db.commit()
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['stage_ran'] is None
+        assert execution['resumed'] is None
 
     @pytest.mark.asyncio
     async def test_lookup_is_keyed_on_the_requested_stage(self, journal):

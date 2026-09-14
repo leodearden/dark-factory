@@ -466,6 +466,19 @@ class ReconciliationJournal:
         ``_resume`` keys straight into ``run.stage_reports`` before persisting,
         and a run holding only those did not run the stage.
 
+        ``resumed`` reports whether that ``_resume`` key is present, i.e. whether
+        the startup adopt-and-resume pass
+        (``reconciliation/harness.py::_resume_interrupted_runs``) has taken this
+        run over at least once. It is returned because ``status`` alone cannot
+        tell a SETTLED run from one that is executing again: the adopt pass
+        persists its resume bookkeeping and then leaves the column reading
+        ``'interrupted'``, because ``run_full_cycle`` marks the run running only
+        on the in-memory object and ``complete_run`` is the sole writer of that
+        column. A caller weighing ``stage_ran`` as evidence needs both. It is
+        three-valued for the same reason ``stage_ran`` is — an unparseable blob
+        answers neither question, and collapsing it to ``False`` would read as
+        positive evidence the run was never adopted.
+
         Scoped by ``project_id`` — tighter than ``get_run``, which is keyed on
         ``id`` alone — to match the project-scoped identity of the ledger row it
         explains. A projection rather than a reuse of ``get_run`` because that
@@ -490,6 +503,7 @@ class ReconciliationJournal:
             if not isinstance(reports, dict):
                 raise ValueError('stage_reports is not a JSON object')
             stage_ran = stage in reports
+            resumed = '_resume' in reports
         except (TypeError, ValueError):
             logger.warning(
                 'reconciliation.get_run_stage_execution: '
@@ -501,10 +515,12 @@ class ReconciliationJournal:
                 extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
             )
             stage_ran = None
+            resumed = None
 
         return {
             'status': row['status'],
             'stage_ran': stage_ran,
+            'resumed': resumed,
             'started_at': row['started_at'],
             'completed_at': row['completed_at'],
         }
