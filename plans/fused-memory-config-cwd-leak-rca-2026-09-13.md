@@ -65,7 +65,7 @@ pytest CWD, and of nothing else that moved.
 
 **The environment is the other half of the same leak, and the file path does not close it.**
 `model_config` sets `env_prefix=''` with `env_nested_delimiter='__'` and `case_sensitive=False`, so
-a *bare* variable named after any of the model's nineteen top-level fields is an unprefixed
+a *bare* variable named after any of the model's top-level fields is an unprefixed
 override that outranks the YAML. Measured at `3e2676b2a2`, with the variable inherited from the
 launching shell: both `TASKMASTER='{"project_root": "/pwned-by-env"}'` and
 `TASKMASTER__PROJECT_ROOT=/pwned-by-env` resolve `config.taskmaster.project_root` to
@@ -106,6 +106,25 @@ defect. The sibling keeps a weaker fixture that *looks* like it covers the same 
 subprojects, one `BaseSettings`-plus-relative-path pattern, one RCA already written, and the
 second occurrence still took an 18-day investigation to reach.
 
+**And the remedy below is a second hand-copy, which is a deliberate half-measure.** Review raised
+the obvious objection: copying the `_isolate_*_config` / `code_default_config` pair into a second
+`conftest.py` reproduces the very drift mechanism this section has just diagnosed, and the two
+copies have *already* diverged (see the residual below). The designated home exists —
+`df_pytest_isolation.py` at the repo root, stdlib-and-pytest-only, already imported by both
+subprojects' conftests — and a factory parameterised by (env var, canonical path, settings class)
+would fit inside that constraint.
+
+It was not done here, for one mechanical reason and one design reason. Mechanically, the extraction
+edits `df_pytest_isolation.py` and `orchestrator/tests/conftest.py`, and this task holds a
+concurrency lock on neither; taking them would widen its footprint into files another task may be
+editing concurrently. By design, the two fixtures are not yet the same fixture: the orchestrator's
+pins a `project_root` at `tmp_path` and reads a prefixed `ORCH_` env surface, while fused-memory's
+scrubs an UNPREFIXED surface derived from `model_fields`, adds three YAML interpolation names, and
+deliberately does not pin a project root. A factory written today would take all of that as
+parameters — a design question, not a copy-paste. It is filed as a follow-up so the third
+`BaseSettings` subproject does not need a third copy, and recorded here so a later reader can tell
+"not considered" from "considered and scoped out".
+
 ## The fix, and what sized it
 
 Mirror of the orchestrator's shape into `fused-memory/tests/conftest.py`: autouse
@@ -115,7 +134,11 @@ env surface; opt-in `code_default_config` supplies pure schema defaults. `preser
 is absorbed rather than kept — `monkeypatch.setenv` already restores on teardown, so keeping both
 would leave two autouse fixtures owning one variable with no defined ordering. The scrubbed names
 are derived from `FusedMemoryConfig.model_fields` at import, so a field added later is covered
-without an edit; `PATH`, `OPENAI_API_KEY` and `MEM0_API_KEY` do not match and are untouched.
+without an edit; `PATH`, `OPENAI_API_KEY` and `MEM0_API_KEY` do not match and are untouched —
+asserted rather than merely stated, since the narrowness is what keeps `PATH` alive for ~19.8k
+tests: `test_config_hermeticity.py::TestTheScrubStaysNarrow` plants nine near-miss names ambiently
+and fails if a widened match deletes one (mutation-checked: a single-underscore head match fails
+five of the nine).
 
 Pinning the **canonical** file rather than an absent one was chosen so collateral is zero by
 construction: it reproduces the CWD=`fused-memory/` semantics every currently-green test was
@@ -137,6 +160,45 @@ Full suite at `c7df77ee67` under the registered module command: `19788 passed, 3
 416.48s, exit 0. With `TASKMASTER`, `TASKMASTER__PROJECT_ROOT` and `SERVER__PORT` exported into
 pytest's environment, the config suites still pass — 346 of them — where before the fix the
 inherited value won.
+
+## The residual: resolution is CWD-independent, the leaves are not
+
+The pin fixes which FILE is read, not what that file's values denote. Measured under the pin:
+
+| leaf | value |
+|---|---|
+| `taskmaster.project_root` | `.` |
+| `reconciliation.explore_codebase_root` | `.` |
+| `queue.data_dir` | `./data/queue` |
+| `reconciliation.data_dir` | `./data/reconciliation` |
+
+Two `FusedMemoryConfig()` constructions either side of a `chdir` therefore produce byte-identical
+`model_dump()`s that denote different directories. That is a weaker invariant than "the config does
+not depend on the CWD" sounds, and reading the dump equality as semantic equality would be the same
+false-assurance shape that produced the phantom red in the first place, so
+`test_config_hermeticity.py` states BOTH halves executably: the dump equality, and a companion test
+asserting that the same relative leaf resolves to two different directories.
+
+The orchestrator's fixture closes this half by also pinning `ORCH_PROJECT_ROOT` at `tmp_path` — "the
+other load-bearing part", in its own docstring. The analogue is deliberately not taken here: it
+would change the value ~19.8k currently-green tests read, which is the collateral the design
+decision above rules out. Filed as a follow-up.
+
+What **is** closed is the ambient half of it. Measured with `CONFIG_PATH` already pinned at the
+canonical file, `PROJECT_ROOT=/pwned-by-env` resolved *both* `taskmaster.project_root` and
+`reconciliation.explore_codebase_root` to `/pwned-by-env`. The YAML's own `${VAR:default}`
+interpolation is a **third** environment surface: pydantic never sees it, so the
+`model_fields`-derived scrub cannot cover it, and the file pin does not outrank it. Inheriting one
+is a real launch condition rather than a contrived one — this repo's operator scripts export
+`PROJECT_ROOT` (`scripts/memory-metadata-coverage-census.sh` and two siblings), and the census
+timer's installed systemd unit carries it in the same env block as `CONFIG_PATH`
+(`scripts/tests/test_install_memory_metadata_coverage_census_timer.py` pins that trio). So `_isolate_fm_config` now deletes
+the three interpolation variables that redirect a path leaf: `PROJECT_ROOT`, `QUEUE_DATA_DIR`,
+`RECONCILIATION_DATA_DIR`. Deleting is free where pinning is not — all three are unset under both
+registered verify commands, and the two tests that set `PROJECT_ROOT` do so function-scoped and
+still win. They are listed by name rather than derived, because deriving the interpolation surface
+from the file would sweep in `${OPENAI_API_KEY}` and `${FALKORDB_URI:...}`, which the config reads
+from the environment *by design*.
 
 ## A second hole, confirmed and deliberately not fixed here
 
