@@ -543,7 +543,9 @@ class TestRetentionCliff:
             now=self._T0,
         )
 
-    async def _record_run(self, journal, run_id, *, stage_ran, started_at=None):
+    async def _record_run(
+        self, journal, run_id, *, stage_ran, started_at=None, completed_at=None
+    ):
         started = started_at or self._T0
         await journal.start_run(
             ReconciliationRun(
@@ -566,7 +568,7 @@ class TestRetentionCliff:
         # `now` in the past, and the retention comparison would be meaningless.
         await journal._db.execute(
             "UPDATE runs SET status = 'completed', completed_at = ? WHERE id = ?",
-            (started.isoformat(), run_id),
+            ((completed_at or started).isoformat(), run_id),
         )
         await journal._db.commit()
 
@@ -597,6 +599,120 @@ class TestRetentionCliff:
             assert after['present'] is False
             assert after['reason'] == 'expired'
             assert after['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_a_late_completion_never_pushes_the_reader_past_gcs_cliff(
+        self, mock_config, tmp_path,
+    ):
+        """The two cliffs must not cross, and only one direction is safe.
+
+        ``write_cycle_summary`` stamps ``expires_at`` from ITS OWN write time —
+        Stage 2, mid-loop — while the run row is completed only after the whole
+        stage loop, i.e. after Stage 3's LLM turn and far later still for an
+        interrupted-then-resumed run. Aging the absence from ``completed_at``
+        would therefore put the reader's cliff AFTER gc()'s, and every absence
+        in the window between them would read as a confident ``missing`` for a
+        row that was merely reaped — the exact false data-loss class this task
+        exists to remove. Aging from ``started_at`` (always <= the write time)
+        keeps the reader at or behind gc().
+        """
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-completed-long-after-its-stage2-write'
+            await self._write_summary(service, run_id)
+            await self._record_run(
+                journal,
+                run_id,
+                stage_ran=True,
+                completed_at=self._T0 + timedelta(hours=6),
+            )
+
+            # Anti-inversion: the row really was written, so a later `expired`
+            # cannot be a test that simply never created one.
+            before = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE, now=self._T0,
+            )
+            assert before['present'] is True
+
+            # Between the two cliffs: past the writer's expires_at (T0 + TTL),
+            # short of completed_at + TTL.
+            between = self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS, hours=1)
+            await store.gc(_PROJECT_ID, between.isoformat(), [])
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE, now=between,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'expired'
+            assert result['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_the_exact_retention_boundary_is_not_yet_expired(
+        self, mock_config, tmp_path,
+    ):
+        """Reader and writer must agree on the boundary itself, not just on
+        either side of it: ``gc()`` deletes on ``expires_at < now``, so at
+        exactly the cliff the row still exists and its absence is still a
+        genuine gap."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-exactly-at-the-cliff'
+            await self._record_run(journal, run_id, stage_ran=True)
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS),
+            )
+
+            assert result['reason'] == 'missing'
+            assert result['expected'] is True
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_a_naive_run_timestamp_is_read_as_utc_not_raised(
+        self, mock_config, tmp_path,
+    ):
+        """A tz-less ``runs.started_at`` parses fine and then blows up the
+        comparison against an aware ``now``. Every other reader of this column
+        already reads naive as UTC (``throughput.py``,
+        ``summary_pool.py::_assume_utc``), and a read-only presence check must
+        classify rather than raise ``TypeError`` at its caller."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-with-a-naive-timestamp'
+            await self._record_run(journal, run_id, stage_ran=True)
+            await journal._db.execute(
+                'UPDATE runs SET started_at = ?, completed_at = NULL WHERE id = ?',
+                (self._T0.replace(tzinfo=None).isoformat(), run_id),
+            )
+            await journal._db.commit()
+
+            inside = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS - 1),
+            )
+            past = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS + 1),
+            )
+
+            assert inside['reason'] == 'missing'
+            assert past['reason'] == 'expired'
         finally:
             await store.close()
             await journal.close()
@@ -650,8 +766,9 @@ class TestRetentionCliff:
 
     @pytest.mark.asyncio
     async def test_incomplete_run_ages_from_started_at(self, mock_config, tmp_path):
-        """A still-running run has completed_at IS NULL — age falls back to
-        started_at rather than raising."""
+        """A still-running run has completed_at IS NULL. The absence is aged
+        from started_at unconditionally, so the NULL is simply never read —
+        there is no fallback to get wrong."""
         service, store, journal = await self._wire(mock_config, tmp_path)
         try:
             run_id = 'run-never-completed'

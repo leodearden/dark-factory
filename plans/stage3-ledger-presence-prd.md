@@ -161,7 +161,7 @@ evaluated top-down; `expected` is the gate consumers act on:
 | 2 | `ledger_unavailable` | no ledger wired | `None` |
 | 3 | `run_unknown` | journal unwired, no `runs` row, read raised, `stage_reports` unparseable, or the run has not settled yet | `None` |
 | 4 | `stage_not_run` | SETTLED `runs` row present, `stage` absent from `stage_reports` | `False` |
-| 5 | `expired` | run older than `CYCLE_SUMMARY_TTL_DAYS`, so any row would have been `gc()`'d | `None` |
+| 5 | `expired` | `runs.started_at` older than `CYCLE_SUMMARY_TTL_DAYS`, so any row would have been `gc()`'d | `None` |
 | 6 | `missing` | stage ran, within retention, no row | `True` |
 
 `stage_not_run` deliberately outranks `expired`: it is a positive fact from the
@@ -169,6 +169,18 @@ never-reaped `runs` table and stays true regardless of TTL, whereas `expired`
 only says the evidence was destroyed. Derived by joining `runs` through
 `ReconciliationJournal.get_run_stage_execution`, a four-column projection scoped
 to `(id, project_id)`.
+
+**Rung 5 ages from `started_at`, never `completed_at`, so the reader's cliff can
+never fall behind `gc()`'s.** `write_cycle_summary` stamps `expires_at` from its
+own write time, which lies strictly between the two: Stage 2 writes mid-loop,
+while the run row is completed only after the whole stage loop — after Stage 3's
+LLM turn, and far later for an interrupted-then-resumed run. Aging from
+`completed_at` would put the reader's cliff after `gc()`'s, and every absence in
+the window between them would be reported as a confident `missing` for a row that
+was merely reaped. `started_at <= write time` makes the skew land the safe way:
+the ambiguous window degrades to the inconclusive `expired`. A naive timestamp in
+that column is read as UTC, the convention every other reader of `runs` already
+applies; anything that still fails to age falls to rung 3.
 
 **`stage_reports` is only evidence once a run has SETTLED.** `harness.py`
 accumulates `run.stage_reports` in memory and persists the whole blob after the

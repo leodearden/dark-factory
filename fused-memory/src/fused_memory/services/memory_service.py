@@ -8254,13 +8254,33 @@ class MemoryService:
         # The stage ran. Whether its missing row is data loss depends on
         # whether the row could still exist at all: past the retention window
         # gc() has hard-DELETEd it either way, so absence says nothing.
-        reference_iso = execution['completed_at'] or execution['started_at']
+        #
+        # Aged from started_at, never completed_at, because the two cliffs must
+        # not cross. write_cycle_summary stamps expires_at from ITS OWN write
+        # time, which falls between the two: the run row is completed only
+        # after the whole stage loop — after Stage 3's LLM turn, and far later
+        # for an interrupted-then-resumed run. Aging from completed_at would
+        # put the reader's cliff AFTER gc()'s, and every absence in that window
+        # would read as a confident `missing` for a row that was merely reaped.
+        # started_at is always <= the write time, so the reader's cliff lands
+        # at or before gc()'s and the ambiguous window degrades to the
+        # inconclusive `expired` — the fail-safe direction.
+        reference_iso = execution['started_at']
         try:
             reference = datetime.fromisoformat(reference_iso)
+            # A naive journal timestamp is UTC, the convention every other
+            # reader of this column already applies (throughput.py,
+            # summary_pool.py::_assume_utc). Normalising INSIDE the guard keeps
+            # the docstring's promise that every failure here degrades to
+            # run_unknown: a residual mixed-awareness comparison raises
+            # TypeError, which a read-only presence check must not propagate.
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=UTC)
+            expired = reference + timedelta(days=CYCLE_SUMMARY_TTL_DAYS) < now
         except (TypeError, ValueError):
             logger.warning(
-                'get_cycle_summary_presence: unparseable run timestamp %r for '
-                'run_id=%s stage=%s in project=%s; cannot age the absence',
+                'get_cycle_summary_presence: could not age run timestamp %r '
+                'for run_id=%s stage=%s in project=%s; cannot age the absence',
                 reference_iso,
                 run_id,
                 stage,
@@ -8268,7 +8288,7 @@ class MemoryService:
                 extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
             )
             return 'run_unknown', None, run_status
-        if reference + timedelta(days=CYCLE_SUMMARY_TTL_DAYS) < now:
+        if expired:
             return 'expired', None, run_status
         return 'missing', True, run_status
 
