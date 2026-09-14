@@ -15,6 +15,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -116,20 +117,50 @@ def test_module_body_imports_no_yaml_and_no_first_party_package():
             'the system python3, which does not have it')
 
 
-def test_source_carries_no_first_party_top_level_import():
-    """Belt and braces on the same fact, read off the source.
+_LOAD_UNDER_AN_IMPORT_BLOCKER = '''
+import importlib.util, sys
 
-    hasattr alone would miss `from shared.psi import _ARMS`, which binds
-    `_ARMS` rather than `shared`.
+FORBIDDEN = {'shared', 'sampler', 'orchestrator', 'yaml'}
+
+
+class Blocker:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in FORBIDDEN:
+            raise AssertionError('module-level import of ' + fullname)
+        return None
+
+
+sys.meta_path.insert(0, Blocker())
+spec = importlib.util.spec_from_file_location('calibration_under_test', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print('loaded')
+'''
+
+
+def test_loading_the_script_executes_no_first_party_or_yaml_import():
+    """The gate-time property, EXECUTED rather than grepped off the source.
+
+    At gate time the shebang resolves to the system python3, which has yaml
+    but none of `shared`, `sampler`, `orchestrator`. A top-level first-party
+    import would crash ε1/ε2 on import, fourteen days after this lands, in a
+    born-at-L2 path with no earlier signal.
+
+    This replaces a rescan of the source text for lines beginning `import x` /
+    `from x`, which was strictly weaker in both directions: it missed indented
+    and `__import__` forms, and it could only ever report what the source LOOKS
+    like. Loading the module behind a meta-path finder that raises reports what
+    the module DOES, in every form an import can take. It also closes the hole
+    the scan existed for — `from shared.psi import _ARMS` binds `_ARMS`, not
+    `shared`, so the hasattr check above cannot see it.
     """
-    source = SCRIPT.read_text()
-    body = [
-        line for line in source.splitlines()
-        if line.startswith(('import ', 'from ')) and not line.lstrip().startswith('#')
-    ]
-    for line in body:
-        for pkg in ('shared', 'sampler', 'orchestrator', 'yaml'):
-            assert not line.startswith((f'import {pkg}', f'from {pkg}')), line
+    result = subprocess.run(
+        [sys.executable, '-c', _LOAD_UNDER_AN_IMPORT_BLOCKER, str(SCRIPT)],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'loaded' in result.stdout, result.stdout
 
 
 # ── the argument surface ────────────────────────────────────────────────────
@@ -847,8 +878,16 @@ psi_admission:
 
 
 def test_smoke_against_the_two_real_committed_configs(tmp_path: Path):
-    """Exits 0 and names whatever degradation is true, pinning neither
-    project's current values — those are operator decisions that change."""
+    """The real committed yaml is found and PARSES, and the report is whole.
+
+    Neither project's current values are pinned — those are operator decisions
+    that change, and a test that froze them would go red on an ordinary tuning
+    commit. What is stable is that the file this script is aimed at by default
+    exists, is valid yaml, and carries the analysis all the way through to the
+    report. `isinstance(payload['degradations'], list)`, which is what this
+    asserted before, is true of any list-valued output and so witnessed none of
+    that.
+    """
     db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
 
     result = run_script(
@@ -858,7 +897,12 @@ def test_smoke_against_the_two_real_committed_configs(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     payload = trailing_json(result.stdout)
-    assert isinstance(payload['degradations'], list)
+    for cannot_read in ('local_config_missing', 'local_config_unreadable',
+                        'local_config_unparseable'):
+        assert cannot_read not in payload['degradations'], payload['degradation_details']
+    assert payload['percentiles']['runqueue_ratio']['n'] == 2
+    assert payload['holds']['runqueue_ratio'], payload
+    assert '## Config drift against the peer project' in result.stdout
 
 
 # ── detail (D): leaves that merely restate the shipped code default ─────────
@@ -931,7 +975,18 @@ def test_an_absent_defaults_mapping_yields_no_verdict():
     assert module.compare_to_code_defaults(None, _INJECTED_DEFAULTS) is None
 
 
-def test_the_flags_are_produced_for_both_the_local_and_peer_blocks(tmp_path: Path):
+def test_the_flags_are_produced_for_both_the_local_and_peer_blocks(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Both verdicts must REACH the report, each on its own side's line.
+
+    This asserted on compare_to_code_defaults called directly, having called
+    main() and discarded everything it produced — so deleting the main() call
+    left it green and nothing checked that either flag was ever rendered. The
+    defaults are still injected rather than fetched (the whole point of the
+    check is that this script owns no copy of them), but now through the same
+    seam main() uses.
+    """
     module = load_script()
     local = write_yaml(tmp_path / 'local.yaml', """
 psi_admission:
@@ -942,18 +997,28 @@ psi_admission:
   io_some_avg10: 40.0
 """)
     db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    monkeypatch.setattr(
+        module, 'fetch_code_defaults',
+        lambda **_kwargs: (_INJECTED_DEFAULTS, []),
+    )
 
     module.main([
         '--db', str(db), '--config', str(local), '--peer-config', str(peer),
         '--no-report',
     ])
-    local_block, _ = module.load_psi_admission_block(local, 'local')
-    peer_block, _ = module.load_psi_admission_block(peer, 'peer')
 
-    assert module.compare_to_code_defaults(
-        local_block, _INJECTED_DEFAULTS)['restates_default'] == ['mem_some_avg10']
-    assert module.compare_to_code_defaults(
-        peer_block, _INJECTED_DEFAULTS)['restates_default'] == ['io_some_avg10']
+    stdout = capsys.readouterr().out
+    payload = trailing_json(stdout)
+    assert payload['restates_code_default']['local'][
+        'restates_default'] == ['mem_some_avg10']
+    assert payload['restates_code_default']['peer'][
+        'restates_default'] == ['io_some_avg10']
+    # Each side's verdict on its OWN line: the report is what an operator
+    # reads, and a local flag rendered under "peer" would be worse than none.
+    local_line, = [ln for ln in stdout.splitlines() if ln.startswith('- **local**')]
+    peer_line, = [ln for ln in stdout.splitlines() if ln.startswith('- **peer**')]
+    assert 'mem_some_avg10' in local_line and 'io_some_avg10' not in local_line
+    assert 'io_some_avg10' in peer_line and 'mem_some_avg10' not in peer_line
 
 
 def test_compare_to_code_defaults_has_no_built_in_defaults_mapping():
@@ -1124,20 +1189,39 @@ def test_the_report_is_written_with_a_dated_name_and_announced_on_stderr(
     assert written[0].read_text().startswith('# Load-threshold calibration')
 
 
-def test_the_filename_heading_and_commit_subject_share_one_clock_read(tmp_path: Path):
+def test_the_filename_heading_and_commit_subject_share_one_clock_read(tmp_path: Path,
+                                                                     monkeypatch):
     """One `datetime.now(UTC)`, reused — not three reads that can straddle
-    midnight and produce a report whose name, heading and commit disagree."""
+    midnight and produce a report whose name, heading and commit disagree.
+
+    The clock is REPLACED with one that returns a different day on every read,
+    because against the real clock this test passed on every second of the day
+    except the midnight boundary it names — which is to say it did not pin the
+    property at all. With this clock a second read is visible immediately.
+    """
     repo = make_repo(tmp_path)
     db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
     module = load_script()
 
+    instants = iter([
+        datetime(2026, 9, 14, 23, 59, 59, tzinfo=UTC),
+        datetime(2026, 9, 15, 0, 0, 1, tzinfo=UTC),
+        datetime(2026, 9, 16, 0, 0, 1, tzinfo=UTC),
+    ])
+
+    class ADifferentDayOnEveryRead:
+        @staticmethod
+        def now(_tz=None):
+            return next(instants)
+
+    monkeypatch.setattr(module, 'datetime', ADifferentDayOnEveryRead)
+
     module.main(['--db', str(db), '--report-dir', str(repo / 'plans'), '--commit'])
 
     written, = (repo / 'plans').glob('load-threshold-calibration-*.md')
-    date = written.stem.rsplit('-', 3)[-3:]
-    date_str = '-'.join(date)
-    assert date_str in written.read_text().splitlines()[0]
-    assert date_str in git_out(repo, 'log', '-1', '--pretty=%s')
+    assert written.name == 'load-threshold-calibration-2026-09-14.md'
+    assert '2026-09-14' in written.read_text().splitlines()[0]
+    assert '2026-09-14' in git_out(repo, 'log', '-1', '--pretty=%s')
 
 
 def test_a_report_dir_at_the_repo_root_still_commits(tmp_path: Path):
