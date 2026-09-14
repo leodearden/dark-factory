@@ -288,7 +288,7 @@ class TestBoldItemLabels:
     def test_labels_returned_in_document_order(self):
         assert bold_item_labels(_BULLET_SECTION, '## Two stances') == ['Comments.', 'Tests.']
 
-    def test_a_continuation_line_s_inline_bold_is_not_a_label(self):
+    def test_a_continuation_lines_inline_bold_is_not_a_label(self):
         assert 'inline bold' not in bold_item_labels(_BULLET_SECTION, '## Two stances')
 
     def test_section_stops_at_the_next_heading(self):
