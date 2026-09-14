@@ -668,11 +668,20 @@ def main(argv: list[str] | None = None) -> int:
         # commit subject below — three reads could straddle midnight and
         # produce a report whose own name disagrees with its heading.
         out = args.report_dir / f'load-threshold-calibration-{stamp}.md'
-        out.write_text(report, encoding='utf-8')
-        # To STDERR, so stdout's last line stays the single-line JSON.
-        print(f'report: {out}', file=sys.stderr)
-        if args.commit:
-            degradations += commit_report(out, stamp)
+        # A NAMED degradation, never a non-zero exit — commit_report's shape,
+        # and for its reason: the analysis is the deliverable and filing it is
+        # a convenience, while ε1/ε2 classify a non-zero rc as an INFRA FAULT
+        # with no gate. The report text is already on stdout above, so nothing
+        # the run produced is lost when only the filing fails.
+        try:
+            out.write_text(report, encoding='utf-8')
+        except OSError as exc:
+            degradations.append(f'report_unwritable: {out} ({exc})')
+        else:
+            # To STDERR, so stdout's last line stays the single-line JSON.
+            print(f'report: {out}', file=sys.stderr)
+            if args.commit:
+                degradations += commit_report(out, stamp)
 
     # A degradation raised by the commit above lands in the JSON but not in the
     # already-written report text — the report cannot narrate its own commit.

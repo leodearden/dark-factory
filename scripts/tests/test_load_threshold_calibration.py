@@ -367,6 +367,36 @@ def test_a_stem_arm_reports_per_leaf_and_is_never_pooled(tmp_path: Path):
     assert cold[80.0]['hold_fraction'] == pytest.approx(0.0)
 
 
+def test_an_unwritable_report_dir_is_a_named_degradation_not_a_traceback(
+    tmp_path: Path,
+):
+    """The one boundary that was not honouring the always-exit-0 contract.
+
+    ε1/ε2 are always_escalates with no target_unit, so a non-zero rc is
+    classified an INFRA FAULT and born at L2 — a human paged about a "broken
+    script" instead of reading the calibration that already ran. Every other
+    boundary in the file (read_series, load_psi_admission_block,
+    fetch_code_defaults, commit_report) already returns a named degradation.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0, 3.0]})
+    missing = tmp_path / 'no-such-dir' / 'nor-this-one'
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio',
+                        '--report-dir', str(missing))
+
+    assert result.returncode == 0, (
+        f'a missing --report-dir turned a completed analysis into rc='
+        f'{result.returncode}: {result.stderr}'
+    )
+    payload = trailing_json(result.stdout)
+    assert 'report_unwritable' in payload['degradations'], payload['degradations']
+    detail = next(d for d in payload['degradation_details']
+                  if d.startswith('report_unwritable'))
+    assert str(missing) in detail, detail
+    # The analysis itself is still delivered, not swallowed with the write.
+    assert payload['percentiles']['runqueue_ratio']['n'] == 3
+
+
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
     """`_` is a single-character LIKE wildcard, and every selector contains one.
 
