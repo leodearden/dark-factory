@@ -41,9 +41,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 # `attempt-<N>[.<infix>].summary.json` — the live worktree spelling.
 _WORKTREE_RE = re.compile(r'^attempt-(\d+)(?:\.(.+))?\.summary\.json$')
@@ -256,3 +259,161 @@ def load_records(roots: Iterable[Path]) -> Corpus:
                     continue
                 records.append(Record(where=where, payload=payload))
     return Corpus(records=tuple(records), skipped=tuple(skipped))
+
+
+@dataclass(frozen=True)
+class Leg:
+    """One selected ``commands[]`` entry — the full-suite run of one attempt."""
+
+    where: RecordPath
+    label: str
+    cmd: str
+    rc: int
+    timed_out: bool
+    started_at: str
+    duration_secs: float
+    load: dict | None
+
+
+@dataclass(frozen=True)
+class Selection:
+    """The selected legs, and why every other entry was not selected.
+
+    ``rejected`` is a reason -> count mapping so ``n`` is always reconcilable
+    against the corpus: ``len(legs) + sum(rejected.values())`` is the number of
+    ``commands[]`` entries considered. A selector that reported only its
+    positives could not distinguish "this module rarely runs the full suite"
+    from "the shape filter stopped matching" — and those call for opposite
+    responses.
+    """
+
+    legs: tuple[Leg, ...]
+    rejected: dict[str, int]
+
+
+def read_module_test_command(root: Path, prefix: str) -> str | None:
+    """The ``test_command`` a module declares, read from its own yaml.
+
+    Read as PLAIN YAML rather than through ``OrchestratorConfig``: this script
+    has to run read-only against any project root, including one whose
+    ``.venv`` is absent or whose interpreter differs from the caller's, which
+    CLAUDE.md documents as the normal state of a task worktree. The cost is
+    that the census cannot see config-layer precedence — it reports the raw
+    declared value, and says so.
+
+    ``None`` — never a fallback — for an absent file, an unparseable one, or a
+    file with no ``test_command``. A guessed default here would be compared
+    against every record in the corpus and reject them all, reporting ``n=0``,
+    which reads exactly like "this module never ran the full suite".
+    """
+    path = root / prefix / 'orchestrator.yaml'
+    try:
+        data = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    command = data.get('test_command')
+    return command if isinstance(command, str) else None
+
+
+def _normalise_command(cmd: str) -> str:
+    """Collapse whitespace, and nothing else.
+
+    The comparison is deliberately exact-modulo-whitespace. Anything fuzzier
+    would readmit precisely the runs the filter exists to exclude: a
+    file-scoped `pytest tests/test_foo.py`, or a `-k`/`--lf`-narrowed form,
+    whose durations are not comparable to a full-suite run's. Whitespace alone
+    is tolerated because a command that has been through a parse/render
+    round-trip can differ in spacing while being the same invocation.
+    """
+    return ' '.join(cmd.split())
+
+
+def select_full_suite_legs(
+    corpus: Corpus,
+    *,
+    root: Path,
+    prefix: str,
+    label: str = 'test',
+    role: str | None = None,
+) -> Selection:
+    """Select the ``label`` legs that ran *prefix*'s declared full suite.
+
+    Reads each record's ``commands[]`` array, NEVER the top level. That
+    distinction is load-bearing: ``_build_summary_payload`` fills the top-level
+    rc/cmd/started_at/duration_secs from "the loudest raw exit code" (a
+    negative rc — a signal kill — sorting above every non-negative one), so on
+    an attempt whose lint leg was killed the top level describes the LINT leg.
+    A per-module duration census reading it would report a 4-second lint
+    command as the suite.
+
+    ``role=None`` means "do not filter by role", which is the only usable
+    default for the archive corpus, where the role is not knowable from the
+    path at all (see ``RecordPath.role``).
+
+    Every considered entry is either selected or counted under a reason, so the
+    caller can always reconcile ``n`` against the corpus.
+    """
+    expected = read_module_test_command(root, prefix)
+    wanted_infix = sanitise_prefix(prefix)
+    legs: list[Leg] = []
+    rejected: Counter[str] = Counter()
+
+    for record in corpus.records:
+        if record.where.module_prefix != wanted_infix:
+            rejected['prefix_mismatch'] += 1
+            continue
+        if role is not None and record.where.role != role:
+            rejected['role_mismatch'] += 1
+            continue
+        entries = record.payload.get('commands')
+        if not isinstance(entries, list):
+            rejected['no_commands_array'] += 1
+            continue
+        for entry in entries:
+            reason = _reject_reason(entry, expected, label)
+            if reason is not None:
+                rejected[reason] += 1
+                continue
+            legs.append(
+                Leg(
+                    where=record.where,
+                    label=entry['label'],
+                    cmd=entry['cmd'],
+                    rc=entry['rc'],
+                    timed_out=bool(entry.get('timed_out')),
+                    started_at=entry.get('started_at') or '',
+                    duration_secs=float(entry['duration_secs']),
+                    load=entry.get('load'),
+                ),
+            )
+
+    return Selection(legs=tuple(legs), rejected=dict(rejected))
+
+
+def _reject_reason(entry: object, expected: str | None, label: str) -> str | None:
+    """Why *entry* is not a full-suite run of the wanted leg, or ``None``.
+
+    Ordered cheapest-and-most-specific first, so a rejection is attributed to
+    the most informative reason available rather than to whichever check
+    happened to run first. ``segmented`` is kept distinct from
+    ``command_mismatch`` because it is a different fact about the corpus: the
+    command matched, but it ran as a sequence of separately-timed subprojects,
+    so the duration describes a different execution topology of the same chain.
+    """
+    if not isinstance(entry, dict):
+        return 'malformed_entry'
+    if entry.get('label') != label:
+        return 'label_mismatch'
+    if entry.get('cmd') is None:
+        return 'no_cmd'
+    if entry.get('segments'):
+        return 'segmented'
+    if expected is None:
+        return 'no_declared_command'
+    if _normalise_command(str(entry['cmd'])) != _normalise_command(expected):
+        return 'command_mismatch'
+    if not isinstance(entry.get('duration_secs'), (int, float)):
+        return 'no_duration'
+    return None
