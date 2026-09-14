@@ -845,8 +845,10 @@ class TestDistilledRendering:
         would announce blocking a leak of content nobody renders."""
         context = await self._render(briefing, [_grouped_parent()])
 
-        assert '- [uncategorized · undated · graphiti] Native canonical.' in context
-        assert '  - [amendment · undated · graphiti] NATIVE AMENDMENT BODY' in context
+        assert '- [uncategorized · undated · mem0] Native canonical.' in context
+        # The child is tagged with its PARENT's store: a nested digest has no
+        # source_store of its own, having been collapsed into the parent hit.
+        assert '  - [amendment · undated · mem0] NATIVE AMENDMENT BODY' in context
         assert 'FOREIGN AMENDMENT BODY' not in context
 
     async def test_the_section_headings_come_from_the_specs(

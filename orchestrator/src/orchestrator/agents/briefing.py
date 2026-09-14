@@ -373,6 +373,117 @@ def filter_foreign_project_results(
     return json.dumps(payload, indent=2, ensure_ascii=False), dropped, nested_dropped
 
 
+UNCATEGORIZED = 'uncategorized'
+UNDATED = 'undated'
+UNKNOWN_STORE = 'unknown'
+"""Placeholders for the three tag fields a result may not carry.
+
+Measured live, not assumed: Graphiti-sourced results carry ``category:
+null`` and ``created_at: null``, and every edge of a queried task node came
+back with ``temporal: null``. The tag is therefore best-effort and the
+content is not — a missing field renders as one of these words rather than
+as ``None``, and never suppresses the entry it describes.
+"""
+
+
+def _entry_category(entry: dict) -> str:
+    """Label an entry: its own category, else its metadata copy, else its kind."""
+    metadata = entry.get('metadata')
+    metadata_category = metadata.get('category') if isinstance(metadata, dict) else None
+    for value in (entry.get('category'), metadata_category, entry.get('kind')):
+        if isinstance(value, str) and value:
+            return value
+    return UNCATEGORIZED
+
+
+def _entry_date(entry: dict) -> str:
+    """Date an entry: its ``created_at``, else the date its fact became valid.
+
+    Rendered date-only. A memory's usefulness turns on how old it is, not on
+    what second it was written, and the full ISO timestamp is envelope.
+    """
+    temporal = entry.get('temporal')
+    valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
+    for value in (entry.get('created_at'), valid_at):
+        if isinstance(value, str) and len(value) >= 10:
+            return value[:10]
+    return UNDATED
+
+
+def _memory_bullet(entry: dict, store: str, indent: str = '') -> str | None:
+    """Render one recalled entry as ``- [category · date · store] content``.
+
+    Returns ``None`` for an entry carrying no text at all: a bullet with an
+    empty body would spend tokens telling an agent that something it cannot
+    read exists. Content is rendered WHOLE (D5) with continuation lines
+    indented so a multi-paragraph memory stays inside its own bullet.
+    """
+    if not isinstance(entry, dict):
+        return None
+    content = entry.get('content') or entry.get('digest')
+    if not isinstance(content, str) or not content.strip():
+        return None
+    body = content.strip().replace('\n', '\n' + indent + '  ')
+    return f'{indent}- [{_entry_category(entry)} · {_entry_date(entry)} · {store}] {body}'
+
+
+def render_memory_results(payload_text: str) -> str:
+    """Distil a filtered ``search`` payload into markdown bullets (D5).
+
+    One bullet per surviving result, plus one nested bullet per grouped child
+    (:data:`GROUPED_CHILD_KEYS`) — those children carry an amendment's digest
+    or a pinned body, which reach the prompt today as nested JSON and would
+    otherwise vanish silently, making the nested-drop note announce blocking
+    a leak of content nobody renders.
+
+    Fails OPEN on a malformed payload, exactly as
+    :func:`filter_foreign_project_results` does and for the same reason: a
+    serialisation surprise must not blank a section that has real facts in
+    it. The raw text is returned unchanged and a WARNING is logged. Returns
+    ``''`` when the payload is well-formed but holds nothing renderable, so
+    the caller skips the section the same way it skips an empty one.
+    """
+    try:
+        payload = json.loads(payload_text)
+        results = payload['results']
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError) as e:
+        logger.warning(
+            f'render_memory_results: payload is not a renderable search reply ({e}); '
+            'rendering it unfiltered'
+        )
+        return payload_text
+    if not isinstance(results, list):
+        logger.warning(
+            f"render_memory_results: payload['results'] is a {type(results).__name__}, "
+            'not a list; rendering it unfiltered'
+        )
+        return payload_text
+
+    bullets: list[str] = []
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        store = entry.get('source_store')
+        store = store if isinstance(store, str) and store else UNKNOWN_STORE
+        bullet = _memory_bullet(entry, store)
+        if bullet is None:
+            continue
+        bullets.append(bullet)
+        grouped = entry.get('grouped')
+        if not isinstance(grouped, dict):
+            continue
+        for key in GROUPED_CHILD_KEYS:
+            children = grouped.get(key)
+            if not isinstance(children, list):
+                continue
+            bullets.extend(
+                child_bullet
+                for child in children
+                if (child_bullet := _memory_bullet(child, store, indent='  ')) is not None
+            )
+    return '\n'.join(bullets)
+
+
 MEMORY_CONTEXT_CAVEAT = (
     "_This context was recalled from the `{project_id}` project's memory — "
     'it is NOT a description of this worktree. It may name tasks, repos, '
@@ -1496,8 +1607,9 @@ Handle this escalation, then call `resolve_issue` with a summary.
                 foreign_dropped += dropped
                 nested_dropped += nested
                 queries_fired += 1
-                if section:
-                    recalled_sections.append(f'## {spec.section_title}\n\n{section}')
+                rendered = render_memory_results(section) if section else ''
+                if rendered:
+                    recalled_sections.append(f'## {spec.section_title}\n\n{rendered}')
 
         except Exception as e:
             logger.warning(f'Failed to fetch memory context: {e}')
