@@ -261,6 +261,69 @@ VERIFY_CLI_PER_TEST_TIMEOUT = 300
 DELIBERATE_TIGHT_BOUND_CEILING = 60
 
 
+# task 3451's measured worst-case happy-path subprocess spawn latency (n=3:
+# 2.13/3.10/4.71, load-per-core 6.6) -- the per-spawn price
+# `required_timeout_secs` below charges.
+#
+# WHY THAT PROVENANCE LICENSES REUSE BEYOND THE OFFLINE LANE (task 5333): the
+# figure is a worst case measured UNDER CONTENTION, at load-per-core 6.6, and
+# the TestRow7KillSwitchByteIdentity crashes it is now also used to size were
+# recorded at load-per-core 5.5-11 -- the same regime, BRACKETED rather than
+# extrapolated from.  A latency measured on an idle host would not transfer;
+# this one does.
+#
+# MOVED HERE from test_offline_lane_integration.py by task 5333, which needed
+# the same arithmetic in test_merge_queue_deep_integration_gate.py -- a module
+# that cannot import a test module without coupling the two suites' collection
+# order.  Pinned, along with a guard against a second copy growing back, by
+# test_timeout_marker_inversion_guard.py::TestSpawnBoundSizingModel.
+MEASURED_SPAWN_LATENCY_SECS = 4.71
+
+
+def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> float:
+    """Task 4203 -- THE canonical sizing model for ``@pytest.mark.timeout``
+    OVERRIDES on tests whose cost is dominated by real subprocess spawns.
+
+    This is the single, callable statement of the model: callers CALL it
+    rather than re-deriving or re-stating it in prose, so the rule cannot
+    drift into per-callsite copies the way a spawn count already had before
+    4203 consolidated it (two landed docstrings undercounted
+    ``_drive_advance``, inconsistently).
+
+    THE MODEL: a test's effective per-test pytest-timeout must cover its
+    bounded-wait sum (*bounded_secs* -- the sums of ``_LANE_PASS_BOUND_SECS``
+    -style waits the test's own body composes) PLUS its counted out-of-bound
+    real-git subprocess spawns (*out_of_bound_spawns* -- real git work done
+    OUTSIDE any bounded ``wait_for`` window), each spawn priced at the
+    worst-case measured :data:`MEASURED_SPAWN_LATENCY_SECS`.  Every term is
+    an already-measured, already-pinned quantity; nothing guessed.
+
+    WHY THE ADDITIVE TERM EXISTS: pytest-timeout 2.4.0 installs its timer in
+    ``pytest_runtest_protocol`` whenever ``func_only`` is False -- unset
+    repo-wide, so true for every test here -- meaning the per-test budget
+    covers fixture setup/teardown and all real-git test-body work, not just
+    the bounded waits.  Before 4203 the marker-CARRYING guard in
+    test_offline_lane_integration.py compared a marker against the
+    bounded-wait sum alone, reserving ZERO headroom for that real-git work,
+    while the marker-LESS guard beside it reserved 40% of the budget for
+    exactly it.  That asymmetry, not any one test's marker value, is what
+    4203 fixed.
+
+    SCOPE -- the marker-carrying OVERRIDES only, i.e. a number a suite
+    CHOOSES.  A marker-less population is deliberately NOT gated by this
+    model; see test_offline_lane_integration.py::
+    test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling for why.
+
+    THE ROUNDING RULE deliberately lives with the CALLERS, not here: each
+    takes this figure up to the next multiple of the 60s pyproject grid (see
+    :data:`DEEP_GATE_SCENE_TEST_TIMEOUT`, and the worked
+    ``@pytest.mark.timeout(120)`` comment in test_offline_lane_integration.py).
+    Returning the raw requirement keeps the model one idea wide, and lets a
+    caller that wants the unrounded number have it.
+    """
+    return bounded_secs + out_of_bound_spawns * MEASURED_SPAWN_LATENCY_SECS
+
+
 # task 3540: the claimant-liveness TTL the row builder below derives its
 # symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
 # imports this same constant to pin `config.claimant_liveness_ttl_secs`, so a
