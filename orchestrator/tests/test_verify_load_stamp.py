@@ -207,3 +207,152 @@ class TestLoadSample:
         import orchestrator.verify  # noqa: PLC0415
 
         assert orchestrator.verify.read_psi_sample is shared.psi.read_psi_sample
+
+
+# The live orchestrator `test_command` (orchestrator/orchestrator.yaml:5) —
+# the dominant case, and the one that makes a single resolved integer a lie:
+# it carries NO `-n`, so the worker count is decided by pyproject `addopts`,
+# which the verify path never reads.
+LIVE_TEST_COMMAND = (
+    'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300'
+)
+
+
+class TestXdistWorkers:
+    """``verify._xdist_workers(cmd, verify_env)`` — two facts, neither guessed.
+
+    D17 asks for "the xdist worker count actually in effect". Measured, the
+    dominant live case admits no single answer: the command above carries no
+    ``-n``, so the count comes from pyproject ``addopts``, which verify never
+    reads. Collapsing that to one integer would mean either guessing (report
+    the env value even when nothing says ``auto``) or fabricating (report a
+    default) — and a guessed worker count inside a measurement corpus is
+    indistinguishable from a measured one a month later, which is the exact
+    class of fabricated datum this deliverable exists to remove.
+
+    So: two orthogonal, separately-sourced, independently-nullable facts. The
+    census derives the count where it is derivable and says "unknown" where it
+    is not.
+    """
+
+    def test_the_exact_key_set(self):
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert set(_xdist_workers(LIVE_TEST_COMMAND, {})) == {
+            'n_flag',
+            'auto_num_workers',
+        }
+
+    def test_an_explicit_worker_count_is_read_off_the_flag(self):
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        record = _xdist_workers('uv run pytest tests/ -n 8 --timeout=300', {})
+
+        assert record['n_flag'] == '8'
+
+    def test_n_auto_is_reported_verbatim_not_resolved(self):
+        """``'auto'`` is what the command SAYS; resolving it here would guess."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers('uv run pytest tests/ -n auto', {})['n_flag'] == 'auto'
+
+    def test_the_live_command_carries_no_flag_and_says_so(self):
+        """The dominant case: addopts decides, and verify cannot see addopts."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers(LIVE_TEST_COMMAND, {})['n_flag'] is None
+
+    def test_a_non_pytest_command_yields_no_flag(self):
+        """Mirrors the no-op guard ``apply_pytest_numprocesses`` documents."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers('uv run ruff check src/ tests/', {})['n_flag'] is None
+        assert _xdist_workers('uv run pyright src/', {})['n_flag'] is None
+
+    def test_a_governed_wrapper_yields_no_flag_rather_than_a_misparse(self):
+        """The reason there is no regex here.
+
+        Once cpu-governed, the command is an opaque outer
+        ``<exec> -- /bin/bash -c '...'`` string. A regex would happily find the
+        inner ``-n 8`` and report it as this command's flag; the structured
+        parser reports OPAQUE, which is the truth about what verify can see.
+        The stamp is taken BEFORE the wrap for exactly this reason, so this
+        case is defence in depth rather than the live path.
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        governed = (
+            "/opt/df/cpu-governed-exec.sh -- /bin/bash -c "
+            "'uv run pytest tests/ -n 8'"
+        )
+        assert _xdist_workers(governed, {})['n_flag'] is None
+
+    def test_a_raw_retained_chain_yields_no_flag(self):
+        """An `&&` chain has no ONE invocation's flag to report."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        chain = 'cd shared && uv run pytest tests/ -n 4 && uv run pytest tests/scripts/'
+        assert _xdist_workers(chain, {})['n_flag'] is None
+
+    def test_auto_num_workers_comes_off_the_passed_env(self):
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        record = _xdist_workers(
+            'uv run pytest tests/ -n auto', {'PYTEST_XDIST_AUTO_NUM_WORKERS': '6'},
+        )
+
+        assert record['auto_num_workers'] == '6'
+
+    def test_auto_num_workers_is_null_when_the_env_does_not_set_it(self):
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers(LIVE_TEST_COMMAND, {})['auto_num_workers'] is None
+        assert _xdist_workers(LIVE_TEST_COMMAND, None)['auto_num_workers'] is None
+
+    def test_the_two_facts_are_independent(self):
+        """Neither field is derived from the other — that is the whole point.
+
+        The env value is reported even with no ``-n auto`` to consume it, and a
+        literal ``-n`` is reported with no env value present. A reader that
+        wants the effective count joins them itself and can see when it cannot.
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        env = {'PYTEST_XDIST_AUTO_NUM_WORKERS': '6'}
+
+        assert _xdist_workers(LIVE_TEST_COMMAND, env) == {
+            'n_flag': None,
+            'auto_num_workers': '6',
+        }
+        assert _xdist_workers('uv run pytest tests/ -n 8', {}) == {
+            'n_flag': '8',
+            'auto_num_workers': None,
+        }
+
+    @pytest.mark.parametrize(
+        'cmd',
+        ['', '   ', 'uv run pytest tests/ -n', "pytest 'unclosed", '&&', '-n 8'],
+        ids=['empty', 'blank', 'dangling-n', 'unbalanced-quote', 'bare-op', 'bare-flag'],
+    )
+    def test_a_malformed_command_never_raises(self, cmd):
+        """Same never-raise contract as ``_load_sample``: nulls, not an exception.
+
+        ``-n`` with no following token is the interesting one — the structured
+        splitter falls back to bare-flag classification rather than indexing
+        past the end, so there is no value to report and none is invented.
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        record = _xdist_workers(cmd, {})
+
+        assert set(record) == {'n_flag', 'auto_num_workers'}
+        assert record['n_flag'] is None
+
+    def test_the_record_is_json_native(self):
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        record = _xdist_workers(
+            'uv run pytest tests/ -n 8', {'PYTEST_XDIST_AUTO_NUM_WORKERS': '6'},
+        )
+
+        assert json.loads(json.dumps(record)) == record
