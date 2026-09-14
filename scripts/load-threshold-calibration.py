@@ -122,10 +122,14 @@ def pct(xs: list[float], p: float) -> float:
     return ys[k]
 
 
+def default_project_root() -> Path:
+    """Which checkout owns the code, via the env seam the installer uses."""
+    return Path(os.environ.get('DARK_FACTORY_ROOT', '/home/leo/src/dark-factory'))
+
+
 def default_db() -> Path:
     """The corpus, via the env seam sampler/__main__.py and the installer use."""
-    root = os.environ.get('DARK_FACTORY_ROOT', '/home/leo/src/dark-factory')
-    return Path(root) / 'data/load-samples.db'
+    return default_project_root() / 'data/load-samples.db'
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -141,6 +145,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help='this project\'s orchestrator config (default: %(default)s)')
     ap.add_argument('--peer-config', type=Path, default=DEFAULT_PEER_CONFIG,
                     help='the peer project\'s orchestrator config (default: %(default)s)')
+    ap.add_argument('--project-root', type=Path, default=None,
+                    help='checkout whose orchestrator code supplies the shipped '
+                         'defaults (default: $DARK_FACTORY_ROOT). Independent of '
+                         '--config, which only says where the yaml lives.')
     ap.add_argument('--report-dir', type=Path, default=DEFAULT_REPORT_DIR,
                     help='where the markdown report is written (default: %(default)s)')
     ap.add_argument('--no-report', action='store_true',
@@ -151,6 +159,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument('--commit', action='store_true',
                     help='git commit --only the written report (for the scheduled run)')
     args = ap.parse_args(argv)
+    # Resolved HERE and not as an argparse default, so the env seam is read at
+    # call time rather than frozen at import.
+    if args.project_root is None:
+        args.project_root = default_project_root()
     if args.db is None:
         args.db = default_db()
     return args
@@ -691,6 +703,30 @@ def readability_degradations(
     return out
 
 
+def _discover_repo(directory: Path) -> tuple[str | None, list[str]]:
+    """The git repo enclosing *directory*, ASKED of git rather than computed.
+
+    The repo used to be ``report_path.parent.parent``, which is right only for
+    the default ``<root>/plans/<file>.md`` layout: ``--report-dir <root>``
+    resolved to the directory ABOVE the repo and the commit degraded for no
+    reason an operator could see. Where the report goes and which repo encloses
+    it are not the same fact, and only git knows the second one.
+    """
+    try:
+        proc = subprocess.run(
+            ['git', '-C', str(directory), 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f'report_commit_failed: {exc}']
+    if proc.returncode != 0:
+        return None, [
+            f'report_commit_failed: {directory} is inside no git repository '
+            f'({proc.stderr.strip()[:200]})'
+        ]
+    return proc.stdout.strip(), []
+
+
 def commit_report(path: Path, stamp: str) -> list[str]:
     """`git add --` then `git commit --only <path>`; degrade named on failure.
 
@@ -705,7 +741,9 @@ def commit_report(path: Path, stamp: str) -> list[str]:
     non-zero rc as an INFRA FAULT with no gate, so letting git turn a
     delivered calibration into a born-at-L2 page would be exactly backwards.
     """
-    repo = str(path.parent.parent)
+    repo, degradations = _discover_repo(path.parent)
+    if repo is None:
+        return degradations
     subject = (
         f'plans: load-threshold calibration report {stamp} '
         '(scripts/load-threshold-calibration.py)'
@@ -746,7 +784,7 @@ def main(argv: list[str] | None = None) -> int:
     configured = arm_thresholds(local_block)
     drift = compare_blocks(local_block, peer_block)
     code_defaults, defaults_degradations = fetch_code_defaults(
-        command=default_defaults_command(args.uv_bin), cwd=args.config.parent)
+        command=default_defaults_command(args.uv_bin), cwd=args.project_root)
     degradations += defaults_degradations
     restatements = {
         'local': compare_to_code_defaults(local_block, code_defaults),

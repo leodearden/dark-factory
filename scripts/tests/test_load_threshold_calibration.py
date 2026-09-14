@@ -1026,6 +1026,59 @@ def test_the_defaults_command_uses_no_sync(tmp_path: Path):
     assert '--project' in command and 'orchestrator' in command, command
 
 
+def test_the_defaults_subprocess_runs_in_the_project_root_not_beside_the_config(
+    tmp_path: Path, monkeypatch
+):
+    """Two unrelated dimensions had been fused into one flag (heuristic 3).
+
+    The subprocess that asks the LIVE MODEL for its shipped defaults ran with
+    ``cwd=args.config.parent``, so `--config /home/leo/src/reify/...` quietly
+    compared that config against REIFY's orchestrator code and labelled the
+    answer "the shipped code default". Both projects are dark-factory-derived,
+    so it succeeds and silently reports the wrong project's numbers — the worst
+    shape of failure for a file whose whole job is naming drift.
+
+    Where the config lives and which checkout owns the code are independent
+    facts, and each now has its own input.
+    """
+    module = load_script()
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    elsewhere = tmp_path / 'some' / 'other' / 'checkout'
+    elsewhere.mkdir(parents=True)
+    (elsewhere / 'cfg.yaml').write_text('psi_admission:\n  mem_some_avg10: 15.0\n')
+    project_root = tmp_path / 'the-real-root'
+    project_root.mkdir()
+
+    seen: dict = {}
+
+    def capture(*, command, cwd):
+        seen['command'], seen['cwd'] = command, cwd
+        return None, ['code_defaults_unavailable: stubbed']
+
+    monkeypatch.setattr(module, 'fetch_code_defaults', capture)
+    module.main([
+        '--db', str(db), '--no-report',
+        '--config', str(elsewhere / 'cfg.yaml'),
+        '--project-root', str(project_root),
+    ])
+
+    assert Path(seen['cwd']) == project_root, (
+        f'the defaults subprocess ran in {seen["cwd"]}, which is derived from '
+        '--config rather than from the project root'
+    )
+
+
+def test_the_project_root_defaults_through_the_same_env_seam_as_the_corpus(
+    monkeypatch,
+):
+    """One seam for "which checkout is this", already used by default_db."""
+    module = load_script()
+    monkeypatch.setenv('DARK_FACTORY_ROOT', '/somewhere/else')
+
+    assert module.parse_args([]).project_root == Path('/somewhere/else')
+    assert module.default_db() == Path('/somewhere/else/data/load-samples.db')
+
+
 # ── the --report-dir / --no-report / --commit trio ──────────────────────────
 
 
@@ -1085,6 +1138,40 @@ def test_the_filename_heading_and_commit_subject_share_one_clock_read(tmp_path: 
     date_str = '-'.join(date)
     assert date_str in written.read_text().splitlines()[0]
     assert date_str in git_out(repo, 'log', '-1', '--pretty=%s')
+
+
+def test_a_report_dir_at_the_repo_root_still_commits(tmp_path: Path):
+    """The repo is discovered, not computed from the report path.
+
+    `repo = path.parent.parent` is right only for the default
+    <root>/plans/<file>.md layout. `--report-dir <root>` put the report at
+    <root>/<file>.md, whose parent.parent is the directory ABOVE the repo, so
+    the commit degraded for no reason the operator could see.
+    """
+    repo = make_repo(tmp_path)
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+    module = load_script()
+
+    module.main(['--db', str(db), '--report-dir', str(repo), '--commit'])
+
+    written, = repo.glob('load-threshold-calibration-*.md')
+    committed = git_out(repo, 'show', '--name-only', '--pretty=', 'HEAD').split()
+    assert written.name in committed, (
+        f'the report at the repo root was not committed; HEAD touched {committed}'
+    )
+
+
+def test_a_report_dir_outside_any_repo_is_still_a_named_degradation(tmp_path: Path):
+    """Discovery must not turn "no repo here" into a silent success."""
+    outside = tmp_path / 'not-a-repo'
+    outside.mkdir()
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+
+    result = run_script('--db', str(db), '--report-dir', str(outside), '--commit')
+
+    assert result.returncode == 0, result.stderr
+    payload = trailing_json(result.stdout)
+    assert 'report_commit_failed' in payload['degradations'], payload
 
 
 def test_no_report_prints_everything_but_writes_no_file(tmp_path: Path):
