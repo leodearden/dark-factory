@@ -71,19 +71,25 @@ def probe_dir() -> Iterator[Path]:
 def _collect(probe_dir: Path, *extra_args: str) -> str:
     """Run `pytest --collect-only` bound to cockpit's real pyproject.toml.
 
-    Returns combined stdout+stderr. `-n0` overrides cockpit's `-n auto` addopts
-    to keep collection serial without disabling the xdist plugin outright
-    (`-p no:xdist` would conflict with the surviving `-n auto` and make pytest
-    exit with "unrecognized arguments: -n").
+    Returns combined stdout+stderr, having first asserted the run SUCCEEDED.
+    `-n0` overrides cockpit's `-n auto` addopts to keep collection serial
+    without disabling the xdist plugin outright (`-p no:xdist` would conflict
+    with the surviving `-n auto` and make pytest exit with "unrecognized
+    arguments: -n").
 
     BOTH are load-bearing since task 5408 put `-n auto --dist loadgroup` in
     cockpit's addopts, and the shape is mirrored from the sibling that already
     faced this, fused-memory/tests/test_integration_marker_config.py::_collect.
-    Without them, an environment where the plugin is missing exits 4 writing
-    `unrecognized arguments: -n` to STDERR, this helper returns an empty string,
-    and `'test_marked_smoke' not in output` passes VACUOUSLY while the sibling
-    assertion below fails with a message about collection that says nothing
-    about the real cause.
+
+    THE EXIT-CODE CHECK IS THE ACTUAL GUARD, and appending stderr only improves
+    the message. In an environment where the plugin is missing, pytest exits 4
+    writing `unrecognized arguments: -n` — and every NEGATIVE assertion built on
+    this output (`'test_marked_smoke' not in output`) then passes VACUOUSLY on a
+    run that collected nothing. Combining the streams makes a failure readable;
+    only the returncode makes it FAIL, and at the cause rather than at whichever
+    sibling positive assertion happens to notice. Both live call sites collect
+    at least one test, so rc 5 (no tests collected) is a real defect here too
+    and is deliberately not exempted.
     """
     test_file = probe_dir / 'test_probe.py'
     test_file.write_text(_PROBE_SRC)
@@ -107,7 +113,17 @@ def _collect(probe_dir: Path, *extra_args: str) -> str:
         timeout=30,
         cwd=str(COCKPIT_DIR),
     )
-    return result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, (
+        f'`pytest --collect-only` exited {result.returncode} for '
+        f'extra_args={extra_args!r}, so the output below reports an '
+        'environment or plugin failure rather than what cockpit\'s addopts '
+        'deselects. Exit 4 with "unrecognized arguments: -n" means the '
+        'interpreter running this has no pytest-xdist, which cockpit declares '
+        'in its dev group (task 5408); exit 5 means nothing was collected at '
+        f'all.\nOutput:\n{combined}'
+    )
+    return combined
 
 
 class TestSmokeMarkerDeselection:
