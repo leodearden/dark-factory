@@ -465,3 +465,16 @@ def test_main_refuses_a_readable_store_that_has_no_tables(tmp_path, capsys):
     assert exit_code != 0
     assert captured.out == ""
     assert str(table_less) in captured.err
+
+
+def test_main_refuses_a_file_that_is_not_a_sqlite_database(tmp_path, capsys):
+    """Pointing at the wrong file entirely earns a diagnosis, not a traceback."""
+    not_a_database = tmp_path / "tasks.db"
+    not_a_database.write_text('{"tasks": []}')
+
+    exit_code = main(["--db", str(not_a_database)])
+
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert captured.out == ""
+    assert str(not_a_database) in captured.err

@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -198,15 +199,17 @@ def test_connect_ro_refuses_a_readable_store_that_has_no_tables(tmp_path):
     assert str(excinfo.value.path) in str(excinfo.value)
 
 
-def test_the_three_refusals_of_one_path_each_read_differently(tmp_path):
+def test_the_four_refusals_of_one_path_each_read_differently(tmp_path):
     """No two refusals may read the same.
 
     Collapsing any of them into one "unusable store" message would restore
-    exactly the unactionable signal this guard exists to remove — the three
-    remedies differ (resolve the main checkout; you are one directory too
-    high; you are pointing at some other .db entirely).
+    exactly the unactionable signal this guard exists to remove — the whole
+    point of the enum is that the reader learns WHICH of four mistakes they
+    made, and each has its own remedy (resolve the main checkout; you are one
+    directory too high; you are pointing at some other .db; that is not a
+    database at all).
 
-    The SAME path takes all three shapes in turn, so a difference between the
+    The SAME path takes all four shapes in turn, so a difference between the
     messages can only come from the remedy prose and never from the path each
     of them names.
     """
@@ -220,13 +223,22 @@ def test_the_three_refusals_of_one_path_each_read_differently(tmp_path):
     with pytest.raises(TaskDbUnreadable) as table_less_refusal:
         connect_ro(path)
 
+    path.write_text('{"tasks": []}')
+    with pytest.raises(TaskDbUnreadable) as not_a_database_refusal:
+        connect_ro(path)
+
     path.unlink()
     with pytest.raises(TaskDbUnreadable) as absent_refusal:
         connect_ro(path)
 
-    refusals = (stub_refusal, table_less_refusal, absent_refusal)
-    assert len({r.value.reason for r in refusals}) == 3
-    assert len({str(r.value) for r in refusals}) == 3
+    refusals = (
+        stub_refusal,
+        table_less_refusal,
+        not_a_database_refusal,
+        absent_refusal,
+    )
+    assert len({r.value.reason for r in refusals}) == 4
+    assert len({str(r.value) for r in refusals}) == 4
 
 
 def test_connect_ro_refuses_a_stub_that_grew_past_zero_bytes_without_tables(tmp_path):
@@ -273,6 +285,52 @@ def test_an_unguarded_read_only_open_of_a_stub_answers_no_such_table(tmp_path):
         conn.close()
 
     assert "no such table: tasks" in str(excinfo.value)
+
+
+def test_connect_ro_refuses_a_file_that_is_not_a_sqlite_database(tmp_path):
+    """The probe is now the first code to touch the file's bytes, so the
+    "not a database at all" error surfaces HERE.
+
+    `connect_ro` promises to open the store or refuse with
+    `TaskDbUnreadable`; letting `sqlite3.DatabaseError` escape would leave a
+    fresh instance of the same "the contract says X, the code does Y" defect
+    this round exists to close — and the reader would get a raw traceback
+    instead of a diagnosis.
+    """
+    not_a_database = tmp_path / "tasks.db"
+    not_a_database.write_text('{"tasks": []}')
+
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro(not_a_database)
+
+    assert excinfo.value.reason is TaskDbProblem.NOT_A_DATABASE
+    assert excinfo.value.path == not_a_database.resolve()
+    assert str(excinfo.value.path) in str(excinfo.value)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="mode 000 does not deny root")
+def test_a_store_that_cannot_be_OPENED_is_not_relabelled_not_a_database(make_tasks_db):
+    """The discrimination that keeps the diagnosis honest.
+
+    `sqlite3.OperationalError` is a SUBCLASS of `sqlite3.DatabaseError`, so a
+    catch that branched on the exception CLASS would report every unreadable
+    store as "not a database" — turning a permissions problem, a locked
+    store, or one that vanished mid-open into a confident wrong answer.
+
+    Measured here: non-sqlite bytes report `SQLITE_NOTADB` (26) while a real
+    store at mode 000 reports `SQLITE_CANTOPEN` (14). Only the structured
+    code tells them apart, so only the structured code may be branched on.
+    """
+    unopenable = make_tasks_db([{"id": 1, "status": "done"}])
+    unopenable.chmod(0o000)
+    try:
+        with pytest.raises((sqlite3.OperationalError, TaskDbUnreadable)) as excinfo:
+            connect_ro(unopenable)
+    finally:
+        unopenable.chmod(0o600)
+
+    claimed_reason = getattr(excinfo.value, "reason", None)
+    assert claimed_reason is not TaskDbProblem.NOT_A_DATABASE
 
 
 def test_an_unguarded_read_only_open_of_a_table_less_store_answers_no_such_table(
