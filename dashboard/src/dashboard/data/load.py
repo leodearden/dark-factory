@@ -13,8 +13,21 @@ ts, value, window_mean, window_max) are the consumer contract.
 ``KNOWN_METRICS`` is the stable set of metric names the dashboard serves.
 Keys not in this tuple are filtered from query results, giving the frontend
 a fixed shape regardless of future sampler additions.  The response always
-contains all 9 keys; absent-from-DB known metrics return the placeholder
-shape ``{current: null, sparkline: [], window_mean: null, window_max: null}``.
+contains all 9 keys; a known metric with nothing to serve returns the
+placeholder shape
+``{current: null, sparkline: [], window_mean: null, window_max: null}``.
+
+TWO things produce that placeholder, and only the first is "absent from the
+DB".  The second is a metric whose newest row is older than
+``_RECENCY_SLACK_SECONDS`` before the newest row of ANY served metric — see
+the recency-bound note below.  ``sampler/__main__.py`` degrades each
+collection group independently, so one group can stall while its siblings
+keep writing every 5 s, and after the slack elapses the stalled group's cards
+go to the placeholder.  That is intended: /api/load is polled every 5 s and
+the frontend renders ``current`` as the live number, so an hour-old value is
+not a stale reading of host load but a reading of a collector that has
+stopped, and "no data" is the honest answer.  Pinned by
+``test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking``.
 
 PSI window columns
 ------------------
@@ -126,6 +139,16 @@ _RECENCY_SLACK_SECONDS = 3600
 # now()-relative bound would blank the card after an outage longer than the
 # slack, whereas anchoring to the data keeps showing the last known samples,
 # exactly as the unbounded query did.
+#
+# The anchor is GLOBAL across the 9 served metrics, not per metric, and the
+# difference shows in the PARTIAL degrade: one collection group stalls while
+# its siblings keep writing, the siblings advance the anchor, and after the
+# slack the stalled group's cards go to the placeholder.  Kept global
+# deliberately -- see the module docstring for why "no data" is the honest
+# answer there, and the test that pins it.  A per-metric bound
+# (`ts >= (SELECT MAX(ts) FROM samples s2 WHERE s2.metric = samples.metric)`)
+# would instead report each stalled metric's last value as current forever,
+# and makes the scalar subquery correlated.
 #
 # Cost is linear in the SLACK, not in retention, so the slack must stay modest:
 # measured on the same probe, 1h = 28.7 ms, 24h = 347 ms, 7d = 2,168 ms.

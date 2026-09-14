@@ -329,3 +329,54 @@ async def test_bound_is_anchored_to_newest_row_not_wall_clock(tmp_path: Path) ->
 
     assert result['occt_queue_depth']['current'] == 2.0
     assert result['occt_queue_depth']['sparkline'] == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking(
+    tmp_path: Path,
+) -> None:
+    """The PARTIAL degrade, which the whole-sampler-down test above does not cover.
+
+    ``sampler/__main__.py`` degrades each collection group independently: the
+    PSI group can hand run_tick ``{}`` every tick while the process and load
+    groups keep writing.  The recency bound is anchored to a GLOBAL MAX(ts), so
+    the still-writing groups advance the anchor and the stalled group's last
+    rows fall outside the window.  Those cards then return the placeholder
+    shape, where the unbounded query kept serving hour-old values.
+
+    That is INTENDED, and it is why the anchor stays global.  /api/load is
+    polled every 5 s and the frontend renders ``current`` as the live number,
+    so a value last written over an hour ago is not a stale reading of the
+    host's load — it is a reading of a collector that has stopped, and saying
+    "no data" is the honest answer.  The whole-sampler-down case above is
+    genuinely different: there the anchor moves with the data, so nothing is
+    claimed to be fresher than anything else.
+    """
+    db_path = tmp_path / 'partial-degrade.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    base = 10_000_000
+    rows = [
+        # The load group kept ticking right up to `base`.
+        (base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+        for i in range(10)
+    ]
+    # The PSI group stopped two hours ago — beyond the 1 h slack.
+    rows += [(base - 7200 - (9 - i) * 5, 'psi_cpu_some_avg10', 5.0 + i, None, None)
+             for i in range(10)]
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['verify_concurrency']['current'] == 109.0
+    assert result['psi_cpu_some_avg10'] == {
+        'current': None, 'sparkline': [], 'window_mean': None, 'window_max': None,
+    }, 'a collector stalled beyond the slack must read as no-data, not as live'
