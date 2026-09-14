@@ -80,6 +80,24 @@ _RANGE_SEP = '..'
 DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WINDOW = '14d'
 
+# The budget family's home. Resolved off THIS FILE's location rather than
+# imported by bare name, because a bare `from module_budget_family import ...`
+# resolves only under pytest — tests/scripts/conftest.py is what puts that
+# directory on sys.path, and this script must also run as a plain CLI.
+_FAMILY_DIR = Path(__file__).resolve().parent.parent / 'tests' / 'scripts'
+
+# D17's refusal ceiling, restated here for the REPORT only. The gate that acts
+# on it is test_module_verify_budgets.py::CENSUS_FLOOR_REFUSAL_CEILING; this
+# copy exists so an operator running the census learns that a floor above it is
+# a FINDING without having to read the guard.
+REFUSAL_CEILING = 7200
+
+# The constant this census feeds, named in the report so an operator running it
+# knows where the number lands.
+FEEDS_CONSTANT = (
+    'tests/scripts/test_module_verify_budgets.py::ORCHESTRATOR_BUDGET_CENSUS'
+)
+
 
 @dataclass(frozen=True)
 class RecordPath:
@@ -900,6 +918,7 @@ def build_report(
         'by_load_band': by_load_band(legs),
         'cold_separability': cold_separability(legs),
         'merge_gate': merge_gate_budget(roots[0]),
+        'budget_check': budget_check(summarise_legs(legs)),
     }
 
 
@@ -959,6 +978,18 @@ def format_report(report: dict[str, Any]) -> str:
     if report['by_day']:
         lines += ['', 'BY DAY (UTC)']
         lines += [_format_row(day, row) for day, row in report['by_day'].items()]
+
+    check = report['budget_check']
+    lines += [
+        '',
+        'DERIVED BUDGET FLOOR (ruling D17: 1.5x the measured max, '
+        'rounded up to 100s)',
+        f"  measured max   {check['measured_max'] or '-'}",
+        f"  derived floor  {check['derived_floor'] or '<none>'}"
+        f"  (refusal ceiling {check['refusal_ceiling']})",
+        f"  feeds          {check['feeds']}",
+        f"  {check['note']}",
+    ]
 
     cold = report['cold_separability']
     lines += [
@@ -1056,6 +1087,80 @@ def main(argv: Sequence[str], now: datetime | None = None) -> int:
     print(json.dumps(report, indent=2) if args.json else format_report(report))
     return status
 
+
+
+def _census_budget_floor(worst: float) -> int | None:
+    """D17's derived floor for *worst*, via the budget family's ONE spelling.
+
+    Imported rather than re-spelled, so the floor this report PRINTS and the
+    floor ``test_module_verify_budgets``' excepted branch ASSERTS cannot drift
+    apart — an operator must be able to run this, read a number, and set the
+    budget to it without the gate disagreeing. This is the same property the
+    family's canonical-expression guard establishes for ``min_budget``.
+
+    Returns ``None`` when the family module cannot be located, and the report
+    says "derivation unavailable" rather than falling back to a locally-written
+    multiple. That fallback is the one thing this function must not do: it
+    would agree today and drift the moment either side changed, which is
+    precisely the failure the shared expression prevents. The closing guard in
+    tests/scripts/test_verify_budget_census.py asserts against this file's
+    SOURCE that no such multiple appears here, so the phrasing above avoids
+    writing one even inside prose.
+    """
+    if str(_FAMILY_DIR) not in sys.path:
+        sys.path.insert(0, str(_FAMILY_DIR))
+    try:
+        from module_budget_family import census_budget_floor
+    except ImportError:
+        return None
+    return census_budget_floor(worst)
+
+
+def budget_check(overall: dict[str, Any]) -> dict[str, Any]:
+    """The derived-floor section: what this distribution implies for a budget.
+
+    ``derived_floor`` is ``None`` when there is no max to derive from — never a
+    ``0``, which would read as a derived answer — and when the family module is
+    unreachable, which is reported as its own state.
+    """
+    worst = overall['durations']['max']
+    floor = None if worst is None else _census_budget_floor(worst)
+    if worst is None:
+        note = (
+            'No full-suite run in this window, so no floor is derived. This is '
+            'NOT a floor of zero.'
+        )
+    elif floor is None:
+        note = (
+            f'Derivation UNAVAILABLE: could not import census_budget_floor from '
+            f'{_FAMILY_DIR}. Deliberately NOT recomputed locally — a second '
+            f'spelling would agree today and drift later. Run this from a full '
+            f'checkout to get the floor.'
+        )
+    elif floor > REFUSAL_CEILING:
+        note = (
+            f'The derived floor {floor}s EXCEEDS the {REFUSAL_CEILING}s refusal '
+            f'ceiling. THIS IS A FINDING TO ESCALATE, NOT A BUDGET TO RAISE '
+            f'(ruling D17; commit 36c4c71eb4 recorded that "the next raise '
+            f'should be refused"). File '
+            f"escalate_blocker(category='design_concern') with these figures. "
+            f'The remedy is trimming the suite, not a wider budget.'
+        )
+    else:
+        note = (
+            f'The derived floor {floor}s is within the {REFUSAL_CEILING}s '
+            f'refusal ceiling, with {REFUSAL_CEILING - floor}s of floor to '
+            f'spare. A slower worst run consumes that margin; crossing it is a '
+            f'finding to escalate rather than a number to raise.'
+        )
+    return {
+        'measured_max': worst,
+        'derived_floor': floor,
+        'refusal_ceiling': REFUSAL_CEILING,
+        'exceeds_refusal_ceiling': floor is not None and floor > REFUSAL_CEILING,
+        'feeds': FEEDS_CONSTANT,
+        'note': note,
+    }
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1:]))
