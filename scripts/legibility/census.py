@@ -1305,6 +1305,152 @@ def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
     return same_title[-1] if same_title else None
 
 
+DROP_NO_STANDING = "no-standing-candidate"
+DROP_CONTRADICTION = "contradicts-standing"
+DROP_AGREEMENT = "agrees-with-standing"
+"""Stable machine keys for the three ways a paid-for verdict can be dropped.
+
+Same convention, and the same reason, as the ``SECTION_*`` report keys above:
+the distinction an operator acts on must be readable as DATA, not recovered by
+matching English out of a log line. The three differ in what an operator must
+DO -- the merge and this run disagree about the title / a standing record
+contradicts a fresh verdict / a standing record agrees with it -- which is what
+justified separate messages in the first place, so it is the thing to carry
+structurally and the thing tests assert on."""
+
+
+@dataclass(frozen=True)
+class DroppedVerdict:
+    """One verdict this run PAID FOR that resolved to no pending candidate
+    and was therefore discarded.
+
+    Post-4144 the drop itself is CORRECT: the merger declines to fabricate a
+    pending twin over an already-adjudicated record. What was missing is that
+    it happened at all, and against WHAT. The run summary, the persisted
+    report and the tests all read this one structure."""
+
+    verdict: str
+    """``"verified"`` or ``"rejected"`` -- which adjudication loop paid for it.
+    Inverts against ``standing_disposition``; see :func:`_dropped_verdict`."""
+
+    title: str | None
+    kind: str
+    """``DROP_NO_STANDING`` / ``DROP_CONTRADICTION`` / ``DROP_AGREEMENT``."""
+
+    standing_id: str | None = None
+    standing_disposition: str | None = None
+    standing_first_seen: str | None = None
+    """The standing record that explains the drop -- all three ``None``
+    exactly when ``kind`` is ``DROP_NO_STANDING``. ``first_seen`` and
+    ``disposition`` are ``_CANDIDATE_SCHEMA``-REQUIRED fields
+    (``codebook.py::_CANDIDATE_SCHEMA``), so a standing record always carries
+    them."""
+
+
+def _dropped_verdict(
+    *, verdict: str, cluster: dict, cb: dict, contradicting_disposition: str,
+) -> DroppedVerdict:
+    """Classify one dropped *verdict* against whatever candidate is standing
+    for *cluster*'s title in *cb*.
+
+    THE INVERSION, and the only thing that differs between the two
+    adjudication loops: ``promoted`` and ``rejected`` swap roles. A standing
+    PROMOTION contradicts a fresh REJECT (a live codebook entry stands for a
+    title this run judged unfounded); a standing REJECT contradicts a fresh
+    VERIFY (a pattern this run confirmed enters no entry at all). That
+    inversion is one value -- *contradicting_disposition* -- passed at each
+    call site, where it sits next to the loop it belongs to and is the
+    obvious thing to read when checking whether a label is right.
+
+    A parameter rather than two copies of this ladder: the mislabelling edit
+    both shapes guard against fails
+    ``test_dropped_verdict_contradiction_marker_inverts_between_the_loops``
+    either way, while two copies additionally allow the messages to DRIFT,
+    which no test catches."""
+    standing = _find_adjudicated_candidate(cb, cluster.get("title"))
+    if standing is None:
+        return DroppedVerdict(
+            verdict=verdict, title=cluster.get("title"), kind=DROP_NO_STANDING,
+        )
+    return DroppedVerdict(
+        verdict=verdict,
+        title=cluster.get("title"),
+        kind=(
+            DROP_CONTRADICTION
+            if standing.get("disposition") == contradicting_disposition
+            else DROP_AGREEMENT
+        ),
+        standing_id=standing.get("id"),
+        standing_disposition=standing.get("disposition"),
+        standing_first_seen=standing.get("first_seen"),
+    )
+
+
+_DROPPED_VERDICT_LOSS = {
+    "verified": (
+        "this run CONFIRMED a pattern a prior verdict called unfounded, so it enters "
+        "NO codebook entry and is invisible to every later census"
+    ),
+    "rejected": (
+        "a live codebook entry stands for a title this run judged unfounded"
+    ),
+}
+"""What a CONTRADICTED drop actually COSTS, per loop -- the one clause
+:func:`_dropped_verdict_message` cannot render uniformly, because the two
+losses differ in substance and not merely in wording."""
+
+
+def _dropped_verdict_message(record: DroppedVerdict) -> str:
+    """The operator-facing WARNING text for *record* -- rendered FROM the
+    record, so the prose is free to be reworded without breaking anything
+    that asserts on the drop."""
+    if record.kind == DROP_NO_STANDING:
+        return (
+            f"census: {record.verdict} cluster {record.title!r} resolved to no pending "
+            "candidate AND no same-title candidate exists at all -- this verdict is "
+            "DROPPED with no standing record to explain it; the merge and this run's "
+            "cluster list disagree about the title."
+        )
+    standing = (
+        f"id={record.standing_id}, disposition={record.standing_disposition}, "
+        f"first_seen={record.standing_first_seen}"
+    )
+    if record.kind == DROP_CONTRADICTION:
+        return (
+            f"census: {record.verdict} cluster {record.title!r} resolved to no pending "
+            f"candidate -- this verdict is DROPPED and CONTRADICTS the standing "
+            f"{record.standing_disposition} record ({standing}): "
+            f"{_DROPPED_VERDICT_LOSS[record.verdict]}. Nothing reconciles the two; "
+            "only a hand re-open will change it."
+        )
+    return (
+        f"census: {record.verdict} cluster {record.title!r} resolved to no pending "
+        "candidate -- this verdict is DROPPED and AGREES with the standing one, which "
+        f"already recorded the title as {record.standing_disposition} ({standing}). "
+        "Nothing to do; only the verify call was spent."
+    )
+
+
+def _report_dropped_verdicts(records: list[DroppedVerdict]) -> None:
+    """Announce the run's dropped verdicts: one WARNING per record, then ONE
+    run-summary line sizing the total.
+
+    Emitted only when there is something to say -- silence on a clean run
+    keeps the summary informative rather than skimmable. The per-record lines
+    say WHICH titles; the summary says how much of the run went nowhere."""
+    for record in records:
+        logger.warning("%s", _dropped_verdict_message(record))
+    if records:
+        logger.warning(
+            "census: %d unresolved verdict(s) -- verdicts that found no pending "
+            "candidate and were dropped. These were PAID FOR and went nowhere: a "
+            "prior adjudication of the same title is standing and only a hand "
+            "re-open will change it. See the per-cluster warnings above for which "
+            "titles.",
+            len(records),
+        )
+
+
 def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
     """Return *path* if it is free, else the first unused numbered sibling
     (``{stem}-2{suffix}``, ``{stem}-3{suffix}``, ...).
@@ -1386,9 +1532,21 @@ class CensusOutcome:
     cap interrupted, which is what makes a defer legible next to an
     ordinary run in which the verifier genuinely rejected everything."""
 
+    dropped_verdicts: tuple[DroppedVerdict, ...] = ()
+    """Every verdict this run PAID FOR that resolved to no pending candidate
+    and was dropped, one record each (``status == "done"`` runs only).
+
+    THE authority on what was dropped: ``unresolved_verdicts`` below is its
+    length, the run-summary WARNING is rendered from it, and the report's
+    unresolved-verdicts section is built from it. A caller asking WHICH titles
+    went nowhere, and whether any of them contradicts a standing record, reads
+    records rather than the English of a log line."""
+
     unresolved_verdicts: int = 0
     """How many verify verdicts this run PAID FOR resolved to no pending
-    candidate and were dropped (``status == "done"`` runs only).
+    candidate and were dropped (``status == "done"`` runs only) --
+    ``len(dropped_verdicts)``, kept as its own field because it is what
+    ``main``'s summary line and every count-only caller actually want.
 
     NOT a loss of persisted state -- the codebook is correct either way. The
     standing prior verdict holding is the CORRECT outcome; the merger is
@@ -1843,10 +2001,11 @@ def run_census(
     for record in mining_result.records:
         updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
 
-    # ONE counter for every verdict this run paid for and dropped, shared by
-    # both adjudication loops below -- a per-loop name would fork the tally
-    # permanently.
-    unresolved_verdicts = 0
+    # ONE list for every verdict this run paid for and dropped, shared by both
+    # adjudication loops below -- a per-loop name would fork the tally
+    # permanently. Records, not a bare count, so the run summary, the persisted
+    # report and the tests all read one structure.
+    dropped_verdicts: list[DroppedVerdict] = []
 
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -1859,44 +2018,16 @@ def run_census(
             # CONFIRMED enters no codebook entry, and every later census codes
             # against entries -- so it goes invisible, not merely uncounted.
             #
-            # THE INVERSION: `promoted` and `rejected` swap roles between the
-            # two loops. A standing PROMOTION contradicts a fresh REJECT; a
-            # standing REJECT contradicts a fresh VERIFY. These two ladders
-            # read as near-duplicates and are not -- this is the one place the
-            # loops must NOT be unified, because a shared ladder would
-            # silently mislabel every drop in whichever loop lost the
-            # argument. Pinned by
-            # test_dropped_verdict_contradiction_marker_inverts_between_the_loops.
-            unresolved_verdicts += 1
-            standing = _find_adjudicated_candidate(updated_codebook, cluster.get("title"))
-            if standing is None:
-                logger.warning(
-                    "census: verified cluster %r resolved to no pending candidate AND "
-                    "no same-title candidate exists at all -- this verdict is DROPPED "
-                    "with no standing record to explain it; the merge and this run's "
-                    "cluster list disagree about the title.",
-                    cluster.get("title"),
-                )
-            elif standing.get("disposition") == "rejected":
-                logger.warning(
-                    "census: verified cluster %r resolved to no pending candidate -- "
-                    "this verdict is DROPPED and CONTRADICTS a standing REJECTION: this "
-                    "run CONFIRMED a pattern a prior verdict called unfounded "
-                    "(id=%s, disposition=%s, first_seen=%s), so it enters NO codebook "
-                    "entry and is invisible to every later census. Nothing reconciles "
-                    "the two; only a hand re-open will change it.",
-                    cluster.get("title"), standing.get("id"),
-                    standing.get("disposition"), standing.get("first_seen"),
-                )
-            else:
-                logger.warning(
-                    "census: verified cluster %r resolved to no pending candidate -- "
-                    "this verdict is DROPPED and AGREES with the standing one, which "
-                    "already promoted the title to a live entry (id=%s, disposition=%s, "
-                    "first_seen=%s). Nothing to do; only the verify call was spent.",
-                    cluster.get("title"), standing.get("id"),
-                    standing.get("disposition"), standing.get("first_seen"),
-                )
+            dropped_verdicts.append(_dropped_verdict(
+                verdict="verified",
+                cluster=cluster,
+                cb=updated_codebook,
+                # THE INVERSION, this loop's half: a standing REJECT is what
+                # contradicts a fresh VERIFY. The `rejected` loop below passes
+                # "promoted". Pinned by
+                # test_dropped_verdict_contradiction_marker_inverts_between_the_loops.
+                contradicting_disposition="rejected",
+            ))
             continue
         severity = cluster.get("severity")
         if severity not in _VALID_ENTRY_SEVERITIES:
@@ -1923,56 +2054,22 @@ def run_census(
             # candidate. Post-4144 this is a normal outcome, not an anomaly:
             # the merger declined to fabricate a pending twin over a standing
             # verdict. Skipping it is still correct -- announcing it is what
-            # was missing. The three branches differ in what an operator must
-            # DO, which is the only thing that justifies separate messages.
-            unresolved_verdicts += 1
-            standing = _find_adjudicated_candidate(updated_codebook, cluster.get("title"))
-            if standing is None:
-                logger.warning(
-                    "census: rejected cluster %r resolved to no pending candidate AND "
-                    "no same-title candidate exists at all -- this verdict is DROPPED "
-                    "with no standing record to explain it; the merge and this run's "
-                    "cluster list disagree about the title.",
-                    cluster.get("title"),
-                )
-            elif standing.get("disposition") == "promoted":
-                logger.warning(
-                    "census: rejected cluster %r resolved to no pending candidate -- "
-                    "this verdict is DROPPED and CONTRADICTS a standing PROMOTION: a "
-                    "live codebook entry stands for a title this run judged unfounded "
-                    "(id=%s, disposition=%s, first_seen=%s). Nothing reconciles the "
-                    "two; only a hand re-open will change it.",
-                    cluster.get("title"), standing.get("id"),
-                    standing.get("disposition"), standing.get("first_seen"),
-                )
-            else:
-                logger.warning(
-                    "census: rejected cluster %r resolved to no pending candidate -- "
-                    "this verdict is DROPPED and AGREES with the standing one, which "
-                    "already rejected the title (id=%s, disposition=%s, first_seen=%s). "
-                    "Nothing to do; only the verify call was spent.",
-                    cluster.get("title"), standing.get("id"),
-                    standing.get("disposition"), standing.get("first_seen"),
-                )
+            # was missing.
+            dropped_verdicts.append(_dropped_verdict(
+                verdict="rejected",
+                cluster=cluster,
+                cb=updated_codebook,
+                # THE INVERSION, this loop's half: a standing PROMOTION is what
+                # contradicts a fresh REJECT.
+                contradicting_disposition="promoted",
+            ))
             continue
         updated_codebook = reject_candidate(updated_codebook, cand_id)
 
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
 
-    # ONE run-summary line, emitted only when there is something to say --
-    # silence on a clean run keeps the line informative rather than
-    # skimmable. The per-cluster warnings above say WHICH titles; this says
-    # how much of the run went nowhere.
-    if unresolved_verdicts:
-        logger.warning(
-            "census: %d unresolved verdict(s) -- verdicts that found no pending "
-            "candidate and were dropped. These were PAID FOR and went nowhere: a "
-            "prior adjudication of the same title is standing and only a hand "
-            "re-open will change it. See the per-cluster warnings above for which "
-            "titles.",
-            unresolved_verdicts,
-        )
+    _report_dropped_verdicts(dropped_verdicts)
 
     validation_errors = codebook.validate(updated_codebook)
     if validation_errors:
@@ -2151,7 +2248,8 @@ def run_census(
         filed_task_ids=filed_task_ids,
         stop_reason=mining_result.stop_reason,
         dry_run=dry_run_filing,
-        unresolved_verdicts=unresolved_verdicts,
+        dropped_verdicts=tuple(dropped_verdicts),
+        unresolved_verdicts=len(dropped_verdicts),
     )
 
 

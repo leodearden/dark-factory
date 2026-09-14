@@ -2154,13 +2154,42 @@ def _verify_fn_with_unknown_titles(*, verified=(), rejected=()):
 
 def _dropped_verdict_warnings(caplog):
     """Every WARNING naming `_REJECTED_TITLE` as a dropped verdict -- either
-    loop's, since both name the title and both say DROPPED."""
+    loop's, since both name the title and both say DROPPED.
+
+    Used to assert the drop is ANNOUNCED at all (a silent drop is the whole
+    defect) and, in one place, that the announcement names the record it came
+    from. What KIND of drop it is comes off
+    `CensusOutcome.dropped_verdicts`, not out of this English."""
     return [
         r.getMessage() for r in caplog.records
         if r.levelno == logging.WARNING
         and _REJECTED_TITLE in r.getMessage()
         and "DROPPED" in r.getMessage()
     ]
+
+
+def _drop_warnings_naming(caplog, title):
+    """Every dropped-verdict WARNING naming *title* -- the general form of
+    `_dropped_verdict_warnings`, for the ghost-title runs."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and title in r.getMessage()
+        and "DROPPED" in r.getMessage()
+    ]
+
+
+def _one_dropped(outcome):
+    """The run's single dropped-verdict record, or a legible failure naming
+    what was actually carried.
+
+    THE structure these tests assert on: `kind` is a closed set of machine
+    keys, so the contradiction/agreement distinction an operator acts on is
+    checked as data instead of by matching "CONTRADICT" inside a sentence
+    that is free to be reworded."""
+    records = outcome.dropped_verdicts
+    assert len(records) == 1, f"expected exactly one dropped verdict; got: {records}"
+    return records[0]
 
 
 def test_run_census_dropped_reject_over_a_promoted_candidate_is_a_contradiction(
@@ -2177,20 +2206,17 @@ def test_run_census_dropped_reject_over_a_promoted_candidate_is_a_contradiction(
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    messages = _dropped_verdict_warnings(caplog)
-    assert len(messages) == 1, (
-        "exactly one WARNING must name the dropped reject verdict; got: "
-        f"{messages}"
-    )
-    message = messages[0]
-    # All four facts an operator needs to find the standing record by hand.
-    assert _REJECTED_TITLE in message
-    assert "cand-20260701-7" in message
-    assert "promoted" in message
-    assert "2026-07-01" in message
+    record = _one_dropped(outcome)
+    assert record.verdict == "rejected"
+    assert record.title == _REJECTED_TITLE
     # The marker that separates this from the agreement case below. A live
     # ENTRY standing against a fresh reject is the thing to act on.
-    assert "CONTRADICT" in message.upper()
+    assert record.kind == mod.DROP_CONTRADICTION
+    # All three facts an operator needs to find the standing record by hand.
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "promoted"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
 
     # Surfacing the drop must not change what is persisted.
     assert outcome.status == "done"
@@ -2214,16 +2240,16 @@ def test_run_census_dropped_reject_over_a_rejected_candidate_is_agreement(
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    messages = _dropped_verdict_warnings(caplog)
-    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
-    message = messages[0]
-    assert _REJECTED_TITLE in message
-    assert "cand-20260701-7" in message
-    assert "rejected" in message
-    assert "2026-07-01" in message
-    # Asserted as an ABSENCE against the marker the promoted case asserts as a
-    # presence, so the two messages cannot converge on one wording later.
-    assert "CONTRADICT" not in message.upper()
+    record = _one_dropped(outcome)
+    assert record.verdict == "rejected"
+    assert record.title == _REJECTED_TITLE
+    # Asserted against the key the promoted case asserts, so the two cases
+    # cannot converge on one classification later.
+    assert record.kind == mod.DROP_AGREEMENT
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "rejected"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
 
     assert outcome.status == "done"
     assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
@@ -2253,16 +2279,19 @@ def test_run_census_dropped_reject_with_no_standing_candidate_says_so_plainly(
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    messages = [
-        r.getMessage() for r in caplog.records
-        if r.levelno == logging.WARNING
-        and "A title the merge never saw" in r.getMessage()
-        and "DROPPED" in r.getMessage()
-    ]
-    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
-    message = messages[0]
-    assert "no same-title candidate" in message.lower()
-    assert "disagree" in message.lower()
+    record = _one_dropped(outcome)
+    assert record.verdict == "rejected"
+    assert record.title == "A title the merge never saw"
+    assert record.kind == mod.DROP_NO_STANDING
+    # All three standing fields are None exactly when there is no standing
+    # record -- the absence is carried, not explained away with a fabricated
+    # one.
+    assert (
+        record.standing_id,
+        record.standing_disposition,
+        record.standing_first_seen,
+    ) == (None, None, None)
+    assert _drop_warnings_naming(caplog, record.title), "the drop must be announced"
 
     assert outcome.status == "done"
     assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
@@ -2296,18 +2325,16 @@ def test_run_census_dropped_verify_over_a_rejected_candidate_is_a_contradiction(
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    messages = _dropped_verdict_warnings(caplog)
-    assert len(messages) == 1, (
-        f"exactly one WARNING must name the dropped verify verdict; got: {messages}"
-    )
-    message = messages[0]
-    # The same four facts the reject branches name, so an operator finds the
-    # standing record by hand from either loop's line.
-    assert _REJECTED_TITLE in message
-    assert "cand-20260701-7" in message
-    assert "rejected" in message
-    assert "2026-07-01" in message
-    assert "CONTRADICT" in message.upper()
+    record = _one_dropped(outcome)
+    assert record.verdict == "verified"
+    assert record.title == _REJECTED_TITLE
+    assert record.kind == mod.DROP_CONTRADICTION
+    # The same three facts the reject branches carry, so an operator finds the
+    # standing record by hand from either loop's drop.
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "rejected"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
 
     # WHAT WAS ACTUALLY LOST. The reject-side trio has no analogue for this
     # assertion, and it is the one that would have caught the silence: a
@@ -2336,16 +2363,16 @@ def test_run_census_dropped_verify_over_a_promoted_candidate_is_agreement(
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    messages = _dropped_verdict_warnings(caplog)
-    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
-    message = messages[0]
-    assert _REJECTED_TITLE in message
-    assert "cand-20260701-7" in message
-    assert "promoted" in message
-    assert "2026-07-01" in message
-    # Asserted as an ABSENCE against the presence asserted above, so the two
-    # messages cannot converge on one wording later.
-    assert "CONTRADICT" not in message.upper()
+    record = _one_dropped(outcome)
+    assert record.verdict == "verified"
+    assert record.title == _REJECTED_TITLE
+    # Asserted against the key the contradiction case asserts, so the two
+    # cases cannot converge on one classification later.
+    assert record.kind == mod.DROP_AGREEMENT
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "promoted"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
 
     assert outcome.status == "done"
     assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
@@ -2362,12 +2389,16 @@ def test_dropped_verdict_contradiction_marker_inverts_between_the_loops(tmp_path
     every drop it touches. Asserted here so that edit fails at the inversion
     rather than in an operator's journal."""
     cases = [
-        ("fresh VERIFY vs standing reject", _verified_run_kwargs, "rejected", True),
-        ("fresh VERIFY vs standing promotion", _verified_run_kwargs, "promoted", False),
-        ("fresh REJECT vs standing promotion", _rejected_run_kwargs, "promoted", True),
-        ("fresh REJECT vs standing reject", _rejected_run_kwargs, "rejected", False),
+        ("fresh VERIFY vs standing reject",
+         _verified_run_kwargs, "rejected", mod.DROP_CONTRADICTION),
+        ("fresh VERIFY vs standing promotion",
+         _verified_run_kwargs, "promoted", mod.DROP_AGREEMENT),
+        ("fresh REJECT vs standing promotion",
+         _rejected_run_kwargs, "promoted", mod.DROP_CONTRADICTION),
+        ("fresh REJECT vs standing reject",
+         _rejected_run_kwargs, "rejected", mod.DROP_AGREEMENT),
     ]
-    for label, build_kwargs, standing, expect_contradiction in cases:
+    for label, build_kwargs, standing, expected_kind in cases:
         caplog.clear()
         kwargs = build_kwargs(
             tmp_path / label.replace(" ", "-"), _codebook_with_standing(standing),
@@ -2375,14 +2406,13 @@ def test_dropped_verdict_contradiction_marker_inverts_between_the_loops(tmp_path
         with caplog.at_level(logging.WARNING):
             outcome = mod.run_census(**kwargs)
 
-        messages = _dropped_verdict_warnings(caplog)
-        assert len(messages) == 1, f"{label}: expected one WARNING; got: {messages}"
-        marked = "CONTRADICT" in messages[0].upper()
-        assert marked is expect_contradiction, (
-            f"{label}: contradiction marker present={marked}, expected "
-            f"{expect_contradiction} -- the two loops invert, they do not share "
-            f"one branch ladder. Message: {messages[0]}"
+        record = _one_dropped(outcome)
+        assert record.kind == expected_kind, (
+            f"{label}: classified {record.kind!r}, expected {expected_kind!r} -- "
+            f"the two loops invert; `contradicting_disposition` at the call site "
+            f"is the one value that inverts. Record: {record}"
         )
+        assert record.standing_disposition == standing
         assert outcome.status == "done"
         assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
 
@@ -2406,10 +2436,12 @@ def test_standing_candidate_follows_the_mergers_promoted_first_precedence(
     authoritative, because no entry exists to carry the signal -- so the
     later `rejected` record stands and the drop really is an agreement."""
     cases = [
-        ("promoted_to resolves", "entry-spurious", "cand-20260701-7", True),
-        ("promoted_to dangles", "entry-that-never-existed", "cand-20260724-2", False),
+        ("promoted_to resolves",
+         "entry-spurious", "cand-20260701-7", mod.DROP_CONTRADICTION),
+        ("promoted_to dangles",
+         "entry-that-never-existed", "cand-20260724-2", mod.DROP_AGREEMENT),
     ]
-    for label, promoted_to, expected_id, expect_contradiction in cases:
+    for label, promoted_to, expected_id, expected_kind in cases:
         caplog.clear()
         kwargs = _rejected_run_kwargs(
             tmp_path / label.replace(" ", "-"),
@@ -2418,17 +2450,14 @@ def test_standing_candidate_follows_the_mergers_promoted_first_precedence(
         with caplog.at_level(logging.WARNING):
             outcome = mod.run_census(**kwargs)
 
-        messages = _dropped_verdict_warnings(caplog)
-        assert len(messages) == 1, f"{label}: expected one WARNING; got: {messages}"
-        message = messages[0]
-        assert expected_id in message, (
-            f"{label}: the standing record named must be the one the merger "
-            f"routes to ({expected_id}); message: {message}"
+        record = _one_dropped(outcome)
+        assert record.standing_id == expected_id, (
+            f"{label}: the standing record must be the one the merger routes "
+            f"to ({expected_id}); record: {record}"
         )
-        marked = "CONTRADICT" in message.upper()
-        assert marked is expect_contradiction, (
-            f"{label}: contradiction marker present={marked}, expected "
-            f"{expect_contradiction} -- message: {message}"
+        assert record.kind == expected_kind, (
+            f"{label}: classified {record.kind!r}, expected {expected_kind!r} -- "
+            f"record: {record}"
         )
         assert outcome.status == "done"
         assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
@@ -2452,16 +2481,16 @@ def test_run_census_dropped_verify_with_no_standing_candidate_says_so_plainly(
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    messages = [
-        r.getMessage() for r in caplog.records
-        if r.levelno == logging.WARNING
-        and ghost in r.getMessage()
-        and "DROPPED" in r.getMessage()
-    ]
-    assert len(messages) == 1, f"expected one dropped-verdict WARNING; got: {messages}"
-    message = messages[0]
-    assert "no same-title candidate" in message.lower()
-    assert "disagree" in message.lower()
+    record = _one_dropped(outcome)
+    assert record.verdict == "verified"
+    assert record.title == ghost
+    assert record.kind == mod.DROP_NO_STANDING
+    assert (
+        record.standing_id,
+        record.standing_disposition,
+        record.standing_first_seen,
+    ) == (None, None, None)
+    assert _drop_warnings_naming(caplog, ghost), "the drop must be announced"
 
     assert outcome.status == "done"
     assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
@@ -2548,6 +2577,62 @@ def test_run_census_carries_unresolved_verdicts_as_an_outcome_field(tmp_path, ca
 
     assert dropping_outcome.unresolved_verdicts == 2
     assert clean_outcome.unresolved_verdicts == 0
+    # The count is the records' length, always -- two fields that can disagree
+    # are two sources of truth, and `main`'s summary line reads the count while
+    # the report reads the records.
+    assert dropping_outcome.unresolved_verdicts == len(dropping_outcome.dropped_verdicts)
+    assert clean_outcome.unresolved_verdicts == len(clean_outcome.dropped_verdicts)
+    assert clean_outcome.dropped_verdicts == ()
+
+
+def test_dropped_verdict_warning_is_rendered_from_the_record(tmp_path, caplog):
+    """THE one place the operator-facing drop prose is checked, and it is
+    checked against the RECORD's own field values rather than a hand-picked
+    phrase.
+
+    What must hold is that a drop is announced and names the standing record
+    an operator would have to go and find; every other word is free to be
+    reworded, which is the point of moving the contradiction/agreement
+    distinction onto `kind`. Covers all three kinds and both loops, since the
+    message builder branches on exactly those."""
+    ghost = "A title the merge never saw"
+    cases = {
+        "contradiction": _rejected_run_kwargs(
+            tmp_path / "contradiction", _codebook_with_standing("promoted"),
+        ),
+        "agreement": _verified_run_kwargs(
+            tmp_path / "agreement", _codebook_with_standing("promoted"),
+        ),
+        "no-standing": _rejected_run_kwargs(
+            tmp_path / "no-standing", _minimal_v2_codebook(),
+            verify_fn=_verify_fn_rejecting_unknown_titles(ghost),
+        ),
+    }
+    seen_kinds = set()
+    for label, kwargs in cases.items():
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            outcome = mod.run_census(**kwargs)
+
+        record = _one_dropped(outcome)
+        seen_kinds.add(record.kind)
+        messages = _drop_warnings_naming(caplog, record.title)
+        assert len(messages) == 1, f"{label}: expected one WARNING; got: {messages}"
+        for field_name in (
+            "verdict", "title", "standing_id",
+            "standing_disposition", "standing_first_seen",
+        ):
+            value = getattr(record, field_name)
+            if value is None:
+                continue
+            assert str(value) in messages[0], (
+                f"{label}: the WARNING does not name {field_name}={value!r}, so an "
+                f"operator cannot find the record it is about. Message: {messages[0]}"
+            )
+
+    assert seen_kinds == {
+        mod.DROP_CONTRADICTION, mod.DROP_AGREEMENT, mod.DROP_NO_STANDING,
+    }, f"every kind must be exercised; reached: {seen_kinds}"
 
 
 def test_unresolved_verdicts_is_one_counter_reached_by_both_loops(tmp_path, caplog):
@@ -2584,6 +2669,9 @@ def test_unresolved_verdicts_is_one_counter_reached_by_both_loops(tmp_path, capl
         f"on the same counter. Got: {summaries[0]}"
     )
     assert mixed_outcome.unresolved_verdicts == 2
+    # The structural form of the same claim, and the stronger one: a count of
+    # 2 is reachable from one loop, a record from EACH loop is not.
+    assert {r.verdict for r in mixed_outcome.dropped_verdicts} == {"verified", "rejected"}
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
