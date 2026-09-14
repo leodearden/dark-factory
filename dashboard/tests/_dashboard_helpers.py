@@ -126,11 +126,37 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     the empty list, i.e. exactly one root to fan out over; there is no temp
     path to redirect it to that would be more isolated than none.
 
+    SETS ``DASHBOARD_FUSED_MEMORY_URLS``, which inverts the
+    delete-rather-than-redirect rule above — deliberately, and the asymmetry
+    has to be stated or the next reader will "consolidate" it into the
+    ``delenv`` list and silently re-aim the suite at production.  Deleting the
+    three vars above makes the config fall back to ``project_root``-relative
+    paths, which are already inside the isolated root.  Deleting THIS one
+    falls back to ``DEFAULT_FUSED_MEMORY_URLS = ('http://localhost:8002',)`` —
+    the operator's live shared fused-memory instance, measured answering a 404
+    in 1.29ms on 2026-09-14.  For this variable, deleting is the OPPOSITE of
+    isolation, and unset is the state the whole suite ran in until task 5185.
+
+    The traffic that stops: ``lifespan()`` spawns ``_burndown_loop``, which
+    immediately ``await collect_snapshot(...)`` -> ``data/tasks.py::fetch_tasks``
+    -> ``TTLCache.get_or_refresh`` + ``mcp_fanout.first_success`` against that
+    URL, and ``_metrics_loop`` does the same — twice per ``TestClient(app)``
+    lifespan, of which this suite runs many.  A slow real response there keeps
+    that work alive past ``TestClient.__exit__``, which then blocks in
+    ``wait_shutdown`` until pytest-timeout fires, blaming whichever test
+    happened to be holding the fixture.
+
+    A DEFAULT, not a lock, exactly like the paths above: a function-scoped
+    ``monkeypatch.setenv`` is created after — and torn down before — the
+    session-scoped context, so ``two_url_client`` and any test that overrides
+    the URLs itself still wins unchanged.
+
     A plain function rather than a fixture so the env contract is directly
     unit-testable against a simulated operator environment — a session-scoped
     autouse fixture cannot be re-run from inside a test.
     """
     mp.setenv('DASHBOARD_PROJECT_ROOT', str(root))
+    mp.setenv('DASHBOARD_FUSED_MEMORY_URLS', ','.join(HERMETIC_FUSED_MEMORY_URLS))
     mp.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
     mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
     mp.delenv('QUEUE_DATA_DIR', raising=False)
