@@ -242,7 +242,10 @@ class TestHermeticFusedMemoryUrls:
             'a tuple, like DEFAULT_FUSED_MEMORY_URLS it stands in for — a '
             'mutable default is one test away from being edited for everyone'
         )
-        assert HERMETIC_FUSED_MEMORY_URLS, 'the list must not be empty'
+        assert len(HERMETIC_FUSED_MEMORY_URLS) > 0, (
+            'the tuple must not be empty: every check below is a loop over '
+            'it, so an empty one asserts nothing at all'
+        )
         for url, host, port in self._endpoints():
             assert host in ('127.0.0.1', '::1'), (
                 f'{url} must name a loopback literal: a hostname can resolve '
@@ -272,6 +275,7 @@ class TestHermeticFusedMemoryUrls:
         import socket
 
         for url, host, port in self._endpoints():
+            assert port is not None, f'{url} names no port to probe'
             try:
                 with socket.create_connection((host, port), timeout=1.0):
                     pass
