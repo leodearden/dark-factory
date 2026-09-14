@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.briefing_queries import TASK_SEMANTIC, BriefingScope, queries_for
 
 from orchestrator.agents.briefing import (
     FOREIGN_PROJECT_TAG_KEYS,
@@ -66,6 +67,35 @@ def _result(id_: str, content: str, metadata: dict | None = None, source_store: 
         'metadata': {} if metadata is None else metadata,
         'created_at': None,
     }
+
+
+def _task_scope(task_id: str = '3609') -> BriefingScope:
+    """A scope standing in for a real dispatch — an id, a title and declared files.
+
+    Every end-to-end test below drives ``_get_memory_context`` through this,
+    because the query table asks what a dispatch is ABOUT: a scope carrying
+    only an id yields no area terms and so fires the single generic
+    conventions query instead of the two-query task-scoped set.
+    """
+    return BriefingScope.from_task({
+        'id': task_id,
+        'title': 'Project-scope the dispatched-agent briefing context block',
+        'metadata': {'files': ['orchestrator/src/orchestrator/agents/briefing.py']},
+    })
+
+
+def _search_arguments(mcp_call_mock) -> list[dict]:
+    """The ``arguments`` of every ``search`` tools/call the assembler made.
+
+    Filters by tool name rather than counting awaits: a task-scoped dispatch
+    also calls ``get_entity`` on the same transport, and the query-table
+    assertions are about searches.
+    """
+    return [
+        call.args[2]['arguments']
+        for call in mcp_call_mock.await_args_list
+        if call.args[2].get('name') == 'search'
+    ]
 
 
 class TestFilterForeignProjectResults:
@@ -487,12 +517,12 @@ def _mcp_search_envelope(results: list[dict]) -> dict:
 class TestGetMemoryContextFiltersForeignFacts:
     """``_get_memory_context`` drops foreign-tagged results end-to-end.
 
-    ``_mcp_search`` is called once per hardcoded query (project overview,
-    conventions, decisions, and — since a ``task_id`` is passed — task
-    context: four calls). The stub answers every call identically, so a
-    single foreign result per query yields a filtered count of 4 in the
-    assembled block, not 1 — the count must reflect all four queries, not
-    just one.
+    ``_mcp_search`` is called once per spec the query table selects for the
+    scope — for a task-scoped dispatch, the area-conventions and
+    task-semantic pair (task 3659: the four hardcoded queries are gone). The
+    stub answers every call identically, so a single foreign result per query
+    yields a filtered count of 2 in the assembled block, not 1 — the count
+    must reflect both queries, not just one.
     """
 
     async def test_filters_foreign_facts_and_announces_the_drop(
@@ -512,22 +542,23 @@ class TestGetMemoryContextFiltersForeignFacts:
             ),
         ])
         foreign_per_query = 1
-        queries_fired = 4  # overview, conventions, decisions, task-context (task_id given below)
+        queries_fired = 2  # area conventions + task-semantic (the scope declares files)
         expected_dropped = foreign_per_query * queries_fired
 
         with caplog.at_level(logging.INFO), patch(
             'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
         ):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert context.splitlines()[0] == '# Context'
         assert 'Own project fact about dark_factory.' in context
         assert 'crates/reify-compiler' not in context
         assert "A park on 'crates/reify-compiler/src'" not in context
         # The message names BOTH numbers (slots and queries) rather than
-        # just `expected_dropped` — one distinct foreign fact matching all
-        # four queries must not read as "4 memory results", which would
-        # overstate the leak volume by 4x (task 3609 amendment).
+        # just `expected_dropped` — one distinct foreign fact matching every
+        # query must not read as N distinct "memory results", which would
+        # overstate the leak volume by the number of queries fired (task
+        # 3609 amendment).
         assert (
             f'{expected_dropped} memory result slot(s) across {queries_fired} queries were '
             'tagged to another project and filtered out'
@@ -551,12 +582,12 @@ class TestGetMemoryContextFiltersForeignFacts:
         with caplog.at_level(logging.INFO), patch(
             'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
         ):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert context.splitlines()[0] == '# Context'
         assert 'Foreign fact.' not in context
         assert '_No memory context available' in context
-        assert '4 memory result slot(s) across 4 queries' in context
+        assert '2 memory result slot(s) across 2 queries' in context
         assert any(r.levelno == logging.INFO for r in caplog.records)
         assert 'filtered' in caplog.text.lower()
 
@@ -573,13 +604,13 @@ class TestGetMemoryContextFiltersForeignFacts:
         """
         envelope = _mcp_search_envelope([_grouped_parent()])
         # One foreign amendment + one foreign pinned body per query, and the
-        # stub answers all four queries identically.
-        expected_nested = 2 * 4
+        # stub answers both queries identically.
+        expected_nested = 2 * 2
 
         with caplog.at_level(logging.INFO), patch(
             'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
         ):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert 'FOREIGN AMENDMENT BODY' not in context
         assert 'FOREIGN SIGHTING BODY' not in context
@@ -587,7 +618,7 @@ class TestGetMemoryContextFiltersForeignFacts:
             'The parent itself was never foreign and must still be recalled'
         )
         assert (
-            f'{expected_nested} nested memory record(s) across 4 queries were '
+            f'{expected_nested} nested memory record(s) across 2 queries were '
             'tagged to another project and filtered out'
         ) in context, (
             f'a nested-only drop must be reported as nested records, got {context!r}'
@@ -610,16 +641,103 @@ class TestGetMemoryContextFiltersForeignFacts:
         with caplog.at_level(logging.INFO), patch(
             'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
         ):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert 'Foreign fact.' not in context
         assert 'FOREIGN AMENDMENT BODY' not in context
         assert (
-            '4 memory result slot(s) and 8 nested memory record(s) across 4 '
+            '2 memory result slot(s) and 4 nested memory record(s) across 2 '
             'queries were tagged to another project and filtered out'
         ) in context, (
             f'both quantities must be named, and named apart, got {context!r}'
         )
+
+
+@pytest.mark.asyncio
+class TestQueryTableComesFromTheSharedSpecs:
+    """The queries fired are the ones ``shared.briefing_queries`` declares.
+
+    Task 3659 (PRD lane β, D1/D2/D3/D8/D9). The assembler used to spell four
+    queries inline at ``limit=5`` with no store, category or caller identity.
+    Every assertion here reads the expected values back OUT of the shared
+    specs rather than re-spelling them, so a template reworded in ``shared``
+    cannot leave this file passing against a stale copy.
+    """
+
+    async def test_a_task_scoped_dispatch_fires_exactly_two_searches(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        fired = [args['query'] for args in _search_arguments(mcp)]
+        assert fired == [text for _spec, text in queries_for(_task_scope())]
+
+    async def test_every_search_carries_its_spec_s_scoping(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        by_query = {args['query']: args for args in _search_arguments(mcp)}
+        for spec, text in queries_for(_task_scope()):
+            args = by_query[text]
+            assert args['limit'] == spec.limit
+            assert tuple(args.get('stores', ())) == spec.stores
+            assert tuple(args.get('categories', ())) == spec.categories
+            assert args['project_id'] == briefing.project_id
+
+    async def test_the_retired_queries_are_asked_by_nobody(
+        self, briefing: BriefingAssembler,
+    ):
+        """D1 retires these two rather than rewording them, so neither may
+        survive as a query OR as a rendered section heading."""
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        asked = ' '.join(args['query'] for args in _search_arguments(mcp)).lower()
+        for retired in ('project overview architecture goals', 'recent decisions and rationale'):
+            assert retired not in asked
+        assert '## Project Context' not in context
+        assert '## Recent Decisions' not in context
+
+    async def test_every_search_declares_who_is_asking(
+        self, briefing: BriefingAssembler,
+    ):
+        """D8: the journal records the caller, and the string it records is
+        the same one the prompt's own ``## Agent Identity`` block declares."""
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        arguments = _search_arguments(mcp)
+        assert arguments
+        for args in arguments:
+            assert args['caller_agent_id'] == 'claude-task-3609-implementer'
+            assert args['caller_task_id'] == '3609'
+        assert 'claude-task-3609-implementer' in briefing._agent_identity('3609', 'implementer')
+
+    async def test_a_task_less_dispatch_declares_the_role_alone(
+        self, briefing: BriefingAssembler,
+    ):
+        """A reviewer dispatched without a task still identifies itself, and
+        asks the one query an empty scope can phrase."""
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            await briefing._get_memory_context(BriefingScope(), 'reviewer')
+
+        arguments = _search_arguments(mcp)
+        assert len(arguments) == 1
+        assert arguments[0]['caller_agent_id'] == 'claude-reviewer'
+        assert 'caller_task_id' not in arguments[0]
 
 
 @pytest.mark.asyncio
@@ -642,7 +760,7 @@ class TestMemoryContextProvenanceCaveat:
         ])
 
         with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert context.splitlines()[0] == '# Context'
         assert briefing.project_id in context
@@ -666,7 +784,7 @@ class TestMemoryContextProvenanceCaveat:
         envelope = {'result': {'content': []}}
 
         with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert context == '# Context\n\n_No memory context available._'
 
@@ -690,7 +808,7 @@ class TestMemoryContextProvenanceCaveat:
         ])
 
         with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert 'crates/reify-compiler' in context
         assert briefing.project_id in context
@@ -703,30 +821,25 @@ class TestMemoryContextProvenanceCaveat:
         were already successfully recalled.
 
         The caveat used to be gated on `memory_unavailable`, which — because
-        it is set by a `try`/`except` wrapping all four searches — suppressed
-        the caveat for the WHOLE block even when earlier queries had already
+        it is set by a `try`/`except` wrapping every search — suppressed the
+        caveat for the WHOLE block even when earlier queries had already
         returned real facts. This patches `_scoped_search` directly (rather
-        than `mcp_call`, as the other tests in this module do) because
-        `_mcp_search` itself catches every exception internally and returns
-        `None` — a `mcp_call` failure can never reach `_get_memory_context`
-        as a raised exception, only as an empty result. `_scoped_search` is
-        the seam where `_get_memory_context`'s own `try`/`except` can
-        actually observe a failure.
+        than `mcp_call`, as the other tests in this module do) so exactly one
+        of the two queries fails while the other returns real facts.
         """
-        async def scoped_search_side_effect(query):
-            if 'decisions' in query:
+        async def scoped_search_side_effect(spec, query, **_kwargs):
+            if spec.slug == 'briefing-task-semantic':
                 raise TimeoutError('memory service unreachable')
             return f'## recalled for: {query}', 0, 0
 
         with patch.object(
             briefing, '_scoped_search', new=AsyncMock(side_effect=scoped_search_side_effect),
         ):
-            context = await briefing._get_memory_context('3609')
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
         assert context.splitlines()[0] == '# Context'
-        assert '## Project Context' in context
-        assert '## Conventions' in context
-        assert '## Recent Decisions' not in context
+        assert '## Conventions & Gotchas' in context
+        assert '## Task Context' not in context
         assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) in context
 
 
@@ -740,7 +853,10 @@ class TestScopedSearch:
         self, briefing: BriefingAssembler,
     ):
         with patch.object(briefing, '_mcp_search', new=AsyncMock(return_value=None)):
-            result = await briefing._scoped_search('anything')
+            result = await briefing._scoped_search(
+                TASK_SEMANTIC, 'anything',
+                caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
+            )
 
         assert result == (None, 0, 0)
 
@@ -748,8 +864,7 @@ class TestScopedSearch:
         self, briefing: BriefingAssembler, caplog,
     ):
         """``_mcp_search`` joins every MCP text block with ``'\\n'`` before
-        returning (unchanged by this task — see its allowlist entry in
-        ``shared/tests/silent_fallthrough_allowlist.py``). If the search
+        returning. If the search
         tool ever answers with more than one text block, the joined text is
         not a single valid JSON document, so the filter fails open — the
         cross-project filter silently stops working for that query, though
@@ -774,7 +889,10 @@ class TestScopedSearch:
         with caplog.at_level(logging.WARNING), patch(
             'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
         ):
-            text, dropped, _nested = await briefing._scoped_search('anything')
+            text, dropped, _nested = await briefing._scoped_search(
+                TASK_SEMANTIC, 'anything',
+                caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
+            )
 
         # Known limitation: the joined multi-block text isn't valid JSON, so
         # the filter fails open rather than filtering each block — the
