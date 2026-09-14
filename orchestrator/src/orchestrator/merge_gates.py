@@ -1183,8 +1183,8 @@ async def _branch_delta_survives(
     from, what it produced, and where the merge landed it.  A rename pair
     alone proves nothing — ``git diff -M`` pairs at ~50% similarity, so a
     resolution that relocates a file and discards the branch's edit still
-    pairs.  This is the check that turns such a pair from a licence into
-    a candidate.
+    pairs.  A pair is therefore only a CANDIDATE for suppression; this is
+    the check that confirms one.
 
     EVERY failure mode returns False, i.e. "keep flagging".  That is the
     safe direction even though the surrounding gates fail OPEN on git
@@ -1193,8 +1193,8 @@ async def _branch_delta_survives(
     introduce a false block relative to main, whereas failing open here
     would hide genuine work loss.
 
-    Deliberately conservative in two known ways, both erring toward a
-    false flag and never toward a false negative.  ``git apply`` matches
+    Deliberately conservative in three known ways, every one erring
+    toward a false flag and never toward a false negative.  ``git apply`` matches
     exact context with no fuzz, so a main-side edit landing inside the
     branch hunk's three context lines yields a flag (measured: an edit
     three lines away still reverse-applies cleanly).  And a binary file
