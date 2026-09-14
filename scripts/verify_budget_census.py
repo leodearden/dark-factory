@@ -619,3 +619,196 @@ def by_day(legs: Iterable[Leg]) -> dict[str, dict[str, Any]]:
             continue
         buckets.setdefault(day.isoformat(), []).append(leg)
     return {day: summarise_legs(group) for day, group in sorted(buckets.items())}
+
+
+# ---------------------------------------------------------------------------
+# Load regimes. Deliverable 1 puts the pressure reading INSIDE the record being
+# censused, which is why D1 is sequenced before D2 and why this does NOT join
+# to the sampler's data/load-samples.db: a timestamp-range join into that
+# long-format store has no precedent in the repo, would be new design surface
+# with its own window-alignment and missing-sample semantics, and is
+# unnecessary by construction.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PsiBand:
+    """One half-open ``[lo, hi)`` band of host CPU ``some avg10`` pressure.
+
+    ``why`` is not decoration: an edge nobody can argue with is an edge nobody
+    can correct, and these are the boundaries a budget derivation will be read
+    against.
+    """
+
+    name: str
+    lo: float
+    hi: float
+    why: str
+
+
+PSI_BANDS: tuple[PsiBand, ...] = (
+    PsiBand(
+        'idle', 0.0, 5.0,
+        'the quiet host the old "measure on an idle box" advice asked for; '
+        'below ~5% some-pressure nothing is waiting on CPU for long',
+    ),
+    PsiBand(
+        'light', 5.0, 25.0,
+        'one or two co-resident verifies — the fleet at low occupancy',
+    ),
+    PsiBand(
+        'moderate', 25.0, 50.0,
+        'the band the dispatch-admission gate is tuned around, so the '
+        'common steady state of a busy fleet',
+    ),
+    PsiBand(
+        'heavy', 50.0, 100.0,
+        'sustained contention; a duration here is as much a statement about '
+        'the host as about the suite',
+    ),
+    PsiBand(
+        'saturated', 100.0, float('inf'),
+        'pressure at or past the full-stall ceiling — kept as its own band '
+        'rather than folded into heavy, because a budget derived from these '
+        'runs is measuring the host',
+    ),
+)
+
+UNSTAMPED = 'unstamped'
+"""The bucket for a leg whose host load is NOT KNOWN.
+
+Two populations land here and both belong: a record written before the load
+stamp existed, and one whose PSI read degraded to null. Neither may be filed in
+a zero-pressure band — that would put the busiest historical runs in the IDLE
+band and then invite the conclusion that the suite is slow even on a quiet
+host. Today this bucket is the whole corpus.
+"""
+
+
+def band_for(cpu_some10: float) -> str:
+    """The band *cpu_some10* falls in. The bands tile ``[0, inf)``."""
+    for band in PSI_BANDS:
+        if band.lo <= cpu_some10 < band.hi:
+            return band.name
+    return PSI_BANDS[-1].name
+
+
+def _start_pressure(load: dict | None) -> float | None:
+    """The host CPU pressure a leg STARTED under, or ``None`` if not knowable.
+
+    ``None`` covers an absent record, a malformed one, and a null reading
+    inside a present one — the last being ``_load_sample``'s own
+    "component degraded" encoding, which means "we could not tell" and must
+    never be read as 0.0.
+    """
+    if not isinstance(load, dict):
+        return None
+    start = load.get('start')
+    if not isinstance(start, dict):
+        return None
+    value = start.get('cpu_some10')
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def by_load_band(legs: Iterable[Leg]) -> dict[str, dict[str, Any]]:
+    """Summarise *legs* per load band, with ``unstamped`` as its own row.
+
+    Every band is present even when empty, so a reader can see that a band was
+    measured and found empty rather than guessing whether it was reported at
+    all. Banded counts plus ``unstamped`` reconcile against the selected ``n``.
+    """
+    buckets: dict[str, list[Leg]] = {band.name: [] for band in PSI_BANDS}
+    buckets[UNSTAMPED] = []
+    for leg in legs:
+        pressure = _start_pressure(leg.load)
+        key = UNSTAMPED if pressure is None else band_for(pressure)
+        buckets[key].append(leg)
+    return {name: summarise_legs(group) for name, group in buckets.items()}
+
+
+def cold_separability(legs: Iterable[Leg]) -> dict[str, Any]:
+    """State whether cold runs can be separated from warm ones. They cannot.
+
+    A summary.json carries no is-cold flag. The only available inference —
+    "attempt-1 in a worktree with no prior verify dir is cold" — is a guess:
+    an attempt-1 record is also what a worktree that was RESET and re-verified
+    warm leaves behind, and the marker that would settle it
+    (``.task/verify_warmed``) is not part of the record and does not survive
+    into the archive. Acting on the guess would mix warm reruns into a cold
+    distribution and then freeze the result into a budget as if measured.
+
+    D17 rules the fallback for exactly this case: label the cold value INTERIM
+    with its basis. So this returns a FINDING — counts, and the reason — and
+    deliberately contains NO duration series. A series here would be a cold
+    distribution built on a guess, indistinguishable a month later from one
+    that was measured.
+    """
+    legs = tuple(legs)
+    first = sum(1 for leg in legs if leg.where.attempt == 1)
+    return {
+        'cold_separable': False,
+        'first_attempt_records': first,
+        'later_attempt_records': len(legs) - first,
+        'basis': (
+            'a summary.json carries no is-cold flag, and the only available '
+            'inference (attempt-1 with no prior verify dir) cannot tell a cold '
+            'first verify from a warm re-verify of a reset worktree: the '
+            '.task/verify_warmed marker is not part of the record and does not '
+            'survive into the archive. first_attempt_records is the count a '
+            'cold inference would have claimed, reported so the size of the '
+            'guess is visible rather than the guess being made.'
+        ),
+    }
+
+
+_MERGE_BUDGET_KEY = 'merge_verify_cold_command_timeout_secs'
+_MERGE_BUDGET_SOURCES = (
+    Path('dark-factory-orchestrator.yaml'),
+    Path('orchestrator/src/orchestrator/defaults.yaml'),
+)
+
+
+def merge_gate_budget(root: Path) -> dict[str, Any]:
+    """Read the merge gate's cold budget from the config chain. REPORT ONLY.
+
+    Resolved in the layering order an operator would read — the project's own
+    top-level config, then the shipped defaults — as plain YAML, because this
+    script must not import orchestrator config code (see the module docstring).
+    The cost is that this cannot see full config-layer precedence; it reports
+    the raw value and names the file it came from, so a reader can check.
+
+    The merge gate is ALWAYS cold: it verifies a freshly-created worktree every
+    time. So its budget is a different question from the task lane's, and this
+    census does not answer it. Saying so in the report is what stops a reader
+    applying a warm-derived figure to a path that is strictly costlier.
+    """
+    for relative in _MERGE_BUDGET_SOURCES:
+        path = root / relative
+        try:
+            data = yaml.safe_load(path.read_text(encoding='utf-8'))
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict) and _MERGE_BUDGET_KEY in data:
+            return {
+                _MERGE_BUDGET_KEY: data[_MERGE_BUDGET_KEY],
+                'source': str(path),
+                'always_cold': True,
+                'note': (
+                    'The merge gate verifies a freshly-created worktree every '
+                    'time, so it is always COLD and its budget is a different '
+                    'question from the task lane figures above. Reported for '
+                    'context; this census changes nothing about it.'
+                ),
+            }
+    return {
+        _MERGE_BUDGET_KEY: None,
+        'source': None,
+        'always_cold': True,
+        'note': (
+            f'No {_MERGE_BUDGET_KEY} found in '
+            f'{", ".join(str(s) for s in _MERGE_BUDGET_SOURCES)} under this '
+            f'root. Reported as null rather than defaulted: a guessed budget '
+            f'here reads exactly like a measured one. The merge gate is '
+            f'always COLD either way, and this census changes nothing about it.'
+        ),
+    }
