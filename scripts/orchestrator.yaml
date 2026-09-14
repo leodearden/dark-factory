@@ -55,10 +55,11 @@
 # gated by tests/scripts/test_merge_gate_parallelism_config.py::
 # test_scripts_leg_carries_the_parallel_flags_on_its_test_command and
 # ::test_root_addopts_never_leaks_the_parallel_flags.
-# `auto` rather than a literal: pytest-xdist resolves it through
-# PYTEST_XDIST_AUTO_NUM_WORKERS, which dark-factory-orchestrator.yaml pins in
-# verify_env and verify._resolve_verify_env injects for every verify role, so one
-# knob governs every parallel module and the A/B cut moves them together.
+# `auto` rather than a literal, and `--dist loadgroup` rather than xdist's
+# default: both arguments are written once, in the guard that enforces them —
+# tests/scripts/test_merge_gate_parallelism_config.py's module docstring and
+# ::test_parallel_member_addopts_declare_xdist_with_loadgroup. Not restated
+# here, so the A/B knob has one place to be re-argued rather than five.
 # MEASURED on the 5408 tree at `-n 8 --dist loadgroup`: 5333 passed / 2 skipped
 # in 117.71s, exit 0, against the 394-490s serial runs recorded below.
 # shared — the --project this command selects — gains "pytest-xdist>=3.5.0" in
