@@ -1008,6 +1008,134 @@ class TestQuarantineFailureDoesNotSwallowTheAbort:
         logged = '\n'.join(r.getMessage() for r in caplog.records)
         assert str(merge_rr) in logged
 
+def _merge_rr_read_fails(monkeypatch, error: OSError) -> None:
+    """Make reading MERGE_RR fail with a chosen errno, by the same means as above.
+
+    Monkeypatched for the reasons :func:`_quarantine_rename_fails` gives, plus
+    one this case adds: it pins ``IsADirectoryError`` and ``PermissionError``
+    as DISTINCT states, where a real fixture would hand back whichever errno
+    the filesystem and euid happened to produce.
+
+    Scoped to the MERGE_RR name, so the quarantined backup — a different name —
+    is still readable, and a case can assert the evidence survived.
+    """
+    real_read_bytes = Path.read_bytes
+
+    def read_bytes(self: Path):
+        if self.name == 'MERGE_RR':
+            raise error
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', read_bytes)
+
+
+def vanished_worktree(tmp_path: Path, monkeypatch) -> Path:
+    """Deleted out-of-band: ``git`` cannot be spawned, so there is no exit code."""
+    return tmp_path / 'deleted-out-of-band'
+
+
+def worktree_is_a_file(tmp_path: Path, monkeypatch) -> Path:
+    """Same spawn failure, different errno (``ENOTDIR``) — a distinct code path in."""
+    path = tmp_path / 'a-file'
+    path.write_text('not a directory\n')
+    return path
+
+
+def merge_rr_is_a_directory(tmp_path: Path, monkeypatch) -> Path:
+    """A valid repo whose MERGE_RR cannot be read as a file (``EISDIR``)."""
+    repo, _ = build_mid_rebase_repo(tmp_path)
+    _merge_rr_read_fails(
+        monkeypatch, IsADirectoryError(errno.EISDIR, 'Is a directory'),
+    )
+    return repo
+
+
+def merge_rr_is_unreadable(tmp_path: Path, monkeypatch) -> Path:
+    """A valid repo whose MERGE_RR cannot be read at all (``EACCES``)."""
+    repo, _ = build_mid_rebase_repo(tmp_path)
+    _merge_rr_read_fails(
+        monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+    )
+    return repo
+
+
+#: Hostile states the preflight must survive.  Every one was MEASURED to raise
+#: on this branch before the guards landed, so none of them is a hypothetical.
+HOSTILE_STATES = (
+    vanished_worktree,
+    worktree_is_a_file,
+    merge_rr_is_a_directory,
+    merge_rr_is_unreadable,
+)
+
+
+class TestPreflightIsTotal:
+    """The fail-safe contract is an INVARIANT over the entry point, not two patches.
+
+    Both docstrings in the module already assert it — ``guarded_abort``'s "It
+    never raises", ``preflight_rebase_recovery``'s "returns an
+    unresolved-but-clean result rather than raising" — and what review found is
+    that the contract did not hold.  The two defects it named were instances;
+    pinning only those leaves the defect class live, and leaves the prose
+    untrue for the next reader who relies on it.
+
+    So the battery is over STATES, not over the call sites that happened to be
+    found.  ``survey_locks`` is deliberately absent: ``Path.glob`` on an
+    unreadable directory was measured to yield ``[]`` rather than raise, so a
+    glob arm would assert a hole that does not exist.
+    """
+
+    @pytest.mark.parametrize('report_only', [False, True])
+    @pytest.mark.parametrize(
+        'make_worktree', HOSTILE_STATES, ids=lambda f: f.__name__,
+    )
+    def test_no_hostile_state_makes_the_preflight_raise(
+        self, make_worktree, report_only: bool, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Both arms of the one public flag: report-only takes different branches."""
+        worktree = make_worktree(tmp_path, monkeypatch)
+
+        result = rebase_recovery.preflight_rebase_recovery(
+            worktree, report_only=report_only,
+        )
+
+        assert isinstance(result, rebase_recovery.PreflightResult)
+        assert result.verdict in {
+            rebase_recovery.VERDICT_CLEAN,
+            rebase_recovery.VERDICT_REPAIRED,
+            rebase_recovery.VERDICT_BLOCKED,
+        }
+
+    def test_a_merge_rr_that_could_not_be_read_is_never_called_clean(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Surviving is not enough — the survivor must not report a lie.
+
+        Folding an unreadable MERGE_RR into the absent/healthy branch would
+        make the preflight say ``clean`` about a file it never managed to
+        inspect, which is exactly the dishonesty ``PreflightResult.verdict``'s
+        own docstring argues against for ``report_only``.  Absent means
+        healthy; unreadable means unknown, and unknown is not healthy.
+        """
+        repo = merge_rr_is_unreadable(tmp_path, monkeypatch)
+
+        repaired = rebase_recovery.preflight_rebase_recovery(repo)
+        assert repaired.verdict != rebase_recovery.VERDICT_CLEAN
+        assert repaired.merge_rr_backup is not None, 'evidence is still preserved'
+        assert not (repo / '.git' / 'MERGE_RR').exists()
+
+    def test_an_unreadable_merge_rr_is_reported_unrepaired_when_nothing_moves(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Report-only leaves it in place, so the caller must be told it is there."""
+        repo = merge_rr_is_unreadable(tmp_path, monkeypatch)
+
+        reported = rebase_recovery.preflight_rebase_recovery(repo, report_only=True)
+
+        assert reported.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert reported.unrepaired
+        assert (repo / '.git' / 'MERGE_RR').exists()
+
 # ---------------------------------------------------------------------------
 # The CLI the skills invoke
 # ---------------------------------------------------------------------------
