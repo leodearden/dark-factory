@@ -356,3 +356,96 @@ class TestXdistWorkers:
         )
 
         assert json.loads(json.dumps(record)) == record
+
+
+class TestLoadReachesTheSummaryPayload:
+    """``_build_summary_payload`` rebuilds each entry from an explicit WHITELIST.
+
+    Not a passthrough — so a field absent from that list is silently dropped.
+    Its own docstring records the time that happened to ``segments``, leaving
+    the one structured record of which segments never ran available only as
+    free text inside the aggregated ``output`` blob. ``load`` is the same
+    shape of field landing in the same place, so it gets the same guard.
+    """
+
+    def _load(self, cpu=2.5):
+        return {
+            'start': {'cpu_some10': cpu, 'cpu_some60': 1.8, 'runqueue_ratio': 0.75},
+            'end': {'cpu_some10': 9.5, 'cpu_some60': 4.0, 'runqueue_ratio': 2.25},
+            'xdist': {'n_flag': None, 'auto_num_workers': '6'},
+        }
+
+    def _run(self, label='test', **overrides):
+        run = {
+            'label': label,
+            'cmd': f'uv run {label}',
+            'rc': 0,
+            'output': '',
+            'timed_out': False,
+            'started_at': 'ts',
+            'duration_secs': 1.5,
+            'segments': None,
+            'load': self._load(),
+        }
+        run.update(overrides)
+        return run
+
+    def test_every_command_entry_carries_its_load(self):
+        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+
+        payload = _build_summary_payload(
+            [self._run('test'), self._run('lint', load=self._load(cpu=7.5))],
+            'clean',
+            '',
+        )
+
+        assert [e['load'] for e in payload['commands']] == [
+            self._load(),
+            self._load(cpu=7.5),
+        ]
+
+    def test_a_run_dict_with_no_load_key_serialises_as_null(self):
+        """`.get`, not `[]` — the remote merge-verify path hand-builds run dicts.
+
+        Those predate the key, so indexing would raise a KeyError on the merge
+        path. This is the exact accommodation `segments` already documents for
+        the same callers.
+        """
+        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+
+        legacy = self._run()
+        del legacy['load']
+
+        payload = _build_summary_payload([legacy], 'clean', '')
+
+        assert payload['commands'][0]['load'] is None
+
+    def test_load_is_present_on_every_entry_even_when_null(self):
+        """Unconditional: absent-vs-null is the ambiguity the key exists to kill."""
+        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+
+        legacy = self._run()
+        del legacy['load']
+
+        payload = _build_summary_payload([legacy, self._run('lint')], 'clean', '')
+
+        assert all('load' in entry for entry in payload['commands'])
+
+    def test_a_skipped_leg_contributes_no_entry_at_all(self):
+        """Unchanged behaviour — `cmd is None` is filtered before the rebuild."""
+        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+
+        payload = _build_summary_payload(
+            [self._run('test'), self._run('type', cmd=None, load=None)],
+            'clean',
+            '',
+        )
+
+        assert [e['label'] for e in payload['commands']] == ['test']
+
+    def test_the_payload_is_json_native(self):
+        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+
+        payload = _build_summary_payload([self._run()], 'clean', '')
+
+        assert json.loads(json.dumps(payload)) == payload
