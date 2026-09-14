@@ -279,14 +279,35 @@ class TestRetentionAndVacuum:
         store.maybe_vacuum(now)
         assert store.should_vacuum(now + 86400) is True
 
-    def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path):
+    def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path, monkeypatch):
+        """The stamp is recorded on the path where a VACUUM actually RUNS.
+
+        The store must carry reclaimable pages or
+        ``_VACUUM_MIN_RECLAIMABLE_FRACTION`` short-circuits maybe_vacuum, and
+        this then stamps via the SKIP path — which
+        ``test_the_clock_is_still_stamped_so_the_check_is_not_per_tick``
+        already covers, leaving this test asserting nothing of its own.  The
+        contract it uniquely pins is the retry rule: the clock is stamped
+        AFTER a successful VACUUM, not before it.
+        """
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
-        now = 1_000_000
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        store.cleanup_old(now, retain_seconds=100)
+        assert store.reclaimable_fraction() >= 0.10, (
+            'setup must open the reclaimable-fraction gate, or this test is vacuous'
+        )
+        executed = _vacuum_spy(monkeypatch)
 
         store.maybe_vacuum(now)
 
+        # The stamp alone cannot distinguish this path from the skip path --
+        # both write the same `now` -- so pin that a VACUUM really ran.
+        assert [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+            'stamped without running a VACUUM: the retry rule is not being honoured'
+        )
         # Verify last_vacuum_ts was recorded in meta table
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         row = conn.execute(
