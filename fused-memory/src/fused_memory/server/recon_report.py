@@ -515,10 +515,13 @@ _ERR_ALREADY_COMPLETED: dict[str, str] = {
 
 
 def _duplicate_finding_error(
-    existing_id: str, warnings: list[str] | None = None
+    existing_id: str,
+    warnings: list[str] | None = None,
+    *,
+    supersedes_dropped: bool = False,
 ) -> dict[str, Any]:
     """Build the duplicate_finding error dict, optionally carrying truncation
-    warnings (task-2410).
+    warnings (task-2410) and a dropped-supersession warning (task-4653).
 
     add_finding truncates description/suggested_action/category BEFORE the
     dedup check runs (see its docstring), so a caller whose overlength input turns
@@ -526,14 +529,28 @@ def _duplicate_finding_error(
     truncated text itself is discarded (a duplicate is never stored), but
     the warning is not.  Mirrors the success-path contract: ``'warnings'``
     is present only when *warnings* is non-empty.
+
+    *supersedes_dropped* extends that same "the input is discarded, the
+    warning is not" contract to a ``supersedes`` that resolved but was never
+    stamped because this filing deduped (add_finding is validate-early /
+    stamp-late, so the duplicate return precedes the stamp).  Reporting it is
+    what keeps that path from reinstating the defect ``supersedes`` exists to
+    close: the caller asked for a retirement, got ``duplicate_finding`` back,
+    and would otherwise have no signal that the relation went unrecorded.
+    The stamp is deliberately still NOT applied here — mutating on a return
+    documented to mutate nothing would produce exactly the half-applied case
+    the whole-call-atomicity contract rules out.
     """
     error: dict[str, Any] = {
         'error': 'duplicate_finding',
         'error_type': 'ReconReportDuplicateFinding',
         'existing_finding_id': existing_id,
     }
-    if warnings:
-        error['warnings'] = warnings
+    all_warnings = list(warnings) if warnings else []
+    if supersedes_dropped:
+        all_warnings.append(f'supersedes not applied: duplicate of {existing_id}')
+    if all_warnings:
+        error['warnings'] = all_warnings
     return error
 
 
@@ -1351,6 +1368,21 @@ class ReconReportState:
         nothing and needs no index cleanup; the stamp is written only after
         the new finding is allocated and appended (it needs the new
         finding_id), so a ``duplicate_finding`` return never stamps anything.
+
+        That duplicate return therefore DROPS a resolved ``supersedes``, and
+        says so: it carries a ``supersedes not applied: duplicate of <id>``
+        warning.  Not stamping is deliberate — the deduping call filed no new
+        finding, so there is no new finding_id for the pointer to name, and
+        stamping the pre-existing duplicate would mutate state on a return
+        documented to mutate nothing, i.e. exactly the half-applied case the
+        whole-call-atomicity contract above rules out.  But dropping it
+        SILENTLY would reinstate the defect from the caller's side: a Stage-2
+        agent re-filing its ``..._resolved`` finding (a retry, a re-raise)
+        would be told only ``duplicate_finding`` while the claim it meant to
+        retire stayed live.  Warning instead of failing keeps the retry
+        idempotent for the finding itself while leaving the unrecorded
+        relation visible; re-file with the ORIGINAL superseder's finding_id,
+        or retract it first, to record it.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1454,7 +1486,9 @@ class ReconReportState:
         if sig != (None, None):
             existing_id = self._run_sig_index.get(run_id, {}).get(sig)
             if existing_id is not None:
-                return _duplicate_finding_error(existing_id, warnings)
+                return _duplicate_finding_error(
+                    existing_id, warnings, supersedes_dropped=supersedes is not None
+                )
         else:
             # Blank/whitespace-only descriptions normalize to '' — skip dedup so
             # each blank informational finding allocates independently.  The empty
@@ -1464,7 +1498,9 @@ class ReconReportState:
                 desc_hash = _description_hash(description)
                 existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
                 if existing_id is not None:
-                    return _duplicate_finding_error(existing_id, warnings)
+                    return _duplicate_finding_error(
+                        existing_id, warnings, supersedes_dropped=supersedes is not None
+                    )
 
         finding_id = str(uuid.uuid4())
         if actionable is None:

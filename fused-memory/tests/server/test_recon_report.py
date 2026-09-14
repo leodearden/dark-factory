@@ -4295,6 +4295,68 @@ class TestReconReportSupersedes:
         assert state.delete_finding('r1', a_fid) == {'status': 'deleted', 'finding_id': a_fid}
         assert b_finding.superseded_by is None
 
+    def test_a_supersedes_dropped_by_dedup_says_so_in_warnings(self):
+        """Validate-early/stamp-late means the ``duplicate_finding`` return
+        never reaches the stamp, so the requested retirement does NOT happen.
+        The caller must be TOLD that, rather than left to infer it.
+
+        Silence here would reinstate the original defect from the caller's
+        side: a Stage-2 agent that files its ``..._resolved`` finding twice (a
+        retry, a re-raise) gets ``duplicate_finding`` back, and without a
+        warning has no signal that the retirement it asked for was dropped —
+        leaving the refuted claim live beside its refutation, which is the
+        state ``supersedes`` exists to prevent.
+
+        The stamp is deliberately NOT applied on this path: doing so would
+        mutate state on a return documented to mutate nothing, producing
+        exactly the half-applied case the whole-call-atomicity contract
+        (see the class docstring and ``finding_unknown``) rules out.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        target = self._file(state, flag_type='memory_mechanism_contradiction')
+        # Establishes the superseder's own signature, so the identical filing
+        # below dedups onto it rather than allocating a second row.
+        first = self._file(state, flag_type='memory_mechanism_contradiction_resolved')
+
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=target,
+        )
+
+        assert dup.get('error') == 'duplicate_finding', dup
+        assert dup.get('existing_finding_id') == first, dup
+        assert _stored_finding(state, 'r1', target).superseded_by is None
+        assert any('supersedes not applied' in w for w in dup.get('warnings', [])), dup
+
+    def test_a_deduped_filing_without_supersedes_gains_no_warning(self):
+        """The dropped-supersession warning is scoped to calls that actually
+        ASKED for one — an ordinary duplicate still returns no ``warnings``
+        key at all, per ``_duplicate_finding_error``'s present-only-when-
+        non-empty contract."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        self._file(state, flag_type='memory_mechanism_contradiction')
+
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='memory_mechanism_contradiction',
+        )
+
+        assert dup.get('error') == 'duplicate_finding', dup
+        assert 'warnings' not in dup, dup
+
 
 # ---------------------------------------------------------------------------
 # task-4653 consumer (1): the flagged_items projection.  A superseded finding
