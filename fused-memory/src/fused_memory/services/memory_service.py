@@ -14,7 +14,7 @@ import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
@@ -65,6 +65,9 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL as _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_TTL_DAYS,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_MERGE,
@@ -8020,6 +8023,7 @@ class MemoryService:
         project_id: str,
         run_id: str,
         stage: str,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
 
@@ -8097,6 +8101,16 @@ class MemoryService:
         fail-safe direction — never flag on uncertainty — and matches the
         contract's existing inconclusive-means-do-not-report norm (PRD
         plans/stage3-ledger-presence-prd.md §8.3).
+
+        Now that reaping is routine, ``present=False`` on any run older than
+        the retention window carries NO information about whether the stage
+        wrote a summary — the row would have been hard-DELETEd either way.
+        That is exactly why ``expected`` is ``None`` there rather than True.
+
+        *now* injects the clock for the retention comparison, matching the
+        convention ``ReconLedgerStore`` and ``summary_pool.write_cycle_summary``
+        already follow, so tests can pin the boundary deterministically. The
+        MCP tool surface does not expose it.
         """
         ledger = getattr(self, 'recon_ledger', None)
         journal = getattr(self, 'recon_journal', None)
@@ -8150,7 +8164,12 @@ class MemoryService:
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
 
         reason, expected, run_status = await self._classify_summary_absence(
-            journal, project_id, run_id, stage, present=record is not None
+            journal,
+            project_id,
+            run_id,
+            stage,
+            present=record is not None,
+            now=now or datetime.now(UTC),
         )
         return {
             'present': record is not None,
@@ -8173,6 +8192,7 @@ class MemoryService:
         stage: str,
         *,
         present: bool,
+        now: datetime,
     ) -> tuple[str, bool | None, str | None]:
         """Explain an absent cycle_summary row as ``(reason, expected, run_status)``.
 
@@ -8212,6 +8232,26 @@ class MemoryService:
             # Checked BEFORE retention: a positive fact from the never-reaped
             # runs table, true regardless of TTL.
             return 'stage_not_run', False, run_status
+
+        # The stage ran. Whether its missing row is data loss depends on
+        # whether the row could still exist at all: past the retention window
+        # gc() has hard-DELETEd it either way, so absence says nothing.
+        reference_iso = execution['completed_at'] or execution['started_at']
+        try:
+            reference = datetime.fromisoformat(reference_iso)
+        except (TypeError, ValueError):
+            logger.warning(
+                'get_cycle_summary_presence: unparseable run timestamp %r for '
+                'run_id=%s stage=%s in project=%s; cannot age the absence',
+                reference_iso,
+                run_id,
+                stage,
+                project_id,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            return 'run_unknown', None, run_status
+        if reference + timedelta(days=CYCLE_SUMMARY_TTL_DAYS) < now:
+            return 'expired', None, run_status
         return 'missing', True, run_status
 
     # ------------------------------------------------------------------

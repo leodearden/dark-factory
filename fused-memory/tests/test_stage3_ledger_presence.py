@@ -471,7 +471,16 @@ class TestRetentionCliff:
             await journal.update_run_stage_reports(
                 run_id, {_STAGE: self._report()}
             )
-        await journal.complete_run(run_id, 'completed')
+        # journal.complete_run stamps wall-clock time and takes no clock — it
+        # is a WRITER, and this task does not touch writers (PRD §11) — so the
+        # completion timestamp is stamped directly here instead. Otherwise the
+        # run would age from real-now while the reader is handed an injected
+        # `now` in the past, and the retention comparison would be meaningless.
+        await journal._db.execute(
+            "UPDATE runs SET status = 'completed', completed_at = ? WHERE id = ?",
+            (started.isoformat(), run_id),
+        )
+        await journal._db.commit()
 
     @pytest.mark.asyncio
     async def test_reaped_row_is_expired_not_missing(self, mock_config, tmp_path):
