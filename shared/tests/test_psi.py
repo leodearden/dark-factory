@@ -180,6 +180,8 @@ class TestPsiSampleV2Fields:
         'own_cpu_some10',
         'own_cgroup',
         'own_read_ok',
+        # Ruling D17 (task 3353) appends the 60 s CPU window by the same rule.
+        'cpu_some60',
     )
 
     def test_v1_construction_still_works_and_v2_fields_default(self):
@@ -197,6 +199,7 @@ class TestPsiSampleV2Fields:
         assert sample.own_cpu_some10 == 0.0
         assert sample.own_cgroup == ''
         assert sample.own_read_ok is False
+        assert sample.cpu_some60 == 0.0
 
     def test_v2_fields_settable_by_keyword(self):
         from shared.psi import PsiSample
@@ -287,6 +290,39 @@ def _healthy_sample(**overrides):
     )
     fields.update(overrides)
     return PsiSample(**fields)
+
+
+class TestPsiSampleCpuSome60:
+    """The 60 s CPU window on the sample (task 3353, ruling D17).
+
+    Appended DEFAULTED, per the rule the class docstring already states: the
+    defaults are the "component absent" reading, so every shipped keyword
+    construction stays valid. It is TELEMETRY, not a gate arm — the D10
+    saturation rank is owned by the load-throttle PRD and tasks 3590/3592, so
+    stamping a verify summary must not move it.
+    """
+
+    def test_the_60s_window_is_telemetry_not_a_gate_arm(self):
+        """A sky-high 60 s window must not saturate, even with a threshold set.
+
+        The cfg carries a ``cpu_some_avg60`` a future arm would read, so this
+        goes red if anyone wires the field into ``_ARMS`` rather than passing
+        silently on ``getattr(cfg, field, None)``.
+        """
+        cfg = _saturation_cfg()
+        cfg.cpu_some_avg60 = 1.0
+        sample = _healthy_sample(cpu_some60=99.0)
+
+        assert sample.saturated(cfg) is False
+        with pytest.raises(ValueError):
+            sample.tripping_metric(cfg)
+
+    def test_the_60s_window_does_not_displace_the_10s_arm(self):
+        """The 10 s arm still trips on its own value, not the 60 s one."""
+        cfg = _configured_cfg(cpu_some_avg10=85.0)
+
+        assert _healthy_sample(cpu_some10=90.0, cpu_some60=0.0).saturated(cfg) is True
+        assert _healthy_sample(cpu_some10=0.0, cpu_some60=90.0).saturated(cfg) is False
 
 
 class TestPsiSampleSaturated:
@@ -1066,6 +1102,7 @@ class TestReadPsiSampleHappyPath:
 
         assert sample.read_ok is True
         assert sample.cpu_some10 == pytest.approx(2.50)
+        assert sample.cpu_some60 == pytest.approx(1.80)
         assert sample.mem_some10 == pytest.approx(1.23)
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == pytest.approx(0.75)
@@ -1105,6 +1142,7 @@ class TestReadPsiSampleFailOpen:
     def _assert_sentinel(self, sample):
         assert sample.read_ok is False
         assert sample.cpu_some10 == 0.0
+        assert sample.cpu_some60 == 0.0
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0
@@ -1191,7 +1229,7 @@ class TestReadPsiSampleV2Composition:
 
         return read
 
-    def test_all_ten_fields_populated_when_every_component_succeeds(self, tmp_path):
+    def test_every_field_populated_when_every_component_succeeds(self, tmp_path):
         import os
 
         from shared.psi import read_psi_sample
@@ -1202,6 +1240,7 @@ class TestReadPsiSampleV2Composition:
 
         assert sample.read_ok is True
         assert sample.cpu_some10 == pytest.approx(2.50)
+        assert sample.cpu_some60 == pytest.approx(1.80)
         assert sample.mem_some10 == pytest.approx(1.23)
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == pytest.approx(0.75)
@@ -1220,6 +1259,7 @@ class TestReadPsiSampleV2Composition:
 
         assert sample.read_ok is False
         assert sample.cpu_some10 == 0.0
+        assert sample.cpu_some60 == 0.0
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0
