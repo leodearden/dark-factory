@@ -38,7 +38,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_queue import ItemLifecycleState, MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import GroupMergeRequest, QueuedBranch
 
 # ── repo fixtures (mirrors test_merge_queue_conflict_graph.py:34-50) ──────────
@@ -129,16 +129,17 @@ def _make_git_ops(repo: Path, *, pool: bool = True, size: int = 1) -> GitOps:
 
 
 
-def _lifecycle_states(worker: SpeculativeMergeWorker) -> dict[str, str]:
-    """Published projection of the item-lifecycle registry: {request_id: state}.
+def _registry_states(worker: SpeculativeMergeWorker) -> dict[str, ItemLifecycleState]:
+    """The item-lifecycle registry's non-terminal map, read from the registry itself.
 
-    ``snapshot()['entries']`` is built by iterating
-    ``ItemLifecycle.non_terminal_items()`` and mapping each state through
-    ``_REGISTRY_STATE_TO_WIRE`` (``orchestrator/merge_queue.py::SpeculativeMergeWorker.snapshot``),
-    so comparing this map before and after a call is the published form of
-    "the queue's lifecycle state is untouched".
+    ``snapshot()['entries']`` is NOT a usable stand-in here: its lane-buffer
+    section hard-codes ``'queued'`` and excludes buffered ids from the
+    registry-sourced section, so it stays identical whether or not
+    ``chain_snapshot()`` registers or transitions a buffered item. The one
+    private hop (``_lifecycle``) is a measured residual — the public surface
+    that would remove it is task 5446's.
     """
-    return {e['request_id']: e['state'] for e in worker.snapshot()['entries']}
+    return worker._lifecycle.non_terminal_items()
 
 def _make_config(repo: Path, git_config: GitConfig | None = None) -> OrchestratorConfig:
     return OrchestratorConfig(
@@ -877,11 +878,11 @@ class TestChainSnapshot:
         worker._lane_buffers['normal'].extend(
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102)
         )
-        before = _lifecycle_states(worker)
+        before = _registry_states(worker)
 
         worker.chain_snapshot()
 
-        assert _lifecycle_states(worker) == before
+        assert _registry_states(worker) == before
 
     async def test_is_idempotent(self, git_repo: Path):
         """Two consecutive calls return equal tuples."""
@@ -1450,7 +1451,7 @@ class TestBuildChainTruncation:
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
         )
         buffers_before = {k: list(v) for k, v in worker._lane_buffers.items()}
-        lifecycle_before = _lifecycle_states(worker)
+        lifecycle_before = _registry_states(worker)
 
         res = await build_chain(
             git_ops, worker.chain_snapshot(), head, cap=6, target_depth=3,
@@ -1464,7 +1465,7 @@ class TestBuildChainTruncation:
             assert len(after[lane_name]) == len(items)
             for got, want in zip(after[lane_name], items, strict=True):
                 assert got is want
-        assert _lifecycle_states(worker) == lifecycle_before
+        assert _registry_states(worker) == lifecycle_before
         assert noted == []
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
