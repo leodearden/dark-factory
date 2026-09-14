@@ -862,6 +862,155 @@ class TestDistilledRendering:
             assert f'## {spec.section_title}' in context
 
 
+def _entity_envelope(nodes: list[dict], edges: list[dict]) -> dict:
+    """The ``get_entity`` reply envelope, in the shape the server sends it.
+
+    Mirrors ``fused_memory.services.memory_service``'s ``_node_to_dict`` /
+    ``_edge_to_dict``: nodes carry ``{uuid, name, summary, labels}`` and edges
+    ``{uuid, fact, temporal}``, where ``temporal`` is ``None`` on the
+    exact-match path (EdgeDict has no valid_at) and a
+    ``{valid_at, invalid_at}`` dict on the fuzzy path.
+    """
+    return {
+        'result': {
+            'content': [
+                {'type': 'text', 'text': json.dumps({'nodes': nodes, 'edges': edges})},
+            ],
+        },
+    }
+
+
+def _node(name: str, summary: str = 'A task node.') -> dict:
+    return {'uuid': 'n1', 'name': name, 'summary': summary, 'labels': ['Entity']}
+
+
+def _edge(fact: str, valid_at: str | None = None) -> dict:
+    return {
+        'uuid': 'e1',
+        'fact': fact,
+        'temporal': None if valid_at is None else {'valid_at': valid_at, 'invalid_at': None},
+    }
+
+
+@pytest.mark.asyncio
+class TestTaskEntityChannel:
+    """The second half of D3's dual-channel task context.
+
+    ``get_entity`` is asked for ``Task <id>`` alongside the semantic search.
+    Its documented fuzzy fallback answers a miss with a DIFFERENT entity —
+    measured, a request for one task number returning a neighbouring one — so
+    the reply is admitted only on exact name equality. The guard is
+    deliberately client-side: the PRD puts server-side fuzzy-path changes out
+    of scope.
+    """
+
+    async def _render(
+        self, briefing: BriefingAssembler, entity_reply: dict,
+    ) -> str:
+        """Answer the searches with one fact and the entity call with *entity_reply*."""
+        search_reply = _mcp_search_envelope([_result('1', 'A recalled fact.', source_store='mem0')])
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            return entity_reply if params['name'] == 'get_entity' else search_reply
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(side_effect=dispatch)):
+            return await briefing._get_memory_context(_task_scope(), 'implementer')
+
+    async def test_an_exactly_named_node_renders_its_summary_and_edges(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3609', 'Project-scopes the briefing context block.')],
+            edges=[_edge('Task 3609 is related to task 3212.')],
+        ))
+
+        assert 'Project-scopes the briefing context block.' in context
+        assert 'Task 3609 is related to task 3212.' in context
+        task_section = context.split('## Task Context')[1]
+        assert 'Task 3609 is related to task 3212.' in task_section
+
+    async def test_the_entity_is_asked_for_by_exact_task_name(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        entity_calls = [
+            call.args[2]['arguments']
+            for call in mcp.await_args_list
+            if call.args[2].get('name') == 'get_entity'
+        ]
+        assert len(entity_calls) == 1
+        assert entity_calls[0]['name'] == 'Task 3609'
+        assert entity_calls[0]['project_id'] == briefing.project_id
+
+    async def test_a_fuzzy_neighbour_is_rendered_by_nothing(
+        self, briefing: BriefingAssembler,
+    ):
+        """The wrong-neighbour hazard: a miss answers with another task's
+        node, whose facts would otherwise be read as this task's own."""
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3212', 'A DIFFERENT TASK ENTIRELY.')],
+            edges=[_edge('Task 3212 threads caller identity through search.')],
+        ))
+
+        assert 'A DIFFERENT TASK ENTIRELY.' not in context
+        assert 'Task 3212 threads caller identity' not in context
+        assert 'A recalled fact.' in context, 'the semantic channel is unaffected'
+
+    async def test_an_empty_node_list_renders_nothing_and_does_not_raise(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(nodes=[], edges=[]))
+
+        assert '## Task Context' in context
+        assert 'A recalled fact.' in context
+
+    async def test_a_dateless_edge_renders_its_fact_alone(
+        self, briefing: BriefingAssembler,
+    ):
+        """Measured live: every edge of a queried task node carried
+        ``temporal: null``, so a date must never be required."""
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3609')],
+            edges=[_edge('Task 3609 is related to task 3212.')],
+        ))
+
+        assert 'Task 3609 is related to task 3212.' in context
+        assert 'None' not in context
+
+    async def test_a_dated_edge_renders_its_date_alongside_the_fact(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3609')],
+            edges=[
+                _edge('Task 3609 landed as commit abc123.', valid_at='2026-09-14T07:58:01.179808+00:00'),
+                _edge('Task 3609 is related to task 3212.'),
+            ],
+        ))
+
+        task_section = context.split('## Task Context')[1]
+        assert '2026-09-14' in task_section
+        assert 'Task 3609 landed as commit abc123.' in task_section
+        assert 'Task 3609 is related to task 3212.' in task_section
+
+    async def test_a_task_less_dispatch_asks_for_no_entity(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            await briefing._get_memory_context(BriefingScope(), 'reviewer')
+
+        assert not [
+            call for call in mcp.await_args_list
+            if call.args[2].get('name') == 'get_entity'
+        ]
+
+
 @pytest.mark.asyncio
 class TestMemoryContextProvenanceCaveat:
     """A standing caveat covers the leak channel the tag filter cannot reach.
