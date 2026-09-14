@@ -25,10 +25,15 @@ measurements, never in an assertion.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from audit_offcontract_review_findings import (
     CONTRACT_SEVERITIES,
+    TRIAGE_SEVERITIES,
+    census,
     normalize_issue,
+    select_population,
 )
 
 # ---------------------------------------------------------------------------
@@ -262,3 +267,166 @@ def test_an_empty_string_title_is_treated_as_absent():
     raw = {**TITLE_DETAIL_SHAPE, "title": "   "}
     statement = normalize_issue("3453", 1, raw)["statement"]
     assert statement.strip().startswith("The deploy payload")
+
+
+# ---------------------------------------------------------------------------
+# census / select_population — measurement over a verdict tree.
+#
+# The fixture tree below is built by the test and is the ONLY thing these
+# assertions read. See the module docstring: the live tree and the frozen
+# corpus are both moving targets, so pinning a number from either would pin a
+# conclusion rather than a behaviour.
+# ---------------------------------------------------------------------------
+
+def _write_verdict(root, task, role, emitted_at, issues):
+    path = root / task / "verdicts" / f"{role}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "role": role,
+        "emitted_at": emitted_at,
+        "schema_version": 1,
+        "verdict": {"issues": issues},
+    }))
+    return path
+
+
+def _fixture_tree(tmp_path):
+    """A tree carrying one instance of every case the census must survive."""
+    root = tmp_path / ".task-meta"
+
+    # On-contract: a `suggestion` with the contract `location` spelling.
+    _write_verdict(root, "2896", "reviewer_comprehensive", "2026-08-01T00:00:00+00:00", [
+        {"severity": "suggestion", "category": "robustness",
+         "location": "a/b.py:1", "description": "on contract"},
+    ])
+    # Off-contract but BELOW the triage floor.
+    _write_verdict(root, "3031", "reviewer_comprehensive", "2026-07-19T00:00:00+00:00", [
+        {"severity": "low", "category": "documentation",
+         "file": "c/d.py", "line": 2, "title": "too minor to triage"},
+    ])
+    # Off-contract and inside the triage band.
+    _write_verdict(root, "3041", "reviewer_comprehensive", "2026-08-10T00:00:00+00:00", [
+        {"severity": "medium", "category": "correctness",
+         "file": "e/f.py", "line": 3, "title": "in band"},
+    ])
+    # Off-contract, in band, and from a role that is NOT reviewer_comprehensive.
+    _write_verdict(root, "3075", "reviewer_scoped", "2026-08-05T00:00:00+00:00", [
+        {"severity": "high", "category": "correctness",
+         "file": "g/h.py", "line": 4, "title": "foreign role"},
+    ])
+    # A verdict that parses but carries no issues — the shape task 2896's
+    # archived `reviews/` copies actually have, which is why `files` and
+    # `verdicts_with_issues` must be separate numbers.
+    _write_verdict(root, "3142", "reviewer_comprehensive", "2026-08-09T00:00:00+00:00", [])
+    # An issue with no location signal at all: normalize_issue refuses it, so it
+    # must be TALLIED rather than crashing the census or vanishing from it.
+    _write_verdict(root, "3308", "reviewer_comprehensive", "2026-08-02T00:00:00+00:00", [
+        {"severity": "medium", "category": "correctness", "title": "nowhere"},
+    ])
+    # Malformed JSON.
+    unparseable = root / "3363" / "verdicts" / "reviewer_comprehensive.json"
+    unparseable.parent.mkdir(parents=True, exist_ok=True)
+    unparseable.write_text("{not json at all")
+
+    return root
+
+
+def test_census_counts_files_verdicts_and_issues_separately(tmp_path):
+    result = census(_fixture_tree(tmp_path))
+
+    assert result.files == 7
+    assert result.verdicts_with_issues == 5, "the empty verdict must not be counted"
+    assert result.issues == 5
+
+
+def test_census_counts_off_contract_severity_and_location_less_separately(tmp_path):
+    """These are different populations. All 23 dropped findings were in BOTH,
+    which is exactly why the two gates compounded — but the census must not
+    assume that, or it cannot ever show the two diverging."""
+    result = census(_fixture_tree(tmp_path))
+
+    assert result.off_contract_severity == 4, "low + medium + high + unlocatable medium"
+    assert result.location_less == 4, "everything except the on-contract suggestion"
+
+
+def test_census_breaks_issues_down_by_emitting_role(tmp_path):
+    result = census(_fixture_tree(tmp_path))
+    assert result.roles == {"reviewer_comprehensive": 4, "reviewer_scoped": 1}
+
+
+def test_census_reports_the_emission_window(tmp_path):
+    result = census(_fixture_tree(tmp_path))
+    assert result.emitted_first == "2026-07-19T00:00:00+00:00"
+    assert result.emitted_last == "2026-08-10T00:00:00+00:00"
+
+
+def test_census_tallies_a_malformed_file_instead_of_crashing_or_dropping_it(tmp_path):
+    result = census(_fixture_tree(tmp_path))
+
+    assert result.unparseable == 1
+    assert result.files == 7, "an unparseable file is still a file that was there"
+
+
+def test_census_tallies_an_unlocatable_issue_instead_of_crashing_or_dropping_it(tmp_path):
+    """Same no-silent-fail-soft reasoning as `unparseable`: an issue the
+    normalizer refuses is a measurement the census must report, not lose."""
+    result = census(_fixture_tree(tmp_path))
+
+    assert result.unlocatable == 1
+    assert result.issues == 5, "the refused issue is still counted as present"
+    assert len(result.roles) == 2
+
+
+def test_census_of_an_empty_tree_is_all_zeroes(tmp_path):
+    empty = tmp_path / ".task-meta"
+    empty.mkdir()
+    result = census(empty)
+
+    assert (result.files, result.issues, result.unparseable) == (0, 0, 0)
+    assert result.roles == {}
+    assert result.emitted_first is None
+    assert result.emitted_last is None
+
+
+def test_select_population_keeps_only_off_contract_issues_in_the_triage_band(tmp_path):
+    selected = select_population(_fixture_tree(tmp_path))
+
+    assert {issue.record["severity"] for issue in selected} == {"medium", "high"}
+    assert all(issue.record["off_contract"] for issue in selected)
+    assert all(issue.record["severity"] in TRIAGE_SEVERITIES for issue in selected)
+
+
+def test_select_population_excludes_the_on_contract_suggestion(tmp_path):
+    selected = select_population(_fixture_tree(tmp_path))
+    assert "suggestion" not in {issue.record["severity"] for issue in selected}
+
+
+def test_select_population_excludes_severities_below_the_triage_floor(tmp_path):
+    selected = select_population(_fixture_tree(tmp_path))
+    assert "low" not in {issue.record["severity"] for issue in selected}
+
+
+def test_select_population_never_filters_on_role(tmp_path):
+    """Role is a census OBSERVATION, not a selection criterion. The foreign-role
+    `high` is in the population; dropping it would understate the residue."""
+    selected = select_population(_fixture_tree(tmp_path))
+
+    assert {issue.role for issue in selected} == {"reviewer_comprehensive", "reviewer_scoped"}
+    assert any(issue.role == "reviewer_scoped" for issue in selected)
+
+
+def test_select_population_carries_the_verdict_facts_the_issue_itself_lacks(tmp_path):
+    """Role, emission time and source path belong to the verdict file, not the
+    issue, so `normalize_issue` cannot supply them and the walker must."""
+    foreign = next(i for i in select_population(_fixture_tree(tmp_path)) if i.role == "reviewer_scoped")
+
+    assert foreign.emitted_at == "2026-08-05T00:00:00+00:00"
+    assert foreign.path.name == "reviewer_scoped.json"
+    assert foreign.location_less is True
+    assert foreign.record["location"] == "g/h.py:4"
+
+
+def test_the_contract_and_triage_severity_sets_are_disjoint():
+    """If they ever overlapped, an issue could be both on-contract and in the
+    triage band, and `select_population` would silently return nothing."""
+    assert not (CONTRACT_SEVERITIES & TRIAGE_SEVERITIES)
