@@ -847,6 +847,80 @@ class TestCollectLoadMetricsOwnPressure:
         # The leaf tail is the FULL leaf directory name, verbatim.
         assert 'own_cpu_some10:orchestrator-dark-factory.service' in own
 
+    def test_the_live_none_branch_resolves_its_own_cgroup_hermetically(self, tmp_path):
+        """The branch production actually takes, driven without touching /proc.
+
+        __main__ calls ``collect_load_metrics()`` with no arguments, so the
+        ``own_cgroup_path is None`` path — ask α's resolver for the live 0::
+        path — is the one that runs on every real tick. Every other test in
+        this class injects ``own_cgroup_path`` explicitly and so skips it,
+        which left the live wiring (does it pass the right argument? does it
+        take ``.path``?) protected by nothing. Forwarding α's own
+        ``proc_cgroup_path`` seam is what makes it drivable against a fixture
+        instead of only against the real /proc/self/cgroup.
+        """
+        from shared.psi import RunqueueReading, resolve_own_cgroup
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        resolve_own_cgroup.cache_clear()
+
+        result = collect_load_metrics(
+            read_runqueue=lambda **_kwargs: RunqueueReading(1.0, True),
+            proc_cgroup_path=tree.proc_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        own = {k: v for k, v in result.items() if k.startswith('own_')}
+        assert len(own) == 14, (
+            'the live None branch discovered no leaves, so the resolved anchor '
+            f'disagrees with the injected one; got {sorted(own)}'
+        )
+        for i, leaf in enumerate(LIVE_ORCHESTRATOR_LEAVES):
+            assert own[f'own_cpu_some10:{leaf}'] == pytest.approx(0.5 + i)
+            assert own[f'own_read_ok:{leaf}'] == 1.0
+
+    def test_the_resolution_reads_the_injected_proc_file_not_the_live_one(
+        self, tmp_path, caplog
+    ):
+        """What makes the test above non-vacuous, and it needs saying why.
+
+        LIVE_OWN_CGROUP_PATH is byte-identical to this host's real
+        /proc/self/cgroup 0:: line, and the anchor is derived from the
+        ``user@<uid>.service`` segment alone — so on this host a run that
+        IGNORED the seam and read the real /proc would derive the very same
+        anchor and discover the fixture's leaves anyway. The positive test
+        therefore cannot, by itself, show the seam is plumbed.
+
+        This one can: the injected 0:: line carries no ``user@`` segment, so
+        α's resolver has nothing to anchor at and discovery must report zero
+        leaves. A run that read the live /proc instead would anchor
+        successfully and emit fourteen own_* rows, failing here.
+        """
+        from shared.psi import RunqueueReading, resolve_own_cgroup
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        tree.proc_cgroup_path.write_text('0::/system.slice/not-a-user-manager.service\n')
+        resolve_own_cgroup.cache_clear()
+
+        with caplog.at_level(logging.WARNING, logger='sampler.metrics'):
+            result = collect_load_metrics(
+                read_runqueue=lambda **_kwargs: RunqueueReading(1.0, True),
+                proc_cgroup_path=tree.proc_cgroup_path,
+                cgroup_root=tree.cgroup_root,
+            )
+
+        assert not [k for k in result if k.startswith('own_')], (
+            'own_* rows were emitted from an unanchorable 0:: line, so the '
+            'resolution read the live /proc/self/cgroup and not the seam'
+        )
+        assert 'no pressure cgroups discovered' in caplog.text
+        # The runqueue group is independent and still reports.
+        assert result['runqueue_read_ok'] == 1.0
+
     def test_absent_pressure_file_degrades_only_its_own_leaf(self, tmp_path):
         broken = 'orchestrator-reify.service'
         tree = live_topology(tmp_path, **{broken.replace('.', '_').replace('-', '_'): None})

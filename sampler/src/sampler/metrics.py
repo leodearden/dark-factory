@@ -229,6 +229,7 @@ def collect_load_metrics(
     *,
     read_runqueue: Callable[..., RunqueueReading] = read_runqueue_ratio,
     own_cgroup_path: str | None = None,
+    proc_cgroup_path: str | Path | None = None,
     cgroup_root: Path = _CGROUP_ROOT,
 ) -> dict[str, float]:
     """Return the runqueue and per-cgroup own-pressure metrics for one tick.
@@ -253,7 +254,15 @@ def collect_load_metrics(
             reader is written here (INV-5).
         own_cgroup_path: The sampler's own ``0::`` kernel path. ``None`` asks
             α's ``resolve_own_cgroup`` for the live one, so there is no second
-            /proc/self/cgroup reader either.
+            /proc/self/cgroup reader either. That ``None`` is the branch every
+            real tick takes, since ``__main__`` calls this with no arguments.
+        proc_cgroup_path: Where to read that ``0::`` line FROM, forwarded to α
+            unchanged. Only consulted when ``own_cgroup_path`` is ``None``,
+            which is the only branch that resolves anything. ``None`` here
+            leaves the argument out of α's call rather than spelling
+            ``/proc/self/cgroup`` a second time, so the live path keeps its
+            single home in α (heuristic 11) and the live resolution keeps its
+            existing cache key.
         cgroup_root: Where the unified hierarchy is mounted.
     """
     runqueue = read_runqueue()
@@ -262,7 +271,10 @@ def collect_load_metrics(
         out['runqueue_ratio'] = float(runqueue.ratio)
 
     if own_cgroup_path is None:
-        own_cgroup_path = resolve_own_cgroup(None, cgroup_root=str(cgroup_root)).path
+        seam = {} if proc_cgroup_path is None else {'proc_cgroup_path': proc_cgroup_path}
+        own_cgroup_path = resolve_own_cgroup(
+            None, cgroup_root=str(cgroup_root), **seam
+        ).path
     leaves = discover_pressure_cgroups(
         own_cgroup_path=own_cgroup_path, cgroup_root=cgroup_root
     )
