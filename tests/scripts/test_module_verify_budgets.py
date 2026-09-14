@@ -114,6 +114,7 @@ import yaml
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
     FAMILY_READER_PATH,
+    census_budget_floor,
     min_budget,
     published_pairs,
 )
@@ -1511,3 +1512,83 @@ def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
         'guard pins the SET of returned prefixes against '
         'FAMILY_PUBLISHED_PREFIXES instead of iterating whatever it finds'
     )
+
+
+class TestCensusBudgetFloor:
+    """`census_budget_floor` — the family's ONE spelling of D17's derivation.
+
+    ceil-to-100(1.5 * worst). Lives beside `min_budget` in
+    `module_budget_family` so the family has one home for budget expressions,
+    and imported by name here under the same single-import discipline the
+    canonical-expression guard enforces for `min_budget`.
+
+    It is a DIFFERENT trade from `min_budget`, not a weakening of it: ruling
+    D17 rejected the 2x multiple for this module as a moving target against a
+    still-growing unsharded suite, and replaced it with a tighter multiple over
+    a SHORTER, regime-scoped window.
+    """
+
+    @pytest.mark.parametrize(
+        ('worst', 'expected'),
+        [
+            # An already-round product must not round up a further 100.
+            (4800.0, 7200),
+            # The plan's worked example: 1.5 * 3753 = 5629.5 -> 5700.
+            (3753.0, 5700),
+            # The measured prevailing-regime max: 1.5 * 4626.17 = 6939.25 -> 7000.
+            (4626.166946739017, 7000),
+            # The retired-regime max, which is why the window is regime-scoped.
+            (4991.13326132996, 7500),
+            (0.0, 0),
+            # Any positive fraction of a 100s block rounds UP to it.
+            (0.1, 100),
+            (66.66, 100),
+            (66.67, 200),
+        ],
+    )
+    def test_exact_values_across_the_rounding_boundaries(self, worst, expected):
+        assert census_budget_floor(worst) == expected
+
+    def test_the_return_type_is_int(self):
+        """It is compared against a yaml-declared budget, so it must not be a
+        float that prints as one thing and compares as another."""
+        assert isinstance(census_budget_floor(3753.0), int)
+
+    def test_it_rounds_up_where_min_budget_rounds_down(self):
+        """The direction is load-bearing and opposite.
+
+        `min_budget` truncates DOWN and degenerates to zero for cheap suites —
+        acceptable for a "at least 2x" sanity floor. A floor derived from a
+        measured TAIL must not be truncated BELOW that tail, so this one rounds
+        up. A single value where both are non-degenerate shows the split.
+        """
+        assert census_budget_floor(66.67) == 200
+        assert min_budget(66.67) == 100
+
+    def test_it_never_returns_less_than_the_worst_run_it_derives_from(self):
+        """The property that makes it a FLOOR: 1.5x, rounded up, always clears W."""
+        for worst in (0.1, 22.49, 66.67, 233.5, 3753.0, 4626.17, 4991.13, 5288.0):
+            assert census_budget_floor(worst) > worst
+
+    def test_it_is_distinct_from_min_budget_in_multiple_and_direction(self):
+        """A test asserting the two AGREE somewhere would let one silently
+        become the other. This asserts they disagree on a live figure."""
+        worst = 4626.166946739017
+
+        assert census_budget_floor(worst) == 7000
+        assert min_budget(worst) == 9200
+        assert census_budget_floor(worst) != min_budget(worst)
+
+    def test_it_is_not_in_the_canonical_expression_namespace(self):
+        """Deliberately NOT wired into the family's publisher guard.
+
+        That guard evaluates each publisher's floor expression in a namespace
+        holding only `min_budget` and the published worst, without
+        `__builtins__`, so a re-spelled derivation raises NameError. Adding a
+        second callable to it would let a publisher's MIN_MODULE_BUDGET_SECS
+        silently switch derivations and still evaluate green — which is the
+        exact drift that namespace exists to catch.
+        """
+        import module_budget_family as family  # noqa: PLC0415
+
+        assert family.HELPER_NAME == 'min_budget'
