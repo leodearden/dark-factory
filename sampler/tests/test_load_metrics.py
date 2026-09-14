@@ -509,6 +509,10 @@ class TestParserRehomedToShared:
         """sampler.metrics.parse_pressure_file must be the SAME object as
         shared.psi.parse_pressure_file -- a re-export, not a duplicate copy
         that could drift and re-derive the kernel-asymmetry bug (DA-D9).
+
+        This covers every caller in the module, /proc/pressure/* and each
+        discovered cgroup's cpu.pressure alike: the cgroup text goes through
+        α's parser, not a copy of it (INV-5).
         """
         import shared.psi
 
@@ -920,19 +924,6 @@ class TestCollectLoadMetricsOwnPressure:
 
         for key, value in result.items():
             assert type(value) is float, f'{key} is {type(value).__name__}: {value!r}'
-
-    def test_no_second_pressure_parser_exists(self):
-        """The cgroup text goes through α's parser, not a copy of it (INV-5)."""
-        import shared.psi
-
-        import sampler.metrics
-
-        assert sampler.metrics.parse_pressure_file is shared.psi.parse_pressure_file
-        source = Path(sampler.metrics.__file__).read_text()
-        assert 'avg10=' not in source, (
-            'sampler.metrics must not contain a pressure-line pattern of its own; '
-            'shared.psi.parse_pressure_file is the single parser (INV-5).'
-        )
 
 
 # ---------------------------------------------------------------------------
