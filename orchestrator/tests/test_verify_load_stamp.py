@@ -449,3 +449,248 @@ class TestLoadReachesTheSummaryPayload:
         payload = _build_summary_payload([self._run()], 'clean', '')
 
         assert json.loads(json.dumps(payload)) == payload
+
+
+# The stamp is only worth anything if it is TAKEN. Everything above proves the
+# record serialises; these drive `run_verification` for real against a tmp_path
+# worktree and read the summary.json it WRITES.
+#
+# That distinction is not hypothetical here. Every test in
+# test_verify_segmented_fallback.py once spied on `_persist_attempt_logs`'
+# ARGUMENT, and that seam cannot see `_build_summary_payload`'s key whitelist
+# dropping a field on the way to disk — which is exactly what happened to
+# `segments`: the docstrings claimed the JSON and the tests asserting the JSON
+# were asserting the argument.
+
+_CHAIN_TEST_COMMAND = (
+    'cd shared && uv run pytest tests/ -q && uv run --project shared pytest tests/scripts/ -q'
+)
+
+
+def _module_config(*, test_command, type_check_command=None):
+    """A `__fallback__` module config; type is left SKIPPED by default."""
+    from orchestrator.config import ModuleConfig  # noqa: PLC0415
+
+    return ModuleConfig(
+        prefix='__fallback__',
+        test_command=test_command,
+        lint_command='uv run ruff check src/',
+        type_check_command=type_check_command,
+    )
+
+
+async def _run_and_read_summary(tmp_path, *, segmented, reader):
+    """Drive the REAL `run_verification` and return (result, parsed summary.json).
+
+    *reader* is handed to the REAL `_load_sample`, so its never-raise wrapper
+    and its read_ok -> None mapping are the ones under test here — only the
+    /proc read itself is replaced. Patching `verify.read_psi_sample` would NOT
+    work: `_load_sample`'s `read=` default is bound at def time, so a later
+    patch of the module attribute never reaches it.
+    """
+    from unittest.mock import patch  # noqa: PLC0415
+
+    from orchestrator import verify as verify_mod  # noqa: PLC0415
+    from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+
+    (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+    real_load_sample = verify_mod._load_sample
+
+    def scripted_load_sample():
+        return real_load_sample(read=reader)
+
+    async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+        return 0, 'ok', False
+
+    config = OrchestratorConfig(
+        project_root=tmp_path, verify_admission_enabled=False,
+    )
+    with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+         patch('orchestrator.verify._load_sample', side_effect=scripted_load_sample):
+        result = await verify_mod.run_verification(
+            tmp_path,
+            config,
+            _module_config(
+                test_command=_CHAIN_TEST_COMMAND if segmented else 'uv run pytest tests/ -n 8',
+            ),
+            attempt_id=1,
+            # Load-bearing, not decoration: run_verification persists only when
+            # attempt_id AND task_id are both set.
+            task_id='3353',
+            max_retries=0,
+            segment_chained_test=segmented,
+        )
+
+    summary_path = tmp_path / '.task' / 'verify' / 'attempt-1.__fallback__.summary.json'
+    assert summary_path.exists(), (
+        f'run_verification persisted no summary JSON at {summary_path}; wrote '
+        f'{sorted(p.name for p in (tmp_path / ".task" / "verify").glob("*"))}'
+    )
+    return result, json.loads(summary_path.read_text(encoding='utf-8'))
+
+
+def _rising_reader():
+    """A reader whose every call reads a BUSIER host than the last.
+
+    Monotonic rather than a fixed pair, which is what makes the start/end
+    assertions safe under the concurrent test/lint/type gather: the legs
+    interleave their samples arbitrarily, but a single leg's start is always
+    drawn before its own end.
+    """
+    import itertools  # noqa: PLC0415
+
+    counter = itertools.count(1)
+
+    def read():
+        n = float(next(counter))
+        return _sample(cpu_some10=n, cpu_some60=n / 2, runqueue_ratio=n / 4)
+
+    return read
+
+
+def _raising_reader():
+    def read():
+        raise OSError('/proc/pressure/cpu went away mid-verify')
+
+    return read
+
+
+@pytest.mark.parametrize('segmented', [False, True], ids=['unsegmented', 'segmented'])
+class TestTheStampIsTakenOnTheRealPath:
+    """INV-10, and the guard D17 names.
+
+    Parametrized over BOTH execution branches of `_run_or_skip_timed` — the
+    plain one and the `&&`-chain segmented one — so the stamp cannot land on
+    one path only. That asymmetry is not imagined: the `-n` cap sitting three
+    lines away WAS silently dropped on the segmented path, because the rewrite
+    landed on `cmd` while segments were built from `config_cmd`, and task 3478
+    existed to remove it.
+    """
+
+    @staticmethod
+    def _stamped(summary):
+        return [c for c in summary['commands'] if c['cmd'] is not None]
+
+    @pytest.mark.asyncio
+    async def test_every_command_that_ran_carries_a_start_and_an_end(
+        self, tmp_path, segmented,
+    ):
+        _result, summary = await _run_and_read_summary(
+            tmp_path, segmented=segmented, reader=_rising_reader(),
+        )
+
+        entries = self._stamped(summary)
+        assert entries, 'no command entry reached the written summary at all'
+        for entry in entries:
+            assert entry['load'] is not None, (
+                f"{entry['label']}: load never reached disk — "
+                '_build_summary_payload rebuilds from a key whitelist'
+            )
+            assert set(entry['load']) == {'start', 'end', 'xdist'}
+
+    @pytest.mark.asyncio
+    async def test_the_start_and_end_are_two_distinct_samples(
+        self, tmp_path, segmented,
+    ):
+        """The point of the pair: a budget reader wants the load DURING the run.
+
+        A single sample reused for both would serialise identically and satisfy
+        every shape assertion above, so this is the one that catches it.
+        """
+        _result, summary = await _run_and_read_summary(
+            tmp_path, segmented=segmented, reader=_rising_reader(),
+        )
+
+        for entry in self._stamped(summary):
+            start, end = entry['load']['start'], entry['load']['end']
+            assert start != end, f"{entry['label']}: one sample reused for both ends"
+            assert start['cpu_some10'] < end['cpu_some10'], (
+                f"{entry['label']}: end sample was drawn before the start sample"
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_xdist_facts_ride_along(self, tmp_path, segmented):
+        _result, summary = await _run_and_read_summary(
+            tmp_path, segmented=segmented, reader=_rising_reader(),
+        )
+
+        for entry in self._stamped(summary):
+            assert set(entry['load']['xdist']) == {'n_flag', 'auto_num_workers'}
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_leg_contributes_no_entry(self, tmp_path, segmented):
+        """Unchanged behaviour: the type leg has no command, so there is nothing
+        to stamp and no entry to stamp it on."""
+        _result, summary = await _run_and_read_summary(
+            tmp_path, segmented=segmented, reader=_rising_reader(),
+        )
+
+        assert 'type' not in {c['label'] for c in summary['commands']}
+
+    @pytest.mark.asyncio
+    async def test_the_written_summary_is_still_json(self, tmp_path, segmented):
+        _result, summary = await _run_and_read_summary(
+            tmp_path, segmented=segmented, reader=_rising_reader(),
+        )
+
+        assert json.loads(json.dumps(summary)) == summary
+
+
+@pytest.mark.parametrize('segmented', [False, True], ids=['unsegmented', 'segmented'])
+class TestTelemetryFailureDoesNotChangeTheVerdict:
+    """INV-1 / INV-11 on the REAL path: a broken /proc may not fail a verify.
+
+    The verdict is compared against the healthy run's verdict rather than
+    against a hardcoded expectation, so this stays a statement about EQUALITY
+    under degradation — it cannot pass by both runs being broken in the same
+    new way.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_verdict_is_identical_with_a_broken_reader(
+        self, tmp_path, segmented,
+    ):
+        healthy, healthy_summary = await _run_and_read_summary(
+            tmp_path / 'healthy', segmented=segmented, reader=_rising_reader(),
+        )
+        degraded, degraded_summary = await _run_and_read_summary(
+            tmp_path / 'degraded', segmented=segmented, reader=_raising_reader(),
+        )
+
+        assert (degraded.passed, degraded.timed_out, degraded.category) == (
+            healthy.passed, healthy.timed_out, healthy.category,
+        )
+        assert degraded_summary['rc'] == healthy_summary['rc']
+        assert degraded_summary['category'] == healthy_summary['category']
+        assert degraded_summary['timed_out'] == healthy_summary['timed_out']
+
+    @pytest.mark.asyncio
+    async def test_the_load_fields_are_null_throughout_rather_than_zero(
+        self, tmp_path, segmented,
+    ):
+        """Null, not 0.0 — a broken read must not render as an idle host."""
+        _result, summary = await _run_and_read_summary(
+            tmp_path, segmented=segmented, reader=_raising_reader(),
+        )
+
+        entries = [c for c in summary['commands'] if c['cmd'] is not None]
+        assert entries
+        for entry in entries:
+            for end in ('start', 'end'):
+                assert entry['load'][end] == {
+                    'cpu_some10': None,
+                    'cpu_some60': None,
+                    'runqueue_ratio': None,
+                }
+
+    @pytest.mark.asyncio
+    async def test_the_record_is_still_structurally_complete(
+        self, tmp_path, segmented,
+    ):
+        """Degraded means "nulls inside", never "the key went missing"."""
+        _result, summary = await _run_and_read_summary(
+            tmp_path, segmented=segmented, reader=_raising_reader(),
+        )
+
+        for entry in [c for c in summary['commands'] if c['cmd'] is not None]:
+            assert set(entry['load']) == {'start', 'end', 'xdist'}
