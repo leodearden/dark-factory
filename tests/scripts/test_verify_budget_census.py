@@ -272,3 +272,121 @@ class TestParseRecordPathRejections:
                 tmp_path, '5422', f'attempt-1.orchestrator.test-{_STAMP_US}.log',
             ),
         ) is None
+
+
+class TestLoadRecordsIsTotal:
+    """The walker must never quietly shrink its own corpus.
+
+    That is the exact failure this task exists to end: a budget derived from a
+    distribution that silently dropped the records it could not read is not a
+    measurement, and nothing in its output would say so. Every file the globs
+    select is either a loaded record or a COUNTED skip carrying its reason, and
+    `len(records) + len(skipped)` reconciles against the corpus size.
+    """
+
+    def test_both_corpora_are_walked(self, tmp_path):
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json')
+        _archive_record(
+            tmp_path, '5422', f'attempt-1.orchestrator.summary-{_STAMP_US}.json',
+        )
+
+        corpus = load_records([tmp_path])
+
+        assert {r.where.corpus for r in corpus.records} == {'worktree', 'archive'}
+        assert corpus.skipped == ()
+
+    def test_several_roots_are_walked(self, tmp_path):
+        """`--project-root` is repeatable, like the sibling report's."""
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        one, two = tmp_path / 'one', tmp_path / 'two'
+        _worktree_record(one, '1', 'attempt-1.orchestrator.summary.json')
+        _worktree_record(two, '2', 'attempt-1.orchestrator.summary.json')
+
+        corpus = load_records([one, two])
+
+        assert sorted(r.where.task_id for r in corpus.records) == ['1', '2']
+
+    def test_a_missing_root_is_not_a_crash(self, tmp_path):
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        corpus = load_records([tmp_path / 'absent'])
+
+        assert corpus.records == ()
+        assert corpus.skipped == ()
+
+    def test_the_payload_is_carried_verbatim(self, tmp_path):
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        path = _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json')
+        payload = {'category': 'clean', 'rc': 0, 'commands': [{'label': 'test'}]}
+        path.write_text(json.dumps(payload), encoding='utf-8')
+
+        corpus = load_records([tmp_path])
+
+        assert [r.payload for r in corpus.records] == [payload]
+
+    @pytest.mark.parametrize(
+        ('content', 'reason'),
+        [
+            ('not json at all', 'not_json'),
+            ('', 'not_json'),
+            ('[1, 2, 3]', 'not_an_object'),
+            ('"a string"', 'not_an_object'),
+        ],
+    )
+    def test_an_unusable_file_is_counted_with_its_reason(
+        self, tmp_path, content, reason,
+    ):
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        path = _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json')
+        path.write_text(content, encoding='utf-8')
+
+        corpus = load_records([tmp_path])
+
+        assert corpus.records == ()
+        assert [s.reason for s in corpus.skipped] == [reason]
+        assert corpus.skipped[0].path == path
+
+    def test_an_unreadable_file_is_counted_not_raised(self, tmp_path):
+        """A directory standing where a summary should be — the never-raise arm."""
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        stub = tmp_path / '.worktrees' / '3353' / '.task' / 'verify'
+        (stub / 'attempt-1.orchestrator.summary.json').mkdir(parents=True)
+
+        corpus = load_records([tmp_path])
+
+        assert corpus.records == ()
+        assert [s.reason for s in corpus.skipped] == ['unreadable']
+
+    def test_every_selected_file_is_accounted_for(self, tmp_path):
+        """The reconciliation property, asserted directly."""
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        good = _worktree_record(tmp_path, '1', 'attempt-1.orchestrator.summary.json')
+        bad = _worktree_record(tmp_path, '2', 'attempt-1.orchestrator.summary.json')
+        bad.write_text('{oops', encoding='utf-8')
+        _worktree_record(tmp_path, '3', 'attempt-1.orchestrator.test.log')
+
+        corpus = load_records([tmp_path])
+
+        assert len(corpus.records) + len(corpus.skipped) == 2
+        assert [r.where.path for r in corpus.records] == [good]
+
+    def test_the_log_legs_beside_a_summary_are_not_selected(self, tmp_path):
+        """Neither glob admits a `.log`, so they are not skips either."""
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.test.log')
+        _archive_record(
+            tmp_path, '5422', f'attempt-1.orchestrator.test-{_STAMP_US}.log',
+        )
+
+        corpus = load_records([tmp_path])
+
+        assert corpus.records == ()
+        assert corpus.skipped == ()
