@@ -189,12 +189,28 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
 
     Logs at WARNING naming the dangling ids and the backup path: a repair that
     happens silently is indistinguishable from a repair that never ran.
+
+    A move that FAILS is reported, never raised: ``None`` comes back exactly as
+    for a healthy scan, and the caller distinguishes the two by the scan it
+    already holds — a suspect scan with no backup is what
+    :attr:`PreflightResult.unrepaired` renders and what turns the verdict
+    ``blocked``.  Degrading this way is the whole point of the module: an abort
+    that must still run cannot be blocked by a repair that could not, and it is
+    the same shape :func:`sweep_stale_locks` uses for a lock it cannot unlink.
     """
     if not scan.suspect:
         return None
 
     backup = _free_backup_path(scan.merge_rr_path)
-    scan.merge_rr_path.rename(backup)
+    try:
+        scan.merge_rr_path.rename(backup)
+    except OSError as exc:
+        logger.warning(
+            'Could not quarantine suspect MERGE_RR %s: %s. Left in place; the '
+            'abort still runs and the result reports it un-repaired.',
+            scan.merge_rr_path, exc,
+        )
+        return None
     logger.warning(
         'Quarantined suspect MERGE_RR to %s — dangling rr-cache refs: [%s]; '
         'unparsable records: %d. Evidence preserved; the abort that follows '
