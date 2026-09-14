@@ -354,6 +354,14 @@ def test_census_breaks_issues_down_by_emitting_role(tmp_path):
     assert result.roles == {"reviewer_comprehensive": 4, "reviewer_scoped": 1}
 
 
+def test_the_role_breakdown_reconciles_with_the_issue_total(tmp_path):
+    """A census whose parts do not add up is worse than no census: it reads as
+    measured. The refused issue must appear in SOME role bucket, or the
+    breakdown silently omits whatever the walk could not read."""
+    result = census(_fixture_tree(tmp_path))
+    assert sum(result.roles.values()) == result.issues
+
+
 def test_census_reports_the_emission_window(tmp_path):
     result = census(_fixture_tree(tmp_path))
     assert result.emitted_first == "2026-07-19T00:00:00+00:00"

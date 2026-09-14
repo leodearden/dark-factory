@@ -37,14 +37,21 @@ moving target, never a fact about a closed set.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from collections import Counter
 from pathlib import Path
+from typing import NamedTuple
 
 DEFAULT_ROOT = Path("/home/leo/src/dark-factory/.worktrees/.task-meta")
 
 #: The only two severities the review gates understand. Anything else is read as
 #: a suggestion and skipped by the in-scope filter — the drop this task triages.
 CONTRACT_SEVERITIES = frozenset({"blocking", "suggestion"})
+
+#: The severities task 5430 triages. Everything below this floor was emitted at
+#: low/minor/nit/trivial and is deliberately out of scope.
+TRIAGE_SEVERITIES = frozenset({"high", "major", "medium", "moderate"})
 
 #: Ordered key preference for the headline. `title` is the common spelling;
 #: `short_summary` is the one the ReportFindings-shaped verdicts use.
@@ -127,11 +134,146 @@ def normalize_issue(task_id: str, index: int, raw: dict) -> dict:
     }
 
 
+class VerdictIssue(NamedTuple):
+    """One normalized issue plus the facts that belong to its verdict FILE.
+
+    Role, emission time and source path are properties of the verdict, not of
+    the issue, so `normalize_issue` cannot supply them — the walker does.
+    """
+    path: Path
+    role: str
+    emitted_at: str | None
+    location_less: bool
+    record: dict
+
+
+class Census(NamedTuple):
+    """A DATED MEASUREMENT of a verdict tree, never a fact about a closed set.
+
+    `issues` counts normalized issues; `unlocatable` counts the residue the
+    normalizer refused, so `issues + unlocatable` is every issue entry present.
+    `verdicts_with_issues` reads the raw list, so a verdict whose only entry was
+    refused still counts as carrying one, and `sum(roles.values()) == issues`
+    for the same reason. `off_contract_severity` and
+    `location_less` are deliberately separate tallies: the 23 findings task 5430
+    triages were in both, which is how the two review gates compounded, but a
+    census that folded them together could never show the two diverging.
+    """
+    files: int
+    unparseable: int
+    unlocatable: int
+    verdicts_with_issues: int
+    issues: int
+    off_contract_severity: int
+    location_less: int
+    roles: dict[str, int]
+    emitted_first: str | None
+    emitted_last: str | None
+
+
+class Scan(NamedTuple):
+    issues: list[VerdictIssue]
+    files: int
+    unparseable: int
+    unlocatable: int
+    verdicts_with_issues: int
+    emitted_at: list[str]
+    roles: Counter
+
+
+def _scan(root: Path) -> Scan:
+    """Walk `<root>/*/verdicts/*.json` once. The SPOT for tree traversal.
+
+    Tolerant by tallying, never by dropping: a file that will not parse and an
+    issue the normalizer refuses are both counted, so a caller is told what the
+    walk could not read rather than being handed a quietly short number.
+    """
+    issues: list[VerdictIssue] = []
+    files = unparseable = unlocatable = verdicts_with_issues = 0
+    emitted_at: list[str] = []
+    roles: Counter = Counter()
+
+    for path in sorted(root.glob("*/verdicts/*.json")):
+        files += 1
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, ValueError):
+            unparseable += 1
+            continue
+
+        raw_issues = payload.get("verdict", {}).get("issues") or []
+        if raw_issues:
+            verdicts_with_issues += 1
+        role = payload.get("role") or path.stem
+        stamp = payload.get("emitted_at")
+        if stamp:
+            emitted_at.append(stamp)
+
+        for index, raw in enumerate(raw_issues):
+            # Tallied before normalization can refuse the issue, so the role
+            # breakdown reconciles with the issue total rather than quietly
+            # omitting whatever the walk could not read.
+            roles[role] += 1
+            try:
+                record = normalize_issue(path.parent.parent.name, index, raw)
+            except ValueError:
+                unlocatable += 1
+                continue
+            issues.append(VerdictIssue(
+                path=path,
+                role=role,
+                emitted_at=stamp,
+                location_less=not _text(raw, "location"),
+                record=record,
+            ))
+
+    return Scan(issues, files, unparseable, unlocatable, verdicts_with_issues, emitted_at, roles)
+
+
+def census(root: Path) -> Census:
+    """Measure a verdict tree. Makes no selection and no judgement."""
+    scan = _scan(root)
+    return Census(
+        files=scan.files,
+        unparseable=scan.unparseable,
+        unlocatable=scan.unlocatable,
+        verdicts_with_issues=scan.verdicts_with_issues,
+        issues=len(scan.issues) + scan.unlocatable,
+        off_contract_severity=sum(i.record["off_contract"] for i in scan.issues) + scan.unlocatable,
+        location_less=sum(i.location_less for i in scan.issues) + scan.unlocatable,
+        roles=dict(scan.roles),
+        emitted_first=min(scan.emitted_at, default=None),
+        emitted_last=max(scan.emitted_at, default=None),
+    )
+
+
+def select_population(root: Path) -> list[VerdictIssue]:
+    """The issues task 5430 triages: off-contract severity AND in the band.
+
+    Never filters on role. Role is a census observation, and excluding a role
+    here would understate the residue while looking like it had measured it.
+    """
+    return [
+        issue for issue in _scan(root).issues
+        if issue.record["off_contract"] and issue.record["severity"] in TRIAGE_SEVERITIES
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
                         help="task-meta tree to census (default: %(default)s)")
-    parser.parse_args(argv)
+    parser.add_argument("--json", action="store_true", help="emit the census as JSON")
+    args = parser.parse_args(argv)
+
+    measured = census(args.root)
+    if args.json:
+        print(json.dumps({"root": str(args.root), **measured._asdict()}, indent=2))
+    else:
+        print(f"root: {args.root}")
+        for field, value in measured._asdict().items():
+            print(f"  {field}: {value}")
+        print(f"  triage_population: {len(select_population(args.root))}")
     return 0
 
 
