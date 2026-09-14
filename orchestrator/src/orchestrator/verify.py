@@ -5259,7 +5259,9 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     verify's failure cancelling this one via ``asyncio.gather``) cannot
     interrupt that worker thread mid-``time.sleep`` — a bare cancel would
     leave the slot acquired-but-never-released if the thread goes on to
-    succeed, so a done-callback releases it instead.
+    succeed, so a done-callback releases it instead. That release race, and
+    its adjacent never-entered-CM guard, are pinned by
+    ``test_verify_admission_cancel_release.py``.
 
     Ungated role — ``__enter__`` is a synchronous no-op (T1's own role check
     short-circuits before any I/O), so it runs inline on the event loop
