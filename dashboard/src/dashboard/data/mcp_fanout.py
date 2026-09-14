@@ -1430,14 +1430,33 @@ class TTLCache(Generic[V, K]):
         done-callbacks the cancellations trigger find nothing to unpick and
         cannot mutate a roster being iterated.
 
+        **Only tasks on the CALLING loop are touched**, because this cache
+        outlives individual event loops while its tasks do not. The instances
+        are module-level, and the dashboard's own test suite runs a fresh loop
+        per ``TestClient(app)`` in its own thread, so a roster entry left by an
+        earlier loop is a state this method will really meet. Cancelling one
+        cancels its parked future, which schedules that future's callbacks
+        through ``loop.call_soon`` — on a closed loop, ``RuntimeError: Event
+        loop is closed``, the same escape ``dashboard.app.lifespan``'s
+        docstring attributes to task 3466.
+
+        The residual, named honestly: a foreign-loop task is UNREACHABLE, not
+        reaped. Its loop is gone, so nothing this process can do will advance,
+        finish or free it, and it is excluded from the returned count for that
+        reason. Its roster entry is still dropped — otherwise a dead loop's
+        residue counts against ``_MAX_LIVE_BYPASSES_PER_KEY`` forever, denying
+        the live loop bypasses it is entitled to.
+
         Counts tasks, not keys — the caller wants to know how much work was
         still outstanding, and a key may hold up to
         ``_MAX_LIVE_BYPASSES_PER_KEY`` of it.
         """
+        loop = asyncio.get_running_loop()
         reapable = [
             task
             for key in list(self._live_bypasses)
             for task in self._live_bypasses_for(key)
+            if task.get_loop() is loop
         ]
         self._bypass_tasks.clear()
         self._live_bypasses.clear()
