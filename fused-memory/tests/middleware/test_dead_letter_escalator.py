@@ -232,6 +232,23 @@ class TestNeverRaises:
         assert 'add_episode' in caplog.text, caplog.text
         assert not _filed(tmp_path)
 
+    def test_a_non_str_content_preview_still_files(self, tmp_path):
+        """The payload is whatever JSON a queue row happened to hold.
+
+        `content_preview` reaches the escalator from
+        `payload.get('content') or payload.get('fact_text')`, neither of which
+        is type-checked anywhere upstream. Slicing a non-str raises TypeError,
+        and the slice used to sit outside every `try` — so a malformed payload
+        cost the alarm entirely, which is the one outcome this module exists
+        to prevent. A preview an operator cannot read is a far smaller loss
+        than a death nobody hears about.
+        """
+        esc_id = _emit(tmp_path, content_preview={'a dict': 'not a str'})
+
+        assert esc_id is not None, 'a malformed preview must not cost the alarm'
+        detail = _filed(tmp_path)[0]['detail']
+        assert 'a dict' in detail, detail
+
     def test_without_the_escalation_package_it_no_ops(self, tmp_path, monkeypatch, caplog):
         """The minimal-env path: WARNED, nothing filed, `None` returned.
 

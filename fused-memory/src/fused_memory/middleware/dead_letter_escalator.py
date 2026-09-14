@@ -274,74 +274,81 @@ def emit_dead_letter_escalation(
         )
         return None
 
-    # The 200-char bound `log_write_op` already uses for
-    # `params={'content': content[:200]}`. An escalation queue an operator
-    # reads must not grow a full episode body per entry.
-    preview = (content_preview or '')[:_PREVIEW_CHARS]
-
-    if post_execute:
-        remediation = [
-            'THE BACKEND WRITE LANDED. `dead` means the queue gave up, NOT '
-            'that the write never happened: the registered callback runs '
-            'AFTER the backend write returned, so what kept failing here was '
-            'the post-execute work. Replaying this item DUPLICATES the write.',
-            '',
-            'Before any replay, confirm what landed: look up the `backend_ops` '
-            'row joined on this `write_op_id`. Do NOT join on '
-            "`backend_ops.operation` — it is the literal 'add_episode' for "
-            'both the add_episode and the add_memory_graphiti path, so it '
-            'cannot distinguish them and will match the wrong write.',
-            '',
-            'Once the landed write is confirmed, `delete_dead_letters` is the '
-            'correct disposition for this item; `replay_dead_letters` is not.',
-        ]
-    else:
-        remediation = [
-            'The backend write did not land: `_execute_write` itself failed, '
-            'so nothing was written and there is nothing to duplicate.',
-            '',
-            'Once the underlying cause is fixed, `replay_dead_letters` is the '
-            'safe remediation and will re-run this write. Use '
-            '`delete_dead_letters` only when the item is known unrecoverable '
-            '— it destroys the only remaining copy of the content above.',
-        ]
-
-    detail = '\n'.join([
-        f'project_id={project_id!r}',
-        f'project_root={project_root!r}',
-        f'operation={operation!r}',
-        f'group_id={group_id!r}',
-        f'queue_item_id={item_id}',
-        f'attempts={attempts}',
-        f'write_op_id={write_op_id!r}',
-        f'post_execute={post_execute}',
-        f'error={error!r}',
-        f'content_preview={preview!r}',
-        'reported_to_caller='
-        f'{_reported_to_caller(operation, write_op_id, caller_reference)!r}',
-        '',
-        f'A durably-queued {operation!r} write for project {project_id!r} '
-        f'exhausted its attempts and was PERMANENTLY ABANDONED after '
-        f'{attempts} attempt(s). Nothing will retry it.',
-        '',
-        *remediation,
-        '',
-        'ONE RECORD PER (project, operation, error class). `dedupe_count` is '
-        'how many writes died this way, not how many times one write was '
-        'retried — the fields above describe the FIRST death, and the folded '
-        'children carry the rest.',
-        '',
-        'DURABLE RECORD: `write_ops.terminal_status` / '
-        '`write_ops.terminal_error` (task 3582) carry this outcome per write, '
-        'readable via `WriteJournal.get_write_op` for anyone holding the '
-        '`write_op_id` above. The LIVE queue counters — `dead_by_operation` on '
-        'get_queue_stats / get_status, and the aggregate `dead_count` in '
-        'reconciliation/queue_health.py — corroborate this while the row '
-        'exists, and go to zero the moment `delete_dead_letters` sweeps it. '
-        'This escalation is what survives that sweep.',
-    ])
-
+    # EVERY remaining statement is inside this one `try`, so the NEVER RAISES
+    # contract is structural rather than an argument about which of these
+    # expressions can throw. The fields being rendered are whatever JSON a
+    # queue row happened to hold, and none of them is type-checked upstream.
     try:
+        # `str()` for exactly that reason: `content_preview` reaches here from
+        # `payload.get('content') or payload.get('fact_text')`, so a non-str
+        # body must cost the record its legibility, never the alarm itself.
+        # The 200-char bound is the one `log_write_op` already applies to
+        # `params={'content': content[:200]}` — an escalation queue an operator
+        # reads must not grow a full episode body per entry.
+        preview = str(content_preview or '')[:_PREVIEW_CHARS]
+
+        if post_execute:
+            remediation = [
+                'THE BACKEND WRITE LANDED. `dead` means the queue gave up, NOT '
+                'that the write never happened: the registered callback runs '
+                'AFTER the backend write returned, so what kept failing here was '
+                'the post-execute work. Replaying this item DUPLICATES the write.',
+                '',
+                'Before any replay, confirm what landed: look up the `backend_ops` '
+                'row joined on this `write_op_id`. Do NOT join on '
+                "`backend_ops.operation` — it is the literal 'add_episode' for "
+                'both the add_episode and the add_memory_graphiti path, so it '
+                'cannot distinguish them and will match the wrong write.',
+                '',
+                'Once the landed write is confirmed, `delete_dead_letters` is the '
+                'correct disposition for this item; `replay_dead_letters` is not.',
+            ]
+        else:
+            remediation = [
+                'The backend write did not land: `_execute_write` itself failed, '
+                'so nothing was written and there is nothing to duplicate.',
+                '',
+                'Once the underlying cause is fixed, `replay_dead_letters` is the '
+                'safe remediation and will re-run this write. Use '
+                '`delete_dead_letters` only when the item is known unrecoverable '
+                '— it destroys the only remaining copy of the content above.',
+            ]
+
+        detail = '\n'.join([
+            f'project_id={project_id!r}',
+            f'project_root={project_root!r}',
+            f'operation={operation!r}',
+            f'group_id={group_id!r}',
+            f'queue_item_id={item_id}',
+            f'attempts={attempts}',
+            f'write_op_id={write_op_id!r}',
+            f'post_execute={post_execute}',
+            f'error={error!r}',
+            f'content_preview={preview!r}',
+            'reported_to_caller='
+            f'{_reported_to_caller(operation, write_op_id, caller_reference)!r}',
+            '',
+            f'A durably-queued {operation!r} write for project {project_id!r} '
+            f'exhausted its attempts and was PERMANENTLY ABANDONED after '
+            f'{attempts} attempt(s). Nothing will retry it.',
+            '',
+            *remediation,
+            '',
+            'ONE RECORD PER (project, operation, error class). `dedupe_count` is '
+            'how many writes died this way, not how many times one write was '
+            'retried — the fields above describe the FIRST death, and the folded '
+            'children carry the rest.',
+            '',
+            'DURABLE RECORD: `write_ops.terminal_status` / '
+            '`write_ops.terminal_error` (task 3582) carry this outcome per write, '
+            'readable via `WriteJournal.get_write_op` for anyone holding the '
+            '`write_op_id` above. The LIVE queue counters — `dead_by_operation` on '
+            'get_queue_stats / get_status, and the aggregate `dead_count` in '
+            'reconciliation/queue_health.py — corroborate this while the row '
+            'exists, and go to zero the moment `delete_dead_letters` sweeps it. '
+            'This escalation is what survives that sweep.',
+        ])
+
         esc = Escalation( # type: ignore[possibly-unbound]
             id=queue.make_id(_ANCHOR_TASK_ID),
             task_id=_ANCHOR_TASK_ID,
@@ -406,8 +413,8 @@ def emit_dead_letter_escalation(
         # The item is already committed dead; a queue I/O failure must cost the
         # operator a heads-up, never the worker that was draining the group.
         logger.exception(
-            'durable_write_dead_letter: failed to submit the alarm for a lost '
-            '%r write in project_id=%r (item_id=%s)',
+            'durable_write_dead_letter: failed to build or submit the alarm '
+            'for a lost %r write in project_id=%r (item_id=%s)',
             operation, project_id, item_id,
         )
         return None
