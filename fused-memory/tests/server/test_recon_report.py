@@ -3994,6 +3994,26 @@ class TestReconReportSupersedes:
         assert 'finding_id' in added, f'add_finding failed: {added}'
         return added['finding_id']
 
+    def _supersede(self, state, target_fid, run_id='r1', task_id='42', flag_type='r'):
+        """File a finding that retires *target_fid*, returning its finding_id.
+
+        flag_type is a parameter because two findings retiring the SAME target
+        must carry distinct ``(task_id, flag_type)`` signatures, or the second
+        one dedups onto the first instead of allocating a row of its own.
+        """
+        added = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='c',
+            description=f'retires {target_fid}',
+            suggested_action='a',
+            task_id=task_id,
+            flag_type=flag_type,
+            supersedes=target_fid,
+        )
+        assert 'finding_id' in added, f'supersede failed: {added}'
+        return added['finding_id']
+
     def test_fresh_finding_is_not_superseded(self):
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
@@ -4294,6 +4314,64 @@ class TestReconReportSupersedes:
 
         assert state.delete_finding('r1', a_fid) == {'status': 'deleted', 'finding_id': a_fid}
         assert b_finding.superseded_by is None
+
+    def test_retracting_the_newest_superseder_falls_back_to_an_earlier_one(self):
+        """Two findings can retire the same target — each ``supersedes`` stamp
+        moves the target's pointer FORWARD to the newest one.  Retracting that
+        newest superseder must not un-retire a claim the EARLIER one still
+        refutes: clearing the pointer to None would project the target
+        ``actionable`` again and hand it straight back to remediation, a silent
+        un-retirement of a refuted claim.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        b_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        a_fid = self._supersede(
+            state, b_fid, flag_type='memory_mechanism_contradiction_resolved'
+        )
+        c_fid = self._supersede(
+            state, b_fid, flag_type='memory_mechanism_contradiction_resolved_again'
+        )
+        b_finding = _stored_finding(state, 'r1', b_fid)
+        assert b_finding.superseded_by == c_fid
+
+        assert state.delete_finding('r1', c_fid) == {'status': 'deleted', 'finding_id': c_fid}
+
+        assert b_finding.superseded_by == a_fid, (
+            'retracting the newest superseder un-retired a claim the earlier '
+            'one still refutes'
+        )
+        # The invariant that makes the fall-back trustworthy: a non-None
+        # forward pointer always names a finding that ASSERTS the supersession.
+        assert _stored_finding(state, 'r1', b_finding.superseded_by).supersedes == b_fid
+        (item,) = [i for i in _flagged_items(state, 'r1', 's1') if i['finding_id'] == b_fid]
+        assert item['superseded_by'] == a_fid
+        assert item['actionable'] is False
+
+    def test_retracting_every_superseder_restores_the_target_to_live(self):
+        """The complement: the fall-back is a re-point, not a refusal to clear.
+        With no superseder left, the target goes back to live-actionable — the
+        behaviour ``test_retracting_the_superseder_clears_the_targets_forward_pointer``
+        pins for the single-superseder case, here after a chain of two.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        b_fid = self._file(state, flag_type='memory_mechanism_contradiction')
+        a_fid = self._supersede(
+            state, b_fid, flag_type='memory_mechanism_contradiction_resolved'
+        )
+        c_fid = self._supersede(
+            state, b_fid, flag_type='memory_mechanism_contradiction_resolved_again'
+        )
+
+        assert state.delete_finding('r1', c_fid) == {'status': 'deleted', 'finding_id': c_fid}
+        assert state.delete_finding('r1', a_fid) == {'status': 'deleted', 'finding_id': a_fid}
+
+        b_finding = _stored_finding(state, 'r1', b_fid)
+        assert b_finding.superseded_by is None
+        (item,) = [i for i in _flagged_items(state, 'r1', 's1') if i['finding_id'] == b_fid]
+        assert item['superseded_by'] is None
+        assert item['actionable'] is True
 
     def test_a_supersedes_dropped_by_dedup_says_so_in_warnings(self):
         """Validate-early/stamp-late means the ``duplicate_finding`` return

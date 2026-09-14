@@ -1736,6 +1736,36 @@ class TestSupersededByPersistence:
         finally:
             store.close()
 
+    def test_the_reverse_supersedes_edge_is_durable_too(self, tmp_path):
+        """The superseder's own row records WHAT it retired, and that must
+        survive serialization as well.
+
+        _purge_finding's fall-back reads this reverse edge to decide whether a
+        retracted superseder leaves the target still-refuted or genuinely live
+        again.  A reverse edge lost in the store would make that decision
+        silently wrong after a restart — always "genuinely live" — resurrecting
+        a refuted claim.
+        """
+        from fused_memory.server.recon_report import _deserialize_entry
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            state = self._make_state(store)
+            stage1_fid, stage2_fid = self._file_cross_stage(state)
+
+            (row,) = [r for r in store.load_all() if r['stage'] == self._S2]
+            restored = _deserialize_entry(row['entry_json'])
+            (superseder,) = [f for f in restored.findings if f.finding_id == stage2_fid]
+            assert superseder.supersedes == stage1_fid
+            # The target carries only the forward pointer, never the reverse one.
+            target_entry = _deserialize_entry(self._stage1_row(store)['entry_json'])
+            (target,) = [f for f in target_entry.findings if f.finding_id == stage1_fid]
+            assert target.supersedes is None
+        finally:
+            store.close()
+
     def test_stamp_and_neuter_survive_a_restart(self, tmp_path):
         from fused_memory.server.recon_report_store import ReconReportStore
 

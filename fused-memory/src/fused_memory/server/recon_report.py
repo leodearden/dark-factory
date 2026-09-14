@@ -339,13 +339,27 @@ class _Finding:
     citation_failures: list[dict] = field(default_factory=list)
     # Task 4653: the finding_id of the LATER finding that makes this one
     # historical, or None. Written by add_finding's ``supersedes`` argument;
-    # cleared by _purge_finding when the superseder is itself retracted, so the
-    # pointer can never dangle. Defaults None for the same round-trip-safety
-    # reason as standing_decision_id/citation_failures above: recon_report_store
-    # holds entry_json as an opaque TEXT blob, so rows persisted before this
-    # field existed still hydrate via _Finding(**fd) with no schema change and
-    # no migration script.
+    # re-pointed or cleared by _purge_finding when that superseder is itself
+    # retracted, so the pointer can never dangle. Defaults None for the same
+    # round-trip-safety reason as standing_decision_id/citation_failures above:
+    # recon_report_store holds entry_json as an opaque TEXT blob, so rows
+    # persisted before this field existed still hydrate via _Finding(**fd) with
+    # no schema change and no migration script.
     superseded_by: str | None = None
+    # Task 4653: the REVERSE edge — the finding_id this finding was filed to
+    # retire (its add_finding ``supersedes`` target), or None. The two fields
+    # are not redundant and cannot disagree: `supersedes` is the immutable
+    # record of the assertion THIS finding made, while `superseded_by` is the
+    # target's single EFFECTIVE pointer, which later stamps move forward. Only
+    # the reverse edge survives that move, so it is what lets _purge_finding
+    # re-point a target at a superseder that still stands instead of un-retiring
+    # it when the newest superseder is retracted. Invariant: a non-None
+    # `superseded_by` always names a finding whose `supersedes` is this row's id.
+    # Internal — deliberately not projected into flagged_items or
+    # get_findings_for_run: `superseded_by` is the direction a consumer needs
+    # (this claim is dead, here is what replaced it), and projecting both would
+    # put two spellings of one relation on the agent-facing surface.
+    supersedes: str | None = None
 
 
 @dataclass
@@ -765,6 +779,21 @@ class ReconReportState:
         assembled report is that method's intended semantics, and widening it
         with this helper would change what the report CONTAINS — far beyond
         aligning write reach with mutation reach.
+
+        SCOPE CAVEAT, because the invariant above is only as wide as its inputs:
+        the evicted half of the union is derived from ``_run_finding_index``, so
+        an evicted entry is reachable only while it still OWNS at least one
+        indexed finding.  Purging its last finding therefore drops it out of
+        this set — and out of the next :meth:`_persist_run` — leaving its
+        persisted row carrying the purged finding until run quiescence GCs it,
+        or until a restart hydrates it back.  Not reachable today: an evicted
+        entry is by definition completed, :meth:`delete_finding` refuses a
+        completed owning entry, and :meth:`cite_task`'s fold purges only the
+        in-flight new finding, which its own live entry owns.  It is stated
+        rather than relied on silently: a future mutator that can purge from a
+        completed entry needs the write reach pinned some other way (e.g. a
+        per-run set of ``(run_id, stage)`` keys ever persisted) rather than
+        derived from the findings that happen to remain.
         """
         by_key: dict[tuple[str, str], _ReportEntry] = {}
         for entry in self._run_finding_index.get(run_id, {}).values():
@@ -1352,7 +1381,10 @@ class ReconReportState:
         Re-stamping an already-superseded target moves the pointer FORWARD to
         the newest superseder (logged at INFO when overwriting a non-None
         pointer): the most recent assertion about a claim is the one a reader
-        should follow.
+        should follow.  The overwritten assertion is not forgotten — each
+        superseder records its own target in ``_Finding.supersedes`` — so
+        retracting the newest superseder re-points the target at a survivor
+        instead of un-retiring it (see :meth:`_purge_finding`).
 
         A ``supersedes`` that does not resolve to a finding THIS RUN owns
         (unknown id, or an id belonging to another run —
@@ -1514,6 +1546,13 @@ class ReconReportState:
             actionable=actionable,
             task_id=c_task_id,
             flag_type=c_flag_type,
+            # The RESOLVED target's id, not the raw argument: an unresolvable
+            # supersedes never reaches here (validate-early returns
+            # finding_unknown), and deriving it from the resolved object is what
+            # keeps this field from ever holding an id that names nothing.
+            supersedes=(
+                supersedes_target.finding_id if supersedes_target is not None else None
+            ),
         )
         entry.findings.append(finding)
         if sig != (None, None):
@@ -2090,7 +2129,7 @@ class ReconReportState:
         fold anchor (task-2432) — see :meth:`cite_task`'s docstring for both
         folds.
 
-        Also clears every ``superseded_by`` back-reference AT *finding*
+        Also repairs every ``superseded_by`` back-reference AT *finding*
         anywhere in this run (task-4653).  A dangling forward pointer is
         exactly the class of stale pointer this helper exists to prevent:
         left in place it would keep the superseded finding neutered forever,
@@ -2101,6 +2140,16 @@ class ReconReportState:
         routinely been EVICTED from ``_state`` by then while staying
         resolvable and persisted.  Doing it here covers BOTH removal paths
         for free, so they cannot drift apart.
+
+        A target is restored to live-actionable only when NO superseder is left.
+        Several findings can assert supersession of one target — the target
+        carries a single effective pointer that each new stamp moves forward —
+        so purging the newest of them re-points at a surviving one (found
+        through the reverse ``_Finding.supersedes`` edge) rather than clearing
+        to None.  Clearing unconditionally would silently un-retire a claim that
+        a live finding still refutes, projecting it ``actionable`` again and
+        handing it back to remediation: the exact failure class supersession
+        exists to close, reintroduced by the cleanup meant to protect it.
 
         Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
         cited-task fold's retract path in :meth:`cite_task`, so the
@@ -2160,7 +2209,7 @@ class ReconReportState:
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
 
-        # task-4653: clear any forward pointer AT this finding.  The reach is
+        # task-4653: repair every forward pointer AT this finding.  The reach is
         # the run's REACHABLE entries — the same union _persist_run writes, not
         # just its _state rows.  Entry-scoped would be too narrow because the
         # superseder routinely lives in a later stage's entry than its target
@@ -2168,10 +2217,28 @@ class ReconReportState:
         # because that target's stage has routinely been evicted by then, and
         # an evicted stage's finding is still resolvable and still persisted,
         # so a pointer at it is still live and still able to dangle.
-        for other_entry in self._reachable_run_entries(run_id):
-            for other in other_entry.findings:
-                if other.superseded_by == finding.finding_id:
-                    other.superseded_by = None
+        #
+        # Repair, not clear: a target can carry assertions from SEVERAL
+        # superseders (each stamp moves its single effective pointer forward),
+        # and clearing to None would un-retire a claim a surviving superseder
+        # still refutes.  The survivors are found through the reverse
+        # `supersedes` edge each one records, so the pointer falls back to one of
+        # them; only a target with no superseder left goes back to live.  Any
+        # survivor will do — each is an independent assertion that the target is
+        # retired — so the first in reach order is taken.
+        remaining = [
+            f
+            for other_entry in self._reachable_run_entries(run_id)
+            for f in other_entry.findings
+            if f is not finding
+        ]
+        for other in remaining:
+            if other.superseded_by != finding.finding_id:
+                continue
+            other.superseded_by = next(
+                (f.finding_id for f in remaining if f.supersedes == other.finding_id),
+                None,
+            )
 
     def _derived_sig_anchor_project_id(
         self, run_id: str, anchor_finding_id: str, c_cited_task_id: str | None
