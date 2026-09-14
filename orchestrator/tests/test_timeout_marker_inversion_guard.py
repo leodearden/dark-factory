@@ -615,6 +615,136 @@ class TestSanctionedNameMirrors:
         )
 
 
+class TestSpawnBoundSizingModel:
+    """Task 4203's spawn-bound sizing model must have exactly ONE home.
+
+    THE MODEL sizes a ``@pytest.mark.timeout`` OVERRIDE for a test whose cost
+    is dominated by real subprocess spawns rather than by bounded waits.  Its
+    derivation -- what each term means, why the additive term exists, and the
+    scope limit to marker-carrying overrides -- lives with
+    :func:`_orch_helpers.required_timeout_secs`.  Read it there; this class
+    pins the ARITHMETIC, not the reasoning.
+
+    WHY IT IS PINNED HERE rather than where it was born.  Task 4203 wrote the
+    model inside test_offline_lane_integration.py, where only that module
+    could reach it.  Task 5333 needed the same arithmetic for
+    test_merge_queue_deep_integration_gate.py -- which cannot import a test
+    module without coupling the two suites\' collection order -- so it moved to
+    _orch_helpers.py, this package\'s established home for the
+    timeout-constant family.  The last test below is what stops the old copy
+    growing back.
+    """
+
+    def test_the_measured_spawn_latency_is_the_one_task_3451_measured(self) -> None:
+        """The per-spawn price is a MEASUREMENT, and it is that one.
+
+        Pinned as a literal because every timeout this model derives is a
+        MULTIPLE of it: re-measuring it re-prices every marker sized against
+        it at once.  That must be a deliberate edit carrying fresh numbers,
+        never a passing tweak.
+        """
+        assert _orch_helpers.MEASURED_SPAWN_LATENCY_SECS == 4.71, (
+            f'MEASURED_SPAWN_LATENCY_SECS is '
+            f'{_orch_helpers.MEASURED_SPAWN_LATENCY_SECS}, not the 4.71 task '
+            '3451 measured (n=3: 2.13/3.10/4.71, load-per-core 6.6). Every '
+            'timeout derived through required_timeout_secs is a multiple of '
+            'this number, so moving it silently re-prices '
+            'DEEP_GATE_SCENE_TEST_TIMEOUT and every offline-lane marker at '
+            'once. If it really has been re-measured, re-derive those '
+            'constants in the SAME commit and record what was measured.'
+        )
+
+    def test_the_model_is_the_bounded_sum_plus_its_priced_spawns(self) -> None:
+        """``required = bounded_secs + out_of_bound_spawns x latency``.
+
+        Two of the three rows are numbers the model\'s callers ALREADY
+        shipped, so the lifted copy is pinned to reproduce its origin rather
+        than merely to be self-consistent: a move that quietly changed the
+        arithmetic would leave every marker derived before it mis-sized, and
+        nothing else in the tree would say so.
+        """
+        latency = _orch_helpers.MEASURED_SPAWN_LATENCY_SECS
+        table = (
+            (0.0, 0, 0.0, 'the degenerate case -- no waits and no spawns cost nothing'),
+            (
+                15.5,
+                21,
+                114.41,
+                'the derivation worked in test_offline_lane_integration.py::'
+                'test_out_of_bound_spawn_counts_are_measured_not_asserted\'s '
+                '@pytest.mark.timeout(120) comment, the model\'s clearest '
+                'shipped instance',
+            ),
+            (
+                0.0,
+                260,
+                1224.6,
+                'task 5333 -- DEEP_GATE_SCENE_SPAWN_BUDGET priced, the figure '
+                'DEEP_GATE_SCENE_TEST_TIMEOUT rounds up from',
+            ),
+        )
+
+        for bounded, spawns, expected, provenance in table:
+            required = _orch_helpers.required_timeout_secs(bounded, spawns)
+
+            assert required == pytest.approx(expected), (
+                f'required_timeout_secs({bounded}, {spawns}) = {required}, '
+                f'expected {expected} -- {provenance}. The model priced this '
+                'row differently when the marker derived from it was written, '
+                'so that marker is now mis-sized. Re-derive every constant '
+                'built on this model before changing it.'
+            )
+            assert required == bounded + spawns * latency, (
+                f'required_timeout_secs({bounded}, {spawns}) = {required}, but '
+                f'the model it states is bounded_secs + out_of_bound_spawns x '
+                f'MEASURED_SPAWN_LATENCY_SECS = {bounded + spawns * latency}. '
+                'The function and its documented model have diverged; see its '
+                'docstring in _orch_helpers.py.'
+            )
+
+    def test_the_offline_lane_module_no_longer_defines_its_own_copy(self) -> None:
+        """The model\'s ORIGIN must import it, not redeclare it.
+
+        Reads the source TEXT rather than the imported module, because that is
+        the only way to tell an import apart from a redefinition: a module
+        doing both would still answer every attribute lookup correctly while
+        shipping a second, independently-editable copy.
+
+        BOTH SPELLINGS are rejected.  The private one is what task 4203
+        shipped and what a revert would restore; the PUBLIC one is what the
+        module imports today and is therefore the likelier shape for a copy to
+        come back in -- an author retuning a value "just for this module"
+        would shadow the imported name, and every call site would keep
+        reading.
+        """
+        offline_lane = _TESTS_DIR / 'test_offline_lane_integration.py'
+        source = offline_lane.read_text(encoding='utf-8')
+
+        redefinitions = [
+            f'  {offline_lane.name}:{source.count(chr(10), 0, match.start()) + 1}'
+            f'  {match.group(0)!r}'
+            for pattern in (
+                r'^_?MEASURED_SPAWN_LATENCY_SECS\s*(?::[^=\n]+)?=',
+                r'^def _?required_timeout_secs\b',
+            )
+            for match in re.finditer(pattern, source, re.MULTILINE)
+        ]
+
+        assert not redefinitions, (
+            f'{len(redefinitions)} definition(s) of the spawn-bound sizing '
+            'model remain in test_offline_lane_integration.py, which must '
+            'IMPORT it from _orch_helpers.py instead.\n\n'
+            'Task 4203 wrote the model there, where only that module could '
+            'reach it; task 5333 moved it to _orch_helpers.py so '
+            'test_merge_queue_deep_integration_gate.py could size its own '
+            'marker from the same arithmetic without importing a test module. '
+            'A second definition here would not be a redundancy but a FORK -- '
+            'two copies pricing spawns independently -- and 4203\'s own '
+            'docstring records that per-callsite copies of a spawn count had '
+            'ALREADY drifted apart once, inconsistently, before it '
+            'consolidated them.\n\n' + chr(10).join(redefinitions)
+        )
+
 
 # ---------------------------------------------------------------------------
 # _timeout_marker_sites(source) -- inline-fixture unit tests.
