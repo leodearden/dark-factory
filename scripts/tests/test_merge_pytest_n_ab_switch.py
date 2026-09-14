@@ -1,7 +1,6 @@
 """Tests for merge-pytest-n-ab-switch.sh — drives the real script via
 subprocess against a REAL loopback MCP server on an ephemeral port (the
-fake-MCP-server idiom that an earlier, since-retired fixture
-(`_FakeMcpServer`, retired under task 5247) established, extended to the
+`_FakeMcpServer` idiom that task 5247 later retired, extended to the
 STATEFUL escalation server's measured behaviour) and a REAL temp git repo
 holding a temp dark-factory-orchestrator.yaml (the
 test_deploy_w11_lane_lifecycle.py idiom), so step 1's YAML editor, step 2's
@@ -48,9 +47,8 @@ class _FakeEscalationMcp:
     """A real HTTP server speaking the STATEFUL streamable-HTTP protocol the
     escalation MCP really speaks, answering `reload_config` with *report*.
 
-    Modelled on the loopback fake-MCP-server idiom that an earlier,
-    since-retired fixture (`_FakeMcpServer`, retired under task 5247)
-    established, extended with the two behaviours that fixture has no
+    Modelled on the `_FakeMcpServer` fixture that task 5247 later retired,
+    and extended with the two behaviours that fixture has no
     reason to model, its target (fused-memory :8002) being STATELESS: the 400
     rejection of a session-less request, and `text/event-stream` framing of
     the `tools/call` reply. Every behaviour below was measured live against
