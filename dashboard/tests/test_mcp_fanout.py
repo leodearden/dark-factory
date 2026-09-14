@@ -2699,3 +2699,120 @@ class TestTTLCacheBypassCannotClobberANewerValue:
             'a late-returning locked refresh must not clobber a newer value '
             'a bypass already stored for the same key'
         )
+
+
+class TestTTLCacheDetachedRefreshReaping:
+    """A bypass refresh must be reapable at process shutdown (task 5185).
+
+    ``TTLCache``'s standing policy is abandon-don't-cancel: a bypass whose
+    caller gave up keeps running, may still store a late value, and is
+    deliberately never cancelled (see ``_evict_expired``'s ``dead_bypasses``
+    comment and ``clear()``'s docstring). That is right while the process
+    continues — a late store heals the key for the next caller.
+
+    It stops being right at shutdown, where no next caller exists while the
+    task still pins a connection on the shared httpx client. In THIS suite it
+    is worse than a leak: the caches are module-level and so process-global,
+    while every ``TestClient(app)`` runs its own event loop in its own thread,
+    so a bypass started under one test's app lifespan can still be running
+    when the next test file starts.
+
+    These tests pin the shutdown hook the app's ``lifespan`` will call. They
+    build a genuinely in-flight bypass with the idiom
+    ``TestTTLCacheBoundedLockAcquisition`` established — the module bound
+    monkeypatched down plus a refresh parked on a never-set ``asyncio.Event``
+    — so no real network and no sleep-based timing is involved.
+    """
+
+    @staticmethod
+    def _never_resolving_refresh():
+        """Refresh stub that enters, signals, and then never resolves."""
+        entered = asyncio.Event()
+        wedged = asyncio.Event()
+
+        async def _refresh():
+            entered.set()
+            await wedged.wait()  # never set — genuinely unresolved
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        return _refresh, entered
+
+    @classmethod
+    async def _wedge_one_bypass(cls, cache, key='k'):
+        """Put exactly one genuinely in-flight bypass task on *cache* for *key*.
+
+        Holds *key*'s lock so the caller's bounded acquisition times out and
+        it takes the bypass path, then waits until the bypass refresh has
+        actually been ENTERED — not merely scheduled — before returning, so
+        the task is in flight by construction rather than by timing luck.
+
+        Returns ``(bypass_task, caller_task)``. The caller is parked on the
+        shielded bypass and never returns on its own; hand it to
+        :meth:`_drain` once the reaping assertions are done.
+        """
+        refresh, entered = cls._never_resolving_refresh()
+        lock = cache._locks.setdefault(key, asyncio.Lock())
+        await lock.acquire()
+        try:
+            caller = asyncio.create_task(cache.get_or_refresh(key, refresh))
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+        finally:
+            lock.release()
+        return cache._bypass_tasks[key][1], caller
+
+    @staticmethod
+    async def _drain(*tasks):
+        """Cancel and await every still-pending task, swallowing its outcome."""
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_a_new_cache_is_reachable_from_the_module_registry(self):
+        """Enrolment is automatic, so coverage cannot drift as caches are added.
+
+        There are 8 module-level TTLCache instances across 4 modules today;
+        the reaper finds them because every cache enrols itself, not because
+        anything enumerates them.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        assert any(registered is cache for registered in fanout_mod._live_caches), (
+            'a newly constructed TTLCache must enrol itself in the module-level '
+            'live-cache registry; otherwise reap_detached_refreshes() silently '
+            'misses it and the enrolment is not exhaustive by construction'
+        )
+
+    async def test_reap_cancels_awaits_and_forgets_every_in_flight_bypass(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        bypass, caller = await self._wedge_one_bypass(cache, 'k')
+        assert not bypass.done(), 'precondition: the bypass is genuinely in flight'
+
+        reaped = await fanout_mod.reap_detached_refreshes()
+
+        # cancelled(), not "cancel() was called": Task.cancel() only REQUESTS
+        # cancellation, so a reaper that fires and forgets would leave this
+        # False and let the task outlive the shutdown that reaped it.
+        assert bypass.cancelled(), (
+            'reap_detached_refreshes must await each cancellation so it has '
+            'actually landed before shutdown proceeds, not merely request it'
+        )
+        assert reaped == 1, f'the reaper must report what it reaped, got {reaped}'
+        assert cache._live_bypasses == {}, 'the resource roster must be emptied'
+        assert cache._bypass_tasks == {}, 'the liveness map must be emptied'
+
+        await self._drain(caller)
+
+    async def test_reap_is_a_no_op_when_nothing_is_in_flight(self):
+        """The common case — an app that shuts down cleanly — must be silent."""
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        TTLCache(ttl_seconds=60.0)  # registered, but never used
+
+        assert await fanout_mod.reap_detached_refreshes() == 0
