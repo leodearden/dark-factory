@@ -60,11 +60,13 @@ Series = dict[str, list[tuple[int, float]]]
 class ArmSpec(NamedTuple):
     """Everything the report needs about one gate arm.
 
-    ``selector`` is the sampler metric recording this arm. ``is_stem`` says
-    whether it names a metric outright or a ':' prefix with one series per
-    cgroup leaf — the two are read differently and reported separately, never
-    pooled. ``ladder`` is the candidate thresholds to evaluate hold fractions
-    at. ``unit`` labels the numbers for the human reading the escalation.
+    ``selector`` is the sampler metric recording this arm. It may name a
+    metric outright or be a ':' prefix with one series per cgroup leaf; which
+    one it is is read off the RECORDED metric name at every use site, never
+    declared here, because a declared copy of a derivable fact is free to
+    contradict the data. ``ladder`` is the candidate thresholds to evaluate
+    hold fractions at. ``unit`` labels the numbers for the human reading the
+    escalation.
 
     ``readability`` names the ``*_read_ok`` metric recording whether this arm
     was readable at all, or ``None`` when the collector emits none. It has no
@@ -74,7 +76,6 @@ class ArmSpec(NamedTuple):
     """
 
     selector: str
-    is_stem: bool
     ladder: tuple[float, ...]
     unit: str
     readability: str | None
@@ -94,22 +95,22 @@ _PRESSURE_UNIT = '% of wall time stalled (PSI avg10)'
 # "de-duplicate" this with an import, which would crash the gate.
 ARM_METRIC_SELECTORS = {
     'mem_full_avg10': ArmSpec(
-        'psi_mem_full_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
+        'psi_mem_full_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     'mem_some_avg10': ArmSpec(
-        'psi_mem_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
+        'psi_mem_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     'io_some_avg10': ArmSpec(
-        'psi_io_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
+        'psi_io_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     'cpu_some_avg10': ArmSpec(
-        'psi_cpu_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
+        'psi_cpu_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     # A RATIO, not a percentage: procs_running / len(sched_getaffinity(0)).
     # 1.0 is "as many runnable threads as CPUs"; 4.0 is PRD D9's provisional.
     'runqueue_ratio': ArmSpec(
-        'runqueue_ratio', False,
+        'runqueue_ratio',
         (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0),
         'runnable threads per CPU (ratio)', 'runqueue_read_ok'),
     # One series per cgroup leaf, so ':' — reported per leaf, never pooled.
     'own_cpu_some_avg10': ArmSpec(
-        'own_cpu_some10', True, _PRESSURE_LADDER, _PRESSURE_UNIT, 'own_read_ok'),
+        'own_cpu_some10', _PRESSURE_LADDER, _PRESSURE_UNIT, 'own_read_ok'),
 }
 
 
