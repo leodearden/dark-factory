@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import types
 
@@ -2816,3 +2817,109 @@ class TestTTLCacheDetachedRefreshReaping:
         TTLCache(ttl_seconds=60.0)  # registered, but never used
 
         assert await fanout_mod.reap_detached_refreshes() == 0
+
+
+class TestTTLCacheReapIsScopedToTheRunningLoop:
+    """The reaper must touch only tasks bound to the loop it is running on.
+
+    A TTLCache is module-level and so process-global, while event loops are
+    not: this suite runs a fresh loop per ``TestClient(app)``, each in its own
+    thread. A bypass task left behind by one of them is therefore still on the
+    roster of a cache the NEXT loop reaps — bound to a loop that is by then
+    closed. That is a reachable state, not a hypothetical.
+
+    ``Task.cancel()`` on such a task cancels its parked future, which
+    schedules that future's callbacks through ``loop.call_soon`` — on a closed
+    loop, ``RuntimeError: Event loop is closed``. That is precisely the escape
+    ``app.py``'s ``lifespan`` docstring records for task 3466, where a
+    stranded handle queued work onto a closed loop and pytest blamed whichever
+    unrelated test happened to be running at that instant.
+
+    Reaping a foreign-loop task is not merely unsafe, it is meaningless: its
+    loop is gone, so nothing this process can do will ever advance it. The
+    honest name for it is unreachable, not reaped.
+    """
+
+    @staticmethod
+    def _seed_bypass_on_a_closed_loop(cache, key):
+        """Register one in-flight bypass on *cache* from a loop that is then closed.
+
+        Runs that loop in its OWN THREAD — the shape ``TestClient(app)``
+        itself has, and the only one available: a loop cannot be driven from
+        inside a running one.
+
+        Goes through ``_start_bypass`` rather than the lock-timeout idiom the
+        sibling class uses, because an ``asyncio.Lock`` binds to the first
+        loop that acquires it: driving the public path here would strand a
+        foreign-loop lock in ``cache._locks`` and make every later assertion a
+        test artefact rather than the state being pinned.
+
+        The returned task is parked inside its refresh, on a future belonging
+        to the now-closed loop — the exact shape whose cancellation raises.
+        """
+        seeded = {}
+
+        def _drive_a_short_lived_loop():
+            async def _seed():
+                refresh, entered = (
+                    TestTTLCacheDetachedRefreshReaping._never_resolving_refresh()
+                )
+                task = cache._start_bypass(key, refresh, lambda v: True)
+                await asyncio.wait_for(entered.wait(), timeout=5.0)
+                return task
+
+            foreign_loop = asyncio.new_event_loop()
+            try:
+                seeded['task'] = foreign_loop.run_until_complete(_seed())
+            finally:
+                foreign_loop.close()
+
+        thread = threading.Thread(target=_drive_a_short_lived_loop)
+        thread.start()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), 'the seeding loop did not finish'
+        task = seeded['task']
+        # This task can never finish — its loop is gone — so asyncio would log
+        # "Task was destroyed but it is pending!" when the test drops it. That
+        # is the state under test, not a defect, so suppress the notice the
+        # same way asyncio's own machinery does.
+        task._log_destroy_pending = False
+        return task
+
+    async def test_a_foreign_loop_task_is_left_alone_without_poisoning_the_sweep(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        foreign = self._seed_bypass_on_a_closed_loop(cache, 'from-a-dead-loop')
+        mine, caller = await TestTTLCacheDetachedRefreshReaping._wedge_one_bypass(
+            cache, 'on-this-loop'
+        )
+        assert foreign.get_loop() is not asyncio.get_running_loop()
+        assert not foreign.done(), 'precondition: the stranded task is still pending'
+
+        # (a) nothing escapes — on a reaper that cancels indiscriminately this
+        # raises RuntimeError: Event loop is closed.
+        reaped = await fanout_mod.reap_detached_refreshes()
+
+        # (b) the foreign task itself is untouched. Its roster entry may go;
+        # the task may not, because nothing this process does can advance it.
+        assert not foreign.cancelled(), (
+            'a task on a closed loop cannot be reaped — cancelling it only '
+            'queues work onto a loop that will never run again'
+        )
+        assert not foreign.done()
+        # (c) its neighbour in the same cache is still reaped.
+        assert mine.cancelled(), (
+            'one stranded foreign-loop entry must not stop the sweep reaping '
+            'the tasks it genuinely can reach'
+        )
+        # (d) the count is what was actually reaped, not what was inspected.
+        assert reaped == 1, f'only the same-loop task was reapable, got {reaped}'
+        # The dead loop's residue must not pin the key against the live cap.
+        assert cache._live_bypasses == {}
+
+        await TestTTLCacheDetachedRefreshReaping._drain(caller)
