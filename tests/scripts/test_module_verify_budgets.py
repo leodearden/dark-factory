@@ -457,6 +457,25 @@ RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
 }
 
 
+# RULED_COLD_BUDGET_DECLARATIONS: keyed by prefix so the justification lives at
+# the definition site, exactly like RULED_INTERIM_BUDGET_EXCEPTIONS above and
+# MODULE_BUDGET_EXCLUSIONS below. A module listed here DECLARES its own
+# verify_cold_command_timeout_secs; every module NOT listed keeps assertion
+# (f)'s fall-through contract in full.
+#
+# Do NOT widen this dict to silence a surprising (f) failure. (f) exists to
+# make ONE misreading un-silent — that an unset cold knob "inherits" the warm
+# value — and for the six modules task 3473 closed, the fall-through IS the
+# intended behaviour. Adding a prefix here to make a red go green would retire
+# that guard for a module that never wanted a cold budget.
+RULED_COLD_BUDGET_DECLARATIONS: dict[str, str] = {
+    'orchestrator': (
+        "ruling D17 (2026-09-14, task 3353 scope D'): this module declares its "
+        'own cold budget. Populated in step-28.'
+    ),
+}
+
+
 # One real tracked file under each module prefix, used to drive the production
 # plan->execution bridge in assertion (e). Deliberately a PRODUCTION file rather
 # than a test file: verify_plan._derive_module_runs routes a source-only diff
@@ -721,6 +740,66 @@ def test_module_carries_its_own_measured_verify_budget(
 
     # (f) The warm knob deliberately does NOT cover cold. An unset module cold
     # knob falls through to the ROOT cold ceiling, not to this warm value.
+    #
+    # ONE per-module carve-out (RULED_COLD_BUDGET_DECLARATIONS) for a module
+    # that DOES declare its own cold budget. The fall-through contract below is
+    # untouched for every other prefix, so the misreading (f) exists to make
+    # un-silent stays closed for them.
+    cold_declaration = RULED_COLD_BUDGET_DECLARATIONS.get(prefix)
+    root_cold_ceiling = root_config.verify_cold_command_timeout_secs
+    if cold_declaration is not None:
+        declared_cold = mc.verify_cold_command_timeout_secs
+        assert declared_cold is not None, (
+            f'{prefix} is listed in RULED_COLD_BUDGET_DECLARATIONS '
+            f'({cold_declaration}) but {prefix}/orchestrator.yaml declares no '
+            f'verify_cold_command_timeout_secs. Either the declaration was '
+            f'reverted — drop this prefix from the dict so (f)\'s '
+            f'fall-through contract applies again — or the yaml regressed'
+        )
+
+        # The RESOLVER returns it, not merely the yaml holding it. This is what
+        # proves the cascade's step 1 is actually reached: a number present in
+        # the config but shadowed by the cascade would satisfy a yaml-only
+        # check while the cold lane still ran on the root ceiling.
+        resolved_declared = verify._resolve_verify_timeout(
+            root_config, mc, is_cold=True, is_merge_verify=False
+        )
+        assert resolved_declared == declared_cold, (
+            f'_resolve_verify_timeout(is_cold=True) returned '
+            f'{resolved_declared} for {prefix}, not its DECLARED '
+            f'verify_cold_command_timeout_secs={declared_cold}. The value is '
+            f'in the yaml but the cascade is not reaching it, so the cold lane '
+            f'is still running on some other budget'
+        )
+
+        # A cold verify pays verify_cold_preprovision_command and unwarmed
+        # caches ON TOP of the warm cost, so a cold budget BELOW the warm one
+        # is incoherent by construction — it would make the strictly costlier
+        # path the one that times out first.
+        assert declared_cold >= mc.verify_command_timeout_secs, (
+            f'{prefix} declares verify_cold_command_timeout_secs='
+            f'{declared_cold}, BELOW its warm '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs}. A '
+            f'cold verify pays the cold preprovision command and unwarmed '
+            f'caches on top of everything the warm run pays, so this makes the '
+            f'strictly more expensive path time out first'
+        )
+
+        # ...and never below the fleet cold ceiling, the same rule the warm
+        # exception carries and for the same reason: the ceiling is
+        # operator-tunable and this figure is RULED, so the declaration must
+        # survive commit 36c4c71eb4's revert condition rather than falling back
+        # with it.
+        assert declared_cold >= root_cold_ceiling, (
+            f'{prefix} declares verify_cold_command_timeout_secs='
+            f'{declared_cold}, below the repo-root '
+            f'verify_cold_command_timeout_secs={root_cold_ceiling}. The root '
+            f'ceiling is operator-tunable and this module\'s figure is ruled, '
+            f'so the declaration exists precisely to survive a revert of that '
+            f'ceiling — a module figure that falls back with it buys nothing'
+        )
+        return
+
     assert mc.verify_cold_command_timeout_secs is None, (
         f'{prefix}/orchestrator.yaml now declares '
         f'verify_cold_command_timeout_secs='
