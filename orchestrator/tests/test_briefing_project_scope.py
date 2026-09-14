@@ -29,6 +29,7 @@ from orchestrator.agents.briefing import (
     FOREIGN_PROJECT_TAG_KEYS,
     MEMORY_CONTEXT_CAVEAT,
     BriefingAssembler,
+    MemoryQueryOutcome,
     filter_foreign_project_results,
 )
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1226,7 +1227,9 @@ class TestMemoryContextProvenanceCaveat:
         async def scoped_search_side_effect(spec, query, **_kwargs):
             if spec.slug == 'briefing-task-semantic':
                 raise TimeoutError('memory service unreachable')
-            return f'## recalled for: {query}', 0, 0
+            return MemoryQueryOutcome(text=json.dumps({'results': [
+                _result('1', f'recalled for: {query}', source_store='mem0'),
+            ]}))
 
         with patch.object(
             briefing, '_scoped_search', new=AsyncMock(side_effect=scoped_search_side_effect),
@@ -1245,16 +1248,34 @@ class TestScopedSearch:
     ``_mcp_search`` and ``_get_memory_context``.
     """
 
-    async def test_returns_none_with_no_drop_when_underlying_search_is_empty(
+    async def test_an_empty_search_passes_straight_through(
         self, briefing: BriefingAssembler,
     ):
-        with patch.object(briefing, '_mcp_search', new=AsyncMock(return_value=None)):
-            result = await briefing._scoped_search(
+        """Nothing came back, so there is nothing to filter — and nothing
+        broke either, which is what distinguishes this from an outage."""
+        with patch.object(
+            briefing, '_mcp_search', new=AsyncMock(return_value=MemoryQueryOutcome()),
+        ):
+            outcome = await briefing._scoped_search(
                 TASK_SEMANTIC, 'anything',
                 caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
             )
 
-        assert result == (None, 0, 0)
+        assert outcome == MemoryQueryOutcome()
+        assert outcome.failure is None
+
+    async def test_a_failed_search_keeps_its_reason_class(
+        self, briefing: BriefingAssembler,
+    ):
+        failed = MemoryQueryOutcome(failure='timeout')
+
+        with patch.object(briefing, '_mcp_search', new=AsyncMock(return_value=failed)):
+            outcome = await briefing._scoped_search(
+                TASK_SEMANTIC, 'anything',
+                caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
+            )
+
+        assert outcome.failure == 'timeout'
 
     async def test_multi_text_block_response_fails_open_known_limitation(
         self, briefing: BriefingAssembler, caplog,
@@ -1285,7 +1306,7 @@ class TestScopedSearch:
         with caplog.at_level(logging.WARNING), patch(
             'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
         ):
-            text, dropped, _nested = await briefing._scoped_search(
+            outcome = await briefing._scoped_search(
                 TASK_SEMANTIC, 'anything',
                 caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
             )
@@ -1293,10 +1314,10 @@ class TestScopedSearch:
         # Known limitation: the joined multi-block text isn't valid JSON, so
         # the filter fails open rather than filtering each block — the
         # foreign fact is NOT removed.
-        assert dropped == 0
-        assert text is not None
-        assert 'Foreign fact.' in text
-        assert 'Own fact.' in text
+        assert outcome.dropped == 0
+        assert outcome.text is not None
+        assert 'Foreign fact.' in outcome.text
+        assert 'Own fact.' in outcome.text
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 

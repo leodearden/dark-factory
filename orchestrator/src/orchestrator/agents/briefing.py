@@ -550,6 +550,80 @@ def render_entity_block(payload_text: str, expected_name: str) -> str:
     return '\n'.join(lines)
 
 
+MEMORY_FAILURE_TIMEOUT = 'timeout'
+MEMORY_FAILURE_TRANSPORT = 'transport'
+MEMORY_FAILURE_MALFORMED = 'malformed'
+"""Why a memory query produced nothing, when the answer is "it broke".
+
+Three classes, because they call for three different operator responses: a
+timeout says the service is alive and slow, a transport failure says it is
+unreachable, and a malformed reply says it answered with something that is
+not a tool result. "The corpus holds nothing" is NOT one of them — that is
+an empty outcome carrying no failure at all, and conflating the two is the
+defect this vocabulary exists to end.
+"""
+
+MEMORY_EMPTY_NOTICE = '_No memory context available._'
+MEMORY_OUTAGE_NOTICE = '_Memory unavailable ({reasons}) — proceed with codebase exploration._'
+"""The two "nothing recalled" outcomes, deliberately worded apart.
+
+Measured over live briefings, 234 said "no memory context available" because
+the service was failing and 77 because the corpus genuinely had nothing to
+say — in byte-identical prose. An operator reading one could not tell which
+had happened, so neither number was actionable.
+"""
+
+MEMORY_SECTION_FAILURE_NOTICE = (
+    '_The **{section}** section is missing: the memory query failed ({reason})._'
+)
+MEMORY_DEGRADED_STORES_NOTICE = (
+    '_Partial recall for **{section}**: the {stores} store(s) failed._'
+)
+
+
+@dataclass(frozen=True)
+class MemoryQueryOutcome:
+    """What one memory query produced: facts, or a named reason there are none.
+
+    ``text`` is the reply payload (filtered, once it has passed
+    :func:`filter_foreign_project_results`); ``failure`` names one of the
+    reason classes above. Both being absent is the honest empty answer —
+    the query worked and the corpus had nothing.
+    """
+
+    text: str | None = None
+    failure: str | None = None
+    dropped: int = 0
+    nested_dropped: int = 0
+    failed_stores: tuple[str, ...] = ()
+
+
+def _failed_stores(payload_text: str) -> tuple[str, ...]:
+    """Which stores the server reported failing on this query.
+
+    ``degraded``/``failed_stores`` are emitted FAULT-ONLY — a healthy reply
+    carries neither key — so their presence is itself the signal. Read from
+    the RAW reply rather than the filtered one: the filter preserves these
+    sibling keys, but it returns ``''`` when every result was foreign, and a
+    partial store outage is worth reporting even when nothing survived the
+    cross-project filter.
+
+    Silent on a payload that will not parse: the caller has already run it
+    through :func:`filter_foreign_project_results`, which logs that WARNING
+    once. A second copy of the same diagnosis is noise.
+    """
+    try:
+        payload = json.loads(payload_text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ()
+    if not isinstance(payload, dict) or not payload.get('degraded'):
+        return ()
+    stores = payload.get('failed_stores')
+    if not isinstance(stores, list):
+        return ()
+    return tuple(store for store in stores if isinstance(store, str) and store)
+
+
 MEMORY_CONTEXT_CAVEAT = (
     "_This context was recalled from the `{project_id}` project's memory — "
     'it is NOT a description of this worktree. It may name tasks, repos, '
@@ -1658,22 +1732,29 @@ Handle this escalation, then call `resolve_issue` with a summary.
         """
         caller_agent_id = _caller_agent_id(scope.task_id, role)
         recalled_sections: list[str] = []
-        foreign_dropped = 0
-        nested_dropped = 0
-        queries_fired = 0
-        memory_unavailable = False
+        notices: list[str] = []
+        outcomes: list[MemoryQueryOutcome] = []
+        loop_failure: str | None = None
 
         try:
             for spec, query in queries_for(scope):
-                section, dropped, nested = await self._scoped_search(
+                outcome = await self._scoped_search(
                     spec, query,
                     caller_agent_id=caller_agent_id,
                     caller_task_id=scope.task_id,
                 )
-                foreign_dropped += dropped
-                nested_dropped += nested
-                queries_fired += 1
-                blocks = [render_memory_results(section)] if section else []
+                outcomes.append(outcome)
+                if outcome.failure:
+                    notices.append(MEMORY_SECTION_FAILURE_NOTICE.format(
+                        section=spec.section_title, reason=outcome.failure,
+                    ))
+                if outcome.failed_stores:
+                    notices.append(MEMORY_DEGRADED_STORES_NOTICE.format(
+                        section=spec.section_title,
+                        stores=', '.join(outcome.failed_stores),
+                    ))
+
+                blocks = [render_memory_results(outcome.text)] if outcome.text else []
                 if spec.slug == TASK_SEMANTIC.slug and scope.task_id:
                     blocks.append(await self._task_entity_block(scope.task_id))
                 body = '\n\n'.join(block for block in blocks if block)
@@ -1681,8 +1762,21 @@ Handle this escalation, then call `resolve_issue` with a summary.
                     recalled_sections.append(f'## {spec.section_title}\n\n{body}')
 
         except Exception as e:
+            # The loop itself broke — a filter or renderer surprise, not a
+            # per-query fault, so no section can name it. It still counts as
+            # an outage for the notice below.
             logger.warning(f'Failed to fetch memory context: {e}')
-            memory_unavailable = True
+            loop_failure = MEMORY_FAILURE_TRANSPORT
+
+        foreign_dropped = sum(outcome.dropped for outcome in outcomes)
+        nested_dropped = sum(outcome.nested_dropped for outcome in outcomes)
+        queries_fired = len(outcomes)
+        failures = [outcome.failure for outcome in outcomes if outcome.failure]
+        reasons = list(dict.fromkeys(failures + ([loop_failure] if loop_failure else [])))
+        # An outage is "nothing worked", not "something didn't": one failed
+        # query among two is a partial recall, already named section by
+        # section in `notices` above.
+        outage = bool(reasons) and (loop_failure is not None or len(failures) == queries_fired)
 
         # Compute (and log) the filtered-result summary BEFORE any early
         # return below: an all-foreign result set and a partial failure are
@@ -1719,16 +1813,13 @@ Handle this escalation, then call `resolve_issue` with a summary.
             )
 
         if not recalled_sections:
-            if memory_unavailable:
-                if drop_note:
-                    return (
-                        '# Context\n\n_Memory unavailable — proceed with codebase '
-                        f'exploration. Note: {drop_note} before the failure._'
-                    )
-                return '# Context\n\n_Memory unavailable — proceed with codebase exploration._'
+            notice = (
+                MEMORY_OUTAGE_NOTICE.format(reasons=', '.join(reasons))
+                if outage else MEMORY_EMPTY_NOTICE
+            )
             if drop_note:
-                return f'# Context\n\n_No memory context available ({drop_note})._'
-            return '# Context\n\n_No memory context available._'
+                notice += f'\n\n_Note: {drop_note}._'
+            return f'# Context\n\n{notice}'
 
         # recalled_sections is non-empty: gate the provenance caveat on that
         # fact alone, NOT on memory_unavailable — a later query failing must
@@ -1741,11 +1832,13 @@ Handle this escalation, then call `resolve_issue` with a summary.
             caveat += f'\n\n_In total, {drop_note}._'
 
         rendered_sections = list(recalled_sections)
-        if memory_unavailable:
-            rendered_sections.append(
+        if loop_failure is not None:
+            notices.append(
                 '_Memory unavailable for the remaining queries — proceed with '
                 'codebase exploration for anything not covered above._'
             )
+        if notices:
+            rendered_sections.append('\n'.join(notices))
 
         return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
 
@@ -1789,14 +1882,15 @@ Handle this escalation, then call `resolve_issue` with a summary.
         *,
         caller_agent_id: str,
         caller_task_id: str | None,
-    ) -> tuple[str | None, int, int]:
+    ) -> MemoryQueryOutcome:
         """Search fused-memory and drop cross-project results from the reply.
 
         Thin wrapper over :meth:`_mcp_search` that applies
         :func:`filter_foreign_project_results` to the raw text before it
-        reaches :meth:`_get_memory_context`. Returns the filter's ``(text,
-        dropped, nested_dropped)`` triple verbatim, or ``(None, 0, 0)`` when
-        the underlying search itself returned nothing (nothing to filter).
+        reaches :meth:`_get_memory_context`, and carries the reply's
+        ``failed_stores`` alongside. A failed or empty search passes through
+        with its outcome intact — there is nothing to filter, and the reason
+        it produced nothing must survive to the renderer.
 
         Assumes :meth:`_mcp_search` answers with a single JSON document: it
         joins every MCP response text block with ``'\\n'`` before returning.
@@ -1806,14 +1900,21 @@ Handle this escalation, then call `resolve_issue` with a summary.
         ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
         pinned limitation.
         """
-        raw = await self._mcp_search(
+        reply = await self._mcp_search(
             spec, query,
             caller_agent_id=caller_agent_id,
             caller_task_id=caller_task_id,
         )
-        if not raw:
-            return None, 0, 0
-        return filter_foreign_project_results(raw, self.project_id)
+        if not reply.text:
+            return reply
+        text, dropped, nested_dropped = filter_foreign_project_results(reply.text, self.project_id)
+        return replace(
+            reply,
+            text=text,
+            dropped=dropped,
+            nested_dropped=nested_dropped,
+            failed_stores=_failed_stores(reply.text),
+        )
 
     async def _mcp_search(
         self,
@@ -1822,7 +1923,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
         *,
         caller_agent_id: str,
         caller_task_id: str | None,
-    ) -> str | None:
+    ) -> MemoryQueryOutcome:
         """Ask one query of fused-memory over its MCP HTTP endpoint.
 
         The spec supplies the retrieval scoping — which stores, which
@@ -1830,6 +1931,12 @@ Handle this escalation, then call `resolve_issue` with a summary.
         for the journal (D8). An empty ``stores``/``categories`` tuple is
         omitted rather than sent empty, so the server applies its own routing
         instead of being handed a filter that matches nothing.
+
+        A failure is NAMED (see the reason classes above) and logged at
+        WARNING, never swallowed at DEBUG: an unreachable memory service used
+        to be indistinguishable here from an empty corpus, which left the
+        caller's honest outage branch unreachable and masked a live transient
+        server error for 234 briefings.
         """
         arguments: dict[str, Any] = {
             'query': query,
@@ -1851,16 +1958,28 @@ Handle this escalation, then call `resolve_issue` with a summary.
                 {'name': 'search', 'arguments': arguments},
                 timeout=10,
             )
-            content = result.get('result', {}).get('content', [])
-            texts = []
-            for block in content:
-                if isinstance(block, dict) and block.get('type') == 'text':
-                    texts.append(block['text'])
-            return '\n'.join(texts) if texts else None
-
+        except TimeoutError as e:
+            logger.warning(f'Memory search timed out for {query!r}: {e}')
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_TIMEOUT)
         except Exception as e:
-            logger.debug(f'MCP search failed for "{query}": {e}')
-            return None
+            logger.warning(f'Memory search failed for {query!r}: {e}')
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_TRANSPORT)
+
+        reply = result.get('result') if isinstance(result, dict) else None
+        if not isinstance(reply, dict):
+            logger.warning(
+                f'Memory search for {query!r} answered with no tool result: {result!r}'
+            )
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        texts = [
+            block['text']
+            for block in reply.get('content', [])
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        # No text blocks is an honest empty answer, not a fault: the tool
+        # replied, it simply recalled nothing.
+        return MemoryQueryOutcome(text='\n'.join(texts) if texts else None)
 
     def _format_prior_proposal(self, task: dict) -> str:
         """Format the most recent dry-run block-time proposal, if any.
