@@ -115,19 +115,27 @@ class MergeRrScan:
     """What one worktree's MERGE_RR says, and which of it resolves.
 
     ``suspect`` is the single question a caller acts on: it is true when the
-    file names a conflict id with no backing rr-cache directory, OR when it
-    holds a record git itself would reject.  The two have different symptoms
-    and the same remedy, so they share one flag.
+    file names a conflict id with no backing rr-cache directory, when it holds
+    a record git itself would reject, or when it could not be READ at all.  The
+    three have different symptoms and the same remedy, so they share one flag.
+
+    ``unreadable`` is carried as a flag rather than folded into an empty parse
+    because absent and unreadable are opposite answers: an absent MERGE_RR is
+    the normal healthy state, while an unreadable one is a file this run never
+    managed to inspect — unknown, and unknown is not healthy.  A rename needs
+    write permission on the DIRECTORY rather than read on the file, so an
+    unreadable MERGE_RR can still be moved aside and its evidence kept.
     """
 
     merge_rr_path: Path
     records: tuple[MergeRrRecord, ...]
     dangling: tuple[MergeRrRecord, ...]
     unparsable: tuple[bytes, ...]
+    unreadable: bool = False
 
     @property
     def suspect(self) -> bool:
-        return bool(self.dangling or self.unparsable)
+        return bool(self.dangling or self.unparsable or self.unreadable)
 
 
 def scan_merge_rr(*, git_dir: Path, common_dir: Path) -> MergeRrScan:
@@ -144,15 +152,28 @@ def scan_merge_rr(*, git_dir: Path, common_dir: Path) -> MergeRrScan:
     is what git stores the preimage inside.
 
     A missing MERGE_RR is the normal healthy state — most worktrees have none —
-    and yields an empty scan rather than an error.  Both arguments stay
-    explicit so the classifier is pure filesystem work, testable without a
-    repository; :func:`resolve_git_dirs` supplies them for real callers.
+    and yields an empty scan rather than an error.  Any OTHER read failure is
+    recorded as ``unreadable`` instead: it must not raise, because this runs on
+    a recovery path, and it must not be folded into the healthy branch either,
+    because that would report a file nothing inspected as clean.  Both
+    arguments stay explicit so the classifier is pure filesystem work, testable
+    without a repository; :func:`resolve_git_dirs` supplies them for real
+    callers.
     """
     merge_rr_path = git_dir / 'MERGE_RR'
+    unreadable = False
     try:
         data = merge_rr_path.read_bytes()
     except FileNotFoundError:
         data = b''
+    except OSError as exc:
+        logger.warning(
+            'Could not read MERGE_RR at %s: %s. Treated as suspect — a file '
+            'this run never inspected is unknown, not healthy.',
+            merge_rr_path, exc,
+        )
+        data = b''
+        unreadable = True
 
     parsed = parse_merge_rr(data)
     rr_cache = common_dir / 'rr-cache'
@@ -165,6 +186,27 @@ def scan_merge_rr(*, git_dir: Path, common_dir: Path) -> MergeRrScan:
         records=parsed.records,
         dangling=dangling,
         unparsable=parsed.unparsable,
+        unreadable=unreadable,
+    )
+
+
+def _suspicion(
+    dangling: tuple[MergeRrRecord, ...],
+    unparsable: tuple[bytes, ...],
+    *,
+    unreadable: bool,
+) -> str:
+    """One rendering of why a MERGE_RR is suspect, for every place that says so.
+
+    Three callers describe the same three facts — the quarantine's WARNING, the
+    report-only WARNING, and :attr:`PreflightResult.unrepaired` — and a
+    suspicion named at two of them and missed at the third reads as "suspect,
+    for no reason given".
+    """
+    return (
+        f'dangling rr-cache refs: '
+        f'[{", ".join(record.conflict_id for record in dangling)}]; '
+        f'unparsable records: {len(unparsable)}; unreadable: {unreadable}'
     )
 
 
@@ -212,12 +254,10 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
         )
         return None
     logger.warning(
-        'Quarantined suspect MERGE_RR to %s — dangling rr-cache refs: [%s]; '
-        'unparsable records: %d. Evidence preserved; the abort that follows '
-        'would have deleted it.',
+        'Quarantined suspect MERGE_RR to %s — %s. Evidence preserved; the '
+        'abort that follows would have deleted it.',
         backup,
-        ', '.join(record.conflict_id for record in scan.dangling),
-        len(scan.unparsable),
+        _suspicion(scan.dangling, scan.unparsable, unreadable=scan.unreadable),
     )
     return backup
 
@@ -388,6 +428,7 @@ class PreflightResult:
     locks_removed: tuple[LockFinding, ...]
     locks_retained: tuple[LockFinding, ...]
     resolved: bool = True
+    merge_rr_unreadable: bool = False
 
     @property
     def unrepaired(self) -> tuple[str, ...]:
@@ -404,11 +445,14 @@ class PreflightResult:
             f'{", ".join(str(pid) for pid in finding.holder_pids)}'
             for finding in self.locks_retained if finding.holder_pids
         ]
-        if self.merge_rr_backup is None and (self.dangling or self.unparsable):
+        suspect = self.dangling or self.unparsable or self.merge_rr_unreadable
+        if self.merge_rr_backup is None and suspect:
             reasons.append(
-                'suspect MERGE_RR left in place — dangling rr-cache refs: ['
-                + ', '.join(record.conflict_id for record in self.dangling)
-                + f']; unparsable records: {len(self.unparsable)}',
+                'suspect MERGE_RR left in place — '
+                + _suspicion(
+                    self.dangling, self.unparsable,
+                    unreadable=self.merge_rr_unreadable,
+                ),
             )
         return tuple(reasons)
 
@@ -508,10 +552,15 @@ def preflight_rebase_recovery(
     *report_only* performs detection and reporting with no mutation, so an
     operator can inspect before authorising a repair.
 
-    FAIL-SAFE: a preflight that cannot resolve the git directories logs and
-    returns an unresolved-but-clean result rather than raising.  This decorates
-    a RECOVERY path, so it must never itself become the reason recovery fails —
-    an unguarded abort that might crash still beats no abort at all.
+    FAIL-SAFE, and TOTAL: no filesystem state makes this raise.  Every failure
+    — a worktree git cannot be spawned in, a MERGE_RR that cannot be read, a
+    quarantine or a lock removal that cannot be performed — is folded into the
+    returned value, whose ``verdict`` then says what was left un-repaired.
+    This decorates a RECOVERY path, so it must never itself become the reason
+    recovery fails: an unguarded abort that might crash still beats no abort at
+    all.  That is an enforced invariant, not an aspiration —
+    ``orchestrator/tests/test_rebase_recovery.py::TestPreflightIsTotal``
+    parametrizes it over the hostile states measured to have broken it.
     """
     worktree = Path(worktree)
     dirs = resolve_git_dirs(worktree)
@@ -531,11 +580,9 @@ def preflight_rebase_recovery(
     if report_only and scan.suspect:
         logger.warning(
             'Rebase-recovery preflight (report-only) found a suspect MERGE_RR '
-            'at %s — dangling rr-cache refs: [%s]; unparsable records: %d. '
-            'Nothing was moved.',
+            'at %s — %s. Nothing was moved.',
             scan.merge_rr_path,
-            ', '.join(record.conflict_id for record in scan.dangling),
-            len(scan.unparsable),
+            _suspicion(scan.dangling, scan.unparsable, unreadable=scan.unreadable),
         )
 
     sweep = (
@@ -553,6 +600,7 @@ def preflight_rebase_recovery(
         merge_rr_backup=backup,
         locks_removed=sweep.removed,
         locks_retained=sweep.retained,
+        merge_rr_unreadable=scan.unreadable,
     )
 
 
@@ -584,9 +632,13 @@ async def guarded_abort(
        stale-lock rc 128.
 
     The preflight is sync filesystem work, so it runs off-thread rather than
-    blocking the event loop.  It never raises: a preflight that cannot resolve
-    the worktree degrades to an unguarded abort, which is still strictly better
-    than no abort at all.
+    blocking the event loop.  It never raises — see
+    :func:`preflight_rebase_recovery` for the enforced totality invariant and
+    the test that pins it — so a worktree it cannot inspect, or damage it
+    cannot repair, degrades to an unguarded abort rather than to no abort.
+    The abort's own errors still surface: ``run`` reports a non-zero exit as a
+    value, and ``git_ops._run`` still raises ``WorktreeMissing`` for a cwd that
+    has vanished, which is the typed exception its callers recover from.
 
     Returns *run*'s ``(rc, stdout, stderr)`` unchanged, so no call site's
     control flow, return value or logging has to change.
