@@ -265,7 +265,20 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,
-    'orchestrator': 5288.0,
+    # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
+    # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
+    # regime's worst GREEN full-suite run.
+    #
+    # REFRESHING THIS DOWNWARD DOES NOT WEAKEN THE GUARD, and a reviewer
+    # diffing plan against code should not read a lowered measurement as a
+    # loosened check. W stops being the only floor in the excepted branch:
+    # census_budget_floor(4626.17) = 7000 now EXCEEDS this figure and is the
+    # BINDING floor, asserted alongside the surviving `budget > worst`. Net
+    # strength strictly increases — before, the excepted branch's only real
+    # floor was a single frozen number that could not detect its own
+    # staleness; now it is a derivation over a dated, regime-scoped,
+    # reproducible census that names the command to repeat.
+    'orchestrator': 4626.166946739017,
 }
 
 # Single, EXPLICIT, documented exception to assertions (b) and (c) below —
@@ -300,21 +313,30 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 # against. Same lesson as commit e9d1055ed8: a guard must not pin an
 # operator-tunable live yaml value.
 #
-# INTERIM, AND NOT YET D-DERIVED (Leo's ruling D16', 2026-09-08): 7200 is an
-# operator estimate — ~1.6x headroom over the ~4400s loaded extrapolation
-# from task 4176's contended run — not a measured distribution. Task 3353's
-# scope D (p50/p90/max under load, with PSI and runqueue) refines it later;
-# this exception's NUMBER is expected to change with that refinement, not
-# this exception's EXISTENCE, which is why the exception is keyed on the
-# module rather than on today's figure.
+# NOW D-DERIVED (Leo's ruling D17, 2026-09-14, task 3353 scope D'). It was an
+# operator estimate under D16' — ~1.6x headroom over a ~4400s extrapolation
+# from task 4176's contended run, not a distribution. It is now a DERIVATION
+# over a dated, regime-scoped census: see ORCHESTRATOR_BUDGET_CENSUS, whose
+# verbatim command is the way to repeat it. This exception's NUMBER is still
+# expected to change as the census is re-measured, not this exception's
+# EXISTENCE — which is why it stays keyed on the module rather than on today's
+# figure.
 #
 # WHAT THE EXCEPTION DOES NOT BUY. It drops (b)'s ~2x min_budget MULTIPLE,
-# not the measurement floor underneath it. The excepted branch asserts the
-# declared budget is at or above the fleet ceiling AND still clears
-# MEASURED_MODULE_SUITE_WORST_SECS[prefix] — so this dict cannot be used to
-# park a budget inside the band where green runs have already been observed
-# to land, which is the failure mode the ruling exists to remove and the one
-# an "except (b) and (c) entirely" reading would silently re-open.
+# not the measurement floor underneath it — and since D17 it does not even buy
+# a bare fleet-ceiling check. The excepted branch asserts the declared budget
+# is at or above max(census_budget_floor(census max), fleet ceiling) AND still
+# clears MEASURED_MODULE_SUITE_WORST_SECS[prefix] — so this dict cannot be used
+# to park a budget inside the band where green runs have already been observed
+# to land, which is the failure mode the ruling exists to remove and the one an
+# "except (b) and (c) entirely" reading would silently re-open.
+#
+# WHY `>=` AND NOT `>` against the fleet ceiling, unchanged from D16': commit
+# 36c4c71eb4 raised that ceiling onto this module's ruled figure as a stopgap
+# and recorded the condition for putting it back. The two are expected to
+# separate again, and the module keeps its ruled figure through that revert
+# rather than falling back with the ceiling — so the comparison must admit
+# equality while they coincide.
 #
 # Do NOT widen this dict for any other module: every other declared budget
 # still narrows below the fleet ceiling and is still held to (b) and (c) in
@@ -322,12 +344,15 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
     'orchestrator': (
         "esc-4211-6 (2026-09-07 option B / 2026-09-11 option C), Leo's ruling "
-        "D16' (2026-09-08): verify_command_timeout_secs=7200 is a deliberate, "
-        'documented INTERIM exception to assertions (b) and (c) — a budget '
-        'that does not narrow below the fleet ceiling, to stop false '
-        'infra_timeouts on a suite whose green runs already exceed the 3600s '
-        "ceiling the ruling was made against — and is NOT yet D-derived. Task "
-        '3353 scope D refines it with a measured distribution.'
+        "D16' (2026-09-08), refined by ruling D17 (2026-09-14, task 3353 "
+        "scope D'): verify_command_timeout_secs=7200 is a deliberate, "
+        'documented exception to assertions (b) and (c) — a budget that does '
+        'not narrow below the fleet ceiling, to stop false infra_timeouts on '
+        'a suite whose green runs already exceed the 3600s ceiling the ruling '
+        'was made against. It is NO LONGER a bare estimate: the floor holding '
+        'it up is max(census_budget_floor(ORCHESTRATOR_BUDGET_CENSUS.'
+        'max_secs), fleet ceiling), derived from a dated, regime-scoped '
+        'census whose repeat command is recorded at that constant.'
     ),
 }
 
@@ -379,25 +404,48 @@ class BudgetCensus(NamedTuple):
     measured_at: str
 
 
-# RED (step-25): deliberately seeded with the BARE TRAILING-14-DAY figures, so
-# the assertions below fail on the exact arithmetic fork design decision 4
-# exists to prevent — window_start (08-31) precedes regime_since (09-12T08),
-# and ceil-to-100(1.5 * 4991) = 7500 exceeds the refusal ceiling. Step-26
-# replaces this with the regime-scoped run.
+# MEASURED 2026-09-14 by the verbatim command below, over the PREVAILING
+# config regime. RE-MEASURE BY REPEATING THAT COMMAND and replacing this whole
+# record, so the next figure is a repeat rather than a re-derivation.
+#
+# THE THREE REGIMES THE CENSUS FOUND, which is why this one is scoped:
+#   pre-2026-09-03          n=26  p50=1551  p90=2385  max=3225   t/o=1   floor 4900
+#   09-03 .. 09-12T08       n=26  p50=3090  p90=4223  max=4991   t/o=14  floor 7500
+#   since 09-12T08 (THIS)   n=14  p50=3275  p90=3685  max=4626   t/o=0   floor 7000
+# The middle regime corroborates the segmentation on its own evidence: 14
+# timeouts against this regime's 0, which is the distress commit 36c4c71eb4
+# relieved by raising the ceiling 3600 -> 7200.
+#
+# DIVERGENCE FROM D17's STATED FIGURES, recorded rather than smoothed over.
+# The ruling expected max=3753 -> floor 5700. Measured max is 4626 -> floor
+# 7000, because a green run landed at 2026-09-14T09:35 (task 3541) after the
+# ruling was written, making 3753 the second-highest. n/p50/p90 all match the
+# ruling's shape. Consequence filed as esc-3353-15: headroom against the
+# refusal ceiling is 174s of floor (7000 vs 7200), i.e. a single green run
+# above 4800s trips assertion (3) above. That is the ruling's INTENDED
+# behaviour — the finding surfaces instead of the budget silently rising — so
+# when it fires, read it as the escalate branch working.
+#
+# EVERY IN-WINDOW RUN IS UNSTAMPED. Deliverable 1 of this task adds the host
+# load stamp; it had not merged when this was measured, so all 14 records
+# carry no load reading and the census's load bands are all empty. The figures
+# here are therefore durations under UNKNOWN host load — which is precisely the
+# gap D1 closes for the next re-measure.
 ORCHESTRATOR_BUDGET_CENSUS = BudgetCensus(
-    window_start='2026-08-31T00:00:00+00:00',
-    window_end='2026-09-14T15:39:03+00:00',
-    regime='bare trailing 14d — STRADDLES the retired 3-slot/3600 regime',
+    window_start='2026-09-12T08:00:00+00:00',
+    window_end='2026-09-15T00:00:00+00:00',
+    regime='prevailing config since the 3600 -> 7200 fleet-ceiling raise',
     regime_since='2026-09-12T08:00:00+00:00',
-    n=44,
-    p50=3040.0,
-    p90=3999.0,
-    max_secs=4991.13326132996,
-    timed_out=14,
+    n=14,
+    p50=3274.9211449669992,
+    p90=3684.5928532374005,
+    max_secs=4626.166946739017,
+    timed_out=0,
     census_command=(
         'uv run --project shared python scripts/verify_budget_census.py '
         '--root /home/leo/src/dark-factory --module orchestrator '
-        '--label test --role task --window 14d'
+        '--label test --role task '
+        '--window 2026-09-12T08:00:00+00:00..2026-09-15T00:00:00+00:00'
     ),
     measured_at='2026-09-14',
 )
