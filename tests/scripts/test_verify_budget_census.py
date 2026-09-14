@@ -1202,3 +1202,274 @@ class TestTheMergeGateBudgetIsReported:
 
         assert readout['always_cold'] is True
         assert 'census changes nothing' in readout['note'].lower()
+
+
+# A frozen clock, injected into every main() call below, so the trailing-window
+# boundary is deterministic. The sibling suites do the same; a window resolved
+# against the real clock makes a test's own fixtures age out of it.
+_NOW = '2026-09-14T12:00:00+00:00'
+
+
+def _main(capsys, *argv):
+    """Drive `main()` and return `(rc, stdout, stderr)` — the sibling's idiom."""
+    from datetime import datetime  # noqa: PLC0415
+
+    import verify_budget_census as mod  # noqa: PLC0415
+
+    code = mod.main(list(argv), now=datetime.fromisoformat(_NOW))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+class TestTheCliContract:
+    """`main(argv, now=None)` over the same report dict the text renderer reads.
+
+    `--root` is the injection point that makes the whole script testable
+    against a synthetic corpus. Without it every test here would have to run
+    against the live tree, which is the thing this suite's norm forbids.
+    """
+
+    def test_a_synthetic_corpus_reports_its_own_numbers(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+
+        rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        assert rc == 0
+        assert '3300' in out
+
+    def test_json_switches_the_whole_output_to_one_document(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+
+        rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+
+        assert rc == 0
+        report = json.loads(out)
+        assert report['window']
+        assert report['module'] == 'orchestrator'
+
+    def test_the_text_renderer_reads_the_same_dict_json_emits(self, tmp_path, capsys):
+        """One structure, two renderings — the sibling's build_report/render split.
+
+        Asserted by driving both and checking the text carries the figure the
+        JSON reports, so the two cannot describe different runs.
+        """
+        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+
+        _rc, text, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+        _rc, raw, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+
+        reported_max = json.loads(raw)['overall']['durations']['max']
+        assert str(int(reported_max)) in text
+
+    def test_the_window_is_resolved_against_the_injected_clock(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+            '--window', '14d', '--json',
+        )
+
+        lo, hi = json.loads(out)['window']
+        assert hi.startswith('2026-09-14T12:00:00')
+        assert lo.startswith('2026-08-31T12:00:00')
+
+    def test_the_dated_window_is_honoured(self, tmp_path, capsys):
+        _corpus_with(
+            tmp_path,
+            _leg(started_at='2026-09-13T04:00:00+00:00', duration_secs=3300.0),
+            _leg(started_at='2026-08-25T04:00:00+00:00', duration_secs=4991.0),
+        )
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+            '--window', '2026-09-12T08:00:00+00:00..2026-09-14T12:00:00+00:00',
+        )
+
+        assert json.loads(out)['overall']['durations']['max'] == 3300.0
+
+    def test_the_role_filter_reaches_the_selector(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        merge = _worktree_record(
+            tmp_path, '_merge-abc123', 'attempt-1.orchestrator.summary.json',
+        )
+        merge.write_text(
+            json.dumps(_summary(_leg(duration_secs=9999.0))), encoding='utf-8',
+        )
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+            '--role', 'task', '--json',
+        )
+
+        assert json.loads(out)['overall']['durations']['max'] == 3300.0
+
+    def test_the_label_filter_reaches_the_selector(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg(label='lint', cmd=_FULL_SUITE))
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+            '--label', 'lint', '--json',
+        )
+
+        assert json.loads(out)['overall']['durations']['n'] == 1
+
+    def test_roots_are_repeatable(self, tmp_path, capsys):
+        one, two = tmp_path / 'one', tmp_path / 'two'
+        _corpus_with(one, _leg(duration_secs=3300.0), lane='1')
+        _corpus_with(two, _leg(duration_secs=3400.0), lane='2')
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(one), '--root', str(two),
+            '--module', 'orchestrator', '--json',
+        )
+
+        assert json.loads(out)['overall']['durations']['n'] == 2
+
+
+class TestTheExitCodeVocabulary:
+    """0 / 1 / 2, as `merge_lane_throughput.main` documents."""
+
+    def test_success_is_zero(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg())
+
+        rc, _out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        assert rc == 0
+
+    def test_an_unreadable_named_root_is_one_and_the_others_still_report(
+        self, tmp_path, capsys,
+    ):
+        """Partial failure is reported on stderr, not turned into a crash."""
+        good = tmp_path / 'good'
+        _corpus_with(good, _leg(duration_secs=3300.0))
+
+        rc, out, err = _main(
+            capsys, '--root', str(good), '--root', str(tmp_path / 'absent'),
+            '--module', 'orchestrator', '--json',
+        )
+
+        assert rc == 1
+        assert 'absent' in err
+        assert json.loads(out)['overall']['durations']['max'] == 3300.0
+
+    def test_a_malformed_window_is_two_with_nothing_on_stdout(self, tmp_path, capsys):
+        rc, out, err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+            '--window', 'fortnight',
+        )
+
+        assert rc == 2
+        assert out == ''
+        assert 'fortnight' in err
+
+
+class TestAnEmptyCorpusIsReportedNotFabricated:
+    """The case that separates an honest census from a reassuring one.
+
+    A root with no corpus must not yield a p50 of 0.0, and must not traceback.
+    It must say, in as many words, that it found nothing — which is the only
+    output that cannot be mistaken for a fast suite.
+    """
+
+    def test_a_root_with_neither_corpus_exits_zero(self, tmp_path, capsys):
+        rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        assert rc == 0
+        assert out
+
+    def test_the_empty_report_carries_nulls_not_zeros(self, tmp_path, capsys):
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+
+        durations = json.loads(out)['overall']['durations']
+        assert durations == {'n': 0, 'p50': None, 'p90': None, 'max': None}
+
+    def test_the_text_report_says_it_found_nothing(self, tmp_path, capsys):
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        assert 'no ' in out.lower() or 'none' in out.lower() or '0 ' in out
+
+    def test_a_root_with_records_but_no_matching_module_is_also_empty(
+        self, tmp_path, capsys,
+    ):
+        """Zero SELECTED is a different fact from zero RECORDS, and both are
+        reported — the rejection counts are what tell them apart."""
+        _corpus_with(tmp_path, _leg())
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'shared', '--json',
+        )
+
+        report = json.loads(out)
+        assert report['overall']['durations']['n'] == 0
+        assert report['corpus']['records'] == 1
+        assert report['rejected']['prefix_mismatch'] == 1
+
+
+class TestTheReportCarriesItsOwnProvenance:
+    """A figure without its window and its filters is not reproducible."""
+
+    def test_the_report_names_its_window_module_label_and_role(
+        self, tmp_path, capsys,
+    ):
+        _corpus_with(tmp_path, _leg())
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+            '--role', 'task', '--json',
+        )
+
+        report = json.loads(out)
+        assert report['module'] == 'orchestrator'
+        assert report['label'] == 'test'
+        assert report['role'] == 'task'
+        assert len(report['window']) == 2
+
+    def test_the_report_names_the_command_it_compared_against(self, tmp_path, capsys):
+        """So a reader can see WHICH command's distribution this is."""
+        _corpus_with(tmp_path, _leg())
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+
+        assert json.loads(out)['expected_command'] == _FULL_SUITE
+
+    def test_the_report_carries_the_skip_and_rejection_counts(self, tmp_path, capsys):
+        """The reconciliation trail, in the artifact itself."""
+        _corpus_with(tmp_path, _leg())
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+
+        report = json.loads(out)
+        assert 'skipped' in report['corpus']
+        assert 'rejected' in report
+
+    def test_the_findings_ride_in_the_report(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg())
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+
+        report = json.loads(out)
+        assert report['cold_separability']['cold_separable'] is False
+        assert report['merge_gate']['always_cold'] is True
+        assert 'unstamped' in report['by_load_band']
