@@ -417,15 +417,31 @@
     },
     {
       "id": "3367-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, verbatim. The gate in verify.py still reads `category == FailureCategory.ENV_TRANSIENT and attempt.test.cmd is not None and attempt.test.rc != 0`, and the comment block above it still states THE RULE as 'it therefore fires only when the TEST leg is the failing one' while explicitly resting that on 'an explicit `attempt.test.rc != 0`'. The finding's objection is untouched: rc != 0 establishes only that the test leg failed SOMEHOW, not that it is the leg which classified ENV_TRANSIENT. Re-measured ranks confirm the masking is still possible — ENV_TRANSIENT severity_rank 10 still outranks TEST_FAILURE 11 (the absolute numbers shifted by one since August, the ORDER is identical), so a phantom TYPE-leg ENV_TRANSIENT still sets the aggregate category while a genuine test regression holds rc=1. The comment has in fact acquired a defence that does not reach the finding: 'The rc check is correct on its own terms ... re-running a passing leg can never recover anything.' True, and irrelevant — it answers the rc==0 case, not the rc!=0-for-a-real-regression case the finding describes. The sharpest evidence is thirty lines below the gate: the bare-xdist reclassification guard requires `attempt.test.rc != 0 and attempt.lint.rc == 0 and attempt.type.rc == 0` — precisely the co-occurrence guard this gate lacks, in the same function, added for the same reason. The finding cited that as in-repo precedent; it is still precedent, and still unapplied here.",
+      "followup_ticket": null,
+      "evidence": {
+        "gate_current": "category == FailureCategory.ENV_TRANSIENT and attempt.test.cmd is not None and attempt.test.rc != 0",
+        "rule_comment_still_present": "THE RULE (task 3367) ... 'fires only when the TEST leg is the failing one'",
+        "ranks_remeasured": "ENV_TRANSIENT rank=10 outranks TEST_FAILURE rank=11 (August said 9 vs 10; order unchanged)",
+        "adjacent_guard_has_the_missing_check": "the bare-xdist guard in the same function requires lint.rc == 0 and type.rc == 0",
+        "suggested_fix_still_applies": "gate on the test leg's OWN classify_failure result rather than its rc"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3367-correctness-1",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, and the remedy is now CHEAPER than when the finding was written. Confirmed by measurement rather than reading: ENV_TRANSIENT is severity_rank 10 and TEST_FAILURE 11, so ENV_TRANSIENT still wins _worst_category; ENV_TRANSIENT is still a member of INFRA_TRANSIENT_CATEGORIES; and merge_queue.py still routes on the AGGREGATE at three sites (`(verify.category or '') in INFRA_TRANSIENT_CATEGORIES`), so a run whose TYPE leg is phantom-red and whose TEST leg is genuinely red is still held as transient infra with no steward and no branch-blaming. WHAT CHANGED IS THE AVAILABILITY OF THE FIX, not the defect. The repo now carries per-leg categories (`local_verify.failing_leg_categories`, pinned by TestSummarizeChecksReportsEveryFailingLegCategory) and has already adopted the exact principle this finding asks for, in a comment headed 'GATE ON EVERY FAILING LEG, NOT THE AGGREGATE CATEGORY (task 3173 review)' — whose reasoning is the same shape as this finding's: severity_rank lets a high-severity infra leg dominate a co-occurring branch-blaming TEST_FAILURE, which is correct for 'how bad was this run' and wrong for attribution. That principle was applied ONLY to the indeterminate-verdict veto cross-check. The infra-transient routing three functions away still keys on the single aggregate value. So the fix no longer needs new machinery — it needs the existing machinery extended to a site that was missed, and the inconsistency between the two adjacent policies is now itself the argument.",
+      "followup_ticket": null,
+      "evidence": {
+        "ranks_remeasured": "ENV_TRANSIENT rank=10 beats TEST_FAILURE rank=11; is_infra_transient=True",
+        "aggregate_routing_sites_still_present": "merge_queue.py lines ~2997, ~3080, ~3584 test (verify.category or '') in INFRA_TRANSIENT_CATEGORIES",
+        "per_leg_machinery_now_exists": "VerifyResult.failing_leg_categories, consumed at merge_queue.py ~3323",
+        "principle_already_adopted_elsewhere": "merge_queue.py comment 'GATE ON EVERY FAILING LEG, NOT THE AGGREGATE CATEGORY (task 3173 review)' — applied only to the INDETERMINATE_VERDICT_CATEGORIES veto",
+        "consequence_unchanged": "a real branch regression is held as infra_issue: blocked + transient-infra reason, no steward, no fix loop"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3453-correctness-0",
@@ -447,9 +463,17 @@
     },
     {
       "id": "3679-test-coverage-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "a",
+      "note": "Fixed, and dispositioned the way the finding demanded — by searching for a pin test, not by re-reading the docstring. TestAnchoredSlotTimeoutWithCollateralIsEnvTransient now EXISTS at orchestrator/tests/test_verify_classify.py, and it pins exactly what the docstring claims: the full slot-shape x collateral-shape x order cross-product classifying ENV_TRANSIENT rather than SEMAPHORE_TIMEOUT. In August that grep returned nothing repo-wide. TWO THINGS MAKE THIS THE MOST INTERESTING (a) IN THE ROSTER. First, the fixing work is labelled 'task 4126 (recovered from the task-3679 review)' in both the test's comment block and its class docstring — so this finding was independently RECOVERED and acted on through some route other than the review gate that dropped it. It is direct evidence that the dropped-finding population was not uniformly lost, and the only such evidence in this triage. Second, the repo has since grown a structural guard against the whole defect CLASS: orchestrator/tests/test_cited_test_class_drift.py asserts that every test class cited by name in a src docstring actually resolves to a real class, and its module docstring names this very incident as the motivation — 'orchestrator.verify_classify carried one for TEN DAYS naming a class that existed nowhere in the repo (citation landed 2026-08-05; the class was written 2026-08-15)'. The finding's own remedy was one test; what landed was that test plus a detector for every future instance. No follow-up is warranted.",
+      "followup_ticket": null,
+      "evidence": {
+        "cited_class_now_exists": "orchestrator/tests/test_verify_classify.py::TestAnchoredSlotTimeoutWithCollateralIsEnvTransient",
+        "august_grep_result": "no hits repo-wide for AnchoredSlotTimeout|WithCollateralIsEnvTransient",
+        "fixed_by": "task 4126, self-described as 'recovered from the task-3679 review'",
+        "class_level_guard_added": "orchestrator/tests/test_cited_test_class_drift.py — every src-cited test class must resolve; cites this incident as motivation",
+        "behaviour_was_never_wrong": "the finding said so too; the defect was the missing pin plus a false docstring claim, and both are closed"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3757-correctness-0",
