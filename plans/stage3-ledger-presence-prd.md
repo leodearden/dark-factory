@@ -267,6 +267,22 @@ Then **delete** the "Known gap" comment (`stage3.py:9-22`), and add the tool to
   protection, because the Mem0 fallback is retained for every non-definitive read.
 - **Stage disambiguation:** presence is always queried with an explicit `stage`;
   the Stage-2 verification hardcodes `'task_knowledge_sync'`.
+- **Accepted false negative — current-cycle loss (task 3731).** Stage 3's
+  dominant call site is the run it is executing inside, and that run's
+  `stage_reports` has not been flushed yet, so rung 3 answers `run_unknown`: for
+  the CURRENT `run_id` the primary path can confirm a row is PRESENT but never
+  that one is genuinely ABSENT. A Stage-2 ledger write lost during the current
+  cycle is therefore detected only by the §8.2 step-2 Mem0 fallback, whose
+  unreliability is why the ledger authority was introduced (tasks 2652, 4186).
+  Before this widening that absence was actionable on the primary path, so this
+  IS a sensitivity loss — a deliberate trade, not an oversight: it is what
+  removes the 61-of-64 false `stage_not_run` findings, and it is the fail-safe
+  direction (never flag on uncertainty). Pinned by
+  `test_current_cycle_loss_is_an_accepted_false_negative`, stated in the Stage 3
+  prompt, and recorded here so a later reader does not read the fallback-only
+  path as a defect. Restoring the sensitivity needs a WRITE-path change — the
+  harness flushing `stage_reports` per stage instead of once after the loop —
+  which §11 puts out of scope for both this PRD and task 3731.
 - **No write path touched:** `write_cycle_summary` is unchanged (read/visibility
   fix only). Reaffirmed by task 3731, which is also read-only: it adds a `runs`
   projection and widens a return payload, and touches no writer. The Mem0

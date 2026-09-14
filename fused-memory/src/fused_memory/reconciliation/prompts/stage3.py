@@ -230,8 +230,10 @@ failed). Do NOT conclude presence or absence from this path — fall through to 
 FALLBACK below instead. **Expect this for the run you are running inside of**: the \
 `runs.stage_reports` column the tool types an absence from is not a finished account of \
 a run until that run settles, so for the CURRENT run_id the tool can confirm a row is \
-PRESENT but can never confirm one is genuinely absent. The FALLBACK below therefore remains the \
-detection path for current-cycle loss, exactly as before this field existed.
+PRESENT but can never confirm one is genuinely absent. The FALLBACK below is therefore \
+the ONLY detection path for current-cycle loss — an accepted, deliberate cost of \
+suppressing the false `stage_not_run` findings, and a WEAKER path than this one. Work it \
+properly: an inconclusive result here is not reassurance.
 - `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
 decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
 well have run the stage and lost only the ledger write.

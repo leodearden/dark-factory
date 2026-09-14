@@ -34,6 +34,16 @@ from fused_memory.services.memory_service import MemoryService
 _PROJECT_ID = 'dark_factory'
 _STAGE = 'task_knowledge_sync'
 
+#: Every run status whose `stage_reports` blob the harness has flushed, so the
+#: classifier may read it as evidence. Spelled out rather than imported from
+#: `ReconciliationJournal._STAGE_REPORTS_PERSISTED_STATUSES`: parametrizing over
+#: the roster under test would let a narrowing edit drop a status while this
+#: suite stayed green, which is precisely the regression these arms pin.
+#: `interrupted` belongs here because `_start_run` never adopts the run — the
+#: adopted variant is covered by
+#: `test_adopted_resumed_run_is_inconclusive_not_stage_not_run`.
+_SETTLED_STATUSES = ['completed', 'failed', 'rolled_back', 'circuit_breaker', 'interrupted']
+
 
 class TestWriteThenReadLedgerSeam:
     """Write→read boundary/seam test (G2 integration signal + regression
@@ -208,7 +218,7 @@ class TestTypedAbsenceClassification:
             await journal.complete_run(run_id, status)
 
     @staticmethod
-    async def _write_row(store, run_id, *, remediation=False):
+    async def _write_row(store, run_id, *, remediation=False, stage=_STAGE):
         await store.upsert(
             ReconLedgerRecord(
                 project_id=_PROJECT_ID,
@@ -216,7 +226,7 @@ class TestTypedAbsenceClassification:
                 payload_json=json.dumps({'remediation': remediation}),
                 state='active',
                 created_at=datetime.now(UTC).isoformat(),
-                flag_type=_STAGE,
+                flag_type=stage,
                 run_id=run_id,
             )
         )
@@ -292,24 +302,26 @@ class TestTypedAbsenceClassification:
             await journal.close()
 
     @pytest.mark.asyncio
-    async def test_stage_that_never_ran_is_not_a_gap(self, mock_config, tmp_path):
-        """The 61-of-64 majority in live data, and the esc-3421-1 shape: an
-        interrupted run whose stage_reports never names Stage 2 simply never
+    @pytest.mark.parametrize('run_status', _SETTLED_STATUSES)
+    async def test_stage_that_never_ran_is_not_a_gap(
+        self, mock_config, tmp_path, run_status,
+    ):
+        """The 61-of-64 majority in live data, and the esc-3421-1 shape: a
+        settled run whose stage_reports never names Stage 2 simply never
         reached it. Nothing was lost, so nothing should be flagged."""
         service, store, journal = await self._wire(mock_config, tmp_path)
         try:
-            await self._start_run(
-                journal, 'run-never-reached-stage2', status='interrupted',
-            )
+            run_id = f'run-never-reached-stage2-{run_status}'
+            await self._start_run(journal, run_id, status=run_status)
 
             result = await service.get_cycle_summary_presence(
-                project_id=_PROJECT_ID, run_id='run-never-reached-stage2', stage=_STAGE,
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE,
             )
 
             assert result['present'] is False
             assert result['reason'] == 'stage_not_run'
             assert result['expected'] is False
-            assert result['run_status'] == 'interrupted'
+            assert result['run_status'] == run_status
         finally:
             await store.close()
             await journal.close()
@@ -379,6 +391,44 @@ class TestTypedAbsenceClassification:
             await journal.close()
 
     @pytest.mark.asyncio
+    async def test_current_cycle_loss_is_an_accepted_false_negative(
+        self, mock_config, tmp_path,
+    ):
+        """The sensitivity this task GIVES UP, pinned so a later reader cannot
+        mistake it for an oversight (PRD §8.3).
+
+        Stage 3's dominant call site is the run it is executing inside, and for
+        that run the durable evidence does not exist yet — the harness flushes
+        `stage_reports` once, after the stage loop. So a Stage-2 row that is
+        genuinely lost RIGHT NOW still types as `run_unknown` and is never
+        reported on the authoritative path. The fixture rules out the innocent
+        explanation: this run wrote its Stage-1 row, so the ledger is live and
+        reachable for it, and the Stage-2 absence is real.
+
+        Before the widening, this absence was actionable on the primary path.
+        The trade — lose current-cycle sensitivity, kill 61-of-64 false
+        `stage_not_run` findings, fall back to the weaker Mem0 paths — is
+        deliberate and is the fail-safe direction: never flag on uncertainty.
+        """
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-current-cycle-loss', status='running')
+            await self._write_row(
+                store, 'run-current-cycle-loss', stage='memory_consolidator',
+            )
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-current-cycle-loss', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
     async def test_in_flight_run_with_present_row_still_reads_present(
         self, mock_config, tmp_path,
     ):
@@ -403,14 +453,14 @@ class TestTypedAbsenceClassification:
             await journal.close()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('run_status', ['interrupted', 'failed'])
+    @pytest.mark.parametrize('run_status', _SETTLED_STATUSES)
     async def test_stage_ran_but_row_absent_is_a_real_gap(
         self, mock_config, tmp_path, run_status,
     ):
         """Regression guard for the CRITICAL constraint: run_status must NOT
         gate the verdict. Three measured `failed` runs really did execute
         Stage 2 and lose the ledger write, so a status-gated implementation
-        would suppress every one of them. Both statuses must flag."""
+        would suppress every one of them. Every settled status must flag."""
         service, store, journal = await self._wire(mock_config, tmp_path)
         try:
             run_id = f'run-lost-write-{run_status}'
