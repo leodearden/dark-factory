@@ -138,15 +138,35 @@ _ESCALATION_TOOLS = [
 # concatenation, like every other splice in this file -- these prompts are
 # deliberately not f-strings (see the MANDATED_STAGING_COMMAND note above).
 # Regression-guarded by orchestrator/tests/test_roles_escalation_ladder.py.
+#
+# The two `action` values quoted verbatim in the escalate_blocker bullet --
+# `terminate_cleanly` and `keep_driving` -- are WIRE TOKENS defined in
+# `escalation.models.FILER_ACTIONS` and emitted by `escalate_blocker`. NO CODE
+# READS THEM: this prose is the only thing that tells an agent what the key it
+# receives means, so a rename at the emission site would silently decouple the
+# instruction from the response. Exactly like MANDATED_STAGING_COMMAND, that
+# constant is a *test anchor*, not a shared template -- this prompt is not an
+# f-string, so the copy below must be updated with it, and
+# test_roles_escalation_ladder.py catches the drift after the fact rather than
+# preventing it structurally (task 5368).
 ESCALATION_LADDER_CORE = """
 ## Escalation
 
 If you encounter a problem you cannot solve at your scope, you can escalate:
 
 - **`escalate_info(...)`** — Non-blocking observation. Report it and continue working.
-- **`escalate_blocker(...)`** — Blocking problem. Report it, then commit any in-progress
-  work, log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
-  and you will be re-invoked.
+- **`escalate_blocker(...)`** — Blocking problem. Report it, then read the `action` key
+  of the response and do what it says.
+  - `terminate_cleanly` (every normal branch) — commit any in-progress work, log your
+    iteration, and STOP. Do NOT retry — the handler will resolve the issue and you will
+    be re-invoked.
+  - `keep_driving` — accompanies `status: accepted_unpersisted`. Your filing was accepted
+    but a post-write re-read could not confirm it landed, so there may be no record on
+    disk for any handler to drain. Stopping here would remove your task from every
+    recovery path in exchange for an escalation nobody will ever see. So do NOT stop:
+    keep driving the blocked task as best you can, and re-file on your next iteration.
+    The dedupe gate collapses a repeat filing into one record, so re-filing is safe and
+    is the intended recovery.
 
 Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
 risk_identified, infra_issue.
