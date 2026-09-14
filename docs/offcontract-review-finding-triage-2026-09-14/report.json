@@ -323,15 +323,33 @@
     },
     {
       "id": "3041-architectural-coherence-1",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live: both sides of the incoherence are intact, and each has since been documented MORE firmly rather than reconciled. The eviction key is still `(is_ledger_stamp, has_parseable_created_at, created_at)`, and it now carries a formal 'Retention contract (task 3041)' stating that narratives are evicted BEFORE any ledger_stamp and calling the narrative 'the disposable LLM-authored duplicate that task 2468 already tried to suppress'. Meanwhile prompts/stage2.py still MANDATES exactly that record as the resolution of a `missing_stage2_summary` carry-forward finding — 'The reconstruction `add_memory` MUST carry metadata={...'record_type': 'narrative'}' — and still tells the model the write is 'deterministically findable by metadata-keyed lookup and subject to the stage2_cycle_summary pool cap'. There is no narrative carve-out, exemption or protection anywhere in summary_pool.py. So the reconstruct -> evict-on-first-trim -> re-flag loop the finding described is still reachable: one module calls the record disposable and first-out, the other directs an LLM to write it as a durable resolution, and the prompt never warns that it will be the next thing trimmed. IMPORTANT NARROWING, recorded so the follow-up is not misaimed: the eviction ORDER is not the defect. Its rationale is explicit and incident-backed — letting a narrative evict a ledger_stamp 'is what made all three of run 84eae9bd's anchors vanish together (recon gate 165 / esc-165-1)' — and the ledger_stamp is the copy an auditor correlates against get_cycle_summary_presence. The remedy therefore almost certainly belongs on the PROMPT side (warn the model, exempt a reconstruction from the cap, or stop directing the write at all), not by reverting the retention contract.",
+      "followup_ticket": null,
+      "evidence": {
+        "eviction_key_unchanged": "(is_ledger_stamp, has_parseable_created_at, created_at) — narratives first",
+        "retention_contract_now_formalised": "'record_type=narrative records are evicted BEFORE any record_type=ledger_stamp'; narrative called 'the disposable LLM-authored duplicate'",
+        "prompt_side_unchanged": "prompts/stage2.py still MANDATES record_type='narrative' as the carry-forward resolution and calls it 'subject to the stage2_cycle_summary pool cap'",
+        "no_carve_out": "no narrative exemption or protection anywhere in summary_pool.py",
+        "remedy_is_probably_prompt_side": "the eviction order's rationale is incident-backed (recon gate 165 / esc-165-1); reverting it would reintroduce that incident"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3064-efficiency-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, and MEASURABLY WORSE than when the finding was written — which is exactly why the plan required re-measuring rather than trusting the August number. The get_statuses docstring is now 9,376 characters. August measured 8,328, itself grown from an original 959. So the description was indeed edited again in the interval, and it grew by a further ~1,048 chars: the trend the finding identified continued unchecked for six weeks. FastMCP still uses `fn.__doc__` as the tool description, so the mechanism is unchanged. ONE GENUINE MITIGATION, observed first-hand in this very session rather than inferred, and recorded because it cuts against the finding: this client DEFERS MCP tool schemas — the fused-memory tools arrived as names only, with an explicit note that their schemas are not loaded until fetched via a search tool, and `get_statuses` was never fetched. So for a deferred-schema client the 9,376 chars are NOT standing context, and the finding's '~1,900 extra tokens of standing context per session' overstates the cost for that client. It does NOT dispose of the finding, for two reasons. Deferral is a CLIENT-side behaviour that varies per client and can change without notice, so it is not a property of the server the finding is about; and the non-Claude-Code consumers the finding named — the reconciliation stages and the eval harness's FakeMcpClient — are unaffected by it. The content critique also stands on its own: the bulk of the text is maintainer-facing rationale (the who-calls-this census, the why-page_size-is-not-clamped note, the rule for future maintainers) that belongs in block comments, not in a wire-shipped tool description.",
+      "followup_ticket": null,
+      "evidence": {
+        "measured_now_chars": 9376,
+        "august_chars": 8328,
+        "original_chars": 959,
+        "delta_since_august": "+1048 — the description was edited again and grew",
+        "mechanism_unchanged": "FastMCP uses fn.__doc__ as the tool description",
+        "client_side_mitigation_observed": "this session's client deferred fused-memory tool schemas; get_statuses' schema was never loaded, so for such a client the text is not standing context",
+        "why_that_does_not_dispose_of_it": "deferral is client-side and varies; the reconciliation stages and the eval harness FakeMcpClient are unaffected; and the maintainer-facing-content critique is independent"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3075-correctness-0",
@@ -372,15 +390,34 @@
     },
     {
       "id": "3142-correctness-1",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, reproduced at runtime with output BYTE-IDENTICAL to the August finding. Running the shipped code in this worktree (module resolved to fused-memory/src/fused_memory/services/completion_claim_gate.py, i.e. this tree, which is unmodified from main for this file): 'Merged PR #4521 into main' -> kind='applied_work' subject='task' ref='4521'; 'The upstream issue #123 was closed as wontfix' -> kind='filing_dispatch' subject='task' ref='123'. Both match the finding's recorded results exactly. `_refs_in_clause` still applies TASK_REF_RE (plus _EXTERNAL_TASK_REF_RE) with no PR/pull/issue/GH exclusion, so the bare `#` cue still captures a PR or issue number as a task ref and the gate then consults the task authority about an id the sentence never claimed anything about. Both downstream outcomes the finding named remain live: a real non-terminal task with that id yields 'mismatch' (a false accusation about work nobody claimed), and a nonexistent id yields 'unverifiable' — still tagged, still escalated. NOT COVERED BY THE EXISTING TASK: 4205 tracks three false-positive classes from the task-3381 sweep — filing claims held to a completion standard, cross-repo commit probing, and negation-stripper misses. The bare-`#` PR/issue over-match does not appear among them, so unlike its sibling 3142[0] this one needs its own follow-up.",
+      "followup_ticket": null,
+      "evidence": {
+        "runtime_repro": [
+          "'Merged PR #4521 into main' -> applied_work/task/4521",
+          "'The upstream issue #123 was closed as wontfix' -> filing_dispatch/task/123"
+        ],
+        "identical_to_august": true,
+        "module_measured": "fused-memory/src/fused_memory/services/completion_claim_gate.py in this worktree (unmodified from main)",
+        "no_exclusion_added": "_refs_in_clause applies TASK_REF_RE and _EXTERNAL_TASK_REF_RE with no PR/pull/issue/GH guard",
+        "not_covered_by_4205": "4205's three classes are filing/terminality, cross-repo commit probing, negation-stripper misses"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3142-correctness-2",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, verbatim. In the coroutine, `probe = make_commit_probe(root)` is still called INLINE and only the per-ref call is threaded: `answer = await asyncio.to_thread(probe, ref)` on the very next lines. make_commit_probe still eagerly resolves the git toplevel at construction time via a blocking subprocess.run(['git','rev-parse','--show-toplevel']). The docstring a few lines above still states the rationale the construction defeats — 'asyncio.to_thread — a blocking git call on the event loop would stall every other in-flight MCP request behind one episode's verification'. That is precisely what the un-threaded rev-parse reintroduces, once per claimed project per episode, for up to the probe timeout on a slow, NFS-backed or lock-hung repository. The finding's two suggested remedies — wrap the construction in `await asyncio.to_thread(make_commit_probe, root)`, or make toplevel resolution lazy inside the threaded probe — are both still available and both cheap; neither was applied. The compounding issue it noted also stands: nothing caps commit refs per episode, so the per-sha probes remain serial.",
+      "followup_ticket": null,
+      "evidence": {
+        "construction_still_inline": "probe = make_commit_probe(root) in the coroutine body",
+        "only_the_call_is_threaded": "answer = await asyncio.to_thread(probe, ref)",
+        "blocking_call_at_construction": "subprocess.run(['git','rev-parse','--show-toplevel']) inside make_commit_probe",
+        "docstring_still_states_the_defeated_rationale": "'a blocking git call on the event loop would stall every other in-flight MCP request'",
+        "neither_remedy_applied": "no to_thread around construction; toplevel resolution not made lazy"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3308-contract-drift-0",
@@ -522,9 +559,16 @@
     },
     {
       "id": "3757-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "a",
+      "note": "Fixed, and fixed with the finding's own reasoning reproduced almost verbatim in the code. The uniqueness check is now `_require_unique_uuids`, and it is called from OUTSIDE verify_manifest's manifest-attributable try — the docstring says so explicitly: 'It is its own function, called from OUTSIDE verify_manifest's manifest-attributable try, because the failures that clause used to cover have two different culprits'. The justification is the finding's argument restated: 'select is handed two MANIFEST values (n and seed) over a STORE-supplied population. No manifest value can put the same node in FalkorDB twice, so reporting a duplicated node as bad_manifest sends the reader off to re-derive a corpus that is perfectly correct while the duplicated node that actually needs deleting stays put.' The distinction the finding was careful to preserve is preserved too: the carve-out is 'deliberately the uniqueness rule ALONE, and not the whole of _group_by_cell', because an unsatisfiable recorded n genuinely IS a manifest defect and allocate 'already reports — correctly — as bad_manifest'. That is exactly the line the finding drew between the two culprits sharing one clause, and it is the same case its cited test test_an_unsatisfiable_recorded_n_is_still_a_bad_manifest pins. The rule also lives in one place rather than being re-spelled ('one home for it, and no second spelling to drift').",
+      "followup_ticket": null,
+      "evidence": {
+        "check_relocated": "_require_unique_uuids is called from OUTSIDE verify_manifest's manifest-attributable try",
+        "reasoning_matches_the_finding": "'No manifest value can put the same node in FalkorDB twice ... while the duplicated node that actually needs deleting stays put'",
+        "distinction_preserved": "carve-out is the uniqueness rule ALONE; an unsatisfiable recorded n still correctly reports bad_manifest via allocate",
+        "spot_respected": "the rule is called, not re-spelled — 'one home for it, and no second spelling to drift'"
+      },
+      "checked_at": "2026-09-14"
     }
   ],
   "findings": [],
