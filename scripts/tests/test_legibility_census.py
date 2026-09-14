@@ -4119,14 +4119,16 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_ht
         return _FakeHttpxResponse(rpc_response)
 
     install_fake_httpx(_fake_post)
+
     # ENTITLED to reach census's real delegate: this test owns the endpoint --
     # `install_fake_httpx` substitutes a stub httpx BELOW the transport, so
     # nothing leaves the process, and the whole point is to assert the real
-    # outbound request shape. Declared at the call site rather than inferred
+    # outbound request shape. Declared around the call rather than inferred
     # (task 5279 W1).
-    monkeypatch.setattr(mod, "_refuse_real_post_under_test", lambda url, tool_name: None)
-
-    result = mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
+    with mod.own_endpoint():
+        result = mod._post_mcp_tool_call(
+            "http://localhost:8002/mcp", "submit_task", {"a": 1},
+        )
 
     assert result == {"ok": True}
     headers = captured_kwargs.get("headers") or {}
@@ -4232,22 +4234,21 @@ def test_post_mcp_tool_call_outside_pytest_still_reaches_the_transport(monkeypat
     assert mod._refuse_real_post_under_test("http://localhost:9/mcp", "escalate_info") is None
 
 
-def test_refuse_real_post_under_test_is_the_named_escape_hatch(monkeypatch):
+def test_own_endpoint_is_the_declared_escape_hatch(monkeypatch):
     """Entitlement to post for real under pytest is DECLARED, not inferred.
 
     No automatic signal separates "a server this test brought up on an
     ephemeral port" from "the ambient production server on 8103" -- the
     leaking tests use 8103 too. So a caller that serves or fakes its OWN
-    endpoint neutralises `mod._refuse_real_post_under_test` at the call site,
-    which is what `escalation/tests/test_legibility_census_escalation_e2e.py`
-    (task 3644's live-server acceptance suite) does. Pinning the seam by NAME
-    is what keeps that opt-out from silently turning into "the guard stopped
-    working"."""
+    endpoint says so by wrapping the call in `mod.own_endpoint()`, which is
+    what `escalation/tests/test_legibility_census_escalation_e2e.py` (task
+    3644's live-server acceptance suite) does. Pinning the seam is what keeps
+    that opt-out from silently turning into "the guard stopped working"."""
     recorder = _make_transport_recorder()
     monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
-    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_refuse_real_post_under_test (call)")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_own_endpoint (call)")
 
-    # Without the opt-out: refused, and the refusal explains itself.
+    # Without the declaration: refused, and the refusal explains itself.
     with pytest.raises(mod.CensusPostRefusedUnderTest) as excinfo:
         mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
     assert recorder.calls == []
@@ -4256,12 +4257,47 @@ def test_refuse_real_post_under_test_is_the_named_escape_hatch(monkeypatch):
     # tool, the target and the way out are all named in the message itself.
     assert "escalate_info" in message
     assert "http://localhost:8103/mcp" in message
-    assert "_refuse_real_post_under_test" in message
+    assert "own_endpoint" in message
 
-    # With the opt-out declared at the call site: the transport is reached.
-    monkeypatch.setattr(mod, "_refuse_real_post_under_test", lambda url, tool_name: None)
-    mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    # With the declaration around the call: the transport is reached.
+    with mod.own_endpoint():
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
     assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})]
+
+
+def test_own_endpoint_grant_does_not_outlive_its_block(monkeypatch):
+    """The grant is CALL-scoped, which is the whole reason it is a context
+    manager rather than a rebind that lasts a test or a fixture.
+
+    census posts to two endpoints -- `escalate_info` on the project's
+    escalation server and `submit_task` on fused-memory -- and a test that
+    owns one of them owns only that one. A grant that leaked past the `with`
+    would quietly entitle the other, which is strictly more than the
+    declaration claims. Also pinned: the grant is released even when the
+    entitled call RAISES, since an e2e test asserting on a failure is exactly
+    the shape that would otherwise leave it set."""
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_own_endpoint_scope (call)")
+
+    with mod.own_endpoint():
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    with pytest.raises(mod.CensusPostRefusedUnderTest):
+        mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
+
+    def _boom(url, tool_name, arguments, timeout=None):
+        raise RuntimeError("the entitled call itself failed")
+
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", _boom)
+    with pytest.raises(RuntimeError), mod.own_endpoint():
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    with pytest.raises(mod.CensusPostRefusedUnderTest):
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})], (
+        "only the one entitled POST may have reached the transport"
+    )
 
 
 # ---------------------------------------------------------------------------

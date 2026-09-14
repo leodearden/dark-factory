@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import copy
 import functools
 import json
@@ -416,13 +417,54 @@ class CensusPostRefusedUnderTest(RuntimeError):
 
     The contract: a pytest process never speaks to a real MCP endpoint
     through census.py. A caller that serves or fakes its OWN endpoint is
-    entitled to, and DECLARES that by neutralizing
-    :func:`_refuse_real_post_under_test` at the call site.
+    entitled to, and DECLARES that by wrapping those calls in
+    :func:`own_endpoint`.
 
     A distinct type, not a bare ``RuntimeError``, so the regression test has
     something falsifiable to assert on and an operator reading a log can tell
     a refused test POST from an ordinary transport failure.
     """
+
+
+_own_endpoint_declared: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "census_own_endpoint_declared", default=False,
+)
+"""Whether the calls being made right here post to an endpoint the CALLER
+owns. Set only by :func:`own_endpoint`, and only for the duration of its
+block -- a ``ContextVar`` rather than a module global so the grant cannot
+outlive the ``with`` that made it, and so concurrent contexts cannot inherit
+one another's entitlement."""
+
+
+@contextlib.contextmanager
+def own_endpoint():
+    """Declare that the MCP POSTs made inside this block target an endpoint
+    the CALLER owns -- a server it brought up itself on an ephemeral port, or
+    a faked transport below httpx -- so
+    :func:`_refuse_real_post_under_test` stands aside for exactly those calls.
+
+    THE supported way to reach a real POST from inside a pytest process; see
+    that function for why the default is to refuse. Use it as narrowly as the
+    call it entitles::
+
+        with census.own_endpoint():
+            escalate_fn(category="infra_issue", ...)
+
+    Call-SCOPED on purpose. The entitlement is a claim about one endpoint, and
+    census posts to two (``escalate_info`` on the project's escalation server,
+    ``submit_task`` on fused-memory) -- a grant that lasted a whole test or
+    fixture would silently cover the other one too, which is more than any
+    caller means to claim. Being a public function also gives the two test
+    suites that need it (``scripts/tests/test_legibility_census.py`` and
+    ``escalation/tests/test_legibility_census_escalation_e2e.py``, in
+    different packages) a supported seam to depend on instead of each reaching
+    in and rebinding a private name.
+    """
+    token = _own_endpoint_declared.set(True)
+    try:
+        yield
+    finally:
+        _own_endpoint_declared.reset(token)
 
 
 def _refuse_real_post_under_test(url: str, tool_name: str) -> None:
@@ -443,27 +485,33 @@ def _refuse_real_post_under_test(url: str, tool_name: str) -> None:
     recon-escalation-watcher closes; ``esc-legibility-census-dark_factory-2``
     reached ``dedupe_count=21`` that way.
 
-    WHY RAISE. Loud over silent (no-silent-fail-soft): a sentinel return
-    would make a suppressed POST look like a successful one to
-    :func:`default_submit_fn`, whose caller has no best-effort swallow and
-    would record a filing that never happened. Raising costs nothing on the
-    escalation path -- ``_escalate_fn``'s existing ``except Exception``
-    already turns any transport failure into its established WARNING and
-    returns ``{}``, so ``main()`` still prints ``census: FAILED`` and returns
-    1.
+    WHY RAISE. Loud over silent (no-silent-fail-soft): a sentinel return is
+    indistinguishable from a real MCP response at every consumer. ``{}`` is
+    what ``_escalate_fn`` already returns when a POST genuinely fails, and
+    what ``run_census`` reads as "submit_fn returned no usable id" -- so a
+    suppressed POST would arrive looking like an ordinary weak response
+    rather than like a suppression, and any future caller that checks only
+    for an exception would read it as success. A typed exception says which
+    one it is at both consumers. Raising costs nothing on the escalation
+    path -- ``_escalate_fn``'s existing ``except Exception`` already turns
+    any transport failure into its established WARNING and returns ``{}``,
+    so ``main()`` still prints ``census: FAILED`` and returns 1.
 
     WHY A DECLARED HATCH RATHER THAN A SNIFFED ONE. No automatic signal
     separates "a server this test brought up on an ephemeral port" from "the
     ambient production server on 8103": the leaking tests write
     ``escalation_port: 8103`` into their own tmp_path config, so port, config
     shape and project_id all match. Entitlement is therefore a human
-    judgement about who owns the endpoint, declared by monkeypatching this
-    function -- see ``escalation/tests/test_legibility_census_escalation_e2e.py``
-    (task 3644's live-server acceptance suite, which must keep reaching the
-    real streamable-HTTP protocol). A caller who forgets fails loud with a
-    message naming the hatch; the opposite default -- allow, and remember to
-    block -- is what produced the dedupe_count above.
+    judgement about who owns the endpoint, declared by wrapping the entitled
+    calls in :func:`own_endpoint` -- see
+    ``escalation/tests/test_legibility_census_escalation_e2e.py`` (task
+    3644's live-server acceptance suite, which must keep reaching the real
+    streamable-HTTP protocol). A caller who forgets fails loud with a message
+    naming the hatch; the opposite default -- allow, and remember to block --
+    is what produced the dedupe_count above.
     """
+    if _own_endpoint_declared.get():
+        return
     current_test = os.environ.get("PYTEST_CURRENT_TEST")
     if current_test is None:
         return
@@ -472,8 +520,8 @@ def _refuse_real_post_under_test(url: str, tool_name: str) -> None:
         f"({url}) from inside a pytest process (PYTEST_CURRENT_TEST="
         f"{current_test!r}). A test-minted escalation is indistinguishable at "
         f"triage from a genuine census failure. If this caller serves or fakes "
-        f"its OWN endpoint, declare that at the call site by monkeypatching "
-        f"census._refuse_real_post_under_test to a no-op."
+        f"its OWN endpoint, declare that around the call: "
+        f"`with census.own_endpoint(): ...`."
     )
 
 
@@ -2555,8 +2603,8 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
 
     Being the single boundary is also why the pytest guard lives here:
     :func:`_refuse_real_post_under_test` covers both consumers in one call,
-    and a caller entitled to post for real under pytest neutralizes it at the
-    call site.
+    and a caller entitled to post for real under pytest declares that by
+    wrapping the call in :func:`own_endpoint`.
     """
     _refuse_real_post_under_test(url, tool_name)
     return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=30.0)

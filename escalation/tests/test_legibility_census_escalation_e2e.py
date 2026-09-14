@@ -112,27 +112,26 @@ def _write_legibility_yaml(project_root, *, escalation_port):
     return config_path
 
 
-def _declare_own_endpoint(monkeypatch):
-    """Declare that this test OWNS the endpoint it is about to post to, so
-    census's pytest guard stands aside (task 5279 W1).
-
-    `census._refuse_real_post_under_test` refuses every real MCP POST made
-    from inside a pytest process, because a test-minted escalation is
-    indistinguishable at triage from a genuine census failure. The census
-    tests in this file are the entitled exception: `serve_escalation_mcp`
-    brings up a REAL escalation server on an EPHEMERAL port over a tmp_path
-    queue, and the whole point of this suite (task 3644) is to drive the real
-    streamable-HTTP protocol against it and read the escalation back out by
-    id. Nothing reaches the operator's queue on :8103.
-
-    Entitlement is declared rather than sniffed because nothing distinguishes
-    the two cases automatically -- the tests that leak write
-    `escalation_port: 8103` into their own tmp_path config, so port, config
-    shape and project_id all match a legitimate run. Only the sibling tests
-    that post through their own `_default_poster` (nightly, transcript
-    persistence) need no declaration: they never route through census.
-    """
-    monkeypatch.setattr(census, '_refuse_real_post_under_test', lambda url, tool_name: None)
+# WHY THE `with census.own_endpoint():` BLOCKS BELOW (task 5279 W1).
+#
+# census refuses every real MCP POST made from inside a pytest process,
+# because a test-minted escalation is indistinguishable at triage from a
+# genuine census failure. The census tests in this file are the entitled
+# exception: `serve_escalation_mcp` brings up a REAL escalation server on an
+# EPHEMERAL port over a tmp_path queue, and the whole point of this suite
+# (task 3644) is to drive the real streamable-HTTP protocol against it and
+# read the escalation back out by id. Nothing reaches the operator's queue on
+# :8103.
+#
+# Entitlement is declared rather than sniffed because nothing distinguishes
+# the two cases automatically -- the tests that leak write
+# `escalation_port: 8103` into their own tmp_path config, so port, config
+# shape and project_id all match a legitimate run. It is declared around the
+# entitled CALL rather than for a whole test or fixture because this suite
+# owns the escalation server it started and nothing else: a wider grant would
+# also un-guard a `submit_task` POST to the fleet's :8002. Only the sibling
+# tests that post through their own `_default_poster` (nightly, transcript
+# persistence) need no declaration: they never route through census.
 
 
 @pytest.fixture
@@ -152,7 +151,6 @@ def live_census_project(tmp_path, serve_escalation_mcp, monkeypatch):
         raise RuntimeError(_RAISED_MESSAGE)
 
     monkeypatch.setattr(census, 'run_census', _raising_run_census)
-    _declare_own_endpoint(monkeypatch)
     yield project_root, queue
 
 
@@ -168,7 +166,7 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
     """
     project_root, queue = live_census_project
 
-    with caplog.at_level(logging.WARNING, logger='legibility.census'):
+    with caplog.at_level(logging.WARNING, logger='legibility.census'), census.own_endpoint():
         exit_code = census.main(['--project-root', str(project_root), '--force'])
 
     # (1) The authoritative exit signal is never masked by the escalation POST.
@@ -207,7 +205,7 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
 
 
 def test_default_escalate_fn_returns_the_live_servers_response(
-    tmp_path, serve_escalation_mcp, monkeypatch,
+    tmp_path, serve_escalation_mcp,
 ):
     """The poster's RETURN VALUE is the real server's response, not a
     swallowed `{}` -- i.e. the census learns the id of what it filed.
@@ -226,14 +224,14 @@ def test_default_escalate_fn_returns_the_live_servers_response(
         project_root / 'docs' / 'legibility' / 'legibility.yaml'
     )
     escalate_fn = census._build_default_escalate_fn(cfg)
-    _declare_own_endpoint(monkeypatch)
 
-    response = escalate_fn(
-        category='infra_issue',
-        severity='info',
-        summary=f'legibility census run failed ({_PROJECT_ID}): {_RAISED_MESSAGE}',
-        detail='traceback would go here',
-    )
+    with census.own_endpoint():
+        response = escalate_fn(
+            category='infra_issue',
+            severity='info',
+            summary=f'legibility census run failed ({_PROJECT_ID}): {_RAISED_MESSAGE}',
+            detail='traceback would go here',
+        )
 
     assert response, 'escalate_fn returned a falsy response -- the POST was swallowed'
     escalation_id = response.get('id')
