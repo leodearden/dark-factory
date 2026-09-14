@@ -10,6 +10,7 @@ mock service, mirroring test_count_by_metadata_tool.py's split.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -425,6 +426,11 @@ class TestTypedAbsenceCrossesTheMcpBoundary:
         This already failed BEFORE task 3731's widening: the signature still
         omitted ``remediation``, which task 2652 added to the payload two
         cycles ago, so the stages have been reading a stale contract since.
+
+        Compared KEY to KEY, not substring to blob: a ``'status'`` key would
+        pass a plain ``in`` test against the documented ``'run_status'``, and
+        ``'reason'`` against ``'reasons'``, so the drift this exists to catch
+        could recur undetected.
         """
         server, store, journal, run_id = await self._server_with(
             mock_config, tmp_path, stage_ran=True,
@@ -435,14 +441,19 @@ class TestTypedAbsenceCrossesTheMcpBoundary:
                 {'project_id': _PROJECT_ID, 'run_id': run_id, 'stage': _STAGE},
             )
             documented = MCP_CALL_SIGNATURES['get_cycle_summary_presence']
+            # The signature renders each key as a quoted name followed by a
+            # colon; the `reason` VALUE literals are quoted too but are
+            # separated by `|`, so they are not picked up as keys.
+            documented_keys = set(re.findall(r"'([a-z_]+)':", documented))
 
-            undocumented = sorted(k for k in result if k not in documented)
+            undocumented = sorted(set(result) - documented_keys)
 
             assert not undocumented, (
                 f'get_cycle_summary_presence returns {undocumented} but '
                 f'MCP_CALL_SIGNATURES does not name them. The stages read the '
                 f'rendered signature, not the Python return, so an unnamed key '
-                f'is invisible to every consumer. Documented: {documented!r}'
+                f'is invisible to every consumer. Documented keys: '
+                f'{sorted(documented_keys)}'
             )
         finally:
             await store.close()

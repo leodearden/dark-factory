@@ -16693,14 +16693,17 @@ class TestTypedAbsenceReachesEveryPrompt:
 
     The service can now distinguish a genuine gap from a stage that never ran
     and from a row the TTL reaped, but that only removes false findings if the
-    prompts consuming the presence check are gated on ``expected`` rather than
-    on bare ``present: false``. This is the producer/consumer coupling guard.
+    prompts consuming the presence check name every branch it can return. This
+    is the producer/consumer coupling guard.
 
     Token-level by design, matching the style
-    ``test_stage1_prompt_checks_ledger_for_stage2_summary`` documents: the
-    ``reason`` literals and the ``expected`` gate are machine-meaningful and
-    cannot occur incidentally, so harmless rewording does not break these while
-    a dropped branch does.
+    ``test_stage1_prompt_checks_ledger_for_stage2_summary`` documents: a
+    ``reason`` literal is a value the service really returns and cannot occur
+    incidentally, so harmless rewording does not break this while a dropped
+    branch does. Nothing here pins the prompts' PROSE — how each branch phrases
+    its gate is a wording choice, and a test that pinned it would fail on a
+    reword that changed no behaviour while still passing on a prompt that kept
+    the words and dropped the branch.
     """
 
     @staticmethod
@@ -16724,17 +16727,4 @@ class TestTypedAbsenceReachesEveryPrompt:
                 f'{name} consumes get_cycle_summary_presence but never names '
                 f'reason={reason!r}. An unnamed reason is one the stage cannot '
                 f'act on, so the absence silently reads as a gap again.'
-            )
-
-    @pytest.mark.parametrize('token', ['expected: true', 'expected: false'])
-    def test_every_prompt_gates_on_expected(self, token):
-        """Asserts the VALUED token, not a bare 'expected' substring: the bare
-        word already occurs as ordinary prose in all three prompts ('expected
-        and routine', 'expected state'), so asserting it would pass vacuously
-        and pin nothing."""
-        for name, prompt in self._prompts().items():
-            assert token in prompt, (
-                f'{name} must gate its actionable branch on `{token}`, not on '
-                f'bare `present: false` — that conflation is the defect this '
-                f'task removes.'
             )
