@@ -40,19 +40,34 @@ class TestParsePressureFileRehome:
         from shared.psi import parse_pressure_file
 
         result = parse_pressure_file(PSI_CPU_TEXT)
-        assert result == {'some_avg10': 2.50, 'full_avg10': 0.30}
+        assert result == {
+            'some_avg10': 2.50,
+            'some_avg60': 1.80,
+            'full_avg10': 0.30,
+            'full_avg60': 0.20,
+        }
 
     def test_missing_full_defaults_to_zero(self):
         from shared.psi import parse_pressure_file
 
         result = parse_pressure_file(PSI_MEM_TEXT)
-        assert result == {'some_avg10': 1.23, 'full_avg10': 0.0}
+        assert result == {
+            'some_avg10': 1.23,
+            'some_avg60': 0.90,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
 
     def test_io_both_lines(self):
         from shared.psi import parse_pressure_file
 
         result = parse_pressure_file(PSI_IO_TEXT)
-        assert result == {'some_avg10': 0.75, 'full_avg10': 0.45}
+        assert result == {
+            'some_avg10': 0.75,
+            'some_avg60': 0.60,
+            'full_avg10': 0.45,
+            'full_avg60': 0.30,
+        }
 
     def test_float_precision(self):
         from shared.psi import parse_pressure_file
@@ -77,6 +92,74 @@ class TestParsePressureFileRehome:
         from shared.psi import parse_pressure_file
 
         assert parse_pressure_file(PSI_MEM_TEXT) is not None
+
+
+class TestParsePressureFileBothWindows:
+    """Both averaging windows come off ONE scan (task 3353, ruling D17).
+
+    D17 wants the verify-summary load stamp to carry cpu ``some avg10`` AND
+    ``avg60`` while forbidding a second PSI reader, so the ONE re-homed reader
+    grows the 60 s window additively rather than a parallel parser appearing in
+    verify.py. The ``found`` sentinel semantics are deliberately UNCHANGED by
+    that growth: only a TOTAL miss returns ``None``, and a line carrying a
+    window this parser knows is a parse even when the other window is absent.
+    """
+
+    def test_a_line_without_avg60_still_parses(self):
+        """avg60-absent is a partial miss (0.0), never the None sentinel."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file('some avg10=1.50 total=42\n')
+        assert result == {
+            'some_avg10': 1.50,
+            'some_avg60': 0.0,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
+
+    def test_a_line_without_avg10_still_parses_on_the_60s_window(self):
+        """The generalised scan is window-symmetric: either window is a find."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file('some avg60=2.25 total=42\n')
+        assert result == {
+            'some_avg10': 0.0,
+            'some_avg60': 2.25,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
+
+    def test_total_miss_still_returns_the_none_sentinel(self):
+        """A window this parser does not read is still a total miss."""
+        from shared.psi import parse_pressure_file
+
+        assert parse_pressure_file('some avg300=1.20 total=42\n') is None
+        assert parse_pressure_file('garbage line with no avg fields\n') is None
+        assert parse_pressure_file('') is None
+
+    def test_avg300_is_never_mistaken_for_a_known_window(self):
+        """The 300 s window must not bleed into either extracted window."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file(PSI_CPU_TEXT)
+        assert result is not None
+        assert 1.20 not in result.values()
+        assert 0.10 not in result.values()
+
+    def test_both_windows_of_both_lines_come_off_one_scan(self):
+        """One line carries two windows, so the scan cannot stop at the first."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file(
+            'some avg10=9.00 avg60=8.00 avg300=7.00 total=1\n'
+            'full avg10=6.00 avg60=5.00 avg300=4.00 total=2\n'
+        )
+        assert result == {
+            'some_avg10': 9.00,
+            'some_avg60': 8.00,
+            'full_avg10': 6.00,
+            'full_avg60': 5.00,
+        }
 
 
 class TestPsiSampleV2Fields:
