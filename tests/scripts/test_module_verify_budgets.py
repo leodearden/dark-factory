@@ -108,6 +108,7 @@ import os
 import pathlib
 import textwrap
 from collections.abc import Callable
+from typing import NamedTuple
 
 import pytest
 import yaml
@@ -330,6 +331,84 @@ RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
     ),
 }
 
+# D17's HARD CONSTRAINT (Leo, 2026-09-14). A census-derived floor above this
+# figure is a FINDING, never a silent raise: commit 36c4c71eb4 raised the fleet
+# ceiling 3600 -> 7200 as a STOPGAP and recorded that "the next raise should be
+# refused". So if the derivation below ever demands more than this, the answer
+# is to escalate and trim the suite (tasks 4600 / 5412 / 5280 own that half of
+# scope D), not to move the number.
+CENSUS_FLOOR_REFUSAL_CEILING = 7200
+
+
+class BudgetCensus(NamedTuple):
+    """One module's verify-duration census, frozen with its own provenance.
+
+    THE POINT OF THE SHAPE. The prose entry in
+    ``RULED_INTERIM_BUDGET_EXCEPTIONS`` could say "7200 is an operator
+    estimate" and nothing could check it. These fields are asserted against, so
+    the excepted branch stops asserting prose and starts asserting a
+    DERIVATION.
+
+    ``census_command`` and ``measured_at`` are not decoration: they are what
+    make the next figure a REPEAT rather than a re-derivation, which is exactly
+    what ``MEASURED_MODULE_SUITE_WORST_SECS``' own provenance block demands.
+    Re-measure by re-running that command, and replace the whole record.
+
+    ``regime``/``regime_since`` exist because a bare trailing window is WRONG
+    here, and provably so. A 14-day window from 2026-09-14 reaches back to
+    08-31 and straddles the retired 3-slot / 3600-ceiling regime, whose max was
+    4991s -> a floor of 7500, which trips the refusal ceiling above on evidence
+    from a configuration that no longer exists. D17's rule says "under the
+    PREVAILING config", so the window is
+    ``intersection(trailing-14d, prevailing regime)`` and the assertion
+    ``window_start >= regime_since`` holds it there. That assertion goes INERT
+    on its own once 14 days of prevailing-regime data exist, which is the point
+    — it narrows the window only while narrowing is needed, and says why.
+    """
+
+    window_start: str
+    window_end: str
+    regime: str
+    regime_since: str
+    n: int
+    p50: float
+    p90: float
+    max_secs: float
+    timed_out: int
+    census_command: str
+    measured_at: str
+
+
+# RED (step-25): deliberately seeded with the BARE TRAILING-14-DAY figures, so
+# the assertions below fail on the exact arithmetic fork design decision 4
+# exists to prevent — window_start (08-31) precedes regime_since (09-12T08),
+# and ceil-to-100(1.5 * 4991) = 7500 exceeds the refusal ceiling. Step-26
+# replaces this with the regime-scoped run.
+ORCHESTRATOR_BUDGET_CENSUS = BudgetCensus(
+    window_start='2026-08-31T00:00:00+00:00',
+    window_end='2026-09-14T15:39:03+00:00',
+    regime='bare trailing 14d — STRADDLES the retired 3-slot/3600 regime',
+    regime_since='2026-09-12T08:00:00+00:00',
+    n=44,
+    p50=3040.0,
+    p90=3999.0,
+    max_secs=4991.13326132996,
+    timed_out=14,
+    census_command=(
+        'uv run --project shared python scripts/verify_budget_census.py '
+        '--root /home/leo/src/dark-factory --module orchestrator '
+        '--label test --role task --window 14d'
+    ),
+    measured_at='2026-09-14',
+)
+
+# Keyed by prefix, like every other justification dict here, so the
+# parametrized branch below stays total rather than special-casing one name.
+RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
+    'orchestrator': ORCHESTRATOR_BUDGET_CENSUS,
+}
+
+
 # One real tracked file under each module prefix, used to drive the production
 # plan->execution bridge in assertion (e). Deliberately a PRODUCTION file rather
 # than a test file: verify_plan._derive_module_runs routes a source-only diff
@@ -484,15 +563,58 @@ def test_module_carries_its_own_measured_verify_budget(
         # something. root_warm is operator-tunable and currently sits ON this
         # module's ruled figure; the floor that actually holds the budget up
         # is the measurement assertion below, not this one.
-        assert mc.verify_command_timeout_secs >= root_warm, (
-            f'{prefix} is listed in RULED_INTERIM_BUDGET_EXCEPTIONS '
-            f'({ruled_exception}) as a budget that deliberately does NOT '
-            f'narrow below the repo-root ceiling, but its declared '
-            f'verify_command_timeout_secs={mc.verify_command_timeout_secs} is '
-            f'below verify_command_timeout_secs={root_warm}. Either the ruling '
-            f'no longer applies — remove this prefix from '
-            f'RULED_INTERIM_BUDGET_EXCEPTIONS so (b)/(c) apply in full — or '
-            f'{prefix}/orchestrator.yaml regressed'
+        census = RULED_BUDGET_CENSUS[prefix]
+
+        # (4) THE WINDOW IS REGIME-SCOPED. Asserted BEFORE the derivation it
+        # feeds, because a straddling window makes every figure below describe
+        # a configuration that no longer exists. Goes inert on its own once 14
+        # days of prevailing-regime data exist.
+        assert census.window_start >= census.regime_since, (
+            f'{prefix} budget census window starts {census.window_start}, '
+            f'BEFORE the prevailing config regime began '
+            f'({census.regime_since}, commit 36c4c71eb4). A window that '
+            f'straddles the retired 3-slot / 3600s-ceiling regime derives the '
+            f'floor below from runs made under a configuration that no longer '
+            f'exists — measured, that regime max is 4991s and yields a 7500s '
+            f'floor, which trips CENSUS_FLOOR_REFUSAL_CEILING. Re-run '
+            f'{census.census_command!r} with an explicit '
+            f'--window {census.regime_since}..<now> and replace the record'
+        )
+
+        # (3) D17's HARD CONSTRAINT, asserted before it is used as a floor.
+        derived_floor = census_budget_floor(census.max_secs)
+        assert derived_floor <= CENSUS_FLOOR_REFUSAL_CEILING, (
+            f'{prefix} census-derived floor is {derived_floor}s — ABOVE the '
+            f'{CENSUS_FLOOR_REFUSAL_CEILING}s refusal ceiling. THIS IS A '
+            f'FINDING TO ESCALATE, NOT A NUMBER TO RAISE. Commit 36c4c71eb4 '
+            f'raised the fleet ceiling 3600 -> 7200 as a stopgap and recorded '
+            f'that "the next raise should be refused", so do NOT edit '
+            f'CENSUS_FLOOR_REFUSAL_CEILING, do NOT raise the yaml, and do NOT '
+            f'weaken this assertion. File '
+            f"escalate_blocker(category='design_concern') naming this census "
+            f'(n={census.n}, p50={census.p50}, p90={census.p90}, '
+            f'max={census.max_secs}, window {census.window_start}..'
+            f'{census.window_end}, measured {census.measured_at}) and that '
+            f'refusal condition. The remedy is trimming the suite — tasks '
+            f'4600 / 5412 / 5280 own that half of scope D — not a wider budget'
+        )
+
+        # (1) THE DERIVATION. Replaces a bare `>= root_warm`: that alone would
+        # let the budget sit anywhere at or above an operator-tunable value,
+        # including inside the band where green runs land once the ceiling
+        # reverts. The floor is now the STRONGER of the census derivation and
+        # the fleet ceiling, so it survives commit 36c4c71eb4's revert.
+        census_floor = max(derived_floor, root_warm)
+        assert mc.verify_command_timeout_secs >= census_floor, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} is below its census-derived '
+            f'floor of {census_floor}s = max(census_budget_floor('
+            f'{census.max_secs})={derived_floor}, root ceiling={root_warm}). '
+            f'Its RULED_INTERIM_BUDGET_EXCEPTIONS entry ({ruled_exception}) '
+            f'excuses it from (b)/(c), NOT from the derivation that replaced '
+            f'them. Either the ruling no longer applies — remove this prefix '
+            f'so (b)/(c) apply in full — or {prefix}/orchestrator.yaml '
+            f'regressed. Re-measure with {census.census_command!r}'
         )
 
         # ...AND IT STILL CLEARS THIS MODULE'S OWN WORST RECORDED GREEN RUN.
