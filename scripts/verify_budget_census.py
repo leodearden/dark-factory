@@ -39,12 +39,16 @@ so.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import math
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -68,6 +72,9 @@ _ARCHIVE_ANCHOR = 'verify-logs'
 
 WORKTREE_GLOB = f'{_WORKTREE_ANCHOR}/*/.task/verify/*.summary.json'
 ARCHIVE_GLOB = 'data/verify-logs/*/*.summary-*.json'
+
+_RELATIVE_RE = re.compile(r'^(\d+)d$')
+_RANGE_SEP = '..'
 
 
 @dataclass(frozen=True)
@@ -417,3 +424,198 @@ def _reject_reason(entry: object, expected: str | None, label: str) -> str | Non
     if not isinstance(entry.get('duration_secs'), (int, float)):
         return 'no_duration'
     return None
+
+
+# ---------------------------------------------------------------------------
+# Numeric and temporal helpers. Shape mirrored from
+# scripts/merge_lane_throughput.py (parse_window / _percentile / _series) —
+# the same interpolation, the same None-on-empty, the same injected clock.
+# COPIED, not imported: scripts/ modules do not import one another here, and
+# that sibling is a 1899-line runs.db report whose sections are irrelevant.
+# ---------------------------------------------------------------------------
+
+
+def _percentile(values: Sequence[float], pct: float) -> float | None:
+    """Return the *pct*-th percentile of *values*, or ``None`` when empty.
+
+    Linear interpolation between the two nearest order statistics (the
+    ``numpy.percentile`` default) on the ascending sort: with
+    ``k = (n - 1) * pct / 100``, the result is
+    ``s[floor(k)] + (k - floor(k)) * (s[ceil(k)] - s[floor(k)])``.
+
+    ``None`` — never ``0.0`` — for an empty series. A ``0.0`` p50 would render
+    "no full-suite run in this window" as an INSTANTANEOUS suite, which in a
+    budget report is worse than merely wrong: it invites a reader to conclude
+    the suite got faster on evidence that says nothing at all.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    k = (len(ordered) - 1) * (pct / 100.0)
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return float(ordered[lo])
+    return float(ordered[lo] + (k - lo) * (ordered[hi] - ordered[lo]))
+
+
+def _series(values: Sequence[float]) -> dict[str, Any]:
+    """Summarise a duration series as n/p50/p90/max, the three stats ``None``
+    together when the series is empty."""
+    return {
+        'n': len(values),
+        'p50': _percentile(values, 50),
+        'p90': _percentile(values, 90),
+        'max': max(values) if values else None,
+    }
+
+
+def parse_instant(stamp: str) -> datetime | None:
+    """Parse an ISO-8601 *stamp* to a tz-aware UTC instant, or ``None``.
+
+    A naive stamp is read as UTC (every writer in this corpus emits UTC). An
+    unparseable one is ``None`` rather than a substituted default: defaulting
+    to the current clock would invent a run inside whatever window is being
+    reported, in the one artifact whose job is to say what actually ran.
+    """
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def day_bucket(stamp: str) -> date | None:
+    """The UTC calendar day *stamp* falls in, or ``None`` if unparseable.
+
+    Normalised to UTC BEFORE taking the date. Bucketing on the string's leading
+    ten characters would file ``2026-09-13T23:30:00-04:00`` under the 13th when
+    it is the 14th in UTC — sliding runs across a day boundary and smearing the
+    trailing-window edge a derived floor depends on.
+    """
+    instant = parse_instant(stamp)
+    return None if instant is None else instant.date()
+
+
+def parse_window(spec: str, now: datetime) -> tuple[datetime, datetime]:
+    """Resolve a ``--window`` *spec* against an injected *now* into ``(lo, hi)``.
+
+    Two forms::
+
+        <N>d          -> (now - N days, now)
+        <iso>..<iso>  -> exactly those two instants
+
+    Both endpoints are tz-aware UTC. *now* is a parameter, never read inside,
+    so every caller and every test fixes the clock explicitly — which is what
+    makes a trailing window's boundary deterministic.
+
+    The dated form is the mechanism for a report whose header carries a fixed
+    date: ``14d`` covers a different fortnight every day and so cannot
+    reproduce one.
+
+    Raises :class:`argparse.ArgumentTypeError`, echoing the offending spec, for
+    an empty, malformed, zero-length or reversed window. A reversed range is
+    rejected rather than silently swapped: it far more often means the operator
+    pasted the bounds backwards than that they wanted that window.
+    """
+    relative = _RELATIVE_RE.match(spec)
+    if relative:
+        days = int(relative.group(1))
+        if days <= 0:
+            raise argparse.ArgumentTypeError(
+                f'bad --window {spec!r}: window must span at least one day.',
+            )
+        return (now - timedelta(days=days), now)
+
+    if _RANGE_SEP in spec:
+        parts = spec.split(_RANGE_SEP)
+        if len(parts) != 2 or not all(part.strip() for part in parts):
+            raise argparse.ArgumentTypeError(
+                f'bad --window {spec!r}: the dated form takes exactly two '
+                f'ISO-8601 endpoints separated by "..".',
+            )
+        lo = parse_instant(parts[0].strip())
+        hi = parse_instant(parts[1].strip())
+        if lo is None or hi is None:
+            raise argparse.ArgumentTypeError(
+                f'bad --window {spec!r}: both endpoints must be ISO-8601 instants.',
+            )
+        if lo >= hi:
+            raise argparse.ArgumentTypeError(
+                f'bad --window {spec!r}: start {lo.isoformat()} is not before '
+                f'end {hi.isoformat()}.',
+            )
+        return (lo, hi)
+
+    raise argparse.ArgumentTypeError(
+        f'bad --window {spec!r}: expected "<N>d" or "<iso>..<iso>".',
+    )
+
+
+def within_window(
+    legs: Iterable[Leg], window: tuple[datetime, datetime],
+) -> tuple[Leg, ...]:
+    """The legs whose ``started_at`` falls in ``[lo, hi)``.
+
+    A leg whose timestamp does not parse is EXCLUDED: it cannot be placed in
+    the window, so it cannot honestly be counted in it. The count still
+    reconciles, because the selector already reported how many legs it found.
+    """
+    lo, hi = window
+    kept = []
+    for leg in legs:
+        instant = parse_instant(leg.started_at)
+        if instant is not None and lo <= instant < hi:
+            kept.append(leg)
+    return tuple(kept)
+
+
+def summarise_legs(legs: Iterable[Leg]) -> dict[str, Any]:
+    """Partition *legs* into clean durations, timeouts and failures.
+
+    A TIMED-OUT leg's duration is the BUDGET, not the suite, so folding it into
+    the percentiles would measure the ceiling and call it the workload — and a
+    budget then derived from that distribution would be derived from itself,
+    the one circularity a census must not have. A FAILED leg stopped at its
+    first failure, so its duration is not the suite's either; it is a different
+    fact, and counted apart.
+
+    The two buckets are exclusive — a timeout carries a non-zero rc too, and if
+    both claimed it ``n + timed_out + failed`` would stop reconciling against
+    the number of legs.
+    """
+    durations: list[float] = []
+    timed_out = 0
+    failed = 0
+    for leg in legs:
+        if leg.timed_out:
+            timed_out += 1
+        elif leg.rc != 0:
+            failed += 1
+        else:
+            durations.append(leg.duration_secs)
+    return {
+        'durations': _series(durations),
+        'timed_out': timed_out,
+        'failed': failed,
+    }
+
+
+def by_day(legs: Iterable[Leg]) -> dict[str, dict[str, Any]]:
+    """Summarise *legs* per UTC calendar day, keyed by ISO date string.
+
+    Keyed by string rather than ``date`` so the report dict is JSON-native with
+    no serialisation step — the same flatness rule the summary schema itself
+    follows.
+    """
+    buckets: dict[str, list[Leg]] = {}
+    for leg in legs:
+        day = day_bucket(leg.started_at)
+        if day is None:
+            continue
+        buckets.setdefault(day.isoformat(), []).append(leg)
+    return {day: summarise_legs(group) for day, group in sorted(buckets.items())}
