@@ -35,6 +35,7 @@ is impossible at the git level even if the pre-flight is refactored away).
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -912,6 +913,100 @@ class TestVanishedWorktreeKeepsTheTypedException:
 
         assert result.resolved is False
         assert result.verdict == rebase_recovery.VERDICT_CLEAN
+
+def _quarantine_rename_fails(monkeypatch, error: OSError) -> None:
+    """Make the quarantine's ``rename`` of MERGE_RR fail with a chosen errno.
+
+    Monkeypatched rather than ``chmod``ed.  ``chmod`` is a no-op for root, so a
+    permission-bit fixture asserts nothing wherever CI runs as root — the same
+    vacuous pass this module's own header warns about for "abort works" on a
+    healthy worktree.  A monkeypatch is deterministic and root-independent, and
+    it models the likelier race more directly anyway: a concurrent process
+    unlinking MERGE_RR between the scan's ``read_bytes`` and the quarantine's
+    ``rename`` produces an errno, not a permission change.
+
+    Scoped to the MERGE_RR name so every other rename in the process — pytest's
+    own bookkeeping included — still works.
+    """
+    real_rename = Path.rename
+
+    def rename(self: Path, target):
+        if self.name == 'MERGE_RR':
+            raise error
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, 'rename', rename)
+
+
+class TestQuarantineFailureDoesNotSwallowTheAbort:
+    """A repair this module cannot perform degrades into the RESULT, not an exception.
+
+    The module exists to stop a recovery path failing hard, so a preflight that
+    raises makes it the NEW reason recovery fails — strictly worse than having
+    no preflight at all.  Measured on this branch with a read-only git dir:
+    the quarantine's unguarded ``rename`` raised ``PermissionError`` out through
+    ``guarded_abort``, THE ABORT NEVER RAN, and the worktree was left wedged.
+
+    ``sweep_stale_locks`` already had the right shape — ``except OSError``
+    around ``unlink``, counting the lock as retained — so the module's two
+    mutating repairs degraded differently for no reason a reader could derive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_abort_is_still_issued_and_the_evidence_survives(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Nothing escapes, the guarded vector is still emitted, MERGE_RR stays.
+
+        The runner records instead of spawning, so the abort that would
+        otherwise DELETE MERGE_RR does not run — which is what lets the same
+        case assert both that the abort was issued and that a failed move
+        destroyed no evidence.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+        _quarantine_rename_fails(
+            monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+        )
+        recorded: list[list[str]] = []
+
+        rc, _, _ = await rebase_recovery.guarded_abort(
+            'rebase', repo, _recording_run(recorded),
+        )
+
+        assert rc == 0
+        assert recorded == [[*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']]
+        assert recorded[0].index('rerere.enabled=false') < recorded[0].index('rebase')
+        assert merge_rr.read_bytes() == original
+
+    def test_the_failure_is_reported_as_unrepaired_and_logged(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """``guarded_abort`` discards the result, so the report is asserted here.
+
+        No new reporting machinery is needed for this: a suspect scan with no
+        backup is already rendered by ``unrepaired`` and already turns the
+        verdict ``blocked``, so the operator is told precisely what was left
+        un-repaired while the abort proceeds regardless.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        _quarantine_rename_fails(
+            monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert result.merge_rr_backup is None
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert conflict_id in ' '.join(result.unrepaired)
+        assert merge_rr.exists()
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(merge_rr) in logged
 
 # ---------------------------------------------------------------------------
 # The CLI the skills invoke
