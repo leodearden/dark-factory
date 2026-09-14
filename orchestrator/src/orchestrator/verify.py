@@ -1732,6 +1732,13 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     the one structured record of which segments never ran, leaving those facts
     only as free text inside the aggregated ``output`` blob.
 
+    ``load`` (task 3353) rides here on identical terms, ``.get`` included, and
+    for the same reason: it is the host load the command ran under, and this
+    payload is the artifact the budget census reads. A field missing from the
+    whitelist would not FAIL — it would quietly produce a corpus with no load
+    column, which is the defect above repeated on the deliverable whose entire
+    purpose is that column.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -1764,6 +1771,7 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
                 'started_at': r['started_at'],
                 'duration_secs': r['duration_secs'],
                 'segments': r.get('segments'),
+                'load': r.get('load'),
             }
             for r in active_runs
         ],
@@ -3037,6 +3045,25 @@ class CheckRun:
     # with no segments" — an impossible state ``split_and_chain_segments``'
     # fewer-than-2 refusal already prevents.
     segments: 'list[dict] | None' = None
+    # The host load this check ran under (task 3353, ruling D17); ``None``
+    # when it ran no command. LAST field so every pre-3353 positional
+    # construction site stays valid — the same rule ``segments`` above
+    # documents, and the reason the two are adjacent.
+    #
+    # THE SHAPE, stated once and only here:
+    #     {'start': {cpu_some10, cpu_some60, runqueue_ratio},
+    #      'end':   {cpu_some10, cpu_some60, runqueue_ratio},
+    #      'xdist': {n_flag, auto_num_workers}}
+    # ``start``/``end`` are ``_load_sample()`` records taken around the
+    # command's own execution, and ``xdist`` is ``_xdist_workers()``. A null
+    # INSIDE those records means "not knowable", never "zero" — see
+    # ``_load_sample``, which owns that convention.
+    #
+    # A plain JSON-native dict rather than a nested dataclass, for the same
+    # reason the rest of this schema is flat: ``to_dict()``'s output is
+    # written straight into JSON, so anything needing its own serialisation
+    # step is a second place for the shape to drift.
+    load: 'dict | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -3054,8 +3081,8 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 8-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments), 7 of which were
+        (all take ``list[dict]``) — the exact 9-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load), 7 of which were
         previously hand-built inline in ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
@@ -3069,6 +3096,11 @@ class CheckRun:
         segments" from "this run was not segmented" — reintroducing an
         absent-vs-null ambiguity in the very schema whose job is to make
         skipped-vs-passed unambiguous.
+
+        ``load`` (task 3353) is emitted on exactly the same terms, for exactly
+        that reason: the budget census's hardest records to classify are the
+        historical ones, and "absent" vs "null" is the distinction that tells
+        it whether a run predates load stamping or merely went unstamped.
         """
         return {
             'label': self.label,
@@ -3079,6 +3111,7 @@ class CheckRun:
             'started_at': self.started_at or '',
             'duration_secs': self.duration_secs,
             'segments': self.segments,
+            'load': self.load,
         }
 
 
