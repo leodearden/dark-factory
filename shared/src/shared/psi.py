@@ -348,6 +348,14 @@ class PsiSample:
     distinguishable from a healthy one BY VALUE rather than collapsing to a
     flat sentinel. The defaults are the "component absent" reading, so every
     shipped keyword construction stays valid.
+
+    ``cpu_some60`` (ruling D17, task 3353) appends by that same rule: the host
+    CPU ``some avg60``, carried for the verify-summary load stamp, and governed
+    by the HOST component's ``read_ok`` like the four fields beside it. It is
+    deliberately absent from ``_ARMS``: it is telemetry, and adding an arm would
+    silently change ``saturated()`` / ``tripping_metric()``, whose D10 rank is
+    owned by PRD ``plans/load-throttle-harmonisation-prd.md`` and tasks
+    3590/3592.
     """
 
     cpu_some10: float
@@ -360,6 +368,7 @@ class PsiSample:
     own_cpu_some10: float = 0.0
     own_cgroup: str = ''
     own_read_ok: bool = False
+    cpu_some60: float = 0.0
 
     def _tripping_arms(self, cfg) -> Iterator[_Arm]:
         """Yield the arms of ``_ARMS`` this sample trips, in D10 rank order."""
@@ -418,20 +427,33 @@ class PsiSample:
 
 
 class _HostReading(NamedTuple):
-    """The host-PSI component: the four /proc/pressure/* fields plus its flag."""
+    """The host-PSI component: the five /proc/pressure/* fields plus its flag.
+
+    No field is defaulted, on purpose: both construction sites are in this
+    module, so a default would buy nothing but a silent 0.0 — which reads as a
+    QUIET host — for a field some later edit forgets to pass.
+    """
 
     cpu_some10: float
+    cpu_some60: float
     mem_some10: float
     mem_full10: float
     io_some10: float
     read_ok: bool
 
 
-_HOST_FAIL_OPEN = _HostReading(0.0, 0.0, 0.0, 0.0, False)
+_HOST_FAIL_OPEN = _HostReading(
+    cpu_some10=0.0,
+    cpu_some60=0.0,
+    mem_some10=0.0,
+    mem_full10=0.0,
+    io_some10=0.0,
+    read_ok=False,
+)
 
 
 def _read_host_pressure(read: Callable[[str], str]) -> _HostReading:
-    """Read /proc/pressure/{cpu,memory,io}; degrade the four host fields together.
+    """Read /proc/pressure/{cpu,memory,io}; degrade the host fields together.
 
     Fail-open (DA-D6): if any source is unreadable (``read`` raises ANY
     exception -- e.g. ``OSError``, or a ``UnicodeDecodeError`` from non-UTF-8
@@ -459,6 +481,7 @@ def _read_host_pressure(read: Callable[[str], str]) -> _HostReading:
 
     return _HostReading(
         cpu_some10=cpu['some_avg10'],
+        cpu_some60=cpu['some_avg60'],
         mem_some10=mem['some_avg10'],
         mem_full10=mem['full_avg10'],
         io_some10=io['some_avg10'],
@@ -476,13 +499,14 @@ def read_psi_sample(
 ) -> PsiSample:
     """Read the three PSI components into one PsiSample.
 
-    Maps cpu.some -> cpu_some10, mem.some -> mem_some10, mem.full ->
-    mem_full10, io.some -> io_some10, and adds the runqueue and own-cgroup
-    components (PRD ``plans/load-throttle-harmonisation-prd.md`` §6.1/§6.3).
+    Maps cpu.some -> cpu_some10 (and its 60 s window -> cpu_some60), mem.some
+    -> mem_some10, mem.full -> mem_full10, io.some -> io_some10, and adds the
+    runqueue and own-cgroup components (PRD
+    ``plans/load-throttle-harmonisation-prd.md`` §6.1/§6.3).
     ``project_id`` selects the slice name the own-cgroup resolver looks for.
 
     The three sources are orthogonal, so they are read INDEPENDENTLY and
-    assembled once: a host-PSI failure zeroes only the four host fields and
+    assembled once: a host-PSI failure zeroes only the host fields and
     sets ``read_ok=False``, while the runqueue and own-cgroup components keep
     whatever they separately obtained. Collapsing a partial degradation to a
     flat all-zero sentinel would discard a reading that actually succeeded,
@@ -508,4 +532,5 @@ def read_psi_sample(
         own_cpu_some10=own.some_avg10,
         own_cgroup=own.cgroup,
         own_read_ok=own.read_ok,
+        cpu_some60=host.cpu_some60,
     )
