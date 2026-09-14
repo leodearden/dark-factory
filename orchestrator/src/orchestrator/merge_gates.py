@@ -29,6 +29,7 @@ import logging
 import os
 import posixpath
 import re
+import tempfile
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1167,9 +1168,92 @@ async def _rename_pairs(
     return pairs
 
 
+async def _branch_delta_survives(
+    before: tuple[str, str],
+    after: tuple[str, str],
+    merged: tuple[str, str],
+    git_ops: GitOps,
+    *,
+    log_prefix: str,
+    task_id: str | None = None,
+) -> bool:
+    """True only when the branch's own delta is demonstrably in the merge.
+
+    Each argument is a ``(rev, path)`` pair: what the branch started
+    from, what it produced, and where the merge landed it.  A rename pair
+    alone proves nothing — ``git diff -M`` pairs at ~50% similarity, so a
+    resolution that relocates a file and discards the branch's edit still
+    pairs.  This is the check that turns such a pair from a licence into
+    a candidate.
+
+    EVERY failure mode returns False, i.e. "keep flagging".  That is the
+    safe direction even though the surrounding gates fail OPEN on git
+    errors: declining an unproven suppression merely restores the
+    pre-rename-awareness behaviour, which by construction cannot
+    introduce a false block relative to main, whereas failing open here
+    would hide genuine work loss.
+
+    Deliberately conservative in two known ways, both erring toward a
+    false flag and never toward a false negative.  ``git apply`` matches
+    exact context with no fuzz, so a main-side edit landing inside the
+    branch hunk's three context lines yields a flag (measured: an edit
+    three lines away still reverse-applies cleanly).  And a binary file
+    produces a patch ``git apply`` will not take, so it flags too.  A
+    third follows from ``_run`` stripping stdout: a patch whose final
+    context line carries trailing whitespace loses it and will not
+    apply — again a flag, never a silent suppression.
+    """
+    rc, patch, err = await _run(
+        ['git', 'diff', f'{before[0]}:{before[1]}', f'{after[0]}:{after[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: branch-delta diff %s:%s..%s:%s failed (rc=%d, stderr=%s); '
+            'not suppressing. task_id=%s',
+            log_prefix, before[0], before[1], after[0], after[1],
+            rc, err.strip(), task_id or '<unknown>',
+        )
+        return False
+    if not patch.strip():
+        return True
+
+    rc, blob, err = await _run(
+        ['git', 'show', f'{merged[0]}:{merged[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: merged blob %s:%s unreadable (rc=%d, stderr=%s); '
+            'not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        # ``_run`` returns ``stdout.decode().strip()``, and ``git apply``
+        # rejects a patch with no final newline as "corrupt patch at line
+        # N".  Re-terminate rather than reaching for an unstripped runner.
+        (tmp / 'delta.patch').write_text(patch + '\n')
+        # The AFTER path, NOT the merged path: `git apply -R` locates the
+        # file by the patch's ``b/`` (new) side.  A fresh tmpdir is also
+        # required — with differing a/b paths, reverse-apply additionally
+        # demands the ``a/`` path be absent.
+        staged = tmp / after[1]
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(blob)
+        rc, _, _ = await _run(
+            ['git', 'apply', '--check', '-R', '-p1', 'delta.patch'], cwd=tmp,
+        )
+    return rc == 0
+
+
 async def _rename_aware_real_drops(
     dropped_in_merge: list[str],
     branch_changed: set[str],
+    base: str,
     task_head: str,
     merge_commit_sha: str,
     git_ops: GitOps,
@@ -1180,9 +1264,16 @@ async def _rename_aware_real_drops(
 
     A path can disappear from ``task_head`` for two very different
     reasons: the merge DISCARDED it, or the merge carried it to a new
-    name.  Under ``--no-renames`` those look identical, so a path the
-    merge merely relocated is excluded here — it is a rename SOURCE in
-    ``task_head..merge_commit``, not a drop.
+    name.  Under ``--no-renames`` those look identical, so a rename
+    SOURCE in ``task_head..merge_commit`` is a candidate for exclusion.
+
+    A pair alone is NOT sufficient to discount a drop.  ``git diff -M``
+    pairs at ~50% similarity, so a resolution that relocates a file and
+    throws the branch's edit away still pairs (measured ``R095``) — the
+    two outcomes are indistinguishable by pairing alone.  The candidate
+    is therefore confirmed by :func:`_branch_delta_survives`, which
+    re-applies the branch's own delta against the merged blob; only a
+    confirmed pair is discounted.
 
     Merge-diff order is preserved, as the caller's warning reports it.
 
@@ -1198,12 +1289,22 @@ async def _rename_aware_real_drops(
 
     relocated = {old: new for old, new in pairs}
     authored = [p for p in dropped_in_merge if p in branch_changed]
-    real_drops = [p for p in authored if p not in relocated]
 
-    suppressed = [(p, relocated[p]) for p in authored if p in relocated]
+    real_drops: list[str] = []
+    suppressed: list[tuple[str, str]] = []
+    for p in authored:
+        new = relocated.get(p)
+        if new is not None and await _branch_delta_survives(
+            (base, p), (task_head, p), (merge_commit_sha, new),
+            git_ops, log_prefix='drop-guard', task_id=task_id,
+        ):
+            suppressed.append((p, new))
+        else:
+            real_drops.append(p)
+
     if suppressed:
         logger.info(
-            'drop-guard: rename accounts for disappearance, not flagging '
+            'drop-guard: content verified at the new name, not flagging '
             '%r (old, new). task_id=%s merge_commit_sha=%s',
             suppressed, task_id or '<unknown>', merge_commit_sha,
         )
@@ -1250,7 +1351,11 @@ async def _check_plan_targets_in_tree(
     / ``D`` filters are what make the intersection meaningful; rename
     resolution is applied instead as a separate, additive ``-M`` pass over
     ``task_head..merge_commit`` (:func:`_rename_aware_real_drops`), which
-    excludes an apparently-dropped path that is really a rename SOURCE.
+    treats an apparently-dropped path that is really a rename SOURCE as a
+    CANDIDATE for exclusion — and, because ``-M`` pairs at ~50%
+    similarity and so cannot distinguish a faithful relocation from one
+    that discarded the branch's edit, confirms it by re-applying the
+    branch's own delta against the merged blob before discounting it.
 
     Fail-open on rc != 0: post-merge verify is the next safety net, and
     flagging a phantom drop on a transient git error is worse than missing
@@ -1325,7 +1430,7 @@ async def _check_plan_targets_in_tree(
     # Subtract main-side change: only a path the branch actually produced
     # AND the merge discarded — not merely relocated — is a real drop.
     real_drops = await _rename_aware_real_drops(
-        dropped_in_merge, branch_changed, task_head, merge_commit_sha,
+        dropped_in_merge, branch_changed, base, task_head, merge_commit_sha,
         git_ops, task_id=task_id,
     )
     if real_drops is None:
