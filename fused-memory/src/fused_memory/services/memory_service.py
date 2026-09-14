@@ -3062,13 +3062,12 @@ class MemoryService:
            ``mem0_thing``, which is indistinguishable by shape from the Mem0
            group of a project named ``thing``; the injected registry is the
            only evidence that settles it, so it outranks the prefix strip.
-        2. Otherwise, a ``mem0_`` prefix whose remainder IS in the registry
-           strips to that remainder — the shape ``_dual_write_callback``
-           writes.
-        3. Otherwise a ``mem0_`` prefix strips anyway. The map may be empty or
-           stale, and a prefix this codebase itself writes is better evidence
-           than none.
-        4. Otherwise the group_id is returned UNCHANGED, so the caller reaches
+        2. Otherwise a ``mem0_`` prefix strips — the shape
+           ``_dual_write_callback`` writes — WHETHER OR NOT the remainder is
+           itself in the registry. The map may be empty or stale, and a prefix
+           this codebase itself writes is better evidence than none, so there
+           is deliberately no membership test on the stripped remainder.
+        3. Otherwise the group_id is returned UNCHANGED, so the caller reaches
            its unresolvable-root WARNING rather than filing into a project it
            guessed.
 
