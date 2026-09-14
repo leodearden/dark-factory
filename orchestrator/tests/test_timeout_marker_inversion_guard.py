@@ -92,6 +92,14 @@ _ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
 #: test_marker_registration_drift.py::TESTS_DIR.
 _TESTS_DIR = Path(__file__).resolve().parent
 
+#: The module task 5333 sizes and ratchets: eight real-git classes that all
+#: carried an identical bare ``300`` regardless of weight, which is what made
+#: TestRow7KillSwitchByteIdentity's under-sizing invisible.
+_DEEP_GATE_MODULE = 'test_merge_queue_deep_integration_gate.py'
+
+#: The class whose marker is DERIVED from a measured spawn count (task 5333).
+_ROW7_CLASS = 'TestRow7KillSwitchByteIdentity'
+
 #: Same spelling as tests/scripts/test_fallback_verify_config.py, which pins
 #: the FLEET-chain side of this same budget (``--timeout > 60`` on every
 #: pytest segment of dark-factory-orchestrator.yaml, and ``--timeout >= 300``
@@ -148,12 +156,20 @@ class _Site(NamedTuple):
     ``seconds`` is None when the argument is present but UNRESOLVABLE, or
     absent entirely -- "no opinion", never "too small".  See
     :func:`_timeout_marker_sites`.
+
+    ``spelling`` is the argument's unparsed SOURCE (``'300'``,
+    ``'VERIFY_CLI_PER_TEST_TIMEOUT'``), empty when there is no argument.  It
+    answers the question ``seconds`` cannot: a bare literal and the constant
+    NAMING that same number resolve identically, so only the spelling
+    distinguishes a marker that moves with a re-derivation from one that has
+    to be found and hand-edited.
     """
 
     qualname: str
     kind: str
     seconds: float | None
     lineno: int
+    spelling: str
 
 
 def _timeout_call_arg(call: ast.Call) -> ast.expr | None:
@@ -241,12 +257,14 @@ def _timeout_sites_in(elements: list[ast.expr], qualname: str, kind: str) -> lis
     for element in elements:
         if not isinstance(element, ast.Call) or _marker_name(element) != 'timeout':
             continue
+        arg = _timeout_call_arg(element)
         sites.append(
             _Site(
                 qualname=qualname,
                 kind=kind,
-                seconds=_resolve_seconds(_timeout_call_arg(element)),
+                seconds=_resolve_seconds(arg),
                 lineno=element.lineno,
+                spelling='' if arg is None else ast.unparse(arg),
             )
         )
     return sites
@@ -352,6 +370,47 @@ def _inverts(seconds: float | None) -> bool:
     return (
         seconds is not None
         and DELIBERATE_TIGHT_BOUND_CEILING < seconds < VERIFY_CLI_PER_TEST_TIMEOUT
+    )
+
+
+def _class_def(tree: ast.Module, name: str) -> ast.ClassDef | None:
+    """The top-level class *name*, or None if the module defines no such class.
+
+    Top-level only: a pytest test class is collected only at module scope, so
+    a nested definition of the same name would not be the thing under pin.
+    """
+    return next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name),
+        None,
+    )
+
+
+def _autouse_fixtures(node: ast.ClassDef) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]:
+    """*node*'s own ``@pytest.fixture(autouse=True)`` functions.
+
+    Its OWN body only, never a walk: an autouse fixture bound anywhere else --
+    at module scope, or in a sibling class -- applies to a different set of
+    tests, and a pin that accepted one would pass while the class it names
+    went unguarded.
+
+    ``autouse`` is matched as the literal ``True`` rather than for mere
+    presence, since ``autouse=False`` is a fixture that never runs.
+    """
+    return tuple(
+        statement
+        for statement in node.body
+        if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
+        and any(
+            isinstance(decorator, ast.Call)
+            and ast.unparse(decorator.func).endswith('fixture')
+            and any(
+                keyword.arg == 'autouse'
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in decorator.keywords
+            )
+            for decorator in statement.decorator_list
+        )
     )
 
 
@@ -964,6 +1023,106 @@ class TestSpawnBudgetVerdict:
             'a reader cannot tell "this scene got heavier" (re-derive the '
             'constants) from "the counting seam broke" (fix the fixture). They '
             'are different failures with different remedies.'
+        )
+
+
+class TestRow7SceneIsGuarded:
+    """What test_merge_queue_deep_integration_gate.py must carry for task 5333.
+
+    TWO HALVES OF ONE MECHANISM, pinned together because either alone decays.
+    The widened marker without the budget fixture is a number that silently
+    goes stale the next time the scene grows -- which is exactly how it got
+    stale in the first place.  The budget fixture without the widened marker
+    guards a class that still dies on a loaded host before the fixture can
+    report anything.
+    """
+
+    def _row7_marker(self) -> _Site:
+        """The ``timeout`` marker site on the Row 7 class, or fail saying it is gone."""
+        sites = [
+            site
+            for module, site in _tree_scan().sites
+            if module == _DEEP_GATE_MODULE and site.qualname == _ROW7_CLASS
+        ]
+
+        assert sites, (
+            f'{_DEEP_GATE_MODULE}::{_ROW7_CLASS} carries no @pytest.mark.timeout '
+            'at all. It is the heaviest class in that file (234 git spawns in '
+            'its worst test) and falls back to the pyproject default without '
+            'one, which is how it came to die as an unattributed xdist worker '
+            'crash. Restore the marker.'
+        )
+        assert len(sites) == 1, (
+            f'{_DEEP_GATE_MODULE}::{_ROW7_CLASS} carries {len(sites)} timeout '
+            f'markers at lines {[s.lineno for s in sites]}; the effective '
+            'budget is then whichever pytest-timeout reads last, which no '
+            'reader can predict. Keep exactly one.'
+        )
+        return sites[0]
+
+    def test_the_row7_marker_is_the_derived_constant_not_a_literal(self) -> None:
+        """Spelled as the NAME, so a re-derivation moves exactly one number.
+
+        The value alone is not enough: a bare ``1260`` resolves identically,
+        and would leave the constant and the marker as two independent copies
+        of one figure -- the state this task found the file in, where eight
+        classes of very different weight all carried an identical bare 300.
+        """
+        marker = self._row7_marker()
+
+        assert marker.spelling == 'DEEP_GATE_SCENE_TEST_TIMEOUT', (
+            f'{_DEEP_GATE_MODULE}::{_ROW7_CLASS} pins its timeout as '
+            f'{marker.spelling!r} (line {marker.lineno}) rather than as the '
+            'name DEEP_GATE_SCENE_TEST_TIMEOUT. That marker is DERIVED from a '
+            'measured spawn count, so it must move when the derivation does; '
+            'a literal here is a second copy of the number that no '
+            're-derivation can reach. Import the constant from _orch_helpers.'
+        )
+        assert marker.seconds == DEEP_GATE_SCENE_TEST_TIMEOUT, (
+            f'{_DEEP_GATE_MODULE}::{_ROW7_CLASS} resolves to '
+            f'{marker.seconds}, not DEEP_GATE_SCENE_TEST_TIMEOUT '
+            f'({DEEP_GATE_SCENE_TEST_TIMEOUT}). _SANCTIONED_TIMEOUT_NAMES has '
+            'drifted from the real constant, which would leave this ratchet '
+            'reasoning about a number the file does not pin.'
+        )
+
+    def test_the_row7_class_binds_an_autouse_spawn_budget_fixture(self) -> None:
+        """The marker is only honest while the budget it was sized from is enforced.
+
+        Read from the class BODY rather than from module text, so a fixture
+        that drifted out to module scope -- where it would silently apply to
+        every class in the file, or to none -- does not read as coverage of
+        this one.
+        """
+        tree = _parse((_TESTS_DIR / _DEEP_GATE_MODULE).read_text(encoding='utf-8'))
+        assert tree is not None, f'{_DEEP_GATE_MODULE} did not parse'
+
+        row7 = _class_def(tree, _ROW7_CLASS)
+        assert row7 is not None, (
+            f'{_DEEP_GATE_MODULE} defines no top-level class {_ROW7_CLASS}. If '
+            'it was renamed, rename it here and in DEEP_GATE_SCENE_TEST_TIMEOUT'
+            "'s comment too -- those constants are sized for THIS class's "
+            'measured cost and mean nothing detached from it.'
+        )
+
+        guarded = [
+            fixture.name
+            for fixture in _autouse_fixtures(row7)
+            for node in ast.walk(fixture)
+            if isinstance(node, ast.Name) and node.id == 'spawn_budget_violation'
+        ]
+
+        assert guarded, (
+            f'{_DEEP_GATE_MODULE}::{_ROW7_CLASS} binds no autouse fixture that '
+            'calls spawn_budget_violation.\n\n'
+            'DEEP_GATE_SCENE_TEST_TIMEOUT is sized against '
+            'DEEP_GATE_SCENE_SPAWN_BUDGET rather than against the raw '
+            'measurement precisely so that the budget, not a comment, is what '
+            'keeps the marker honest. Without the fixture the marker is a '
+            'number that decays silently: task 5028 moved this scene\'s spawn '
+            'counts within a single day, in an unrelated lane, and nothing in '
+            'the tree reported it. Restore the fixture rather than widening '
+            'the marker further.'
         )
 
 
