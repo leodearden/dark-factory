@@ -300,8 +300,15 @@ def _human_duration(seconds: int) -> str:
     return f'{seconds}s'
 
 
+# A run survives a tick arriving late, but not a hole in the corpus. Three
+# times the observed spacing is wide enough that ordinary jitter (the timer is
+# OnUnitActiveSec, so a slow tick pushes the next one out) never splits a real
+# run, and narrow enough that a restart or a crashed collector always does.
+_HOLD_RUN_GAP_MULTIPLE = 3
+
+
 def longest_hold_run(
-    values: list[float], threshold: float, *, spacing_seconds: int
+    points: list[tuple[int, float]], threshold: float, *, spacing_seconds: int
 ) -> dict:
     """Longest CONSECUTIVE run of holding ticks, in ticks and wall-clock.
 
@@ -316,13 +323,44 @@ def longest_hold_run(
     It is reported BESIDE the fraction, not instead of it, because a fraction
     alone cannot tell 20% delivered as single-tick blips from 20% delivered as
     one continuous block — opposite verdicts for a dispatch throttle.
+
+    It takes (ts, value) POINTS, not bare values, because a gap in the corpus
+    is not a continuation. Walking values alone and multiplying by the median
+    spacing reported holds at ts 1000/1005/1010, a multi-hour outage, then
+    holds at 100000/100005 as one run of "5 ticks (25s)" — for an interval
+    actually spanning ~27 h. Welding across an outage is wrong in precisely the
+    direction the clause cares about.
+
+    Wall-clock is likewise READ from the timestamps rather than multiplied out
+    of the tick count, so a run whose ticks arrived late reports the time it
+    really spanned. The run's own final tick is added back: without it a
+    single-tick hold would report 0 s for a hold that did happen, and for an
+    evenly-spaced run the number stays exactly ticks x spacing.
+
+    The winner is the longest in SECONDS, not in ticks, because seconds is what
+    the clause asks about; on a regular cadence the two coincide.
     """
-    longest = current = 0
-    for value in values:
-        current = current + 1 if value >= threshold else 0
-        longest = max(longest, current)
-    seconds = longest * spacing_seconds
-    return {'ticks': longest, 'seconds': seconds, 'human': _human_duration(seconds)}
+    max_gap = _HOLD_RUN_GAP_MULTIPLE * spacing_seconds
+    best_ticks = best_seconds = 0
+    ticks = 0
+    start_ts = previous_ts = 0
+    for ts, value in points:
+        if value < threshold:
+            ticks = 0
+        elif ticks and ts - previous_ts <= max_gap:
+            ticks += 1
+        else:
+            ticks, start_ts = 1, ts
+        previous_ts = ts
+        if ticks:
+            seconds = ts - start_ts + spacing_seconds
+            if seconds > best_seconds:
+                best_ticks, best_seconds = ticks, seconds
+    return {
+        'ticks': best_ticks,
+        'seconds': best_seconds,
+        'human': _human_duration(best_seconds),
+    }
 
 
 def load_psi_admission_block(path: Path, side: str) -> tuple[dict | None, list[str]]:
@@ -535,21 +573,36 @@ def hold_table(
         ladder = ladders.get(stem) or ladders.get(metric)
         if ladder is None:
             continue
-        timestamps = [ts for ts, _ in points]
         values = [v for _, v in points]
-        spacing = observed_spacing(timestamps)
+        spacing = observed_spacing([ts for ts, _ in points])
         out[metric] = [
-            {
-                'threshold': threshold,
-                'hold_fraction': round(hold_fraction(values, threshold), 4),
-                'within_d11_target': within_d11_target(hold_fraction(values, threshold)),
-                'longest_hold_run': longest_hold_run(
-                    values, threshold, spacing_seconds=spacing
-                ),
-            }
+            _rung(points, values, threshold, spacing)
             for threshold in ladder
         ]
     return out
+
+
+def _rung(
+    points: list[tuple[int, float]],
+    values: list[float],
+    threshold: float,
+    spacing: int,
+) -> dict:
+    """One ladder rung. The fraction is computed ONCE and reused.
+
+    It used to be computed twice per rung — once to report and once to judge
+    against the target — which doubled 8 full passes per metric into 16 over a
+    series that is ~518k points at the 30-day steady state.
+    """
+    fraction = hold_fraction(values, threshold)
+    return {
+        'threshold': threshold,
+        'hold_fraction': round(fraction, 4),
+        'within_d11_target': within_d11_target(fraction),
+        'longest_hold_run': longest_hold_run(
+            points, threshold, spacing_seconds=spacing
+        ),
+    }
 
 
 def coverage_table(

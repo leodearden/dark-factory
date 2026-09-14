@@ -284,8 +284,9 @@ def test_longest_hold_run_is_reported_in_ticks_and_wall_clock():
     module = load_script()
     # 240 consecutive holds at the pinned 5 s cadence = 20 minutes.
     values = [0.0] * 10 + [9.0] * 240 + [0.0] * 10
+    points = [(1000 + i * 5, v) for i, v in enumerate(values)]
 
-    run = module.longest_hold_run(values, 5.0, spacing_seconds=5)
+    run = module.longest_hold_run(points, 5.0, spacing_seconds=5)
 
     assert run['ticks'] == 240
     assert run['seconds'] == 1200
@@ -303,10 +304,64 @@ def test_one_long_block_is_distinguished_from_the_same_fraction_as_blips():
     block = [0.0] * 800 + [9.0] * 200
     blips = [9.0 if i % 5 == 0 else 0.0 for i in range(1000)]
 
+    def at_cadence(values):
+        return [(1000 + i * 5, v) for i, v in enumerate(values)]
+
     assert module.hold_fraction(block, 5.0) == pytest.approx(0.2)
     assert module.hold_fraction(blips, 5.0) == pytest.approx(0.2)
-    assert module.longest_hold_run(block, 5.0, spacing_seconds=5)['ticks'] == 200
-    assert module.longest_hold_run(blips, 5.0, spacing_seconds=5)['ticks'] == 1
+    assert module.longest_hold_run(
+        at_cadence(block), 5.0, spacing_seconds=5)['ticks'] == 200
+    assert module.longest_hold_run(
+        at_cadence(blips), 5.0, spacing_seconds=5)['ticks'] == 1
+
+
+def test_a_run_is_not_welded_across_a_sampler_outage():
+    """The number D11's second clause is read off must not span a gap.
+
+    The run walked values alone and multiplied the count by the median
+    spacing, so it could not see a hole in the corpus. Holds at ts
+    1000/1005/1010, a multi-hour outage, then holds at 100000/100005 reported
+    as one run of "5 ticks (25s)" for an interval actually spanning ~27 h.
+    "Never sits at the floor for hours" is exactly the question this answers,
+    so welding across an outage is wrong in the direction that matters.
+    """
+    module = load_script()
+    points = [
+        (1000, 9.0), (1005, 9.0), (1010, 9.0),
+        (100_000, 9.0), (100_005, 9.0),          # after a ~27 h outage
+    ]
+
+    run = module.longest_hold_run(points, 5.0, spacing_seconds=5)
+
+    assert run['ticks'] == 3, (
+        f'the outage was welded into the run: {run}'
+    )
+    assert run['seconds'] == 15
+
+
+def test_wall_clock_is_read_off_the_timestamps_not_multiplied_from_ticks():
+    """A run whose ticks are late reports the time it actually spanned."""
+    module = load_script()
+    # Five holding samples, but the sampler ran late: 12 s between them, still
+    # inside the gap tolerance, so it is one run spanning 48 s + its own tick.
+    points = [(1000 + i * 12, 9.0) for i in range(5)]
+
+    run = module.longest_hold_run(points, 5.0, spacing_seconds=5)
+
+    assert run['ticks'] == 5
+    assert run['seconds'] == 53, (
+        'ticks x nominal spacing would have reported 25 s for an interval that '
+        f'actually spanned 48 s of wall clock: {run}'
+    )
+
+
+def test_a_single_tick_hold_still_reports_its_own_tick_of_wall_clock():
+    """`ts_end - ts_start` alone would report 0s for a hold that did happen."""
+    module = load_script()
+
+    run = module.longest_hold_run([(1000, 9.0)], 5.0, spacing_seconds=5)
+
+    assert run == {'ticks': 1, 'seconds': 5, 'human': '5s'}
 
 
 def test_observed_spacing_is_measured_from_the_corpus_not_assumed(tmp_path: Path):
