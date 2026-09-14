@@ -1104,6 +1104,64 @@ async def _map_advance_failure(
     )
 
 
+async def _rename_pairs(
+    from_ref: str,
+    to_ref: str,
+    git_ops: GitOps,
+    *,
+    log_prefix: str,
+    task_id: str | None = None,
+) -> list[tuple[str, str]] | None:
+    """Return ``(old_path, new_path)`` for every rename between two trees.
+
+    The one place in this module that asks git "what was renamed between
+    these two trees".  Both rename-aware gates are built on it, on
+    opposite ranges: the equivalence gate resolves the BRANCH side
+    (``base..branch_head``) and the plan-target drop-guard the MERGE side
+    (``task_head..merge_commit``).
+
+    A tree-to-tree ``-M`` diff collapses a multi-commit rename chain into
+    a single pair, so no hop-by-hop walk is needed here — contrast
+    :func:`_rename_pair_for` / :func:`_resolve_renamed_plan_path`, which
+    must walk commits because they start from a path that no longer
+    exists rather than from two trees.
+
+    ``-M``'s default 50% similarity threshold is deliberate: a rename
+    edited too heavily for git to pair simply does not appear here, and
+    the caller degrades to its pre-rename-awareness behaviour — a
+    possible false block, which is the fail-CLOSED direction and the safe
+    way to be wrong.  ``-C`` (copy detection) is deliberately NOT passed:
+    a copy leaves its source in place, so treating a copy target as
+    accounted-for, or a copy source as relocated, would suppress a path
+    whose content genuinely could have been dropped.
+
+    Returns ``None`` — never a partial list — on rc != 0, so every caller
+    can tell "git could not answer" from "git answered: no renames".
+    """
+    rc, out, err = await _run(
+        ['git', 'diff', '-M', '--name-status', from_ref, to_ref],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: rename-pair diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            log_prefix, from_ref, to_ref, rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return None
+
+    pairs: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3:
+            continue
+        status, old_path, new_path = fields[0], fields[1], fields[2]
+        if status.startswith('R') and old_path and new_path:
+            pairs.append((old_path, new_path))
+    return pairs
+
+
 async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
@@ -2286,6 +2344,52 @@ async def _check_plan_files_touched_in_branch(
     )
 
 
+async def _rename_aware_compare_set(
+    branch_touched: list[str],
+    main_touched: set[str],
+    base_sha: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str] | None:
+    """Subtract main-side change from *branch_touched*, following renames.
+
+    The string-only rule — "keep a branch-touched path main did not touch"
+    — misses the case where the branch RELOCATED a path main edited: the
+    two halves of the rename are unrelated strings, so main's edit lands
+    in ``main_touched`` under the SOURCE name while the branch's work is
+    compared under the TARGET name.  A path is therefore excluded when
+    main touched it OR the path it was renamed from.
+
+    The branch's OLD path deliberately stays in the compare set when main
+    did not touch it: a resolution that RESURRECTS a path the branch
+    deleted is caught precisely because that path is still compared.
+
+    Returns ``None`` when the rename map is unreadable, so the caller can
+    fail open rather than silently running the buggy string-only rule.
+    """
+    pairs = await _rename_pairs(
+        base_sha, branch_head, git_ops,
+        log_prefix='post-merge-equiv', task_id=task_id,
+    )
+    if pairs is None:
+        return None
+
+    sources = {new: old for old, new in pairs}
+    kept = [p for p in branch_touched if p not in main_touched]
+    compare_set = [p for p in kept if sources.get(p, p) not in main_touched]
+
+    suppressed = [(p, sources[p]) for p in kept if p not in compare_set]
+    if suppressed:
+        logger.info(
+            'post-merge-equiv: rename accounts for divergence, not comparing '
+            '%r (target, source — main touched the source). task_id=%s',
+            suppressed, task_id or '<unknown>',
+        )
+    return compare_set
+
+
 async def _check_post_merge_equivalence(
     task_worktree: Path,
     advanced_sha: str,
@@ -2312,6 +2416,22 @@ async def _check_post_merge_equivalence(
     so merged main differs from the branch tip there without anything being
     dropped.  Anchoring the base on ``main_sha`` rather than ``advanced_sha``
     keeps the gate robust to ``advance_main``'s CAS-retry rebase.
+
+    That subtraction is on path STRINGS, so it needs a rename
+    correspondence to be sound: when the branch RELOCATED a path main
+    edited, main's edit is recorded under the rename SOURCE and the
+    branch's work under the TARGET, and the target survives a subtraction
+    that should have removed it.  :func:`_rename_aware_compare_set`
+    therefore excludes a branch-touched path when main touched it *or the
+    path it was renamed from* (task 5342; measured as reify task 5694 /
+    esc-5694-5).  ``--no-renames`` on both set-building diffs is retained
+    and is load-bearing in that design: main's own rename must stay
+    DECOMPOSED so its source path appears in ``main_touched`` — that is
+    exactly the set the branch's rename sources are looked up in, and a
+    rename-collapsed main diff would hide the source and reintroduce the
+    miss.  The branch's OLD path likewise stays in the compare set when
+    main did not touch it, so a merge that RESURRECTS a path the branch
+    deleted is still flagged.
 
     The surviving compare set is the branch's own work that main did not
     touch; we ask git whether any of those paths differ between
@@ -2437,7 +2557,12 @@ async def _check_post_merge_equivalence(
         return []
     main_touched = {ln.strip() for ln in main_touched_out.splitlines() if ln.strip()}
 
-    compare_set = [p for p in branch_touched if p not in main_touched]
+    compare_set = await _rename_aware_compare_set(
+        branch_touched, main_touched, base_sha, branch_head, git_ops,
+        task_id=task_id,
+    )
+    if compare_set is None:
+        return []
     if not compare_set:
         # Empty pathspec on ``git diff -- `` means *all files*, not none, so
         # short-circuit rather than running an unscoped diff.
