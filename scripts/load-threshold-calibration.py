@@ -154,6 +154,21 @@ def read_series(
     live corpus. A ':' selector matches every per-cgroup leaf under that stem,
     each kept as its OWN series — pooling them would average unrelated
     workloads into one meaningless number.
+
+    The stem match is ``GLOB``, not ``LIKE``, for two independently sufficient
+    reasons. Correctness: ``_`` is a single-character wildcard in LIKE and
+    every selector contains one, so ``own_cpu_some10:%`` also matches
+    ``own-cpu-some10:leaf`` — and this repo spells unit and slice names with
+    hyphens throughout, making that a realistic next metric name. GLOB has no
+    ``_`` wildcard. Cost: LIKE is ASCII-case-INsensitive by default, so it
+    cannot use a BINARY-collated index and this query planned as
+    ``SCAN samples``; GLOB is always case-sensitive, so the prefix
+    optimisation applies and the plan becomes ``MULTI-INDEX OR`` over
+    ``SEARCH samples USING INDEX idx_samples_metric_ts (metric=?)`` plus
+    ``(metric>? AND metric<?)``. Measured on a 2.16M-row probe with this exact
+    schema. At the 30-day steady state the corpus is ~13M rows, so the LIKE
+    spelling was a full scan per selector — the same shape of cost regression
+    the dashboard's ``/api/load`` query carried before it was bounded.
     """
     specs = (
         [ARM_METRIC_SELECTORS[arm]] if arm else list(ARM_METRIC_SELECTORS.values())
@@ -169,8 +184,8 @@ def read_series(
         for selector in selectors:
             rows = con.execute(
                 'SELECT metric, ts, value FROM samples'
-                ' WHERE metric = ? OR metric LIKE ? ORDER BY ts',
-                (selector, f'{selector}:%'),
+                ' WHERE metric = ? OR metric GLOB ? ORDER BY ts',
+                (selector, f'{selector}:*'),
             ).fetchall()
             for metric, ts, value in rows:
                 series.setdefault(metric, []).append((int(ts), float(value)))

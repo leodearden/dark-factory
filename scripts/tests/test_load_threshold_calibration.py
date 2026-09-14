@@ -367,6 +367,37 @@ def test_a_stem_arm_reports_per_leaf_and_is_never_pooled(tmp_path: Path):
     assert cold[80.0]['hold_fraction'] == pytest.approx(0.0)
 
 
+def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
+    """`_` is a single-character LIKE wildcard, and every selector contains one.
+
+    A stem selector is matched against the corpus as a ':'-prefixed pattern.
+    Spelled with LIKE, `own_cpu_some10:%` also matches `own-cpu-some10:leaf` —
+    the underscores match the hyphens — and this repo spells unit and slice
+    names with hyphens everywhere (`orchestrator-dark-factory.service`,
+    `df-<project>.slice`), so that is a realistic next metric name and not a
+    contrived one. Pooling it into this arm's series would shift the arm's
+    percentiles and hold fractions with no degradation reported.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'own_cpu_some10:orchestrator-dark-factory.service': [1.0] * 50,
+        'own-cpu-some10:a-hyphen-spelled-future-metric': [99.0] * 50,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert set(payload['holds']) == {
+        'own_cpu_some10:orchestrator-dark-factory.service'
+    }, (
+        'the hyphen-spelled metric was pooled into this arm: a selector\'s '
+        f"underscores are being read as wildcards; got {sorted(payload['holds'])}"
+    )
+    assert set(payload['percentiles']) == {
+        'own_cpu_some10:orchestrator-dark-factory.service'
+    }
+
+
 def test_the_human_report_carries_the_unit_label(tmp_path: Path):
     """"4.0" means nothing to the human reading the escalation without it."""
     db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0, 3.0]})
