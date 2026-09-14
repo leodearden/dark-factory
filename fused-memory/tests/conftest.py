@@ -136,20 +136,174 @@ def worker_id(request) -> str:
     return resolve_xdist_worker_id(request)
 
 
-@pytest.fixture(autouse=True)
-def preserve_config_path():
-    """Save and restore os.environ['CONFIG_PATH'] around every test.
+#: The canonical fused-memory config, by ABSOLUTE path, for the autouse
+#: ``_isolate_fm_config`` pin below.  Derived from this file's location and
+#: NEVER from ``Path.cwd()`` — a CWD-derived path would reintroduce the exact
+#: leak the pin exists to close.
+FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 
-    This is a safety net: if a test (or the code under test) modifies CONFIG_PATH,
-    it won't leak into subsequent tests.  The fixture is autouse so all tests in this
-    package are covered without needing to request it explicitly.
+#: The top-level fields ``FusedMemoryConfig`` exposes to the environment.
+#: DERIVED from the model, never listed by hand: a field added later is then
+#: covered with no edit here, which is the drift that let this leak class
+#: survive in one subproject after being fixed in the other.
+_FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
+
+#: The variables the TRACKED config interpolates into its PATH-VALUED leaves:
+#: ``${PROJECT_ROOT:.}`` (``taskmaster.project_root``,
+#: ``reconciliation.explore_codebase_root``), ``${QUEUE_DATA_DIR:./data/queue}``
+#: and ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``.  A THIRD env
+#: surface, reached through the YAML's own interpolation rather than through
+#: pydantic's env layer, so the derived names above cannot see it: measured
+#: with ``CONFIG_PATH`` already pinned at the canonical file,
+#: ``PROJECT_ROOT=/pwned-by-env`` still rewrote both of its leaves, and this
+#: repo's operator scripts do export ``PROJECT_ROOT``
+#: (``scripts/memory-metadata-coverage-census.sh`` and two siblings).
+#: LISTED rather than derived, unlike the model fields: deriving the
+#: interpolation surface from the file would sweep in ``${OPENAI_API_KEY}`` and
+#: ``${FALKORDB_URI:...}``, which the config reads from the environment BY
+#: DESIGN.  Only path-valued names belong here.
+_FM_CONFIG_PATH_INTERPOLATIONS = ('PROJECT_ROOT', 'QUEUE_DATA_DIR', 'RECONCILIATION_DATA_DIR')
+
+
+def _reads_as_a_config_override(env_name):
+    """Whether pydantic-settings would read *env_name* as a config field.
+
+    ``env_prefix=''`` makes the WHOLE name a top-level field name, and
+    ``env_nested_delimiter='__'`` makes everything before the first ``__`` the
+    top-level field of a nested override.  Both are matched case-insensitively
+    because the model sets ``case_sensitive=False``.
+
+    Nothing else matches: ``PATH`` is not ``path_scope_adjudicator``, and
+    ``FOO__TASKMASTER`` has the head ``foo``.  That narrowness is deliberate —
+    unrelated fixtures and the uv/venv machinery legitimately need the ambient
+    environment, so a blanket clear would trade one nondeterminism for a worse
+    one.  It is also asserted rather than merely asserted-in-prose:
+    ``test_config_hermeticity.py::TestTheScrubStaysNarrow`` plants those
+    near-miss names ambiently and fails if a widened match deletes one, which
+    is the failure a reader would otherwise meet as a cascade in an unrelated
+    suite.
     """
-    original = os.environ.get('CONFIG_PATH')
-    yield
-    if original is None:
-        os.environ.pop('CONFIG_PATH', None)
-    else:
-        os.environ['CONFIG_PATH'] = original
+    lowered = env_name.lower()
+    return lowered in _FM_CONFIG_FIELDS or lowered.split('__', 1)[0] in _FM_CONFIG_FIELDS
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fm_config(monkeypatch):
+    """Pin ``CONFIG_PATH`` at the canonical config so config resolution does
+    not depend on the process CWD (task 5444).
+
+    ``FusedMemoryConfig`` is a pydantic-settings ``BaseSettings``, not a plain
+    ``BaseModel``: ``fused_memory.config.schema::FusedMemoryConfig.settings_customise_sources``
+    reads ``CONFIG_PATH`` with a default of the RELATIVE ``config/config.yaml``,
+    and ``fused_memory.config.schema::YamlSettingsSource.__call__`` returns
+    ``{}`` — silently — when that path does not exist.
+
+    WITHOUT THIS PIN the YAML layer is present only when pytest happens to run
+    from ``fused-memory/``.  Run the identical commit from the repo root and
+    every field a test does not pass explicitly drops to its code default; the
+    tracked ``taskmaster:`` section disappears and ``config.taskmaster``
+    becomes ``None``.  That is not hypothetical: it is why
+    ``test_referent_repair.py``'s taskmaster test read as green for both
+    registered verify commands (both ``cd`` into ``fused-memory/``) and red for
+    a human running it from the root — a phantom main-red that cost an
+    investigation and produced a fix for a test that was never broken.  See
+    ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``.
+
+    Pinning the CANONICAL file rather than an absent one reproduces the
+    CWD=``fused-memory/`` semantics every currently-green test was written
+    against, so the pin changes no test's meaning — it only makes the result
+    the same from everywhere.  Tests that want pure schema defaults opt into
+    ``code_default_config`` below.
+
+    Mirrors the CONFIG-PATH half of
+    ``orchestrator/tests/conftest.py::_isolate_orch_config``, whose docstring
+    records the same reasoning for ``ORCH_CONFIG_PATH`` ("the absolute path is
+    also CWD-independent, so the config no longer depends on running from
+    ``orchestrator/``").  That hardening was applied subproject-locally and
+    never propagated; this is the propagation.
+
+    THE HALF DELIBERATELY NOT PROPAGATED.  ``_isolate_orch_config`` also pins
+    ``ORCH_PROJECT_ROOT`` at ``tmp_path`` — "the other load-bearing part" in
+    its own words — which rewrites the config's path leaves.  The tracked
+    fused-memory config's path leaves are RELATIVE: measured under this pin
+    they are ``taskmaster.project_root='.'``,
+    ``reconciliation.explore_codebase_root='.'``,
+    ``queue.data_dir='./data/queue'`` and
+    ``reconciliation.data_dir='./data/reconciliation'``.  So what this fixture
+    buys is that config RESOLUTION is CWD-independent — same layers, same
+    strings, from any CWD — while those four STRINGS still denote the
+    directory pytest was launched from.  Pointing them at tmp would change the
+    value ~19.8k currently-green tests read, which is the behaviour change this
+    task's zero-collateral design decision rules out; it is recorded in the RCA
+    and filed as a follow-up rather than done here.  What IS closed is the
+    ambient half of it: the variables that redirect those leaves are scrubbed
+    below, so the leaves denote the launching CWD and nothing else.
+    ``test_config_hermeticity.py`` states both halves executably.
+
+    ``monkeypatch.setenv`` restores the pre-existing value at teardown, so this
+    SUBSUMES the ``preserve_config_path`` fixture it replaced — one fixture
+    owning ``CONFIG_PATH`` rather than two with no defined ordering between
+    them.  A test that sets ``CONFIG_PATH`` itself still wins: a
+    function-scoped ``monkeypatch.setenv`` in the test body runs after this
+    autouse fixture.  That same ordering is why the scrub below cannot — and
+    must not — stop a test setting ``SERVER__PORT`` deliberately; it removes
+    only what pytest INHERITED.
+
+    THE ENVIRONMENT HALF.  Pinning the file closes only half the leak.  The
+    model sets ``env_prefix=''``, so a bare ambient variable named after any
+    top-level field is an unprefixed override that outranks the YAML.
+    Measured: ``TASKMASTER='{"project_root": "/pwned-by-env"}'`` rewrites
+    ``config.taskmaster.project_root`` even with ``CONFIG_PATH`` pointing at a
+    missing file, so whatever the shell, the CI runner or a parent process
+    happens to export decides what a test reads.  The names are DERIVED from
+    the model rather than listed, mirroring
+    ``orchestrator/src/orchestrator/verify.py``'s reason for scrubbing the
+    whole ``ORCH_`` prefix: so a variable added later cannot reintroduce the
+    class.  The comprehension snapshots the names before the loop deletes any,
+    since mutating ``os.environ`` while iterating it raises.
+    ``_FM_CONFIG_PATH_INTERPOLATIONS`` is the same treatment for the YAML's own
+    interpolation surface, which pydantic never sees and the derived names
+    therefore miss.
+    """
+    for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
+        monkeypatch.delenv(inherited, raising=False)
+
+    for interpolated in _FM_CONFIG_PATH_INTERPOLATIONS:
+        monkeypatch.delenv(interpolated, raising=False)
+
+    monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
+
+
+@pytest.fixture
+def code_default_config(monkeypatch, tmp_path):
+    """Resolve ``FusedMemoryConfig()`` from the SCHEMA alone, on request.
+
+    Opt-in counterpart to the autouse ``_isolate_fm_config`` above.  That
+    fixture deliberately keeps the tracked ``fused-memory/config/config.yaml``
+    loaded, because that is what every currently-green test was written
+    against — but it therefore leaves no way to ask what a field's CODE
+    default is.  Pointing ``CONFIG_PATH`` at a guaranteed-absent file makes
+    ``fused_memory.config.schema::YamlSettingsSource.__call__`` skip the YAML
+    layer (its ``.exists()`` is False), so only the schema's own defaults
+    remain.
+
+    Request it explicitly, or via ``@pytest.mark.usefixtures``; NEVER autouse.
+    It runs after the autouse pin and deliberately overrides it, so making it
+    autouse would strip the YAML from the whole suite.
+
+    THE MEASUREMENT THAT SIZES BOTH FIXTURES — taken at eb04f1d1c8, the whole
+    suite with the YAML layer removed (``FM_CONFIG_PATH`` temporarily
+    re-pointed at an absent file, less the two assertions in this branch that
+    exist to pin the file's PRESENCE and so cannot survive its removal):
+    ``1 failed, 19783 passed, 3 skipped`` in 265.69s.  The single failure is
+    ``test_referent_repair.py::TestTheStormGateProjectRoot::test_the_taskmaster_project_root_is_never_used_as_a_fallback``
+    — the trap this task exists because of.  Exactly one test in ~19.8k reads
+    a value that only the ambient file supplies, which is why a CWD-dependent
+    config could sit under this suite unnoticed.  Mirrors
+    ``orchestrator/tests/conftest.py::code_default_config``, whose absent-file
+    trick this copies.
+    """
+    monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -477,7 +631,16 @@ def make_edge_backend():
 
 @pytest.fixture
 def mock_config(tmp_path) -> FusedMemoryConfig:
-    """A FusedMemoryConfig that doesn't require real API keys or services."""
+    """A FusedMemoryConfig that doesn't require real API keys or services.
+
+    NOT hermetic, despite reading that way.  ``FusedMemoryConfig`` is a
+    pydantic-settings ``BaseSettings``: only the sections passed explicitly
+    below are fixed here.  Every other field — ``taskmaster`` among them —
+    comes from the YAML that ``_isolate_fm_config`` pins and from the
+    environment (the model sets ``env_prefix=''``).  A test asserting on a
+    field this factory does not name is asserting on the tracked
+    ``fused-memory/config/config.yaml``, not on a code default.
+    """
     return FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',

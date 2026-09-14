@@ -28,39 +28,92 @@ from _fm_helpers import (
 # than a convenience.  Autouse applies to every test in THIS module.
 from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
 
+CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
+
+#: The config ``_isolate_fm_config`` is supposed to pin, derived HERE from this
+#: file's own location rather than read back from the conftest constant the
+#: fixture writes.  Reading the constant back would compare the pin against
+#: itself: a ``FM_CONFIG_PATH`` repointed at some other absolute file that
+#: happens to exist would satisfy that equality, and the absolute/exists
+#: assertions beside it, while silently resolving a different config.
+CANONICAL_CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+
+
+def _fused_memory_conftest():
+    """The loaded fused-memory conftest, found by PATH rather than by name.
+
+    ``sys.modules['conftest']`` is shared with sibling subprojects'
+    conftests — conftest.py's own docstring says so, which is the reason
+    ``_fm_helpers.py`` exists — so keying on the name could hand back a
+    different package's module.
+
+    A type checker sees the same ambiguity, and resolves it the wrong way:
+    rooted at the REPO ROOT — which is where a scoped verify command runs
+    pyright from — a plain ``import conftest`` binds the root-level
+    ``conftest.py``, and every attribute read off it is an unknown-attribute
+    error.  Resolving by path is CWD-independent under both readings, which
+    is the very invariant the fixtures below exist to establish.
+    """
+    target = CONFTEST_PATH.resolve()
+    for module in list(sys.modules.values()):
+        path = getattr(module, '__file__', None)
+        if path and Path(path).resolve() == target:
+            return module
+    raise AssertionError(f'{CONFTEST_PATH} is not loaded')
+
+
 # ---------------------------------------------------------------------------
-# preserve_config_path fixture tests
+# _isolate_fm_config fixture tests
 # ---------------------------------------------------------------------------
 
-class TestPreserveConfigPath:
-    """preserve_config_path autouse fixture saves/restores CONFIG_PATH around each test."""
+class TestIsolateFmConfig:
+    """The autouse ``_isolate_fm_config`` pins CONFIG_PATH CWD-independently.
 
-    def test_absent_key_is_absent(self, preserve_config_path):
-        """When CONFIG_PATH is not set, the fixture doesn't interfere."""
-        # Remove CONFIG_PATH if present so we start clean
-        os.environ.pop('CONFIG_PATH', None)
-        assert os.environ.get('CONFIG_PATH') is None
+    Task 5444.  It replaced ``preserve_config_path``, which only saved and
+    restored the variable and so left resolution a function of the process
+    CWD; these tests assert the replacement's stronger guarantee instead of
+    the old one's.
+    """
 
-    def test_can_set_config_path_during_test(self, preserve_config_path):
-        """Setting CONFIG_PATH during a test is visible within the test."""
-        os.environ['CONFIG_PATH'] = '/tmp/inside_test.yaml'
-        assert os.environ['CONFIG_PATH'] == '/tmp/inside_test.yaml'
-        # Cleanup is the fixture's responsibility; we just verify it's set here
+    def test_config_path_is_pinned_to_the_canonical_absolute_config(self):
+        """CONFIG_PATH names the tracked config, by a path that exists and is absolute.
 
-    def test_fixture_accepts_pre_set_value(self, preserve_config_path):
-        """The fixture can be requested explicitly even when CONFIG_PATH was set before."""
-        os.environ['CONFIG_PATH'] = '/tmp/pre_set.yaml'
-        # Fixture should save this value on entry; test can see it
-        assert os.environ['CONFIG_PATH'] == '/tmp/pre_set.yaml'
+        Requests no fixture by name, so the pin being visible at all is what
+        observes the fixture's autouse-ness.
 
-    def test_is_autouse_so_no_explicit_request_needed(self):
-        """preserve_config_path is autouse; tests don't need to request it by name.
+        ``is_absolute`` is the load-bearing assertion: a relative path is
+        precisely the defect — ``YamlSettingsSource.__call__`` resolves it
+        against the process CWD and silently returns ``{}`` when it misses, so
+        a regression to a CWD-derived pin would still satisfy an equality
+        check run from ``fused-memory/`` and fail from anywhere else.
 
-        This test requests no fixture by name but still passes when autouse is active.
-        If the fixture is broken (e.g., raises on setup) this test will fail.
+        The equality half is sensitive to a wrong CONSTANT as well as to a
+        wrong fixture, because the expected path comes from
+        ``CANONICAL_CONFIG_PATH`` above and not from the conftest.
         """
-        # No CONFIG_PATH interaction; just confirms autouse doesn't break normal tests
-        assert True
+        pinned = os.environ['CONFIG_PATH']
+
+        assert Path(pinned).resolve() == CANONICAL_CONFIG_PATH.resolve()
+        assert Path(pinned).is_absolute()
+        assert Path(pinned).exists()
+
+    def test_a_test_local_config_path_overrides_the_pin_and_does_not_leak(self, tmp_path):
+        """The escape hatch the pin must leave open, and its boundary.
+
+        Fifteen test modules set ``CONFIG_PATH`` themselves and keep working
+        because a function-scoped ``setenv`` runs after the autouse fixture.
+        The nested ``MonkeyPatch.context()`` is what makes the restore half
+        observable in-test: an assertion in a test body cannot see the autouse
+        fixture's own teardown, and reading the value back from a later test
+        would be the cross-test coupling this fixture exists to remove.
+        """
+        local_config = tmp_path / 'local.yaml'
+
+        with pytest.MonkeyPatch.context() as local:
+            local.setenv('CONFIG_PATH', str(local_config))
+            assert os.environ['CONFIG_PATH'] == str(local_config)
+
+        assert Path(os.environ['CONFIG_PATH']).resolve() == CANONICAL_CONFIG_PATH.resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -398,24 +451,7 @@ class TestMakeGraphMockCypherDispatch:
 # The integration-lane in-use lease (task 4775)
 # ---------------------------------------------------------------------------
 
-CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 REAPER_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
-
-
-def _fused_memory_conftest():
-    """The loaded fused-memory conftest, found by PATH rather than by name.
-
-    ``sys.modules['conftest']`` is shared with sibling subprojects'
-    conftests — conftest.py's own docstring says so, which is the reason
-    ``_fm_helpers.py`` exists — so keying on the name could hand back a
-    different package's module.
-    """
-    target = CONFTEST_PATH.resolve()
-    for module in list(sys.modules.values()):
-        path = getattr(module, '__file__', None)
-        if path and Path(path).resolve() == target:
-            return module
-    raise AssertionError(f'{CONFTEST_PATH} is not loaded')
 
 
 class TestTheIntegrationLaneLeaseFixture:
