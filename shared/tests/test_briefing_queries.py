@@ -266,8 +266,10 @@ class TestQueriesForScope:
         text = dict((spec.slug, q) for spec, q in queries_for(self._scope()))['briefing-task-semantic']
 
         assert 'Briefing memory rescope' in text
+        # Case-insensitive: a term the title already spells (here "Briefing")
+        # is carried by the title's own spelling rather than repeated.
         for term in ('orchestrator', 'agents', 'briefing'):
-            assert term in text
+            assert term in text.lower()
 
     def test_the_task_semantic_query_never_carries_the_bare_task_id(self):
         """The measured 0/5 failure mode: a bare task number embeds close to

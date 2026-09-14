@@ -152,3 +152,115 @@ def derive_area_terms(scope: BriefingScope) -> tuple[str, ...]:
     if not terms:
         terms = _first_seen(_words(scope.title))
     return terms[:AREA_TERM_LIMIT]
+
+
+@dataclass(frozen=True)
+class BriefingQuerySpec:
+    """One question the briefing asks memory, and how to ask it.
+
+    ``text`` is a template rendered by :func:`render_query`; ``slug`` is the
+    key PRD-γ's registry files its canonical/claim/held-out phrasings under,
+    so one topic tracks one question.
+    """
+
+    slug: str
+    section_title: str
+    text: str
+    stores: tuple[str, ...] = ()
+    categories: tuple[str, ...] = ()
+    limit: int = 5
+
+
+_CONVENTIONS_SECTION = 'Conventions & Gotchas'
+_CONVENTIONS_STORES = ('mem0',)
+_CONVENTIONS_CATEGORIES = ('preferences_and_norms', 'procedural_knowledge')
+"""Conventions live in Mem0 under exactly these two categories.
+
+Scoping the store and the categories is what made this channel work: the
+same intent asked unscoped returned zero Mem0 entries in any merged top-20,
+because Graphiti edge facts crowd out every prose convention on relevance.
+"""
+
+CONVENTIONS_GENERIC = BriefingQuerySpec(
+    slug='briefing-conventions-generic',
+    section_title=_CONVENTIONS_SECTION,
+    text='conventions, norms and gotchas for working in this repository',
+    stores=_CONVENTIONS_STORES,
+    categories=_CONVENTIONS_CATEGORIES,
+)
+"""The last resort, for a dispatch whose scope names neither files nor title."""
+
+CONVENTIONS_AREA = BriefingQuerySpec(
+    slug='briefing-conventions-area',
+    section_title=_CONVENTIONS_SECTION,
+    text='conventions and gotchas for {area}',
+    stores=_CONVENTIONS_STORES,
+    categories=_CONVENTIONS_CATEGORIES,
+)
+
+TASK_SEMANTIC = BriefingQuerySpec(
+    slug='briefing-task-semantic',
+    section_title='Task Context',
+    text='{title} {area}',
+)
+"""The task channel, phrased semantically — never as the bare task id.
+
+Store-unscoped on purpose, unlike the conventions channel: a task's context
+is as likely to be a Graphiti edge fact about a neighbouring task as a Mem0
+observation, and there is no category that names "about this work".
+"""
+
+QUERY_SPECS: tuple[BriefingQuerySpec, ...] = (
+    CONVENTIONS_GENERIC,
+    CONVENTIONS_AREA,
+    TASK_SEMANTIC,
+)
+"""Every spec that exists, for registry enumeration — NOT a firing order.
+
+What one dispatch actually asks is :func:`queries_for`, which picks between
+the two conventions specs and fires the task channel only when the scope
+says something.
+
+Two queries are absent by decision, not by oversight. "project overview
+architecture goals" is retired because the corpus holds no overview entry
+(literal scan) and a dispatched agent already reads CLAUDE.md in its own
+checkout. "recent decisions and rationale" is retired because "recent" is a
+temporal predicate the search API cannot express, and the semantic residue
+returns meta-fragments about the word "decisions" (measured 5/5 noise). A
+recency-windowed Graphiti query is future work, to be added when a consumer
+names it — not a reworded version of either string.
+"""
+
+
+def _without_repeated_words(text: str) -> str:
+    """Collapse a query to its first occurrence of each word.
+
+    The area ladder falls back to the task title when a task declares no
+    files, so ``{title} {area}`` would otherwise echo the whole title back
+    into the same query. Comparison ignores case and punctuation; the first
+    spelling is the one kept.
+    """
+    kept: dict[str, str] = {}
+    for token in text.split():
+        key = ''.join(_WORD.findall(token.lower())) or token
+        kept.setdefault(key, token)
+    return ' '.join(kept.values())
+
+
+def render_query(spec: BriefingQuerySpec, scope: BriefingScope) -> str:
+    """Render *spec* for *scope* — a pure function of the two."""
+    return _without_repeated_words(
+        spec.text.format(title=scope.title, area=' '.join(derive_area_terms(scope)))
+    )
+
+
+def queries_for(scope: BriefingScope) -> tuple[tuple[BriefingQuerySpec, str], ...]:
+    """The ordered ``(spec, query text)`` pairs one dispatch should fire.
+
+    One predicate decides both halves: whether the scope yields area terms at
+    all. With terms, the conventions channel can be phrased about this task's
+    area and the task channel has something to ask; without them, neither is
+    possible and the generic conventions query is all that is left.
+    """
+    specs = (CONVENTIONS_AREA, TASK_SEMANTIC) if derive_area_terms(scope) else (CONVENTIONS_GENERIC,)
+    return tuple((spec, render_query(spec, scope)) for spec in specs)
