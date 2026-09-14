@@ -38,17 +38,23 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE as _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE,
 )
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_TTL_DAYS as _CYCLE_SUMMARY_TTL_DAYS,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
 
-# Retention window for authoritative cycle_summary ledger rows (task 2229).
-# The ledger is a control-plane store, not a permanent audit log, and Stage 3
-# only ever consumes recent summaries — so rows are given a bounded TTL and
-# reaped by the existing ReconLedgerStore.gc() expires_at pass (already run
-# each cycle by _gc_recon_markers) rather than kept forever or given bespoke
-# cleanup code.
-CYCLE_SUMMARY_TTL_DAYS: int = 30
+# Retention window for authoritative cycle_summary ledger rows (task 2229),
+# stamped as expires_at by write_cycle_summary below and reaped by the existing
+# ReconLedgerStore.gc() expires_at pass (already run each cycle by
+# _gc_recon_markers). Single-sourced in the leaf recon_pool_map since task 3731
+# and re-exported here under its historical name, for the same lockstep reason
+# as the record_types below: the presence READER in
+# services/memory_service.py now needs the same window to tell a reaped row
+# from one that was never written, and cannot import this module without
+# closing a service <-> reconciliation import cycle.
+CYCLE_SUMMARY_TTL_DAYS: int = _CYCLE_SUMMARY_TTL_DAYS
 
 # record_type vocabulary for cycle_summary Mem0 writes (task 2468). There are
 # two distinct writers of kind='cycle_summary': this module's deterministic,
