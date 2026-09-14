@@ -9,7 +9,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
+from shared.briefing_queries import (
+    TASK_SEMANTIC,
+    BriefingQuerySpec,
+    BriefingScope,
+    queries_for,
+)
 
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
@@ -482,6 +487,67 @@ def render_memory_results(payload_text: str) -> str:
                 if (child_bullet := _memory_bullet(child, store, indent='  ')) is not None
             )
     return '\n'.join(bullets)
+
+
+def render_entity_block(payload_text: str, expected_name: str) -> str:
+    """Render a ``get_entity`` reply, but ONLY for an exactly-named node (D3).
+
+    ``get_entity`` tries an exact name match and then falls back to fuzzy /
+    semantic matching, so a task node that does not exist is answered with a
+    NEIGHBOURING task's node — measured — whose facts would then be read as
+    this task's own. Admitting a reply only when the node's name equals
+    *expected_name* character-for-character is what makes the channel safe to
+    render. The guard is client-side by decision: the PRD puts server-side
+    fuzzy-path changes out of scope, and a consumer that cannot tolerate a
+    wrong neighbour should not depend on the server to stop sending one.
+
+    An edge's date is best-effort: measured live, every edge of a queried
+    task node carried ``temporal: null`` (the exact-match path builds edges
+    from an EdgeDict that has no ``valid_at`` at all), so a dated edge is the
+    exception and a date is never required.
+
+    Returns ``''`` — never raises — for a missing, mis-shaped, empty or
+    wrong-named reply.
+    """
+    try:
+        payload = json.loads(payload_text)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning(f'render_entity_block: reply for {expected_name!r} is not JSON ({e})')
+        return ''
+    if not isinstance(payload, dict):
+        return ''
+
+    nodes = payload.get('nodes')
+    nodes = nodes if isinstance(nodes, list) else []
+    node = next(
+        (n for n in nodes if isinstance(n, dict) and n.get('name') == expected_name),
+        None,
+    )
+    if node is None:
+        logger.debug(
+            f'render_entity_block: no node named exactly {expected_name!r} '
+            'in the reply; nothing rendered'
+        )
+        return ''
+
+    summary = node.get('summary')
+    heading = f'**{expected_name}**'
+    if isinstance(summary, str) and summary.strip():
+        heading += f' — {summary.strip()}'
+
+    lines = [heading]
+    edges = payload.get('edges')
+    for edge in edges if isinstance(edges, list) else []:
+        if not isinstance(edge, dict):
+            continue
+        fact = edge.get('fact')
+        if not isinstance(fact, str) or not fact.strip():
+            continue
+        temporal = edge.get('temporal')
+        valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
+        dated = f' ({valid_at[:10]})' if isinstance(valid_at, str) and len(valid_at) >= 10 else ''
+        lines.append(f'- {fact.strip()}{dated}')
+    return '\n'.join(lines)
 
 
 MEMORY_CONTEXT_CAVEAT = (
@@ -1607,9 +1673,12 @@ Handle this escalation, then call `resolve_issue` with a summary.
                 foreign_dropped += dropped
                 nested_dropped += nested
                 queries_fired += 1
-                rendered = render_memory_results(section) if section else ''
-                if rendered:
-                    recalled_sections.append(f'## {spec.section_title}\n\n{rendered}')
+                blocks = [render_memory_results(section)] if section else []
+                if spec.slug == TASK_SEMANTIC.slug and scope.task_id:
+                    blocks.append(await self._task_entity_block(scope.task_id))
+                body = '\n\n'.join(block for block in blocks if block)
+                if body:
+                    recalled_sections.append(f'## {spec.section_title}\n\n{body}')
 
         except Exception as e:
             logger.warning(f'Failed to fetch memory context: {e}')
@@ -1679,6 +1748,39 @@ Handle this escalation, then call `resolve_issue` with a summary.
             )
 
         return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
+
+    async def _task_entity_block(self, task_id: str) -> str:
+        """The knowledge-graph half of D3's dual-channel task context.
+
+        The semantic search answers "what memory reads like this task"; this
+        answers "what the graph records ABOUT this task", which is a
+        different question and a different corpus. Asked only when there is a
+        task id to name — an entity called ``Task None`` matches nothing, and
+        the fuzzy fallback would answer that miss with a stranger.
+        """
+        expected_name = f'Task {task_id}'
+        raw = await self._mcp_get_entity(expected_name)
+        return render_entity_block(raw, expected_name) if raw else ''
+
+    async def _mcp_get_entity(self, name: str) -> str | None:
+        """Look one entity up over fused-memory's MCP HTTP endpoint."""
+        try:
+            result = await mcp_call(
+                f'{self.memory_url}/mcp',
+                'tools/call',
+                {'name': 'get_entity', 'arguments': {'name': name, 'project_id': self.project_id}},
+                timeout=10,
+            )
+            texts = [
+                block['text']
+                for block in result.get('result', {}).get('content', [])
+                if isinstance(block, dict) and block.get('type') == 'text'
+            ]
+            return '\n'.join(texts) if texts else None
+
+        except Exception as e:
+            logger.warning(f'MCP get_entity failed for {name!r}: {e}')
+            return None
 
     async def _scoped_search(
         self,
