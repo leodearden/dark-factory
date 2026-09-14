@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -392,6 +393,27 @@ class TestThirtyDayRetention:
 # ---------------------------------------------------------------------------
 
 
+class _DeleteFailingConnection:
+    """A real connection with exactly one statement broken: the DELETE.
+
+    The stamp-after-prune invariant is precisely that the DELETE can fail while
+    the meta write still succeeds, so the injection has to fail that one
+    statement and nothing else. Everything else — the INSERT OR REPLACE
+    ``_set_meta`` issues, commit, close — delegates to the real connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        if sql.lstrip().upper().startswith('DELETE'):
+            raise sqlite3.OperationalError('injected: DELETE failed')
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
 class TestCleanupIsIntervalGated:
     """Why this gate exists, pinned so it cannot be "simplified" away.
 
@@ -517,12 +539,22 @@ class TestCleanupIsIntervalGated:
         assert _count_at(db_path, planted_after) == 0
         assert store.should_cleanup(now + 60, interval_seconds=30) is False
 
-    def test_the_stamp_is_written_only_after_a_successful_prune(self, tmp_path: Path):
+    def test_the_stamp_is_written_only_after_a_successful_prune(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """Mirrors maybe_vacuum: a transient failure must not suppress retries.
 
         A stamp written before the DELETE would silence cleanup for a whole
         interval on one locked-database error, and the next window would then
         be double-length.
+
+        Reaching for the private ``_connect`` is deliberate: there is no public
+        seam for "make the DELETE fail and only the DELETE", and failure
+        injection is the recognised reason to reach into internals — read it as
+        that, not as the tests-touch-internals smell. The obvious alternative,
+        chmod(0o444) on the database file, is what this test used to do and it
+        was vacuous: it breaks the meta write too, so a stamp-first
+        implementation satisfies every assertion below.
         """
         from sampler.store import LoadSampleStore
 
@@ -532,17 +564,19 @@ class TestCleanupIsIntervalGated:
         stale = now - THIRTY_DAYS - 60
         store.insert_sample(stale, 'runqueue_ratio', 1.0)
 
-        db_path.chmod(0o444)
-        try:
-            with pytest.raises(sqlite3.Error):
-                store.cleanup_old(now)
-        finally:
-            # The -wal and -shm sidecars inherit the main file's mode when
-            # SQLite recreates them, so restoring only db.sqlite would leave
-            # the store readonly and the recovery leg below meaningless.
-            for path in tmp_path.glob('db.sqlite*'):
-                path.chmod(0o644)
+        # Bind the real method BEFORE patching — calling store._connect() from
+        # inside the replacement would re-enter the replacement itself.
+        real_connect = store._connect
+        monkeypatch.setattr(
+            store, '_connect', lambda: _DeleteFailingConnection(real_connect())
+        )
+        with pytest.raises(sqlite3.Error):
+            store.cleanup_old(now)
+        monkeypatch.undo()
 
+        assert store._get_meta('last_cleanup_ts') is None, (
+            'a failed prune must leave the clock unstamped'
+        )
         assert store.should_cleanup(now) is True, (
             'a failed prune must leave the store still due, not stamped'
         )
