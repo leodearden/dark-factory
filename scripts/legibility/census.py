@@ -1263,19 +1263,46 @@ def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
     in *cb* for *title* -- the one whose verdict explains why
     ``_find_pending_candidate_id`` found nothing.
 
-    Returns the LAST same-title match in list order. That tie-break is
-    copied from ``codebook.apply_coding_record``'s own ``same_title[-1]``
-    rule (the record it routes a recurrence sighting to), deliberately, so
-    census and the merger cannot disagree about which record is
-    authoritative when more than one adjudicated candidate shares a
-    title. ``None`` means no same-title candidate exists at all, which is
-    a different and stranger situation -- the caller says so plainly
-    rather than inventing an explanation."""
-    match = None
-    for candidate in cb.get("candidates") or []:
-        if candidate.get("title") == title and candidate.get("disposition") != "pending":
-            match = candidate
-    return match
+    Mirrors ``codebook.apply_coding_record``'s own TWO-STEP precedence for
+    exactly this situation (its ``elif same_title:`` branch, reached when
+    every same-title candidate is adjudicated), so census and the merger
+    cannot disagree about which record is authoritative:
+
+    1. the LAST ``promoted`` same-title candidate whose ``promoted_to``
+       names an entry that actually EXISTS -- the merger routes the
+       recurrence sighting to that ENTRY, so that is what stands;
+    2. otherwise the LAST same-title non-pending candidate, which is where
+       the merger files the sighting instead (``same_title[-1]``, its
+       deterministic tie-break).
+
+    Step 1 is not a refinement of step 2 but a different answer: for
+    ``[promoted(resolvable), rejected]`` the two disagree, and reading step 2
+    alone inverts every label the caller prints -- an operator would be told
+    that a live codebook entry standing against a fresh REJECT is an
+    agreement. Duplicate-title adjudicated pairs are known to exist (the
+    task-4144 ``cand-20260722-28`` / ``cand-20260724-2`` pair), so the order
+    is reachable, not hypothetical.
+
+    A ``promoted`` record whose ``promoted_to`` resolves to nothing
+    (hand-edited, or pre-``promote_candidate``) is NOT authoritative under
+    step 1 -- again matching the merger, which falls through to step 2 for
+    it, because no entry exists to carry the signal.
+
+    ``None`` means no same-title candidate exists at all, which is a
+    different and stranger situation -- the caller says so plainly rather
+    than inventing an explanation."""
+    same_title = [
+        candidate for candidate in cb.get("candidates") or []
+        if candidate.get("title") == title and candidate.get("disposition") != "pending"
+    ]
+    entry_ids = {entry.get("id") for entry in cb.get("entries") or [] if entry.get("id")}
+    for candidate in reversed(same_title):
+        if (
+            candidate.get("disposition") == "promoted"
+            and candidate.get("promoted_to") in entry_ids
+        ):
+            return candidate
+    return same_title[-1] if same_title else None
 
 
 def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:

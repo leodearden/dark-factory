@@ -2115,6 +2115,29 @@ def _codebook_with_standing(disposition):
     return _codebook_with_adjudicated_candidate(disposition)
 
 
+def _codebook_with_duplicate_standing_candidates(*, promoted_to="entry-spurious"):
+    """The live codebook's KNOWN duplicate-title shape: a `promoted`
+    same-title candidate followed by a `rejected` one (the task-4144
+    cand-20260722-28 / cand-20260724-2 pair the module docstrings cite).
+
+    Order is the whole point -- `rejected` is LAST, so a bare "last same-title
+    match" tie-break picks it while the merger routes the recurrence sighting
+    to the promoted record's live ENTRY. *promoted_to* is parameterised so the
+    same shape can be built with a `promoted_to` that resolves to NO entry,
+    which is the case the merger itself falls through on."""
+    cb = _codebook_with_adjudicated_candidate(
+        "promoted", promoted_to=promoted_to, extra_entry=_promoted_entry(),
+    )
+    cb["candidates"].append({
+        "id": "cand-20260724-2",
+        "title": _REJECTED_TITLE,
+        "first_seen": "2026-07-24",
+        "disposition": "rejected",
+        "sightings": [],
+    })
+    return cb
+
+
 def _verify_fn_with_unknown_titles(*, verified=(), rejected=()):
     """A verifier whose verdicts name titles the merge never saw -- the
     shortest route to N dropped verdicts in one run, on EITHER adjudication
@@ -2359,6 +2382,53 @@ def test_dropped_verdict_contradiction_marker_inverts_between_the_loops(tmp_path
             f"{label}: contradiction marker present={marked}, expected "
             f"{expect_contradiction} -- the two loops invert, they do not share "
             f"one branch ladder. Message: {messages[0]}"
+        )
+        assert outcome.status == "done"
+        assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_standing_candidate_follows_the_mergers_promoted_first_precedence(
+    tmp_path, caplog,
+):
+    """When TWO adjudicated candidates share a title, the one that stands is
+    the one the MERGER treats as authoritative -- a `promoted` record whose
+    entry exists wins over a later `rejected` one.
+
+    Reading the list-order last match instead inverts the label on exactly
+    this shape: a live codebook entry stands while the census's fresh REJECT
+    is discarded (the CONTRADICTION an operator must act on), and the drop
+    would be announced as an AGREEMENT with a standing rejection. Seeded in
+    the order that makes the two answers differ, which is the order the live
+    codebook is known to carry (task 4144).
+
+    The second case pins the fall-through the merger also performs: a
+    `promoted` record whose `promoted_to` names no existing entry is NOT
+    authoritative, because no entry exists to carry the signal -- so the
+    later `rejected` record stands and the drop really is an agreement."""
+    cases = [
+        ("promoted_to resolves", "entry-spurious", "cand-20260701-7", True),
+        ("promoted_to dangles", "entry-that-never-existed", "cand-20260724-2", False),
+    ]
+    for label, promoted_to, expected_id, expect_contradiction in cases:
+        caplog.clear()
+        kwargs = _rejected_run_kwargs(
+            tmp_path / label.replace(" ", "-"),
+            _codebook_with_duplicate_standing_candidates(promoted_to=promoted_to),
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome = mod.run_census(**kwargs)
+
+        messages = _dropped_verdict_warnings(caplog)
+        assert len(messages) == 1, f"{label}: expected one WARNING; got: {messages}"
+        message = messages[0]
+        assert expected_id in message, (
+            f"{label}: the standing record named must be the one the merger "
+            f"routes to ({expected_id}); message: {message}"
+        )
+        marked = "CONTRADICT" in message.upper()
+        assert marked is expect_contradiction, (
+            f"{label}: contradiction marker present={marked}, expected "
+            f"{expect_contradiction} -- message: {message}"
         )
         assert outcome.status == "done"
         assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
