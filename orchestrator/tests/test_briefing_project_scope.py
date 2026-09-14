@@ -741,6 +741,126 @@ class TestQueryTableComesFromTheSharedSpecs:
 
 
 @pytest.mark.asyncio
+class TestDistilledRendering:
+    """Recalled memory renders as markdown bullets, never as raw JSON (D5).
+
+    Task 3659. The block used to carry the search payload verbatim — braces,
+    ids, relevance scores, provenance uuids — which measured ~85% envelope by
+    token. Each surviving result now renders as one
+    ``- [category · date · store] content`` bullet, with the content WHOLE:
+    fidelity over budget, bounded by ``limit=5`` and by query scoping rather
+    than by a per-entry cap.
+    """
+
+    async def _render(self, briefing: BriefingAssembler, results: list[dict]) -> str:
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value=_mcp_search_envelope(results)),
+        ):
+            return await briefing._get_memory_context(_task_scope(), 'implementer')
+
+    async def test_a_mem0_result_renders_as_a_tagged_bullet(
+        self, briefing: BriefingAssembler,
+    ):
+        entry = _result('1', 'Never run git stash in any dark-factory checkout.', source_store='mem0')
+        entry['category'] = 'preferences_and_norms'
+        entry['created_at'] = '2026-08-15T22:22:49+00:00'
+
+        context = await self._render(briefing, [entry])
+
+        assert (
+            '- [preferences_and_norms · 2026-08-15 · mem0] '
+            'Never run git stash in any dark-factory checkout.'
+        ) in context
+
+    async def test_no_raw_json_survives_anywhere_in_the_block(
+        self, briefing: BriefingAssembler,
+    ):
+        entry = _result('1', 'A recalled fact.', source_store='mem0')
+        entry['category'] = 'observations_and_summaries'
+        entry['created_at'] = '2026-08-15T22:22:49+00:00'
+
+        context = await self._render(briefing, [entry])
+
+        assert '{' not in context and '}' not in context
+        assert 'relevance_score' not in context
+        assert 'provenance' not in context
+
+    async def test_a_long_entry_renders_whole(self, briefing: BriefingAssembler):
+        """D5 is explicit that entries are not capped: a canonical memory
+        record is long precisely because its reasoning is the payload."""
+        long_content = 'The measured rationale. ' * 200
+        entry = _result('1', long_content.strip(), source_store='mem0')
+
+        context = await self._render(briefing, [entry])
+
+        assert long_content.strip() in context
+        assert '...' not in context
+        assert 'truncated' not in context
+
+    async def test_a_graphiti_result_falls_back_to_its_valid_at_date(
+        self, briefing: BriefingAssembler,
+    ):
+        """Graphiti-sourced results carry no category and no created_at, but
+        may carry a temporal envelope — measured live, not assumed."""
+        entry = _result('1', 'An edge fact about task 3659.', source_store='graphiti')
+        entry['temporal'] = {'valid_at': '2026-09-14T07:58:01.179808+00:00', 'invalid_at': None}
+
+        context = await self._render(briefing, [entry])
+
+        assert (
+            '- [uncategorized · 2026-09-14 · graphiti] An edge fact about task 3659.'
+        ) in context
+
+    async def test_the_category_falls_back_to_the_metadata_copy(
+        self, briefing: BriefingAssembler,
+    ):
+        """Mem0 results carry the category on the result AND in metadata; a
+        payload that only carries the metadata copy must still be tagged."""
+        entry = _result('1', 'A convention.', metadata={'category': 'procedural_knowledge'},
+                        source_store='mem0')
+        entry['created_at'] = '2026-08-15T22:22:49+00:00'
+
+        context = await self._render(briefing, [entry])
+
+        assert '- [procedural_knowledge · 2026-08-15 · mem0] A convention.' in context
+
+    async def test_an_untagged_undated_result_still_renders_its_content(
+        self, briefing: BriefingAssembler,
+    ):
+        """The tag is best-effort; the content is not. A missing category or
+        date renders as a named placeholder rather than as ``None``."""
+        context = await self._render(
+            briefing, [_result('1', 'A fact with no tags at all.', source_store='mem0')],
+        )
+
+        assert '- [uncategorized · undated · mem0] A fact with no tags at all.' in context
+        assert 'None' not in context
+
+    async def test_grouped_children_render_as_nested_bullets(
+        self, briefing: BriefingAssembler,
+    ):
+        """An amendment digest reaches the prompt today as nested JSON; it
+        must keep reaching it as a nested bullet, or the nested-drop note
+        would announce blocking a leak of content nobody renders."""
+        context = await self._render(briefing, [_grouped_parent()])
+
+        assert '- [uncategorized · undated · graphiti] Native canonical.' in context
+        assert '  - [amendment · undated · graphiti] NATIVE AMENDMENT BODY' in context
+        assert 'FOREIGN AMENDMENT BODY' not in context
+
+    async def test_the_section_headings_come_from_the_specs(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, [_result('1', 'A fact.', source_store='mem0')])
+
+        assert '## Conventions & Gotchas' in context
+        assert '## Task Context' in context
+        for spec, _text in queries_for(_task_scope()):
+            assert f'## {spec.section_title}' in context
+
+
+@pytest.mark.asyncio
 class TestMemoryContextProvenanceCaveat:
     """A standing caveat covers the leak channel the tag filter cannot reach.
 
@@ -864,8 +984,8 @@ class TestScopedSearch:
         self, briefing: BriefingAssembler, caplog,
     ):
         """``_mcp_search`` joins every MCP text block with ``'\\n'`` before
-        returning. If the search
-        tool ever answers with more than one text block, the joined text is
+        returning. If the search tool ever answers with more than one text
+        block, the joined text is
         not a single valid JSON document, so the filter fails open — the
         cross-project filter silently stops working for that query, though
         the block still renders (nothing is lost from the prompt, just the
