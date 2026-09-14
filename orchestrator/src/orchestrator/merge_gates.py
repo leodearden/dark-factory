@@ -2520,6 +2520,7 @@ async def _rename_aware_compare_set(
     main_touched: set[str],
     base_sha: str,
     branch_head: str,
+    advanced_sha: str,
     git_ops: GitOps,
     *,
     task_id: str | None = None,
@@ -2530,8 +2531,16 @@ async def _rename_aware_compare_set(
     — misses the case where the branch RELOCATED a path main edited: the
     two halves of the rename are unrelated strings, so main's edit lands
     in ``main_touched`` under the SOURCE name while the branch's work is
-    compared under the TARGET name.  A path is therefore excluded when
-    main touched it OR the path it was renamed from.
+    compared under the TARGET name.
+
+    A pair whose source main touched is only a CANDIDATE for exclusion,
+    never a licence to skip the path.  ``git diff -M`` pairs at ~50%
+    similarity, so a resolution that keeps the relocation and throws the
+    branch's edit away still pairs (measured ``R095``) — and nothing else
+    covers that case, since the branch's old path is already absent from
+    ``task_head`` and so never reaches the drop-guard's ``D`` set.
+    Exclusion therefore requires :func:`_branch_delta_survives` to
+    re-apply the branch's delta against the merged blob.
 
     The branch's OLD path deliberately stays in the compare set when main
     did not touch it: a resolution that RESURRECTS a path the branch
@@ -2548,14 +2557,28 @@ async def _rename_aware_compare_set(
         return None
 
     sources = {new: old for old, new in pairs}
-    kept = [p for p in branch_touched if p not in main_touched]
-    compare_set = [p for p in kept if sources.get(p, p) not in main_touched]
+    compare_set: list[str] = []
+    suppressed: list[tuple[str, str]] = []
+    for p in branch_touched:
+        if p in main_touched:
+            continue
+        old = sources.get(p)
+        # The branch's delta SPANS the rename here (base:old ->
+        # branch_head:new), unlike the drop-guard's case where the branch
+        # edited in place and the MERGE relocated.  The blob-to-blob diff
+        # form absorbs both without special-casing.
+        if old is not None and old in main_touched and await _branch_delta_survives(
+            (base_sha, old), (branch_head, p), (advanced_sha, p),
+            git_ops, log_prefix='post-merge-equiv', task_id=task_id,
+        ):
+            suppressed.append((p, old))
+        else:
+            compare_set.append(p)
 
-    suppressed = [(p, sources[p]) for p in kept if p not in compare_set]
     if suppressed:
         logger.info(
-            'post-merge-equiv: rename accounts for divergence, not comparing '
-            '%r (target, source — main touched the source). task_id=%s',
+            'post-merge-equiv: content verified at the new name, not '
+            'comparing %r (target, source). task_id=%s',
             suppressed, task_id or '<unknown>',
         )
     return compare_set
@@ -2593,9 +2616,15 @@ async def _check_post_merge_equivalence(
     edited, main's edit is recorded under the rename SOURCE and the
     branch's work under the TARGET, and the target survives a subtraction
     that should have removed it.  :func:`_rename_aware_compare_set`
-    therefore excludes a branch-touched path when main touched it *or the
-    path it was renamed from* (task 5342; measured as reify task 5694 /
-    esc-5694-5).  ``--no-renames`` on both set-building diffs is retained
+    therefore treats a branch-touched path whose rename SOURCE main
+    touched as a CANDIDATE for exclusion (task 5342; measured as reify
+    task 5694 / esc-5694-5) — and, because ``-M`` pairs at ~50%
+    similarity and so cannot tell a faithful relocation from one that
+    discarded the branch's edit, takes the exclusion only when the
+    branch's own delta re-applies against the merged blob.  Nothing else
+    covers that case: the branch's old path is already absent from
+    ``task_head`` and so never reaches the drop-guard's ``D`` set.
+    ``--no-renames`` on both set-building diffs is retained
     and is load-bearing in that design: main's own rename must stay
     DECOMPOSED so its source path appears in ``main_touched`` — that is
     exactly the set the branch's rename sources are looked up in, and a
@@ -2729,8 +2758,8 @@ async def _check_post_merge_equivalence(
     main_touched = {ln.strip() for ln in main_touched_out.splitlines() if ln.strip()}
 
     compare_set = await _rename_aware_compare_set(
-        branch_touched, main_touched, base_sha, branch_head, git_ops,
-        task_id=task_id,
+        branch_touched, main_touched, base_sha, branch_head, advanced_sha,
+        git_ops, task_id=task_id,
     )
     if compare_set is None:
         return []
