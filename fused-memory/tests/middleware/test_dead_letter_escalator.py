@@ -482,10 +482,11 @@ class TestTheRecordIsSelfSufficientForTriage:
         _emit(tmp_path, post_execute=True, write_op_id='W-77')
         detail = _filed(tmp_path)[0]['detail']
 
+        # Identifiers, not prose: the two branches are discriminated by the
+        # `backend_ops` lookup, which only the post-execute one prescribes.
+        # Rewording either sentence must not turn this red; selecting the
+        # wrong branch must.
         assert 'post_execute=True' in detail, detail
-        assert 'LANDED' in detail, detail
-        assert 'DUPLICATE' in detail.upper(), detail
-        assert 'backend_ops' in detail, detail
         assert 'write_op_id' in detail, detail
         assert 'backend_ops.operation' in detail, (
             'the join must warn off backend_ops.operation, which is the literal '
@@ -497,9 +498,13 @@ class TestTheRecordIsSelfSufficientForTriage:
         detail = _filed(tmp_path)[0]['detail']
 
         assert 'post_execute=False' in detail, detail
-        assert 'did not land' in detail, detail
+        assert '_execute_write' in detail, detail
         assert 'replay_dead_letters' in detail, detail
         assert 'delete_dead_letters' in detail, detail
+        assert 'backend_ops' not in detail, (
+            'the backend_ops confirmation belongs to the post-execute branch '
+            'alone — nothing landed here, so there is nothing to look up'
+        )
 
     def test_the_detail_names_the_durable_write_op_record_it_was_raised_from(
         self, tmp_path,

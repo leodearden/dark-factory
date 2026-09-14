@@ -12,6 +12,10 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import poll_until
 
+from fused_memory.middleware.dead_letter_escalator import (
+    _REPORTED_TO_CALLER,
+    _REPORTED_TO_CALLER_DEFAULT,
+)
 from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
 
@@ -1029,7 +1033,9 @@ class TestAddEpisodeDeadLetterIsObservable:
         # says not only that a write died but that a caller ACTED on a success
         # that will never be true, and names the id that caller holds.
         assert 'reported_to_caller=' in record['detail'], record['detail']
-        assert 'queued' in record['detail'], record['detail']
+        assert _REPORTED_TO_CALLER['add_episode'].text in record['detail'], (
+            record['detail']
+        )
         assert episode_id in record['detail'], (
             'the returned episode_id must appear verbatim so an operator can '
             'tie the alarm back to the call that was lied to'
@@ -1137,12 +1143,12 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
         # this record currently claims no synchronous success was reported —
         # which is false, and is exactly the lie the alarm exists to surface.
         assert 'reported_to_caller=' in detail, detail
-        assert 'stores_written' in detail, (
+        assert _REPORTED_TO_CALLER['add_memory_graphiti'].text in detail, (
             'the caller was told graphiti was WRITTEN, not that the write was '
             'queued; an alarm that misreports what the caller was promised is '
             'not triageable'
         )
-        assert "status='queued'" not in detail, (
+        assert _REPORTED_TO_CALLER['add_episode'].text not in detail, (
             'add_memory never returns a queued status — that is add_episode'
         )
 
@@ -1179,4 +1185,4 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
             'the operation 3582\'s terminal hook skips — and the hole this '
             'alarm exists to close'
         )
-        assert 'no synchronous success was reported' in detail, detail
+        assert _REPORTED_TO_CALLER_DEFAULT in detail, detail
