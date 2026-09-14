@@ -43,7 +43,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
+from _task_db_scan import (
+    TABLE_NAMES_SQL,
+    TaskDbUnreadable,
+    connect_ro,
+    tasks_db_path,
+)
 
 _GIT_TIMEOUT_SECS = 30
 
@@ -180,14 +185,7 @@ def introspect(conn: sqlite3.Connection) -> tuple[Table, ...]:
     are left out: they are the same in every store and never the subject of
     the question being asked.
     """
-    names = [
-        row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
-            "ORDER BY name"
-        )
-    ]
+    names = [row[0] for row in conn.execute(f"{TABLE_NAMES_SQL} ORDER BY name")]
     return tuple(Table(name=name, columns=_table_columns(conn, name)) for name in names)
 
 

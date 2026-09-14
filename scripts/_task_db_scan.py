@@ -155,6 +155,7 @@ class TaskDbProblem(Enum):
 
     ABSENT = "absent"
     EMPTY_STUB = "empty_stub"
+    NO_TABLES = "no_tables"
 
 
 _REFUSAL_REMEDY = {
@@ -171,7 +172,20 @@ _REFUSAL_REMEDY = {
         "live .taskmaster/tasks/tasks.db, and a read-write sqlite3.connect of a "
         "path that did not exist."
     ),
+    TaskDbProblem.NO_TABLES: (
+        "a readable sqlite database with NO tables in it, so every query "
+        "against it answers `no such table: tasks`. This is what pointing at "
+        "the wrong .db file looks like from the inside — and it is also what "
+        "the 0-byte decoy above the live store becomes the moment any process "
+        "opens it read-write, which is why size alone cannot catch it."
+    ),
 }
+
+
+TABLE_NAMES_SQL = (
+    "SELECT name FROM sqlite_master "
+    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+)
 
 
 class TaskDbUnreadable(Exception):
@@ -213,7 +227,12 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
         raise TaskDbUnreadable(resolved, TaskDbProblem.ABSENT)
     if resolved.stat().st_size == 0:
         raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
-    return sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+
+    conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+    if conn.execute(f"{TABLE_NAMES_SQL} LIMIT 1").fetchone() is None:
+        conn.close()
+        raise TaskDbUnreadable(resolved, TaskDbProblem.NO_TABLES)
+    return conn
 
 
 def resolve_project_roots(
