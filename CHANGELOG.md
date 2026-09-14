@@ -157,38 +157,52 @@ primitive (a single `git diff -M --name-status`, parsed with the tab-split idiom
 what was renamed between two trees.
 
 - **Post-merge equivalence gate** — before: a branch-touched path was compared unless
-  main touched *that exact path*. After: it is excluded when main touched it **or the
-  path it was renamed from**. So relocating a file main concurrently edited at the old
-  path no longer produces a false `Conflict resolution likely dropped or rewrote work`
-  (measured: reify task 5694, merge `d1d857f43545`, esc-5694-5).
+  main touched *that exact path*. After: a path whose rename **source** main touched
+  becomes a *candidate* for exclusion, and is excluded only once the branch's own delta
+  is verified present in the merged blob. So relocating a file main concurrently edited
+  at the old path no longer produces a false `Conflict resolution likely dropped or
+  rewrote work` (measured: reify task 5694, merge `d1d857f43545`, esc-5694-5).
 - **Plan-target drop-guard** — before: every apparently-dropped path the branch had
   changed was flagged. After: a path that is a rename **source** between task HEAD and
-  the merge commit is excluded. So a sibling relocating a file the branch *modified* no
-  longer produces a false `Merge commit is missing plan target files` (measured: reify
-  esc-6436-4).
+  the merge commit becomes a *candidate*, excluded only once the same content check
+  confirms the branch's work is at the new name. So a sibling relocating a file the
+  branch *modified* no longer produces a false `Merge commit is missing plan target
+  files` (measured: reify esc-6436-4).
 
-Both remain **fail-CLOSED**: a rename whose source main never touched is still compared,
-a genuine delete with no pairable rename still blocks, and a rename edited too heavily
-for `-M`'s default 50% similarity to pair simply degrades to the old behaviour — a
-possible false block, which is the safe way to be wrong. `-C` is deliberately not passed,
-since a copy leaves its source in place. An unreadable rename map fails **open** at both
-sites, uniform with each gate's four existing `rc != 0` arms. All five pre-existing diffs
-are byte-identical; `--no-renames` on the equivalence gate's main-touched diff is in fact
-load-bearing in the new design, because main's own rename must stay decomposed for its
-source to appear in the set the branch's rename sources are looked up in.
+The content check is one shared primitive used by both gates: diff the branch's own
+delta blob-to-blob (`git diff <base>:<old> <after_rev>:<after_path>`) and reverse-apply
+it against the merged blob with `git apply --check -R`.
 
-When a rename arm changes an outcome it logs one INFO naming the suppressed pairs, so a
-gate that passes says *why*. The complementary case — a block that survives rename
+**A rename pair is not, by itself, evidence the work survived.** Git pairs renames at
+~50% similarity, so a resolution that relocates a file and *discards* the branch's edit
+still pairs (measured `R095`) — suppressing on the bare pair would turn both gates into
+silent work-loss holes, and neither gate backstops the other on this case. Hence the
+content check, and hence two deliberately *different* error directions: an unreadable
+**rename map** fails **open** (uniform with each gate's four existing `rc != 0` arms —
+the gate cannot tell a rename from a drop at all, so it degrades), while an unverifiable
+**content probe** declines to suppress, falling back to pre-change flagging, which by
+construction cannot introduce a false block relative to main. The probe is conservative
+in the same direction throughout: `git apply` matches context with no fuzz, and binary
+files produce a patch it will not take, so both flag rather than silently pass.
+
+`-C` is deliberately not passed, since a copy leaves its source in place. All five
+pre-existing diffs are byte-identical; `--no-renames` on the equivalence gate's
+main-touched diff is in fact load-bearing in the new design, because main's own rename
+must stay decomposed for its source to appear in the set the branch's rename sources are
+looked up in.
+
+When a suppression fires, each gate logs one INFO naming the pairs and recording that the
+content was verified at the new name, so a gate that passes says *why*. The complementary case — a block that survives rename
 resolution — now names its triage command **and its direction**
 (`git diff <tip12> <advanced12> -- <path>`, branch tip first) plus the `git log --follow`
 a relocated path requires; reading that diff backwards, and a `--follow`-less history
 that looked empty, are what steered the esc-5694-5 RCA to the opposite of the truth.
 
-The merge-lane ratchet baseline is regenerated accordingly. The only rise is
-`merge_gates.py`'s `lines`/`prose_lines` — the earned cost of the new behaviour and its
-docstrings. Extracting the two adapters rather than inlining them actually *lowered* both
-host functions (`_check_post_merge_equivalence` 25→24, `_check_plan_targets_in_tree`
-16→15), and the three new keys land at 8/10/10 against the cognitive-15 new-key ceiling.
+The merge-lane ratchet baseline is regenerated accordingly. `merge_gates.py`'s
+`lines`/`prose_lines` rise — the earned cost of the new behaviour, the content probe and
+their docstrings. Extracting the adapters rather than inlining them actually *lowered*
+both host functions (`_check_post_merge_equivalence` 25→24, `_check_plan_targets_in_tree`
+16→15), and the four new keys land at 5/8/11/11 against the cognitive-15 new-key ceiling.
 
 #### Stage 1 folds through `consolidate_memories`, and the `recon-stage-*` write exemption is retired (task 3134)
 
