@@ -37,6 +37,7 @@ produce on demand: a non-zero rc from a specific git subcommand.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -44,6 +45,7 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_gates import _check_post_merge_equivalence
 
 # ---------------------------------------------------------------------------
 # Fixtures — the standard real-git fixture triple, copied verbatim from
@@ -120,3 +122,225 @@ class _RunSpy:
         if self._fail_when is not None and self._fail_when(cmd):
             return 128, '', 'fatal: injected failure (test fault injection)\n'
         return await _run(cmd, cwd, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Scenario staging
+#
+# Both scenarios share the same base and the same branch-side rename; they
+# differ only in what MAIN does concurrently.  The 40 spaced lines and the
+# top-vs-bottom edit split are lifted from
+# test_merge_queue.py::TestCheckPostMergeEquivalence::
+# test_sibling_also_touched_lockfile_not_flagged (the esc-3843 Cargo.lock
+# case), where they guarantee the 3-way merge is clean.
+# ---------------------------------------------------------------------------
+
+_BASE_MODULE = ''.join(f'line{i}\n' for i in range(1, 41))
+
+
+async def _commit_base_module(git_ops: GitOps) -> None:
+    """Put ``pkg/mod.py`` (40 spaced lines) on main — the shared fork point."""
+    (git_ops.project_root / 'pkg').mkdir()
+    (git_ops.project_root / 'pkg' / 'mod.py').write_text(_BASE_MODULE)
+    await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+    await _run(
+        ['git', 'commit', '-m', 'Main: add pkg/mod.py'],
+        cwd=git_ops.project_root,
+    )
+
+
+async def _branch_relocates_and_edits(git_ops: GitOps, branch: str) -> Path:
+    """Cut *branch*, ``git mv`` the module and edit it near the TOP."""
+    wt = (await git_ops.create_worktree(branch)).path
+    (wt / 'pkg' / 'sub').mkdir(parents=True)
+    rc, _, err = await _run(
+        ['git', 'mv', 'pkg/mod.py', 'pkg/sub/mod.py'], cwd=wt,
+    )
+    assert rc == 0, f'git mv failed: {err!r}'
+    (wt / 'pkg' / 'sub' / 'mod.py').write_text(
+        _BASE_MODULE.replace('line2\n', 'line2\nBRANCH_EDIT\n')
+    )
+    await git_ops.commit(wt, 'Branch: relocate pkg/mod.py and edit it')
+    return wt
+
+
+async def _main_edits_the_rename_source(git_ops: GitOps) -> None:
+    """Main edits ``pkg/mod.py`` near the BOTTOM — at the rename SOURCE."""
+    (git_ops.project_root / 'pkg' / 'mod.py').write_text(
+        _BASE_MODULE.replace('line37\n', 'line37\nMAIN_EDIT\n')
+    )
+    await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+    await _run(
+        ['git', 'commit', '-m', 'Main: edit pkg/mod.py'],
+        cwd=git_ops.project_root,
+    )
+
+
+@pytest.mark.asyncio
+class TestEquivalenceGateRenameAwareness:
+    """The gate must follow a branch-side rename back to its source."""
+
+    async def test_rename_with_main_side_source_edit_is_not_flagged(
+        self, git_ops: GitOps,
+    ):
+        """Branch relocates a file main concurrently edited → no divergence.
+
+        The regression (reify task 5694 / esc-5694-5).  ``main_touched``
+        carries the rename SOURCE (``pkg/mod.py``) because main edited it
+        there, while ``branch_touched`` carries both halves of the split
+        rename.  The raw string subtraction leaves the NEW path in the
+        compare set, and the scoped diff then reports it even though the
+        merged file carries BOTH sides' edits.
+        """
+        await _commit_base_module(git_ops)
+        wt = await _branch_relocates_and_edits(git_ops, 'equiv-rename')
+        await _main_edits_the_rename_source(git_ops)
+        main_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(wt, 'equiv-rename')
+        assert merge_result.success, (
+            f'expected clean 3-way merge; details={merge_result.details!r}'
+        )
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            outcome = await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='equiv-rename', max_attempts=1,
+            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
+            assert advanced is not None
+
+            # Non-vacuous precondition 1: the merge really did relocate the
+            # file — so the gate is being asked about a rename, not a no-op.
+            rc, tree_out, _ = await _run(
+                ['git', 'ls-tree', '-r', '--name-only', advanced],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0
+            tree = tree_out.split()
+            assert 'pkg/sub/mod.py' in tree, f'merged tree: {tree!r}'
+            assert 'pkg/mod.py' not in tree, f'merged tree: {tree!r}'
+
+            # Non-vacuous precondition 2: nothing was dropped AND the merged
+            # file genuinely differs from the branch tip (it carries main's
+            # edit too) — so a passing gate is not passing for want of a diff.
+            rc, blob, _ = await _run(
+                ['git', 'show', f'{advanced}:pkg/sub/mod.py'],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0
+            assert 'BRANCH_EDIT' in blob, 'branch work missing from merge'
+            assert 'MAIN_EDIT' in blob, 'main work missing from merge'
+
+            failed = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, main_sha, task_id='equiv-rename',
+            )
+            assert failed == [], (
+                f'a relocated file whose source main edited must not be '
+                f'flagged; got {failed!r}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_rename_whose_source_main_never_touched_is_still_compared(
+        self, git_ops: GitOps,
+    ):
+        """A rename main did NOT touch the source of stays in the compare set.
+
+        The fail-CLOSED discriminator.  This test PASSES on today's code and
+        that is INTENDED — it is the no-false-negative pin, and it must stay
+        green through the fix.  What it forbids is the cheap over-broad
+        remedy of suppressing every rename TARGET: that would make the
+        regression above pass while silently disabling the gate for every
+        relocated file, which is the one class of work it exists to protect.
+
+        Same base and same branch rename as above, but main's concurrent
+        commit touches an unrelated file, so no rename source is in
+        ``main_touched``.  The gate is then pointed at a synthetic
+        ``advanced_sha`` lacking the renamed file — the
+        ``test_diverging_tree_flags_files`` trick (test_merge_queue.py
+        L9198) — and must still report it.
+        """
+        await _commit_base_module(git_ops)
+        rc, base_out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        base_sha = base_out.strip()
+
+        wt = await _branch_relocates_and_edits(git_ops, 'equiv-rename-unrelated')
+
+        # Main moves ahead, but nowhere near the rename source.
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add other.py'],
+            cwd=git_ops.project_root,
+        )
+        main_sha = await git_ops.get_main_sha()
+
+        # base_sha predates the branch entirely, so the relocated file is
+        # absent from it — exactly what a resolution that dropped the
+        # branch's work would look like.
+        failed = await _check_post_merge_equivalence(
+            wt, base_sha, git_ops, main_sha,
+            task_id='equiv-rename-unrelated',
+        )
+        assert 'pkg/sub/mod.py' in failed, (
+            f'a rename whose source main never touched must still be '
+            f'compared; got {failed!r}'
+        )
+
+    async def test_rename_map_git_error_fails_open(
+        self, git_ops: GitOps, caplog, monkeypatch,
+    ):
+        """A failing rename-pair diff fails OPEN, loudly.
+
+        Uniform with the gate's four existing ``rc != 0`` arms and with its
+        stated policy: a transient git error must not block a successful
+        merge from being recorded.
+        """
+        await _commit_base_module(git_ops)
+        wt = await _branch_relocates_and_edits(git_ops, 'equiv-rename-failopen')
+        await _main_edits_the_rename_source(git_ops)
+        main_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(wt, 'equiv-rename-failopen')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            outcome = await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='equiv-rename-failopen', max_attempts=1,
+            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
+            assert advanced is not None
+
+            spy = _RunSpy(
+                fail_when=lambda cmd: '--name-status' in cmd and '-M' in cmd,
+            )
+            monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+
+            with caplog.at_level(
+                logging.WARNING, logger='orchestrator.merge_queue',
+            ):
+                failed = await _check_post_merge_equivalence(
+                    wt, advanced, git_ops, main_sha,
+                    task_id='equiv-rename-failopen',
+                )
+
+            assert failed == [], (
+                f'an unreadable rename map must fail open; got {failed!r}'
+            )
+            warnings = '\n'.join(
+                r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING
+            )
+            assert 'rename-pair diff' in warnings, (
+                f'fail-open must name the failed command; got {warnings!r}'
+            )
+            assert 'failing open' in warnings, warnings
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
