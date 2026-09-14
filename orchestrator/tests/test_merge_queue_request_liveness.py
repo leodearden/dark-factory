@@ -293,7 +293,10 @@ class TestCheckRequestLiveness:
 
         assert not req.result.done()
         assert queue.empty()
+        # Both halt mechanisms, because they are independently reachable: a
+        # per-lane halt (is_wip_halted) and the separate operator halt Event.
         assert not worker.is_wip_halted
+        assert not worker._operator_halt.is_set()
 
     async def test_resolved_request_does_not_alarm(
         self,
@@ -520,9 +523,11 @@ class TestWedgedVerifyIntegration:
         assert esc.category == 'merge_request_stuck'
         assert req.request_id in esc.summary
 
-        # Observation-only: still wedged, nothing mutated or halted.
+        # Observation-only: still wedged, nothing mutated or halted — neither
+        # of the two independently reachable halt mechanisms engaged.
         assert not req.result.done()
         assert not worker.is_wip_halted
+        assert not worker._operator_halt.is_set()
 
         # ── Release the gate and confirm clean shutdown ────────────────
         gate_release.set()
@@ -3513,6 +3518,18 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         assert vr.status == InflightStatus.REQUEUED, (
             f'a dead-verify abort must REQUEUE, got status={vr.status!r}'
         )
+        # Drain the (inert — no worker loop is running here) queue rather than
+        # reaching into asyncio.Queue's undocumented `_queue` deque: identity
+        # membership is the actual claim. This happens BEFORE the census read
+        # below, and must: snapshot() emits every request still sitting on
+        # `_queue` with a hardcoded 'queued' independently of the registry, so
+        # a reading taken with the request still parked there is satisfied by
+        # queue membership alone — and this test's whole subject is that the
+        # requeue SITE bounced the REGISTRY.
+        parked = [q.get_nowait() for _ in range(q.qsize())]
+        assert any(p is req for p in parked), (
+            f'the request must actually be parked on the live queue: {parked!r}'
+        )
         current = lane_state(worker, rid)
         assert current == 'queued', (
             f'the requeue site must return the item to the census as queued so the '
@@ -3521,13 +3538,6 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         assert worker._live_items[rid] is req, (
             f'_live_items must hold the MergeRequest after the requeue: '
             f'{worker._live_items.get(rid)!r}'
-        )
-        # Drain the (inert — no worker loop is running here) queue rather than
-        # reaching into asyncio.Queue's undocumented `_queue` deque: this is the
-        # test's last use of `q`, and identity membership is the actual claim.
-        parked = [q.get_nowait() for _ in range(q.qsize())]
-        assert any(p is req for p in parked), (
-            f'the request must actually be parked on the live queue: {parked!r}'
         )
         assert not req.result.done(), (
             'a re-queued request must be left PENDING for its re-dispatch'
@@ -4045,7 +4055,12 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         assert outcome.status == 'done', (
             f'the request must land unaided, got {outcome!r}'
         )
-        assert not worker.is_wip_halted, (
+        # Two INDEPENDENTLY reachable mechanisms, so one predicate cannot
+        # cover both: `is_wip_halted` is "at least one lane halted", while
+        # `_operator_halt` is a separate Event raised only by operator_halt()
+        # and cleared only by unhalt_all_lanes(). A per-lane resume that left
+        # the operator halt set reads as not-wip-halted with a live halt.
+        assert not worker._operator_halt.is_set(), (
             'recovery must not depend on (or leave behind) an operator halt'
         )
         assert not worker.is_wip_halted, (

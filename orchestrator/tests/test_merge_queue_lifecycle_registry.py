@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import dataclasses
 import inspect
 import logging
 import textwrap
@@ -579,19 +580,26 @@ class TestRequeueToQueuedSites:
         entry = await worker._dispatch_item(item)
 
         assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert not queue.empty(), 'req must be put back on the queue by the halt branch'
+        # Take the request OFF the queue BEFORE reading the census: snapshot()
+        # emits everything still sitting on `_queue` with a hardcoded 'queued'
+        # independently of the registry, so a reading taken while the request
+        # is still parked there is satisfied by queue membership alone and says
+        # nothing about the registry bounce this test is about. Same ordering
+        # as test_requeue_request_moves_queue_ledger_and_registry_together.
+        drained = await queue.get()
+        assert drained is req
         assert lane_state(worker, req.request_id) == 'queued', (
             f'a pre-dispatch halt must re-arm the request as queued: '
             f'{lane_entry(worker, req.request_id)!r}'
         )
         assert worker._live_items[req.request_id] is req
-        assert not queue.empty(), 'req must be put back on the queue by the halt branch'
         assert len(fake_eq.filed) == 0, (
             f'requeue must not escalate: {fake_eq.filed!r}'
         )
 
         # Re-arm and re-drain: the SAME request_id flows back through the
         # normal drain chokepoint without a duplicate-register ValueError.
-        drained = await queue.get()
         worker._buffer_owned_request(drained)
 
         assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.LANE_BUFFERED
@@ -838,6 +846,17 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             f'site — ledger={sorted(ledger_rids)!r} registry={sorted(registry_rids)!r}; '
             f'unpaired={sorted(set(ledger_rids) - set(registry_rids))!r}'
         )
+        # Take the request OFF the queue BEFORE reading the census: snapshot()
+        # emits everything still sitting on `_queue` with a hardcoded 'queued'
+        # independently of the registry, so a reading taken while the request
+        # is still parked there is satisfied by queue membership alone and says
+        # nothing about the registry bounce this test is about. Same ordering
+        # as test_requeue_request_moves_queue_ledger_and_registry_together.
+        parked = {queue.get_nowait().request_id for _ in range(queue.qsize())}
+        assert parked == expected, (
+            f'all three requeues must actually be parked on the queue: {parked!r}'
+        )
+
         for rid in expected:
             assert lane_state(worker, rid) == 'queued', (
                 f'{rid} must be left queued; census reads {lane_entry(worker, rid)!r}'
@@ -1605,6 +1624,11 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             f'a retired request must leave the public census: '
             f'{lane_entry(worker, req.request_id)!r}'
         )
+        assert req.request_id not in worker._live_items, (
+            'retiring is a transition AND a live-object pop; the census cannot\n'
+            'see the second half, because every snapshot path already skips a\n'
+            'TERMINAL rid -- so a leaked live object is invisible there'
+        )
 
         await worker.stop()
         await worker_task
@@ -1685,6 +1709,11 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             f'a retired request must leave the public census: '
             f'{lane_entry(worker, req.request_id)!r}'
         )
+        assert req.request_id not in worker._live_items, (
+            'retiring is a transition AND a live-object pop; the census cannot\n'
+            'see the second half, because every snapshot path already skips a\n'
+            'TERMINAL rid -- so a leaked live object is invisible there'
+        )
 
     async def test_passthrough_entry_retires_directly_without_finalizing(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -1736,6 +1765,11 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         assert lane_state(worker, req.request_id) is None, (
             f'a retired request must leave the public census: '
             f'{lane_entry(worker, req.request_id)!r}'
+        )
+        assert req.request_id not in worker._live_items, (
+            'retiring is a transition AND a live-object pop; the census cannot\n'
+            'see the second half, because every snapshot path already skips a\n'
+            'TERMINAL rid -- so a leaked live object is invisible there'
         )
 
     async def test_runner_unavailable_cascade_finalizing_merging_redispatch_parked(
@@ -2143,6 +2177,11 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
             f'a dropped request must be retired out of the census: '
             f'{lane_entry(worker, rid)!r}'
         )
+        assert rid not in worker._live_items, (
+            'retiring is a transition AND a live-object pop; the census cannot\n'
+            'see the second half, because every snapshot path already skips a\n'
+            'TERMINAL rid -- so a leaked live object is invisible there'
+        )
         assert _accretion_warnings(caplog) == [], (
             f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
             f'{_accretion_warnings(caplog)!r}'
@@ -2370,6 +2409,11 @@ class TestStopMidFlightRetiresEveryContainer:
                 f'{req.task_id} ({req.request_id}) did not retire out of the '
                 f'census after stop(): {lane_entry(worker, req.request_id)!r}'
             )
+            assert req.request_id not in worker._live_items, (
+                'retiring is a transition AND a live-object pop; the census cannot\n'
+                'see the second half, because every snapshot path already skips a\n'
+                'TERMINAL rid -- so a leaked live object is invisible there'
+            )
             assert req.result.done(), f'{req.task_id}: Future must be resolved by stop()'
 
 
@@ -2427,6 +2471,11 @@ class TestAbandonPredispatchRetiresRegistry:
             f'a retired request must leave the public census: '
             f'{lane_entry(worker, req.request_id)!r}'
         )
+        assert req.request_id not in worker._live_items, (
+            'retiring is a transition AND a live-object pop; the census cannot\n'
+            'see the second half, because every snapshot path already skips a\n'
+            'TERMINAL rid -- so a leaked live object is invisible there'
+        )
         assert req.result.cancelled(), 'the abandon drop must never overwrite the cancellation'
 
         await worker.stop()
@@ -2465,6 +2514,11 @@ class TestAbandonPredispatchRetiresRegistry:
         assert lane_state(worker, req.request_id) is None, (
             f'a retired request must leave the public census: '
             f'{lane_entry(worker, req.request_id)!r}'
+        )
+        assert req.request_id not in worker._live_items, (
+            'retiring is a transition AND a live-object pop; the census cannot\n'
+            'see the second half, because every snapshot path already skips a\n'
+            'TERMINAL rid -- so a leaked live object is invisible there'
         )
 
 
@@ -2541,6 +2595,11 @@ class TestCoalesceSupersededRetiresRegistry:
                 f'{req.task_id} did not retire after being absorbed into the '
                 f'train: {lane_entry(worker, req.request_id)!r}'
             )
+            assert req.request_id not in worker._live_items, (
+                'retiring is a transition AND a live-object pop; the census cannot\n'
+                'see the second half, because every snapshot path already skips a\n'
+                'TERMINAL rid -- so a leaked live object is invisible there'
+            )
 
         # The new train's OWN request_id is a DIFFERENT registry entry —
         # already registered at LANE_BUFFERED (step-4), untouched by the
@@ -2556,19 +2615,63 @@ class TestCoalesceSupersededRetiresRegistry:
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class _Sample:
+    """One mid-pipeline reading of the lane's two views of live work.
+
+    *registry* is the set of request_ids the lifecycle registry considers
+    non-terminal, *census* the set ``snapshot()`` reports, and *entry* the
+    census row for the request being driven (``None`` when absent).
+    """
+
+    registry: set[str]
+    census: set[str]
+    entry: dict | None
+
+
+def _sample(worker: Any, request_id: str) -> _Sample:
+    """Both views of live work, read at one instant.
+
+    ``_lifecycle`` is the one private read in this file that no public
+    surface replaces: the lane censuses its non-terminal set through
+    ``snapshot()`` but never exposes the set itself, and comparing the two is
+    the whole point of a sample.
+    """
+    return _Sample(
+        registry=set(worker._lifecycle.non_terminal_items()),
+        census={e['request_id'] for e in worker.snapshot()['entries']},
+        entry=lane_entry(worker, request_id),
+    )
+
+
+def _assert_agreement(sample: _Sample, window: str) -> None:
+    """The two views must name exactly the same request_ids."""
+    assert sample.registry == sample.census, (
+        f'registry/snapshot disagree at the {window} sample: '
+        f'snapshot only={sample.census - sample.registry}, '
+        f'registry only={sample.registry - sample.census}'
+    )
+
+
 @pytest.mark.asyncio
 class TestRegistrySnapshotAgreementAtSamplingPoints:
-    """``snapshot()`` must surface the request at EVERY mid-pipeline
-    sampling point — the census has no blind spot (task 2169 step-11).
+    """At EVERY mid-pipeline sampling point the SET of request_ids the
+    registry considers non-terminal must equal the SET ``snapshot()``
+    censuses — one agreeing census, drift caught in BOTH directions (task
+    2169 step-11).
 
-    Each test gates on the census itself (``lane_state``) inside a real
-    ``get_main_sha``/``advance_main`` call and asserts the gate fired: a
-    window the census skipped never fires, which is the incident these
-    samples exist to prevent. The captured entry is then checked for the
-    fields a dashboard/heartbeat consumer reads. Single-item drives (not
-    concurrent multi-item) so there is no ambiguity from the producer-
-    boundary asymmetry (an undrained raw-queue item legitimately shows up
-    in the census before the drain registers it).
+    Each test gates inside a real ``get_main_sha``/``advance_main`` call and
+    asserts the gate fired: a window the census skipped never fires, which is
+    the incident these samples exist to prevent. The captured entry is then
+    checked for the fields a dashboard/heartbeat consumer reads. Single-item
+    drives (not concurrent multi-item) so there is no ambiguity from the
+    producer-boundary asymmetry (an undrained raw-queue item legitimately
+    shows up in the census before the drain registers it).
+
+    The set comparison needs the lane's own non-terminal set, which has no
+    public expression today — hence the one ``_lifecycle`` read per sample.
+    A presence check on the single driven request is strictly weaker: it
+    cannot see an entry the census invents or one the registry has lost.
 
     The DISPATCHING window was the one former exception: an item mid
     ``_dispatch_item`` was census-only, deliberately absent from
@@ -2587,7 +2690,7 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
         worker = make_lane(git_ops, queue)
         req = _make_request('kappa-sample-merging', 'kappa-sample-merging', wt, config)
 
-        captured: list[dict | None] = []
+        captured: list[_Sample] = []
         original_get_main_sha = git_ops.get_main_sha
         fired = False
 
@@ -2595,7 +2698,7 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             nonlocal fired
             if lane_state(worker, req.request_id) == 'merging' and not fired:
                 fired = True
-                captured.append(lane_entry(worker, req.request_id))
+                captured.append(_sample(worker, req.request_id))
             return await original_get_main_sha()
 
         worker_task = asyncio.create_task(worker.run())
@@ -2611,7 +2714,9 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             'the census never reported the request as merging while the real '
             'merge ran — the blind spot this sample exists to catch'
         )
-        entry = captured[0]
+        sample = captured[0]
+        _assert_agreement(sample, 'MERGING')
+        entry = sample.entry
         assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
         assert entry['branch'] == req.branch.bare_id, f'{entry!r}'
 
@@ -2638,7 +2743,7 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             'kappa-sample-dispatching', 'kappa-sample-dispatching', wt, config,
         )
 
-        captured: list[dict | None] = []
+        captured: list[_Sample] = []
         original_get_main_sha = git_ops.get_main_sha
         fired = False
 
@@ -2646,7 +2751,7 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             nonlocal fired
             if lane_state(worker, req.request_id) == 'dispatching' and not fired:
                 fired = True
-                captured.append(lane_entry(worker, req.request_id))
+                captured.append(_sample(worker, req.request_id))
             return await original_get_main_sha()
 
         worker_task = asyncio.create_task(worker.run())
@@ -2662,7 +2767,9 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             'the census never reported the request as dispatching — the '
             'task-2068 blind spot, reopened'
         )
-        entry = captured[0]
+        sample = captured[0]
+        _assert_agreement(sample, 'DISPATCHING')
+        entry = sample.entry
         assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
 
         await worker.stop()
@@ -2680,11 +2787,11 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             'kappa-sample-finalizing', 'kappa-sample-finalizing', wt, config,
         )
 
-        captured: list[dict | None] = []
+        captured: list[_Sample] = []
         original_advance = git_ops.advance_main
 
         async def _capturing_advance(*args: Any, **kwargs: Any) -> Any:
-            captured.append(lane_entry(worker, req.request_id))
+            captured.append(_sample(worker, req.request_id))
             return await original_advance(*args, **kwargs)
 
         worker_task = asyncio.create_task(worker.run())
@@ -2697,7 +2804,9 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             assert outcome.status == 'done', f'{outcome}'
 
         assert len(captured) >= 1, 'advance_main must have been called at least once'
-        entry = captured[0]
+        sample = captured[0]
+        _assert_agreement(sample, 'FINALIZING')
+        entry = sample.entry
         assert entry is not None, (
             'the census dropped the request while advance_main ran — the '
             'phantom/blind-spot window this sample exists to catch'
@@ -2754,6 +2863,13 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
             if lane_state(worker, req.request_id) is not None
         }
         assert leaked == {}, f'completed requests still in the census: {leaked!r}'
+        # The other half of retirement, which the census cannot express: a
+        # TERMINAL rid is skipped by every snapshot path, so a live object
+        # left behind reads as clean above no matter how many there are.
+        still_live = {req.task_id for req in reqs if req.request_id in worker._live_items}
+        assert still_live == set(), (
+            f'completed requests still hold a live object: {still_live!r}'
+        )
 
         await worker.stop()
         await worker_task
