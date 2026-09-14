@@ -972,14 +972,25 @@ anchor plus one corroborator already meets the >=2 threshold, anchoring it
 costs genuine gold turns for zero recall."""
 
 HARNESS_BRIEFING_SUBHEADINGS: tuple[str, ...] = (
-    '## project context', '## conventions', '## recent decisions',
-    '## task context',
+    '## project context', '## conventions', '## conventions & gotchas',
+    '## recent decisions', '## task context',
 )
 """CORROBORATING heading literals -- the structural sub-blocks a real
-briefing carries alongside an anchor
-(orchestrator/src/orchestrator/agents/briefing.py: '## Project Context'
-:1270, '## Conventions' :1277, '## Recent Decisions' :1284, '## Task
-Context' :1294 inside ``_get_memory_context``'s recalled_sections list).
+briefing carries alongside an anchor. Matched as WHOLE lowercased LINES
+(see :func:`is_harness_injected_turn`), so a renamed heading needs its own
+entry rather than matching by prefix.
+
+Two generations, both live, because this filter reads transcripts written
+long before it: today
+``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``
+renders its headings from the section titles in
+``shared/src/shared/briefing_queries.py`` -- '## Conventions & Gotchas' and
+'## Task Context' -- while '## Project Context', '## Conventions' and
+'## Recent Decisions' are the pre-task-3659 spellings, retired from the
+query table but still present throughout the archived corpus. Do not prune
+the retired three: dropping them silently un-classifies every historical
+briefing turn.
+
 Never sufficient alone: a human turn headed '## Conventions' carries no
 anchor and stays gold.
 
@@ -990,13 +1001,17 @@ prompt template (:367/:670/:827/:927/:968/:1007/:1095/:1120/:1212) and was
 listed here until the task 3610 amendment pass, but '# Task' + '# Action'
 is also an ordinary human spec-writing shape, and losing a genuine gold
 turn is a SILENT error where an admitted briefing turn is a visible one.
-It costs almost no recall: every one of those templates begins with
-``{context}``, so a real briefing always carries the '# Context' anchor
-and, whenever memory context is available, its '##' sub-blocks too. The
-corner this declines is the memory-UNAVAILABLE variant of the two
-identity-less templates (build_reviewer_prompt :998, build_merger_prompt
-:1109), which then shows only '# Context' + '# Action' -- a shape the
-pre-3610 all-of-three rule did not catch either, so nothing regresses."""
+It costs almost no recall: every template that carries a memory block
+begins with ``{context}``, so such a briefing always carries the
+'# Context' anchor and, whenever memory context is available, its '##'
+sub-blocks too. The corner this declines is the memory-UNAVAILABLE variant
+of ``BriefingAssembler.build_reviewer_prompt``, the one identity-less
+template that still has a context slot, which then shows only '# Context' +
+'# Action' -- a shape the pre-3610 all-of-three rule did not catch either,
+so nothing regresses. ``BriefingAssembler.build_merger_prompt`` declines
+the corner entirely: since task 3659 it carries no memory block at all, so
+it emits no '# Context' anchor to be corroborated (D7 -- the merger is
+mechanical and the generic block was never shown to help it)."""
 
 RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
     '## reconciliation run review', '### run metadata', '### stage reports',

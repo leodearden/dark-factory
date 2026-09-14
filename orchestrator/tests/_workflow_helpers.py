@@ -441,8 +441,13 @@ class FakeBriefing:
 
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = None,
-        amendment_suggestions: list[dict] | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+        task: dict | None = None,
     ) -> str:
+        # `amendment_suggestions` is keyword-only in both the Protocol and
+        # the production method; it was positional-or-keyword here, which is
+        # drift neither ruff nor pyright reports — only a call through this
+        # fake would have caught it.
         return f'Review ({reviewer_type}): {diff[:100]}'
 
     async def build_completion_judge_prompt(
@@ -455,9 +460,7 @@ class FakeBriefing:
     ) -> str:
         return f'Judge task {task_id}: plan has {len(plan.get("steps", []))} steps'
 
-    async def build_merger_prompt(
-        self, conflicts: str, task_intent: str, context: str | None = None
-    ) -> str:
+    async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str:
         return f'Merge: {conflicts[:100]}'
 
     async def build_resume_prompt(

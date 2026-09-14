@@ -1473,8 +1473,16 @@ This task holds locks for the following modules:
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        task: dict | None = None,
     ) -> str:
         """Build prompt for a reviewer agent.
+
+        *task* scopes the memory block to the work under review (D7). The
+        reviewer is the highest-volume role in the fleet and had only the
+        generic project-wide block, even though the workflow holds the task
+        at every dispatch site. It stays optional so callers that hold no
+        task — and every test that passes ``context`` directly — keep
+        working, falling back to the generic conventions query.
 
         When *amendment_suggestions* is provided, this review immediately
         follows an in-workflow amendment round; an advisory "# Amendment
@@ -1486,7 +1494,7 @@ This task holds locks for the following modules:
         ``partition_suggestions_by_delta`` filter is the enforceable guarantee.
         """
         if context is None:
-            context = await self._get_memory_context(BriefingScope(), 'reviewer')
+            context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
 
         # Truncate very large diffs to avoid blowing the context
         if len(diff) > 50000:
@@ -1596,16 +1604,17 @@ your verdict as JSON matching the schema. Follow the safety rules: if the
 diff is empty or trivial, `substantive_work=false` and `complete=false`.
 """
 
-    async def build_merger_prompt(
-        self, conflicts: str, task_intent: str, context: str | None = None
-    ) -> str:
-        """Build prompt for the merger agent."""
-        if context is None:
-            context = await self._get_memory_context(BriefingScope(), 'merger')
+    async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str:
+        """Build prompt for the merger agent.
 
+        Carries NO memory block, by decision (D7). Merging is mechanical —
+        read both sides of a conflict, preserve both intents, test — and the
+        role is rare (7 dispatches in 14 days, measured). What it had was the
+        generic project-wide recall nobody could show helped it, so the block
+        and its ``context`` parameter are gone rather than rescoped: this
+        absence is deliberate, not an oversight.
+        """
         return f"""\
-{context}
-
 # Task Intent
 
 {task_intent}
