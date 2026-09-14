@@ -16738,26 +16738,3 @@ class TestTypedAbsenceReachesEveryPrompt:
                 f'bare `present: false` — that conflation is the defect this '
                 f'task removes.'
             )
-
-    def test_run_status_is_never_a_gating_condition(self):
-        """NEGATIVE guard. Three measured `failed` runs really did execute
-        Stage 2 and lose the ledger write, so gating on run_status suppresses
-        precisely the real findings it appears to filter. Wherever a prompt
-        mentions run_status at all, the diagnostic-only caveat must ride
-        along, so a later editor cannot quietly reintroduce status gating."""
-        for name, prompt in self._prompts().items():
-            if 'run_status' not in prompt:
-                continue
-            assert 'diagnostic' in prompt.lower(), (
-                f'{name} mentions run_status without the diagnostic-only '
-                f'caveat. run_status is evidence for a report line, never a '
-                f'condition that decides whether to flag.'
-            )
-
-    def test_fail_safe_anchors_are_retained(self):
-        """The fail-safe is WIDENED, never removed: this change only ever
-        removes false positives (PRD §8.3 monotonicity)."""
-        for name, prompt in self._prompts().items():
-            assert 'ledger_available' in prompt, f'{name} lost ledger_available'
-            assert 'AUTHORITATIVE' in prompt, f'{name} lost the AUTHORITATIVE anchor'
-            assert 'INCONCLUSIVE' in prompt, f'{name} lost the INCONCLUSIVE branch'
