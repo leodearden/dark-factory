@@ -26,7 +26,6 @@ measurements, never in an assertion.
 from __future__ import annotations
 
 import pytest
-
 from audit_offcontract_review_findings import (
     CONTRACT_SEVERITIES,
     normalize_issue,

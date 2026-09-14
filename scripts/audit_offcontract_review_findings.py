@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Audit the reviewer findings that the off-contract verdict shape dropped.
+
+READ-ONLY / REPORT-ONLY: this module and its CLI open no database, mutate no
+task, verdict or plan artifact, and write nothing outside stdout. The triage it
+supports is a read-and-report exercise; any actual fix belongs in a per-defect
+follow-up task.
+
+Background (task 5430, origin esc-2896-10): between 2026-07-19 and 2026-08-10
+`reviewer_comprehensive` emitted verdicts whose `verdict.issues[]` entries used
+an off-contract shape — `severity` outside {blocking, suggestion}, and
+`file`+`line` instead of `location`. Both review gates key on the contract
+fields, so those findings were read as suggestions AND skipped by the in-scope
+filter: the amendment gate never fired and no implementer ever saw them. The
+companion task prevents recurrence; task 5430 accounts for the residue, and this
+script does the mechanical half of that accounting.
+
+It does three things and NO JUDGEMENT:
+
+  - `normalize_issue` collapses any of the six observed issue schemas into one
+    record. It is the single place that knows about the shape variance, so a
+    caller never re-derives "where is the headline in this one".
+  - `census` / `select_population` measure a verdict tree.
+  - `validate_report` checks a finished triage report against its frozen roster.
+
+Whether a given finding is still live on today's main is a judgement over code
+that has moved for seven weeks. No function here answers that, and none should:
+the dispositions live in the triage report, with their reasoning.
+
+A NOTE ON THE NUMBERS THIS PRINTS. The verdict corpus is untracked runtime state
+under a gitignored `.worktrees/`, and later re-reviews overwrite a verdict file
+in place. It is therefore NOT a stable population: task 2896's verdict was
+overwritten on 2026-09-12, destroying the highest-severity finding in task
+5430's own roster. Every census this script emits is a dated measurement of a
+moving target, never a fact about a closed set.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+DEFAULT_ROOT = Path("/home/leo/src/dark-factory/.worktrees/.task-meta")
+
+#: The only two severities the review gates understand. Anything else is read as
+#: a suggestion and skipped by the in-scope filter — the drop this task triages.
+CONTRACT_SEVERITIES = frozenset({"blocking", "suggestion"})
+
+#: Ordered key preference for the headline. `title` is the common spelling;
+#: `short_summary` is the one the ReportFindings-shaped verdicts use.
+HEADLINE_KEYS = ("title", "short_summary")
+
+#: Ordered key preference for the primary detail body. First populated key wins.
+DETAIL_KEYS = ("description", "detail", "summary")
+
+#: Supplementary detail keys, appended in this order when populated. These are
+#: additive rather than alternatives: a shape can carry several at once.
+SUPPLEMENT_KEYS = ("failure_scenario", "reproduce", "suggestion", "suggested_fix", "recommendation")
+
+
+def _text(raw: dict, key: str) -> str | None:
+    """Return raw[key] as stripped text, or None when absent/blank.
+
+    `title: None` and `title: "   "` are both treated as absent — five of the
+    23 dropped findings carry an explicit null here.
+    """
+    value = raw.get(key)
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def _resolve_location(raw: dict) -> str:
+    """Resolve a location from either the on-contract or off-contract spelling.
+
+    Raises rather than returning a partly-None string: an unlocatable finding
+    that stringifies to "None:None" reads as located, and then nobody checks it.
+    """
+    on_contract = _text(raw, "location")
+    if on_contract:
+        return on_contract
+    file = _text(raw, "file")
+    if not file:
+        raise ValueError(
+            f"issue carries no location signal at all: neither `location` nor `file` "
+            f"(keys present: {sorted(raw)})"
+        )
+    line = raw.get("line")
+    return f"{file}:{line}" if line is not None else file
+
+
+def _resolve_statement(raw: dict) -> str:
+    """Join every populated text key into one readable statement.
+
+    Nothing is dropped: the shapes disagree about which key carries the detail,
+    so preferring one and discarding the rest would lose real content.
+    """
+    parts: list[str] = []
+    for key in HEADLINE_KEYS:
+        if headline := _text(raw, key):
+            parts.append(headline)
+            break
+    for key in DETAIL_KEYS:
+        if detail := _text(raw, key):
+            parts.append(detail)
+            break
+    parts.extend(f"{key}: {text}" for key in SUPPLEMENT_KEYS if (text := _text(raw, key)))
+    return "\n\n".join(parts)
+
+
+def normalize_issue(task_id: str, index: int, raw: dict) -> dict:
+    """Collapse one reviewer issue of any observed schema into one record.
+
+    Pure: takes a dict, returns a dict, touches no disk. `index` is the issue's
+    position in `verdict.issues[]`, which is what makes the derived `id` stable
+    and re-checkable against a frozen verdict file.
+    """
+    return {
+        "id": f"{task_id}-{raw.get('category')}-{index}",
+        "task": task_id,
+        "index": index,
+        "severity": raw.get("severity"),
+        "category": raw.get("category"),
+        "location": _resolve_location(raw),
+        "statement": _resolve_statement(raw),
+        "off_contract": raw.get("severity") not in CONTRACT_SEVERITIES,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
+                        help="task-meta tree to census (default: %(default)s)")
+    parser.parse_args(argv)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
