@@ -1155,3 +1155,92 @@ class TestCalibrationScriptArmTableLockstep:
                 f'{name} is bound at module level in the calibration script; it must '
                 'stay stdlib-only so it loads under the system python3 at gate time.'
             )
+
+
+# ---------------------------------------------------------------------------
+# Review suggestion 3: the metrics <-> sampler vocabulary reconciler
+# ---------------------------------------------------------------------------
+
+
+class TestEmittedNamesAreAdmittedByRunTick:
+    """The one pair of vocabularies inside this package with no reconciler.
+
+    sampler.metrics EMITS metric names; sampler.sampler ADMITS them, against
+    its own frozensets, with an ``assert`` placed BEFORE every insert. So a
+    mismatch does not degrade one group — it aborts the whole tick, and the
+    sampler writes zero rows of any group every 5 s until someone reads the
+    journal.
+
+    Nothing caught that. The lockstep guards added by this task reconcile
+    metrics.py against the calibration script, and _ARMS against
+    ARM_METRIC_STEMS, but every run_tick test feeds a hand-written dict and
+    every __main__ test monkeypatches the collectors away. Renaming an emitted
+    stem consistently across metrics.py, ARM_METRIC_STEMS and the calibration
+    script therefore left the whole suite green and production broken.
+
+    This drives the REAL collectors into the REAL run_tick, through public
+    interfaces only — no private frozenset is imported here, because a row
+    landing in the store is the property that actually matters.
+    """
+
+    @staticmethod
+    def _collect_all(tree):
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import (
+            collect_load_metrics,
+            collect_process_metrics,
+            collect_psi,
+        )
+
+        mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+        return {
+            'psi': collect_psi(read=lambda name: mapping[name]),
+            'process_metrics': collect_process_metrics(
+                proc_iter=lambda _attrs: iter(()), fd9_exists=lambda _pid: False
+            ),
+            'load_metrics': collect_load_metrics(
+                read_runqueue=lambda **_kwargs: RunqueueReading(2.5, True),
+                own_cgroup_path=tree.own_cgroup_path,
+                cgroup_root=tree.cgroup_root,
+            ),
+        }
+
+    def test_every_name_the_collectors_emit_reaches_the_store(self, tmp_path):
+        import sqlite3
+
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        tree = live_topology(tmp_path)
+        groups = self._collect_all(tree)
+        emitted = {name for group in groups.values() for name in group}
+        # 14 own_* (7 leaves x value+read_ok) + 2 runqueue + 6 psi + 3 process
+        # — the 25 metrics/tick the retention sizing was measured against.
+        assert len(emitted) == 14 + 2 + 6 + 3, (
+            f'the fixture did not exercise all three groups; got {sorted(emitted)}'
+        )
+
+        db_path = tmp_path / 'db.sqlite'
+        # Raises AssertionError out of run_tick if any emitted name is one the
+        # guard does not admit — which is exactly the production failure.
+        run_tick(LoadSampleStore(db_path), 1_000_000, **groups)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            stored = {row[0] for row in conn.execute('SELECT DISTINCT metric FROM samples')}
+        finally:
+            conn.close()
+        assert stored == emitted
+
+    def test_the_df_topology_vocabulary_is_admitted_too(self, tmp_path):
+        """Post-3394 the leaf names change shape; the stem must still admit them."""
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        tree = df_topology(tmp_path, 'dark-factory', 'reify')
+        groups = self._collect_all(tree)
+        load = groups['load_metrics']
+        assert 'own_cpu_some10:df-dark-factory.slice' in load, sorted(load)
+
+        run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, **groups)
