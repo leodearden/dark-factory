@@ -453,6 +453,7 @@ def test_a_fable_merger_run_reports_its_turns_and_the_merge_it_resolved(runs_db)
     assert run.succeeded is True
     assert run.end_event_model == FABLE
     assert run.cost_usd == 6.08
+    assert run.merge_outcome is not None
     assert run.merge_outcome.state == 'done'
     assert run.merge_outcome.merge_sha == 'd411f107'
 
@@ -478,8 +479,10 @@ def test_the_last_merge_finalized_wins_not_the_first(runs_db):
 
     rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
 
-    assert rows[0].merge_outcome.state == 'done'
-    assert rows[0].merge_outcome.merge_sha == 'd411f107'
+    outcome = rows[0].merge_outcome
+    assert outcome is not None
+    assert outcome.state == 'done'
+    assert outcome.merge_sha == 'd411f107'
 
 
 def test_an_invocation_with_no_matching_end_event_reports_turns_none(runs_db):
